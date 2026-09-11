@@ -71,14 +71,16 @@ def fix_composites(root: Path) -> int:
 PRINT_ERR = re.compile(r"^error\[E0277\]: `([^`]+)` has no printed representation\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 
 
-def fix_printable(work: Path, log: str) -> int:
+def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
     """hegeltest 0.33+: drawn values must be printable. For a type defined in the same file, add
     `hegel::PrettyPrintable` to its derive; otherwise wrap the drawn generator expression in
     `.print_as_debug()` and bring `hegel::Generator` into scope. Returns the number of edits."""
     sites: dict[Path, list[tuple[int, int, str]]] = {}
     for m in PRINT_ERR.finditer(log):
         ty, file, line, col = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
-        sites.setdefault(work / file, []).append((line, col, ty.split("::")[-1].split("<")[0]))
+        # cargo prints paths relative to the package directory it ran in, else the workspace root
+        path = next((p for p in (pkg_dir / file, work / file) if p.is_file()), work / file)
+        sites.setdefault(path, []).append((line, col, ty.split("::")[-1].split("<")[0]))
     edits = 0
     for f, locs in sites.items():
         if not f.is_file():
@@ -250,7 +252,7 @@ def port(crate: str) -> str:
         r = sh(str(TOOLS / "zoo"), "test", "--no-apply", f"rust/{crate}", check=False)
         out = r.stdout + r.stderr
         log = (WORK / f"{crate}.log").read_text(errors="replace") if (WORK / f"{crate}.log").exists() else ""
-        if not PRINT_ERR.search(log) or not fix_printable(work, log):
+        if not PRINT_ERR.search(log) or not fix_printable(work, log, pkg_dir):
             break
         nfix += 1
     if re.search(r"^error(\[E\d+\])?: ", log, re.M) and "test result" not in log:
