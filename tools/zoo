@@ -102,7 +102,17 @@ class Target:
 
     @property
     def expected_failures(self) -> dict[str, str]:
-        return dict(self.meta.get("expected_failures", {}))
+        """test name -> bug id. Values in target.toml are either "bug/id" or
+        { bug = "bug/id", intermittent = true } for tests that reach the bug only on some runs."""
+        out = {}
+        for name, v in self.meta.get("expected_failures", {}).items():
+            out[name] = v["bug"] if isinstance(v, dict) else v
+        return out
+
+    @property
+    def intermittent(self) -> set[str]:
+        return {n for n, v in self.meta.get("expected_failures", {}).items()
+                if isinstance(v, dict) and v.get("intermittent")}
 
 
 def load_pins() -> dict:
@@ -199,7 +209,9 @@ class Rust(Backend):
     def default_env(self, t: Target) -> dict:
         # Cargo is happy to build a crate whose rust-version is older than hegeltest's MSRV;
         # tell it not to fail resolution on that (predecessor patches were made this way).
-        return {"CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS": "allow", "CARGO_TERM_COLOR": "never"}
+        return {"CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS": "allow", "CARGO_TERM_COLOR": "never",
+                # keep Hegel's failure database out of the upstream checkout (and of hegel.patch)
+                "HEGEL_DATABASE": str(WORK / t.lang / f"{t.name}.hegel")}
 
     # "test a::b ... ok" | "test a::b - should panic ... ok" | "test src/x.rs - f (line 3) ... ok"
     _line = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$", re.M)
@@ -215,7 +227,7 @@ class Rust(Backend):
         return res
 
     def patch_excludes(self) -> list[str]:
-        return [":(exclude)Cargo.lock", ":(exclude)**/Cargo.lock"]
+        return [":(exclude,glob)**/Cargo.lock"]
 
 
 BACKENDS: dict[str, Backend] = {b.lang: b for b in (Rust(),)}
@@ -245,10 +257,18 @@ def fetch(t: Target) -> None:
     have = git(t, "cat-file", "-e", f"{base}^{{commit}}", check=False, capture=True).returncode == 0
     if not have:
         log(f"{t.id}: fetching {base[:12]} from {upstream}")
-        r = git(t, "fetch", "-q", "--depth", "1", "origin", base, check=False)
-        if r.returncode != 0:  # server refuses fetch-by-sha; take the whole history
-            log(f"{t.id}: shallow fetch refused, fetching full history")
+        r = None
+        if len(base) == 40:
+            r = git(t, "fetch", "-q", "--depth", "1", "origin", base, check=False)
+        if r is None or r.returncode != 0:  # abbreviated sha, or server refuses fetch-by-sha
+            log(f"{t.id}: fetching full history")
             git(t, "fetch", "-q", "origin")
+    if len(base) < 40:  # imported targets carry the predecessor's 12-hex sha: resolve and record it
+        full = git(t, "rev-parse", "--verify", f"{base}^{{commit}}", capture=True).stdout.strip()
+        tt = t.dir / "target.toml"
+        tt.write_text(tt.read_text().replace(f'commit = "{base}"', f'commit = "{full}"', 1))
+        t.meta["base"]["commit"] = base = full
+        log(f"{t.id}: resolved base commit to {full}")
     git(t, "checkout", "-q", "--detach", base)
 
 
@@ -274,9 +294,10 @@ def apply(t: Target) -> None:
 def save(t: Target) -> None:
     if not (t.work / ".git").is_dir():
         die(f"{t.id}: nothing in {t.work}; run `zoo apply` and edit there first")
+    excludes = [":(exclude,glob)**/.hegel/**", *backend(t).patch_excludes()]
     git(t, "add", "-N", "--all")  # make new files show up in diff
-    excludes = backend(t).patch_excludes()
-    r = git(t, "diff", "--binary", "--", ".", *excludes, capture=True)
+    # diff against the base commit, not the index: `apply --3way` leaves the patch staged
+    r = git(t, "diff", "--binary", "HEAD", "--", ".", *excludes, capture=True)
     text = r.stdout
     if not text.strip():
         die(f"{t.id}: working tree in {t.work} has no changes against base")
@@ -294,6 +315,7 @@ class Verdict:
     unexpected_passed: list[str]   # listed as expected failures but passed: bug fixed?
     missing: list[str]             # expected failures that did not run at all
     ignored: list[str]
+    intermittent_passed: list[str] = field(default_factory=list)  # intermittent ones that passed this run
 
     @property
     def ok(self) -> bool:
@@ -302,12 +324,15 @@ class Verdict:
 
 def judge(t: Target, results: dict[str, str]) -> Verdict:
     exp = t.expected_failures
+    inter = t.intermittent
     v = Verdict([], [], [], [], [], [])
     for name, r in results.items():
         if r == "ignored":
             v.ignored.append(name)
         elif r == "FAILED":
             (v.expected_failed if name in exp else v.unexpected_failed).append(name)
+        elif name in inter:
+            v.intermittent_passed.append(name)
         elif name in exp:
             v.unexpected_passed.append(name)
         else:
@@ -347,6 +372,8 @@ def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
         print(f"    FAIL  {n}")
     for n in v.unexpected_passed:
         print(f"    PASS? {n}  (listed as expected failure for {t.expected_failures[n]} — fixed upstream?)")
+    for n in v.intermittent_passed:
+        print(f"    pass  {n}  (intermittent expected failure for {t.expected_failures[n]}; passed this run)")
     for n in v.missing:
         print(f"    MISSING {n}  (expected failure not found in results)")
     if not v.ok:

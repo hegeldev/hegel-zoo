@@ -123,7 +123,10 @@ result = "reproduces"                    # reproduces | fixed | not-run
 ```
 
 Tests that expose a still-open bug stay in the patch, unmodified, and are listed in
-`target.toml [expected_failures]`. The runner treats their failure as expected and their
+`target.toml [expected_failures]`. A test that reaches a known bug only on some runs (a
+model-based test whose random walk sometimes hits the buggy sequence, say) is listed as
+`"name" = { bug = "id", intermittent = true }`: its failure is expected and its passing is
+not taken as a sign the bug is fixed. The runner treats their failure as expected and their
 *passing* as a signal ("bug roaring/1 no longer reproduces at 0.12.0 — fixed?") that the record
 needs updating. This keeps the patch clean enough to send upstream and keeps CI green without
 `#[ignore]` littering. Process-aborting bugs (crash/hang/OOM) are the exception: per the skill,
