@@ -218,6 +218,18 @@ test` at 0.41+ builds `libhegel_c` via hegeltest's build script, so patches need
 0.33 `PrintableGenerator` for hand-written generators, 0.42 stateful `Machine`), but this
 sample says the import is cheap and largely mechanical.
 
+A static survey of all 162 patches (same day) bears that out. Median patch adds 817 lines;
+all pin 0.28.2. Of the constructs that changed: 96 patches use `#[hegel::composite]` (the
+mechanical fix above), 129 use `one_of!` of which about 8 exceed the new 12-arm limit
+(calamine, edn-rs, jj, jsonc-parser, ron, sqlparser, vte — switch to vec-based `one_of()`),
+38 use stateful testing (`#[hegel::state_machine]`/`#[rule]`/`#[invariant]`/`stateful::run`,
+which the 0.35 and 0.42 changes touch), and 3 have hand-written `Generator` impls (0.33
+`PrintableGenerator`). 19 use nothing that changed. So roughly 120 port mechanically and 40
+need patterned manual edits. Only 25 new test files were created across all patches against
+549 edits to existing files — the predecessor followed the skill's "add to existing files"
+rule, so the new-file preference above would govern new targets, not the import. 84 patches
+note an MSRV below hegeltest's 1.86, which the runner must handle.
+
 ## Open questions
 
 1. **Patch vs standalone package**, and the "prefer new files" deviation from the skill.
