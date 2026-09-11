@@ -19,7 +19,7 @@ that a test which found a bug at version *n* is re-run at version *n+1* and the 
 ```
 README.md
 DESIGN.md
-hegel.toml                     # pinned Hegel library version per language (single source of truth)
+zoo.toml                     # pinned Hegel library version per language (single source of truth)
 TROPHIES.md                    # generated: every bug across all targets, by status
 targets/
   rust/<name>/
@@ -62,7 +62,7 @@ date = "2026-07-20"
 version = "0.11.2"                      # nearest upstream release tag, if any
 
 [hegel]
-version = "0.44.1"                      # must equal hegel.toml's pin for this language (zoo check enforces)
+version = "0.44.1"                      # must equal zoo.toml's pin for this language (zoo check enforces)
 
 [run]
 # language backends supply defaults (cargo test -p roaring, go test ./..., …); override here
@@ -147,7 +147,7 @@ zoo bump   <target> <commit|tag>
                          rebase the patch onto a new upstream commit (3-way; stops on conflict),
                          run, append [[bug.observed]] rows, update [base]
 zoo bump-hegel <lang> <version>
-                         update hegel.toml and every patch's dependency line for that language
+                         update zoo.toml and every patch's dependency line for that language
 zoo report               regenerate TROPHIES.md
 zoo new    <lang> <name> <upstream>
                          scaffold a target directory
@@ -160,7 +160,7 @@ should not fail because upstream's own suite has a flaky network test).
 
 ## Pinning Hegel
 
-`hegel.toml` at the root holds one version per language library:
+`zoo.toml` at the root holds one version per language library:
 
 ```toml
 [rust]       hegeltest = "0.44.1"
@@ -204,6 +204,19 @@ first real maintenance task, which will exercise the tooling and reveal how much
 0.28→0.44 API drift costs. Then one pilot target per other language, chosen from domains the
 Rust experiment found richest (interpreters, parsers of untrusted input, codecs, anything with
 a reference implementation to diff against), before scaling out.
+
+### Evidence from a spike (2026-09-11, humantime)
+
+The predecessor's `humantime.patch` (base `76c8929`, hegeltest 0.28.2) was applied to a fresh
+clone on the project's 2-CPU VM: applied cleanly, built and ran in 17 s, 46 tests passed and
+exactly the two known-bug tests failed deterministically (trophy #20 and the weak-parser
+duplicate of upstream #67). Bumping to hegeltest **0.44.1** produced five compile errors, all
+the 0.29 change (`#[hegel::composite]` now takes `&TestCase`), each with a compiler message
+saying exactly what to change; after that mechanical edit the result was identical. `cargo
+test` at 0.41+ builds `libhegel_c` via hegeltest's build script, so patches need no
+`static-engine` feature. Across 162 patches the API drift will vary (0.30 `one_of!` arity,
+0.33 `PrintableGenerator` for hand-written generators, 0.42 stateful `Machine`), but this
+sample says the import is cheap and largely mechanical.
 
 ## Open questions
 
