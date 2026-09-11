@@ -1,0 +1,851 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index dbfa7a9..752687a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -53,6 +53,7 @@ memchr = { version = "2.4.0", default-features = false, optional = true }
+ 
+ [dev-dependencies]
+ doc-comment = "0.3.3"
++hegeltest = "0.44.1"
+ # fst = "0.4.5"
+ 
+ [package.metadata.docs.rs]
+diff --git a/src/tests.rs b/src/tests.rs
+index a5276f8..715e4b7 100644
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -1662,3 +1662,834 @@ fn regression_stream_rare_byte_prefilter() {
+ 
+     run().unwrap()
+ }
++
++/// Property-based tests written with hegel.
++///
++/// These supplement both the hand-written table tests above and the fuzz
++/// target in `fuzz/fuzz-targets/fuzz_find.rs`. The fuzz target only checks
++/// that nothing panics; the properties here are differential: the crate's
++/// searchers are compared against a naive scanner that implements the
++/// documented match-kind semantics directly, and the different automaton
++/// backends (noncontiguous NFA, contiguous NFA, DFA) are compared against
++/// each other.
++///
++/// The naive oracle encodes the following documented tie-breaking rules,
++/// which were cross-checked against the `STANDARD`, `LEFTMOST*` and
++/// `OVERLAPPING` test tables above:
++///
++/// * `Standard`: report the match that *ends* earliest (matches are reported
++///   "as they are seen" by the automaton). Among matches ending at the same
++///   position, the automaton's match list stores the longest pattern first
++///   (the state's own pattern, then its suffixes via failure links), so the
++///   longest match wins; exact duplicates resolve to the smallest pattern ID.
++/// * `LeftmostFirst`: earliest start position; ties resolve to the pattern
++///   that was provided first (smallest pattern ID).
++/// * `LeftmostLongest`: earliest start position; ties resolve to the longest
++///   pattern, then to the smallest pattern ID (for duplicate patterns).
++/// * Overlapping searches report every occurrence of every pattern, ordered
++///   by end position, then by start position (longest first within an end
++///   position), then by pattern ID.
++/// * Non-overlapping iterators resume at the end of the previous match, and
++///   an empty match that starts exactly at the end of the previous match is
++///   skipped (see `FindIter::handle_overlapping_empty_match`).
++///
++/// NOTE: two of the tests in this module (`hegel_known_bug_*`, at the
++/// bottom) pin real bugs found by these properties and fail
++/// deterministically; see their doc comments for details.
++mod hegel_props {
++    use std::{
++        cmp::Reverse,
++        format,
++        string::{String, ToString},
++        vec,
++        vec::Vec,
++    };
++
++    use hegel::generators;
++
++    use hegel::Generator;
++
++    use crate::{
++        AhoCorasick, AhoCorasickKind, Anchored, Input, Match, MatchKind,
++        StartKind,
++    };
++
++    // ------------------------------------------------------------------
++    // The naive oracle.
++    // ------------------------------------------------------------------
++
++    /// A match, in plain-data form so that oracle and crate results compare
++    /// and print nicely.
++    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
++    struct NaiveMatch {
++        pid: usize,
++        start: usize,
++        end: usize,
++    }
++
++    fn nm(m: Match) -> NaiveMatch {
++        NaiveMatch {
++            pid: m.pattern().as_usize(),
++            start: m.start(),
++            end: m.end(),
++        }
++    }
++
++    /// Every occurrence of every pattern in the haystack, in the order that
++    /// an overlapping search reports them: by end position, then by start
++    /// position (i.e. longest first within one end position), then by
++    /// pattern ID.
++    fn naive_occurrences(pats: &[Vec<u8>], hay: &[u8]) -> Vec<NaiveMatch> {
++        let mut out = Vec::new();
++        for start in 0..=hay.len() {
++            for (pid, p) in pats.iter().enumerate() {
++                let end = start + p.len();
++                if end <= hay.len() && &hay[start..end] == p.as_slice() {
++                    out.push(NaiveMatch { pid, start, end });
++                }
++            }
++        }
++        out.sort_by_key(|m| (m.end, m.start, m.pid));
++        out
++    }
++
++    /// The single match that a search starting at `start` must report under
++    /// the given match kind, or `None` if there is no match. If `anchored`
++    /// is true, only matches beginning exactly at `start` count.
++    fn naive_find(
++        pats: &[Vec<u8>],
++        hay: &[u8],
++        kind: MatchKind,
++        start: usize,
++        anchored: bool,
++    ) -> Option<NaiveMatch> {
++        if start > hay.len() {
++            return None;
++        }
++        let mut best: Option<NaiveMatch> = None;
++        for s in start..=hay.len() {
++            if anchored && s > start {
++                break;
++            }
++            // Early exit purely to keep the oracle linear on big haystacks
++            // (the stream property uses 64KB+ ones); it does not change the
++            // result. No later start can improve a leftmost match, and no
++            // match starting at or after the best end can end earlier.
++            if let Some(b) = best {
++                let done = match kind {
++                    MatchKind::Standard => s >= b.end,
++                    MatchKind::LeftmostFirst
++                    | MatchKind::LeftmostLongest => true,
++                };
++                if done {
++                    break;
++                }
++            }
++            for (pid, p) in pats.iter().enumerate() {
++                let e = s + p.len();
++                if e > hay.len() || &hay[s..e] != p.as_slice() {
++                    continue;
++                }
++                let cand = NaiveMatch { pid, start: s, end: e };
++                best = Some(match best {
++                    None => cand,
++                    Some(b) => {
++                        if preferred(kind, &cand, &b) {
++                            cand
++                        } else {
++                            b
++                        }
++                    }
++                });
++            }
++        }
++        best
++    }
++
++    /// True if `a` must be reported in preference to `b` under `kind`.
++    fn preferred(kind: MatchKind, a: &NaiveMatch, b: &NaiveMatch) -> bool {
++        match kind {
++            MatchKind::Standard => {
++                (a.end, a.start, a.pid) < (b.end, b.start, b.pid)
++            }
++            MatchKind::LeftmostFirst => (a.start, a.pid) < (b.start, b.pid),
++            MatchKind::LeftmostLongest => {
++                (a.start, Reverse(a.end), a.pid)
++                    < (b.start, Reverse(b.end), b.pid)
++            }
++        }
++    }
++
++    /// The sequence of non-overlapping matches, replicating the documented
++    /// iterator semantics: resume at the end of the previous match, and skip
++    /// an empty match that abuts the end of the previous match.
++    fn naive_find_iter(
++        pats: &[Vec<u8>],
++        hay: &[u8],
++        kind: MatchKind,
++        anchored: bool,
++    ) -> Vec<NaiveMatch> {
++        let mut out = Vec::new();
++        let mut start = 0usize;
++        let mut last_match_end: Option<usize> = None;
++        loop {
++            let Some(mut m) = naive_find(pats, hay, kind, start, anchored)
++            else {
++                break;
++            };
++            if m.start == m.end && Some(m.end) == last_match_end {
++                // An empty match overlapping the end of the previous match
++                // is skipped by bumping the search start by one.
++                start += 1;
++                match naive_find(pats, hay, kind, start, anchored) {
++                    Some(m2) => m = m2,
++                    None => break,
++                }
++            }
++            start = m.end;
++            last_match_end = Some(m.end);
++            out.push(m);
++        }
++        out
++    }
++
++    // ------------------------------------------------------------------
++    // Generators.
++    // ------------------------------------------------------------------
++
++    /// Draws a pattern set and a haystack. Most of the time both come from a
++    /// tiny alphabet so that matches, overlaps and shared prefixes/suffixes
++    /// are common; sometimes both are arbitrary bytes. In all modes, some
++    /// patterns may be overwritten with substrings of the haystack and one
++    /// pattern may be spliced into the haystack, so that even the
++    /// full-byte-alphabet mode sees real matches.
++    fn draw_input(
++        tc: &hegel::TestCase,
++        min_pattern_len: usize,
++    ) -> (Vec<Vec<u8>>, Vec<u8>) {
++        let mode = tc.draw(generators::integers::<u8>().max_value(2));
++        let (mut pats, mut hay) = if mode < 2 {
++            let alphabet: &[u8] = if mode == 0 { b"ab" } else { b"abc" };
++            let byte = || generators::sampled_from(alphabet.to_vec());
++            let pats: Vec<Vec<u8>> = tc.draw(
++                generators::vecs(
++                    generators::vecs(byte())
++                        .min_size(min_pattern_len)
++                        .max_size(6),
++                )
++                .min_size(1)
++                .max_size(8),
++            );
++            let n = tc.draw(generators::integers::<usize>().max_value(40));
++            let hay: Vec<u8> =
++                tc.draw(generators::vecs(byte()).min_size(n).max_size(64));
++            (pats, hay)
++        } else {
++            let pats: Vec<Vec<u8>> = tc.draw(
++                generators::vecs(
++                    generators::binary()
++                        .min_size(min_pattern_len)
++                        .max_size(6),
++                )
++                .min_size(1)
++                .max_size(6),
++            );
++            let hay: Vec<u8> = tc.draw(generators::binary().max_size(64));
++            (pats, hay)
++        };
++        // Overwrite some patterns with substrings of the haystack, so that
++        // matches occur even for the arbitrary-bytes alphabet.
++        for i in 0..pats.len() {
++            if hay.is_empty() || !tc.draw(generators::booleans()) {
++                continue;
++            }
++            let s = tc.draw(
++                generators::integers::<usize>().max_value(hay.len() - 1),
++            );
++            let max_e = core::cmp::min(hay.len(), s + 6);
++            let min_e = core::cmp::min(s + min_pattern_len, max_e);
++            let e = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(min_e)
++                    .max_value(max_e),
++            );
++            if e - s >= min_pattern_len {
++                pats[i] = hay[s..e].to_vec();
++            }
++        }
++        // Splice one pattern into the haystack at a drawn position.
++        if tc.draw(generators::booleans()) {
++            let pid = tc.draw(
++                generators::integers::<usize>().max_value(pats.len() - 1),
++            );
++            let p = pats[pid].clone();
++            if !p.is_empty() && p.len() <= hay.len() {
++                let pos = tc.draw(
++                    generators::integers::<usize>()
++                        .max_value(hay.len() - p.len()),
++                );
++                hay[pos..pos + p.len()].copy_from_slice(&p);
++            }
++        }
++        (pats, hay)
++    }
++
++    /// Builds an `AhoCorasick` searcher with a drawn backend configuration
++    /// (automaton kind, prefilter, byte classes, dense depth), so that every
++    /// property runs against all internal implementations.
++    fn build_ac(
++        tc: &hegel::TestCase,
++        pats: &[Vec<u8>],
++        kind: MatchKind,
++        start_kind: StartKind,
++    ) -> AhoCorasick {
++        let mut b = AhoCorasick::builder();
++        b.match_kind(kind).start_kind(start_kind);
++        b.kind(tc.draw((generators::sampled_from(vec![
++            None,
++            Some(AhoCorasickKind::NoncontiguousNFA),
++            Some(AhoCorasickKind::ContiguousNFA),
++            Some(AhoCorasickKind::DFA),
++        ])).print_as_debug()));
++        b.prefilter(tc.draw(generators::booleans()));
++        b.byte_classes(tc.draw(generators::booleans()));
++        if tc.draw(generators::booleans()) {
++            b.dense_depth(
++                tc.draw(generators::integers::<usize>().max_value(4)),
++            );
++        }
++        b.build(pats).expect("failed to build AhoCorasick searcher")
++    }
++
++    // ------------------------------------------------------------------
++    // Properties.
++    // ------------------------------------------------------------------
++
++    /// The crown differential: `find_iter` must agree with the naive scanner
++    /// for the given match kind.
++    ///
++    /// `min_pattern_len` is 0 for standard semantics but 1 for the leftmost
++    /// kinds, because of a known bug pinned by
++    /// `hegel_known_bug_leftmost_ignores_leftmost_empty_match` below: with an
++    /// empty pattern, leftmost searches can report a match that does not
++    /// start at the leftmost matching position.
++    fn check_find_iter_against_naive(
++        tc: &hegel::TestCase,
++        kind: MatchKind,
++        min_pattern_len: usize,
++    ) {
++        let (pats, hay) = draw_input(tc, min_pattern_len);
++        let ac = build_ac(tc, &pats, kind, StartKind::Unanchored);
++        let got: Vec<NaiveMatch> =
++            ac.find_iter(Input::new(&hay)).map(nm).collect();
++        let want = naive_find_iter(&pats, &hay, kind, false);
++        assert_eq!(
++            got, want,
++            "kind={:?} patterns={:?} haystack={:?} (searcher kind: {:?})",
++            kind,
++            pats,
++            hay,
++            ac.kind(),
++        );
++    }
++
++    #[hegel::test]
++    fn hegel_standard_find_iter_agrees_with_naive(tc: hegel::TestCase) {
++        check_find_iter_against_naive(&tc, MatchKind::Standard, 0);
++    }
++
++    #[hegel::test]
++    fn hegel_leftmost_first_find_iter_agrees_with_naive(tc: hegel::TestCase) {
++        check_find_iter_against_naive(&tc, MatchKind::LeftmostFirst, 1);
++    }
++
++    #[hegel::test]
++    fn hegel_leftmost_longest_find_iter_agrees_with_naive(
++        tc: hegel::TestCase,
++    ) {
++        check_find_iter_against_naive(&tc, MatchKind::LeftmostLongest, 1);
++    }
++
++    /// Anchored searches must agree with the naive scanner restricted to
++    /// matches that begin exactly where each search starts.
++    #[hegel::test]
++    fn hegel_anchored_find_iter_agrees_with_naive(tc: hegel::TestCase) {
++        let (pats, hay) = draw_input(&tc, 0);
++        let kind = tc.draw((generators::sampled_from(vec![
++            MatchKind::Standard,
++            MatchKind::LeftmostFirst,
++            MatchKind::LeftmostLongest,
++        ])).print_as_debug());
++        let start_kind = tc.draw((generators::sampled_from(vec![
++            StartKind::Anchored,
++            StartKind::Both,
++        ])).print_as_debug());
++        let ac = build_ac(&tc, &pats, kind, start_kind);
++        let input = Input::new(&hay).anchored(Anchored::Yes);
++        let got: Vec<NaiveMatch> = ac.find_iter(input).map(nm).collect();
++        let want = naive_find_iter(&pats, &hay, kind, true);
++        assert_eq!(
++            got, want,
++            "kind={:?} start_kind={:?} patterns={:?} haystack={:?}",
++            kind, start_kind, pats, hay,
++        );
++    }
++
++    /// An overlapping search must report *every* occurrence of *every*
++    /// pattern, in order of (end, start, pattern ID).
++    ///
++    /// Empty patterns are excluded because of a known bug pinned by
++    /// `hegel_known_bug_overlapping_duplicates_empty_matches` below: with an
++    /// empty pattern, overlapping searches report duplicate empty matches.
++    #[hegel::test]
++    fn hegel_overlapping_iter_reports_every_occurrence(tc: hegel::TestCase) {
++        let (pats, hay) = draw_input(&tc, 1);
++        let ac =
++            build_ac(&tc, &pats, MatchKind::Standard, StartKind::Unanchored);
++        let got: Vec<NaiveMatch> =
++            ac.find_overlapping_iter(Input::new(&hay)).map(nm).collect();
++        let want = naive_occurrences(&pats, &hay);
++        assert_eq!(
++            got, want,
++            "patterns={:?} haystack={:?} (searcher kind: {:?})",
++            pats,
++            hay,
++            ac.kind(),
++        );
++    }
++
++    /// `is_match`, `find` and `find_iter` must be consistent with each other
++    /// and with the naive occurrence scan, for both anchored and unanchored
++    /// searches and a drawn start-of-search position.
++    #[hegel::test]
++    fn hegel_is_match_iff_find_iff_find_iter(tc: hegel::TestCase) {
++        let (pats, hay) = draw_input(&tc, 0);
++        let kind = tc.draw((generators::sampled_from(vec![
++            MatchKind::Standard,
++            MatchKind::LeftmostFirst,
++            MatchKind::LeftmostLongest,
++        ])).print_as_debug());
++        let anchored = tc.draw(generators::booleans());
++        let ac = build_ac(&tc, &pats, kind, StartKind::Both);
++        let start =
++            tc.draw(generators::integers::<usize>().max_value(hay.len()));
++        let input = Input::new(&hay).range(start..).anchored(if anchored {
++            Anchored::Yes
++        } else {
++            Anchored::No
++        });
++        let is_match = ac.is_match(input.clone());
++        let found = ac.find(input.clone()).map(nm);
++        let all: Vec<NaiveMatch> =
++            ac.find_iter(input.clone()).map(nm).collect();
++        assert_eq!(is_match, found.is_some());
++        assert_eq!(found, all.first().copied());
++        // Against the naive oracle: a match exists iff some occurrence
++        // starts at (anchored) or after (unanchored) the search start.
++        let occs = naive_occurrences(&pats, &hay);
++        let expected = if anchored {
++            occs.iter().any(|m| m.start == start)
++        } else {
++            occs.iter().any(|m| m.start >= start)
++        };
++        assert_eq!(
++            is_match, expected,
++            "kind={:?} anchored={:?} start={} patterns={:?} haystack={:?}",
++            kind, anchored, start, pats, hay,
++        );
++    }
++
++    /// `replace_all_bytes` must equal a naive left-to-right splice of the
++    /// naive scanner's non-overlapping matches.
++    #[hegel::test]
++    fn hegel_replace_all_bytes_agrees_with_naive_splice(tc: hegel::TestCase) {
++        let kind = tc.draw((generators::sampled_from(vec![
++            MatchKind::Standard,
++            MatchKind::LeftmostFirst,
++            MatchKind::LeftmostLongest,
++        ])).print_as_debug());
++        // Empty patterns are excluded for the leftmost kinds because of the
++        // known bug pinned by
++        // `hegel_known_bug_leftmost_ignores_leftmost_empty_match`.
++        let min_pattern_len =
++            if kind == MatchKind::Standard { 0 } else { 1 };
++        let (pats, hay) = draw_input(&tc, min_pattern_len);
++        let ac = build_ac(&tc, &pats, kind, StartKind::Unanchored);
++        let reps: Vec<Vec<u8>> = tc.draw(
++            generators::vecs(generators::binary().max_size(4))
++                .min_size(pats.len())
++                .max_size(pats.len()),
++        );
++        let got = ac.replace_all_bytes(&hay, &reps);
++        let mut want = Vec::new();
++        let mut last = 0usize;
++        for m in naive_find_iter(&pats, &hay, kind, false) {
++            want.extend_from_slice(&hay[last..m.start]);
++            want.extend_from_slice(&reps[m.pid]);
++            last = m.end;
++        }
++        want.extend_from_slice(&hay[last..]);
++        assert_eq!(
++            got, want,
++            "kind={:?} patterns={:?} haystack={:?} replacements={:?}",
++            kind, pats, hay, reps,
++        );
++    }
++
++    /// Every automaton backend (auto-selected, noncontiguous NFA, contiguous
++    /// NFA, DFA) crossed with prefilter and byte-class settings must report
++    /// exactly the same matches.
++    #[hegel::test]
++    fn hegel_all_backends_report_identical_matches(tc: hegel::TestCase) {
++        let (pats, hay) = draw_input(&tc, 0);
++        let kind = tc.draw((generators::sampled_from(vec![
++            MatchKind::Standard,
++            MatchKind::LeftmostFirst,
++            MatchKind::LeftmostLongest,
++        ])).print_as_debug());
++        let ci = tc.draw(generators::booleans());
++        let dense_depth = tc.draw(generators::optional(
++            generators::integers::<usize>().max_value(4),
++        ));
++        let mut results: Vec<(String, Vec<NaiveMatch>, Vec<NaiveMatch>)> =
++            Vec::new();
++        for ack in [
++            None,
++            Some(AhoCorasickKind::NoncontiguousNFA),
++            Some(AhoCorasickKind::ContiguousNFA),
++            Some(AhoCorasickKind::DFA),
++        ] {
++            for prefilter in [false, true] {
++                for byte_classes in [false, true] {
++                    let mut b = AhoCorasick::builder();
++                    b.match_kind(kind)
++                        .kind(ack)
++                        .prefilter(prefilter)
++                        .byte_classes(byte_classes)
++                        .ascii_case_insensitive(ci);
++                    if let Some(depth) = dense_depth {
++                        b.dense_depth(depth);
++                    }
++                    let ac = b.build(&pats).expect("build failed");
++                    let found: Vec<NaiveMatch> =
++                        ac.find_iter(Input::new(&hay)).map(nm).collect();
++                    let overlapping: Vec<NaiveMatch> =
++                        if kind == MatchKind::Standard {
++                            ac.find_overlapping_iter(Input::new(&hay))
++                                .map(nm)
++                                .collect()
++                        } else {
++                            Vec::new()
++                        };
++                    results.push((
++                        format!(
++                            "kind={:?} (resolved {:?}) prefilter={:?} \
++                             byte_classes={:?}",
++                            ack,
++                            ac.kind(),
++                            prefilter,
++                            byte_classes,
++                        ),
++                        found,
++                        overlapping,
++                    ));
++                }
++            }
++        }
++        let (first_cfg, first_found, first_over) = &results[0];
++        for (cfg, found, over) in &results[1..] {
++            assert_eq!(
++                (first_found, first_over),
++                (found, over),
++                "backends disagree: [{}] vs [{}] \
++                 match_kind={:?} ci={:?} dense_depth={:?} \
++                 patterns={:?} haystack={:?}",
++                first_cfg,
++                cfg,
++                kind,
++                ci,
++                dense_depth,
++                pats,
++                hay,
++            );
++        }
++    }
++
++    /// An ASCII-case-insensitive searcher must behave exactly like a naive
++    /// scan over the ASCII-lowercased patterns and haystack. The alphabet
++    /// includes `@`/`` ` `` and `[`/`{`, which differ by 0x20 like ASCII
++    /// letter pairs do but must NOT be folded.
++    #[hegel::test]
++    fn hegel_ascii_case_insensitive_agrees_with_naive_folded(
++        tc: hegel::TestCase,
++    ) {
++        let kind = tc.draw((generators::sampled_from(vec![
++            MatchKind::Standard,
++            MatchKind::LeftmostFirst,
++            MatchKind::LeftmostLongest,
++        ])).print_as_debug());
++        // Empty patterns are excluded for the leftmost kinds because of the
++        // known bug pinned by
++        // `hegel_known_bug_leftmost_ignores_leftmost_empty_match`.
++        let min_pattern_len =
++            if kind == MatchKind::Standard { 0 } else { 1 };
++        let alphabet: Vec<u8> = b"aAbZz@`[{".to_vec();
++        let byte = || generators::sampled_from(alphabet.clone());
++        let pats: Vec<Vec<u8>> = tc.draw(
++            generators::vecs(
++                generators::vecs(byte())
++                    .min_size(min_pattern_len)
++                    .max_size(5),
++            )
++            .min_size(1)
++            .max_size(8),
++        );
++        let hay: Vec<u8> =
++            tc.draw(generators::vecs(byte()).max_size(48));
++        let mut b = AhoCorasick::builder();
++        b.match_kind(kind).ascii_case_insensitive(true);
++        b.kind(tc.draw((generators::sampled_from(vec![
++            None,
++            Some(AhoCorasickKind::NoncontiguousNFA),
++            Some(AhoCorasickKind::ContiguousNFA),
++            Some(AhoCorasickKind::DFA),
++        ])).print_as_debug()));
++        let ac = b.build(&pats).expect("build failed");
++        let got: Vec<NaiveMatch> =
++            ac.find_iter(Input::new(&hay)).map(nm).collect();
++        let folded_pats: Vec<Vec<u8>> =
++            pats.iter().map(|p| p.to_ascii_lowercase()).collect();
++        let folded_hay = hay.to_ascii_lowercase();
++        let want = naive_find_iter(&folded_pats, &folded_hay, kind, false);
++        assert_eq!(
++            got, want,
++            "kind={:?} patterns={:?} haystack={:?}",
++            kind, pats, hay,
++        );
++    }
++
++    /// A reader that hands out the haystack in a drawn schedule of chunk
++    /// sizes, to exercise the stream search's buffer management.
++    struct ChunkedReader {
++        data: Vec<u8>,
++        pos: usize,
++        chunk_sizes: Vec<usize>,
++        i: usize,
++    }
++
++    impl std::io::Read for ChunkedReader {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            let chunk = self.chunk_sizes[self.i % self.chunk_sizes.len()];
++            self.i += 1;
++            let n = core::cmp::min(
++                core::cmp::min(chunk, buf.len()),
++                self.data.len() - self.pos,
++            );
++            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
++            self.pos += n;
++            Ok(n)
++        }
++    }
++
++    /// `stream_find_iter` (standard semantics only, no empty patterns) must
++    /// agree with the naive scanner, including across the stream buffer's
++    /// 64KB roll boundary and for arbitrary read-chunk schedules.
++    #[hegel::test]
++    fn hegel_stream_find_iter_agrees_with_naive(tc: hegel::TestCase) {
++        let (pats, mut hay) = draw_input(&tc, 1);
++        // Sometimes grow the haystack past the 64KB stream buffer capacity
++        // (by repeating it), so that the buffer roll logic is exercised.
++        if !hay.is_empty() && tc.draw(generators::booleans()) {
++            let target = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(65_530)
++                    .max_value(65_700),
++            );
++            while hay.len() < target {
++                let take = core::cmp::min(hay.len(), target - hay.len());
++                hay.extend_from_within(..take);
++            }
++        }
++        let ac =
++            build_ac(&tc, &pats, MatchKind::Standard, StartKind::Unanchored);
++        let chunk_sizes: Vec<usize> = tc.draw(
++            generators::vecs(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(4096),
++            )
++            .min_size(1)
++            .max_size(8),
++        );
++        let rdr = ChunkedReader {
++            data: hay.clone(),
++            pos: 0,
++            chunk_sizes,
++            i: 0,
++        };
++        let got: Vec<NaiveMatch> = ac
++            .stream_find_iter(rdr)
++            .map(|r| nm(r.expect("stream search failed")))
++            .collect();
++        let want = naive_find_iter(&pats, &hay, MatchKind::Standard, false);
++        assert_eq!(
++            got, want,
++            "patterns={:?} haystack.len()={} (searcher kind: {:?})",
++            pats,
++            hay.len(),
++            ac.kind(),
++        );
++    }
++
++    /// The packed searcher (Teddy/Rabin-Karp SIMD fast paths, a completely
++    /// separate implementation from the AC automatons and not covered by the
++    /// fuzz target) must agree with the naive leftmost scanners.
++    #[hegel::test]
++    fn hegel_packed_searcher_agrees_with_naive_leftmost(tc: hegel::TestCase) {
++        use crate::packed;
++
++        let (pats, hay) = draw_input(&tc, 1);
++        let (packed_kind, kind) = tc.draw((generators::sampled_from(vec![
++            (packed::MatchKind::LeftmostFirst, MatchKind::LeftmostFirst),
++            (
++                packed::MatchKind::LeftmostLongest,
++                MatchKind::LeftmostLongest,
++            ),
++        ])).print_as_debug());
++        // Force each of the packed engines in turn; a forced engine may be
++        // unavailable (e.g. Teddy on CPUs without the required SIMD), in
++        // which case build() returns None and that engine is skipped. The
++        // default configuration is also included.
++        let force = tc.draw(generators::integers::<u8>().max_value(2));
++        let mut config = packed::Config::new();
++        config.match_kind(packed_kind);
++        match force {
++            0 => {}
++            1 => {
++                config.only_teddy(true);
++            }
++            2 => {
++                config.only_rabin_karp(true);
++            }
++            _ => unreachable!(),
++        }
++        let searcher =
++            match config.builder().extend(&pats).build() {
++                Some(searcher) => searcher,
++                // Not every pattern set is supported by every packed engine.
++                None => return,
++            };
++        let got: Vec<NaiveMatch> =
++            searcher.find_iter(&hay).map(nm).collect();
++        let want = naive_find_iter(&pats, &hay, kind, false);
++        assert_eq!(
++            got, want,
++            "packed_kind={:?} force={} patterns={:?} haystack={:?}",
++            packed_kind, force, pats, hay,
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // KNOWN FAILURES.
++    //
++    // The two tests below pin real bugs found by the properties above. They
++    // fail deterministically on every run (every generated case is a
++    // counterexample) and are expected to keep failing until the bugs are
++    // fixed. The properties above exclude the affected inputs (empty
++    // patterns) so that they stay green and keep testing everything else.
++    // ------------------------------------------------------------------
++
++    /// KNOWN FAILURE: leftmost searches do not report the leftmost match
++    /// when the leftmost match is an empty match and a non-empty pattern
++    /// matches later.
++    ///
++    /// `MatchKind::LeftmostFirst`/`LeftmostLongest` document that "the
++    /// leftmost match kind always prefers the leftmost match among all
++    /// possible matches". With patterns `["ab", ""]` and haystack `"aab"`,
++    /// the leftmost match is the empty match at offset 0 (pattern 1) — the
++    /// regex `ab|` reports exactly that — but `find_iter` reports only
++    /// `(0, 1, 3)`, a match starting at offset 1.
++    ///
++    /// The behavior is also internally inconsistent: with patterns
++    /// `["b", ""]` and haystack `"ab"` (where the automaton dies at offset 0
++    /// instead of walking into a later full match), the leftmost empty match
++    /// IS reported. The cause is in `try_find_fwd_imp` in
++    /// `src/automaton.rs`: the pending empty match recorded for the start
++    /// state is unconditionally overwritten by any later match, even though
++    /// that match starts further right. All backends (noncontiguous NFA,
++    /// contiguous NFA, DFA) share the bug.
++    #[hegel::test]
++    fn hegel_known_bug_leftmost_ignores_leftmost_empty_match(
++        tc: hegel::TestCase,
++    ) {
++        let kind = tc.draw((generators::sampled_from(vec![
++            MatchKind::LeftmostFirst,
++            MatchKind::LeftmostLongest,
++        ])).print_as_debug());
++        // Patterns ["a"^n ++ "b", ""] and haystack "a"^(n+m) ++ "b" with
++        // m >= 1: the non-empty pattern does not match at offset 0, so the
++        // leftmost match is the empty match at offset 0.
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(6));
++        let m = tc.draw(generators::integers::<usize>().min_value(1).max_value(6));
++        let mut pat = vec![b'a'; n];
++        pat.push(b'b');
++        let pats = vec![pat, Vec::new()];
++        let mut hay = vec![b'a'; n + m];
++        hay.push(b'b');
++        let ac = build_ac(&tc, &pats, kind, StartKind::Unanchored);
++        let got: Vec<NaiveMatch> =
++            ac.find_iter(Input::new(&hay)).map(nm).collect();
++        let want = naive_find_iter(&pats, &hay, kind, false);
++        assert_eq!(
++            got, want,
++            "kind={:?} patterns={:?} haystack={:?} (searcher kind: {:?})",
++            kind,
++            pats,
++            hay,
++            ac.kind(),
++        );
++    }
++
++    /// KNOWN FAILURE: overlapping searches report duplicate empty matches.
++    ///
++    /// With patterns `["", "ab"]` and haystack `"ab"`,
++    /// `find_overlapping_iter` reports `(0, 2, 2)` twice:
++    /// `[(0,0,0), (0,1,1), (1,0,2), (0,2,2), (0,2,2)]`.
++    ///
++    /// The cause is in `NFA` construction
++    /// (`src/nfa/noncontiguous.rs::fill_failure_transitions`): when the
++    /// start state is a match state (an empty pattern exists), a state
++    /// whose failure transition points at the start state receives the
++    /// start state's matches twice — once via `copy_matches(fail, next)`
++    /// when its parent is processed, and once via the unconditional
++    /// `copy_matches(start_unanchored_id, id)` when it is processed itself.
++    /// This needs a state of depth >= 2 whose failure state is the start
++    /// state, which is why the hand-written `OVERLAPPING` tests above (all
++    /// depth-1 patterns alongside the empty pattern) do not catch it. All
++    /// backends share the bug.
++    #[hegel::test]
++    fn hegel_known_bug_overlapping_duplicates_empty_matches(
++        tc: hegel::TestCase,
++    ) {
++        // Patterns ["", "a"^n ++ "b"]: the state reached by the full
++        // non-empty pattern has a failure transition to the start state
++        // (no proper suffix of "a"^n ++ "b" is one of its prefixes).
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(6));
++        let mut pat = vec![b'a'; n];
++        pat.push(b'b');
++        let pats = vec![Vec::new(), pat];
++        let hay = pats[1].clone();
++        let ac =
++            build_ac(&tc, &pats, MatchKind::Standard, StartKind::Unanchored);
++        let got: Vec<NaiveMatch> =
++            ac.find_overlapping_iter(Input::new(&hay)).map(nm).collect();
++        let want = naive_occurrences(&pats, &hay);
++        assert_eq!(
++            got, want,
++            "patterns={:?} haystack={:?} (searcher kind: {:?})",
++            pats,
++            hay,
++            ac.kind(),
++        );
++    }
++}

@@ -136,9 +136,12 @@ def fix_printable(work: Path, log: str) -> int:
             need_import = True
             edits += 1
         text = "\n".join(lines)
-        if need_import and "use hegel::Generator;" not in text:
+        already = re.search(r"^\s*use hegel::(?:generators::)?(?:\{[^}]*\b|)Generator\b", text, re.M)
+        if need_import and not already:
             # put the import next to the nearest `use hegel::generators…` so it lands in the right module
             text, n = re.subn(r"^(\s*)(use hegel::generators(?:::\w+)?(?: as \w+)?;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
+            if not n:  # else after the first `use` (never above `//!` inner docs)
+                text, n = re.subn(r"^(\s*)(use [^\n]*;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
             if not n:
                 text = "use hegel::Generator;\n" + text
         f.write_text(text)
