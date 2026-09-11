@@ -1,6 +1,6 @@
 # Design of the zoo
 
-**Status: proposed, not yet settled.** Open questions are collected at the end.
+**Status: settled 2026-09-11** (decisions at the end). Amend as the zoo teaches us better.
 
 ## What the zoo is
 
@@ -230,14 +230,14 @@ need patterned manual edits. Only 25 new test files were created across all patc
 rule, so the new-file preference above would govern new targets, not the import. 84 patches
 note an MSRV below hegeltest's 1.86, which the runner must handle.
 
-## Open questions
+## Decisions (David, 2026-09-11)
 
-1. **Patch vs standalone package**, and the "prefer new files" deviation from the skill.
-2. **Seeding by wholesale import** of the predecessor's patches and trophies, or a curated
-   subset (say the ~90 crates with bugs), or fresh?
-3. **Known-bug tests as `expected_failures`** in `target.toml` (proposed) versus marking them
-   ignored/skipped inside the patch.
-4. **CI on GitHub Actions** with a weekly full run — acceptable in minutes and in noise? The
-   alternative is running the full matrix on the project's own VM (2 CPUs; slow but free).
-5. **Reporting upstream**: is filing the bugs with maintainers part of this project's remit
-   (it would go as Andon work items with GitHub access), or does the zoo only record them?
+1. **Patches** against pinned upstream commits, as above; new files preferred for new targets.
+2. **Seed by importing the predecessor** wholesale, updating each patch to the pinned Hegel.
+3. **Known-bug tests stay as written and are listed as `expected_failures`.** The zoo's tests
+   never work around a known bug.
+4. **CI on GitHub Actions** as above; `tools/zoo` must equally run everything locally, since
+   porting to new Hegel versions is done locally.
+5. **The zoo only records bugs.** Most predecessor bugs have already been filed upstream;
+   upstreaming what the zoo finds will be a separate downstream project later. Bug records
+   therefore carry `upstream_issue` when known but the zoo does not chase it.
