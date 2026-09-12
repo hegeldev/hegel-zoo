@@ -1,0 +1,543 @@
+diff --git a/ruzstd/Cargo.toml b/ruzstd/Cargo.toml
+index 42f7418..678af17 100644
+--- a/ruzstd/Cargo.toml
++++ b/ruzstd/Cargo.toml
+@@ -25,6 +25,7 @@ alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-all
+ 
+ [dev-dependencies]
+ criterion = "0.5"
++hegeltest = "0.44.1"
+ rand = { version = "0.8.5", features = ["small_rng"] }
+ zstd = "0.13.2"
+ 
+diff --git a/ruzstd/src/tests/mod.rs b/ruzstd/src/tests/mod.rs
+index 3a1c574..d1d129f 100644
+--- a/ruzstd/src/tests/mod.rs
++++ b/ruzstd/src/tests/mod.rs
+@@ -744,6 +744,526 @@ pub mod dict_test;
+ pub mod encode_corpus;
+ pub mod fuzz_regressions;
+ 
++/// Property-based tests (hegel). These supplement the fuzz targets in
++/// `fuzz/fuzz_targets` (decode robustness, interop with the C library) with
++/// in-tree, shrinkable properties runnable via plain `cargo test`.
++#[cfg(all(test, feature = "std"))]
++mod hegel_props {
++    extern crate std;
++
++    use alloc::vec;
++    use alloc::vec::Vec;
++    use std::{format, string::ToString};
++
++    use hegel::generators;
++
++    use crate::decoding::errors::ReadFrameHeaderError;
++    use crate::decoding::{FrameDecoder, StreamingDecoder, DEFAULT_MAX_WINDOW_SIZE};
++
++    /// Payload generator covering the interesting input classes for a
++    /// compressor: empty, random (incompressible -> raw blocks), highly
++    /// repetitive (RLE / long matches, sized to span more than one 128 KiB
++    /// block), and mixed segments.
++    #[hegel::composite]
++    fn payloads(tc: &hegel::TestCase) -> Vec<u8> {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => Vec::new(),
++            1 => tc.draw(generators::binary().max_size(4096)),
++            2 => {
++                let chunk = tc.draw(generators::binary().min_size(1).max_size(8));
++                // > 128 KiB so the frame spans multiple blocks
++                let total = tc.draw(generators::integers::<usize>().max_value(160 * 1024));
++                chunk.iter().copied().cycle().take(total).collect()
++            }
++            _ => {
++                let nsegs = tc.draw(generators::integers::<usize>().min_value(2).max_value(4));
++                let mut v = Vec::new();
++                for _ in 0..nsegs {
++                    if tc.draw(generators::booleans()) {
++                        let seg = tc.draw(generators::binary().max_size(1024));
++                        v.extend_from_slice(&seg);
++                    } else {
++                        let b = tc.draw(generators::integers::<u8>());
++                        let n = tc.draw(generators::integers::<usize>().max_value(16 * 1024));
++                        v.resize(v.len() + n, b);
++                    }
++                }
++                v
++            }
++        }
++    }
++
++    /// Smaller payloads for properties that decode many variants per case.
++    #[hegel::composite]
++    fn small_payloads(tc: &hegel::TestCase) -> Vec<u8> {
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => Vec::new(),
++            1 => tc.draw(generators::binary().max_size(2048)),
++            _ => {
++                let chunk = tc.draw(generators::binary().min_size(1).max_size(8));
++                let total = tc.draw(generators::integers::<usize>().max_value(8 * 1024));
++                chunk.iter().copied().cycle().take(total).collect()
++            }
++        }
++    }
++
++    /// Read everything from `r`, but stop once `cap` bytes have been produced.
++    /// Returns (bytes, hit_cap, error). The cap protects the test's memory
++    /// against decompression bombs, not any library contract.
++    fn read_capped(
++        mut r: impl std::io::Read,
++        cap: usize,
++    ) -> (Vec<u8>, bool, Option<std::io::Error>) {
++        let mut out = Vec::new();
++        let mut buf = [0u8; 16 * 1024];
++        loop {
++            if out.len() >= cap {
++                return (out, true, None);
++            }
++            match r.read(&mut buf) {
++                Ok(0) => return (out, false, None),
++                Ok(n) => out.extend_from_slice(&buf[..n]),
++                Err(e) => return (out, false, Some(e)),
++            }
++        }
++    }
++
++    /// An `io::Read` that hands out data in a drawn schedule of chunk sizes,
++    /// to exercise the decoder's short-read handling.
++    struct ChunkedReader<'a> {
++        data: &'a [u8],
++        schedule: &'a [usize],
++        i: usize,
++    }
++
++    impl std::io::Read for ChunkedReader<'_> {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            if self.data.is_empty() {
++                return Ok(0);
++            }
++            let chunk = self.schedule[self.i % self.schedule.len()]
++                .min(buf.len())
++                .min(self.data.len());
++            self.i += 1;
++            buf[..chunk].copy_from_slice(&self.data[..chunk]);
++            self.data = &self.data[chunk..];
++            Ok(chunk)
++        }
++    }
++
++    /// Property 1 (crown roundtrip): anything the reference C encoder
++    /// produces, ruzstd's StreamingDecoder must decode back to the original
++    /// bytes exactly, at any compression level.
++    #[hegel::test]
++    fn prop_reference_encode_ruzstd_decode_roundtrip(tc: hegel::TestCase) {
++        let payload = tc.draw(payloads());
++        let level: i32 = tc.draw(generators::sampled_from(vec![1, 3, 6, 12, 19]));
++        let compressed = zstd::stream::encode_all(payload.as_slice(), level)
++            .expect("reference encoder failed");
++
++        let mut dec = StreamingDecoder::new(compressed.as_slice())
++            .expect("ruzstd rejected a valid frame at init");
++        let mut out = Vec::new();
++        std::io::Read::read_to_end(&mut dec, &mut out)
++            .expect("ruzstd failed to decode a valid frame");
++        assert_eq!(out, payload);
++    }
++
++    /// Property 2: frames with a pinned content size (the bulk API always
++    /// writes Frame_Content_Size) must report that size through
++    /// `content_size()` and decode losslessly through `decode_all`.
++    #[hegel::test]
++    fn prop_bulk_frame_content_size_and_decode_all(tc: hegel::TestCase) {
++        let payload = tc.draw(payloads());
++        let level: i32 = tc.draw(generators::sampled_from(vec![1, 3, 6, 12, 19]));
++        let compressed = zstd::bulk::compress(&payload, level).expect("reference encoder failed");
++
++        let mut dec = FrameDecoder::new();
++        dec.reset(&mut compressed.as_slice())
++            .expect("ruzstd rejected a valid frame at init");
++        assert_eq!(
++            dec.content_size(),
++            payload.len() as u64,
++            "content_size() disagrees with the FCS the reference encoder wrote"
++        );
++
++        let mut out = vec![0u8; payload.len()];
++        let written = dec
++            .decode_all(&compressed, &mut out)
++            .expect("ruzstd failed to decode a valid frame");
++        assert_eq!(written, payload.len());
++        assert_eq!(out, payload);
++    }
++
++    /// Property 3 (robustness, oracle-independent): arbitrary bytes -- pure
++    /// garbage, magic-prefixed garbage, or a truncated valid frame with a
++    /// garbage tail -- must never panic the decoder. Errors are fine. Output
++    /// reading is capped so a decompression bomb becomes a bounded read, not
++    /// an OOM abort.
++    #[hegel::test]
++    fn prop_arbitrary_bytes_never_panic(tc: hegel::TestCase) {
++        let shape = tc.draw(generators::integers::<u8>().max_value(2));
++        let input: Vec<u8> = match shape {
++            0 => tc.draw(generators::binary().max_size(2048)),
++            1 => {
++                let mut v = crate::common::MAGIC_NUM.to_le_bytes().to_vec();
++                let tail = tc.draw(generators::binary().max_size(2048));
++                v.extend_from_slice(&tail);
++                v
++            }
++            _ => {
++                let payload = tc.draw(generators::binary().max_size(512));
++                let mut v = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
++                let keep = tc.draw(generators::integers::<usize>().max_value(v.len()));
++                v.truncate(keep);
++                let tail = tc.draw(generators::binary().max_size(64));
++                v.extend_from_slice(&tail);
++                v
++            }
++        };
++
++        // StreamingDecoder path: Err at init or while reading is acceptable,
++        // panicking is not.
++        if let Ok(mut dec) = StreamingDecoder::new(input.as_slice()) {
++            let (_out, _hit_cap, _err) = read_capped(&mut dec, 16 * 1024 * 1024);
++        }
++
++        // decode_all path: must return an error (e.g. TargetTooSmall for
++        // bombs) rather than panic.
++        let mut out = vec![0u8; 1024 * 1024];
++        let mut dec = FrameDecoder::new();
++        drop(dec.decode_all(&input, &mut out));
++    }
++
++    /// Property 4 (corruption + differential): take a valid frame, flip bytes
++    /// or truncate it. ruzstd must handle it gracefully (Err or Ok, no
++    /// panic/hang), and whenever both ruzstd and the C decoder accept the
++    /// whole corrupted input, they must produce identical output (the format
++    /// fully determines decoding).
++    ///
++    /// Accept/reject is deliberately NOT compared: ruzstd defaults to a
++    /// 100 MiB window cap (libzstd: 128 MiB), does not verify checksums, and
++    /// stops after the first frame, so acceptance can legitimately differ.
++    #[hegel::test]
++    fn prop_corrupted_frame_graceful_and_agrees_with_c(tc: hegel::TestCase) {
++        let payload = tc.draw(small_payloads());
++        let level: i32 = tc.draw(generators::sampled_from(vec![1, 3, 9]));
++        let mut frame =
++            zstd::stream::encode_all(payload.as_slice(), level).expect("reference encoder failed");
++
++        if tc.draw(generators::booleans()) {
++            // flip 1..=4 bytes
++            let flips = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++            for _ in 0..flips {
++                let pos = tc.draw(generators::integers::<usize>().max_value(frame.len() - 1));
++                let xor = tc.draw(generators::integers::<u8>().min_value(1));
++                frame[pos] ^= xor;
++            }
++        } else {
++            // truncate strictly
++            let new_len = tc.draw(
++                generators::integers::<usize>().max_value(frame.len().saturating_sub(1)),
++            );
++            frame.truncate(new_len);
++        }
++
++        // Caps protect the test's memory (a corrupted frame can declare large
++        // RLE blocks), not a library contract.
++        const CAP: usize = 4 * 1024 * 1024;
++
++        let ruzstd_out: Option<Vec<u8>> = match StreamingDecoder::new(frame.as_slice()) {
++            Err(_) => None,
++            Ok(mut dec) => {
++                let (out, hit_cap, err) = read_capped(&mut dec, CAP);
++                // Only compare when ruzstd consumed the entire input as one
++                // frame -- the C streaming decoder decodes *all* frames.
++                let fully_consumed = dec.into_inner().is_empty();
++                if err.is_some() || hit_cap || !fully_consumed {
++                    None
++                } else {
++                    Some(out)
++                }
++            }
++        };
++
++        let c_out: Option<Vec<u8>> = match zstd::stream::read::Decoder::new(frame.as_slice()) {
++            Err(_) => None,
++            Ok(mut dec) => {
++                let (out, hit_cap, err) = read_capped(&mut dec, CAP);
++                if err.is_some() || hit_cap {
++                    None
++                } else {
++                    Some(out)
++                }
++            }
++        };
++
++        if let (Some(r), Some(c)) = (&ruzstd_out, &c_out) {
++            assert_eq!(
++                r, c,
++                "ruzstd and libzstd both accepted a corrupted frame but disagree on its content"
++            );
++        }
++    }
++
++    /// Property 5 (skippable frames per spec): skippable frames (magic
++    /// 0x184D2A50..=0x184D2A5F + LE length + payload) interleaved with real
++    /// frames contribute nothing to the output; `decode_all` must return
++    /// exactly the concatenation of the real frames' content. The C decoder
++    /// is run as a second witness.
++    #[hegel::test]
++    fn prop_skippable_frames_are_skipped(tc: hegel::TestCase) {
++        let nsegs = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let mut input = Vec::new();
++        let mut expected = Vec::new();
++        for _ in 0..nsegs {
++            if tc.draw(generators::booleans()) {
++                let nibble = tc.draw(generators::integers::<u32>().max_value(0xF));
++                let body = tc.draw(generators::binary().max_size(512));
++                input.extend_from_slice(&(0x184D2A50u32 | nibble).to_le_bytes());
++                input.extend_from_slice(&(body.len() as u32).to_le_bytes());
++                input.extend_from_slice(&body);
++            } else {
++                let payload = tc.draw(generators::binary().max_size(1024));
++                let frame = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
++                input.extend_from_slice(&frame);
++                expected.extend_from_slice(&payload);
++            }
++        }
++
++        let mut out = vec![0u8; expected.len()];
++        let mut dec = FrameDecoder::new();
++        let written = dec
++            .decode_all(&input, &mut out)
++            .expect("decode_all failed on skippable + real frames");
++        assert_eq!(written, expected.len());
++        assert_eq!(out, expected);
++
++        let c = zstd::stream::decode_all(input.as_slice())
++            .expect("C decoder failed on skippable + real frames");
++        assert_eq!(c, expected);
++    }
++
++    /// Property 6 (source chunking is invisible): decoding the same frame
++    /// through a reader that returns arbitrarily small chunks, into
++    /// arbitrarily sized output buffers, must give the same bytes as a
++    /// one-shot decode. Exercises the short-read/resume paths.
++    #[hegel::test]
++    fn prop_chunked_source_reads_equal_oneshot(tc: hegel::TestCase) {
++        let payload = tc.draw(payloads());
++        let level: i32 = tc.draw(generators::sampled_from(vec![1, 3, 19]));
++        let compressed = zstd::stream::encode_all(payload.as_slice(), level).unwrap();
++
++        let schedule: Vec<usize> = tc.draw(
++            generators::vecs(generators::integers::<usize>().min_value(1).max_value(97))
++                .min_size(1)
++                .max_size(8),
++        );
++        let out_chunk = tc.draw(generators::integers::<usize>().min_value(1).max_value(8192));
++
++        let reader = ChunkedReader {
++            data: &compressed,
++            schedule: &schedule,
++            i: 0,
++        };
++        let mut dec =
++            StreamingDecoder::new(reader).expect("ruzstd rejected a valid frame at init");
++        let mut out = Vec::new();
++        let mut buf = vec![0u8; out_chunk];
++        loop {
++            match std::io::Read::read(&mut dec, &mut buf) {
++                Ok(0) => break,
++                Ok(n) => out.extend_from_slice(&buf[..n]),
++                Err(e) => panic!("chunked decode failed: {:?}", e),
++            }
++        }
++        assert_eq!(out, payload);
++    }
++
++    /// Property 7 (decode_from_to is resumable): feeding a valid frame to the
++    /// old-style push API in arbitrary source increments and draining into an
++    /// arbitrarily small target must reproduce the original content, making
++    /// progress at every step.
++    #[hegel::test]
++    fn prop_decode_from_to_resumable(tc: hegel::TestCase) {
++        let payload = tc.draw(small_payloads());
++        let compressed = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
++
++        // Schedule of source-window advances, drawn up front so it shrinks well.
++        let steps: Vec<usize> = tc.draw(
++            generators::vecs(generators::integers::<usize>().min_value(1).max_value(4096))
++                .min_size(1)
++                .max_size(8),
++        );
++        let tgt_size = tc.draw(generators::integers::<usize>().min_value(1).max_value(4096));
++
++        let mut dec = FrameDecoder::new();
++        let mut out: Vec<u8> = Vec::new();
++        let mut tgt = vec![0u8; tgt_size];
++        let mut pos = 0usize;
++        // decode_from_to auto-inits from the source, so the first window must
++        // contain the whole frame header (max 18 bytes).
++        let mut limit = 18.min(compressed.len());
++        let mut i = 0usize;
++        let max_iters = 2 * compressed.len() + payload.len() / tgt_size + 1000;
++        loop {
++            i += 1;
++            assert!(
++                i <= max_iters,
++                "decode_from_to made no progress (pos={}, limit={}, out={})",
++                pos,
++                limit,
++                out.len()
++            );
++            let (read, written) = dec
++                .decode_from_to(&compressed[pos..limit], &mut tgt)
++                .expect("decode_from_to failed on a valid frame");
++            pos += read;
++            out.extend_from_slice(&tgt[..written]);
++            if pos == compressed.len() && read == 0 && written == 0 {
++                break;
++            }
++            let step = steps[i % steps.len()];
++            limit = (limit + step).min(compressed.len()).max(pos);
++        }
++        assert!(dec.is_finished());
++        assert_eq!(out, payload);
++    }
++
++    /// Property 8 (frame header / magic number classification):
++    /// `read_frame_header` must never panic on arbitrary bytes; skippable
++    /// magics must be reported as SkipFrame with the exact declared length,
++    /// and any other non-zstd magic as BadMagicNumber.
++    #[hegel::test]
++    fn prop_frame_header_magic_classification(tc: hegel::TestCase) {
++        // Boost the interesting prefixes; uniform 4-byte magics almost never
++        // hit the skippable range.
++        let shape = tc.draw(generators::integers::<u8>().max_value(2));
++        let bytes: Vec<u8> = match shape {
++            0 => tc.draw(generators::binary().max_size(24)),
++            1 => {
++                let nibble = tc.draw(generators::integers::<u32>().max_value(0xF));
++                let mut v = (0x184D2A50u32 | nibble).to_le_bytes().to_vec();
++                let tail = tc.draw(generators::binary().max_size(12));
++                v.extend_from_slice(&tail);
++                v
++            }
++            _ => {
++                let mut v = crate::common::MAGIC_NUM.to_le_bytes().to_vec();
++                let tail = tc.draw(generators::binary().max_size(16));
++                v.extend_from_slice(&tail);
++                v
++            }
++        };
++
++        let res = crate::decoding::frame::read_frame_header(bytes.as_slice());
++
++        if bytes.len() < 4 {
++            assert!(matches!(
++                res,
++                Err(ReadFrameHeaderError::MagicNumberReadError(_))
++            ));
++            return;
++        }
++        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
++        if (0x184D2A50..=0x184D2A5F).contains(&magic) {
++            if bytes.len() >= 8 {
++                let expected_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
++                assert!(
++                    matches!(
++                        res,
++                        Err(ReadFrameHeaderError::SkipFrame { magic_number, length })
++                            if magic_number == magic && length == expected_len
++                    ),
++                    "skippable frame not classified per spec"
++                );
++            } else {
++                assert!(res.is_err(), "truncated skippable header must error");
++            }
++        } else if magic != crate::common::MAGIC_NUM {
++            assert!(
++                matches!(res, Err(ReadFrameHeaderError::BadMagicNumber(m)) if m == magic),
++                "wrong magic must be rejected as BadMagicNumber"
++            );
++        }
++        // magic == MAGIC_NUM: header may be valid or not; no-panic is the property.
++    }
++
++    /// Property 9 (anti-bomb window gate, oracle-independent): a frame header
++    /// declaring a window (window descriptor, or Frame_Content_Size in
++    /// single-segment mode) larger than the decoder's limit must be rejected
++    /// at init -- before any decompression -- and one within the limit must
++    /// be accepted. The expected window size is transcribed from the spec's
++    /// formula as an independent oracle.
++    #[hegel::test]
++    fn prop_declared_window_gate(tc: hegel::TestCase) {
++        let single_segment = tc.draw(generators::booleans());
++        let (header, spec_window): (Vec<u8>, u64) = if !single_segment {
++            // magic + descriptor(0) + window descriptor byte
++            let wd = tc.draw(generators::integers::<u8>());
++            let mut h = crate::common::MAGIC_NUM.to_le_bytes().to_vec();
++            h.push(0x00);
++            h.push(wd);
++            // Spec: windowLog = 10 + Exponent; base = 1 << windowLog;
++            // add = (base / 8) * Mantissa
++            let exp = u64::from(wd >> 3);
++            let mantissa = u64::from(wd & 7);
++            let base = 1u64 << (10 + exp);
++            (h, base + (base / 8) * mantissa)
++        } else {
++            // magic + descriptor(single_segment | fcs_flag) + FCS bytes;
++            // window size == frame content size.
++            let flag = tc.draw(generators::integers::<u8>().max_value(3));
++            let n = [1usize, 2, 4, 8][flag as usize];
++            let limit = DEFAULT_MAX_WINDOW_SIZE;
++            let raw: u64 = match flag {
++                0 => tc.draw(generators::integers::<u64>().max_value(0xFF)),
++                1 => tc.draw(generators::integers::<u64>().max_value(0xFFFF)),
++                // Boost the boundary around the 100 MiB limit: a uniform draw
++                // almost never lands next to it.
++                2 => tc.draw(hegel::one_of!(
++                    generators::integers::<u64>().max_value(0xFFFF_FFFF),
++                    generators::integers::<u64>()
++                        .min_value(limit - 4)
++                        .max_value(limit + 4),
++                )),
++                _ => tc.draw(hegel::one_of!(
++                    generators::integers::<u64>(),
++                    generators::integers::<u64>()
++                        .min_value(limit - 4)
++                        .max_value(limit + 4),
++                )),
++            };
++            // The 2-byte format stores value - 256.
++            let fcs = if n == 2 { raw + 256 } else { raw };
++            let desc = 0x20u8 | (flag << 6);
++            let mut h = crate::common::MAGIC_NUM.to_le_bytes().to_vec();
++            h.push(desc);
++            h.extend_from_slice(&raw.to_le_bytes()[..n]);
++            (h, fcs)
++        };
++
++        let mut dec = FrameDecoder::new();
++        let res = dec.init(&mut header.as_slice());
++        if spec_window > DEFAULT_MAX_WINDOW_SIZE {
++            assert!(
++                res.is_err(),
++                "frame declaring a {}-byte window was accepted past the {}-byte limit \
++                 (decompression-bomb pre-allocation risk)",
++                spec_window,
++                DEFAULT_MAX_WINDOW_SIZE
++            );
++        } else {
++            assert!(
++                res.is_ok(),
++                "frame with in-limit window {} rejected: {:?}",
++                spec_window,
++                res
++            );
++        }
++    }
++}
++
+ #[cfg(feature = "std")]
+ #[test]
+ fn verbose_disabled() {
