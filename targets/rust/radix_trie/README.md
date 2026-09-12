@@ -24,3 +24,4 @@
 - 2025-09-16: predecessor base commit `a89f789e1267` (Release v0.3.0 (#79)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/radix_trie.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped a89f789e1267 → 2c965cca2047 (2026-08-10, "chore: remove unnecessary clone (#81)"; 0.3.0); 0 bug(s) still reproduce. 60 tests pass.

@@ -37,3 +37,4 @@
 - 2026-07-19: predecessor base commit `a57da53784fd` (Remove deprecated authors field from Cargo.toml (#158)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/data-encoding.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1. One upstream `assert_eq!(x, [])` on a `Vec<u8>` in `tests/lib.rs` (and its `v3/` copy) rewritten as `assert!(x.is_empty())`: hegeltest 0.44 pulls in `serde_json`, whose `PartialEq` impls make the literal ambiguous (E0282/E0283).
+- 2026-09-12: base bumped a57da53784fd → 65862b9234e2 (2026-09-01, "Fix redundant explicit links in v3 doc (#165)"; 2.11.2-git); 0 bug(s) still reproduce. 97 tests pass.
