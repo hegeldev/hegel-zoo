@@ -5,7 +5,7 @@
 ## What is tested
 
 **`src/kd_tree/mod.rs`**
-- `?`: (no doc comment)
+- `$name` (macro `nearest_one_oracle_test!`, instances `hegel_nearest_one_matches_brute_force_squared_euclidean`, `hegel_nearest_one_matches_brute_force_manhattan`, `hegel_nearest_one_matches_brute_force_chebyshev`): (no doc comment)
 - `hegel_nearest_n_matches_brute_force`: (no doc comment)
 - `hegel_within_inclusive_matches_brute_force`: (no doc comment)
 - `hegel_within_exclusive_matches_brute_force`: (no doc comment)

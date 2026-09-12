@@ -34,9 +34,9 @@
 - `not_inverts_every_live_bit`: `!BitVec` must invert every live bit and preserve the length.
 
 **`tests/equality.rs`**
-- `?`: The same logical bit sequence is `==` no matter which storage type and bit-ordering hold it, and flipping any single bit breaks the equality.
-- `?`: `to_bitvec` of an arbitrary subslice preserves the logical contents, regardless of the head offset of the source slice (Issue #10 class).
-- `?`: Comparison of bit-slices is the lexicographic order of their `Vec<bool>` models, even across differing storage and ordering parameters.
+- `equality_is_logical_not_representational`: The same logical bit sequence is `==` no matter which storage type and bit-ordering hold it, and flipping any single bit breaks the equality.
+- `subslice_to_bitvec_preserves_contents`: `to_bitvec` of an arbitrary subslice preserves the logical contents, regardless of the head offset of the source slice (Issue #10 class).
+- `comparison_is_lexicographic_on_logical_bits`: Comparison of bit-slices is the lexicographic order of their `Vec<bool>` models, even across differing storage and ordering parameters.
 
 ## Oracles
 
