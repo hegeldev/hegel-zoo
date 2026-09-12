@@ -274,7 +274,24 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             need_import = True
             edits += 1
         text = "\n".join(lines)
-        already = re.search(r"^\s*use hegel::(?:generators::)?(?:\{[^}]*\b|)Generator\b", text, re.M)
+        # an existing import only counts if it is in scope at every draw site: ycrdt's was
+        # function-local (`use hegel::generators::{self, Generator}` inside one generator fn)
+        IMPORT_RE = re.compile(r"^\s*use hegel::(?:generators::)?(?:\{[^}]*\b|)Generator\b")
+        already = False
+        if need_import:
+            _ls = text.split("\n")
+            _sites = sorted({l - 1 for l, _, _ in locs})
+            for k, line in enumerate(_ls):
+                if IMPORT_RE.match(line) and k < _sites[0]:
+                    bal, ok = 0, True
+                    for j in range(k + 1, _sites[-1] + 1):
+                        bal += _ls[j].count("{") - _ls[j].count("}")
+                        if bal < 0:  # the block holding the import closed before the last site
+                            ok = False
+                            break
+                    if ok:
+                        already = True
+                        break
         if need_import and not already:
             # The import must land in the module that draws, and never at file scope of library
             # code (hegel is a dev-dependency). Prefer: after a `use hegel::generators…` line;
