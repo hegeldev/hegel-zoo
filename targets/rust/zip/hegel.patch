@@ -1,0 +1,648 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 5facf59d..98c3c431 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -74,6 +74,8 @@ time = { version = "^0.3.47", features = ["formatting", "macros"] }
+ clap = { version = "^4.4.18", features = ["derive"] }
+ tempfile = "3.15"
+ rayon = "1.11"
++hegeltest = "0.44.1"
++crc32fast = "1.5"
+ 
+ [features]
+ _arbitrary = ["dep:arbitrary"]
+diff --git a/tests/end_to_end.rs b/tests/end_to_end.rs
+index 0a357f00..229b7578 100644
+--- a/tests/end_to_end.rs
++++ b/tests/end_to_end.rs
+@@ -391,3 +391,282 @@ fn test_can_create_destination() -> zip::result::ZipResult<()> {
+     assert!(dest.path().join("mimetype").exists());
+     Ok(())
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// These generalize the example-based end-to-end tests above: instead of a
++// fixed set of entries, they draw entry names (including paths, Unicode, and
++// awkward characters), contents, and compression methods, then assert the
++// write→read roundtrip preserves everything.
++// ---------------------------------------------------------------------------
++#[cfg(not(miri))]
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++    use std::io::{Cursor, Read, Write};
++    use zip::write::SimpleFileOptions;
++    use zip::{CompressionMethod, ZipArchive, ZipWriter};
++
++    /// Compression methods that support a full write→read roundtrip with the
++    /// enabled feature set.
++    fn roundtrip_methods() -> Vec<CompressionMethod> {
++        #[allow(unused_mut)]
++        let mut methods = vec![CompressionMethod::Stored];
++        // DEFLATE decompression is unsupported when zopfli is the only backend.
++        #[cfg(all(
++            feature = "_deflate-any",
++            not(all(feature = "deflate-zopfli", not(feature = "deflate-flate2")))
++        ))]
++        methods.push(CompressionMethod::Deflated);
++        #[cfg(feature = "_bzip2_any")]
++        methods.push(CompressionMethod::Bzip2);
++        #[cfg(feature = "zstd")]
++        methods.push(CompressionMethod::Zstd);
++        methods
++    }
++
++    /// A drawn entry name: 1–3 components joined by '/', mixing arbitrary
++    /// Unicode text with hand-picked awkward components. A trailing '/' or
++    /// '\' marks a *directory* entry in the ZIP format (see
++    /// `spec::is_dir`), which is written via `add_directory` rather than
++    /// `start_file`, so those are stripped to stay in the file-entry domain.
++    #[hegel::composite]
++    fn entry_name(tc: &hegel::TestCase) -> String {
++        let awkward = vec![
++            "..", ".", "café", "☃", "🐢", "a b", "-", "#", "it's", "quote\"", "semi;colon",
++            "tab\t", "ẞ", "…", "ends.with.dot.", "\u{202E}rtl",
++        ];
++        let n_components = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let mut parts = Vec::with_capacity(n_components);
++        for _ in 0..n_components {
++            parts.push(tc.draw(hegel::one_of!(
++                generators::text().min_size(1).max_size(10).boxed(),
++                generators::sampled_from(awkward.clone())
++                    .map(String::from)
++                    .boxed(),
++            )));
++        }
++        let mut name = parts.join("/");
++        while name.ends_with('/') || name.ends_with('\\') {
++            name.pop();
++        }
++        if name.is_empty() {
++            // Names made only of separators collapse to nothing; substitute a
++            // placeholder so the entry stays a regular file.
++            name.push('_');
++        }
++        name
++    }
++
++    /// Draw a set of archive entries: unique names, 0–1024 bytes of content
++    /// each, and a compression method drawn per entry.
++    #[hegel::composite]
++    fn archive_entries(
++        tc: &hegel::TestCase,
++        min_entries: usize,
++    ) -> Vec<(String, Vec<u8>, CompressionMethod)> {
++        let names: Vec<String> = tc.draw(
++            generators::vecs(entry_name())
++                .min_size(min_entries)
++                .max_size(8)
++                .unique(true),
++        );
++        let methods = roundtrip_methods();
++        names
++            .into_iter()
++            .map(|name| {
++                let data: Vec<u8> = tc.draw(generators::binary().max_size(1024));
++                let method = tc.draw((generators::sampled_from(methods.clone())).print_as_debug());
++                (name, data, method)
++            })
++            .collect()
++    }
++
++    fn build_archive(entries: &[(String, Vec<u8>, CompressionMethod)]) -> Vec<u8> {
++        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
++        for (name, data, method) in entries {
++            let options = SimpleFileOptions::default().compression_method(*method);
++            writer.start_file(name, options).unwrap();
++            writer.write_all(data).unwrap();
++        }
++        writer.finish().unwrap().into_inner()
++    }
++
++    fn read_entry_by_index(archive: &mut ZipArchive<Cursor<Vec<u8>>>, i: usize) -> Vec<u8> {
++        let mut file = archive.by_index(i).unwrap();
++        let mut contents = Vec::new();
++        file.read_to_end(&mut contents).unwrap();
++        contents
++    }
++
++    /// Crown roundtrip: an archive written with `ZipWriter` reads back with
++    /// `ZipArchive` — the entry count is preserved, and every entry's name
++    /// and bytes are preserved both when iterating by index and when looking
++    /// up by name. Covers the empty archive (0 entries) and empty file
++    /// entries (0 bytes) since both generators go down to zero.
++    #[hegel::test]
++    fn prop_write_read_roundtrip(tc: hegel::TestCase) {
++        let entries = tc.draw((archive_entries(0)).print_as_debug());
++        let bytes = build_archive(&entries);
++        let mut archive =
++            ZipArchive::new(Cursor::new(bytes)).expect("freshly written archive failed to open");
++        assert_eq!(archive.len(), entries.len());
++        assert_eq!(archive.is_empty(), entries.is_empty());
++        // By index: central-directory order matches write order.
++        for (i, (name, data, _)) in entries.iter().enumerate() {
++            {
++                let file = archive.by_index(i).unwrap();
++                assert_eq!(file.name().unwrap().as_ref(), name.as_str());
++            }
++            let contents = read_entry_by_index(&mut archive, i);
++            assert_eq!(&contents, data, "byte mismatch for entry {name:?}");
++        }
++        // By name.
++        for (name, data, _) in &entries {
++            let mut file = archive.by_name(name).unwrap();
++            let mut contents = Vec::new();
++            file.read_to_end(&mut contents).unwrap();
++            assert_eq!(&contents, data, "byte mismatch for by_name({name:?})");
++        }
++    }
++
++    /// `index_for_name`, `name_for_index`, and `file_names` agree with each
++    /// other and with what was written, in write order.
++    #[hegel::test]
++    fn prop_name_lookup_consistency(tc: hegel::TestCase) {
++        let entries = tc.draw((archive_entries(0)).print_as_debug());
++        let bytes = build_archive(&entries);
++        let archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
++        assert_eq!(archive.len(), entries.len());
++        for (i, (name, _, _)) in entries.iter().enumerate() {
++            assert_eq!(archive.index_for_name(name), Some(i), "index_for_name({name:?})");
++            assert_eq!(
++                archive.name_for_index(i).unwrap().unwrap().as_ref(),
++                name.as_str(),
++                "name_for_index({i})"
++            );
++        }
++        let listed: Vec<String> = archive
++            .file_names()
++            .map(|n| n.unwrap().into_owned())
++            .collect();
++        let written: Vec<String> = entries.iter().map(|(n, _, _)| n.clone()).collect();
++        assert_eq!(listed, written);
++    }
++
++    /// Entry metadata read back from the central directory is consistent
++    /// with what was written: uncompressed size, CRC-32 (checked against the
++    /// independent crc32fast oracle), compression method, and file/dir flags.
++    #[hegel::test]
++    fn prop_entry_metadata_consistency(tc: hegel::TestCase) {
++        let entries = tc.draw((archive_entries(0)).print_as_debug());
++        let bytes = build_archive(&entries);
++        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
++        for (i, (name, data, method)) in entries.iter().enumerate() {
++            let file = archive.by_index(i).unwrap();
++            assert_eq!(file.size(), data.len() as u64, "size() for {name:?}");
++            assert_eq!(
++                file.crc32(),
++                crc32fast::hash(data),
++                "crc32() for {name:?}"
++            );
++            assert_eq!(file.compression(), *method, "compression() for {name:?}");
++            assert!(file.is_file(), "is_file() for {name:?}");
++            assert!(!file.is_dir(), "is_dir() for {name:?}");
++        }
++    }
++
++    /// An archive with zero entries and a drawn comment roundtrips: it
++    /// opens, reports itself empty, and preserves the comment bytes exactly.
++    /// One branch splices an EOCD magic into the comment, since the
++    /// end-of-central-directory record is located by scanning backwards
++    /// through the comment area.
++    #[hegel::test]
++    fn prop_empty_archive_with_comment_roundtrip(tc: hegel::TestCase) {
++        let mut comment: Vec<u8> = tc.draw(generators::binary().max_size(1000));
++        if tc.draw(generators::booleans()) && !comment.is_empty() {
++            // Splice an EOCD signature into the comment to stress the
++            // backwards magic search.
++            let pos = tc.draw(
++                generators::integers::<usize>().max_value(comment.len() - 1),
++            );
++            let magic = b"PK\x05\x06";
++            for (i, b) in magic.iter().enumerate() {
++                if pos + i < comment.len() {
++                    comment[pos + i] = *b;
++                }
++            }
++        }
++        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
++        writer
++            .set_raw_comment(comment.clone().into_boxed_slice())
++            .unwrap();
++        let bytes = writer.finish().unwrap().into_inner();
++        let archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
++        assert_eq!(archive.len(), 0);
++        assert!(archive.is_empty());
++        assert_eq!(archive.comment(), comment.as_slice());
++    }
++
++    /// The writer rejects a duplicate file name (documented on
++    /// `start_file`: "The file must not have the same name as a file already
++    /// in the archive"), and the archive remains usable with the original
++    /// entry intact.
++    #[hegel::test]
++    fn prop_duplicate_name_rejected(tc: hegel::TestCase) {
++        let entries = tc.draw((archive_entries(1)).print_as_debug());
++        let dup_index =
++            tc.draw(generators::integers::<usize>().max_value(entries.len() - 1));
++        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
++        for (name, data, method) in &entries {
++            let options = SimpleFileOptions::default().compression_method(*method);
++            writer.start_file(name, options).unwrap();
++            writer.write_all(data).unwrap();
++        }
++        let (dup_name, dup_data, _) = &entries[dup_index];
++        let result = writer.start_file(dup_name, SimpleFileOptions::default());
++        assert!(
++            result.is_err(),
++            "duplicate name {dup_name:?} was accepted by start_file"
++        );
++        let bytes = writer.finish().unwrap().into_inner();
++        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
++        assert_eq!(archive.len(), entries.len());
++        let mut contents = Vec::new();
++        archive
++            .by_name(dup_name)
++            .unwrap()
++            .read_to_end(&mut contents)
++            .unwrap();
++        assert_eq!(&contents, dup_data);
++    }
++
++    /// A few-hundred-KB entry (larger than any internal buffer) roundtrips
++    /// byte-for-byte under every enabled compression method.
++    #[hegel::test(test_cases = 15)]
++    fn prop_large_entry_roundtrip(tc: hegel::TestCase) {
++        let chunk: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(64));
++        let total: usize = tc.draw(
++            generators::integers::<usize>()
++                .min_value(200_000)
++                .max_value(400_000),
++        );
++        let mut data = Vec::with_capacity(total + chunk.len());
++        while data.len() < total {
++            data.extend_from_slice(&chunk);
++        }
++        data.truncate(total);
++        let entries: Vec<(String, Vec<u8>, CompressionMethod)> = roundtrip_methods()
++            .into_iter()
++            .enumerate()
++            .map(|(i, method)| (format!("large_{i}"), data.clone(), method))
++            .collect();
++        let bytes = build_archive(&entries);
++        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
++        assert_eq!(archive.len(), entries.len());
++        for (i, (name, data, _)) in entries.iter().enumerate() {
++            let contents = read_entry_by_index(&mut archive, i);
++            assert_eq!(&contents, data, "byte mismatch for {name:?}");
++        }
++    }
++}
+diff --git a/tests/invalid_path.rs b/tests/invalid_path.rs
+index 81f0b74f..82b71427 100644
+--- a/tests/invalid_path.rs
++++ b/tests/invalid_path.rs
+@@ -207,3 +207,106 @@ pub mod tests {
+         }
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// Generalizes the example-based traversal tests above: entry names are drawn
++// from a hostile-name generator (traversal sequences, absolute paths, drive
++// prefixes, NUL bytes, mixed separators, arbitrary Unicode) and the sanitized
++// paths must never be able to escape an extraction root.
++// ---------------------------------------------------------------------------
++#[cfg(not(miri))]
++mod hegel_path_props {
++    use hegel::generators::{self, Generator};
++    use std::io::{Cursor, Write};
++    use std::path::Component;
++    use zip::write::SimpleFileOptions;
++    use zip::{CompressionMethod, ZipArchive, ZipWriter};
++
++    /// A hostile entry name: 1–6 components (biased toward traversal and
++    /// special components) joined by a drawn separator, optionally made
++    /// absolute. May end with a separator (directory entries are part of the
++    /// domain here — sanitization must be safe for them too).
++    #[hegel::composite]
++    fn hostile_name(tc: &hegel::TestCase) -> String {
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(6));
++        let mut parts = Vec::with_capacity(n);
++        for _ in 0..n {
++            parts.push(tc.draw(hegel::one_of!(
++                generators::sampled_from(vec![
++                    "..", ".", "...", "etc", "passwd", "a", "b", "C:", "c:", "~", "$HOME",
++                    ".\u{0}.", "..\u{0}", " ", "..;",
++                ])
++                .map(String::from)
++                .boxed(),
++                generators::text().min_size(1).max_size(6).boxed(),
++            )));
++        }
++        let sep = tc.draw(generators::sampled_from(vec!["/", "\\"]));
++        let mut name = parts.join(sep);
++        if tc.draw(generators::booleans()) {
++            name.insert(0, '/'); // absolute path
++        }
++        name
++    }
++
++    /// Security contract of `ZipFile::enclosed_name` ("It can't resolve to a
++    /// path outside the current directory. It can't be an absolute path")
++    /// and `ZipFile::mangled_name` ("Absolute paths are made relative,
++    /// ParentDirs are ignored"): whatever hostile name is stored in the
++    /// archive, the sanitized path is relative and contains no `..`, root,
++    /// or prefix components, so joining it onto an extraction root can never
++    /// escape that root.
++    #[hegel::test]
++    fn prop_sanitized_names_never_escape(tc: hegel::TestCase) {
++        let names: Vec<String> = tc.draw(
++            generators::vecs(hostile_name())
++                .min_size(1)
++                .max_size(6)
++                .unique(true),
++        );
++        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
++        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
++        let mut written = 0usize;
++        for name in &names {
++            // The writer accepts these names (archives found in the wild
++            // contain them); skip any it rejects — the reader-side guarantee
++            // is what's under test.
++            if writer.start_file(name, options).is_ok() {
++                writer.write_all(b"x").unwrap();
++                written += 1;
++            }
++        }
++        tc.assume(written > 0);
++        let bytes = writer.finish().unwrap().into_inner();
++        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
++        for i in 0..archive.len() {
++            let file = archive.by_index(i).unwrap();
++            let name = file.name().unwrap().into_owned();
++            if let Some(p) = file.enclosed_name() {
++                assert!(
++                    !p.is_absolute(),
++                    "enclosed_name for {name:?} is absolute: {p:?}"
++                );
++                for c in p.components() {
++                    assert!(
++                        matches!(c, Component::Normal(_) | Component::CurDir),
++                        "enclosed_name for {name:?} contains escaping component {c:?}: {p:?}"
++                    );
++                }
++            }
++            let mangled = file.mangled_name().unwrap();
++            assert!(
++                !mangled.is_absolute(),
++                "mangled_name for {name:?} is absolute: {mangled:?}"
++            );
++            for c in mangled.components() {
++                assert!(
++                    matches!(c, Component::Normal(_)),
++                    "mangled_name for {name:?} contains escaping component {c:?}: {mangled:?}"
++                );
++            }
++        }
++    }
++}
+diff --git a/tests/prepended_garbage.rs b/tests/prepended_garbage.rs
+index dad30e54..dba4f6dc 100644
+--- a/tests/prepended_garbage.rs
++++ b/tests/prepended_garbage.rs
+@@ -22,3 +22,232 @@ fn test_prepended_garbage() {
+         );
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// The reader's central-directory offsets, sizes, and counts are
++// attacker-controlled input. These properties feed `ZipArchive::new` (and
++// the streaming reader) arbitrary bytes, crafted end-of-central-directory
++// records, and corrupted-but-once-valid archives, asserting the reader
++// returns errors instead of panicking, and that reads stay bounded.
++// ---------------------------------------------------------------------------
++#[cfg(not(miri))]
++mod hegel_robustness_props {
++    use hegel::generators::{self, Generator};
++    use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
++    use zip::ZipWriter;
++    use zip::read::read_zipfile_from_stream;
++    use zip::write::SimpleFileOptions;
++
++    /// Cap on how many bytes we will decompress from any single entry of an
++    /// untrusted archive. This bound protects the *test's* resources (it
++    /// mirrors MAX_BYTES_TO_READ in fuzz/read); a corrupted length field
++    /// must not make the test itself OOM. It is not a contract of the
++    /// library, so no assertion fires when a (legitimately high-ratio)
++    /// stream reaches it.
++    const MAX_BYTES_TO_READ: u64 = 1 << 24;
++
++    /// Exercise every untrusted-input code path on `bytes`: seek-based
++    /// archive open, per-entry metadata and (capped) decompression, and the
++    /// streaming reader. Everything may fail; nothing may panic.
++    fn drain_untrusted(bytes: &[u8]) {
++        if let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) {
++            let _ = archive.comment();
++            let _ = archive.offset();
++            for i in 0..archive.len() {
++                if let Ok(file) = archive.by_index(i) {
++                    let _ = file.name().map(|n| n.into_owned());
++                    let _ = file.enclosed_name();
++                    let _ = file.mangled_name();
++                    let mut limited = file.take(MAX_BYTES_TO_READ);
++                    let _ = io::copy(&mut limited, &mut io::sink());
++                }
++            }
++        }
++        let mut reader = Cursor::new(bytes);
++        let _ = reader.seek(SeekFrom::Start(0));
++        while let Ok(Some(file)) = read_zipfile_from_stream(&mut reader) {
++            let mut limited = file.take(MAX_BYTES_TO_READ);
++            if io::copy(&mut limited, &mut io::sink()).is_err() {
++                break;
++            }
++        }
++    }
++
++    /// A syntactically plausible end-of-central-directory record with fully
++    /// drawn field values, preceded by drawn junk. The entry-count,
++    /// central-directory-size, and central-directory-offset fields are the
++    /// classic attacker-controlled inputs (huge counts, self-referential
++    /// offsets).
++    #[hegel::composite]
++    fn crafted_eocd(tc: &hegel::TestCase) -> Vec<u8> {
++        let mut bytes: Vec<u8> = tc.draw(generators::binary().max_size(256));
++        bytes.extend_from_slice(b"PK\x05\x06");
++        for _ in 0..4 {
++            // disk number, CD start disk, entries on this disk, total entries
++            let v: u16 = tc.draw(generators::integers::<u16>());
++            bytes.extend_from_slice(&v.to_le_bytes());
++        }
++        let cd_size: u32 = tc.draw(generators::integers::<u32>());
++        bytes.extend_from_slice(&cd_size.to_le_bytes());
++        let cd_offset: u32 = tc.draw(generators::integers::<u32>());
++        bytes.extend_from_slice(&cd_offset.to_le_bytes());
++        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length
++        bytes
++    }
++
++    /// A Zip64 EOCD locator with a drawn (possibly self-referential) u64
++    /// offset, followed by an EOCD full of Zip64 sentinel values so the
++    /// reader takes the Zip64 path.
++    #[hegel::composite]
++    fn crafted_zip64(tc: &hegel::TestCase) -> Vec<u8> {
++        let mut bytes: Vec<u8> = tc.draw(generators::binary().max_size(256));
++        bytes.extend_from_slice(b"PK\x06\x07");
++        bytes.extend_from_slice(&0u32.to_le_bytes()); // disk with zip64 EOCD
++        let offset: u64 = tc.draw(generators::integers::<u64>());
++        bytes.extend_from_slice(&offset.to_le_bytes());
++        bytes.extend_from_slice(&1u32.to_le_bytes()); // total disks
++        bytes.extend_from_slice(b"PK\x05\x06");
++        bytes.extend_from_slice(&[0xFF; 8]); // disks + entry counts: sentinels
++        bytes.extend_from_slice(&[0xFF; 8]); // CD size + offset: sentinels
++        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length
++        bytes
++    }
++
++    /// Opening and fully (but boundedly) reading ARBITRARY bytes never
++    /// panics, hangs, or reads without bound — errors are the only
++    /// acceptable failure mode.
++    #[hegel::test]
++    fn prop_arbitrary_bytes_never_panic(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(hegel::one_of!(
++            generators::binary().max_size(512).boxed(),
++            crafted_eocd().boxed(),
++            crafted_zip64().boxed(),
++        ));
++        drain_untrusted(&bytes);
++    }
++
++    /// Build a small valid archive, then corrupt it with drawn byte
++    /// overwrites or a truncation. Opening and boundedly reading the result
++    /// may fail but must never panic. Overwrites are biased toward the tail
++    /// of the file, where the EOCD and central directory (the fields that
++    /// drive parsing) live.
++    #[hegel::test(test_cases = 200)]
++    fn prop_corrupted_archive_never_panics(tc: hegel::TestCase) {
++        let n_entries = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
++        for i in 0..n_entries {
++            let data: Vec<u8> = tc.draw(generators::binary().max_size(256));
++            let method = tc.draw((generators::sampled_from(vec![
++                zip::CompressionMethod::Stored,
++                #[cfg(all(
++                    feature = "_deflate-any",
++                    not(all(feature = "deflate-zopfli", not(feature = "deflate-flate2")))
++                ))]
++                zip::CompressionMethod::Deflated,
++            ])).print_as_debug());
++            writer
++                .start_file(
++                    format!("entry_{i}"),
++                    SimpleFileOptions::default().compression_method(method),
++                )
++                .unwrap();
++            writer.write_all(&data).unwrap();
++        }
++        let mut bytes = writer.finish().unwrap().into_inner();
++
++        let kind: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++        match kind {
++            0 => {
++                // Corrupt 1-8 drawn positions with drawn values, biased
++                // toward the tail (EOCD + central directory).
++                let n_corruptions =
++                    tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++                for _ in 0..n_corruptions {
++                    let tail_start = bytes.len().saturating_sub(128);
++                    let pos = tc.draw(hegel::one_of!(
++                        generators::integers::<usize>().max_value(bytes.len() - 1),
++                        generators::integers::<usize>()
++                            .min_value(tail_start)
++                            .max_value(bytes.len() - 1),
++                    ));
++                    let val: u8 = tc.draw(generators::integers::<u8>());
++                    bytes[pos] = val;
++                }
++            }
++            1 => {
++                // Truncate at a drawn position.
++                let keep = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++                bytes.truncate(keep);
++            }
++            _ => {
++                // Overwrite drawn EOCD fields with drawn values, keeping the
++                // rest of the archive valid: a plausible archive whose
++                // headers lie about entry counts, central-directory
++                // size/offset, or comment length. The writer emits no
++                // comment, so the EOCD record is the last 22 bytes.
++                let eocd = bytes.len() - 22;
++                assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06");
++                let n_fields = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++                for _ in 0..n_fields {
++                    // (field offset within EOCD, field width in bytes)
++                    let (off, width) = tc.draw(generators::sampled_from(vec![
++                        (4usize, 2usize), // disk number
++                        (6, 2),           // central directory start disk
++                        (8, 2),           // entries on this disk
++                        (10, 2),          // total entries
++                        (12, 4),          // central directory size
++                        (16, 4),          // central directory offset
++                        (20, 2),          // comment length
++                    ]));
++                    if width == 2 {
++                        let v: u16 = tc.draw(generators::integers::<u16>());
++                        bytes[eocd + off..eocd + off + 2].copy_from_slice(&v.to_le_bytes());
++                    } else {
++                        let v: u32 = tc.draw(generators::integers::<u32>());
++                        bytes[eocd + off..eocd + off + 4].copy_from_slice(&v.to_le_bytes());
++                    }
++                }
++            }
++        }
++        drain_untrusted(&bytes);
++    }
++
++    /// Generalization of `test_prepended_garbage` above: the reader
++    /// documents support for archives with prepended content
++    /// (self-extracting archives), so ANY drawn junk prefix must leave the
++    /// entry count, contents, and reported offset intact.
++    #[hegel::test]
++    fn prop_prepended_junk_preserves_contents(tc: hegel::TestCase) {
++        let junk: Vec<u8> = tc.draw(generators::binary().max_size(512));
++        let n_entries = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let entries: Vec<(String, Vec<u8>)> = (0..n_entries)
++            .map(|i| {
++                let data: Vec<u8> = tc.draw(generators::binary().max_size(256));
++                (format!("entry_{i}"), data)
++            })
++            .collect();
++        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
++        for (name, data) in &entries {
++            writer
++                .start_file(name, SimpleFileOptions::default())
++                .unwrap();
++            writer.write_all(data).unwrap();
++        }
++        let archive_bytes = writer.finish().unwrap().into_inner();
++
++        let mut bytes = junk.clone();
++        bytes.extend_from_slice(&archive_bytes);
++        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
++            .expect("archive with prepended junk failed to open");
++        assert_eq!(archive.len(), entries.len());
++        assert_eq!(archive.offset(), junk.len() as u64);
++        for (name, data) in &entries {
++            let mut file = archive.by_name(name).unwrap();
++            let mut contents = Vec::new();
++            file.read_to_end(&mut contents).unwrap();
++            assert_eq!(&contents, data, "byte mismatch for {name:?}");
++        }
++    }
++}
