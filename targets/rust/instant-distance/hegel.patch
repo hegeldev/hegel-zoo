@@ -1,0 +1,600 @@
+diff --git a/instant-distance/Cargo.toml b/instant-distance/Cargo.toml
+index ab2073b..6ec944b 100644
+--- a/instant-distance/Cargo.toml
++++ b/instant-distance/Cargo.toml
+@@ -26,6 +26,9 @@ serde-big-array = { version = "0.5.0", optional = true }
+ 
+ [dev-dependencies]
+ bencher = "0.1.5"
++hegeltest = "0.44.1"
++rayon = "1.5"
++serde_json = "1.0.151"
+ 
+ [[bench]]
+ name = "all"
+diff --git a/instant-distance/tests/all.rs b/instant-distance/tests/all.rs
+index e9b38e2..d076ca3 100644
+--- a/instant-distance/tests/all.rs
++++ b/instant-distance/tests/all.rs
+@@ -88,6 +88,10 @@ fn randomized(builder: Builder) -> (u64, usize) {
+ }
+ 
+ #[derive(Clone, Copy, Debug)]
++#[cfg_attr(
++    feature = "with-serde",
++    derive(serde::Serialize, serde::Deserialize)
++)]
+ struct Point(f32, f32);
+ 
+ impl instant_distance::Point for Point {
+@@ -96,3 +100,570 @@ impl instant_distance::Point for Point {
+         ((self.0 - other.0).powi(2) + (self.1 - other.1).powi(2)).sqrt()
+     }
+ }
++
++/// Property-based tests (hegel).
++///
++/// instant-distance implements *approximate* nearest-neighbor search, so
++/// "returns the true nearest point" is not a sound property. These tests
++/// check what the crate does guarantee: results are valid, self-consistent,
++/// correctly ordered, bounded in count, reproducible from a seed, and
++/// stable across serialization.
++#[allow(clippy::float_cmp)]
++mod hegel_props {
++    use std::collections::HashSet;
++
++    use hegel::generators::{self, Generator};
++
++    use instant_distance::{Builder, Heuristic, Point as _, Search};
++
++    use super::Point;
++
++    // ---------- generators ----------
++
++    /// Coordinates mix a small integer lattice (forces duplicate points, ties
++    /// and exactly-coincident coordinates) with the full finite f32 range
++    /// (exercises huge magnitudes where squared distances overflow to inf).
++    #[hegel::composite]
++    fn coord(tc: &hegel::TestCase) -> f32 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i8>()
++                .min_value(-4)
++                .max_value(4)
++                .map(|i| i as f32)
++                .boxed(),
++            generators::floats::<f32>()
++                .allow_nan(false)
++                .allow_infinity(false)
++                .boxed(),
++        ))
++    }
++
++    #[hegel::composite]
++    fn finite_point(tc: &hegel::TestCase) -> Point {
++        let x = tc.draw(coord());
++        let y = tc.draw(coord());
++        Point(x, y)
++    }
++
++    fn draw_points(tc: &hegel::TestCase, min_n: usize, max_n: usize) -> Vec<Point> {
++        let n = tc.draw(
++            generators::integers::<usize>()
++                .min_value(min_n)
++                .max_value(max_n),
++        );
++        tc.draw((generators::vecs(finite_point()).min_size(n).max_size(n)).print_as_debug())
++    }
++
++    /// Build configurations are data too: generate them instead of testing
++    /// only `Builder::default()`.
++    #[derive(Clone, Debug)]
++    struct Config {
++        ef_search: usize,
++        ef_construction: usize,
++        /// `None` = simple selection; `Some(keep_pruned)` = heuristic
++        /// selection. `extend_candidates` is always false: enabling it
++        /// deadlocks every build (known bug, see
++        /// `known_bug_extend_candidates_deadlocks_construction` below), so it
++        /// is excluded from generated configurations.
++        heuristic: Option<bool>,
++        ml: f32,
++        seed: u64,
++    }
++
++    impl Config {
++        fn builder(&self) -> Builder {
++            Builder::default()
++                .ef_search(self.ef_search)
++                .ef_construction(self.ef_construction)
++                .select_heuristic(self.heuristic.map(|keep_pruned| Heuristic {
++                    extend_candidates: false,
++                    keep_pruned,
++                }))
++                .ml(self.ml)
++                .seed(self.seed)
++        }
++    }
++
++    fn draw_config(tc: &hegel::TestCase) -> Config {
++        Config {
++            ef_search: tc.draw(generators::integers::<usize>().min_value(1).max_value(200)),
++            ef_construction: tc.draw(generators::integers::<usize>().min_value(1).max_value(200)),
++            heuristic: tc.draw(generators::optional(generators::booleans())),
++            // The upper bound protects against a known bug, not the contract:
++            // ml >= 1.0 makes Hnsw::new's layer-sizing loop diverge (see
++            // `known_bug_ml_equal_one_never_terminates` and
++            // `known_failure_ml_greater_than_one_panics` below).
++            ml: tc.draw(
++                generators::floats::<f32>()
++                    .min_value(-1.0)
++                    .max_value(0.95),
++            ),
++            seed: tc.draw(generators::integers::<u64>()),
++        }
++    }
++
++    /// Run an index build on a single-threaded rayon pool.
++    ///
++    /// This protects the test suite, not the library's contract:
++    /// `Construction::insert` holds the write lock on the new node's
++    /// `ZeroNode` while taking read/write locks on other nodes, so concurrent
++    /// inserts on a multi-threaded pool can acquire the same pair of locks in
++    /// opposite orders and deadlock, wedging the whole test process. With one
++    /// rayon thread construction is sequential and only the (excluded,
++    /// pinned) `extend_candidates` self-deadlock can occur. See
++    /// `known_bug_extend_candidates_deadlocks_construction` below.
++    fn build_st<T: Send>(f: impl FnOnce() -> T + Send) -> T {
++        rayon::ThreadPoolBuilder::new()
++            .num_threads(1)
++            .build()
++            .expect("failed to build single-threaded rayon pool")
++            .install(f)
++    }
++
++    fn results(hnsw: &instant_distance::Hnsw<Point>, query: &Point) -> Vec<(u32, f32)> {
++        let mut search = Search::default();
++        hnsw.search(query, &mut search)
++            .map(|item| (item.pid.into_inner(), item.distance))
++            .collect()
++    }
++
++    // ---------- properties ----------
++
++    /// Every search result is valid and self-consistent: the pid refers to a
++    /// real point of the index, the returned point is bit-identical to the
++    /// input point that got that pid, the reported distance equals an
++    /// independent recomputation of the metric, results are sorted by
++    /// ascending distance, and no pid appears twice.
++    #[hegel::test]
++    fn hegel_search_results_valid_consistent_sorted_unique(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 0, 64);
++        let n = points.len();
++        let config = draw_config(&tc);
++        let query = tc.draw((finite_point()).print_as_debug());
++
++        let (hnsw, pids) = build_st(|| config.builder().build_hnsw(points.clone()));
++
++        // Invert the input-index -> PointId mapping.
++        let mut input_of = vec![usize::MAX; n];
++        for (i, pid) in pids.iter().enumerate() {
++            input_of[pid.into_inner() as usize] = i;
++        }
++
++        let mut search = Search::default();
++        let items = hnsw
++            .search(&query, &mut search)
++            .map(|item| (item.pid, item.distance, *item.point))
++            .collect::<Vec<_>>();
++
++        assert!(items.len() <= config.ef_search);
++        assert!(items.len() <= n);
++
++        let mut seen = HashSet::new();
++        for (pid, distance, point) in &items {
++            assert!(pid.is_valid());
++            let id = pid.into_inner() as usize;
++            assert!(id < n, "pid {id} out of range for {n} points");
++            assert!(seen.insert(*pid), "duplicate pid {pid:?} in results");
++
++            // The returned point is exactly the input point that got this id.
++            let original = points[input_of[id]];
++            assert_eq!(point.0.to_bits(), original.0.to_bits());
++            assert_eq!(point.1.to_bits(), original.1.to_bits());
++
++            // The reported distance is the metric, recomputed independently.
++            assert_eq!(
++                distance.to_bits(),
++                query.distance(point).to_bits(),
++                "reported distance {distance} != recomputed {}",
++                query.distance(point)
++            );
++        }
++
++        for pair in items.windows(2) {
++            assert!(
++                pair[0].1 <= pair[1].1,
++                "results not sorted: {} > {}",
++                pair[0].1,
++                pair[1].1
++            );
++        }
++    }
++
++    /// Result-count bounds that hold for *any* build configuration:
++    /// `len <= min(n, ef_search)`, empty iff the index is empty.
++    ///
++    /// Exact `len == min(n, ef_search)` is NOT guaranteed in general: hegel
++    /// found a 255-point cloud with `select_heuristic(None)` where only 98 of
++    /// the requested 161 results come back. That is inherent to the
++    /// algorithm — `ZeroNode::insert` documents that a new node's id may not
++    /// be inserted into a full neighbor list, so a node can end up with no
++    /// in-links and become unreachable from the entry point.
++    #[hegel::test]
++    fn hegel_search_result_count_bounds(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 0, 300);
++        let n = points.len();
++        let config = draw_config(&tc);
++        let query = tc.draw((finite_point()).print_as_debug());
++
++        let (hnsw, _) = build_st(|| config.builder().build_hnsw(points));
++        let mut search = Search::default();
++        let got = hnsw.search(&query, &mut search).len();
++        assert!(
++            got <= n.min(config.ef_search),
++            "{got} results exceeds min({n}, {})",
++            config.ef_search
++        );
++        assert_eq!(got == 0, n == 0, "empty results iff empty index (got {got}, n {n})");
++    }
++
++    /// For small indices the count is exact: with `n <= M * 2` (64) every
++    /// node's zero-layer neighbor list can hold all other nodes, so every
++    /// point stays reachable and search returns exactly `min(n, ef_search)`
++    /// results. Evidence: the existing `randomized` test asserts
++    /// `results.len() >= 100` (i.e. == ef_search).
++    ///
++    /// This holds for simple selection (`select_heuristic(None)`), where
++    /// links are only ever *added*, with any `ef_construction`. For heuristic
++    /// selection it additionally needs `keep_pruned = true` (dropping pruned
++    /// candidates can drop links) and `ef_construction > n`: the heuristic
++    /// path *rewrites* a neighbor's whole link list via a search capped at
++    /// `ef = ef_construction`, so a small `ef_construction` strips links —
++    /// hegel found 4 duplicate points with `ef_construction = 1` returning
++    /// only 3 of 4 requested results.
++    #[hegel::test]
++    fn hegel_search_count_exact_for_small_index(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 0, 64);
++        let n = points.len();
++        let mut config = draw_config(&tc);
++        // Constrain the config to the regime where exact count is guaranteed
++        // (see doc comment above).
++        config.heuristic = config.heuristic.map(|_| true);
++        if config.heuristic.is_some() && config.ef_construction <= 64 {
++            config.ef_construction = 65;
++        }
++        let query = tc.draw((finite_point()).print_as_debug());
++
++        let (hnsw, _) = build_st(|| config.builder().build_hnsw(points));
++        let mut search = Search::default();
++        let got = hnsw.search(&query, &mut search).len();
++        assert_eq!(
++            got,
++            n.min(config.ef_search),
++            "expected min({n}, {}) results",
++            config.ef_search
++        );
++    }
++
++    /// Querying with a point that is in the index finds a result at distance
++    /// exactly 0.0 in first position. Evidence: the existing `map` unit test
++    /// asserts this for a 5-point index. Kept to n <= 64 (M * 2), where every
++    /// point is guaranteed reachable (see the small-index count test), so the
++    /// exact duplicate cannot be missed.
++    ///
++    /// Note we deliberately do NOT assert the returned coordinates equal the
++    /// query: hegel found that two *different* points can be at computed
++    /// distance 0.0 (e.g. (0.0, 0.0) vs (0.0, 2.6e-23): the squared
++    /// difference underflows f32 to zero), and returning either is correct.
++    #[hegel::test]
++    fn hegel_indexed_point_found_at_distance_zero(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 1, 64);
++        let idx = tc.draw(
++            generators::integers::<usize>()
++                .min_value(0)
++                .max_value(points.len() - 1),
++        );
++        let seed = tc.draw(generators::integers::<u64>());
++        let query = points[idx];
++
++        let (hnsw, _) = build_st(|| Builder::default().seed(seed).build_hnsw(points));
++        let mut search = Search::default();
++        let first = hnsw
++            .search(&query, &mut search)
++            .next()
++            .expect("non-empty index returned no results");
++
++        assert_eq!(first.distance, 0.0, "query point is in the index");
++    }
++
++    /// Building twice from the same points, seed, and configuration produces
++    /// an identical index: same PointId assignment and identical search
++    /// results (ids and distance bits) for arbitrary queries — even though
++    /// construction inserts points in parallel.
++    #[hegel::test]
++    fn hegel_same_seed_same_points_reproduce_identical_index(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 0, 128);
++        let config = draw_config(&tc);
++        let queries = tc.draw((generators::vecs(finite_point()).min_size(1).max_size(3)).print_as_debug());
++
++        let (hnsw_a, pids_a) = build_st(|| config.builder().build_hnsw(points.clone()));
++        let (hnsw_b, pids_b) = build_st(|| config.builder().build_hnsw(points));
++
++        assert_eq!(pids_a, pids_b, "PointId assignment differs between builds");
++        for query in &queries {
++            let a = results(&hnsw_a, query);
++            let b = results(&hnsw_b, query);
++            assert_eq!(
++                a.len(),
++                b.len(),
++                "result counts differ between identical builds"
++            );
++            for (x, y) in a.iter().zip(&b) {
++                assert_eq!(x.0, y.0, "pids differ between identical builds");
++                assert_eq!(x.1.to_bits(), y.1.to_bits());
++            }
++        }
++    }
++
++    /// `HnswMap` search agrees with a raw `Hnsw` built from the same builder
++    /// (same pids and distances), and its value reordering is correct: using
++    /// the original input index as the value, each result's value points back
++    /// at exactly the input point that was returned.
++    #[hegel::test]
++    fn hegel_map_agrees_with_hnsw_and_maps_values_correctly(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 0, 64);
++        let config = draw_config(&tc);
++        let query = tc.draw((finite_point()).print_as_debug());
++
++        let values: Vec<usize> = (0..points.len()).collect();
++        let map = build_st(|| config.builder().build(points.clone(), values));
++        let (hnsw, _) = build_st(|| config.builder().build_hnsw(points.clone()));
++
++        let mut search_map = Search::default();
++        let map_items = map
++            .search(&query, &mut search_map)
++            .map(|item| (item.pid, item.distance, *item.value, *item.point))
++            .collect::<Vec<_>>();
++        let hnsw_items = results(&hnsw, &query);
++
++        assert_eq!(map_items.len(), hnsw_items.len());
++        for ((pid, distance, value, point), (hpid, hdistance)) in
++            map_items.iter().zip(&hnsw_items)
++        {
++            assert_eq!(pid.into_inner(), *hpid);
++            assert_eq!(distance.to_bits(), hdistance.to_bits());
++
++            // The value identifies the input point this result came from.
++            let original = points[*value];
++            assert_eq!(point.0.to_bits(), original.0.to_bits());
++            assert_eq!(point.1.to_bits(), original.1.to_bits());
++        }
++    }
++
++    /// `build_hnsw` returns one PointId per input point, forming a
++    /// permutation of 0..n, and indexing the Hnsw with the id returned for
++    /// input i yields exactly input point i. `iter()` walks ids 0..n in
++    /// order and agrees with indexing.
++    #[hegel::test]
++    fn hegel_pids_are_permutation_mapping_inputs(tc: hegel::TestCase) {
++        let points = draw_points(&tc, 0, 128);
++        let n = points.len();
++        let config = draw_config(&tc);
++
++        let (hnsw, pids) = build_st(|| config.builder().build_hnsw(points.clone()));
++
++        assert_eq!(pids.len(), n);
++        let distinct = pids.iter().collect::<HashSet<_>>();
++        assert_eq!(distinct.len(), n, "pids are not unique");
++        for (i, pid) in pids.iter().enumerate() {
++            assert!(pid.is_valid());
++            assert!((pid.into_inner() as usize) < n);
++            let stored = hnsw[*pid];
++            assert_eq!(stored.0.to_bits(), points[i].0.to_bits());
++            assert_eq!(stored.1.to_bits(), points[i].1.to_bits());
++        }
++
++        let mut count = 0;
++        for (i, (pid, point)) in hnsw.iter().enumerate() {
++            assert_eq!(pid.into_inner() as usize, i);
++            assert_eq!(point.0.to_bits(), hnsw[pid].0.to_bits());
++            assert_eq!(point.1.to_bits(), hnsw[pid].1.to_bits());
++            count += 1;
++        }
++        assert_eq!(count, n);
++    }
++
++    /// Reusing one `Search` handle across many queries (and across two
++    /// different indices) returns exactly the same results as a fresh
++    /// `Search` per query. 260 iterations force the `Visited` generation
++    /// counter (u8, reset at 249) through its wraparound path.
++    #[hegel::test(test_cases = 30)]
++    fn hegel_search_handle_reuse_equivalent_to_fresh(tc: hegel::TestCase) {
++        let points_a = draw_points(&tc, 0, 48);
++        let points_b = draw_points(&tc, 0, 16);
++        let config = draw_config(&tc);
++        let queries = tc.draw((generators::vecs(finite_point()).min_size(1).max_size(4)).print_as_debug());
++
++        let (hnsw_a, _) = build_st(|| config.builder().build_hnsw(points_a));
++        let (hnsw_b, _) = build_st(|| config.builder().build_hnsw(points_b));
++
++        let mut reused = Search::default();
++        for i in 0..260 {
++            let query = &queries[i % queries.len()];
++            let hnsw = if i % 2 == 0 { &hnsw_a } else { &hnsw_b };
++
++            let with_reused = hnsw
++                .search(query, &mut reused)
++                .map(|item| (item.pid.into_inner(), item.distance.to_bits()))
++                .collect::<Vec<_>>();
++            let mut fresh = Search::default();
++            let with_fresh = hnsw
++                .search(query, &mut fresh)
++                .map(|item| (item.pid.into_inner(), item.distance.to_bits()))
++                .collect::<Vec<_>>();
++            assert_eq!(
++                with_reused, with_fresh,
++                "reused Search diverged from fresh Search at iteration {i}"
++            );
++        }
++    }
++
++    /// Building and searching never panics for arbitrary f32 coordinates,
++    /// including NaN and infinities, under arbitrary build configurations.
++    /// Only weak result checks here — with NaN coordinates the distance is
++    /// not a metric, so ordering/recall guarantees don't apply.
++    #[hegel::test]
++    fn hegel_no_panic_on_arbitrary_float_coordinates(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(64));
++        let coords = generators::vecs(generators::floats::<f32>())
++            .min_size(n * 2)
++            .max_size(n * 2);
++        let points = tc
++            .draw(coords)
++            .chunks(2)
++            .map(|c| Point(c[0], c[1]))
++            .collect::<Vec<_>>();
++        let config = draw_config(&tc);
++        let qx = tc.draw(generators::floats::<f32>());
++        let qy = tc.draw(generators::floats::<f32>());
++
++        let (hnsw, _) = build_st(|| config.builder().build_hnsw(points));
++        let mut search = Search::default();
++        let items = hnsw.search(&Point(qx, qy), &mut search).collect::<Vec<_>>();
++        assert!(items.len() <= config.ef_search);
++        assert!(items.len() <= n);
++        for item in &items {
++            assert!(item.pid.is_valid());
++            assert!((item.pid.into_inner() as usize) < n);
++        }
++    }
++
++    /// Serializing and deserializing an `HnswMap` preserves search behavior:
++    /// the roundtripped index returns identical results (pid, distance bits,
++    /// value) for arbitrary queries. Run with `--features with-serde`.
++    #[cfg(feature = "with-serde")]
++    #[hegel::test]
++    fn hegel_serde_roundtrip_preserves_search_results(tc: hegel::TestCase) {
++        use instant_distance::HnswMap;
++
++        let points = draw_points(&tc, 0, 64);
++        let config = draw_config(&tc);
++        let queries = tc.draw(generators::vecs(finite_point()).min_size(1).max_size(3));
++
++        let values: Vec<u32> = (0..points.len() as u32).collect();
++        let map = build_st(|| config.builder().build(points, values));
++
++        let json = serde_json::to_string(&map).expect("serialization failed");
++        let restored: HnswMap<Point, u32> =
++            serde_json::from_str(&json).expect("deserialization failed");
++
++        for query in &queries {
++            let mut search_a = Search::default();
++            let before = map
++                .search(query, &mut search_a)
++                .map(|item| (item.pid.into_inner(), item.distance.to_bits(), *item.value))
++                .collect::<Vec<_>>();
++            let mut search_b = Search::default();
++            let after = restored
++                .search(query, &mut search_b)
++                .map(|item| (item.pid.into_inner(), item.distance.to_bits(), *item.value))
++                .collect::<Vec<_>>();
++            assert_eq!(before, after, "search results changed across roundtrip");
++        }
++    }
++
++    // ---------- pinned known bugs (do not fix per task instructions) ----------
++
++    fn lattice_points(n: usize) -> Vec<Point> {
++        (0..n)
++            .map(|i| Point((i % 37) as f32, (i / 37) as f32 * 0.7))
++            .collect()
++    }
++
++    /// KNOWN FAILURE (real bug, deliberately left failing): `Builder::ml` is
++    /// documented as "the mL parameter from the paper" with no restriction on
++    /// its value, but any ml where `(n as f32 * ml) as usize > n` (e.g. 2.0)
++    /// makes the layer-sizing loop in `Hnsw::new` compute `num - next` with
++    /// `next > num`, panicking with 'attempt to subtract with overflow'
++    /// (src/lib.rs, `sizes.push((num - next, num))`) in debug builds.
++    #[test]
++    fn known_failure_ml_greater_than_one_panics() {
++        let (hnsw, _) = Builder::default()
++            .seed(0)
++            .ml(2.0)
++            .build_hnsw(lattice_points(64));
++        let mut search = Search::default();
++        assert!(hnsw.search(&Point(0.0, 0.0), &mut search).len() <= 100);
++    }
++
++    /// KNOWN BUG (process-hanging, so kept `#[ignore]`d): building with
++    /// `Heuristic { extend_candidates: true, .. }` deadlocks — even on a
++    /// single-threaded rayon pool, with a small benign point set, so the
++    /// configuration is effectively unusable.
++    ///
++    /// DUPLICATE of upstream open issue djc/instant-distance#49 ("Apparent
++    /// deadlock when `Heuristic` option enabled"); the fix PR #50 was closed
++    /// without merging, so it still reproduces on current HEAD. Kept as a
++    /// pinned regression test, not counted as a novel finding.
++    ///
++    /// Mechanism: `Construction::insert` holds the write lock on
++    /// `zero[new]` for its whole run. With `extend_candidates` enabled,
++    /// `Search::select_heuristic` iterates `layer.nearest_iter(candidate.pid)`
++    /// for every candidate — and `new` itself is one of the candidates
++    /// (`add_neighbor_heuristic` pushes it first) — so the same thread tries
++    /// to take a read lock on `zero[new]` while holding its write lock:
++    /// parking_lot locks are not reentrant, so the build blocks forever
++    /// (observed: 0 CPU, all threads futex-parked).
++    ///
++    /// On a multi-threaded pool the same write-lock-held-while-locking-others
++    /// pattern also lets *concurrent* inserts deadlock each other, which is
++    /// why the hegel tests above run builds via `build_st`.
++    #[test]
++    #[ignore = "hangs the process: extend_candidates self-deadlocks index construction; see comment"]
++    fn known_bug_extend_candidates_deadlocks_construction() {
++        let points = (0..40)
++            .map(|i| Point((i % 7) as f32, (i / 7) as f32))
++            .collect::<Vec<_>>();
++        let (hnsw, _) = rayon::ThreadPoolBuilder::new()
++            .num_threads(1)
++            .build()
++            .unwrap()
++            .install(|| {
++                Builder::default()
++                    .select_heuristic(Some(Heuristic {
++                        extend_candidates: true,
++                        keep_pruned: true,
++                    }))
++                    .seed(1)
++                    .build_hnsw(points)
++            });
++        let mut search = Search::default();
++        assert!(hnsw.search(&Point(0.0, 0.0), &mut search).len() <= 100);
++    }
++
++    /// KNOWN BUG (process-aborting, so kept `#[ignore]`d): with `ml = 1.0`
++    /// and >= 32 (`M`) points, the layer-sizing loop in `Hnsw::new` never
++    /// terminates: `next == num` forever, pushing `(0, num)` onto `sizes`
++    /// until the process is OOM-killed. Verified: this reproducer is killed
++    /// by the OOM killer (SIGKILL) rather than failing. Because it aborts the
++    /// whole test process, it must not run as part of the normal suite.
++    #[test]
++    #[ignore = "aborts the process (unbounded memory growth / infinite loop); see comment"]
++    fn known_bug_ml_equal_one_never_terminates() {
++        let (hnsw, _) = Builder::default()
++            .seed(0)
++            .ml(1.0)
++            .build_hnsw(lattice_points(64));
++        let mut search = Search::default();
++        assert!(hnsw.search(&Point(0.0, 0.0), &mut search).len() <= 100);
++    }
++}

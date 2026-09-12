@@ -1,0 +1,777 @@
+diff --git a/hjson_tests/Cargo.toml b/hjson_tests/Cargo.toml
+index 9d329b8..aa20f04 100644
+--- a/hjson_tests/Cargo.toml
++++ b/hjson_tests/Cargo.toml
+@@ -13,3 +13,6 @@ serde-hjson = { version = "*", path = "../hjson" }
+ [[test]]
+ name = "test"
+ path = "tests/test_hjson.rs"
++
++[dev-dependencies]
++hegeltest = { version = "0.44.1", features = ["serde_json"] }
+diff --git a/hjson_tests/tests/test_hjson.rs b/hjson_tests/tests/test_hjson.rs
+index 655d4dd..0ee351a 100644
+--- a/hjson_tests/tests/test_hjson.rs
++++ b/hjson_tests/tests/test_hjson.rs
+@@ -224,3 +224,761 @@ pub fn integer_type() {
+     let json: Value = serde_hjson::from_str("123").unwrap();
+     assert!(json.is_number())
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod hegel_props {
++    use hegel::extras::serde_json as json_gs;
++    use hegel::generators::{self, Generator};
++    use serde::{Deserialize, Serialize};
++    use serde_hjson::{Map, Value};
++    use std::collections::BTreeMap;
++
++    // ------------------------------------------------------------------
++    // Helpers
++    // ------------------------------------------------------------------
++
++    fn num_i128(v: &Value) -> Option<i128> {
++        match v {
++            Value::I64(n) => Some(*n as i128),
++            Value::U64(n) => Some(*n as i128),
++            _ => None,
++        }
++    }
++
++    /// Equality up to hjson's documented number canonicalization: the writer
++    /// emits numbers es6-style (`F64(1.0)` -> "1", `-0.0` -> "0"), so a float
++    /// with an integral value legitimately comes back as `I64`/`U64`.
++    /// Everything else (strings, bools, null, structure) must match exactly.
++    fn hjson_semantic_eq(a: &Value, b: &Value) -> bool {
++        match (a, b) {
++            (Value::Array(x), Value::Array(y)) => {
++                x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| hjson_semantic_eq(p, q))
++            }
++            (Value::Object(x), Value::Object(y)) => {
++                x.len() == y.len()
++                    && x.iter()
++                        .zip(y.iter())
++                        .all(|((ka, va), (kb, vb))| ka == kb && hjson_semantic_eq(va, vb))
++            }
++            _ => {
++                if let (Some(x), Some(y)) = (num_i128(a), num_i128(b)) {
++                    return x == y;
++                }
++                match (a.as_f64(), b.as_f64()) {
++                    (Some(x), Some(y)) => x == y,
++                    _ => a == b,
++                }
++            }
++        }
++    }
++
++    /// Strings for the general roundtrip property. Two exclusions, both
++    /// protecting against bugs pinned by their own canonical failing tests
++    /// (not contract restrictions):
++    /// - `\r` is stripped: see `known_failure_cr_strings_roundtrip`.
++    /// The multiline branch boosts strings with `\n`, which take the
++    /// serializer's `'''` multiline path.
++    #[hegel::composite]
++    fn roundtrip_strings(tc: &hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::text().map(|s| s.replace('\r', "")).boxed(),
++            generators::vecs(generators::from_regex("[ -~]{0,10}"))
++                .min_size(1)
++                .max_size(5)
++                .map(|lines| lines.join("\n"))
++                .boxed(),
++        ))
++    }
++
++    /// Recursive generator for serde_hjson::Value.
++    /// Floats are bounded to |v| < 9.2e18: integral floats just outside the
++    /// i64/u64 range serialize to bare digit strings that re-parse as
++    /// quoteless *strings* — pinned by
++    /// `known_failure_huge_integral_floats_roundtrip`. The bound protects
++    /// this sibling property, not any contract.
++    fn hjson_values(depth: u32) -> generators::BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let leaf = depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) > 0;
++            if leaf {
++                match tc.draw(generators::integers::<u8>().max_value(5)) {
++                    0 => Value::Null,
++                    1 => Value::Bool(tc.draw(generators::booleans())),
++                    2 => Value::I64(tc.draw(generators::integers::<i64>())),
++                    3 => Value::U64(tc.draw(generators::integers::<u64>())),
++                    4 => Value::F64(
++                        tc.draw(generators::floats::<f64>().min_value(-9.2e18).max_value(9.2e18)),
++                    ),
++                    _ => Value::String(tc.draw(roundtrip_strings())),
++                }
++            } else if tc.draw(generators::booleans()) {
++                Value::Array(tc.draw((generators::vecs(hjson_values(depth - 1)).max_size(4)).print_as_debug()))
++            } else {
++                // Non-whitespace C0 control chars are stripped from keys:
++                // escape_key writes them unquoted but parse_keyname rejects
++                // them — pinned by `known_failure_control_char_keys_roundtrip`.
++                // The exclusion protects this sibling property, not a contract.
++                let keys: Vec<String> = tc.draw(
++                    generators::vecs(generators::text().max_size(8).map(|s: String| {
++                        s.chars()
++                            .filter(|&c| c >= '\x20' || "\t\n\x0b\x0c\r".contains(c))
++                            .collect::<String>()
++                    }))
++                    .max_size(4)
++                    .unique(true),
++                );
++                let mut map = Map::new();
++                for k in keys {
++                    let v = tc.draw((hjson_values(depth - 1)).print_as_debug());
++                    map.insert(k, v);
++                }
++                Value::Object(map)
++            }
++        })
++        .boxed()
++    }
++
++    // ------------------------------------------------------------------
++    // 1. JSON is a subset of Hjson: differential against serde_json
++    // ------------------------------------------------------------------
++
++    /// Any valid JSON document must parse under hjson to exactly the value
++    /// serde_json parses it to (both deserialized into serde_json::Value).
++    #[hegel::test]
++    fn hjson_parses_json_identically_to_serde_json(tc: hegel::TestCase) {
++        let v: serde_json::Value = tc.draw(json_gs::values());
++        let json = if tc.draw(generators::booleans()) {
++            serde_json::to_string_pretty(&v).unwrap()
++        } else {
++            serde_json::to_string(&v).unwrap()
++        };
++        let via_hjson: serde_json::Value = serde_hjson::from_str(&json)
++            .unwrap_or_else(|e| panic!("hjson failed to parse valid JSON {:?}: {}", json, e));
++        assert_eq!(via_hjson, v, "diverged on JSON document {:?}", json);
++    }
++
++    // ------------------------------------------------------------------
++    // 2. Parse robustness: never panic, whatever the input
++    // ------------------------------------------------------------------
++
++    /// from_str on arbitrary text returns Ok or Err, never panics.
++    #[hegel::test]
++    fn parse_never_panics_on_arbitrary_text(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text());
++        drop(serde_hjson::from_str::<Value>(&s));
++    }
++
++    /// from_slice on byte input never panics. Bytes are passed through
++    /// `from_utf8_lossy` so the input is always *valid* UTF-8: this still
++    /// exercises from_slice with arbitrary structural garbage, but excludes
++    /// invalid UTF-8, which is a genuine panic bug pinned by
++    /// `known_failure_parse_panics_on_invalid_utf8` (the exclusion protects
++    /// this sibling property, it is not a contract restriction).
++    /// Evidence: the unit tests above pin four historical panics found by
++    /// fuzzing (parse_int_error, removal_index, subtract_overflow,
++    /// invalid_utf8).
++    #[hegel::test]
++    fn parse_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++        let raw: Vec<u8> = tc.draw(generators::binary());
++        let bytes = String::from_utf8_lossy(&raw).into_owned().into_bytes();
++        drop(serde_hjson::from_slice::<Value>(&bytes));
++        drop(serde_hjson::from_slice::<Map<String, Value>>(&bytes));
++    }
++
++    /// KNOWN BUG (panic): invalid UTF-8 inside a quoteless key or value
++    /// reaches `str::from_utf8(&self.str_buf).unwrap()` and panics instead of
++    /// returning Err. There are two such sites: parse_keyname (de.rs:105,
++    /// triggered by e.g. b"\x80:") and parse_tfnns (de.rs:246, triggered by a
++    /// quoteless value starting with n/t/f then a bad byte, e.g. b"n\x80").
++    /// This is a robustness/security bug for from_slice on untrusted bytes.
++    /// Every case drawn here (a key path and a value path) fails
++    /// deterministically.
++    #[hegel::test]
++    fn known_failure_parse_panics_on_invalid_utf8(tc: hegel::TestCase) {
++        // 0x80..=0xBF are continuation bytes, never valid at a sequence start.
++        let bad: u8 = tc.draw(generators::integers::<u8>().min_value(0x80).max_value(0xBF));
++        let bytes: Vec<u8> = if tc.draw(generators::booleans()) {
++            vec![bad, b':'] // parse_keyname path
++        } else {
++            let lead: u8 = tc.draw(generators::sampled_from(vec![b'n', b't', b'f']));
++            vec![lead, bad] // parse_tfnns path
++        };
++        let result = serde_hjson::from_slice::<Value>(&bytes); // panics here
++        assert!(result.is_err(), "invalid UTF-8 must be a parse error");
++    }
++
++    /// Hjson-shaped token soup (braces, quotes, comments, keywords, numbers,
++    /// escapes glued together) never panics the parser.
++    #[hegel::test]
++    fn parse_never_panics_on_hjson_token_soup(tc: hegel::TestCase) {
++        let tokens: Vec<&'static str> = vec![
++            "{", "}", "[", "]", ":", ",", "\"", "'", "''", "'''", "#", "//", "/*", "*/", "\n",
++            "\r\n", " ", "\t", "true", "false", "null", "-", "0", "00", "1.5", "1e", "1e+", ".5",
++            "\\", "\\u", "\\u12", "\\uD834", "a", "key", "9999999999999999999999",
++        ];
++        let n = tc.draw(generators::integers::<usize>().max_value(40));
++        let mut s = String::new();
++        for _ in 0..n {
++            s.push_str(tc.draw(generators::sampled_from(tokens.clone())));
++        }
++        drop(serde_hjson::from_str::<Value>(&s));
++    }
++
++    // ------------------------------------------------------------------
++    // 3. Nesting depth
++    // ------------------------------------------------------------------
++
++    /// Nested arrays/objects up to depth 100 parse correctly to the expected
++    /// structure. The depth is capped at 100 because the parser's recursion
++    /// is unbounded and *aborts the process* (stack overflow) at larger
++    /// depths — around 400 on a 2 MiB stack in debug builds. That bug is
++    /// pinned by `known_abort_stack_overflow_on_deep_nesting` below; the cap
++    /// protects this test's process, it is not a contract.
++    #[hegel::test]
++    fn nested_documents_parse_to_expected_depth(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(100));
++        let arrays = tc.draw(generators::booleans());
++        let doc = if arrays {
++            format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
++        } else {
++            format!("{}1{}", "{a:".repeat(depth), "}".repeat(depth))
++        };
++        let v: Value = serde_hjson::from_str(&doc).expect("valid nested document must parse");
++        let mut cur = &v;
++        let mut seen = 0usize;
++        loop {
++            match cur {
++                Value::Array(a) => {
++                    assert_eq!(a.len(), 1);
++                    cur = &a[0];
++                    seen += 1;
++                }
++                Value::Object(m) => {
++                    assert_eq!(m.len(), 1);
++                    cur = m.get("a").expect("key must be 'a'");
++                    seen += 1;
++                }
++                other => {
++                    assert_eq!(*other, Value::U64(1));
++                    break;
++                }
++            }
++        }
++        assert_eq!(seen, depth);
++    }
++
++    /// KNOWN BUG (process abort): the recursive-descent parser has no depth
++    /// limit, so a small malicious input ("[" repeated) overflows the stack
++    /// and aborts the whole process — no Err is ever returned. Reproduces at
++    /// depth ~400 with a 2 MiB stack (debug), ~20000 with 8 MiB (release);
++    /// 50000 aborts everywhere. Kept #[ignore]d because the failure is an
++    /// abort, not a catchable panic: run with
++    ///   cargo test -p serde-hjson-tests known_abort -- --ignored
++    #[test]
++    #[ignore]
++    fn known_abort_stack_overflow_on_deep_nesting() {
++        let depth = 50_000;
++        let doc = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
++        // This line aborts the process with "has overflowed its stack".
++        let r: serde_hjson::Result<Value> = serde_hjson::from_str(&doc);
++        drop(r);
++    }
++
++    // ------------------------------------------------------------------
++    // 4. Roundtrip: to_string then from_str restores the value
++    // ------------------------------------------------------------------
++
++    /// General value roundtrip: parse(format(v)) is semantically equal to v
++    /// (numbers compared numerically, see hjson_semantic_eq), and the
++    /// roundtrip is a fixpoint: a second format/parse cycle reproduces the
++    /// first result exactly.
++    ///
++    /// The drawn value is wrapped under a fixed key ("root") so it is
++    /// serialized in a normal value position rather than at the document
++    /// root. A *top-level* quoteless string that looks like `key:value`
++    /// (e.g. "0:0") re-parses as an object instead of a string — a real
++    /// serializer/parser inconsistency pinned by
++    /// `known_failure_toplevel_quoteless_string_reparses_as_object`. Wrapping
++    /// keeps this property testing the value serializer without tripping that
++    /// separate root-ambiguity bug; top-level scalars are covered by the JSON
++    /// differential.
++    #[hegel::test]
++    fn value_roundtrips_through_hjson_text(tc: hegel::TestCase) {
++        let inner: Value = tc.draw((hjson_values(3)).print_as_debug());
++        let mut wrap = Map::new();
++        wrap.insert("root".to_string(), inner);
++        let v = Value::Object(wrap);
++        let s1 = serde_hjson::to_string(&v).expect("serialization must succeed");
++        let v1: Value = serde_hjson::from_str(&s1)
++            .unwrap_or_else(|e| panic!("roundtrip parse failed: {} on {:?}", e, s1));
++        assert!(
++            hjson_semantic_eq(&v, &v1),
++            "roundtrip changed value:\n orig: {:?}\n text: {:?}\n back: {:?}",
++            v,
++            s1,
++            v1
++        );
++        // Fixpoint: the second cycle must be exact.
++        let s2 = serde_hjson::to_string(&v1).expect("serialization must succeed");
++        let v2: Value = serde_hjson::from_str(&s2)
++            .unwrap_or_else(|e| panic!("fixpoint parse failed: {} on {:?}", e, s2));
++        assert_eq!(v1 == v2, true, "parse∘format is not a fixpoint: {:?} vs {:?}", v1, v2);
++        let s3 = serde_hjson::to_string(&v2).expect("serialization must succeed");
++        assert_eq!(s2, s3, "serialized form did not stabilize after one cycle");
++    }
++
++    /// KNOWN BUG: strings containing a carriage return take the serializer's
++    /// multiline ('''...''') path (NEEDS_ESCAPEML does not match \r), but the
++    /// multiline *parser* silently drops \r — so the roundtrip loses data:
++    /// Value::String("a\rb") serializes to '''a\rb''' and parses back as
++    /// "ab". Every case drawn here contains a \r and fails deterministically.
++    #[hegel::test]
++    fn known_failure_cr_strings_roundtrip(tc: hegel::TestCase) {
++        let a: String = tc.draw(generators::from_regex("[a-z]{0,5}"));
++        let b: String = tc.draw(generators::from_regex("[a-z]{0,5}"));
++        let v = Value::String(format!("{}\r{}", a, b));
++        let s = serde_hjson::to_string(&v).unwrap();
++        let back: Value = serde_hjson::from_str(&s).unwrap();
++        assert_eq!(v, back, "CR lost through hjson text {:?}", s);
++    }
++
++    /// KNOWN BUG: object keys containing non-whitespace C0 control chars
++    /// (e.g. "\x1f") are written *unquoted* by escape_key (its
++    /// NEEDS_ESCAPE_NAME regex only checks `\s`, which does not match
++    /// \x00-\x08/\x0e-\x1f), but parse_keyname treats every byte <= 0x20 as
++    /// whitespace — so the serializer emits documents it cannot re-parse.
++    /// Every case drawn here fails deterministically.
++    #[hegel::test]
++    fn known_failure_control_char_keys_roundtrip(tc: hegel::TestCase) {
++        // any non-whitespace C0 control: \x00-\x08 or \x0e-\x1f
++        let ctl: u8 = tc.draw(hegel::one_of!(
++            generators::integers::<u8>().max_value(0x08),
++            generators::integers::<u8>().min_value(0x0e).max_value(0x1f),
++        ));
++        let prefix: String = tc.draw(generators::from_regex("[a-z]{0,4}"));
++        let suffix: String = tc.draw(generators::from_regex("[a-z]{0,4}"));
++        let key = format!("{}{}{}", prefix, ctl as char, suffix);
++        let mut map = Map::new();
++        map.insert(key, Value::Null);
++        let v = Value::Object(map);
++        let s = serde_hjson::to_string(&v).unwrap();
++        let back: Value = serde_hjson::from_str(&s)
++            .unwrap_or_else(|e| panic!("serializer emitted unparseable document {:?}: {}", s, e));
++        assert_eq!(v, back);
++    }
++
++    /// KNOWN BUG: integral floats just outside the i64/u64 range (e.g.
++    /// 2^64 = 18446744073709551616.0) are serialized by fmt_small as bare
++    /// digit strings ("18446744073709552000"); on re-parse the u64/i64 parse
++    /// overflows, ParseNumber errors, and the text falls through to the
++    /// quoteless-string path — the number comes back as Value::String.
++    /// Both sampled inputs fail deterministically.
++    #[hegel::test]
++    fn known_failure_huge_integral_floats_roundtrip(tc: hegel::TestCase) {
++        let f: f64 = tc.draw(generators::sampled_from(vec![
++            18446744073709551616.0,  // 2^64, just above u64::MAX
++            -9223372036854777856.0,  // first f64 below i64::MIN
++        ]));
++        let v = Value::F64(f);
++        let s = serde_hjson::to_string(&v).unwrap();
++        let back: Value = serde_hjson::from_str(&s).unwrap();
++        assert!(
++            hjson_semantic_eq(&v, &back),
++            "float {:?} came back as {:?} via {:?}",
++            v,
++            back,
++            s
++        );
++    }
++
++    /// KNOWN BUG: a top-level string value whose quoteless serialization
++    /// looks like `unquotedkey:value` (e.g. "0:0", "a:b") re-parses as an
++    /// object, not a string. quote_str only forces quotes when a string
++    /// *starts* with `:`/`,`/etc. (NEEDS_QUOTES), so an interior colon after
++    /// a valid bare key survives unquoted; at the document root the parser
++    /// then reads it as `{key: value}`. Every sampled input fails
++    /// deterministically. (Nested — inside an array or object value — the
++    /// same string roundtrips correctly.)
++    #[hegel::test]
++    fn known_failure_toplevel_quoteless_string_reparses_as_object(tc: hegel::TestCase) {
++        let key: String = tc.draw(generators::from_regex("[a-z][a-z0-9]{0,4}"));
++        let val: String = tc.draw(generators::from_regex("[a-z0-9]{1,5}"));
++        let s = format!("{}:{}", key, val);
++        let v = Value::String(s);
++        let text = serde_hjson::to_string(&v).unwrap();
++        let back: Value = serde_hjson::from_str(&text).unwrap();
++        assert_eq!(v, back, "top-level string reparsed as {:?} via {:?}", back, text);
++    }
++
++    // ------------------------------------------------------------------
++    // 5. Numbers
++    // ------------------------------------------------------------------
++
++    /// Integer literals parse to the exact value with hjson's documented
++    /// classification: negative -> I64, non-negative -> U64 (evidence:
++    /// util.rs ParseNumber::parse). Covers i64::MIN, u64::MAX and the
++    /// boundaries between them.
++    #[hegel::test]
++    fn integer_literals_parse_exactly(tc: hegel::TestCase) {
++        let n: i128 = tc.draw(hegel::one_of!(
++            generators::integers::<i128>()
++                .min_value(i64::MIN as i128)
++                .max_value(u64::MAX as i128)
++                .boxed(),
++            generators::sampled_from(vec![
++                i64::MIN as i128,
++                i64::MIN as i128 + 1,
++                -1,
++                0,
++                1,
++                i64::MAX as i128,
++                i64::MAX as i128 + 1,
++                u64::MAX as i128,
++            ])
++            .boxed(),
++        ));
++        let text = n.to_string();
++        let v: Value = serde_hjson::from_str(&text)
++            .unwrap_or_else(|e| panic!("integer literal {:?} failed to parse: {}", text, e));
++        if n < 0 {
++            assert_eq!(v, Value::I64(n as i64));
++        } else {
++            assert_eq!(v, Value::U64(n as u64));
++        }
++    }
++
++    /// Float literals in exponent notation parse to the bit-exact f64:
++    /// Rust's LowerExp prints a shortest representation that str::parse
++    /// (which ParseNumber delegates to) must restore exactly, including
++    /// -0.0 and subnormals.
++    #[hegel::test]
++    fn float_literals_parse_bit_exactly(tc: hegel::TestCase) {
++        let f: f64 = tc.draw(
++            generators::floats::<f64>()
++                .allow_nan(false)
++                .allow_infinity(false),
++        );
++        let text = format!("{:e}", f);
++        let parsed: f64 = serde_hjson::from_str(&text)
++            .unwrap_or_else(|e| panic!("float literal {:?} failed to parse: {}", text, e));
++        assert_eq!(
++            parsed.to_bits(),
++            f.to_bits(),
++            "parsed {:?} from {:?}, expected {:?}",
++            parsed,
++            text,
++            f
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // 6. Typed deserialization
++    // ------------------------------------------------------------------
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq)]
++    struct Inner {
++        id: u32,
++        tags: Vec<String>,
++        ratio: f64,
++    }
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq)]
++    struct Model {
++        name: String,
++        enabled: bool,
++        count: i64,
++        limit: Option<u64>,
++        entries: BTreeMap<String, i32>,
++        items: Vec<Inner>,
++    }
++
++    /// A typed model serialized as JSON (a valid hjson document)
++    /// deserializes through hjson back to an equal model — structs, Option,
++    /// Vec, maps, full-range numbers and arbitrary unicode strings.
++    /// (Externally tagged enums are not exercised: the deserializer forwards
++    /// deserialize_enum to deserialize_any and cannot deserialize derived
++    /// enums at all — see HEGEL_REPORT.md.)
++    #[hegel::test]
++    fn typed_struct_roundtrips_from_json(tc: hegel::TestCase) {
++        let inners = |tc: &hegel::TestCase| Inner {
++            id: tc.draw(generators::integers::<u32>()),
++            tags: tc.draw(generators::vecs(generators::text().max_size(6)).max_size(3)),
++            ratio: tc.draw(
++                generators::floats::<f64>()
++                    .allow_nan(false)
++                    .allow_infinity(false),
++            ),
++        };
++        let model = Model {
++            name: tc.draw(generators::text().max_size(12)),
++            enabled: tc.draw(generators::booleans()),
++            count: tc.draw(generators::integers::<i64>()),
++            limit: tc.draw(generators::optional(generators::integers::<u64>())),
++            entries: tc
++                .draw(generators::hashmaps(
++                    generators::text().max_size(6),
++                    generators::integers::<i32>(),
++                ))
++                .into_iter()
++                .collect(),
++            items: {
++                let n = tc.draw(generators::integers::<usize>().max_value(3));
++                (0..n).map(|_| inners(&tc)).collect()
++            },
++        };
++        let json = serde_json::to_string(&model).unwrap();
++        let back: Model = serde_hjson::from_str(&json)
++            .unwrap_or_else(|e| panic!("typed parse failed: {} on {:?}", e, json));
++        assert_eq!(back, model);
++    }
++
++    // ------------------------------------------------------------------
++    // 7. Comment insensitivity
++    // ------------------------------------------------------------------
++
++    /// Inserting #, //, or /* */ comments at token boundaries (line breaks of
++    /// pretty-printed JSON, plus leading/trailing position) does not change
++    /// the parsed value.
++    #[hegel::test]
++    fn comments_between_tokens_do_not_change_value(tc: hegel::TestCase) {
++        let v: serde_json::Value = tc.draw(json_gs::values());
++        let pretty = serde_json::to_string_pretty(&v).unwrap();
++
++        // Bounded schedule of comment slots, cycled over the line boundaries.
++        let texts: Vec<String> = tc.draw(
++            generators::vecs(generators::from_regex("[a-zA-Z0-9 ]{0,10}"))
++                .min_size(1)
++                .max_size(4),
++        );
++        let kinds: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().max_value(3))
++                .min_size(1)
++                .max_size(8),
++        );
++        let comment = |slot: usize| -> Option<String> {
++            let t = &texts[slot % texts.len()];
++            match kinds[slot % kinds.len()] {
++                0 => None,
++                1 => Some(format!("# {}\n", t)),
++                2 => Some(format!("// {}\n", t)),
++                _ => Some(format!("/* {} */\n", t)),
++            }
++        };
++
++        let mut out = String::new();
++        let mut slot = 0;
++        if let Some(c) = comment(slot) {
++            out.push_str(&c);
++        }
++        slot += 1;
++        let lines: Vec<&str> = pretty.split('\n').collect();
++        for (i, line) in lines.iter().enumerate() {
++            out.push_str(line);
++            if i + 1 < lines.len() {
++                out.push('\n');
++                if let Some(c) = comment(slot) {
++                    out.push_str(&c);
++                }
++                slot += 1;
++            }
++        }
++        out.push('\n');
++        if let Some(c) = comment(slot) {
++            out.push_str(&c);
++        }
++
++        let parsed: serde_json::Value = serde_hjson::from_str(&out)
++            .unwrap_or_else(|e| panic!("commented document failed to parse: {}\n{}", e, out));
++        assert_eq!(parsed, v, "comments changed the value; document:\n{}", out);
++    }
++
++    // ------------------------------------------------------------------
++    // 8. Hjson-specific syntax: unquoted keys, quoteless strings,
++    //    trailing commas, optional root braces
++    // ------------------------------------------------------------------
++
++    /// Objects written with hjson's relaxed syntax — unquoted keys,
++    /// quoteless string values, newline separators, optional trailing
++    /// commas, and optional root braces — parse to the expected map.
++    #[hegel::test]
++    fn relaxed_object_syntax_parses_to_expected_map(tc: hegel::TestCase) {
++        let keys: Vec<String> = tc.draw(
++            generators::vecs(generators::from_regex("[A-Za-z_][A-Za-z0-9_.$-]{0,7}"))
++                .min_size(1)
++                .max_size(5)
++                .unique(true),
++        );
++        let braces = tc.draw(generators::booleans());
++        let trailing_comma = tc.draw(generators::booleans());
++
++        let mut expected = Map::new();
++        let mut body = String::new();
++        let last = keys.len() - 1;
++        for (i, k) in keys.into_iter().enumerate() {
++            let pad1: &str = tc.draw(generators::sampled_from(vec!["", " ", "\t"]));
++            let pad2: &str = tc.draw(generators::sampled_from(vec!["", " ", "  ", "\t"]));
++            let style = tc.draw(generators::integers::<u8>().max_value(3));
++            let (text, value, quoteless) = match style {
++                0 => {
++                    // quoteless string value: runs to end of line
++                    let mut w: String = tc.draw(generators::from_regex("[a-z]{1,8}"));
++                    if w == "true" || w == "false" || w == "null" {
++                        w.push('x');
++                    }
++                    (w.clone(), Value::String(w), true)
++                }
++                1 => {
++                    // quoted string value; may contain punctuation and colons
++                    let s: String = tc.draw(generators::from_regex(r#"[a-zA-Z0-9 .:,/#{}\[\]]{0,10}"#));
++                    (format!("\"{}\"", s), Value::String(s), false)
++                }
++                2 => {
++                    let n: i64 = tc.draw(generators::integers::<i64>());
++                    let value = if n < 0 {
++                        Value::I64(n)
++                    } else {
++                        Value::U64(n as u64)
++                    };
++                    (n.to_string(), value, false)
++                }
++                _ => {
++                    let kw: &str = tc.draw(generators::sampled_from(vec!["true", "false", "null"]));
++                    let value = match kw {
++                        "true" => Value::Bool(true),
++                        "false" => Value::Bool(false),
++                        _ => Value::Null,
++                    };
++                    (kw.to_string(), value, false)
++                }
++            };
++            let sep: String = if i == last {
++                if trailing_comma {
++                    if quoteless { "\n,\n".to_string() } else { ",\n".to_string() }
++                } else {
++                    "\n".to_string()
++                }
++            } else if quoteless {
++                "\n".to_string()
++            } else {
++                let s: &str = tc.draw(generators::sampled_from(vec![",\n", "\n", " ,\n", ",\n\n"]));
++                s.to_string()
++            };
++            body.push_str(&k);
++            body.push_str(pad1);
++            body.push(':');
++            body.push_str(pad2);
++            body.push_str(&text);
++            body.push_str(&sep);
++            expected.insert(k, value);
++        }
++
++        let doc = if braces {
++            format!("{{\n{}}}", body)
++        } else {
++            body
++        };
++        let parsed: Value = serde_hjson::from_str(&doc)
++            .unwrap_or_else(|e| panic!("relaxed document failed to parse: {}\n{}", e, doc));
++        assert_eq!(
++            parsed,
++            Value::Object(expected),
++            "document was:\n{}",
++            doc
++        );
++    }
++
++    /// Arrays accept comma and/or newline separators and a trailing comma.
++    #[hegel::test]
++    fn relaxed_array_syntax_parses_to_expected_vec(tc: hegel::TestCase) {
++        let nums: Vec<i64> = tc.draw(generators::vecs(generators::integers::<i64>()).max_size(6));
++        let trailing_comma = tc.draw(generators::booleans());
++        let mut doc = String::from("[");
++        let last = nums.len().wrapping_sub(1);
++        for (i, n) in nums.iter().enumerate() {
++            doc.push_str(&n.to_string());
++            if i != last {
++                let sep: &str = tc.draw(generators::sampled_from(vec![",", "\n", ",\n", " , "]));
++                doc.push_str(sep);
++            } else if trailing_comma {
++                doc.push(',');
++            }
++        }
++        doc.push(']');
++        let expected = Value::Array(
++            nums.iter()
++                .map(|&n| if n < 0 { Value::I64(n) } else { Value::U64(n as u64) })
++                .collect(),
++        );
++        let parsed: Value = serde_hjson::from_str(&doc)
++            .unwrap_or_else(|e| panic!("array document failed to parse: {}\n{}", e, doc));
++        assert_eq!(parsed, expected, "document was: {:?}", doc);
++    }
++
++    // ------------------------------------------------------------------
++    // 9. Quoted-string escapes
++    // ------------------------------------------------------------------
++
++    /// Quoted strings built from arbitrary chars — written raw, as named
++    /// escapes (\n, \t, \", \\, \/, ...), or as \uXXXX (with surrogate pairs
++    /// for astral chars) — decode to exactly the intended characters.
++    #[hegel::test]
++    fn quoted_string_escapes_decode_exactly(tc: hegel::TestCase) {
++        let chars: Vec<char> = tc.draw(
++            generators::vecs(
++                hegel::one_of!(
++                    generators::integers::<u32>().max_value(0x7F),
++                    generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++                    generators::integers::<u32>()
++                        .min_value(0x1_0000)
++                        .max_value(0x10_FFFF),
++                )
++                .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++            )
++            .max_size(20),
++        );
++
++        let mut enc = String::from("\"");
++        for &c in &chars {
++            let named = match c {
++                '"' => Some("\\\""),
++                '\\' => Some("\\\\"),
++                '/' => Some("\\/"),
++                '\u{8}' => Some("\\b"),
++                '\u{c}' => Some("\\f"),
++                '\n' => Some("\\n"),
++                '\r' => Some("\\r"),
++                '\t' => Some("\\t"),
++                _ => None,
++            };
++            let choice = tc.draw(generators::integers::<u8>().max_value(2));
++            match (choice, named) {
++                (0, Some(esc)) => enc.push_str(esc),
++                (1, _) | (0, None) => {
++                    // \u encoding, surrogate pairs for astral chars
++                    let mut buf = [0u16; 2];
++                    for unit in c.encode_utf16(&mut buf) {
++                        enc.push_str(&format!("\\u{:04x}", unit));
++                    }
++                }
++                _ => {
++                    if c >= ' ' && c != '"' && c != '\\' {
++                        enc.push(c);
++                    } else {
++                        let mut buf = [0u16; 2];
++                        for unit in c.encode_utf16(&mut buf) {
++                            enc.push_str(&format!("\\u{:04x}", unit));
++                        }
++                    }
++                }
++            }
++        }
++        enc.push('"');
++
++        let expected: String = chars.iter().collect();
++        let parsed: Value = serde_hjson::from_str(&enc)
++            .unwrap_or_else(|e| panic!("escaped string failed to parse: {} on {:?}", e, enc));
++        assert_eq!(parsed, Value::String(expected), "encoded doc was {:?}", enc);
++    }
++}
