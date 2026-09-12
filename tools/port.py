@@ -331,6 +331,15 @@ def cargo_meta(pkg_dir: Path, work: Path) -> tuple[str, str]:
         pkg = tomllib.loads((pkg_dir / "Cargo.toml").read_text()).get("package", {})
     except Exception:
         return "", ""
+    # a subdir that is only the crate's test harness (snap's `test/` = snap-test 0.0.1): the
+    # version we record is the crate's own, from the root package if the subdir isn't it
+    if pkg_dir != work and pkg.get("name") != work.name:
+        try:
+            root = tomllib.loads((work / "Cargo.toml").read_text()).get("package", {})
+            if root.get("name") == work.name:
+                pkg = root
+        except Exception:
+            pass
     ws = {}
     for cand in (work / "Cargo.toml",):
         try:
