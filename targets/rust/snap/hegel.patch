@@ -1,0 +1,306 @@
+diff --git a/test/Cargo.toml b/test/Cargo.toml
+index 5a8e4ea..260e0f3 100644
+--- a/test/Cargo.toml
++++ b/test/Cargo.toml
+@@ -21,3 +21,6 @@ quickcheck = { version = "0.9", default-features = false }
+ rand = "0.7.3"
+ snap = { version = "*", path = ".." }
+ snappy-cpp = { path = "../snappy-cpp", version = "*", optional = true }
++
++[dev-dependencies]
++hegeltest = "0.44.1"
+diff --git a/test/tests.rs b/test/tests.rs
+index 817dd04..a81a0ac 100644
+--- a/test/tests.rs
++++ b/test/tests.rs
+@@ -641,3 +641,290 @@ fn depress_cpp(bytes: &[u8]) -> Vec<u8> {
+     buf.truncate(n);
+     buf
+ }
++
++// Hegel property-based tests.
++//
++// These generalize the quickcheck properties above (`qc_roundtrip`,
++// `qc_roundtrip_stream`) and extend coverage to areas the quickcheck suite
++// doesn't reach: frame encoding with drawn write-chunk sizes and flushes,
++// streaming reads with small buffers, robustness of both decoders on
++// arbitrary/corrupted/truncated input, concatenated frame streams, and the
++// documented relationships of `decompress_len`/`max_compress_len` to actual
++// sizes.
++mod hegel_props {
++    use std::io::{Read, Write};
++
++    use hegel::generators;
++    use snap::raw::{decompress_len, max_compress_len, Decoder, Encoder};
++    use snap::{read, write};
++
++    use super::{
++        depress, press, read_frame_depress, read_frame_press,
++        write_frame_press,
++    };
++
++    /// Structured payloads for compression: arbitrary bytes, single-byte
++    /// runs, repeated chunks, text, and low-entropy bytes over a small
++    /// alphabet. Runs and repeats exercise the copy operations; sizes above
++    /// 65536 (`MAX_BLOCK_SIZE`) exercise multi-block compression.
++    #[hegel::composite]
++    fn snappy_input(tc: &hegel::TestCase) -> Vec<u8> {
++        match tc.draw(generators::integers::<u8>().max_value(4)) {
++            0 => tc.draw(generators::binary()),
++            1 => {
++                // A run of a single byte.
++                let b = tc.draw(generators::integers::<u8>());
++                let n = tc.draw(generators::integers::<usize>().max_value(70_000));
++                vec![b; n]
++            }
++            2 => {
++                // A repeated seed chunk: highly compressible, and can span
++                // several 64KiB blocks.
++                let chunk = tc.draw(generators::binary().min_size(1).max_size(64));
++                let reps = tc.draw(generators::integers::<usize>().max_value(4_096));
++                let mut out = Vec::with_capacity(chunk.len() * reps);
++                for _ in 0..reps {
++                    out.extend_from_slice(&chunk);
++                }
++                out
++            }
++            3 => tc.draw(generators::text()).into_bytes(),
++            _ => {
++                // Low-entropy bytes drawn from a small alphabet: produces
++                // partial matches and short copies.
++                let alphabet = tc.draw(
++                    generators::vecs(generators::integers::<u8>())
++                        .min_size(1)
++                        .max_size(4)
++                        .unique(true),
++                );
++                let raw = tc.draw(generators::binary().max_size(2_000));
++                raw.iter().map(|&b| alphabet[b as usize % alphabet.len()]).collect()
++            }
++        }
++    }
++
++    // Property: raw compress -> decompress is the identity.
++    // Port of `qc_roundtrip` (which ran 1000 cases; count carried over),
++    // with structured rather than purely arbitrary payloads.
++    #[hegel::test(test_cases = 1000)]
++    fn hegel_roundtrip_raw(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        assert_eq!(depress(&press(&data)), data);
++    }
++
++    // Property: write::FrameEncoder followed by read::FrameDecoder is the
++    // identity, no matter how the input is split across write calls and
++    // regardless of intervening flushes.
++    // Port of `qc_roundtrip_stream` (1000 cases carried over), strengthened:
++    // the original used a single write_all and discarded empty inputs.
++    #[hegel::test(test_cases = 1000)]
++    fn hegel_roundtrip_frame_chunked_writes(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        let mut wtr = write::FrameEncoder::new(vec![]);
++        let mut pos = 0;
++        while pos < data.len() {
++            let n = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(data.len() - pos),
++            );
++            wtr.write_all(&data[pos..pos + n]).unwrap();
++            pos += n;
++            if tc.draw(generators::booleans()) {
++                wtr.flush().unwrap();
++            }
++        }
++        let encoded = wtr.into_inner().unwrap();
++        assert_eq!(read_frame_depress(&encoded), data);
++    }
++
++    // Property: read::FrameEncoder and write::FrameEncoder produce identical
++    // compressed bytes for the same input (when written in one shot).
++    // Generalizes the per-corpus `read_and_write_frame_encoder_match` tests.
++    #[hegel::test]
++    fn hegel_read_write_frame_encoders_agree(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        assert_eq!(read_frame_press(&data), write_frame_press(&data));
++    }
++
++    // Property: reading a frame stream through read::FrameDecoder with a
++    // small caller buffer yields the same bytes as reading it whole.
++    #[hegel::test]
++    fn hegel_frame_decoder_small_buffers(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        let encoded = write_frame_press(&data);
++        let bufsize = tc.draw(
++            generators::integers::<usize>().min_value(1).max_value(97),
++        );
++        let mut rdr = read::FrameDecoder::new(&*encoded);
++        let mut buf = vec![0u8; bufsize];
++        let mut out = vec![];
++        loop {
++            let n = rdr.read(&mut buf).unwrap();
++            if n == 0 {
++                break;
++            }
++            out.extend_from_slice(&buf[..n]);
++        }
++        assert_eq!(out, data);
++    }
++
++    // Property: reading compressed bytes from read::FrameEncoder with a small
++    // caller buffer yields the same bytes as reading it whole. Generalizes
++    // `read_frame_encoder_big_and_little_buffers` (which tested sizes 5 and
++    // 1_000_000 on one corpus file).
++    #[hegel::test]
++    fn hegel_read_frame_encoder_small_buffers(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        let bufsize = tc.draw(
++            generators::integers::<usize>().min_value(1).max_value(97),
++        );
++        let mut rdr = read::FrameEncoder::new(&*data);
++        let mut buf = vec![0u8; bufsize];
++        let mut out = vec![];
++        loop {
++            let n = rdr.read(&mut buf).unwrap();
++            if n == 0 {
++                break;
++            }
++            out.extend_from_slice(&buf[..n]);
++        }
++        assert_eq!(out, read_frame_press(&data));
++    }
++
++    // Property: the raw decoder never panics, whatever the input: arbitrary
++    // bytes, or a valid compression with one bit flipped. It may return an
++    // error or (for lucky corruptions) different data, but must not crash.
++    #[hegel::test]
++    fn hegel_raw_decompress_never_panics(tc: hegel::TestCase) {
++        let input: Vec<u8> = if tc.draw(generators::booleans()) {
++            tc.draw(generators::binary())
++        } else {
++            let data = tc.draw(snappy_input());
++            // press() always emits at least the length header byte.
++            let mut c = press(&data);
++            let idx = tc.draw(
++                generators::integers::<usize>().max_value(c.len() - 1),
++            );
++            let bit = tc.draw(generators::integers::<u8>().max_value(7));
++            c[idx] ^= 1 << bit;
++            c
++        };
++        match decompress_len(&input) {
++            Err(_) => {}
++            // The 16MiB cap protects the *test's* memory (a corrupt header
++            // can claim a length up to 4GiB), not the library's contract.
++            Ok(n) if n <= (1 << 24) => {
++                let mut out = vec![0u8; n];
++                drop(Decoder::new().decompress(&input, &mut out));
++            }
++            Ok(_) => {
++                // Claimed size too large to allocate here; still exercise
++                // the undersized-buffer path.
++                let mut out = vec![0u8; 1024];
++                drop(Decoder::new().decompress(&input, &mut out));
++            }
++        }
++    }
++
++    // Property: read::FrameDecoder never panics, whatever the input:
++    // arbitrary bytes, arbitrary bytes behind a valid stream header, or a
++    // valid stream with one bit flipped.
++    #[hegel::test]
++    fn hegel_frame_decoder_never_panics(tc: hegel::TestCase) {
++        let encoded: Vec<u8> = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => tc.draw(generators::binary()),
++            1 => {
++                // Valid stream identifier so drawn bytes reach the chunk
++                // parsing code instead of failing at the header.
++                let mut v = b"\xFF\x06\x00\x00sNaPpY".to_vec();
++                v.extend(tc.draw(generators::binary()));
++                v
++            }
++            _ => {
++                let data = tc.draw(snappy_input());
++                let mut v = write_frame_press(&data);
++                if !v.is_empty() {
++                    let idx = tc.draw(
++                        generators::integers::<usize>().max_value(v.len() - 1),
++                    );
++                    let bit =
++                        tc.draw(generators::integers::<u8>().max_value(7));
++                    v[idx] ^= 1 << bit;
++                }
++                v
++            }
++        };
++        let mut out = vec![];
++        drop(read::FrameDecoder::new(&*encoded).read_to_end(&mut out));
++    }
++
++    // Property: decoding a truncated frame stream either fails or yields a
++    // prefix of the original data (truncation at a chunk boundary legally
++    // yields the leading chunks; truncation mid-chunk must error).
++    #[hegel::test]
++    fn hegel_frame_truncation_prefix_or_error(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        let encoded = write_frame_press(&data);
++        let cut = tc
++            .draw(generators::integers::<usize>().max_value(encoded.len()));
++        let mut out = vec![];
++        match read::FrameDecoder::new(&encoded[..cut]).read_to_end(&mut out) {
++            Ok(_) => assert!(
++                data.starts_with(&out),
++                "decoded {} bytes that are not a prefix of the input",
++                out.len()
++            ),
++            Err(_) => {}
++        }
++    }
++
++    // Property: decompress_len reports exactly the original input length for
++    // any valid compression (documented: "Returns the decompressed size (in
++    // bytes) of the compressed bytes given").
++    #[hegel::test]
++    fn hegel_decompress_len_matches_original(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        assert_eq!(decompress_len(&press(&data)).unwrap(), data.len());
++    }
++
++    // Property: compressed output never exceeds max_compress_len, the bound
++    // compress() documents callers must allocate.
++    #[hegel::test]
++    fn hegel_max_compress_len_bound(tc: hegel::TestCase) {
++        let data = tc.draw(snappy_input());
++        let bound = max_compress_len(data.len());
++        assert!(bound > 0);
++        assert!(press(&data).len() <= bound);
++    }
++
++    // Property: concatenated frame streams decode to the concatenated data
++    // (the framing format allows a new stream identifier mid-stream, and
++    // FrameDecoder accepts it after the first chunk).
++    #[hegel::test]
++    fn hegel_concatenated_frames(tc: hegel::TestCase) {
++        let a = tc.draw(snappy_input());
++        let b = tc.draw(snappy_input());
++        let mut encoded = write_frame_press(&a);
++        encoded.extend_from_slice(&write_frame_press(&b));
++        let mut expected = a;
++        expected.extend_from_slice(&b);
++        assert_eq!(read_frame_depress(&encoded), expected);
++    }
++
++    // Property: reusing an Encoder across inputs produces the same bytes as
++    // a fresh Encoder ("It is beneficial to reuse an Encoder when possible"
++    // implies reuse must not change the output).
++    #[hegel::test]
++    fn hegel_encoder_reuse_deterministic(tc: hegel::TestCase) {
++        let inputs = tc
++            .draw(generators::vecs(snappy_input()).min_size(1).max_size(4));
++        let mut reused = Encoder::new();
++        for data in &inputs {
++            let with_reuse = reused.compress_vec(data).unwrap();
++            let fresh = Encoder::new().compress_vec(data).unwrap();
++            assert_eq!(with_reuse, fresh);
++        }
++    }
++}

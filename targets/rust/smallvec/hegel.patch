@@ -1,0 +1,625 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f4d59b6..9569d7e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,7 @@ malloc_size_of = { version = "0.1.1", optional = true, default-features = false
+ 
+ [dev-dependencies]
+ bincode = "1.0.1"
++hegeltest = "0.44.1"
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+diff --git a/src/tests.rs b/src/tests.rs
+index 2082f96..d66d4ff 100644
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -155,7 +155,7 @@ fn splice() {
+     let new = [7, 8, 9, 10];
+     let u: SmallVec<u8, 1> = v.splice(1..1, new).collect();
+     assert_eq!(v, [0, 7, 8, 9, 10, 1, 2, 3, 4, 5, 6]);
+-    assert_eq!(u, []);
++    assert!(u.is_empty()); // zoo: was assert_eq!(u, []) — ambiguous with hegeltest's serde_json in scope
+ 
+     // The range is at the beginning and nonempty.
+     let mut v: SmallVec<u8, 1> = smallvec![0, 1, 2, 3, 4, 5, 6];
+@@ -328,7 +328,7 @@ fn test_split_off_take_all() {
+     let orig_capacity: usize = vec.capacity();
+ 
+     let split_off = vec.split_off(0);
+-    assert_eq!(&vec[..], &[]);
++    assert!(vec.is_empty()); // zoo: was assert_eq!(&vec[..], &[])
+     assert_eq!(&split_off[..], &[1, 2, 3, 4, 5, 6]);
+     assert_eq!(vec.capacity(), orig_capacity);
+     assert_eq!(vec.as_ptr(), orig_ptr);
+@@ -538,7 +538,7 @@ fn test_from() {
+ 
+     let vec = vec![];
+     let small_vec: SmallVec<u8, 3> = SmallVec::from(vec);
+-    assert_eq!(&*small_vec, &[]);
++    assert!(small_vec.is_empty()); // zoo: was assert_eq!(&*small_vec, &[])
+     drop(small_vec);
+ 
+     let vec = vec![1, 2, 3, 4, 5];
+@@ -687,12 +687,12 @@ fn test_into_inner() {
+ fn test_from_vec() {
+     let vec = vec![];
+     let small_vec: SmallVec<u8, 3> = SmallVec::from_vec(vec);
+-    assert_eq!(&*small_vec, &[]);
++    assert!(small_vec.is_empty()); // zoo: was assert_eq!(&*small_vec, &[])
+     drop(small_vec);
+ 
+     let vec = vec![];
+     let small_vec: SmallVec<u8, 1> = SmallVec::from_vec(vec);
+-    assert_eq!(&*small_vec, &[]);
++    assert!(small_vec.is_empty()); // zoo: was assert_eq!(&*small_vec, &[])
+     drop(small_vec);
+ 
+     let vec = vec![1];
+@@ -1121,3 +1121,566 @@ mod buf_mut {
+         }
+     }
+ }
++
++// ===========================================================================
++// Property-based tests (hegel), focused on the inline<->spill boundary.
++//
++// All properties compare `SmallVec<i32, 4>` (unless noted) against a
++// `std::Vec<i32>` oracle. The interesting region is around len == 4, where
++// the storage transitions between the inline buffer and the heap.
++//
++// Spill-state facts derived from the implementation (v2 semantics):
++// - `spilled()` reports the storage tag (`TaggedLen::on_heap`), NOT
++//   `len > N`: e.g. `from_vec` adopts a heap allocation as-is (spilled with
++//   any len, and possibly `capacity() < N`), and `truncate` below N does not
++//   move storage back inline.
++// - Sound invariants: `len > N` implies `spilled()`; `!spilled()` implies
++//   `capacity() == N`; `capacity() >= len()` always; `shrink_to_fit`
++//   de-spills whenever `len <= N`.
++// - `capacity() >= N` holds only on paths that never adopt a foreign
++//   allocation via `from_vec` (checked in `hegel_capacity_invariants`).
++#[cfg(test)]
++mod hegel_props {
++    use crate::SmallVec;
++    use alloc::format;
++    use alloc::string::ToString;
++    use alloc::{vec, vec::Vec};
++    use hegel::generators;
++    use hegel::TestCase;
++
++    /// Inline capacity used by most properties below.
++    const N: usize = 4;
++    type Sv = SmallVec<i32, N>;
++
++    /// Element values: mix the full i32 range (boundary values) with a tiny
++    /// range so that duplicates/adjacency are common (dedup/retain need them).
++    fn draw_val(tc: &TestCase) -> i32 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i32>(),
++            generators::integers::<i32>().min_value(0).max_value(3),
++        ))
++    }
++
++    /// A vector of elements whose length clusters around the inline
++    /// capacity boundary (0..=3*N) so both storage modes are exercised.
++    fn draw_elems(tc: &TestCase) -> Vec<i32> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3 * N));
++        let mut v = Vec::with_capacity(n);
++        for _ in 0..n {
++            v.push(draw_val(tc));
++        }
++        v
++    }
++
++    fn sv_from(elems: &[i32]) -> Sv {
++        // Built by pushes (never `from_vec`) so storage starts inline and
++        // spills exactly when len exceeds N.
++        let mut sv = Sv::new();
++        for &x in elems {
++            sv.push(x);
++        }
++        sv
++    }
++
++    // -----------------------------------------------------------------
++    // Property 1 (stateful model test): a drawn op sequence applied to both
++    // SmallVec<i32, 4> and Vec<i32> agrees after every op, and the spill
++    // state stays sound while ops cross the N boundary in both directions.
++    // -----------------------------------------------------------------
++
++    struct SmallVecMachine {
++        sv: Sv,
++        model: Vec<i32>,
++    }
++
++    #[hegel::state_machine]
++    impl SmallVecMachine {
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            let x = draw_val(&tc);
++            self.sv.push(x);
++            self.model.push(x);
++        }
++
++        #[rule]
++        fn pop(&mut self, _: TestCase) {
++            assert_eq!(self.sv.pop(), self.model.pop());
++        }
++
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let idx = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let x = draw_val(&tc);
++            self.sv.insert(idx, x);
++            self.model.insert(idx, x);
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let idx = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            assert_eq!(self.sv.remove(idx), self.model.remove(idx));
++        }
++
++        #[rule]
++        fn swap_remove(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let idx = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            assert_eq!(self.sv.swap_remove(idx), self.model.swap_remove(idx));
++        }
++
++        #[rule]
++        fn truncate(&mut self, tc: TestCase) {
++            // Deliberately allowed to exceed len (no-op) and to cross the
++            // boundary downward (spilled storage must not claim inline).
++            let target = tc.draw(generators::integers::<usize>().max_value(3 * N));
++            self.sv.truncate(target);
++            self.model.truncate(target);
++        }
++
++        #[rule]
++        fn extend(&mut self, tc: TestCase) {
++            let xs = draw_elems(&tc);
++            self.sv.extend(xs.iter().copied());
++            self.model.extend(xs.iter().copied());
++        }
++
++        #[rule]
++        fn clear(&mut self, _: TestCase) {
++            self.sv.clear();
++            self.model.clear();
++        }
++
++        // v2 has no `insert_many`; `insert_from_slice_copy` is the
++        // equivalent for Copy elements. Oracle: Vec::splice at idx..idx.
++        #[rule]
++        fn insert_from_slice(&mut self, tc: TestCase) {
++            let idx = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let xs = draw_elems(&tc);
++            self.sv.insert_from_slice_copy(idx, &xs);
++            self.model.splice(idx..idx, xs.iter().copied());
++        }
++
++        #[rule]
++        fn drain(&mut self, tc: TestCase) {
++            let len = self.model.len();
++            let a = tc.draw(generators::integers::<usize>().max_value(len));
++            let b = tc.draw(generators::integers::<usize>().max_value(len));
++            let (start, end) = (a.min(b), a.max(b));
++            let got: Vec<i32> = self.sv.drain(start..end).collect();
++            let expected: Vec<i32> = self.model.drain(start..end).collect();
++            assert_eq!(got, expected);
++        }
++
++        #[rule]
++        fn retain(&mut self, tc: TestCase) {
++            let t = draw_val(&tc);
++            self.sv.retain(|x| *x < t);
++            self.model.retain(|x| *x < t);
++        }
++
++        #[rule]
++        fn resize(&mut self, tc: TestCase) {
++            let target = tc.draw(generators::integers::<usize>().max_value(3 * N));
++            let x = draw_val(&tc);
++            self.sv.resize(target, x);
++            self.model.resize(target, x);
++        }
++
++        #[rule]
++        fn reserve(&mut self, tc: TestCase) {
++            // Bounded so `reserve` can't overflow capacity; the bound
++            // protects the test's memory, not the library's contract.
++            let additional = tc.draw(generators::integers::<usize>().max_value(4 * N));
++            if tc.draw(generators::booleans()) {
++                self.sv.reserve(additional);
++            } else {
++                self.sv.reserve_exact(additional);
++            }
++            assert!(self.sv.capacity() - self.sv.len() >= additional);
++        }
++
++        #[rule]
++        fn shrink_to_fit(&mut self, _: TestCase) {
++            self.sv.shrink_to_fit();
++            // Documented de-spill behavior: fits inline => back inline.
++            if self.sv.len() <= N {
++                assert!(!self.sv.spilled());
++            } else {
++                assert_eq!(self.sv.capacity(), self.sv.len());
++            }
++        }
++
++        #[rule]
++        fn dedup(&mut self, _: TestCase) {
++            self.sv.dedup();
++            self.model.dedup();
++        }
++
++        // Explicit spill/de-spill trigger: grow to > N spills, grow to <= N
++        // moves storage back inline.
++        #[rule]
++        fn grow(&mut self, tc: TestCase) {
++            let extra = tc.draw(generators::integers::<usize>().max_value(3 * N));
++            self.sv.grow(self.model.len() + extra);
++        }
++
++        #[rule]
++        fn split_off(&mut self, tc: TestCase) {
++            let at = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let tail = self.sv.split_off(at);
++            let expected_tail = self.model.split_off(at);
++            assert_eq!(tail.as_slice(), expected_tail.as_slice());
++        }
++
++        // Round-trip the storage through Vec: `into_vec` of an inline vec
++        // allocates; `from_vec` adopts the allocation (possibly cap < N).
++        #[rule]
++        fn roundtrip_through_vec(&mut self, _: TestCase) {
++            let sv = core::mem::take(&mut self.sv);
++            self.sv = SmallVec::from_vec(sv.into_vec());
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: TestCase) {
++            assert_eq!(self.sv.len(), self.model.len());
++            assert_eq!(self.sv.as_slice(), self.model.as_slice());
++            assert!(self.sv.capacity() >= self.sv.len());
++            // Spill-state soundness: more elements than the inline buffer
++            // holds MUST be on the heap; an inline tag means the capacity is
++            // exactly the inline buffer.
++            if self.sv.len() > N {
++                assert!(self.sv.spilled());
++            }
++            if !self.sv.spilled() {
++                assert_eq!(self.sv.capacity(), N);
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_model_smallvec_vs_vec(tc: TestCase) {
++        let machine = SmallVecMachine {
++            sv: SmallVec::new(),
++            model: Vec::new(),
++        };
++        hegel::stateful::machine(machine).run(tc);
++    }
++
++    // -----------------------------------------------------------------
++    // Property 2: from_vec / into_vec round-trips preserve elements for
++    // several inline capacities straddling the drawn lengths.
++    // -----------------------------------------------------------------
++
++    fn check_vec_roundtrip<const M: usize>(data: &[i32]) {
++        let sv = SmallVec::<i32, M>::from_vec(data.to_vec());
++        assert_eq!(sv.as_slice(), data);
++        if sv.len() > M {
++            assert!(sv.spilled());
++        }
++        let back = sv.into_vec();
++        assert_eq!(back.as_slice(), data);
++    }
++
++    #[hegel::test]
++    fn hegel_from_vec_into_vec_roundtrip(tc: TestCase) {
++        let data = draw_elems(&tc);
++        check_vec_roundtrip::<0>(&data);
++        check_vec_roundtrip::<1>(&data);
++        check_vec_roundtrip::<4>(&data);
++        check_vec_roundtrip::<8>(&data);
++    }
++
++    // -----------------------------------------------------------------
++    // Property 3: From<&[T]> and from_elem match the oracle, and freshly
++    // constructed vectors are inline exactly when they fit.
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_from_slice_and_from_elem_match_oracle(tc: TestCase) {
++        let data = draw_elems(&tc);
++        let sv: Sv = SmallVec::from(data.as_slice());
++        assert_eq!(sv.as_slice(), data.as_slice());
++        assert_eq!(sv.spilled(), data.len() > N);
++
++        let elem = draw_val(&tc);
++        let n = tc.draw(generators::integers::<usize>().max_value(3 * N));
++        let sv: Sv = crate::from_elem(elem, n);
++        assert_eq!(sv.as_slice(), vec![elem; n].as_slice());
++        assert_eq!(sv.spilled(), n > N);
++    }
++
++    // -----------------------------------------------------------------
++    // Property 4: growing past N and shrinking back leaves elements intact
++    // (oracle-independent: we still hold the input we built from).
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_spill_despill_preserves_elements(tc: TestCase) {
++        // Start inline.
++        let head_len = tc.draw(generators::integers::<usize>().max_value(N));
++        let mut expected = Vec::new();
++        let mut sv = Sv::new();
++        for _ in 0..head_len {
++            let x = draw_val(&tc);
++            sv.push(x);
++            expected.push(x);
++        }
++        assert!(!sv.spilled());
++
++        // Cross the boundary upward.
++        let extra = tc.draw(generators::integers::<usize>().min_value(1).max_value(4 * N));
++        for _ in 0..extra {
++            let x = draw_val(&tc);
++            sv.push(x);
++            expected.push(x);
++        }
++        if expected.len() > N {
++            assert!(sv.spilled());
++        }
++        assert_eq!(sv.as_slice(), expected.as_slice());
++
++        // Cross back downward and de-spill.
++        let keep = tc.draw(generators::integers::<usize>().max_value(N));
++        sv.truncate(keep);
++        expected.truncate(keep);
++        // Truncation must not corrupt elements nor falsely claim inline...
++        assert_eq!(sv.as_slice(), expected.as_slice());
++        assert!(sv.capacity() >= sv.len());
++        // ...and shrink_to_fit must move storage back inline.
++        sv.shrink_to_fit();
++        assert!(!sv.spilled());
++        assert_eq!(sv.capacity(), N);
++        assert_eq!(sv.as_slice(), expected.as_slice());
++    }
++
++    // -----------------------------------------------------------------
++    // Property 5: insert_from_slice_copy at drawn positions matches
++    // Vec::splice (insertion at the boundary in particular).
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_insert_from_slice_matches_splice(tc: TestCase) {
++        let base = draw_elems(&tc);
++        let idx = tc.draw(generators::integers::<usize>().max_value(base.len()));
++        let ins = draw_elems(&tc);
++
++        let mut sv = sv_from(&base);
++        let mut model = base.clone();
++        sv.insert_from_slice_copy(idx, &ins);
++        model.splice(idx..idx, ins.iter().copied());
++
++        assert_eq!(sv.as_slice(), model.as_slice());
++        if sv.len() > N {
++            assert!(sv.spilled());
++        }
++    }
++
++    // -----------------------------------------------------------------
++    // Property 6: extend_from_slice / extend_from_within match the Vec
++    // equivalents.
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_extend_from_slice_and_within_match_vec(tc: TestCase) {
++        let base = draw_elems(&tc);
++        let mut sv = sv_from(&base);
++        let mut model = base.clone();
++
++        let xs = draw_elems(&tc);
++        sv.extend_from_slice(&xs);
++        model.extend_from_slice(&xs);
++        assert_eq!(sv.as_slice(), model.as_slice());
++
++        let len = model.len();
++        let a = tc.draw(generators::integers::<usize>().max_value(len));
++        let b = tc.draw(generators::integers::<usize>().max_value(len));
++        let (start, end) = (a.min(b), a.max(b));
++        sv.extend_from_within(start..end);
++        model.extend_from_within(start..end);
++        assert_eq!(sv.as_slice(), model.as_slice());
++    }
++
++    // -----------------------------------------------------------------
++    // Property 7: drain with drawn range kinds (incl. empty and full
++    // ranges) and drawn consumption (full / none / partial front+back)
++    // matches Vec::drain, including the Drop-driven tail move.
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_drain_matches_vec(tc: TestCase) {
++        let data = draw_elems(&tc);
++        let mut sv = sv_from(&data);
++        let mut model = data.clone();
++        let len = data.len();
++
++        // Draw the range kind first, then only the bounds it needs.
++        let kind = tc.draw(generators::integers::<u8>().max_value(3));
++        let a = tc.draw(generators::integers::<usize>().max_value(len));
++        let b = tc.draw(generators::integers::<usize>().max_value(len));
++        let (start, end) = (a.min(b), a.max(b));
++
++        // How much of the iterator to consume before dropping it:
++        // front steps then back steps (may cover none or all of the range).
++        let span = match kind {
++            0 => end - start,
++            1 => end,
++            2 => len - start,
++            _ => len,
++        };
++        let front = tc.draw(generators::integers::<usize>().max_value(span));
++        let back = tc.draw(generators::integers::<usize>().max_value(span - front));
++
++        let mut got = match kind {
++            0 => sv.drain(start..end),
++            1 => sv.drain(..end),
++            2 => sv.drain(start..),
++            _ => sv.drain(..),
++        };
++        let mut expected = match kind {
++            0 => model.drain(start..end),
++            1 => model.drain(..end),
++            2 => model.drain(start..),
++            _ => model.drain(..),
++        };
++        for _ in 0..front {
++            assert_eq!(got.next(), expected.next());
++        }
++        for _ in 0..back {
++            assert_eq!(got.next_back(), expected.next_back());
++        }
++        assert_eq!(got.as_slice(), expected.as_slice());
++        drop(got);
++        drop(expected);
++
++        assert_eq!(sv.as_slice(), model.as_slice());
++        assert!(sv.capacity() >= sv.len());
++    }
++
++    // -----------------------------------------------------------------
++    // Property 8: capacity invariants along allocation-affecting op
++    // sequences that never adopt a foreign allocation: capacity() >= N,
++    // capacity() >= len, inline tag iff capacity == N, and shrink_to_fit
++    // de-spills whenever len <= N.
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_capacity_invariants(tc: TestCase) {
++        let steps = tc.draw(generators::integers::<usize>().min_value(1).max_value(12));
++        let mut sv = Sv::new();
++        let mut model: Vec<i32> = Vec::new();
++        for _ in 0..steps {
++            let op = tc.draw(generators::integers::<u8>().max_value(5));
++            match op {
++                0 => {
++                    let x = draw_val(&tc);
++                    sv.push(x);
++                    model.push(x);
++                }
++                1 => {
++                    let t = tc.draw(generators::integers::<usize>().max_value(3 * N));
++                    sv.truncate(t);
++                    model.truncate(t);
++                }
++                2 => {
++                    let additional =
++                        tc.draw(generators::integers::<usize>().max_value(4 * N));
++                    sv.reserve(additional);
++                    assert!(sv.capacity() - sv.len() >= additional);
++                }
++                3 => {
++                    let additional =
++                        tc.draw(generators::integers::<usize>().max_value(4 * N));
++                    sv.reserve_exact(additional);
++                    assert!(sv.capacity() - sv.len() >= additional);
++                }
++                4 => {
++                    sv.shrink_to_fit();
++                    if sv.len() <= N {
++                        assert!(!sv.spilled());
++                    } else {
++                        assert_eq!(sv.capacity(), sv.len());
++                    }
++                }
++                _ => {
++                    let min_cap = tc.draw(generators::integers::<usize>().max_value(6 * N));
++                    sv.shrink_to(min_cap);
++                }
++            }
++            // Core capacity invariants, after every op. `capacity() >= N`
++            // holds here because no op adopts a foreign Vec allocation.
++            assert!(sv.capacity() >= N);
++            assert!(sv.capacity() >= sv.len());
++            assert_eq!(sv.as_slice(), model.as_slice());
++            if !sv.spilled() {
++                assert_eq!(sv.capacity(), N);
++            }
++            if sv.len() > N {
++                assert!(sv.spilled());
++            }
++        }
++    }
++
++    // -----------------------------------------------------------------
++    // Property 9: IntoIter yields exactly the oracle's elements under a
++    // drawn front/back consumption schedule, with agreeing ExactSizeIterator
++    // lengths at every step.
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_into_iter_matches_vec(tc: TestCase) {
++        let data = draw_elems(&tc);
++        let sv = sv_from(&data);
++
++        let mut it = sv.into_iter();
++        let mut oracle = data.into_iter();
++        // A few extra steps past exhaustion check the fused/None behavior.
++        let steps = tc.draw(generators::integers::<usize>().max_value(4 * N));
++        for _ in 0..steps {
++            assert_eq!(it.len(), oracle.len());
++            assert_eq!(it.as_slice(), oracle.as_slice());
++            if tc.draw(generators::booleans()) {
++                assert_eq!(it.next(), oracle.next());
++            } else {
++                assert_eq!(it.next_back(), oracle.next_back());
++            }
++        }
++        // Whatever remains must agree too.
++        let rest: Vec<i32> = it.collect();
++        let expected: Vec<i32> = oracle.collect();
++        assert_eq!(rest, expected);
++    }
++
++    // -----------------------------------------------------------------
++    // Property 10: repeated truncate/resize crossing the boundary in both
++    // directions matches the oracle and keeps the spill state sound.
++    // -----------------------------------------------------------------
++
++    #[hegel::test]
++    fn hegel_truncate_resize_across_boundary(tc: TestCase) {
++        let data = draw_elems(&tc);
++        let mut sv = sv_from(&data);
++        let mut model = data;
++
++        let steps = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        for _ in 0..steps {
++            let target = tc.draw(generators::integers::<usize>().max_value(3 * N));
++            if tc.draw(generators::booleans()) {
++                sv.truncate(target);
++                model.truncate(target);
++            } else {
++                let x = draw_val(&tc);
++                sv.resize(target, x);
++                model.resize(target, x);
++            }
++            assert_eq!(sv.len(), model.len());
++            assert_eq!(sv.as_slice(), model.as_slice());
++            if sv.len() > N {
++                assert!(sv.spilled());
++            }
++            if !sv.spilled() {
++                assert_eq!(sv.capacity(), N);
++            }
++        }
++    }
++}
