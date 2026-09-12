@@ -40,3 +40,4 @@
 - 2026-05-09: predecessor base commit `0d130ed5bbd6` (Add MSRV-compatible lockfiles (#151)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/slotmap.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 0d130ed5bbd6 → eccedefc5e09 (2026-09-04, "Remove the build script (#162)"; 1.1.1); 0 bug(s) still reproduce. 225 tests pass.
