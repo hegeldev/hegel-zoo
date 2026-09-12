@@ -1,0 +1,552 @@
+diff --git a/miniz_oxide/Cargo.toml b/miniz_oxide/Cargo.toml
+index 3e6c92c..d85afbb 100644
+--- a/miniz_oxide/Cargo.toml
++++ b/miniz_oxide/Cargo.toml
+@@ -28,6 +28,7 @@ alloc = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-all
+ 
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ ## Messes with minimum rust version and drags in deps just for running tests
+ ## so just comment out for now and enable manually when needed for enabling benches
+ # criterion = "0.5"
+diff --git a/miniz_oxide/tests/flush.rs b/miniz_oxide/tests/flush.rs
+index fa713a7..ef9faf6 100644
+--- a/miniz_oxide/tests/flush.rs
++++ b/miniz_oxide/tests/flush.rs
+@@ -236,3 +236,138 @@ fn check_partial_inflate(compressed: &[u8], uncompressed: &[u8]) {
+         "Byte-stream doesn't decompress to the expected data"
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests using hegel.
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self as gs, Generator};
++use miniz_oxide::deflate::core::create_comp_flags_from_zip_params;
++use miniz_oxide::deflate::stream::deflate;
++use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
++use miniz_oxide::{MZError, MZFlush, MZStatus};
++
++/// Payload mixing incompressible noise and byte runs, so drawn flush points
++/// land in both compressible and incompressible regions.
++#[hegel::composite]
++fn flush_payloads(tc: &hegel::TestCase) -> Vec<u8> {
++    let num_segments = tc.draw(gs::integers::<usize>().max_value(3));
++    let mut data = Vec::new();
++    for _ in 0..num_segments {
++        let segment: Vec<u8> = tc.draw(hegel::one_of!(
++            gs::binary().max_size(1024).boxed(),
++            gs::tuples!(
++                gs::integers::<u8>(),
++                gs::integers::<usize>().min_value(1).max_value(4096)
++            )
++            .map(|(b, n)| vec![b; n])
++            .boxed(),
++        ));
++        data.extend_from_slice(&segment);
++    }
++    data
++}
++
++/// Compressing via the streaming `deflate::stream::deflate` API with arbitrary
++/// chunk splits, a drawn flush type at every split, and a small output buffer
++/// must still produce a stream that decompresses back to the original data.
++#[hegel::test]
++fn hegel_streaming_deflate_flush_points_roundtrip(tc: hegel::TestCase) {
++    let payload = tc.draw(flush_payloads());
++    let level = tc.draw(gs::integers::<i32>().min_value(0).max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let out_buf_len = tc.draw(gs::integers::<usize>().min_value(1).max_value(257));
++
++    // Split the payload at drawn cut points.
++    let num_cuts = tc.draw(gs::integers::<usize>().max_value(3));
++    let mut cuts = Vec::with_capacity(num_cuts);
++    for _ in 0..num_cuts {
++        cuts.push(tc.draw(gs::integers::<usize>().max_value(payload.len())));
++    }
++    cuts.sort_unstable();
++    let mut chunk_ranges = Vec::new();
++    let mut prev = 0;
++    for &cut in &cuts {
++        chunk_ranges.push((prev, cut));
++        prev = cut;
++    }
++    chunk_ranges.push((prev, payload.len()));
++
++    let flags = create_comp_flags_from_zip_params(level, if zlib { 15 } else { -15 }, 0);
++    let mut compressor = Box::new(miniz_oxide::deflate::core::CompressorOxide::new(flags));
++    let mut buf = vec![0u8; out_buf_len];
++    let mut compressed = Vec::new();
++
++    for (start, end) in chunk_ranges {
++        let chunk = &payload[start..end];
++        let flush = tc.draw((gs::sampled_from(vec![
++            MZFlush::None,
++            MZFlush::Partial,
++            MZFlush::Sync,
++            MZFlush::Full,
++        ])).print_as_debug());
++
++        // Feed the chunk (with the drawn flush) until it is fully consumed.
++        let mut pos = 0;
++        loop {
++            if pos == chunk.len() && flush == MZFlush::None {
++                // Nothing to feed and nothing to flush.
++                break;
++            }
++            let res = deflate(&mut compressor, &chunk[pos..], &mut buf, flush);
++            pos += res.bytes_consumed;
++            compressed.extend_from_slice(&buf[..res.bytes_written]);
++            match res.status {
++                Ok(_) => {
++                    if pos == chunk.len() {
++                        break;
++                    }
++                    assert!(
++                        res.bytes_consumed > 0 || res.bytes_written > 0,
++                        "deflate made no progress"
++                    );
++                }
++                // No progress possible (e.g. flushing with nothing pending).
++                Err(MZError::Buf) if pos == chunk.len() => break,
++                Err(e) => panic!("deflate returned an error: {:?}", e),
++            }
++        }
++
++        // Drain any pending flush output without requesting another flush
++        // (calling with e.g. Sync again would emit additional sync blocks).
++        if flush != MZFlush::None {
++            loop {
++                let res = deflate(&mut compressor, &[], &mut buf, MZFlush::None);
++                match res.status {
++                    Ok(_) => {
++                        compressed.extend_from_slice(&buf[..res.bytes_written]);
++                        if res.bytes_written < buf.len() {
++                            break;
++                        }
++                    }
++                    Err(MZError::Buf) => break,
++                    Err(e) => panic!("deflate drain returned an error: {:?}", e),
++                }
++            }
++        }
++    }
++
++    // Finish the stream.
++    loop {
++        let res = deflate(&mut compressor, &[], &mut buf, MZFlush::Finish);
++        compressed.extend_from_slice(&buf[..res.bytes_written]);
++        match res.status.expect("deflate finish returned an error") {
++            MZStatus::StreamEnd => break,
++            MZStatus::Ok => (),
++            s => panic!("unexpected status while finishing: {:?}", s),
++        }
++    }
++
++    let decompressed = if zlib {
++        decompress_to_vec_zlib(&compressed)
++    } else {
++        decompress_to_vec(&compressed)
++    }
++    .expect("failed to decompress the streamed output");
++    assert_eq!(payload, decompressed);
++}
+diff --git a/miniz_oxide/tests/test.rs b/miniz_oxide/tests/test.rs
+index 2360fb6..f8332f8 100644
+--- a/miniz_oxide/tests/test.rs
++++ b/miniz_oxide/tests/test.rs
+@@ -625,3 +625,392 @@ fn issue_137_reject_incomplete_litlen_tree() {
+         "incomplete litlen Huffman tree should be rejected"
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests using hegel.
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self as gs, Generator};
++use miniz_oxide::deflate::core::{
++    compress, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus,
++};
++use miniz_oxide::inflate::stream::{inflate, FullReset, InflateState, MinReset, ZeroReset};
++use miniz_oxide::inflate::{
++    decompress_slice_iter_to_slice, decompress_to_vec_with_limit,
++    decompress_to_vec_zlib_with_limit,
++};
++use miniz_oxide::{mz_adler32_oxide, DataFormat, MZFlush, MZStatus, MZ_ADLER32_INIT};
++
++/// Generate structured payloads: a mix of incompressible noise, single-byte
++/// runs, repeated chunks and text-like data, so the compressor's match
++/// encoding (RLE, near and far matches) is exercised, not just literals.
++#[hegel::composite]
++fn payloads(tc: &hegel::TestCase) -> Vec<u8> {
++    let num_segments = tc.draw(gs::integers::<usize>().max_value(4));
++    let mut data = Vec::new();
++    for _ in 0..num_segments {
++        let segment: Vec<u8> = tc.draw(hegel::one_of!(
++            // Incompressible noise.
++            gs::binary().max_size(2048).boxed(),
++            // A run of a single byte (distance-1 matches / RLE).
++            gs::tuples!(
++                gs::integers::<u8>(),
++                gs::integers::<usize>().min_value(1).max_value(8192)
++            )
++            .map(|(b, n)| vec![b; n])
++            .boxed(),
++            // A short chunk repeated many times (longer-distance matches).
++            gs::tuples!(
++                gs::binary().min_size(1).max_size(64),
++                gs::integers::<usize>().min_value(1).max_value(256)
++            )
++            .map(|(chunk, reps)| chunk.repeat(reps))
++            .boxed(),
++            // Text-like data (typical huffman-friendly distribution).
++            gs::from_regex(r"[a-z,\. ]{0,512}")
++                .map(|s: String| s.into_bytes())
++                .boxed(),
++        ));
++        data.extend_from_slice(&segment);
++    }
++    data
++}
++
++/// Compress `input` with the given raw compressor flags, mirroring what
++/// `compress_to_vec` does internally but for arbitrary flag configurations.
++fn compress_with_flags(input: &[u8], flags: u32) -> Vec<u8> {
++    let mut compressor = Box::new(CompressorOxide::new(flags));
++    let mut output = vec![0; (input.len() / 2).max(64)];
++    let mut in_pos = 0;
++    let mut out_pos = 0;
++    loop {
++        let (status, bytes_in, bytes_out) = compress(
++            &mut compressor,
++            &input[in_pos..],
++            &mut output[out_pos..],
++            TDEFLFlush::Finish,
++        );
++        out_pos += bytes_out;
++        in_pos += bytes_in;
++        match status {
++            TDEFLStatus::Done => {
++                output.truncate(out_pos);
++                return output;
++            }
++            TDEFLStatus::Okay => {
++                if output.len() - out_pos < 64 {
++                    let new_len = output.len() * 2;
++                    output.resize(new_len, 0);
++                }
++            }
++            _ => panic!("compression failed unexpectedly: {:?}", status),
++        }
++    }
++}
++
++/// Run streaming inflate over `input`, feeding at most `max_in_chunk` input
++/// bytes per call and using an output buffer of `out_buf_len` bytes.
++fn stream_inflate_collect(
++    state: &mut InflateState,
++    input: &[u8],
++    max_in_chunk: usize,
++    out_buf_len: usize,
++) -> Result<Vec<u8>, MZError> {
++    let mut out = vec![0u8; out_buf_len];
++    let mut result = Vec::new();
++    let mut pos = 0;
++    loop {
++        let end = (pos + max_in_chunk).min(input.len());
++        let res = inflate(state, &input[pos..end], &mut out, MZFlush::None);
++        pos += res.bytes_consumed;
++        result.extend_from_slice(&out[..res.bytes_written]);
++        match res.status {
++            Ok(MZStatus::StreamEnd) => return Ok(result),
++            Ok(_) => {
++                assert!(
++                    res.bytes_consumed > 0 || res.bytes_written > 0,
++                    "inflate made no progress on a valid stream"
++                );
++            }
++            Err(e) => return Err(e),
++        }
++    }
++}
++
++/// Compress -> decompress is the identity for every compression level, window
++/// setting and strategy accepted by `create_comp_flags_from_zip_params`.
++#[hegel::test]
++fn hegel_roundtrip_any_level_window_strategy(tc: hegel::TestCase) {
++    // -3..=12 covers the "use default level" (< 0) and "clamp to 10" (> 10)
++    // branches of the flag builder as well as all real levels 0-10.
++    let level = tc.draw(gs::integers::<i32>().min_value(-3).max_value(12));
++    let window_bits = tc.draw(gs::sampled_from(vec![-15, -10, -1, 0, 1, 9, 15]));
++    let strategy = tc.draw(gs::integers::<i32>().min_value(0).max_value(4));
++    let payload = tc.draw(payloads());
++
++    let flags = create_comp_flags_from_zip_params(level, window_bits, strategy);
++    let compressed = compress_with_flags(&payload, flags);
++    let result = if window_bits > 0 {
++        decompress_to_vec_zlib(&compressed)
++    } else {
++        decompress_to_vec(&compressed)
++    };
++    let decompressed = result.expect("failed to decompress freshly compressed data");
++    assert_eq!(payload, decompressed);
++}
++
++/// Streaming inflate with tiny drawn input/output buffers agrees with the
++/// one-shot decompression functions.
++#[hegel::test]
++fn hegel_streaming_inflate_tiny_buffers_matches_oneshot(tc: hegel::TestCase) {
++    let payload = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let max_in_chunk = tc.draw(gs::integers::<usize>().min_value(1).max_value(67));
++    let out_buf_len = tc.draw(gs::integers::<usize>().min_value(1).max_value(300));
++
++    let (compressed, format) = if zlib {
++        (compress_to_vec_zlib(&payload, level), DataFormat::Zlib)
++    } else {
++        (compress_to_vec(&payload, level), DataFormat::Raw)
++    };
++    let oneshot = if zlib {
++        decompress_to_vec_zlib(&compressed)
++    } else {
++        decompress_to_vec(&compressed)
++    }
++    .expect("one-shot decompression of a valid stream failed");
++
++    let mut state = InflateState::new_boxed(format);
++    let streamed = stream_inflate_collect(&mut state, &compressed, max_in_chunk, out_buf_len)
++        .expect("streaming decompression of a valid stream failed");
++
++    assert_eq!(streamed, oneshot);
++    assert_eq!(streamed, payload);
++}
++
++/// An `InflateState` can be reused for a fresh stream after any reset policy.
++#[hegel::test]
++fn hegel_inflate_state_reset_reuse(tc: hegel::TestCase) {
++    let first = tc.draw(payloads());
++    let second = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let policy = tc.draw(gs::integers::<u8>().max_value(2));
++
++    let format = if zlib { DataFormat::Zlib } else { DataFormat::Raw };
++    let compress_fn: fn(&[u8], u8) -> Vec<u8> = if zlib {
++        compress_to_vec_zlib
++    } else {
++        compress_to_vec
++    };
++    let mut state = InflateState::new_boxed(format);
++
++    let out_first = stream_inflate_collect(&mut state, &compress_fn(&first, level), 64, 512)
++        .expect("decompressing the first stream failed");
++    assert_eq!(out_first, first);
++
++    match policy {
++        0 => state.reset_as(MinReset),
++        1 => state.reset_as(ZeroReset),
++        _ => state.reset_as(FullReset(format)),
++    }
++
++    let out_second = stream_inflate_collect(&mut state, &compress_fn(&second, level), 64, 512)
++        .expect("decompressing the second stream after reset failed");
++    assert_eq!(out_second, second);
++}
++
++/// Decompressing arbitrary bytes must return, never panic.
++#[hegel::test]
++fn hegel_decompress_arbitrary_bytes_no_panic(tc: hegel::TestCase) {
++    let data = tc.draw(gs::binary().max_size(2048));
++    let zlib = tc.draw(gs::booleans());
++    // The 1 MiB limit protects the test against random input that happens to
++    // decode to a huge output; it is not part of the property.
++    let res = if zlib {
++        decompress_to_vec_zlib_with_limit(&data, 1 << 20)
++    } else {
++        decompress_to_vec_with_limit(&data, 1 << 20)
++    };
++    drop(res);
++}
++
++/// A strict prefix of a valid compressed stream must fail to decompress (the
++/// end-of-stream marker is always cut off), and must never panic.
++#[hegel::test]
++fn hegel_decompress_truncated_stream_errors(tc: hegel::TestCase) {
++    let payload = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let compressed = if zlib {
++        compress_to_vec_zlib(&payload, level)
++    } else {
++        compress_to_vec(&payload, level)
++    };
++    let cut = tc.draw(gs::integers::<usize>().max_value(compressed.len() - 1));
++    let res = if zlib {
++        decompress_to_vec_zlib(&compressed[..cut])
++    } else {
++        decompress_to_vec(&compressed[..cut])
++    };
++    assert!(res.is_err(), "truncated stream decompressed successfully");
++}
++
++/// Flipping any single bit of a valid compressed stream must never cause a
++/// panic when decompressing (it may or may not decode successfully).
++#[hegel::test]
++fn hegel_decompress_bitflip_no_panic(tc: hegel::TestCase) {
++    let payload = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let mut compressed = if zlib {
++        compress_to_vec_zlib(&payload, level)
++    } else {
++        compress_to_vec(&payload, level)
++    };
++    let bit = tc.draw(gs::integers::<usize>().max_value(compressed.len() * 8 - 1));
++    compressed[bit / 8] ^= 1 << (bit % 8);
++    // The limit protects the test against corrupt streams that decode to very
++    // large outputs; the property under test is only "no panic".
++    let res = if zlib {
++        decompress_to_vec_zlib_with_limit(&compressed, 1 << 20)
++    } else {
++        decompress_to_vec_with_limit(&compressed, 1 << 20)
++    };
++    drop(res);
++}
++
++/// `decompress_to_vec_*_with_limit` succeeds iff the limit is at least the
++/// decompressed size, and failure reports `HasMoreOutput` with a partial
++/// output no larger than the limit.
++#[hegel::test]
++fn hegel_decompress_limit_respected(tc: hegel::TestCase) {
++    let payload = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let n = payload.len();
++    // Boost the exact boundary (limit == n) as well as drawing freely around it.
++    let limit = tc.draw(hegel::one_of!(
++        gs::just(n).boxed(),
++        gs::integers::<usize>()
++            .max_value(n.saturating_mul(2) + 8)
++            .boxed(),
++    ));
++    let compressed = if zlib {
++        compress_to_vec_zlib(&payload, level)
++    } else {
++        compress_to_vec(&payload, level)
++    };
++    let res = if zlib {
++        decompress_to_vec_zlib_with_limit(&compressed, limit)
++    } else {
++        decompress_to_vec_with_limit(&compressed, limit)
++    };
++    if limit >= n {
++        assert_eq!(
++            res.expect("data within the limit must decompress"),
++            payload
++        );
++    } else {
++        let err = res.expect_err("limit smaller than the output must fail");
++        assert_eq!(err.status, TINFLStatus::HasMoreOutput);
++        assert!(
++            err.output.len() <= limit,
++            "partial output exceeded the limit"
++        );
++    }
++}
++
++/// The zlib wrapper written by `compress_to_vec_zlib` is structurally valid:
++/// correct header check bits, a deflate body that raw-decompresses to the
++/// input, and a big-endian adler32 trailer matching the input checksum.
++#[hegel::test]
++fn hegel_zlib_wrapper_structure(tc: hegel::TestCase) {
++    let payload = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let compressed = compress_to_vec_zlib(&payload, level);
++    assert!(compressed.len() >= 6);
++
++    // CMF: compression method must be 8 (deflate).
++    assert_eq!(compressed[0] & 0x0f, 8);
++    // (CMF * 256 + FLG) must be divisible by 31 and FDICT must not be set.
++    let header = u16::from_be_bytes([compressed[0], compressed[1]]);
++    assert_eq!(header % 31, 0);
++    assert_eq!(compressed[1] & 0x20, 0);
++
++    // The bytes between header and trailer are a raw deflate stream of the payload.
++    let inner = &compressed[2..compressed.len() - 4];
++    assert_eq!(
++        decompress_to_vec(inner).expect("inner deflate stream invalid"),
++        payload
++    );
++
++    // The trailer is the adler32 of the uncompressed data, big-endian.
++    let trailer = u32::from_be_bytes(compressed[compressed.len() - 4..].try_into().unwrap());
++    assert_eq!(trailer, mz_adler32_oxide(MZ_ADLER32_INIT, &payload));
++}
++
++/// `decompress_slice_iter_to_slice` over drawn chunkings of the compressed
++/// input agrees with one-shot decompression.
++#[hegel::test]
++fn hegel_decompress_slice_iter_chunked(tc: hegel::TestCase) {
++    let payload = tc.draw(payloads());
++    let level = tc.draw(gs::integers::<u8>().max_value(10));
++    let zlib = tc.draw(gs::booleans());
++    let ignore_adler = tc.draw(gs::booleans());
++    let compressed = if zlib {
++        compress_to_vec_zlib(&payload, level)
++    } else {
++        compress_to_vec(&payload, level)
++    };
++    let chunk_size = tc.draw(
++        gs::integers::<usize>()
++            .min_value(1)
++            .max_value(compressed.len()),
++    );
++
++    // One spare output byte is needed when a chunk boundary separates the
++    // final data byte from the remaining stream bytes (end-of-block bits or
++    // the adler32 trailer): issue #110. The exact-size case is pinned as a
++    // known failure in `slice_iter_exact_size_output_chunked_raw_known_failure`
++    // below; this property excludes it so it can keep testing everything else.
++    let out_len = payload.len() + 1;
++    let mut out = vec![0u8; out_len];
++    let written = decompress_slice_iter_to_slice(
++        &mut out,
++        compressed.chunks(chunk_size),
++        zlib,
++        ignore_adler,
++    )
++    .expect("chunked decompression failed");
++    assert_eq!(written, payload.len());
++    assert_eq!(&out[..written], payload.as_slice());
++}
++
++/// KNOWN FAILURE — suspected bug found by the hegel property
++/// `hegel_decompress_slice_iter_chunked` (same root cause as issue #110).
++///
++/// `decompress_slice_iter_to_slice` fails with `HasMoreOutput` on an output
++/// buffer of exactly the decompressed size when a chunk boundary leaves the
++/// end-of-block bits in a later chunk: the core decompressor reports
++/// `HasMoreOutput` (preferred over `NeedsMoreInput` when the output buffer is
++/// full), and the iterator wrapper treats that as fatal instead of trying the
++/// next chunk, even though the remaining input produces no further output.
++/// The same call succeeds with the whole input as a single slice, or with an
++/// output buffer one byte larger.
++#[test]
++fn slice_iter_exact_size_output_chunked_raw_known_failure() {
++    use miniz_oxide::inflate::decompress_slice_iter_to_slice;
++
++    let payload = [0u8];
++    let compressed = compress_to_vec(&payload, 1); // [99, 0, 0]
++    let mut out = [0u8; 1]; // exactly the decompressed size
++    let res = decompress_slice_iter_to_slice(&mut out, compressed.chunks(1), false, false);
++    assert_eq!(
++        res,
++        Ok(1),
++        "exact-size output buffer should suffice (it does for a single slice)"
++    );
++    assert_eq!(out[0], 0);
++}

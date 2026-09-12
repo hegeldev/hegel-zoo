@@ -1,0 +1,1008 @@
+diff --git a/matcher/Cargo.toml b/matcher/Cargo.toml
+index 4b90ddb..9640225 100644
+--- a/matcher/Cargo.toml
++++ b/matcher/Cargo.toml
+@@ -17,3 +17,6 @@ default = ["unicode-normalization", "unicode-casefold", "unicode-segmentation"]
+ unicode-normalization = []
+ unicode-casefold = []
+ unicode-segmentation = ["dep:unicode-segmentation"]
++
++[dev-dependencies]
++hegeltest = "0.44.1"
+diff --git a/matcher/src/pattern/tests.rs b/matcher/src/pattern/tests.rs
+index 88880ba..4cf24ce 100644
+--- a/matcher/src/pattern/tests.rs
++++ b/matcher/src/pattern/tests.rs
+@@ -147,3 +147,108 @@ fn pattern_atoms() {
+         ],
+     )
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self, Generator};
++
++use crate::{Config, Matcher, Utf32Str};
++
++/// Pattern strings biased toward the special syntax (`!`, `^`, `'`, `$`,
++/// escapes, whitespace of several kinds) mixed with matchable content.
++#[hegel::composite]
++fn pattern_string(tc: &hegel::TestCase) -> String {
++    tc.draw(hegel::one_of!(
++        generators::text().max_size(12).boxed(),
++        generators::vecs(generators::sampled_from(vec![
++            'a', 'b', 'A', '1', '!', '^', '\'', '$', '\\', ' ', '\t', '\n', '\u{3000}', 'ä',
++            'Ä', '你', '/',
++        ]))
++        .max_size(12)
++        .map(|v| v.into_iter().collect::<String>())
++        .boxed(),
++    ))
++}
++
++#[hegel::composite]
++fn haystack_item(tc: &hegel::TestCase) -> String {
++    tc.draw(
++        generators::vecs(generators::sampled_from(vec![
++            'a', 'b', 'A', 'B', '1', ' ', '/', '!', '^', '$', '\'', 'ä', '你',
++        ]))
++        .max_size(12),
++    )
++    .into_iter()
++    .collect()
++}
++
++/// `Pattern::parse` accepts arbitrary input without panicking, and
++/// `match_list` is consistent with `Pattern::score`: it returns exactly the
++/// items that score `Some`, with their scores, sorted in descending order.
++#[hegel::test]
++fn prop_pattern_parse_and_match_list_consistent(tc: hegel::TestCase) {
++    let pattern_str = tc.draw(pattern_string());
++    let case = tc.draw((generators::sampled_from(vec![
++        CaseMatching::Respect,
++        CaseMatching::Ignore,
++        CaseMatching::Smart,
++    ])).print_as_debug());
++    let norm = tc.draw((generators::sampled_from(vec![
++        Normalization::Never,
++        Normalization::Smart,
++    ])).print_as_debug());
++    let pattern = Pattern::parse(&pattern_str, case, norm);
++    let items: Vec<String> = tc.draw(generators::vecs(haystack_item()).max_size(6));
++    let mut matcher = Matcher::new(Config::DEFAULT);
++    let matches = pattern.match_list(items.iter().map(|s| s.as_str()), &mut matcher);
++    // sorted by score, descending
++    assert!(
++        matches.windows(2).all(|w| w[0].1 >= w[1].1),
++        "match_list result not sorted by descending score: {matches:?}"
++    );
++    // scores agree with Pattern::score, and left-out items really don't match
++    let mut buf = Vec::new();
++    for &(item, score) in &matches {
++        assert_eq!(
++            pattern.score(Utf32Str::new(item, &mut buf), &mut matcher),
++            Some(score),
++            "match_list score for {item:?} disagrees with Pattern::score"
++        );
++    }
++    for item in &items {
++        if !matches.iter().any(|(m, _)| *m == item.as_str()) {
++            assert_eq!(
++                pattern.score(Utf32Str::new(item, &mut buf), &mut matcher),
++                None,
++                "{item:?} was omitted by match_list but scores Some"
++            );
++        }
++    }
++}
++
++/// `Pattern::score` of a multi-atom pattern is the sum of its atoms' scores
++/// (and `None` as soon as one atom fails) -- this is how the docs describe
++/// multi-word matching.
++#[hegel::test]
++fn prop_pattern_score_is_sum_of_atom_scores(tc: hegel::TestCase) {
++    let pattern_str = tc.draw(pattern_string());
++    let pattern = Pattern::parse(&pattern_str, CaseMatching::Smart, Normalization::Smart);
++    let item = tc.draw(haystack_item());
++    let mut matcher = Matcher::new(Config::DEFAULT);
++    let mut buf = Vec::new();
++    let total = pattern.score(Utf32Str::new(&item, &mut buf), &mut matcher);
++    let mut sum: Option<u32> = Some(0);
++    for atom in &pattern.atoms {
++        let mut buf = Vec::new();
++        match (sum, atom.score(Utf32Str::new(&item, &mut buf), &mut matcher)) {
++            (Some(s), Some(a)) => sum = Some(s + a as u32),
++            _ => sum = None,
++        }
++        if sum.is_none() {
++            break;
++        }
++    }
++    assert_eq!(total, sum, "pattern score != sum of atom scores for {item:?}");
++}
+diff --git a/matcher/src/tests.rs b/matcher/src/tests.rs
+index 32a0240..255585f 100644
+--- a/matcher/src/tests.rs
++++ b/matcher/src/tests.rs
+@@ -9,7 +9,7 @@ use crate::{Config, Matcher};
+ 
+ use Algorithm::*;
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum Algorithm {
+     FuzzyOptimal,
+     FuzzyGreedy,
+@@ -769,3 +769,802 @@ fn umlaut() {
+         .match_list(paths, &mut matcher);
+     assert_eq!(matches.len(), 2);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// The `Matcher` API requires the *needle* to be normalized by the caller
++// (unicode normalization + case folding, see the `Matcher` docs), so every
++// generator below normalizes needle characters exactly like the `pattern`
++// module does before handing them to the matcher.
++// ---------------------------------------------------------------------------
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++
++    use super::Algorithm::{self, *};
++    use crate::chars::Char;
++    use crate::{Config, Matcher, Utf32Str};
++
++    /// Characters chosen to exercise interesting matcher paths: ASCII case
++    /// pairs, digits, delimiters, ASCII and non-ASCII whitespace (including
++    /// '\u{b}' where `char::is_whitespace` and `u8::is_ascii_whitespace`
++    /// disagree), latin characters with an ASCII normalization, simple case
++    /// folding pairs outside latin (Ⲽ/ⲽ, KELVIN SIGN), CJK, combining marks
++    /// and '\r'/'\n' (windows-style newline graphemes).
++    pub(crate) const ALPHABET: &[char] = &[
++        'a', 'b', 'o', 'x', 'A', 'B', 'X', '1', '2', '?', ' ', '\t', '\n', '\r', '\u{b}', '/',
++        ':', '.', '-', '_', 'ä', 'Ä', 'ç', 'Ç', 'ȫ', 'é', 'ß', 'Æ', 'ⲽ', 'Ⲽ', '你', '好',
++        '\u{308}', '\u{85}', '\u{2028}', '\u{212a}',
++    ];
++
++    /// An arbitrary matcher configuration (the config is part of the input
++    /// space: normalization, case folding, path bonuses and prefer_prefix all
++    /// change the matched character comparison and scoring).
++    #[hegel::composite]
++    fn arb_config(tc: &hegel::TestCase) -> Config {
++        let mut config = if tc.draw(generators::booleans()) {
++            Config::DEFAULT
++        } else {
++            Config::DEFAULT.match_paths()
++        };
++        config.normalize = tc.draw(generators::booleans());
++        config.ignore_case = tc.draw(generators::booleans());
++        config.prefer_prefix = tc.draw(generators::booleans());
++        config
++    }
++
++    /// A short string over [`ALPHABET`], biased so that needles derived from
++    /// the same alphabet actually occur in haystacks.
++    #[hegel::composite]
++    fn alphabet_string(tc: &hegel::TestCase, max_len: usize) -> String {
++        tc.draw(generators::vecs(generators::sampled_from(ALPHABET.to_vec())).max_size(max_len))
++            .into_iter()
++            .collect()
++    }
++
++    /// Draw a needle for `haystack`: either a (sparse) subsequence of the
++    /// haystack (likely to match) or an independent alphabet string. The
++    /// result is normalized for `config` as the `Matcher` API requires.
++    fn draw_needle(tc: &hegel::TestCase, haystack: &str, config: &Config) -> String {
++        let raw: Vec<char> = if !haystack.is_empty() && tc.draw(generators::booleans()) {
++            let mut subseq = Vec::new();
++            for c in haystack.chars() {
++                // keep roughly a quarter of the haystack characters
++                if tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++                    subseq.push(c);
++                }
++            }
++            subseq
++        } else {
++            tc.draw(generators::vecs(generators::sampled_from(ALPHABET.to_vec())).max_size(5))
++        };
++        raw.into_iter().map(|c| c.normalize(config)).collect()
++    }
++
++    fn run_match(
++        matcher: &mut Matcher,
++        algo: Algorithm,
++        haystack: Utf32Str<'_>,
++        needle: Utf32Str<'_>,
++    ) -> Option<u16> {
++        match algo {
++            FuzzyOptimal => matcher.fuzzy_match(haystack, needle),
++            FuzzyGreedy => matcher.fuzzy_match_greedy(haystack, needle),
++            Substring => matcher.substring_match(haystack, needle),
++            Prefix => matcher.prefix_match(haystack, needle),
++            Postfix => matcher.postfix_match(haystack, needle),
++            Exact => matcher.exact_match(haystack, needle),
++        }
++    }
++
++    fn run_indices(
++        matcher: &mut Matcher,
++        algo: Algorithm,
++        haystack: Utf32Str<'_>,
++        needle: Utf32Str<'_>,
++        indices: &mut Vec<u32>,
++    ) -> Option<u16> {
++        match algo {
++            FuzzyOptimal => matcher.fuzzy_indices(haystack, needle, indices),
++            FuzzyGreedy => matcher.fuzzy_indices_greedy(haystack, needle, indices),
++            Substring => matcher.substring_indices(haystack, needle, indices),
++            Prefix => matcher.prefix_indices(haystack, needle, indices),
++            Postfix => matcher.postfix_indices(haystack, needle, indices),
++            Exact => matcher.exact_indices(haystack, needle, indices),
++        }
++    }
++
++    /// The haystack as seen by the matcher: every char normalized with the
++    /// same (public, feature-gated) normalization the matcher applies.
++    fn normalized_chars(s: Utf32Str<'_>, config: &Config) -> Vec<char> {
++        s.chars().map(|c| c.normalize(config)).collect()
++    }
++
++    fn is_subsequence(needle: &[char], haystack: &[char]) -> bool {
++        let mut hay = haystack.iter();
++        needle.iter().all(|n| hay.by_ref().any(|h| h == n))
++    }
++
++    /// All window start positions where `needle` matches contiguously.
++    fn window_matches(needle: &[char], haystack: &[char]) -> Vec<usize> {
++        if needle.is_empty() || needle.len() > haystack.len() {
++            return Vec::new();
++        }
++        haystack
++            .windows(needle.len())
++            .enumerate()
++            .filter(|(_, w)| *w == needle)
++            .map(|(i, _)| i)
++            .collect()
++    }
++
++    /// Leading/trailing whitespace that exact/prefix/postfix matching skips.
++    /// Leading whitespace is only skipped when the needle does not itself
++    /// start with whitespace (same for trailing). The matcher classifies
++    /// whitespace with `u8::is_ascii_whitespace` for the Ascii representation
++    /// and `char::is_whitespace` for the Unicode representation; the two
++    /// disagree on '\u{b}', an inconsistency pinned by
++    /// `known_failure_vt_whitespace_trim_depends_on_representation`, so this
++    /// oracle mirrors the representation-specific definition.
++    fn trim_bounds(haystack: Utf32Str<'_>, needle: Utf32Str<'_>) -> (usize, usize) {
++        let is_ws = |c: char| {
++            if haystack.is_ascii() {
++                c.is_ascii_whitespace()
++            } else {
++                c.is_whitespace()
++            }
++        };
++        let hay: Vec<char> = haystack.chars().collect();
++        let mut start = 0;
++        let mut end = hay.len();
++        if !needle.first().is_whitespace() {
++            start = hay.iter().take_while(|&&c| is_ws(c)).count();
++        }
++        if !needle.last().is_whitespace() {
++            end = hay.len() - hay.iter().rev().take_while(|&&c| is_ws(c)).count();
++        }
++        (start, end)
++    }
++
++    /// Input classes excluded from sibling properties because they hit the
++    /// bug pinned by
++    /// `known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle`:
++    /// a needle containing "\r\n" becomes a `Utf32Str::Unicode` whose chars
++    /// are all ASCII, which the matcher rejects against Ascii haystacks.
++    fn hits_known_ascii_unicode_needle_bug(hay: Utf32Str<'_>, needle: Utf32Str<'_>) -> bool {
++        hay.is_ascii() && !needle.is_ascii() && needle.chars().all(|c| c.is_ascii())
++    }
++
++    /// Input classes where `substring_match` is known to miss matches,
++    /// pinned by
++    /// `known_failure_substring_misses_match_at_end_of_unicode_haystack` and
++    /// `known_failure_substring_ascii_ignore_case_prefilter_truncation`.
++    fn hits_known_substring_bugs(
++        hay: Utf32Str<'_>,
++        needle: Utf32Str<'_>,
++        config: &Config,
++    ) -> bool {
++        if needle.is_empty() || needle.len() >= hay.len() {
++            // empty needles trivially match; equal lengths take the exact path
++            return false;
++        }
++        let needle_chars: Vec<char> = needle.chars().collect();
++        let hay_norm = normalized_chars(hay, config);
++        let positions = window_matches(&needle_chars, &hay_norm);
++        if positions.is_empty() {
++            // substring_match never invents matches, only misses them
++            return false;
++        }
++        // the unicode path never looks at the last possible window position
++        if !hay.is_ascii() && positions == vec![hay_norm.len() - needle_chars.len()] {
++            return true;
++        }
++        // the ascii ignore_case prefilter for needles whose first [a-z] char
++        // sits at index >= 2 searches the *whole* needle in a truncated
++        // haystack and misses case-variant matches entirely
++        config.ignore_case
++            && hay.is_ascii()
++            && needle.is_ascii()
++            && needle_chars
++                .iter()
++                .position(|c| c.is_ascii_lowercase())
++                .is_some_and(|p| p >= 2)
++    }
++
++    // -----------------------------------------------------------------------
++    // Properties
++    // -----------------------------------------------------------------------
++
++    /// Fuzzy match indices are a strictly increasing, in-bounds subsequence of
++    /// the haystack whose normalized characters spell out the needle
++    /// (this is the check the existing `assert_matches` helper does for
++    /// hand-picked cases, generalized to arbitrary inputs).
++    #[hegel::test]
++    fn prop_fuzzy_indices_form_matching_subsequence(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        let mut matcher = Matcher::new(config.clone());
++        for algo in [FuzzyOptimal, FuzzyGreedy] {
++            let mut indices = Vec::new();
++            if run_indices(&mut matcher, algo, hay, needle, &mut indices).is_none() {
++                assert!(indices.is_empty(), "{algo:?} pushed indices for a non-match");
++                continue;
++            }
++            let needle_chars: Vec<char> = needle.chars().collect();
++            assert_eq!(
++                indices.len(),
++                needle_chars.len(),
++                "{algo:?}: one index per needle char {indices:?}"
++            );
++            assert!(
++                indices.windows(2).all(|w| w[0] < w[1]),
++                "{algo:?}: indices not strictly increasing: {indices:?}"
++            );
++            for (&i, &nc) in indices.iter().zip(&needle_chars) {
++                assert!((i as usize) < hay.len(), "{algo:?}: index {i} out of bounds");
++                assert_eq!(
++                    hay.get(i).normalize(&config),
++                    nc,
++                    "{algo:?}: index {i} does not map to needle char {nc:?} ({indices:?})"
++                );
++            }
++        }
++    }
++
++    /// Substring/prefix/postfix/exact match indices are one contiguous
++    /// in-bounds run mapping to the needle's characters.
++    #[hegel::test]
++    fn prop_contiguous_kind_indices_form_matching_window(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        let mut matcher = Matcher::new(config.clone());
++        for algo in [Substring, Prefix, Postfix, Exact] {
++            let mut indices = Vec::new();
++            if run_indices(&mut matcher, algo, hay, needle, &mut indices).is_none() {
++                assert!(indices.is_empty(), "{algo:?} pushed indices for a non-match");
++                continue;
++            }
++            let needle_chars: Vec<char> = needle.chars().collect();
++            assert_eq!(
++                indices.len(),
++                needle_chars.len(),
++                "{algo:?}: one index per needle char {indices:?}"
++            );
++            assert!(
++                indices.windows(2).all(|w| w[1] == w[0] + 1),
++                "{algo:?}: indices not contiguous: {indices:?}"
++            );
++            for (&i, &nc) in indices.iter().zip(&needle_chars) {
++                assert!((i as usize) < hay.len(), "{algo:?}: index {i} out of bounds");
++                assert_eq!(
++                    hay.get(i).normalize(&config),
++                    nc,
++                    "{algo:?}: index {i} does not map to needle char {nc:?} ({indices:?})"
++                );
++            }
++        }
++    }
++
++    /// The `.._match` and `.._indices` variants of every algorithm agree:
++    /// same Some/None decision, same score, and indices are produced exactly
++    /// for matches of non-empty needles.
++    #[hegel::test]
++    fn prop_match_and_indices_variants_agree(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        let mut matcher = Matcher::new(config);
++        for algo in [FuzzyOptimal, FuzzyGreedy, Substring, Prefix, Postfix, Exact] {
++            let score_only = run_match(&mut matcher, algo, hay, needle);
++            let mut indices = Vec::new();
++            let score_indices = run_indices(&mut matcher, algo, hay, needle, &mut indices);
++            assert_eq!(score_only, score_indices, "{algo:?}: match/indices disagree");
++            if score_indices.is_some() && !needle.is_empty() {
++                assert!(!indices.is_empty(), "{algo:?}: match without indices");
++            } else {
++                assert!(indices.is_empty(), "{algo:?}: indices without match: {indices:?}");
++            }
++        }
++    }
++
++    /// Fuzzy matching succeeds iff the needle is a subsequence of the
++    /// normalized haystack (naive oracle). Holds for both the optimal and the
++    /// greedy algorithm.
++    #[hegel::test]
++    fn prop_fuzzy_match_iff_subsequence(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // see known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle
++        tc.assume(!hits_known_ascii_unicode_needle_bug(hay, needle));
++        let needle_chars: Vec<char> = needle.chars().collect();
++        let expected = is_subsequence(&needle_chars, &normalized_chars(hay, &config));
++        let mut matcher = Matcher::new(config);
++        for algo in [FuzzyOptimal, FuzzyGreedy] {
++            assert_eq!(
++                run_match(&mut matcher, algo, hay, needle).is_some(),
++                expected,
++                "{algo:?}: {hay:?} vs needle {needle:?} (subsequence oracle says {expected})"
++            );
++        }
++    }
++
++    /// Substring matching succeeds iff the needle matches a contiguous window
++    /// of the normalized haystack (naive oracle).
++    #[hegel::test]
++    fn prop_substring_match_iff_contiguous_window(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // see known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle
++        tc.assume(!hits_known_ascii_unicode_needle_bug(hay, needle));
++        // see hits_known_substring_bugs for the two pinned substring bugs
++        tc.assume(!hits_known_substring_bugs(hay, needle, &config));
++        let needle_chars: Vec<char> = needle.chars().collect();
++        let hay_norm = normalized_chars(hay, &config);
++        let expected =
++            needle_chars.is_empty() || !window_matches(&needle_chars, &hay_norm).is_empty();
++        let mut matcher = Matcher::new(config);
++        assert_eq!(
++            matcher.substring_match(hay, needle).is_some(),
++            expected,
++            "{hay:?} vs needle {needle:?} (window oracle says {expected})"
++        );
++    }
++
++    /// Exact matching succeeds iff the needle equals the normalized haystack
++    /// after skipping whitespace on the sides where the needle itself is not
++    /// whitespace.
++    #[hegel::test]
++    fn prop_exact_match_oracle(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // see known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle
++        tc.assume(!hits_known_ascii_unicode_needle_bug(hay, needle));
++        let needle_chars: Vec<char> = needle.chars().collect();
++        let hay_norm = normalized_chars(hay, &config);
++        let expected = if needle_chars.is_empty() {
++            true
++        } else {
++            let (start, end) = trim_bounds(hay, needle);
++            end >= start && hay_norm[start..end] == needle_chars[..]
++        };
++        let mut matcher = Matcher::new(config);
++        assert_eq!(
++            matcher.exact_match(hay, needle).is_some(),
++            expected,
++            "{hay:?} vs needle {needle:?} (exact oracle says {expected})"
++        );
++    }
++
++    /// Prefix matching succeeds iff the needle matches the normalized
++    /// haystack right after its leading whitespace (which is only skipped
++    /// when the needle does not itself start with whitespace).
++    #[hegel::test]
++    fn prop_prefix_match_oracle(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // see known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle
++        tc.assume(!hits_known_ascii_unicode_needle_bug(hay, needle));
++        let needle_chars: Vec<char> = needle.chars().collect();
++        let hay_norm = normalized_chars(hay, &config);
++        let expected = if needle_chars.is_empty() {
++            true
++        } else {
++            let (start, _) = trim_bounds(hay, needle);
++            start + needle_chars.len() <= hay_norm.len()
++                && hay_norm[start..start + needle_chars.len()] == needle_chars[..]
++        };
++        let mut matcher = Matcher::new(config);
++        assert_eq!(
++            matcher.prefix_match(hay, needle).is_some(),
++            expected,
++            "{hay:?} vs needle {needle:?} (prefix oracle says {expected})"
++        );
++    }
++
++    /// Postfix matching succeeds iff the needle matches the normalized
++    /// haystack right before its trailing whitespace (which is only skipped
++    /// when the needle does not itself end with whitespace).
++    #[hegel::test]
++    fn prop_postfix_match_oracle(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // see known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle
++        tc.assume(!hits_known_ascii_unicode_needle_bug(hay, needle));
++        let needle_chars: Vec<char> = needle.chars().collect();
++        let hay_norm = normalized_chars(hay, &config);
++        let expected = if needle_chars.is_empty() {
++            true
++        } else {
++            let (_, end) = trim_bounds(hay, needle);
++            end >= needle_chars.len() && hay_norm[end - needle_chars.len()..end] == needle_chars[..]
++        };
++        let mut matcher = Matcher::new(config);
++        assert_eq!(
++            matcher.postfix_match(hay, needle).is_some(),
++            expected,
++            "{hay:?} vs needle {needle:?} (postfix oracle says {expected})"
++        );
++    }
++
++    /// The match kinds form a hierarchy: an exact match implies prefix and
++    /// postfix matches, those imply a substring match, and a substring match
++    /// implies both fuzzy matches.
++    #[hegel::test]
++    fn prop_match_kind_hierarchy(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // see known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle
++        tc.assume(!hits_known_ascii_unicode_needle_bug(hay, needle));
++        let mut matcher = Matcher::new(config.clone());
++        let exact = matcher.exact_match(hay, needle).is_some();
++        let prefix = matcher.prefix_match(hay, needle).is_some();
++        let postfix = matcher.postfix_match(hay, needle).is_some();
++        let substring = matcher.substring_match(hay, needle).is_some();
++        let fuzzy = matcher.fuzzy_match(hay, needle).is_some();
++        let greedy = matcher.fuzzy_match_greedy(hay, needle).is_some();
++        assert!(!exact || prefix, "exact match without prefix match: {hay:?} {needle:?}");
++        assert!(!exact || postfix, "exact match without postfix match: {hay:?} {needle:?}");
++        // substring misses some matches, see hits_known_substring_bugs
++        if !hits_known_substring_bugs(hay, needle, &config) {
++            assert!(!prefix || substring, "prefix match without substring match: {hay:?} {needle:?}");
++            assert!(!postfix || substring, "postfix match without substring match: {hay:?} {needle:?}");
++        }
++        assert!(!substring || fuzzy, "substring match without fuzzy match: {hay:?} {needle:?}");
++        assert!(!substring || greedy, "substring match without greedy fuzzy match: {hay:?} {needle:?}");
++        assert!(!prefix || fuzzy, "prefix match without fuzzy match: {hay:?} {needle:?}");
++    }
++
++    /// `fuzzy_match` is documented to find the match with the *highest*
++    /// score, so it can never score below the greedy algorithm (which scores
++    /// one particular match with the same scoring function). Both must agree
++    /// on whether a match exists at all.
++    #[hegel::test]
++    fn prop_optimal_fuzzy_scores_at_least_greedy(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        let hay_str = tc.draw(alphabet_string(30));
++        let needle_str = draw_needle(&tc, &hay_str, &config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_str, &mut needle_buf);
++        // The prefer_prefix bonus is applied inconsistently between the
++        // scoring implementations (missing for single-char needles, rounded
++        // differently between the greedy and the matrix algorithm), so the
++        // greedy score can exceed the "optimal" one; see
++        // known_failure_prefer_prefix_bonus_missing_for_single_char_needle and
++        // known_failure_prefer_prefix_bonus_rounding_differs_between_algorithms
++        tc.assume(!config.prefer_prefix);
++        let mut matcher = Matcher::new(config);
++        let optimal = matcher.fuzzy_match(hay, needle);
++        let greedy = matcher.fuzzy_match_greedy(hay, needle);
++        assert_eq!(
++            optimal.is_some(),
++            greedy.is_some(),
++            "optimal and greedy disagree about {hay:?} vs {needle:?}"
++        );
++        if let (Some(o), Some(g)) = (optimal, greedy) {
++            assert!(o >= g, "optimal score {o} < greedy score {g} for {hay:?} vs {needle:?}");
++        }
++    }
++
++    /// The same ASCII content must match the same way regardless of whether
++    /// it is stored in the `Ascii` or the `Unicode` representation of
++    /// `Utf32Str` (both are public and may be constructed directly).
++    #[hegel::test]
++    fn prop_ascii_and_unicode_representations_agree(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        // '\u{b}' is excluded: the two representations genuinely disagree on
++        // it, see known_failure_vt_whitespace_trim_depends_on_representation
++        let bytes: Vec<u8> = tc
++            .draw(generators::vecs(generators::integers::<u8>().max_value(127)).max_size(30))
++            .into_iter()
++            .map(|b| if b == 0x0B { b' ' } else { b })
++            .collect();
++        let mut needle_bytes: Vec<u8> = if !bytes.is_empty() && tc.draw(generators::booleans()) {
++            let mut subseq = Vec::new();
++            for &b in &bytes {
++                if tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++                    subseq.push(b);
++                }
++            }
++            subseq
++        } else {
++            tc.draw(generators::vecs(generators::integers::<u8>().max_value(127)).max_size(4))
++        };
++        if config.ignore_case {
++            // the Matcher API requires a normalized (here: lowercased) needle
++            needle_bytes.make_ascii_lowercase();
++        }
++        let hay_chars: Vec<char> = bytes.iter().map(|&b| b as char).collect();
++        let hay_ascii = Utf32Str::Ascii(&bytes);
++        let hay_unicode = Utf32Str::Unicode(&hay_chars);
++        let needle = Utf32Str::Ascii(&needle_bytes);
++        let mut matcher = Matcher::new(config);
++        // Substring is skipped: both substring implementations miss matches
++        // in representation-dependent ways, see hits_known_substring_bugs.
++        for algo in [FuzzyOptimal, FuzzyGreedy, Prefix, Postfix, Exact] {
++            if algo == FuzzyOptimal && needle_bytes.len() == 1 {
++                // see known_failure_single_char_needle_score_uses_stale_char_class
++                continue;
++            }
++            let mut indices_ascii = Vec::new();
++            let mut indices_unicode = Vec::new();
++            let res_ascii =
++                run_indices(&mut matcher, algo, hay_ascii, needle, &mut indices_ascii);
++            let res_unicode =
++                run_indices(&mut matcher, algo, hay_unicode, needle, &mut indices_unicode);
++            assert_eq!(
++                res_ascii, res_unicode,
++                "{algo:?}: representations disagree for {hay_ascii:?} vs {needle:?}"
++            );
++            assert_eq!(
++                indices_ascii, indices_unicode,
++                "{algo:?}: indices disagree for {hay_ascii:?} vs {needle:?}"
++            );
++        }
++    }
++
++    /// No algorithm panics on arbitrary unicode haystacks and (normalized)
++    /// needles under arbitrary configurations.
++    #[hegel::test]
++    fn prop_no_panic_on_arbitrary_input(tc: hegel::TestCase) {
++        let config = tc.draw((arb_config()).print_as_debug());
++        // lengths stay well below ~2500 matched chars: longer matches hit a
++        // genuine u16 score overflow panic, pinned by
++        // known_failure_score_overflows_on_long_matches
++        let hay_str: String = tc.draw(hegel::one_of!(
++            generators::text().max_size(400).boxed(),
++            alphabet_string(60).boxed(),
++        ));
++        let needle_raw: String = if tc.draw(generators::booleans()) {
++            draw_needle(&tc, &hay_str, &config)
++        } else {
++            let raw: String = tc.draw(generators::text().max_size(10));
++            raw.chars().map(|c| c.normalize(&config)).collect()
++        };
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&hay_str, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&needle_raw, &mut needle_buf);
++        let mut matcher = Matcher::new(config);
++        let mut indices = Vec::new();
++        for algo in [FuzzyOptimal, FuzzyGreedy, Substring, Prefix, Postfix, Exact] {
++            let _ = run_match(&mut matcher, algo, hay, needle);
++            let _ = run_indices(&mut matcher, algo, hay, needle, &mut indices);
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Pinned known failures (real bugs found by the properties above; kept
++    // failing deterministically on purpose -- do not "fix" the tests)
++    // -----------------------------------------------------------------------
++
++    /// KNOWN FAILURE: `substring_match_non_ascii` computes
++    /// `end = haystack.len() - needle.len()` and iterates `haystack[start..end]`,
++    /// which excludes the last valid window start. A needle that only occurs
++    /// at the very end of a `Unicode` haystack is never found:
++    /// `substring_match("你ab", "ab")` returns `None`.
++    #[test]
++    fn known_failure_substring_misses_match_at_end_of_unicode_haystack() {
++        let mut matcher = Matcher::new(Config::DEFAULT);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new("你ab", &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("ab", &mut needle_buf);
++        assert!(
++            matcher.substring_match(hay, needle).is_some(),
++            "\"ab\" is a substring of \"你ab\" but substring_match misses matches \
++             ending at the end of a Unicode haystack"
++        );
++    }
++
++    /// KNOWN FAILURE: the ascii ignore_case prefilter of
++    /// `substring_match_ascii` (the `Some(len)` branch for needles whose
++    /// first `[a-z]` char sits at index >= 2) searches the *entire* needle
++    /// with memmem inside a haystack truncated by `- needle.len() + len`.
++    /// It therefore misses matches close to the end of the haystack and
++    /// *all* case-insensitive (non-identical) matches:
++    /// both `substring_match("xx12b", "12b")` and
++    /// `substring_match("12Bxx", "12b")` return `None`.
++    #[test]
++    fn known_failure_substring_ascii_ignore_case_prefilter_truncation() {
++        let mut matcher = Matcher::new(Config::DEFAULT); // ignore_case: true
++        let mut hay_buf = Vec::new();
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("12b", &mut needle_buf);
++        let hay = Utf32Str::new("xx12b", &mut hay_buf);
++        assert!(
++            matcher.substring_match(hay, needle).is_some(),
++            "\"12b\" is a substring of \"xx12b\""
++        );
++        let mut hay_buf2 = Vec::new();
++        let hay = Utf32Str::new("12Bxx", &mut hay_buf2);
++        assert!(
++            matcher.substring_match(hay, needle).is_some(),
++            "\"12b\" matches \"12B\" in \"12Bxx\" with ignore_case"
++        );
++    }
++
++    /// KNOWN FAILURE: a needle containing the windows-style newline grapheme
++    /// (e.g. "\r\n", which `Utf32Str::new` turns into `Unicode(['\n'])`)
++    /// consists solely of ASCII chars but uses the `Unicode` representation.
++    /// The matcher hardcodes `(Ascii haystack, Unicode needle) => None`, so
++    /// the needle fails to match even though '\n' occurs in the haystack.
++    #[test]
++    fn known_failure_ascii_haystack_rejects_unicode_variant_ascii_needle() {
++        let mut matcher = Matcher::new(Config::DEFAULT);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new("a\nb", &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("\r\n", &mut needle_buf);
++        assert_eq!(needle.len(), 1, "\"\\r\\n\" is a single grapheme ('\\n')");
++        assert!(
++            matcher.fuzzy_match(hay, needle).is_some(),
++            "the needle is normalized to '\\n' which occurs in \"a\\nb\", but \
++             Unicode-representation needles are rejected against Ascii haystacks"
++        );
++    }
++
++    /// KNOWN FAILURE: whitespace trimming in exact/prefix/postfix matching
++    /// uses `u8::is_ascii_whitespace` for Ascii haystacks but
++    /// `char::is_whitespace` for Unicode haystacks. The two disagree on
++    /// '\u{b}' (vertical tab), so the same leading VT is trimmed or not
++    /// depending on the string *representation*: "\u{b}foo你" prefix-matches
++    /// "foo" but "\u{b}foo" does not.
++    #[test]
++    fn known_failure_vt_whitespace_trim_depends_on_representation() {
++        let mut matcher = Matcher::new(Config::DEFAULT);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("foo", &mut needle_buf);
++        let ascii_hay = Utf32Str::Ascii(b"\x0bfoo");
++        let unicode_chars: Vec<char> = "\u{b}foo".chars().collect();
++        let unicode_hay = Utf32Str::Unicode(&unicode_chars);
++        assert_eq!(
++            matcher.prefix_match(ascii_hay, needle).is_some(),
++            matcher.prefix_match(unicode_hay, needle).is_some(),
++            "the same content must match identically in both representations"
++        );
++    }
++
++    /// KNOWN FAILURE: match scores are accumulated in a `u16` without
++    /// saturation in `calculate_score`, so a long match (roughly >= 2500
++    /// matched chars with whitespace-boundary bonuses) overflows and panics
++    /// in debug builds: "attempt to add with overflow" at score.rs.
++    #[test]
++    fn known_failure_score_overflows_on_long_matches() {
++        let mut matcher = Matcher::new(Config::DEFAULT);
++        let long = " a".repeat(1400);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new(&long, &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new(&long, &mut needle_buf);
++        // panics with "attempt to add with overflow" instead of returning
++        let _ = matcher.exact_match(hay, needle);
++    }
++
++    /// KNOWN FAILURE: `fuzzy_match` is documented to find the match with the
++    /// highest score, but for single-char needles it dispatches to
++    /// `substring_match_1_ascii`/`_non_ascii`, which never apply the
++    /// `prefer_prefix` bonus (`calculate_score` and the matrix algorithm both
++    /// do). With `prefer_prefix` enabled the "optimal" score is therefore
++    /// lower than the greedy score for the very same match:
++    /// found by prop_optimal_fuzzy_scores_at_least_greedy with
++    /// haystack "aa", needle "a", match_paths + prefer_prefix config.
++    #[test]
++    fn known_failure_prefer_prefix_bonus_missing_for_single_char_needle() {
++        let mut config = Config::DEFAULT.match_paths();
++        config.normalize = false;
++        config.ignore_case = false;
++        config.prefer_prefix = true;
++        let mut matcher = Matcher::new(config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new("aa", &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("a", &mut needle_buf);
++        let optimal = matcher.fuzzy_match(hay, needle);
++        let greedy = matcher.fuzzy_match_greedy(hay, needle);
++        assert!(
++            optimal >= greedy,
++            "fuzzy_match must find the highest-scoring match, but returned \
++             {optimal:?} while fuzzy_match_greedy returned {greedy:?}"
++        );
++    }
++
++    /// KNOWN FAILURE: with `prefer_prefix` enabled, `calculate_score` (used
++    /// by the greedy algorithm) computes the prefix bonus as
++    /// `MAX_PREFIX_BONUS - penalty / PREFIX_BONUS_SCALE` while the matrix
++    /// algorithm computes `(MAX_PREFIX_BONUS * PREFIX_BONUS_SCALE - penalty)
++    /// / PREFIX_BONUS_SCALE`, which rounds differently for matches starting
++    /// past the first character. `fuzzy_match` (documented to return the
++    /// highest score) can therefore score below `fuzzy_match_greedy`:
++    /// found by prop_optimal_fuzzy_scores_at_least_greedy with
++    /// haystack "abaa", needle "ba", match_paths + prefer_prefix config
++    /// (optimal 42 vs greedy 43).
++    #[test]
++    fn known_failure_prefer_prefix_bonus_rounding_differs_between_algorithms() {
++        let mut config = Config::DEFAULT.match_paths();
++        config.normalize = false;
++        config.ignore_case = false;
++        config.prefer_prefix = true;
++        let mut matcher = Matcher::new(config);
++        let mut hay_buf = Vec::new();
++        let hay = Utf32Str::new("abaa", &mut hay_buf);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("ba", &mut needle_buf);
++        let optimal = matcher.fuzzy_match(hay, needle);
++        let greedy = matcher.fuzzy_match_greedy(hay, needle);
++        assert!(
++            optimal >= greedy,
++            "fuzzy_match must find the highest-scoring match, but returned \
++             {optimal:?} while fuzzy_match_greedy returned {greedy:?}"
++        );
++    }
++
++    /// KNOWN FAILURE: `substring_match_1_non_ascii` (used by fuzzy and
++    /// substring matching for single-char needles on Unicode haystacks) only
++    /// updates `prev_class` on *matching* characters, so the boundary bonus
++    /// of later candidates is computed against the character class of the
++    /// previous *match* instead of the directly preceding character. The
++    /// ASCII path computes it correctly, so the same content scores
++    /// differently in the two representations: "xa/a" vs needle "a" scores
++    /// the delimiter-boundary match after '/' in the Ascii representation
++    /// but returns the first low-bonus match in the Unicode representation.
++    #[test]
++    fn known_failure_single_char_needle_score_uses_stale_char_class() {
++        let mut matcher = Matcher::new(Config::DEFAULT);
++        let mut needle_buf = Vec::new();
++        let needle = Utf32Str::new("a", &mut needle_buf);
++        let ascii_hay = Utf32Str::Ascii(b"xa/a");
++        let unicode_chars: Vec<char> = "xa/a".chars().collect();
++        let unicode_hay = Utf32Str::Unicode(&unicode_chars);
++        assert_eq!(
++            matcher.fuzzy_match(ascii_hay, needle),
++            matcher.fuzzy_match(unicode_hay, needle),
++            "the same content must score identically in both representations"
++        );
++    }
++}
+diff --git a/matcher/src/utf32_str/tests.rs b/matcher/src/utf32_str/tests.rs
+index a38c887..2af52a9 100644
+--- a/matcher/src/utf32_str/tests.rs
++++ b/matcher/src/utf32_str/tests.rs
+@@ -42,3 +42,63 @@ fn test_grapheme_truncation() {
+     assert_eq!(s.slice(..).get(0), 'u');
+     assert_eq!(s.slice(..).get(1), '\n');
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++/// Strings mixing plain ASCII, windows newlines, combining marks and
++/// multi-codepoint graphemes (the cases the `Utf32Str` docs call out).
++#[hegel::composite]
++fn tricky_string(tc: &hegel::TestCase) -> String {
++    use hegel::generators::{self, Generator};
++    tc.draw(hegel::one_of!(
++        generators::text().max_size(30).boxed(),
++        generators::vecs(generators::sampled_from(vec![
++            'a', 'b', 'A', ' ', '\t', '\n', '\r', 'ä', 'u', '\u{308}', '\u{301}', '你', '🇩',
++            '🇪', '\u{200d}',
++        ]))
++        .max_size(30)
++        .map(|v| v.into_iter().collect::<String>())
++        .boxed(),
++    ))
++}
++
++/// Documented guarantee 3 of `Utf32Str`: the length of a `Utf32Str(ing)`
++/// constructed from a string is exactly the number of graphemes in it.
++#[cfg(feature = "unicode-segmentation")]
++#[hegel::test]
++fn prop_utf32_len_is_grapheme_count(tc: hegel::TestCase) {
++    use unicode_segmentation::UnicodeSegmentation;
++    let s = tc.draw(tricky_string());
++    let expected = s.graphemes(true).count();
++    assert_eq!(
++        Utf32String::from(s.as_str()).len(),
++        expected,
++        "Utf32String::from({s:?}) length != grapheme count"
++    );
++    let mut buf = Vec::new();
++    assert_eq!(
++        Utf32Str::new(&s, &mut buf).len(),
++        expected,
++        "Utf32Str::new({s:?}) length != grapheme count"
++    );
++}
++
++/// Documented guarantees 1 and 2 of `Utf32Str`: a string of ASCII graphemes
++/// (ASCII without "\r\n") produces the `Ascii` variant holding exactly the
++/// original string; everything else produces the `Unicode` variant.
++#[hegel::test]
++fn prop_utf32_ascii_variant_iff_ascii_graphemes(tc: hegel::TestCase) {
++    let s = tc.draw(tricky_string());
++    let ascii_graphemes = s.is_ascii() && !s.contains("\r\n");
++    let utf32 = Utf32String::from(s.as_str());
++    assert_eq!(
++        utf32.slice(..).is_ascii(),
++        ascii_graphemes,
++        "wrong variant for {s:?}"
++    );
++    if ascii_graphemes {
++        assert_eq!(utf32.to_string(), s, "Ascii variant must roundtrip");
++    }
++}

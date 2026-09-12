@@ -1,0 +1,936 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index fd44224..b4ec87b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46,6 +46,8 @@ paste = "1.0.15"
+ cc = "1.2.41"
+ rusqlite = { version = "0.37.0", features = ["bundled"] }
+ concat-idents = "1.1.5"
++hegeltest = "0.44.1"
++tempfile = "3.27.0"
+ 
+ 
+ [features]
+@@ -56,4 +58,4 @@ name = "all"
+ harness = false
+ 
+ [build-dependencies]
+-skeptic = "0.13.7"
+\ No newline at end of file
++skeptic = "0.13.7"
+diff --git a/tests/query/auto_update_sk.rs b/tests/query/auto_update_sk.rs
+index 99e6d46..ede6144 100644
+--- a/tests/query/auto_update_sk.rs
++++ b/tests/query/auto_update_sk.rs
+@@ -163,3 +163,266 @@ fn auto_update_multiple_with_secondary_keys() {
+ 
+     rw.commit().unwrap();
+ }
++
++// --- Property-based tests (hegel) ---
++
++mod pbt_model {
++    use super::{Item, ItemKey};
++    use hegel::generators;
++    use hegel::TestCase;
++    use native_db::*;
++    use once_cell::sync::Lazy;
++    use std::collections::BTreeMap;
++
++    static MODELS: Lazy<Models> = Lazy::new(|| {
++        let mut models = Models::new();
++        models.define::<Item>().unwrap();
++        models
++    });
++
++    // Small key spaces so primary-key collisions, unique-secondary-key conflicts
++    // and multi-item secondary groups all happen regularly.
++    fn draw_id(tc: &TestCase) -> u32 {
++        tc.draw(generators::integers::<u32>().max_value(7))
++    }
++
++    fn draw_name(tc: &TestCase) -> String {
++        tc.draw(generators::sampled_from(vec![
++            "a".to_string(),
++            "b".to_string(),
++            "c".to_string(),
++        ]))
++    }
++
++    fn draw_code(tc: &TestCase) -> String {
++        let n = tc.draw(generators::integers::<u8>().max_value(7));
++        format!("C{n}")
++    }
++
++    fn draw_item(tc: &TestCase) -> Item {
++        Item {
++            id: draw_id(tc),
++            name: draw_name(tc),
++            code: draw_code(tc),
++        }
++    }
++
++    // Stateful model test: the database (u32 primary key, non-unique secondary
++    // key `name`, unique secondary key `code`) must behave exactly like a
++    // BTreeMap<u32, Item>. Each rule runs one operation in its own transaction
++    // (committed on success, aborted on expected failure); the invariant checks
++    // after every step that the primary table and *both* secondary indexes agree
++    // exactly with the model — the classic stale-secondary-index bug surface.
++    struct DbMachine {
++        db: Database<'static>,
++        model: BTreeMap<u32, Item>,
++    }
++
++    #[hegel::state_machine]
++    impl DbMachine {
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let item = draw_item(&tc);
++            let pk_conflict = self.model.contains_key(&item.id);
++            let unique_sk_conflict = self.model.values().any(|other| other.code == item.code);
++            let rw = self.db.rw_transaction().unwrap();
++            let result = rw.insert(item.clone());
++            if pk_conflict || unique_sk_conflict {
++                assert!(
++                    matches!(result, Err(db_type::Error::DuplicateKey { .. })),
++                    "expected DuplicateKey inserting {item:?}, got {result:?}"
++                );
++                rw.abort().unwrap();
++            } else {
++                result.unwrap();
++                rw.commit().unwrap();
++                self.model.insert(item.id, item);
++            }
++        }
++
++        #[rule]
++        fn upsert(&mut self, tc: TestCase) {
++            let item = draw_item(&tc);
++            let unique_sk_conflict = self
++                .model
++                .values()
++                .any(|other| other.code == item.code && other.id != item.id);
++            let rw = self.db.rw_transaction().unwrap();
++            let result = rw.upsert(item.clone());
++            if unique_sk_conflict {
++                assert!(
++                    matches!(result, Err(db_type::Error::DuplicateKey { .. })),
++                    "expected DuplicateKey upserting {item:?}, got {result:?}"
++                );
++                rw.abort().unwrap();
++            } else {
++                let old = result.unwrap();
++                rw.commit().unwrap();
++                assert_eq!(old, self.model.insert(item.id, item));
++            }
++        }
++
++        #[rule]
++        fn auto_update(&mut self, tc: TestCase) {
++            let item = draw_item(&tc);
++            let exists = self.model.contains_key(&item.id);
++            let unique_sk_conflict = self
++                .model
++                .values()
++                .any(|other| other.code == item.code && other.id != item.id);
++            let rw = self.db.rw_transaction().unwrap();
++            let result = rw.auto_update(item.clone());
++            if !exists {
++                assert_eq!(result.unwrap(), None);
++                rw.abort().unwrap();
++            } else if unique_sk_conflict {
++                assert!(
++                    matches!(result, Err(db_type::Error::DuplicateKey { .. })),
++                    "expected DuplicateKey auto-updating {item:?}, got {result:?}"
++                );
++                rw.abort().unwrap();
++            } else {
++                let old = result.unwrap();
++                rw.commit().unwrap();
++                assert_eq!(old, self.model.insert(item.id, item));
++            }
++        }
++
++        #[rule]
++        fn remove_existing(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let keys: Vec<u32> = self.model.keys().copied().collect();
++            let idx = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++            let item = self.model.get(&keys[idx]).unwrap().clone();
++            let rw = self.db.rw_transaction().unwrap();
++            let removed = rw.remove(item.clone()).unwrap();
++            rw.commit().unwrap();
++            assert_eq!(removed, item);
++            self.model.remove(&item.id);
++        }
++
++        #[rule]
++        fn remove_arbitrary(&mut self, tc: TestCase) {
++            let item = draw_item(&tc);
++            let rw = self.db.rw_transaction().unwrap();
++            let result = rw.remove(item.clone());
++            match self.model.get(&item.id) {
++                None => {
++                    assert!(
++                        matches!(result, Err(db_type::Error::KeyNotFound { .. })),
++                        "expected KeyNotFound removing {item:?}, got {result:?}"
++                    );
++                    rw.abort().unwrap();
++                }
++                Some(stored) if *stored != item => {
++                    assert!(
++                        matches!(result, Err(db_type::Error::IncorrectInputData { .. })),
++                        "expected IncorrectInputData removing {item:?}, got {result:?}"
++                    );
++                    rw.abort().unwrap();
++                }
++                Some(_) => {
++                    assert_eq!(result.unwrap(), item);
++                    rw.commit().unwrap();
++                    self.model.remove(&item.id);
++                }
++            }
++        }
++
++        #[rule]
++        fn get_primary(&mut self, tc: TestCase) {
++            let id = draw_id(&tc);
++            let r = self.db.r_transaction().unwrap();
++            let got: Option<Item> = r.get().primary(id).unwrap();
++            assert_eq!(got.as_ref(), self.model.get(&id));
++        }
++
++        #[rule]
++        fn get_secondary_unique(&mut self, tc: TestCase) {
++            let code = draw_code(&tc);
++            let r = self.db.r_transaction().unwrap();
++            let got: Option<Item> = r.get().secondary(ItemKey::code, code.clone()).unwrap();
++            let want = self.model.values().find(|other| other.code == code).cloned();
++            assert_eq!(got, want);
++        }
++
++        #[rule]
++        fn scan_name_equal(&mut self, tc: TestCase) {
++            let name = draw_name(&tc);
++            let r = self.db.r_transaction().unwrap();
++            let got: Vec<Item> = r
++                .scan()
++                .secondary::<Item>(ItemKey::name)
++                .unwrap()
++                .equal(name.clone())
++                .unwrap()
++                .collect::<Result<_, _>>()
++                .unwrap();
++            // BTreeMap iterates in id order, matching the multimap's
++            // primary-key order within one secondary key group.
++            let want: Vec<Item> = self
++                .model
++                .values()
++                .filter(|other| other.name == name)
++                .cloned()
++                .collect();
++            assert_eq!(got, want);
++        }
++
++        #[invariant]
++        fn tables_match_model(&mut self, _tc: TestCase) {
++            let r = self.db.r_transaction().unwrap();
++
++            // Primary table: exact content, in primary-key order.
++            let got: Vec<Item> = r
++                .scan()
++                .primary::<Item>()
++                .unwrap()
++                .all()
++                .unwrap()
++                .collect::<Result<_, _>>()
++                .unwrap();
++            let want: Vec<Item> = self.model.values().cloned().collect();
++            assert_eq!(got, want, "primary table diverged from model");
++            assert_eq!(r.len().primary::<Item>().unwrap(), self.model.len() as u64);
++
++            // Non-unique secondary index `name`: every item exactly once,
++            // ordered by (name, id) — stale entries or missing updates show
++            // up here.
++            let got_by_name: Vec<Item> = r
++                .scan()
++                .secondary::<Item>(ItemKey::name)
++                .unwrap()
++                .all()
++                .unwrap()
++                .collect::<Result<_, _>>()
++                .unwrap();
++            let mut want_by_name = want.clone();
++            want_by_name.sort_by(|x, y| x.name.cmp(&y.name).then(x.id.cmp(&y.id)));
++            assert_eq!(got_by_name, want_by_name, "name index diverged from model");
++
++            // Unique secondary index `code`: every item exactly once, ordered
++            // by code.
++            let got_by_code: Vec<Item> = r
++                .scan()
++                .secondary::<Item>(ItemKey::code)
++                .unwrap()
++                .all()
++                .unwrap()
++                .collect::<Result<_, _>>()
++                .unwrap();
++            let mut want_by_code = want.clone();
++            want_by_code.sort_by(|x, y| x.code.cmp(&y.code));
++            assert_eq!(got_by_code, want_by_code, "code index diverged from model");
++        }
++    }
++
++    #[hegel::test]
++    fn pbt_db_matches_model_machine(tc: TestCase) {
++        let db = Builder::new().create_in_memory(&MODELS).unwrap();
++        hegel::stateful::machine(DbMachine {
++                db,
++                model: BTreeMap::new(),
++            }).run(tc);
++    }
++}
+diff --git a/tests/query/insert_get_pk.rs b/tests/query/insert_get_pk.rs
+index e3c2a2a..8203781 100644
+--- a/tests/query/insert_get_pk.rs
++++ b/tests/query/insert_get_pk.rs
+@@ -35,6 +35,65 @@ fn insert_get() {
+     assert_eq!(item, result_item);
+ }
+ 
++// Property: any item, whatever its primary key and (unicode) payload, can be
++// inserted and read back unchanged by primary key (serialize/deserialize + key
++// encoding round-trip).
++#[hegel::test]
++fn pbt_insert_get_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let id = tc.draw(generators::integers::<u32>());
++    let name = tc.draw(generators::text());
++    let item = Item { id, name };
++
++    let mut models = Models::new();
++    models.define::<Item>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    rw.insert(item.clone()).unwrap();
++    rw.commit().unwrap();
++
++    let r = db.r_transaction().unwrap();
++    let result_item: Item = r.get().primary(id).unwrap().unwrap();
++    assert_eq!(item, result_item);
++}
++
++// Property: inserting a second item with the same primary key always fails with
++// `DuplicateKey` and leaves the first item untouched (generalizes
++// `test_insert_duplicate_key` below).
++#[hegel::test]
++fn pbt_insert_duplicate_pk_rejected_db_unchanged(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let id = tc.draw(generators::integers::<u32>());
++    let first = Item {
++        id,
++        name: tc.draw(generators::text()),
++    };
++    let second = Item {
++        id,
++        name: tc.draw(generators::text()),
++    };
++
++    let mut models = Models::new();
++    models.define::<Item>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    rw.insert(first.clone()).unwrap();
++    let result = rw.insert(second);
++    assert!(
++        matches!(result, Err(db_type::Error::DuplicateKey { .. })),
++        "expected DuplicateKey, got {result:?}"
++    );
++    rw.commit().unwrap();
++
++    let r = db.r_transaction().unwrap();
++    let result_item: Item = r.get().primary(id).unwrap().unwrap();
++    assert_eq!(first, result_item);
++}
++
+ #[test]
+ fn test_insert_duplicate_key() {
+     let tf = TmpFs::new().unwrap();
+diff --git a/tests/query/insert_get_sk.rs b/tests/query/insert_get_sk.rs
+index d3be218..30e77e3 100644
+--- a/tests/query/insert_get_sk.rs
++++ b/tests/query/insert_get_sk.rs
+@@ -164,3 +164,59 @@ fn test_insert_optional() {
+         .unwrap();
+     assert_eq!(item_1, result_item);
+ }
++
++#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
++#[native_model(id = 2, version = 1)]
++#[native_db]
++struct UniqueSkItem {
++    #[primary_key]
++    id: u32,
++    #[secondary_key(unique)]
++    code: u16,
++}
++
++// Property: a `unique` secondary key is enforced — inserting a second item with a
++// different primary key but the same unique secondary key always fails with
++// `DuplicateKey`, and the unique-key lookup keeps returning the first item.
++#[hegel::test]
++fn pbt_unique_secondary_key_enforced(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let id1 = tc.draw(generators::integers::<u32>());
++    // Construct a distinct primary key directly instead of filtering.
++    let offset = tc.draw(generators::integers::<u32>().min_value(1));
++    let id2 = id1.wrapping_add(offset);
++    let code = tc.draw(generators::integers::<u16>());
++
++    let first = UniqueSkItem { id: id1, code };
++    let second = UniqueSkItem { id: id2, code };
++
++    let mut models = Models::new();
++    models.define::<UniqueSkItem>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    rw.insert(first.clone()).unwrap();
++    rw.commit().unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    let result = rw.insert(second);
++    assert!(
++        matches!(result, Err(db_type::Error::DuplicateKey { .. })),
++        "expected DuplicateKey, got {result:?}"
++    );
++    // The failed insert has already written the second item into the primary
++    // table before detecting the unique secondary key conflict, so the
++    // transaction must be aborted, not committed.
++    rw.abort().unwrap();
++
++    let r = db.r_transaction().unwrap();
++    let by_code: UniqueSkItem = r
++        .get()
++        .secondary(UniqueSkItemKey::code, code)
++        .unwrap()
++        .unwrap();
++    assert_eq!(by_code, first);
++    let by_pk: UniqueSkItem = r.get().primary(id1).unwrap().unwrap();
++    assert_eq!(by_pk, first);
++}
+diff --git a/tests/scan.rs b/tests/scan.rs
+index 034dda2..7e97305 100644
+--- a/tests/scan.rs
++++ b/tests/scan.rs
+@@ -1400,3 +1400,191 @@ fn test_sentinel_value_approach() {
+ 
+     println!("\n✅ Sentinel value approach successfully demonstrates queryable 'null' values!");
+ }
++
++// --- Property-based tests (hegel) ---
++
++#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
++#[native_model(id = 20, version = 1)]
++#[native_db]
++struct PkRangeItem {
++    #[primary_key]
++    id: u32,
++    name: String,
++}
++
++// Property: a primary-key range scan returns exactly the items whose primary key
++// falls in the range (compared against a filtered model), in ascending key order.
++//
++// NOTE: the `..=end` (unbounded start, inclusive end) range shape is deliberately
++// excluded here because it is known-buggy — see the canonical failing test
++// `pbt_primary_range_to_inclusive_includes_boundary` below.
++#[hegel::test]
++fn pbt_primary_range_scan_matches_model(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let ids: Vec<u32> = tc.draw(generators::vecs(generators::integers::<u32>()).unique(true));
++
++    let mut models = Models::new();
++    models.define::<PkRangeItem>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    for id in &ids {
++        rw.insert(PkRangeItem {
++            id: *id,
++            name: format!("n{id}"),
++        })
++        .unwrap();
++    }
++    rw.commit().unwrap();
++
++    let a = tc.draw(generators::integers::<u32>());
++    let b = tc.draw(generators::integers::<u32>());
++    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
++    let kind = tc.draw(generators::integers::<u8>().max_value(4));
++
++    let r = db.r_transaction().unwrap();
++    let scan = r.scan().primary::<PkRangeItem>().unwrap();
++    let got: Vec<PkRangeItem> = match kind {
++        0 => scan.range(lo..hi).unwrap().collect::<Result<_, _>>().unwrap(),
++        1 => scan
++            .range(lo..=hi)
++            .unwrap()
++            .collect::<Result<_, _>>()
++            .unwrap(),
++        2 => scan.range(lo..).unwrap().collect::<Result<_, _>>().unwrap(),
++        3 => scan.range(..hi).unwrap().collect::<Result<_, _>>().unwrap(),
++        _ => scan
++            .range((
++                std::ops::Bound::<u32>::Unbounded,
++                std::ops::Bound::<u32>::Unbounded,
++            ))
++            .unwrap()
++            .collect::<Result<_, _>>()
++            .unwrap(),
++    };
++
++    let mut expected: Vec<u32> = ids
++        .iter()
++        .copied()
++        .filter(|id| match kind {
++            0 => (lo..hi).contains(id),
++            1 => (lo..=hi).contains(id),
++            2 => *id >= lo,
++            3 => *id < hi,
++            _ => true,
++        })
++        .collect();
++    expected.sort_unstable();
++
++    let got_ids: Vec<u32> = got.iter().map(|item| item.id).collect();
++    assert_eq!(got_ids, expected);
++}
++
++// KNOWN FAILURE: `range(..=k)` (unbounded start, inclusive end) silently behaves
++// like the exclusive `range(..k)`. `KeyRange::new` in src/db_type/key/key.rs maps
++// `(Bound::Unbounded, Bound::Included(end))` to `KeyRange::RangeTo`, whose end
++// bound is *excluded* (the `KeyRange::RangeToInclusive` variant exists but is
++// never constructed). The stored item whose key equals the inclusive end bound is
++// therefore dropped from the scan. Fails deterministically for every drawn id.
++// The same code path is used by secondary-key range scans and `RwScan`.
++#[hegel::test]
++fn pbt_primary_range_to_inclusive_includes_boundary(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let id = tc.draw(generators::integers::<u32>());
++
++    let mut models = Models::new();
++    models.define::<PkRangeItem>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    rw.insert(PkRangeItem {
++        id,
++        name: "boundary".to_string(),
++    })
++    .unwrap();
++    rw.commit().unwrap();
++
++    let r = db.r_transaction().unwrap();
++    let got: Vec<PkRangeItem> = r
++        .scan()
++        .primary::<PkRangeItem>()
++        .unwrap()
++        .range(..=id)
++        .unwrap()
++        .collect::<Result<_, _>>()
++        .unwrap();
++    assert!(
++        got.iter().any(|item| item.id == id),
++        "range(..={id}) must include the item whose primary key is exactly {id}, got {got:?}"
++    );
++}
++
++#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
++#[native_model(id = 21, version = 1)]
++#[native_db]
++struct SkPrefixItem {
++    #[primary_key]
++    id: u32,
++    #[secondary_key]
++    name: String,
++}
++
++// Property: `start_with` on a String secondary key returns exactly the items whose
++// key field starts with the prefix (a UTF-8 string prefix is exactly a byte
++// prefix), ordered by (secondary key, primary key).
++#[hegel::test]
++fn pbt_secondary_start_with_matches_model(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let names: Vec<String> = tc.draw(generators::vecs(generators::text().max_size(6)));
++    let items: Vec<SkPrefixItem> = names
++        .into_iter()
++        .enumerate()
++        .map(|(i, name)| SkPrefixItem {
++            id: i as u32,
++            name,
++        })
++        .collect();
++
++    let mut models = Models::new();
++    models.define::<SkPrefixItem>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    for item in &items {
++        rw.insert(item.clone()).unwrap();
++    }
++    rw.commit().unwrap();
++
++    // Draw either an arbitrary prefix or a (char-boundary) prefix of a stored name,
++    // so the scan regularly matches something.
++    let prefix: String = if !items.is_empty() && tc.draw(generators::booleans()) {
++        let idx = tc.draw(generators::integers::<usize>().max_value(items.len() - 1));
++        let name = &items[idx].name;
++        let k = tc.draw(generators::integers::<usize>().max_value(name.chars().count()));
++        name.chars().take(k).collect()
++    } else {
++        tc.draw(generators::text().max_size(3))
++    };
++
++    let r = db.r_transaction().unwrap();
++    let got: Vec<SkPrefixItem> = r
++        .scan()
++        .secondary::<SkPrefixItem>(SkPrefixItemKey::name)
++        .unwrap()
++        .start_with(prefix.clone())
++        .unwrap()
++        .collect::<Result<_, _>>()
++        .unwrap();
++
++    let mut expected: Vec<SkPrefixItem> = items
++        .iter()
++        .filter(|item| item.name.starts_with(&prefix))
++        .cloned()
++        .collect();
++    expected.sort_by(|x, y| x.name.cmp(&y.name).then(x.id.cmp(&y.id)));
++
++    assert_eq!(got, expected);
++}
+diff --git a/tests/signed_integer_ordering.rs b/tests/signed_integer_ordering.rs
+index 4d3b95b..6b8f93e 100644
+--- a/tests/signed_integer_ordering.rs
++++ b/tests/signed_integer_ordering.rs
+@@ -368,3 +368,118 @@ fn test_mixed_sign_comparisons() -> Result<(), db_type::Error> {
+ 
+     Ok(())
+ }
++
++// --- Property-based tests (hegel) ---
++
++// Property: a full secondary scan over an i64 key returns items in ascending
++// key order for the *entire* i64 domain, including i64::MIN/MAX (generalizes the
++// hand-picked values in the unit tests above).
++#[hegel::test]
++fn pbt_i64_secondary_scan_sorted(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let values: Vec<i64> = tc.draw(generators::vecs(generators::integers::<i64>()));
++
++    let mut models = Models::new();
++    models.define::<TestI64>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    for (i, value) in values.iter().enumerate() {
++        rw.insert(TestI64 {
++            id: i as u32,
++            value: *value,
++        })
++        .unwrap();
++    }
++    rw.commit().unwrap();
++
++    let r = db.r_transaction().unwrap();
++    let all: Vec<TestI64> = r
++        .scan()
++        .secondary(TestI64Key::value)
++        .unwrap()
++        .all()
++        .unwrap()
++        .collect::<Result<Vec<_>, _>>()
++        .unwrap();
++    let got: Vec<i64> = all.iter().map(|x| x.value).collect();
++
++    // Items with equal keys come back ordered by primary key, i.e. insertion
++    // index here, so a stable sort is the exact model.
++    let mut expected = values.clone();
++    expected.sort();
++    assert_eq!(got, expected);
++}
++
++#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++#[native_model(id = 6, version = 1)]
++#[native_db]
++struct TestF64 {
++    #[primary_key]
++    id: u32,
++    #[secondary_key]
++    value: f64,
++}
++
++// KNOWN FAILURE: f64 keys are encoded as raw IEEE-754 big-endian bytes
++// (`impl_inner_key_value_for_primitive!(f64)` in src/db_type/key/key.rs), which is
++// not order-preserving: every negative float has its sign bit set and therefore
++// sorts *after* every positive float, and negative floats sort in reversed order
++// among themselves. The signed integers received an order-preserving XOR encoding
++// (see the impls just above the float ones), the floats did not. Range scans over
++// float keys are broken the same way. The generator always includes one negative
++// and one positive value, so this fails deterministically on every run.
++#[hegel::test]
++fn pbt_f64_secondary_scan_sorted(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let mut values: Vec<f64> =
++        tc.draw(generators::vecs(generators::floats::<f64>().allow_nan(false)));
++    // Deterministic pin: one guaranteed-negative and one guaranteed-positive value.
++    values.push(tc.draw(
++        generators::floats::<f64>()
++            .min_value(f64::MIN)
++            .max_value(-1.0),
++    ));
++    values.push(tc.draw(
++        generators::floats::<f64>()
++            .min_value(1.0)
++            .max_value(f64::MAX),
++    ));
++
++    let mut models = Models::new();
++    models.define::<TestF64>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    let rw = db.rw_transaction().unwrap();
++    for (i, value) in values.iter().enumerate() {
++        rw.insert(TestF64 {
++            id: i as u32,
++            value: *value,
++        })
++        .unwrap();
++    }
++    rw.commit().unwrap();
++
++    let r = db.r_transaction().unwrap();
++    let all: Vec<TestF64> = r
++        .scan()
++        .secondary(TestF64Key::value)
++        .unwrap()
++        .all()
++        .unwrap()
++        .collect::<Result<Vec<_>, _>>()
++        .unwrap();
++    let got: Vec<f64> = all.iter().map(|x| x.value).collect();
++
++    for w in got.windows(2) {
++        assert!(
++            w[0] <= w[1],
++            "secondary scan over an f64 key must be in ascending key order, \
++             but {} appears before {} (full scan: {got:?})",
++            w[0],
++            w[1]
++        );
++    }
++}
+diff --git a/tests/transaction.rs b/tests/transaction.rs
+index 7f75d07..80ea9c1 100644
+--- a/tests/transaction.rs
++++ b/tests/transaction.rs
+@@ -145,3 +145,109 @@ fn test_transaction_fail() {
+     let result: Option<Item> = r.get().primary(2u32).unwrap();
+     assert!(result.is_none());
+ }
++
++// --- Property-based tests (hegel) ---
++
++// Property: a read-write transaction is atomic. After applying a random batch of
++// insert/upsert/remove operations, committing makes exactly the batch's effects
++// visible, while aborting leaves the database exactly in its pre-transaction
++// state — compared item-by-item against a BTreeMap model.
++#[hegel::test]
++fn pbt_commit_abort_atomicity(tc: hegel::TestCase) {
++    use hegel::generators;
++    use std::collections::BTreeMap;
++
++    let mut models = Models::new();
++    models.define::<Item>().unwrap();
++    let db = Builder::new().create_in_memory(&models).unwrap();
++
++    // Committed base state. Small key space so the ops below regularly collide.
++    let base_ids: Vec<u32> = tc.draw(
++        generators::vecs(generators::integers::<u32>().max_value(15)).unique(true),
++    );
++    let mut base: BTreeMap<u32, Item> = BTreeMap::new();
++    let rw = db.rw_transaction().unwrap();
++    for id in base_ids {
++        let item = Item {
++            id,
++            name: tc.draw(generators::text().max_size(4)),
++        };
++        rw.insert(item.clone()).unwrap();
++        base.insert(id, item);
++    }
++    rw.commit().unwrap();
++
++    // A batch of random operations in a second transaction.
++    let mut expected = base.clone();
++    let rw = db.rw_transaction().unwrap();
++    let n_ops = tc.draw(generators::integers::<usize>().max_value(12));
++    for _ in 0..n_ops {
++        let op = tc.draw(generators::integers::<u8>().max_value(2));
++        let id = tc.draw(generators::integers::<u32>().max_value(15));
++        match op {
++            0 => {
++                // insert: fails on an existing primary key, changes nothing
++                let item = Item {
++                    id,
++                    name: tc.draw(generators::text().max_size(4)),
++                };
++                let result = rw.insert(item.clone());
++                if expected.contains_key(&id) {
++                    assert!(
++                        matches!(result, Err(db_type::Error::DuplicateKey { .. })),
++                        "expected DuplicateKey, got {result:?}"
++                    );
++                } else {
++                    result.unwrap();
++                    expected.insert(id, item);
++                }
++            }
++            1 => {
++                // upsert: always succeeds, returns the previous value
++                let item = Item {
++                    id,
++                    name: tc.draw(generators::text().max_size(4)),
++                };
++                let old = rw.upsert(item.clone()).unwrap();
++                assert_eq!(old, expected.insert(id, item));
++            }
++            _ => {
++                // remove: exact current value if present, otherwise KeyNotFound
++                if let Some(current) = expected.remove(&id) {
++                    let removed = rw.remove(current.clone()).unwrap();
++                    assert_eq!(removed, current);
++                } else {
++                    let result = rw.remove(Item {
++                        id,
++                        name: String::new(),
++                    });
++                    assert!(
++                        matches!(result, Err(db_type::Error::KeyNotFound { .. })),
++                        "expected KeyNotFound, got {result:?}"
++                    );
++                }
++            }
++        }
++    }
++
++    let commit = tc.draw(generators::booleans());
++    let final_expected = if commit {
++        rw.commit().unwrap();
++        expected
++    } else {
++        rw.abort().unwrap();
++        base
++    };
++
++    let r = db.r_transaction().unwrap();
++    let got: Vec<Item> = r
++        .scan()
++        .primary::<Item>()
++        .unwrap()
++        .all()
++        .unwrap()
++        .collect::<Result<_, _>>()
++        .unwrap();
++    let want: Vec<Item> = final_expected.into_values().collect();
++    assert_eq!(got, want);
++}
+diff --git a/tests/util.rs b/tests/util.rs
+index c0c9960..459f908 100644
+--- a/tests/util.rs
++++ b/tests/util.rs
+@@ -113,3 +113,73 @@ fn create_local_database_for_tests() {
+     let len = ro.len().primary::<Item2>().unwrap();
+     assert_eq!(len, 1000);
+ }
++
++// --- Property-based tests (hegel) ---
++
++#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
++#[native_model(id = 3, version = 1)]
++#[native_db]
++struct PersistItem {
++    #[primary_key]
++    id: u32,
++    #[secondary_key]
++    tag: String,
++}
++
++// Property: committed data survives closing and reopening the database file —
++// both the primary table and the secondary index return exactly the inserted
++// items, in key order.
++#[hegel::test]
++fn pbt_reopen_persistence(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let ids: Vec<u32> = tc.draw(generators::vecs(generators::integers::<u32>()).unique(true));
++    let mut items = Vec::with_capacity(ids.len());
++    for id in ids {
++        items.push(PersistItem {
++            id,
++            tag: tc.draw(generators::text().max_size(4)),
++        });
++    }
++
++    let dir = tempfile::tempdir().unwrap();
++    let path = dir.path().join("test_db");
++    let mut models = Models::new();
++    models.define::<PersistItem>().unwrap();
++
++    {
++        let db = Builder::new().create(&models, &path).unwrap();
++        let rw = db.rw_transaction().unwrap();
++        for item in &items {
++            rw.insert(item.clone()).unwrap();
++        }
++        rw.commit().unwrap();
++    } // drop closes the database
++
++    let db = Builder::new().open(&models, &path).unwrap();
++    let r = db.r_transaction().unwrap();
++
++    let got: Vec<PersistItem> = r
++        .scan()
++        .primary::<PersistItem>()
++        .unwrap()
++        .all()
++        .unwrap()
++        .collect::<Result<_, _>>()
++        .unwrap();
++    let mut want = items.clone();
++    want.sort_by_key(|item| item.id);
++    assert_eq!(got, want);
++
++    let got_by_tag: Vec<PersistItem> = r
++        .scan()
++        .secondary::<PersistItem>(PersistItemKey::tag)
++        .unwrap()
++        .all()
++        .unwrap()
++        .collect::<Result<_, _>>()
++        .unwrap();
++    let mut want_by_tag = items.clone();
++    want_by_tag.sort_by(|x, y| x.tag.cmp(&y.tag).then(x.id.cmp(&y.id)));
++    assert_eq!(got_by_tag, want_by_tag);
++}
