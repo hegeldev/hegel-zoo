@@ -1,0 +1,635 @@
+diff --git a/capnp/Cargo.toml b/capnp/Cargo.toml
+index 803f6cdc..004abc6f 100644
+--- a/capnp/Cargo.toml
++++ b/capnp/Cargo.toml
+@@ -20,6 +20,7 @@ quickcheck = { version = "1", optional = true }
+ embedded-io = { version = "0.7.1", default-features = false, optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ quickcheck = "=1.0"
+ 
+ [features]
+diff --git a/capnp/src/serialize.rs b/capnp/src/serialize.rs
+index 165a81a9..d994aac7 100644
+--- a/capnp/src/serialize.rs
++++ b/capnp/src/serialize.rs
+@@ -1114,6 +1114,292 @@ pub mod test {
+         }
+     }
+ 
++    /// Bytes that look vaguely like a serialized message: either completely
++    /// arbitrary bytes, or a syntactically valid segment table followed by an
++    /// arbitrary (possibly truncated, possibly over-long) body.
++    #[hegel::composite]
++    fn message_like_bytes(tc: &hegel::TestCase) -> alloc::vec::Vec<u8> {
++        use hegel::generators;
++        if tc.draw(generators::booleans()) {
++            // Completely arbitrary bytes.
++            tc.draw(generators::binary().max_size(512))
++        } else {
++            // Plausible framing: a well-formed segment table with small
++            // segment sizes, followed by a drawn amount of body bytes.
++            let count = tc.draw(generators::integers::<u32>().min_value(1).max_value(4)) as usize;
++            let mut sizes = alloc::vec::Vec::with_capacity(count);
++            for _ in 0..count {
++                sizes.push(tc.draw(generators::integers::<u32>().max_value(6)));
++            }
++            let mut bytes = alloc::vec::Vec::new();
++            bytes.extend(((count - 1) as u32).to_le_bytes());
++            for s in &sizes {
++                bytes.extend(s.to_le_bytes());
++            }
++            if count % 2 == 0 {
++                bytes.extend([0u8; 4]);
++            }
++            let total_body_bytes = sizes.iter().map(|&s| s as usize).sum::<usize>() * 8;
++            // Sometimes complete, sometimes truncated, sometimes with trailing bytes.
++            let body_len = tc.draw(
++                generators::integers::<usize>().max_value(total_body_bytes + 16),
++            );
++            let body: alloc::vec::Vec<u8> = tc.draw(
++                generators::binary().min_size(body_len).max_size(body_len),
++            );
++            bytes.extend(body);
++            bytes
++        }
++    }
++
++    /// Property: `serialize::read_message` on arbitrary untrusted bytes must
++    /// never panic, and on success must never have allocated more message
++    /// space than the default traversal limit allows (the segment table is
++    /// attacker-controlled, so a huge declared size must be rejected up
++    /// front, not allocated).
++    #[cfg_attr(miri, ignore)] // miri is slow with property tests
++    #[hegel::test]
++    fn hegel_read_message_arbitrary_bytes_robust(tc: hegel::TestCase) {
++        let bytes = tc.draw(message_like_bytes());
++        let mut slice = &bytes[..];
++        match read_message(&mut slice, message::ReaderOptions::new()) {
++            Err(_) => {}
++            Ok(msg) => {
++                let limit = message::DEFAULT_READER_OPTIONS
++                    .traversal_limit_in_words
++                    .expect("default options have a traversal limit");
++                assert!(
++                    msg.size_in_words() <= limit,
++                    "message larger than the default traversal limit was accepted"
++                );
++                // Traversing the (arbitrary) root must not panic either.
++                if let Ok(root) = msg.get_root::<crate::any_pointer::Reader>() {
++                    let _ = root.target_size();
++                }
++            }
++        }
++    }
++
++    /// Property: the segment-table security limits are enforced. A message
++    /// declaring too many segments, or segments whose total size exceeds the
++    /// traversal limit, must be rejected with an error (before any large
++    /// allocation happens). Conversely, a well-formed table with a complete
++    /// body must be accepted.
++    #[cfg_attr(miri, ignore)]
++    #[hegel::test]
++    fn hegel_segment_table_limits_enforced(tc: hegel::TestCase) {
++        use hegel::generators;
++        // Raw count field; actual segment count = raw + 1 (may wrap to 0).
++        let raw_count: u32 = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(600),
++            generators::integers::<u32>(),
++        ));
++        let count = (raw_count.wrapping_add(1)) as usize;
++        let mut bytes = raw_count.to_le_bytes().to_vec();
++
++        let mut declared_total_words: u64 = 0;
++        let mut body_complete = false;
++        if (1..super::SEGMENTS_COUNT_LIMIT).contains(&count) {
++            let mut sizes = alloc::vec::Vec::with_capacity(count);
++            for _ in 0..count {
++                // Attacker-controlled sizes: mostly small, sometimes huge.
++                sizes.push(tc.draw(hegel::one_of!(
++                    generators::integers::<u32>().max_value(8),
++                    generators::integers::<u32>(),
++                )));
++            }
++            for s in &sizes {
++                bytes.extend(s.to_le_bytes());
++            }
++            if count % 2 == 0 {
++                bytes.extend([0u8; 4]);
++            }
++            declared_total_words = sizes.iter().map(|&s| s as u64).sum();
++            // Supply the body only when it is small enough for the test to
++            // materialize (this bound protects the test's memory, not the
++            // library's contract).
++            if declared_total_words <= 64 {
++                body_complete = tc.draw(generators::booleans());
++                let full_len = declared_total_words as usize * 8;
++                let body_len = if body_complete {
++                    full_len
++                } else {
++                    // Truncated body (or exactly full for zero-length bodies,
++                    // in which case it is complete after all).
++                    let l = tc.draw(generators::integers::<usize>().max_value(full_len));
++                    if l == full_len {
++                        body_complete = true;
++                    }
++                    l
++                };
++                bytes.extend(core::iter::repeat(0u8).take(body_len));
++            }
++        } else {
++            // Count is invalid; the reader must reject after the first word,
++            // so the rest of the input shouldn't matter.
++            let junk: alloc::vec::Vec<u8> = tc.draw(generators::binary().max_size(64));
++            bytes.extend(junk);
++        }
++
++        let result = read_message(&mut &bytes[..], message::ReaderOptions::new());
++        let default_limit = message::DEFAULT_READER_OPTIONS
++            .traversal_limit_in_words
++            .expect("default options have a traversal limit") as u64;
++        if count == 0 || count >= super::SEGMENTS_COUNT_LIMIT {
++            assert!(result.is_err(), "invalid segment count {count} was accepted");
++        } else if declared_total_words > default_limit {
++            assert!(
++                result.is_err(),
++                "declared total of {declared_total_words} words exceeds the default \
++                 traversal limit but was not rejected"
++            );
++        } else if body_complete {
++            assert!(
++                result.is_ok(),
++                "well-formed message ({count} segments, {declared_total_words} words) \
++                 was rejected: {:?}",
++                result.err()
++            );
++        } else {
++            assert!(result.is_err(), "message with truncated body was accepted");
++        }
++    }
++
++    /// Property: the allocating and non-allocating flat-slice readers agree.
++    /// For the same (aligned) input bytes they must either both fail or both
++    /// succeed, and on success must produce identical segments and consume
++    /// the same number of bytes.
++    #[cfg_attr(miri, ignore)]
++    #[hegel::test]
++    fn hegel_flat_slice_alloc_and_no_alloc_agree(tc: hegel::TestCase) {
++        let bytes = tc.draw(message_like_bytes());
++        // Copy into 8-byte-aligned storage.
++        let mut words = crate::Word::allocate_zeroed_vec(bytes.len().div_ceil(8));
++        crate::Word::words_to_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(&bytes);
++        let buf = &crate::Word::words_to_bytes(&words)[..bytes.len()];
++
++        let mut s1 = buf;
++        let r1 = read_message_from_flat_slice(&mut s1, message::ReaderOptions::new());
++        let mut s2 = buf;
++        let r2 =
++            super::read_message_from_flat_slice_no_alloc(&mut s2, message::ReaderOptions::new());
++        match (r1, r2) {
++            (Ok(m1), Ok(m2)) => {
++                assert_eq!(s1, s2, "readers consumed different numbers of bytes");
++                let seg1 = m1.into_segments();
++                let seg2 = m2.into_segments();
++                assert_eq!(seg1.len(), seg2.len(), "different segment counts");
++                for i in 0..seg1.len() {
++                    assert_eq!(
++                        seg1.get_segment(i as u32),
++                        seg2.get_segment(i as u32),
++                        "segment {i} differs"
++                    );
++                }
++            }
++            (Err(_), Err(_)) => {}
++            (r1, r2) => panic!(
++                "alloc and no_alloc flat-slice readers disagree: alloc ok = {}, no_alloc ok = {}",
++                r1.is_ok(),
++                r2.is_ok()
++            ),
++        }
++    }
++
++    /// Property: writing arbitrary segments and reading them back from a flat
++    /// slice recovers exactly the original segments, and consumes exactly the
++    /// message's bytes — trailing bytes are left untouched (no over-read, no
++    /// under-read).
++    #[cfg_attr(miri, ignore)]
++    #[hegel::test]
++    fn hegel_write_read_roundtrip_consumes_exactly(tc: hegel::TestCase) {
++        use hegel::generators;
++        let n_segments = tc.draw(generators::integers::<usize>().min_value(1).max_value(7));
++        let mut segments: alloc::vec::Vec<alloc::vec::Vec<crate::Word>> =
++            alloc::vec::Vec::new();
++        for _ in 0..n_segments {
++            let raw: alloc::vec::Vec<u64> =
++                tc.draw(generators::vecs(generators::integers::<u64>()).max_size(20));
++            segments.push(
++                raw.iter()
++                    .map(|w| {
++                        let b = w.to_le_bytes();
++                        crate::word(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7])
++                    })
++                    .collect(),
++            );
++        }
++        let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
++        write_message_segments(&mut bytes, &segments);
++        let junk: alloc::vec::Vec<u8> = tc.draw(generators::binary().max_size(32));
++        bytes.extend_from_slice(&junk);
++
++        // Copy into 8-byte-aligned storage.
++        let mut words = crate::Word::allocate_zeroed_vec(bytes.len().div_ceil(8));
++        crate::Word::words_to_bytes_mut(&mut words)[..bytes.len()].copy_from_slice(&bytes);
++        let buf = &crate::Word::words_to_bytes(&words)[..bytes.len()];
++
++        let mut slice = buf;
++        let msg = read_message_from_flat_slice(&mut slice, message::ReaderOptions::new())
++            .expect("reading back a just-written message should succeed");
++        assert_eq!(slice, &junk[..], "reader did not consume exactly the message");
++        let result_segments = msg.into_segments();
++        assert_eq!(result_segments.len(), n_segments);
++        for (i, segment) in segments.iter().enumerate() {
++            assert_eq!(
++                crate::Word::words_to_bytes(&segment[..]),
++                result_segments
++                    .get_segment(i as u32)
++                    .expect("segment should exist")
++            );
++        }
++    }
++
++    /// Property: data written through the low-level builder API (a primitive
++    /// list and a text root) survives serialization and is recovered exactly
++    /// by the reader.
++    #[cfg_attr(miri, ignore)]
++    #[hegel::test]
++    fn hegel_builder_write_read_roundtrip(tc: hegel::TestCase) {
++        use hegel::generators;
++        // Primitive list root. Draw the length separately so that large,
++        // multi-word lists are actually exercised.
++        let n = tc.draw(generators::integers::<usize>().max_value(300));
++        let values: alloc::vec::Vec<u64> = tc.draw(
++            generators::vecs(generators::integers::<u64>())
++                .min_size(n)
++                .max_size(n),
++        );
++        let mut msg = message::Builder::new_default();
++        {
++            let root: crate::any_pointer::Builder = msg.init_root();
++            let mut list: crate::primitive_list::Builder<u64> =
++                root.initn_as(values.len() as u32);
++            for (i, v) in values.iter().enumerate() {
++                list.set(i as u32, *v);
++            }
++        }
++        let bytes = super::write_message_to_words(&msg);
++        let reader = read_message(&mut &bytes[..], message::ReaderOptions::new())
++            .expect("reading back a built message should succeed");
++        let list: crate::primitive_list::Reader<u64> =
++            reader.get_root().expect("root should be readable");
++        assert_eq!(list.len() as usize, values.len());
++        for (i, v) in values.iter().enumerate() {
++            assert_eq!(list.get(i as u32), *v);
++        }
++
++        // Text root.
++        let s: alloc::string::String = tc.draw(generators::text().max_size(100));
++        let mut msg2 = message::Builder::new_default();
++        msg2.set_root(s.as_str()).expect("set_root should succeed");
++        let bytes2 = super::write_message_to_words(&msg2);
++        let reader2 = read_message(&mut &bytes2[..], message::ReaderOptions::new())
++            .expect("reading back a built message should succeed");
++        let text: crate::text::Reader = reader2.get_root().expect("root should be readable");
++        assert_eq!(s.as_str(), text);
++    }
++
+     #[test]
+     fn compute_serialized_size() {
+         const LIST_LENGTH_IN_WORDS: u32 = 5;
+diff --git a/capnp/src/serialize_packed.rs b/capnp/src/serialize_packed.rs
+index 6e1dd551..28b748d0 100644
+--- a/capnp/src/serialize_packed.rs
++++ b/capnp/src/serialize_packed.rs
+@@ -593,6 +593,165 @@ mod tests {
+         }
+     }
+ 
++    /// A `BufRead` that hands out at most `chunk` bytes at a time, to
++    /// exercise the buffer-refresh paths in `PackedRead::read`.
++    struct Chunked<'a> {
++        data: &'a [u8],
++        chunk: usize,
++    }
++
++    impl<'a> std::io::Read for Chunked<'a> {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            let n = buf.len().min(self.chunk).min(self.data.len());
++            buf[..n].copy_from_slice(&self.data[..n]);
++            self.data = &self.data[n..];
++            Ok(n)
++        }
++    }
++
++    impl<'a> std::io::BufRead for Chunked<'a> {
++        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
++            Ok(&self.data[..self.chunk.min(self.data.len())])
++        }
++        fn consume(&mut self, amt: usize) {
++            self.data = &self.data[amt..];
++        }
++    }
++
++    /// Word-aligned byte strings biased toward the packing format's
++    /// interesting shapes: long runs of zero words (tag 0x00 + run count),
++    /// long runs of all-nonzero words (tag 0xff + uncompressed run), and
++    /// arbitrary words. Run lengths above 255 words exercise run splitting.
++    #[hegel::composite]
++    fn unpacked_words_bytes(tc: &hegel::TestCase) -> alloc::vec::Vec<u8> {
++        use hegel::generators;
++        let n_blocks = tc.draw(generators::integers::<usize>().max_value(6));
++        let mut out = alloc::vec::Vec::new();
++        for _ in 0..n_blocks {
++            match tc.draw(generators::integers::<u8>().max_value(2)) {
++                0 => {
++                    // Run of zero words.
++                    let n = tc.draw(generators::integers::<usize>().max_value(600));
++                    out.extend(core::iter::repeat(0u8).take(n * 8));
++                }
++                1 => {
++                    // Run of all-nonzero words (a drawn seed word, repeated).
++                    let n = tc.draw(generators::integers::<usize>().max_value(600));
++                    let mut seed = [0u8; 8];
++                    for b in &mut seed {
++                        *b = tc.draw(generators::integers::<u8>().min_value(1));
++                    }
++                    for _ in 0..n {
++                        out.extend(seed);
++                    }
++                }
++                _ => {
++                    // Arbitrary words.
++                    let n = tc.draw(generators::integers::<usize>().max_value(32));
++                    let bytes: alloc::vec::Vec<u8> =
++                        tc.draw(generators::binary().min_size(n * 8).max_size(n * 8));
++                    out.extend(bytes);
++                }
++            }
++        }
++        out
++    }
++
++    /// Property: packing is a pure, invertible byte transform — packing any
++    /// word-aligned byte string and then unpacking it (through a reader that
++    /// delivers arbitrarily small chunks) restores the input exactly and
++    /// consumes the entire packed stream.
++    #[cfg_attr(miri, ignore)] // miri is slow with property tests
++    #[hegel::test]
++    fn hegel_pack_unpack_roundtrip(tc: hegel::TestCase) {
++        use hegel::generators;
++        let unpacked = tc.draw(unpacked_words_bytes());
++        let mut packed: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
++        PackedWrite { inner: &mut packed }
++            .write_all(&unpacked)
++            .unwrap();
++
++        let chunk = tc.draw(generators::integers::<usize>().min_value(1).max_value(20));
++        let mut out = vec![0u8; unpacked.len()];
++        let mut packed_read = PackedRead {
++            inner: Chunked {
++                data: &packed,
++                chunk,
++            },
++        };
++        packed_read.read_exact(&mut out).unwrap();
++        assert_eq!(out, unpacked, "pack/unpack roundtrip mismatch");
++        assert!(
++            packed_read.inner.data.is_empty(),
++            "unpacking did not consume the entire packed stream"
++        );
++    }
++
++    /// Property: `serialize_packed::read_message` on arbitrary untrusted
++    /// bytes — including corrupted or truncated versions of valid packed
++    /// messages — must never panic, and on success must respect the default
++    /// traversal limit.
++    #[cfg_attr(miri, ignore)]
++    #[hegel::test]
++    fn hegel_packed_read_arbitrary_bytes_robust(tc: hegel::TestCase) {
++        use hegel::generators::{self, Generator};
++        let data: alloc::vec::Vec<u8> = if tc.draw(generators::booleans()) {
++            // Completely arbitrary bytes.
++            tc.draw(generators::binary().max_size(256))
++        } else {
++            // A valid packed message, then corrupted and/or truncated.
++            let segments: alloc::vec::Vec<alloc::vec::Vec<crate::Word>> = tc.draw(
++                (generators::vecs(
++                    generators::vecs(generators::integers::<u64>())
++                        .max_size(6)
++                        .map(|ws: alloc::vec::Vec<u64>| {
++                            ws.iter()
++                                .map(|w| {
++                                    let b = w.to_le_bytes();
++                                    crate::word(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7])
++                                })
++                                .collect()
++                        }),
++                )
++                .min_size(1)
++                .max_size(4)).print_as_debug(),
++            );
++            let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
++            write_message_segments(&mut PackedWrite { inner: &mut buf }, &segments);
++            if !buf.is_empty() {
++                // Corrupt one byte.
++                let idx = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                buf[idx] = tc.draw(generators::integers::<u8>());
++                // Sometimes also truncate.
++                if tc.draw(generators::booleans()) {
++                    let keep = tc.draw(generators::integers::<usize>().max_value(buf.len()));
++                    buf.truncate(keep);
++                }
++            }
++            buf
++        };
++
++        let chunk = tc.draw(generators::integers::<usize>().min_value(1).max_value(16));
++        match read_message(
++            Chunked {
++                data: &data,
++                chunk,
++            },
++            ReaderOptions::new(),
++        ) {
++            Err(_) => {}
++            Ok(msg) => {
++                let limit = crate::message::DEFAULT_READER_OPTIONS
++                    .traversal_limit_in_words
++                    .expect("default options have a traversal limit");
++                assert!(
++                    msg.size_in_words() <= limit,
++                    "message larger than the default traversal limit was accepted"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn did_not_end_cleanly_on_a_segment_boundary() {
+         let packed = &[0xff, 1, 2, 3, 4, 5, 6, 7, 8, 37, 1, 2];
+diff --git a/capnp/tests/canonicalize.rs b/capnp/tests/canonicalize.rs
+index 43631a63..21968a60 100644
+--- a/capnp/tests/canonicalize.rs
++++ b/capnp/tests/canonicalize.rs
+@@ -482,6 +482,94 @@ fn out_of_bounds_zero_sized_void_list_returns_error() {
+     assert!(message.is_canonical().is_err());
+ }
+ 
++/// A message word biased toward valid-looking pointers: null words, struct
++/// pointers, list pointers, and fully arbitrary words. Small offsets and
++/// sizes keep a useful fraction of the generated messages traversable, which
++/// is what the canonicalization property below needs.
++#[cfg(feature = "alloc")]
++fn draw_plausible_word(tc: &hegel::TestCase) -> capnp::Word {
++    use hegel::generators;
++    match tc.draw(generators::integers::<u8>().max_value(3)) {
++        0 => {
++            // Null word.
++            capnp::word(0, 0, 0, 0, 0, 0, 0, 0)
++        }
++        1 => {
++            // Struct pointer: kind 0, small signed offset, small sections.
++            let offset = tc.draw(generators::integers::<i32>().min_value(-4).max_value(4));
++            let data_words = tc.draw(generators::integers::<u16>().max_value(3));
++            let pointer_words = tc.draw(generators::integers::<u16>().max_value(3));
++            let low = (offset as u32) << 2; // kind bits 00 = struct
++            let high = (data_words as u32) | ((pointer_words as u32) << 16);
++            let l = low.to_le_bytes();
++            let h = high.to_le_bytes();
++            capnp::word(l[0], l[1], l[2], l[3], h[0], h[1], h[2], h[3])
++        }
++        2 => {
++            // List pointer: kind 1, small offset, any element size, small count.
++            let offset = tc.draw(generators::integers::<i32>().min_value(-4).max_value(4));
++            let elem_size = tc.draw(generators::integers::<u32>().max_value(7));
++            let count = tc.draw(generators::integers::<u32>().max_value(24));
++            let low = ((offset as u32) << 2) | 1;
++            let high = (count << 3) | elem_size;
++            let l = low.to_le_bytes();
++            let h = high.to_le_bytes();
++            capnp::word(l[0], l[1], l[2], l[3], h[0], h[1], h[2], h[3])
++        }
++        _ => {
++            // Fully arbitrary word.
++            let b = tc.draw(generators::integers::<u64>()).to_le_bytes();
++            capnp::word(b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7])
++        }
++    }
++}
++
++/// Property: canonicalization is a fixpoint. For any message that
++/// canonicalizes successfully, the canonical form must (a) report itself as
++/// canonical, (b) re-canonicalize to exactly the same words, and (c) if the
++/// original message was already canonical, equal the original words.
++#[cfg(feature = "alloc")]
++#[hegel::test]
++fn hegel_canonicalize_is_fixpoint(tc: hegel::TestCase) {
++    use hegel::generators;
++    let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(12));
++    let words: Vec<capnp::Word> = (0..n).map(|_| draw_plausible_word(&tc)).collect();
++
++    let segments = &[capnp::Word::words_to_bytes(&words)];
++    let segment_array = message::SegmentArray::new(segments);
++    let msg = message::Reader::new(segment_array, Default::default());
++
++    let maybe_is_canonical = msg.is_canonical();
++
++    // Guard: arbitrary pointer soup often fails to traverse; that is fine.
++    // (Null roots and small in-bounds struct roots keep this branch live.)
++    let Ok(canonical_words) = msg.canonicalize() else {
++        return;
++    };
++
++    let canonical_segments = &[capnp::Word::words_to_bytes(&canonical_words)];
++    let canonical_segment_array = message::SegmentArray::new(canonical_segments);
++    let canonical_msg = message::Reader::new(canonical_segment_array, Default::default());
++
++    assert!(
++        canonical_msg.is_canonical().unwrap(),
++        "canonicalize() produced a non-canonical message"
++    );
++    let canonical_again = canonical_msg.canonicalize().unwrap();
++    assert_eq!(
++        canonical_words, canonical_again,
++        "canonicalize() is not a fixpoint"
++    );
++
++    if let Ok(true) = maybe_is_canonical {
++        assert_eq!(
++            &canonical_words[..],
++            &words[..],
++            "message reported canonical but canonicalize() changed it"
++        );
++    }
++}
++
+ #[test]
+ fn far_pointer_to_same_segment() {
+     let segment: &[capnp::Word] = &[
+diff --git a/capnp/tests/total_size.rs b/capnp/tests/total_size.rs
+index bc79b37d..486ebde8 100644
+--- a/capnp/tests/total_size.rs
++++ b/capnp/tests/total_size.rs
+@@ -16,3 +16,52 @@ pub fn total_size_out_of_bounds() {
+ 
+     assert!(result.is_err()); // pointer out-of-bounds error
+ }
++
++/// Property: a message crafted as a deep chain of struct pointers is handled
++/// by the default `ReaderOptions::nesting_limit` (64): traversal returns an
++/// error for chains deeper than the limit instead of overflowing the stack,
++/// and succeeds for chains within the limit.
++#[hegel::test]
++fn hegel_deep_pointer_chain_hits_nesting_limit(tc: hegel::TestCase) {
++    use hegel::generators;
++    // Sweep the boundary region densely and go far past it. Depths in the
++    // thousands are exactly where an unenforced limit would abort the process
++    // with a stack overflow, so they must be drawn deliberately.
++    let depth: usize = tc.draw(hegel::one_of!(
++        generators::integers::<usize>().min_value(1).max_value(130),
++        generators::integers::<usize>().min_value(131).max_value(20_000),
++    ));
++
++    // Each word is a struct pointer with offset 0 (body immediately follows),
++    // no data words, and one pointer field -- so word N's pointer section is
++    // word N+1, forming a chain. The final word is a null pointer.
++    let mut words: Vec<capnp::Word> = Vec::with_capacity(depth + 1);
++    for _ in 0..depth {
++        words.push(capnp::word(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00));
++    }
++    words.push(capnp::word(0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00));
++
++    let segments = &[capnp::Word::words_to_bytes(&words)];
++    let segment_array = capnp::message::SegmentArray::new(segments);
++    let message = capnp::message::Reader::new(segment_array, Default::default());
++    let root: capnp::any_pointer::Reader = message.get_root().unwrap();
++
++    // Must return (Ok or Err) rather than crash, at any depth.
++    let result = root.target_size();
++
++    // A chain of depth == nesting_limit is still accepted (the limit counts
++    // pointer follows); the first rejected depth is nesting_limit + 1.
++    let nesting_limit = capnp::message::DEFAULT_READER_OPTIONS.nesting_limit as usize;
++    if depth <= nesting_limit {
++        assert!(
++            result.is_ok(),
++            "chain of depth {depth} (<= nesting limit {nesting_limit}) was rejected: {:?}",
++            result.err()
++        );
++    } else {
++        assert!(
++            result.is_err(),
++            "chain of depth {depth} (> nesting limit {nesting_limit}) was accepted"
++        );
++    }
++}

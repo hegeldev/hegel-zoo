@@ -1,0 +1,662 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b332515..16f3e86 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -96,6 +96,7 @@ chrono = { version = "0.4", features = ["serde", "clock", "std"], default-featur
+ jiff = { version = "0.2", default-features = false, features = ["std"] }
+ rmp-serde = "1.3"
+ facet-json = "0.46"
++hegeltest = "0.44.1"
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+@@ -106,4 +107,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mongodb_internal_bench)']
+ 
+ [profile.bench]
+ debug = true
+-strip = false
+\ No newline at end of file
++strip = false
+diff --git a/src/raw/test.rs b/src/raw/test.rs
+index 4d392d9..6264736 100644
+--- a/src/raw/test.rs
++++ b/src/raw/test.rs
+@@ -509,3 +509,457 @@ proptest! {
+         prop_assert_eq!(doc, roundtrip);
+     }
+ }
++
++// Hegel property-based tests. These supplement the proptest properties above
++// and the `fuzz/` targets: the fuzz targets explore raw bytes but only run
++// out-of-band, and the proptest round-trip skips several Bson variants
++// (DateTime, Timestamp, Decimal128, DbPointer, Symbol, Undefined, Min/MaxKey,
++// NaN doubles). The hegel generator in `props::hegel_props` covers all of
++// them.
++mod hegel_tests {
++    use hegel::Generator;
++    use std::io::Cursor;
++
++    use super::props::hegel_props::{arbitrary_document, doc_eq_bitwise};
++    use crate::{Bson, Document, RawDocument, RawDocumentBuf};
++    use hegel::generators;
++
++    /// Recursively visit every element reachable from a raw document,
++    /// exercising the lazy parsing paths. Returns Err if any element fails to
++    /// parse. Must never panic.
++    fn walk_raw(doc: &RawDocument) -> crate::error::Result<usize> {
++        let mut count = 0;
++        for elem in doc.iter_elements() {
++            let elem = elem?;
++            count += 1;
++            match elem.value()? {
++                crate::RawBsonRef::Document(d) => count += walk_raw(d)?,
++                crate::RawBsonRef::Array(a) => {
++                    count += walk_raw(RawDocument::from_bytes(a.as_bytes())?)?
++                }
++                crate::RawBsonRef::JavaScriptCodeWithScope(c) => count += walk_raw(c.scope)?,
++                _ => {}
++            }
++        }
++        Ok(count)
++    }
++
++    /// extJSON equality on `Bson`. Like `bson_eq_bitwise`, but doubles are
++    /// compared value-wise with NaN treated as equal to NaN regardless of
++    /// sign/payload: canonical extJSON serializes NaN as the string "NaN"
++    /// (or "-NaN"), which does not preserve the NaN payload — documented
++    /// lossiness of the text format, not a bug.
++    #[cfg(feature = "serde_json-1")]
++    fn bson_eq_extjson(a: &Bson, b: &Bson) -> bool {
++        match (a, b) {
++            (Bson::Double(x), Bson::Double(y)) => {
++                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
++            }
++            (Bson::Array(x), Bson::Array(y)) => {
++                x.len() == y.len() && std::iter::zip(x, y).all(|(u, v)| bson_eq_extjson(u, v))
++            }
++            (Bson::Document(x), Bson::Document(y)) => doc_eq_extjson(x, y),
++            (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => {
++                x.code == y.code && doc_eq_extjson(&x.scope, &y.scope)
++            }
++            (x, y) => x == y,
++        }
++    }
++
++    #[cfg(feature = "serde_json-1")]
++    fn doc_eq_extjson(a: &Document, b: &Document) -> bool {
++        a.len() == b.len()
++            && std::iter::zip(a, b).all(|((ka, va), (kb, vb))| ka == kb && bson_eq_extjson(va, vb))
++    }
++
++    /// Round-trip through canonical extended JSON:
++    /// `Bson -> into_canonical_extjson() -> serde_json::Value -> Bson::try_from`
++    /// recovers the original value (modulo documented double/NaN lossiness and
++    /// with Decimal128 excluded — see `arbitrary_bson_leaf`). Also checks that
++    /// the relaxed form parses back without panicking.
++    #[cfg(feature = "serde_json-1")]
++    #[hegel::test]
++    fn hegel_extjson_canonical_roundtrip(tc: hegel::TestCase) {
++        // allow_decimal128 = false: extJSON round-trips Decimal128 lossily.
++        let doc = tc.draw(arbitrary_document(3, false));
++        let original = Bson::Document(doc);
++
++        let canonical = original.clone().into_canonical_extjson();
++        let recovered = Bson::try_from(canonical.clone())
++            .expect("canonical extJSON produced by the crate should parse back");
++        assert!(
++            bson_eq_extjson(&original, &recovered),
++            "canonical extJSON roundtrip mismatch:\n  original: {original:?}\n  extjson: \
++             {canonical}\n  recovered: {recovered:?}"
++        );
++
++        // The relaxed form need not round-trip losslessly (it collapses type
++        // information), but it must parse back without panicking.
++        let relaxed = original.into_relaxed_extjson();
++        let _ = Bson::try_from(relaxed);
++    }
++
++    /// Round-trip: an arbitrary `Document` (all Bson variants, nested
++    /// containers) serialized with `to_vec`/`to_writer` and parsed back via
++    /// both `RawDocumentBuf::from_bytes` and `Document::from_reader` is
++    /// bitwise-identical to the original.
++    #[hegel::test]
++    fn hegel_document_roundtrip(tc: hegel::TestCase) {
++        let doc = tc.draw((arbitrary_document(3, true)).print_as_debug());
++
++        let bytes = doc.to_vec().expect("valid document should serialize");
++
++        // to_writer must produce the same bytes as to_vec.
++        let mut written = Vec::new();
++        doc.to_writer(&mut written)
++            .expect("valid document should serialize");
++        assert_eq!(bytes, written);
++
++        // Parsed (eager) path.
++        let raw = RawDocumentBuf::from_bytes(bytes.clone()).expect("self-produced bytes");
++        let roundtrip = Document::try_from(raw).expect("self-produced bytes should parse");
++        assert!(
++            doc_eq_bitwise(&doc, &roundtrip),
++            "roundtrip mismatch:\n  original: {doc:?}\n  roundtrip: {roundtrip:?}"
++        );
++
++        // Reader path (exercises reader_to_vec length handling).
++        let from_reader =
++            Document::from_reader(Cursor::new(&bytes)).expect("self-produced bytes should parse");
++        assert!(doc_eq_bitwise(&doc, &from_reader));
++    }
++
++    /// Untrusted input: decoding fully arbitrary bytes (raw or length-prefixed
++    /// garbage) returns Err or Ok but never panics, and every lazily-parsed
++    /// element can be visited without panicking.
++    #[hegel::test]
++    fn hegel_decode_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++        // Three flavours of input, so both the reject path (garbage) and the
++        // accept-then-walk path (valid documents, and valid documents with a
++        // few bytes flipped) are exercised.
++        let bytes: Vec<u8> = tc.draw(hegel::one_of!(
++            // (a) pure garbage
++            generators::binary().max_size(64),
++            // (b) garbage with a plausible little-endian length prefix
++            hegel::compose!(|tc| {
++                let tail: Vec<u8> = tc.draw(generators::binary().max_size(60));
++                let claimed = tc.draw(
++                    generators::integers::<i32>()
++                        .min_value(-1)
++                        .max_value(tail.len() as i32 + 5),
++                );
++                let mut b = claimed.to_le_bytes().to_vec();
++                b.extend(tail);
++                b
++            }),
++            // (c) a genuinely valid document, optionally with k byte-flips
++            hegel::compose!(|tc| {
++                let doc = tc.draw((arbitrary_document(2, true)).print_as_debug());
++                let mut b = doc.to_vec().expect("valid document should serialize");
++                let flips = tc.draw(generators::integers::<usize>().max_value(3));
++                for _ in 0..flips {
++                    let idx = tc.draw(generators::integers::<usize>().max_value(b.len() - 1));
++                    b[idx] = tc.draw(generators::integers::<u8>());
++                }
++                b
++            }),
++        ));
++
++        if let Ok(raw) = RawDocument::from_bytes(&bytes) {
++            let _ = walk_raw(raw);
++            let _ = Document::try_from(raw);
++        }
++        let _ = RawDocumentBuf::from_bytes(bytes.clone());
++        let _ = Document::from_reader(Cursor::new(&bytes));
++        #[cfg(feature = "serde")]
++        {
++            let _ = crate::deserialize_from_slice::<Document>(&bytes);
++        }
++    }
++
++    /// Untrusted input: corrupting the length prefix of a valid document is
++    /// always detected by `RawDocument::from_bytes` (which documents that the
++    /// prefix must match the slice length), and never causes a panic or a
++    /// huge allocation in `Document::from_reader`.
++    #[hegel::test]
++    fn hegel_length_prefix_corruption_rejected(tc: hegel::TestCase) {
++        let doc = tc.draw((arbitrary_document(2, true)).print_as_debug());
++        let mut bytes = doc.to_vec().expect("valid document should serialize");
++        let real_len = bytes.len() as i32;
++
++        // Mix arbitrary lengths with boundary values (negative, zero, huge).
++        let corrupted_len = tc.draw(hegel::one_of!(
++            generators::integers::<i32>(),
++            generators::sampled_from(vec![
++                i32::MIN,
++                -1,
++                0,
++                4,
++                5,
++                real_len - 1,
++                real_len + 1,
++                i32::MAX - 1,
++                i32::MAX,
++            ]),
++        ));
++        tc.assume(corrupted_len != real_len);
++        bytes[0..4].copy_from_slice(&corrupted_len.to_le_bytes());
++
++        // A slice whose length disagrees with its prefix must be rejected.
++        assert!(
++            RawDocument::from_bytes(&bytes).is_err(),
++            "length prefix {corrupted_len} != actual {real_len} was accepted"
++        );
++        assert!(RawDocumentBuf::from_bytes(bytes.clone()).is_err());
++
++        // The reader API reads exactly the claimed length from the stream, so
++        // a *smaller* (but still valid) claimed length may legitimately parse
++        // a prefix of the stream. It must never panic, and a claimed length
++        // that is negative, too small, or beyond the available bytes must be
++        // an error.
++        let result = Document::from_reader(Cursor::new(&bytes));
++        if corrupted_len < 5 || corrupted_len > real_len {
++            assert!(
++                result.is_err(),
++                "claimed length {corrupted_len} (actual {real_len}) returned Ok"
++            );
++        }
++    }
++
++    /// Untrusted input: flipping a single byte of a valid document never
++    /// causes a panic in either the raw (lazy) or parsed (eager) pipeline,
++    /// and (with serde) the serde deserializer agrees with the eager parser
++    /// on accept/reject and on the parsed value.
++    #[hegel::test]
++    fn hegel_single_byte_mutation_never_panics(tc: hegel::TestCase) {
++        let doc = tc.draw((arbitrary_document(2, true)).print_as_debug());
++        let mut bytes = doc.to_vec().expect("valid document should serialize");
++
++        let idx = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++        let new_byte = tc.draw(generators::integers::<u8>());
++        bytes[idx] = new_byte;
++
++        let eager: Option<Document> = match RawDocument::from_bytes(&bytes) {
++            Ok(raw) => {
++                let _ = walk_raw(raw);
++                Document::try_from(raw).ok()
++            }
++            Err(_) => None,
++        };
++
++        #[cfg(feature = "serde")]
++        {
++            let serde_doc = crate::deserialize_from_slice::<Document>(&bytes).ok();
++            match (&eager, &serde_doc) {
++                (Some(e), Some(s)) => assert!(
++                    doc_eq_bitwise(e, s),
++                    "eager and serde parsers disagree on value:\n  eager: {e:?}\n  serde: {s:?}"
++                ),
++                (None, None) => {}
++                (e, s) => panic!(
++                    "eager and serde parsers disagree on accept/reject for bytes {bytes:?}:\n  \
++                     eager: {e:?}\n  serde: {s:?}"
++                ),
++            }
++        }
++        let _ = eager;
++    }
++
++    /// Duplicate keys and insertion order are preserved exactly by the raw
++    /// append/iterate cycle (the raw layer, unlike `Document`, is not a map).
++    #[hegel::test]
++    fn hegel_raw_append_iterate_roundtrip(tc: hegel::TestCase) {
++        use super::props::hegel_props::{arbitrary_bson, cstring_text};
++        use crate::{RawBson, raw::CString};
++
++        let pairs: Vec<(String, Bson)> = tc.draw(
++            (generators::vecs(generators::tuples!(cstring_text(), arbitrary_bson(1, true)))
++                .max_size(8)).print_as_debug(),
++        );
++
++        let mut buf = RawDocumentBuf::new();
++        let mut expected = Vec::new();
++        for (k, v) in pairs {
++            let key = CString::try_from(k).expect("cstring_text contains no NUL");
++            let raw: RawBson = v.try_into().expect("generated Bson converts to RawBson");
++            buf.append(&key, raw.clone());
++            expected.push((key, raw));
++        }
++
++        let mut iterated = Vec::new();
++        for elem in buf.iter() {
++            let (k, v) = elem.expect("appended document should iterate cleanly");
++            iterated.push((k.to_string(), RawBson::from(v)));
++        }
++
++        assert_eq!(iterated.len(), expected.len());
++        for ((ik, iv), (ek, ev)) in std::iter::zip(&iterated, &expected) {
++            assert_eq!(ik, ek.as_str());
++            assert!(
++                raw_bson_eq_bitwise(iv, ev),
++                "appended value differs after iteration:\n  appended: {ev:?}\n  iterated: {iv:?}"
++            );
++        }
++    }
++
++    /// Bitwise-double-aware equality for RawBson (NaN payloads must survive).
++    fn raw_bson_eq_bitwise(a: &crate::RawBson, b: &crate::RawBson) -> bool {
++        use crate::RawBson;
++        match (a, b) {
++            (RawBson::Double(x), RawBson::Double(y)) => x.to_bits() == y.to_bits(),
++            (x, y) => x == y,
++        }
++    }
++
++    /// Untrusted input: a string value containing invalid UTF-8 is rejected
++    /// by the strict parsed API (never a panic, never silent acceptance),
++    /// while the documented lossy API accepts it.
++    #[hegel::test]
++    fn hegel_invalid_utf8_string_rejected(tc: hegel::TestCase) {
++        let payload: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(24));
++        let corrupt_at = tc.draw(generators::integers::<usize>().max_value(payload.len() - 1));
++        // Bytes that can never appear anywhere in valid UTF-8.
++        let bad_byte = tc.draw(generators::sampled_from(vec![
++            0xC0u8, 0xC1, 0xF5, 0xF6, 0xF7, 0xF8, 0xFE, 0xFF,
++        ]));
++        let mut payload = payload;
++        payload[corrupt_at] = bad_byte;
++
++        // Hand-assemble { "k": <payload as string> } so lengths stay valid.
++        let mut bytes = Vec::new();
++        bytes.extend(0i32.to_le_bytes()); // placeholder for total length
++        bytes.push(0x02); // string element type
++        bytes.extend(b"k\0");
++        bytes.extend(((payload.len() + 1) as i32).to_le_bytes());
++        bytes.extend(&payload);
++        bytes.push(0); // string null terminator
++        bytes.push(0); // document null terminator
++        let total = bytes.len() as i32;
++        bytes[0..4].copy_from_slice(&total.to_le_bytes());
++
++        let raw = RawDocument::from_bytes(&bytes).expect("structurally valid document");
++
++        // Strict accessors must reject, not panic and not accept.
++        assert!(raw.get_str("k").is_err(), "invalid UTF-8 accepted as &str");
++        assert!(
++            Document::try_from(raw).is_err(),
++            "invalid UTF-8 accepted by Document conversion"
++        );
++
++        // The lossy API must accept the same bytes.
++        let lossy = crate::Utf8Lossy::<Document>::try_from(raw)
++            .expect("utf8-lossy conversion should accept invalid UTF-8 in string values");
++        assert!(matches!(lossy.0.get("k"), Some(Bson::String(_))));
++    }
++
++    /// A document key containing an interior NUL cannot be encoded: `to_vec`
++    /// must return Err (keys are cstrings on the wire), never panic and never
++    /// silently truncate.
++    #[hegel::test]
++    fn hegel_nul_key_rejected(tc: hegel::TestCase) {
++        use super::props::hegel_props::cstring_text;
++
++        let prefix = tc.draw(cstring_text());
++        let suffix = tc.draw(cstring_text());
++        let key = format!("{prefix}\0{suffix}");
++        let value = tc.draw((super::props::hegel_props::arbitrary_bson_leaf(true)).print_as_debug());
++
++        let mut doc = Document::new();
++        doc.insert(key, value);
++
++        assert!(
++            doc.to_vec().is_err(),
++            "key with interior NUL was serialized"
++        );
++        let mut sink = Vec::new();
++        assert!(doc.to_writer(&mut sink).is_err());
++    }
++
++    /// Deeply nested documents/arrays parse (or error) without crashing the
++    /// process. The bytes are built iteratively, so only the decoder recurses.
++    /// Builds the bytes of a document nested `depth` levels deep, each level
++    /// being `{ "a": <inner> }` (or a single-element array). Built iteratively
++    /// so only the *decoder* recurses, never this helper.
++    pub(crate) fn nested_doc_bytes(depth: u32, as_array: bool) -> Vec<u8> {
++        let elem_type: u8 = if as_array { 0x04 } else { 0x03 };
++        let mut inner: Vec<u8> = vec![5, 0, 0, 0, 0];
++        for _ in 0..depth {
++            let mut outer = Vec::with_capacity(inner.len() + 8);
++            outer.extend(((inner.len() + 8) as i32).to_le_bytes());
++            outer.push(elem_type);
++            outer.extend(b"a\0");
++            outer.extend(&inner);
++            outer.push(0);
++            inner = outer;
++        }
++        inner
++    }
++
++    /// Moderately nested documents/arrays round-trip through the eager parser
++    /// and re-serialization without crashing.
++    ///
++    /// NOTE: the depth here is deliberately capped at 30, well below the
++    /// levels at which the decoders overflow the stack — ~282 for
++    /// `Document::try_from`, and even shallower (~60-80 in a debug build) for
++    /// the serde path exercised below. See the
++    /// `hegel_deep_nesting_stack_overflow` reproducer for that KNOWN FAILURE.
++    /// This sibling stays in the safe region so it keeps testing the no-crash
++    /// property on inputs the crate actually handles.
++    #[hegel::test]
++    fn hegel_deep_nesting_no_crash(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<u32>().min_value(1).max_value(30));
++        let as_array = tc.draw(generators::booleans());
++        let bytes = nested_doc_bytes(depth, as_array);
++
++        let raw = RawDocument::from_bytes(&bytes).expect("structurally valid document");
++        let _ = walk_raw(raw);
++        let parsed = Document::try_from(raw).expect("nested document should parse");
++
++        // The eager tree must survive re-serialization. For the document
++        // case the bytes are identical; for arrays the re-encoding uses
++        // positional index keys ("0") instead of our synthetic "a" key, so we
++        // only assert byte-for-byte equality in the document case and check a
++        // re-parse round-trip otherwise.
++        let reencoded = parsed
++            .to_vec()
++            .expect("parsed document should re-serialize");
++        if as_array {
++            let reparsed = Document::from_reader(std::io::Cursor::new(&reencoded))
++                .expect("re-encoded document should parse");
++            assert!(doc_eq_bitwise(&parsed, &reparsed));
++        } else {
++            assert_eq!(reencoded, bytes);
++        }
++
++        #[cfg(feature = "serde")]
++        {
++            let _ = crate::deserialize_from_slice::<Document>(&bytes);
++        }
++    }
++}
++
++/// KNOWN FAILURE (process-aborting bug): decoding a deeply nested BSON
++/// document with the parsed API recurses without a depth limit and overflows
++/// the stack (SIGABRT), rather than returning an `Err`. This is the classic
++/// untrusted-decoder DoS: `RawDocument::from_bytes` accepts the bytes (it does
++/// not recurse), but `Document::try_from` / `Document::from_reader` recurse one
++/// stack frame per nesting level and abort the whole process at ~282 levels in
++/// a debug build. The serde path (`deserialize_from_slice`) is affected too and
++/// overflows even shallower — around 60-80 levels in a debug build.
++///
++/// Kept `#[ignore]`d because a stack overflow aborts the entire test binary,
++/// which would take the rest of the suite down with it. Depth 5000 reproduces
++/// on every run and comfortably across build profiles. `unwrap`s here are
++/// intentional: they document that the crash happens *before* they are reached.
++#[test]
++#[ignore = "KNOWN FAILURE: unbounded recursion in BSON decode overflows the stack (process abort)"]
++fn hegel_deep_nesting_stack_overflow() {
++    let bytes = hegel_tests::nested_doc_bytes(5000, false);
++    // from_bytes does not recurse, so this part succeeds.
++    let raw = RawDocument::from_bytes(&bytes).expect("from_bytes does not recurse");
++    // This recurses one frame per level and overflows the stack.
++    let result = crate::Document::try_from(raw);
++    // Unreachable: the process aborts above. If the bug is fixed, the decoder
++    // should return an Err (or Ok) here rather than crashing.
++    assert!(result.is_err(), "expected a depth-limit error, not a crash");
++}
+diff --git a/src/raw/test/props.rs b/src/raw/test/props.rs
+index 6346d55..8ec2453 100644
+--- a/src/raw/test/props.rs
++++ b/src/raw/test/props.rs
+@@ -58,3 +58,176 @@ pub(crate) fn arbitrary_bson() -> impl Strategy<Value = Bson> {
+         ]
+     })
+ }
++
++/// Hegel generators for arbitrary BSON values and documents, used by the
++/// `hegel_*` property-based tests in `raw/test.rs`.
++pub(crate) mod hegel_props {
++    use hegel::generators::{self, BoxedGenerator, Generator};
++
++    use crate::{
++        Binary,
++        Bson,
++        DateTime,
++        DbPointer,
++        Decimal128,
++        Document,
++        JavaScriptCodeWithScope,
++        Regex,
++        Timestamp,
++        oid::ObjectId,
++        spec::BinarySubtype,
++    };
++
++    /// A string usable anywhere BSON requires a cstring (document keys, regex
++    /// patterns/options): arbitrary text with interior NULs mapped away.
++    #[hegel::composite]
++    pub(crate) fn cstring_text(tc: &hegel::TestCase) -> String {
++        // Replacing rather than filtering keeps the rejection rate at zero.
++        tc.draw(generators::text().max_size(12))
++            .replace('\0', "\u{1}")
++    }
++
++    /// Any f64 bit pattern: the usual float distribution plus raw bit patterns
++    /// (covers NaN payloads, -0.0, subnormals).
++    #[hegel::composite]
++    pub(crate) fn any_f64(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>(),
++            generators::integers::<u64>().map(f64::from_bits),
++        ))
++    }
++
++    /// An arbitrary `Binary` value covering every subtype byte (including
++    /// Reserved and UserDefined ranges).
++    #[hegel::composite]
++    pub(crate) fn arbitrary_binary(tc: &hegel::TestCase) -> Binary {
++        let subtype = BinarySubtype::from(tc.draw(generators::integers::<u8>()));
++        let bytes = tc.draw(generators::binary().max_size(24));
++        Binary { subtype, bytes }
++    }
++
++    /// An arbitrary non-container BSON value.
++    ///
++    /// When `allow_decimal128` is false, `Decimal128` values are never
++    /// produced. Extended-JSON round-trips a `Decimal128` through its decimal
++    /// *string* form, which is not a bijection over arbitrary 16-byte payloads
++    /// (non-canonical coefficients, NaN payloads), so the extJSON property
++    /// disables it. The BSON wire round-trip, which is bitwise, keeps it.
++    #[hegel::composite]
++    pub(crate) fn arbitrary_bson_leaf(tc: &hegel::TestCase, allow_decimal128: bool) -> Bson {
++        let choice = tc.draw(generators::integers::<u8>().max_value(15));
++        match choice {
++            0 => Bson::Null,
++            1 => Bson::Boolean(tc.draw(generators::booleans())),
++            2 => Bson::Int32(tc.draw(generators::integers::<i32>())),
++            3 => Bson::Int64(tc.draw(generators::integers::<i64>())),
++            4 => Bson::Double(tc.draw(any_f64())),
++            // BSON strings are length-prefixed, so NULs are legal in values.
++            5 => Bson::String(tc.draw(generators::text().max_size(16))),
++            6 => Bson::Symbol(tc.draw(generators::text().max_size(16))),
++            7 => Bson::JavaScriptCode(tc.draw(generators::text().max_size(16))),
++            8 => Bson::ObjectId(ObjectId::from_bytes(
++                tc.draw(generators::arrays(generators::integers::<u8>())),
++            )),
++            9 => Bson::DateTime(DateTime::from_millis(
++                tc.draw(generators::integers::<i64>()),
++            )),
++            10 => Bson::Timestamp(Timestamp {
++                time: tc.draw(generators::integers::<u32>()),
++                increment: tc.draw(generators::integers::<u32>()),
++            }),
++            11 => Bson::Binary(tc.draw((arbitrary_binary()).print_as_debug())),
++            12 => Bson::RegularExpression(
++                Regex::from_strings(tc.draw(cstring_text()), tc.draw(cstring_text()))
++                    .expect("cstring_text contains no NUL"),
++            ),
++            // Arbitrary 16-byte pattern; binary round-trips are bitwise.
++            13 if allow_decimal128 => Bson::Decimal128(Decimal128::from_bytes(
++                tc.draw(generators::arrays(generators::integers::<u8>())),
++            )),
++            13 => Bson::Null,
++            14 => Bson::DbPointer(DbPointer {
++                namespace: tc.draw(generators::text().max_size(16)),
++                id: ObjectId::from_bytes(tc.draw(generators::arrays(generators::integers::<u8>()))),
++            }),
++            _ => tc.draw((generators::sampled_from(vec![
++                Bson::Undefined,
++                Bson::MinKey,
++                Bson::MaxKey,
++            ])).print_as_debug()),
++        }
++    }
++
++    /// An arbitrary BSON value with containers nested up to `depth` levels.
++    ///
++    /// Recursive, so this returns a boxed generator rather than using
++    /// `#[hegel::composite]` (which cannot be self-referential).
++    pub(crate) fn arbitrary_bson(
++        depth: u32,
++        allow_decimal128: bool,
++    ) -> BoxedGenerator<'static, Bson> {
++        hegel::compose!(|tc| {
++            // Bias toward leaves so documents stay a manageable size.
++            if depth == 0 || tc.draw(generators::integers::<u8>().max_value(2)) > 0 {
++                tc.draw((arbitrary_bson_leaf(allow_decimal128)).print_as_debug())
++            } else {
++                match tc.draw(generators::integers::<u8>().max_value(2)) {
++                    0 => Bson::Document(tc.draw((arbitrary_document(depth - 1, allow_decimal128)).print_as_debug())),
++                    1 => Bson::Array(tc.draw(
++                        (generators::vecs(arbitrary_bson(depth - 1, allow_decimal128)).max_size(6)).print_as_debug(),
++                    )),
++                    _ => Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
++                        code: tc.draw(generators::text().max_size(16)),
++                        scope: tc.draw((arbitrary_document(depth - 1, allow_decimal128)).print_as_debug()),
++                    }),
++                }
++            }
++        })
++        .boxed()
++    }
++
++    /// An arbitrary `Document` with containers nested up to `depth` levels.
++    pub(crate) fn arbitrary_document(
++        depth: u32,
++        allow_decimal128: bool,
++    ) -> BoxedGenerator<'static, Document> {
++        hegel::compose!(|tc| {
++            let pairs: Vec<(String, Bson)> = tc.draw(
++                (generators::vecs(generators::tuples!(
++                    cstring_text(),
++                    arbitrary_bson(depth, allow_decimal128)
++                ))
++                .max_size(6)).print_as_debug(),
++            );
++            let mut doc = Document::new();
++            for (k, v) in pairs {
++                doc.insert(k, v);
++            }
++            doc
++        })
++        .boxed()
++    }
++
++    /// Structural equality on `Bson` that, unlike `PartialEq`, treats doubles
++    /// as equal iff their bit patterns are equal (so NaN == NaN, and NaN
++    /// payloads and the sign of zero must be preserved).
++    pub(crate) fn bson_eq_bitwise(a: &Bson, b: &Bson) -> bool {
++        match (a, b) {
++            (Bson::Double(x), Bson::Double(y)) => x.to_bits() == y.to_bits(),
++            (Bson::Array(x), Bson::Array(y)) => {
++                x.len() == y.len() && std::iter::zip(x, y).all(|(u, v)| bson_eq_bitwise(u, v))
++            }
++            (Bson::Document(x), Bson::Document(y)) => doc_eq_bitwise(x, y),
++            (Bson::JavaScriptCodeWithScope(x), Bson::JavaScriptCodeWithScope(y)) => {
++                x.code == y.code && doc_eq_bitwise(&x.scope, &y.scope)
++            }
++            (x, y) => x == y,
++        }
++    }
++
++    /// See [`bson_eq_bitwise`]. Key order matters.
++    pub(crate) fn doc_eq_bitwise(a: &Document, b: &Document) -> bool {
++        a.len() == b.len()
++            && std::iter::zip(a, b).all(|((ka, va), (kb, vb))| ka == kb && bson_eq_bitwise(va, vb))
++    }
++}
