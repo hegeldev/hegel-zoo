@@ -42,3 +42,4 @@
 - 2026-03-02: predecessor base commit `d0234ce772eb` (Fix `offset` in `UnitsBackward::remainder()`).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/crop.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped d0234ce772eb → 291ebca637a1 (2026-08-23, "Fix data race in concurrent `Rope` mutation"; 0.4.3); 1 bug(s) still reproduce. 174 tests pass.

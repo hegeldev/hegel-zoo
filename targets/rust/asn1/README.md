@@ -39,3 +39,4 @@
 - 2026-07-20: predecessor base commit `851dc2e18e90` (Upgrade to syn 3 (#622)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/asn1.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 851dc2e18e90 → 992f4df9bf96 (2026-08-17, "Bump dtolnay/rust-toolchain (#624)"; 0.24.1); 0 bug(s) still reproduce. 223 tests pass.
