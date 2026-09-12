@@ -1,0 +1,836 @@
+diff --git a/lib/Cargo.toml b/lib/Cargo.toml
+index 152fc1700..40b728680 100644
+--- a/lib/Cargo.toml
++++ b/lib/Cargo.toml
+@@ -81,6 +81,7 @@ winreg = { workspace = true }
+ assert_matches = { workspace = true }
+ criterion = { workspace = true }
+ eyre = { workspace = true }
++hegeltest = "0.44.1"
+ indoc = { workspace = true }
+ insta = { workspace = true }
+ num_cpus = { workspace = true }
+diff --git a/lib/src/dag_walk.rs b/lib/src/dag_walk.rs
+index ccdfebc5f..a693a8cb9 100644
+--- a/lib/src/dag_walk.rs
++++ b/lib/src/dag_walk.rs
+@@ -250,12 +250,118 @@ fn to_infallible_iter<T>(
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::collections::HashMap;
++
+     use assert_matches::assert_matches;
++    use hegel::generators;
+     use maplit::hashmap;
+     use maplit::hashset;
+ 
+     use super::*;
+ 
++    /// Draws an arbitrary DAG as an adjacency list: node `i` may only have
++    /// neighbors with indices smaller than `i`, which guarantees acyclicity.
++    /// Duplicate edges are allowed since `neighbors_fn` may yield duplicates.
++    #[hegel::composite]
++    fn dags(tc: &hegel::TestCase) -> Vec<Vec<usize>> {
++        let num_nodes = tc.draw(generators::integers::<usize>().max_value(24));
++        let mut neighbors = Vec::with_capacity(num_nodes);
++        for i in 0..num_nodes {
++            if i == 0 {
++                neighbors.push(vec![]);
++            } else {
++                neighbors.push(tc.draw(
++                    generators::vecs(generators::integers::<usize>().max_value(i - 1)).max_size(4),
++                ));
++            }
++        }
++        neighbors
++    }
++
++    fn draw_start_nodes(tc: &hegel::TestCase, num_nodes: usize) -> Vec<usize> {
++        if num_nodes == 0 {
++            vec![]
++        } else {
++            tc.draw(
++                generators::vecs(generators::integers::<usize>().max_value(num_nodes - 1))
++                    .max_size(6),
++            )
++        }
++    }
++
++    /// Oracle: all nodes reachable from `start` (inclusive) by following
++    /// `neighbors` edges.
++    fn reachable_from(start: &[usize], neighbors: &[Vec<usize>]) -> HashSet<usize> {
++        let mut reached = HashSet::new();
++        let mut work = start.to_vec();
++        while let Some(node) = work.pop() {
++            if reached.insert(node) {
++                work.extend(neighbors[node].iter().copied());
++            }
++        }
++        reached
++    }
++
++    /// Property: `topo_order_forward()` returns exactly the nodes reachable
++    /// from `start`, each node once, and (per its doc) every neighbor comes
++    /// before the node itself.
++    #[hegel::test]
++    fn test_topo_order_forward_random_dags(tc: hegel::TestCase) {
++        let neighbors = tc.draw(dags());
++        let start = draw_start_nodes(&tc, neighbors.len());
++
++        let result: Vec<usize> = topo_order_forward(
++            start.clone(),
++            |node: &usize| *node,
++            |node: &usize| neighbors[*node].clone(),
++            |_| "cycle in an acyclic graph",
++        )
++        .unwrap();
++
++        let mut position = HashMap::new();
++        for (index, node) in result.iter().enumerate() {
++            assert_eq!(position.insert(*node, index), None, "{node} emitted twice");
++        }
++        assert_eq!(
++            position.keys().copied().collect::<HashSet<_>>(),
++            reachable_from(&start, &neighbors)
++        );
++        for node in &result {
++            for neighbor in &neighbors[*node] {
++                assert!(
++                    position[neighbor] < position[node],
++                    "neighbor {neighbor} of {node} not emitted before it: {result:?}"
++                );
++            }
++        }
++    }
++
++    /// Property: `heads()` returns exactly the start nodes that are not
++    /// reachable from any *other* node in the start set (per its doc).
++    #[hegel::test]
++    fn test_heads_random_dags(tc: hegel::TestCase) {
++        let neighbors = tc.draw(dags());
++        let start = draw_start_nodes(&tc, neighbors.len());
++
++        let actual = heads(
++            start.clone(),
++            |node: &usize| *node,
++            |node: &usize| neighbors[*node].clone(),
++        );
++
++        let start_set: HashSet<usize> = start.iter().copied().collect();
++        let expected: HashSet<usize> = start_set
++            .iter()
++            .copied()
++            .filter(|node| {
++                !start_set.iter().any(|other| {
++                    other != node && reachable_from(&neighbors[*other], &neighbors).contains(node)
++                })
++            })
++            .collect();
++        assert_eq!(actual, expected);
++    }
++
+     #[test]
+     fn test_dfs_ok() {
+         let neighbors = hashmap! {
+diff --git a/lib/src/diff.rs b/lib/src/diff.rs
+index dc72fbd8b..dd4a0e79c 100644
+--- a/lib/src/diff.rs
++++ b/lib/src/diff.rs
+@@ -1024,6 +1024,9 @@ pub fn diff<'a, T: AsRef<[u8]> + ?Sized + 'a>(
+ 
+ #[cfg(test)]
+ mod tests {
++    use hegel::generators;
++    use hegel::generators::Generator as _;
++
+     use super::*;
+ 
+     // Extracted to a function because type inference is ambiguous due to
+@@ -1032,6 +1035,45 @@ mod tests {
+         vec![]
+     }
+ 
++    /// Draws file-like contents for diffing. Line-oriented content over a
++    /// small alphabet is weighted so that inputs share lines/words and produce
++    /// a mix of matching and different hunks; arbitrary binary content is
++    /// mixed in for coverage of non-UTF-8 input.
++    #[hegel::composite]
++    fn diff_inputs(tc: &hegel::TestCase) -> Vec<u8> {
++        tc.draw(hegel::one_of!(
++            generators::just(Vec::<u8>::new()),
++            generators::just(vec![0u8]),
++            generators::from_regex(r"(\n|[ab]| ){0,40}").map(String::into_bytes),
++            generators::binary().max_size(32),
++        ))
++    }
++
++    /// Property: the hunks of a diff form a partition of the inputs, i.e.
++    /// concatenating the hunk contents for input `i` reconstructs input `i`
++    /// exactly. This holds for any number of inputs and any tokenizer.
++    #[hegel::test]
++    fn test_diff_hunks_reconstruct_inputs(tc: hegel::TestCase) {
++        let num_inputs = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let mut inputs = Vec::new();
++        for _ in 0..num_inputs {
++            inputs.push(tc.draw(diff_inputs()));
++        }
++        let diff = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => ContentDiff::unrefined(&inputs),
++            1 => ContentDiff::by_line(&inputs),
++            _ => ContentDiff::by_word(&inputs),
++        };
++        let mut reconstructed = vec![vec![]; num_inputs];
++        for hunk in diff.hunks() {
++            assert_eq!(hunk.contents.len(), num_inputs);
++            for (output, content) in iter::zip(&mut reconstructed, &hunk.contents) {
++                output.extend_from_slice(content);
++            }
++        }
++        assert_eq!(reconstructed, inputs);
++    }
++
+     #[test]
+     fn test_find_line_ranges_empty() {
+         assert_eq!(find_line_ranges(b""), no_ranges());
+diff --git a/lib/src/fileset_parser.rs b/lib/src/fileset_parser.rs
+index d308df1f3..c20e8844f 100644
+--- a/lib/src/fileset_parser.rs
++++ b/lib/src/fileset_parser.rs
+@@ -577,11 +577,71 @@ fn attach_aliases_err(
+ #[cfg(test)]
+ mod tests {
+     use assert_matches::assert_matches;
++    use hegel::generators;
++    use hegel::generators::Generator as _;
+ 
+     use super::*;
+     use crate::dsl_util::KeywordArgument;
+     use crate::tests::TestResult;
+ 
++    /// Draws text biased toward fileset syntax: concatenations of real
++    /// fileset tokens with arbitrary unicode text mixed in, so that inputs
++    /// regularly get past the tokenizer into deeper parsing code.
++    #[hegel::composite]
++    fn fileset_like_texts(tc: &hegel::TestCase) -> String {
++        let tokens: Vec<String> = tc.draw(
++            generators::vecs(hegel::one_of!(
++                generators::sampled_from(vec![
++                    "a",
++                    "b",
++                    "*",
++                    "**/",
++                    "/",
++                    ".",
++                    "..",
++                    "~",
++                    "|",
++                    "&",
++                    "(",
++                    ")",
++                    ",",
++                    "glob:",
++                    "cwd:",
++                    "cwd-glob:",
++                    "root:",
++                    "root-glob:",
++                    "file:",
++                    "all()",
++                    "none()",
++                    "\"",
++                    "'",
++                    "\\",
++                    " ",
++                    "\n",
++                    "foo(",
++                    "e=f",
++                    "-",
++                    "a.rs",
++                    "\"\\",
++                    "'''",
++                ])
++                .map(str::to_owned),
++                generators::text().max_size(5),
++            ))
++            .max_size(20),
++        );
++        tokens.concat()
++    }
++
++    /// Property: fileset parsing returns `Err` on invalid input; neither
++    /// entry point may panic, whatever the input.
++    #[hegel::test]
++    fn test_parse_program_never_panics(tc: hegel::TestCase) {
++        let text = tc.draw(fileset_like_texts());
++        drop(parse_program(&text));
++        drop(parse_program_or_bare_string(&text));
++    }
++
+     #[derive(Debug)]
+     struct WithFilesetAliasesMap {
+         aliases_map: FilesetAliasesMap,
+diff --git a/lib/src/merge.rs b/lib/src/merge.rs
+index a31a961d9..efd0f3bce 100644
+--- a/lib/src/merge.rs
++++ b/lib/src/merge.rs
+@@ -1013,6 +1013,8 @@ impl Merge<Tree> {
+ 
+ #[cfg(test)]
+ mod tests {
++    use hegel::generators;
++    use hegel::Generator;
+     use test_case::test_case;
+ 
+     use super::*;
+@@ -1593,4 +1595,43 @@ mod tests {
+             (c(&[1, 2, 3]), c(&[4, 5, 6]))
+         );
+     }
++
++    /// Draws an arbitrary `Merge` with 1 to 5 sides. Terms are drawn mostly
++    /// from a small alphabet so that equal terms (which is what drives
++    /// simplification and trivial resolution) actually occur, with occasional
++    /// full-range values mixed in.
++    #[hegel::composite]
++    fn merges(tc: &hegel::TestCase) -> Merge<i64> {
++        let num_sides = tc.draw(generators::integers::<usize>().min_value(1).max_value(5));
++        let num_terms = 2 * num_sides - 1;
++        let values: Vec<i64> = tc.draw(
++            generators::vecs(hegel::one_of!(
++                generators::integers::<i64>().min_value(0).max_value(3),
++                generators::integers::<i64>(),
++            ))
++            .min_size(num_terms)
++            .max_size(num_terms),
++        );
++        Merge::from_vec(values)
++    }
++
++    /// Property: `simplify()` is a normal form, so simplifying twice gives the
++    /// same result as simplifying once.
++    #[hegel::test]
++    fn test_simplify_idempotence(tc: hegel::TestCase) {
++        let merge = tc.draw((merges()).print_as_debug());
++        let once = merge.simplify();
++        assert_eq!(once.simplify(), once);
++    }
++
++    /// Property: updating a merge from its own (unmodified) simplified form is
++    /// a no-op. This is the round-trip that
++    /// `conflicts::update_from_content()` relies on when it expands an edited
++    /// simplified conflict back to the original number of sides.
++    #[hegel::test]
++    fn test_update_from_simplified_roundtrip(tc: hegel::TestCase) {
++        let merge = tc.draw((merges()).print_as_debug());
++        let simplified = merge.simplify();
++        assert_eq!(merge.clone().update_from_simplified(simplified), merge);
++    }
+ }
+diff --git a/lib/src/revset.rs b/lib/src/revset.rs
+index da27aee87..a012e0ffa 100644
+--- a/lib/src/revset.rs
++++ b/lib/src/revset.rs
+@@ -3601,10 +3601,24 @@ mod tests {
+     use std::path::PathBuf;
+ 
+     use assert_matches::assert_matches;
++    use hegel::generators;
+ 
+     use super::*;
+     use crate::tests::TestResult;
+ 
++    /// Property: `format_symbol()` quotes and escapes any string such that
++    /// `parse_symbol()` reads back exactly the original string. This is the
++    /// round-trip used when emitting symbols (bookmark/tag names etc.) into
++    /// revset expressions.
++    #[hegel::test]
++    fn test_format_symbol_parse_symbol_roundtrip(tc: hegel::TestCase) {
++        let symbol: String = tc.draw(generators::text().min_size(1));
++        let formatted = format_symbol(&symbol);
++        let parsed = parse_symbol(&formatted)
++            .unwrap_or_else(|err| panic!("failed to parse {formatted:?}: {err}"));
++        assert_eq!(parsed, symbol);
++    }
++
+     fn parse(revset_str: &str) -> Result<Arc<UserRevsetExpression>, RevsetParseError> {
+         parse_with_aliases(revset_str, [] as [(&str, &str); 0])
+     }
+diff --git a/lib/src/revset_parser.rs b/lib/src/revset_parser.rs
+index 163f6f2b5..bbdd3d45e 100644
+--- a/lib/src/revset_parser.rs
++++ b/lib/src/revset_parser.rs
+@@ -828,6 +828,8 @@ mod tests {
+     use std::collections::HashMap;
+ 
+     use assert_matches::assert_matches;
++    use hegel::generators;
++    use hegel::generators::Generator as _;
+ 
+     use super::*;
+     use crate::dsl_util::KeywordArgument;
+@@ -874,6 +876,66 @@ mod tests {
+             .map_err(|err| *err.kind)
+     }
+ 
++    /// Draws text biased toward revset syntax: concatenations of real revset
++    /// tokens with arbitrary unicode text mixed in, so that inputs regularly
++    /// get past the tokenizer into deeper parsing code.
++    #[hegel::composite]
++    fn revset_like_texts(tc: &hegel::TestCase) -> String {
++        let tokens: Vec<String> = tc.draw(
++            generators::vecs(hegel::one_of!(
++                generators::sampled_from(vec![
++                    "x",
++                    "y",
++                    "all()",
++                    "none()",
++                    "@",
++                    "@origin",
++                    "-",
++                    "+",
++                    "~",
++                    "::",
++                    "..",
++                    "|",
++                    "&",
++                    "(",
++                    ")",
++                    ",",
++                    "=",
++                    "\"",
++                    "'",
++                    "\\",
++                    "\\n",
++                    " ",
++                    "\n",
++                    "foo(",
++                    "x=y",
++                    "exact:",
++                    "glob:",
++                    "0",
++                    "12345678",
++                    "present(",
++                    "#",
++                    "%%",
++                    "\"\\",
++                    "'''",
++                    "abc-123_/",
++                ])
++                .map(str::to_owned),
++                generators::text().max_size(5),
++            ))
++            .max_size(20),
++        );
++        tokens.concat()
++    }
++
++    /// Property: `parse_program()` returns `Err` on invalid input; it must
++    /// never panic, whatever the input.
++    #[hegel::test]
++    fn test_parse_program_never_panics(tc: hegel::TestCase) {
++        let text = tc.draw(revset_like_texts());
++        drop(parse_program(&text));
++    }
++
+     fn parse_normalized(text: &str) -> ExpressionNode<'_> {
+         normalize_tree(parse_program(text).unwrap())
+     }
+diff --git a/lib/tests/test_conflicts.rs b/lib/tests/test_conflicts.rs
+index 7214106c0..f27cb6e8c 100644
+--- a/lib/tests/test_conflicts.rs
++++ b/lib/tests/test_conflicts.rs
+@@ -12,6 +12,9 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++use bstr::BString;
++use hegel::generators;
++use hegel::generators::Generator as _;
+ use indoc::indoc;
+ use itertools::Itertools as _;
+ use jj_lib::backend::FileId;
+@@ -25,6 +28,8 @@ use jj_lib::conflicts::materialize_merge_result_to_bytes;
+ use jj_lib::conflicts::parse_conflict;
+ use jj_lib::conflicts::update_from_content;
+ use jj_lib::files::FileMergeHunkLevel;
++use jj_lib::files::MergeResult;
++use jj_lib::files::merge_hunks;
+ use jj_lib::merge::Merge;
+ use jj_lib::merge::SameChange;
+ use jj_lib::repo::Repo as _;
+@@ -641,6 +646,182 @@ fn test_materialize_update_roundtrip(style: ConflictMarkerStyle) -> TestResult {
+     Ok(())
+ }
+ 
++/// Lines that parse as conflict markers (or nearly do), used to stress
++/// marker-length escalation and conflict parsing.
++const MARKER_LIKE_LINES: [&str; 10] = [
++    "<<<<<<<\n",
++    ">>>>>>>\n",
++    "+++++++\n",
++    "-------\n",
++    "%%%%%%%\n",
++    "|||||||\n",
++    "=======\n",
++    "\\\\\\\\\\\\\\\n",
++    "<<<<<<<<<<<<< text\n",
++    "<<<<\n",
++];
++
++/// Draws one side/base of a file-level conflict. Line-oriented content over a
++/// small alphabet is weighted so that the terms share lines and the merge
++/// produces both resolved and conflicted hunks; CRLF content, marker-like
++/// lines, and arbitrary bytes are mixed in.
++#[hegel::composite]
++fn conflict_terms(tc: &hegel::TestCase) -> BString {
++    let segments: Vec<Vec<u8>> = tc.draw(
++        generators::vecs(hegel::one_of!(
++            generators::from_regex(r"(\n|[ab]){0,12}").map(String::into_bytes),
++            generators::from_regex(r"((\r\n)|[ab]){0,8}").map(String::into_bytes),
++            generators::sampled_from(MARKER_LIKE_LINES.to_vec())
++                .map(|line| line.as_bytes().to_vec()),
++            generators::binary().max_size(8),
++        ))
++        .max_size(4),
++    );
++    BString::from(segments.concat())
++}
++
++/// Property: materializing a conflict and parsing the result back yields
++/// exactly the hunks that were materialized, for every marker style and merge
++/// option. `update_from_content()` relies on this round-trip to detect that a
++/// materialized file is unchanged, so a failure here means writing and
++/// re-snapshotting a conflicted file would corrupt it.
++#[hegel::test]
++fn test_materialize_parse_roundtrip_generated(tc: hegel::TestCase) {
++    let num_sides = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++    let mut terms = Vec::with_capacity(2 * num_sides - 1);
++    for _ in 0..(2 * num_sides - 1) {
++        let mut term = tc.draw((conflict_terms()).print_as_debug());
++        // A lone CR (not part of a CRLF pair) breaks this round trip; that
++        // known bug is pinned by test_materialize_parse_roundtrip_lone_cr
++        // below, so rewrite lone CRs here to keep testing everything else.
++        // CRLF line endings remain covered.
++        let mut i = 0;
++        while i < term.len() {
++            if term[i] == b'\r' && term.get(i + 1) != Some(&b'\n') {
++                term[i] = b'#';
++            }
++            i += 1;
++        }
++        terms.push(term);
++    }
++    let contents = Merge::from_vec(terms);
++    let marker_style = tc.draw((generators::sampled_from(vec![
++        ConflictMarkerStyle::Diff,
++        ConflictMarkerStyle::DiffExperimental,
++        ConflictMarkerStyle::Snapshot,
++        ConflictMarkerStyle::Git,
++    ])).print_as_debug());
++    let hunk_level = tc.draw((generators::sampled_from(vec![
++        FileMergeHunkLevel::Line,
++        FileMergeHunkLevel::Word,
++    ])).print_as_debug());
++    let same_change = tc.draw((generators::sampled_from(vec![
++        SameChange::Accept,
++        SameChange::Keep,
++    ])).print_as_debug());
++    let options = ConflictMaterializeOptions {
++        marker_style,
++        marker_len: None,
++        merge: MergeOptions {
++            hunk_level,
++            same_change,
++        },
++    };
++
++    let materialized =
++        materialize_merge_result_to_bytes(&contents, &ConflictLabels::unlabeled(), &options);
++    match merge_hunks(&contents, &options.merge) {
++        MergeResult::Resolved(resolved) => {
++            // If the merge fully resolves, materialization is just the
++            // resolved content.
++            assert_eq!(materialized, resolved);
++        }
++        MergeResult::Conflict(expected_hunks) => {
++            // Parse with the same marker length that materialization chose,
++            // like the working copy does when snapshotting.
++            let marker_len = choose_materialized_conflict_marker_len(&contents);
++            let parsed = parse_conflict(&materialized, contents.num_sides(), marker_len);
++            assert_eq!(
++                parsed,
++                Some(expected_hunks),
++                "materialized content:\n{materialized}"
++            );
++        }
++    }
++}
++
++/// KNOWN FAILURE: pins a real bug in the materialize/parse round trip.
++///
++/// If a conflict term's content ends with a lone CR (a `\r` not followed by
++/// `\n`), the term does not end with an EOL, so
++/// `materialize_conflict_hunks()` "spreads" the detected EOL (`\n`) to every
++/// side as a separator. When `parse_conflict()` removes the separator again,
++/// it pops the `\n` *and* a preceding `\r` (assuming a CRLF separator), which
++/// eats the `\r` that was real content. The parsed hunks then differ from the
++/// materialized ones, so `update_from_content()` considers an *unmodified*
++/// working-copy file changed and silently rewrites the conflict, dropping the
++/// `\r` from the base/side contents.
++///
++/// Minimal counterexample: contents `["", "\r", ""]` with `SameChange::Keep`
++/// materialize to a conflict whose parse yields `["", "", ""]`.
++///
++/// Code path: `conflicts::materialize_conflict_hunks()` (EOL spreading) +
++/// `conflicts::parse_conflict()` (`term.pop_if(.. b'\n')` followed by
++/// `term.pop_if(.. b'\r')`).
++#[hegel::test]
++fn test_materialize_parse_roundtrip_lone_cr(tc: hegel::TestCase) {
++    // Generator boosted to the buggy region so the failure reproduces on
++    // every run: the base term always ends with a lone CR.
++    let base: BString = {
++        let mut term = tc.draw((generators::from_regex(r"(\n|[ab]){0,8}").map(BString::from)).print_as_debug());
++        term.push(b'\r');
++        term
++    };
++    let contents = Merge::from_vec(vec![BString::from(""), base, BString::from("")]);
++    let marker_style = tc.draw((generators::sampled_from(vec![
++        ConflictMarkerStyle::Diff,
++        ConflictMarkerStyle::DiffExperimental,
++        ConflictMarkerStyle::Snapshot,
++        ConflictMarkerStyle::Git,
++    ])).print_as_debug());
++    let options = ConflictMaterializeOptions {
++        marker_style,
++        marker_len: None,
++        merge: MergeOptions {
++            hunk_level: FileMergeHunkLevel::Line,
++            // Keep, so that the two identical empty sides don't resolve
++            // trivially.
++            same_change: SameChange::Keep,
++        },
++    };
++
++    let materialized =
++        materialize_merge_result_to_bytes(&contents, &ConflictLabels::unlabeled(), &options);
++    match merge_hunks(&contents, &options.merge) {
++        MergeResult::Resolved(resolved) => assert_eq!(materialized, resolved),
++        MergeResult::Conflict(expected_hunks) => {
++            let marker_len = choose_materialized_conflict_marker_len(&contents);
++            let parsed = parse_conflict(&materialized, contents.num_sides(), marker_len);
++            assert_eq!(
++                parsed,
++                Some(expected_hunks),
++                "materialized content:\n{materialized}"
++            );
++        }
++    }
++}
++
++/// Property: `parse_conflict()` returns `None`/`Some` but must never panic,
++/// whatever the input bytes and parameters. It is fed unvalidated working-copy
++/// file contents.
++#[hegel::test]
++fn test_parse_conflict_never_panics(tc: hegel::TestCase) {
++    let input = tc.draw((conflict_terms()).print_as_debug());
++    let num_sides = tc.draw(generators::integers::<usize>());
++    let marker_len = tc.draw(generators::integers::<usize>());
++    drop(parse_conflict(&input, num_sides, marker_len));
++}
++
+ #[test]
+ fn test_materialize_conflict_no_newlines_at_eof() {
+     let test_repo = TestRepo::init();
+diff --git a/lib/tests/test_revset_optimized.rs b/lib/tests/test_revset_optimized.rs
+index 53d7edd0d..12e32e7a1 100644
+--- a/lib/tests/test_revset_optimized.rs
++++ b/lib/tests/test_revset_optimized.rs
+@@ -232,6 +232,188 @@ fn test_mostly_linear() -> TestResult {
+     Ok(())
+ }
+ 
++/// Hegel translation of [`arb_expression`] above: draws an arbitrary resolved
++/// revset expression. Recursion is bounded by `depth`.
++fn draw_expression(
++    tc: &hegel::TestCase,
++    known_commits: &[CommitId],
++    visible_heads: &[Vec<CommitId>],
++    depth: u64,
++) -> Arc<ResolvedRevsetExpression> {
++    use hegel::generators;
++    let draw_index = |max: u8| tc.draw(generators::integers::<u8>().max_value(max));
++    let draw_small = || tc.draw(generators::integers::<u64>().max_value(4));
++    // Weight toward compound expressions until the depth budget runs out.
++    if depth == 0 || draw_index(3) == 0 {
++        match draw_index(6) {
++            0 => RevsetExpression::none(),
++            1 => RevsetExpression::all(),
++            2 => RevsetExpression::visible_heads(),
++            3 => RevsetExpression::root(),
++            4 => RevsetExpression::forks(),
++            5 => {
++                let indexes: Vec<usize> = tc.draw(
++                    generators::vecs(
++                        generators::integers::<usize>().max_value(known_commits.len() - 1),
++                    )
++                    .min_size(1)
++                    .max_size(5)
++                    .unique(true),
++                );
++                RevsetExpression::commits(
++                    indexes
++                        .iter()
++                        .sorted()
++                        .map(|&i| known_commits[i].clone())
++                        .collect(),
++                )
++            }
++            // Use merges() as a filter that isn't constant, like the proptest
++            // version above.
++            _ => RevsetExpression::filter(RevsetFilterPredicate::ParentCount(2..u32::MAX)),
++        }
++    } else {
++        let sub = || draw_expression(tc, known_commits, visible_heads, depth - 1);
++        match draw_index(23) {
++            // Ancestors
++            0 => sub().parents(),
++            1 => sub().ancestors(),
++            2 => sub().ancestors_range(0..draw_small()),
++            // Descendants
++            3 => sub().children(),
++            4 => sub().descendants(),
++            5 => sub().descendants_range(0..draw_small()),
++            // First ancestors
++            6 => sub().first_ancestors_at(1),
++            7 => sub().first_ancestors(),
++            8 => sub().first_ancestors_range(0..draw_small()),
++            // Range
++            9 => sub().range(&sub()),
++            // DagRange
++            10 => sub().dag_range_to(&sub()),
++            11 => sub().connected(),
++            // Reachable
++            12 => sub().reachable(&sub()),
++            // Heads
++            13 => sub().heads(),
++            // Roots
++            14 => sub().roots(),
++            // ForkPoint
++            15 => sub().fork_point(),
++            // MergePoint
++            16 => sub().merge_point(),
++            // Latest
++            17 => sub().latest(draw_small() as usize),
++            // AtOperation (or WithinVisibility)
++            18 => {
++                let index =
++                    tc.draw(generators::integers::<usize>().max_value(visible_heads.len() - 1));
++                Arc::new(RevsetExpression::WithinVisibility {
++                    candidates: sub(),
++                    visible_heads: visible_heads[index].clone(),
++                })
++            }
++            // Coalesce (in binary form)
++            19 => RevsetExpression::coalesce(&[sub(), sub()]),
++            // General set operations
++            20 => sub().negated(),
++            21 => sub().union(&sub()),
++            22 => sub().intersection(&sub()),
++            _ => sub().minus(&sub()),
++        }
++    }
++}
++
++fn assert_optimized_matches_unoptimized(
++    repo: &dyn Repo,
++    expression: &Arc<ResolvedRevsetExpression>,
++) {
++    let optimized_revset = expression.clone().evaluate(repo).unwrap();
++    let unoptimized_revset = expression.clone().evaluate_unoptimized(repo).unwrap();
++    let optimized_ids: Vec<_> = optimized_revset.stream().try_collect().block_on().unwrap();
++    let unoptimized_ids: Vec<_> = unoptimized_revset
++        .stream()
++        .try_collect()
++        .block_on()
++        .unwrap();
++    assert_eq!(
++        optimized_ids, unoptimized_ids,
++        "expression: {expression:#?}"
++    );
++}
++
++/// Property: an optimized revset evaluates to the same commits as the
++/// original expression (same property as the proptest tests above), but on a
++/// freshly generated commit graph per test case rather than a fixed one.
++#[test]
++fn test_optimize_equivalence_generated_graphs() -> TestResult {
++    use hegel::generators;
++
++    let settings = stable_settings();
++    let test_repo = TestRepo::init_with_settings(&settings);
++    let repo = test_repo.repo;
++
++    hegel::Hegel::new(|tc| {
++        // Build an arbitrary commit graph in a transaction that is discarded
++        // at the end of the test case.
++        let mut tx = repo.start_transaction();
++        let root = repo.store().root_commit();
++        let root_id = root.id().clone();
++        let mut commits = vec![root];
++        let num_commits = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        for i in 0..num_commits {
++            let max_parents = 3.min(commits.len());
++            let num_parents = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(max_parents),
++            );
++            let parent_indexes: Vec<usize> = if num_parents == 1 {
++                vec![tc.draw(generators::integers::<usize>().max_value(commits.len() - 1))]
++            } else {
++                // The root commit (index 0) cannot be merged with other
++                // commits, so exclude it from multi-parent draws.
++                tc.draw(
++                    generators::vecs(
++                        generators::integers::<usize>()
++                            .min_value(1)
++                            .max_value(commits.len() - 1),
++                    )
++                    .min_size(num_parents)
++                    .max_size(num_parents)
++                    .unique(true),
++                )
++            };
++            let parents = parent_indexes
++                .iter()
++                .sorted()
++                .map(|&index| commits[index].clone())
++                .collect_vec();
++            let commit = write_new_commit(tx.repo_mut(), &format!("c{i}"), &parents);
++            commits.push(commit);
++        }
++
++        let commit_ids = commits.iter().map(|c| c.id().clone()).collect_vec();
++        let current_heads = tx
++            .repo()
++            .view()
++            .heads()
++            .iter()
++            .cloned()
++            .sorted()
++            .collect_vec();
++        let visible_heads = vec![vec![root_id], current_heads];
++
++        let expression = draw_expression(&tc, &commit_ids, &visible_heads, 4);
++        tc.note(&format!("expression: {expression:#?}"));
++        assert_optimized_matches_unoptimized(tx.repo(), &expression);
++    })
++    // Match the case count the proptest tests above run with by default.
++    .settings(hegel::Settings::new().test_cases(256))
++    .run();
++    Ok(())
++}
++
+ #[test]
+ fn test_weird_merges() -> TestResult {
+     let settings = stable_settings();
