@@ -225,23 +225,39 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             # code (hegel is a dev-dependency). Prefer: after a `use hegel::generators…` line;
             # else right after the nearest `mod … {` above the first draw site; else after the
             # first `use` in the file (integration-test files).
-            first = min(l for l, _, _ in locs) - 1
+            sites = sorted({l - 1 for l, _, _ in locs})
+            first = sites[0]
             ls = text.split("\n")
             n = 0
-            # 1. right after the nearest enclosing `mod … {` above the first draw site (the
-            #    import must be visible in the module that draws; `use hegel::generators…` lines
-            #    can be function-local, so they are not a reliable anchor)
+
+            def in_scope(k: int) -> bool:
+                """Is the block that line k opens (or sits in) still open at every draw site?
+
+                Brace balance from k+1 forward must never dip below zero before each site;
+                a function-local `use` or a module that closed earlier fails this."""
+                bal = 0
+                for j in range(k + 1, sites[-1] + 1):
+                    if j in sites and bal < 0:
+                        return False
+                    bal += ls[j].count("{") - ls[j].count("}")
+                    if bal < 0 and j < sites[-1]:
+                        return False
+                return True
+
+            # 1. after the nearest `use hegel::generators…` line whose scope covers every draw
+            #    site (module-level, or inside the macro body that expands to the drawing code)
             for k in range(min(first, len(ls) - 1), -1, -1):
-                mm = re.match(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$", ls[k])
-                if mm:
-                    ls.insert(k + 1, f"{mm.group(1)}    use hegel::Generator;")
+                mm = re.match(r"^(\s*)use hegel::generators(?:::\w+)?(?: as \w+)?;", ls[k])
+                if mm and in_scope(k):
+                    ls.insert(k + 1, f"{mm.group(1)}use hegel::Generator;")
                     n = 1
                     break
-            # 2. no enclosing module (integration-test file): after a file-scope `use hegel::generators…`
+            # 2. right after the nearest `mod … {` that encloses every draw site
             if not n:
                 for k in range(min(first, len(ls) - 1), -1, -1):
-                    if re.match(r"^use hegel::generators(?:::\w+)?(?: as \w+)?;", ls[k]):
-                        ls.insert(k + 1, "use hegel::Generator;")
+                    mm = re.match(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$", ls[k])
+                    if mm and in_scope(k):
+                        ls.insert(k + 1, f"{mm.group(1)}    use hegel::Generator;")
                         n = 1
                         break
             text = "\n".join(ls)
