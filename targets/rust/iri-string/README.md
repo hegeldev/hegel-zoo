@@ -36,3 +36,4 @@
 - 2026-07-22: predecessor base commit `07d982ed76ec` (doc: fix harmless typo).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/iri-string.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 07d982ed76ec → 9b0eadf9690c (2026-07-27, "style: remove a needless blank line"; 0.7.14); 0 bug(s) still reproduce; fixed upstream: iri-string/1. 423 tests pass. iri-string/1 is fixed upstream in 0.7.14 (empty fragments now rejected for absolute IRI types).
