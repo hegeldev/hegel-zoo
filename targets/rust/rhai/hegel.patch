@@ -1,0 +1,885 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a0e1f789..24be5b94 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,6 +41,7 @@ document-features = { version = "0.2.0", optional = true }
+ arbitrary = { version = "1.3.2", optional = true, features = ["derive"] }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ rmp-serde = "1.1.1"
+ serde_json = { version = "1.0.45", default-features = false, features = ["alloc"] }
+ 
+diff --git a/tests/common/mod.rs b/tests/common/mod.rs
+new file mode 100644
+index 00000000..e4ca5420
+--- /dev/null
++++ b/tests/common/mod.rs
+@@ -0,0 +1,339 @@
++//! Shared hegel generators for property-based tests.
++//!
++//! This module is included via `mod common;` from several integration test
++//! files, so not every item is used by every test target.
++#![allow(dead_code)]
++
++use hegel::generators::{self, Generator};
++use rhai::INT;
++
++// ---------------------------------------------------------------------------
++// Arithmetic expression trees with a Rust-side checked-arithmetic oracle.
++//
++// Evidence: rhai's default build uses checked arithmetic (see
++// `src/packages/arithmetic.rs` and `src/func/builtin.rs`, gated on
++// `#[cfg(not(feature = "unchecked"))]`), where every binary integer operation
++// is `checked_add`/`checked_sub`/`checked_mul`/`checked_div`/`checked_rem`
++// and unary minus is `checked_neg`, erroring on overflow/division by zero.
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, hegel::PrettyPrintable)]
++pub enum Op {
++    Add,
++    Sub,
++    Mul,
++    Div,
++    Rem,
++}
++
++impl Op {
++    pub fn symbol(&self) -> &'static str {
++        match self {
++            Op::Add => "+",
++            Op::Sub => "-",
++            Op::Mul => "*",
++            Op::Div => "/",
++            Op::Rem => "%",
++        }
++    }
++
++    pub fn apply_checked(&self, l: INT, r: INT) -> Option<INT> {
++        match self {
++            Op::Add => l.checked_add(r),
++            Op::Sub => l.checked_sub(r),
++            Op::Mul => l.checked_mul(r),
++            Op::Div => l.checked_div(r),
++            Op::Rem => l.checked_rem(r),
++        }
++    }
++}
++
++#[derive(Debug, Clone, hegel::PrettyPrintable)]
++pub enum Expr {
++    Lit(INT),
++    Neg(Box<Expr>),
++    Bin(Op, Box<Expr>, Box<Expr>),
++}
++
++impl Expr {
++    /// Render as rhai source. Everything is parenthesized so operator
++    /// precedence in the rendered text is irrelevant.
++    pub fn render(&self) -> String {
++        match self {
++            Expr::Lit(n) => format!("({n})"),
++            Expr::Neg(e) => format!("(-{})", e.render()),
++            Expr::Bin(op, l, r) => format!("({} {} {})", l.render(), op.symbol(), r.render()),
++        }
++    }
++
++    /// Render as a rhai script where every literal is first bound to a `let`
++    /// variable. This forces all arithmetic (including unary minus) through
++    /// the *runtime* operators. Rendering literals inline instead would hit
++    /// rhai's parse-time constant folding of unary minus, which deliberately
++    /// converts `-<int constant>` to a *float* constant when negation
++    /// overflows (src/parser.rs, "Negative integer" arm) — a different,
++    /// parse-time semantics that this oracle does not model.
++    pub fn render_via_lets(&self) -> String {
++        fn walk(e: &Expr, lets: &mut Vec<INT>) -> String {
++            match e {
++                Expr::Lit(n) => {
++                    lets.push(*n);
++                    format!("v{}", lets.len() - 1)
++                }
++                Expr::Neg(e) => format!("(-{})", walk(e, lets)),
++                Expr::Bin(op, l, r) => {
++                    format!("({} {} {})", walk(l, lets), op.symbol(), walk(r, lets))
++                }
++            }
++        }
++        let mut lets = Vec::new();
++        let body = walk(self, &mut lets);
++        let mut script = String::new();
++        for (i, n) in lets.iter().enumerate() {
++            script.push_str(&format!("let v{i} = {n};\n"));
++        }
++        script.push_str(&body);
++        script
++    }
++
++    /// Reference implementation with Rust checked arithmetic.
++    /// `None` means "evaluation must produce an arithmetic error".
++    pub fn eval_checked(&self) -> Option<INT> {
++        match self {
++            Expr::Lit(n) => Some(*n),
++            Expr::Neg(e) => e.eval_checked()?.checked_neg(),
++            Expr::Bin(op, l, r) => op.apply_checked(l.eval_checked()?, r.eval_checked()?),
++        }
++    }
++}
++
++/// Full-range integers with boundary values boosted (boundary conjunctions
++/// are rare under uniform generation).
++pub fn int_literals() -> generators::BoxedGenerator<'static, INT> {
++    hegel::one_of!(
++        generators::integers::<INT>(),
++        generators::sampled_from(vec![INT::MIN, INT::MIN + 1, -2, -1, 0, 1, 2, INT::MAX - 1, INT::MAX]),
++    )
++    .boxed()
++}
++
++/// Recursive generator for arithmetic expression trees.
++pub fn exprs(depth: u32) -> generators::BoxedGenerator<'static, Expr> {
++    hegel::compose!(|tc| {
++        if depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++            Expr::Lit(tc.draw(int_literals()))
++        } else if tc.draw(generators::integers::<u8>().max_value(5)) == 0 {
++            Expr::Neg(Box::new(tc.draw((exprs(depth - 1)).print_as_debug())))
++        } else {
++            let op = tc.draw(generators::sampled_from(vec![
++                Op::Add,
++                Op::Sub,
++                Op::Mul,
++                Op::Div,
++                Op::Rem,
++            ]));
++            let l = tc.draw((exprs(depth - 1)).print_as_debug());
++            let r = tc.draw(exprs(depth - 1));
++            Expr::Bin(op, Box::new(l), Box::new(r))
++        }
++    })
++    .boxed()
++}
++
++// ---------------------------------------------------------------------------
++// Well-formed script generator.
++//
++// Generates typed (INT / bool) statements plus a final INT expression, so
++// the whole script always compiles, terminates (loops are bounded), has no
++// side effects, and evaluates to an INT (or fails with a runtime error such
++// as an arithmetic overflow).
++// ---------------------------------------------------------------------------
++
++struct ScriptCtx {
++    ints: Vec<String>,
++    bools: Vec<String>,
++    counter: usize,
++}
++
++impl ScriptCtx {
++    fn fresh(&mut self, prefix: &str) -> String {
++        self.counter += 1;
++        format!("{prefix}{}", self.counter)
++    }
++}
++
++/// Generate a well-formed, terminating, side-effect-free rhai script whose
++/// value is an INT (or a runtime arithmetic error).
++pub fn arbitrary_script(tc: &hegel::TestCase) -> String {
++    let mut ctx = ScriptCtx {
++        ints: Vec::new(),
++        bools: Vec::new(),
++        counter: 0,
++    };
++    let n = tc.draw(generators::integers::<usize>().max_value(8));
++    let mut stmts = Vec::new();
++    for _ in 0..n {
++        let s = statement(tc, &mut ctx);
++        stmts.push(s);
++    }
++    stmts.push(int_expr(tc, &ctx, 3));
++    stmts.join("\n")
++}
++
++fn statement(tc: &hegel::TestCase, ctx: &mut ScriptCtx) -> String {
++    match tc.draw(generators::integers::<u8>().max_value(5)) {
++        // let <int var> = <int expr>;
++        0 => {
++            let name = ctx.fresh("i");
++            let s = format!("let {name} = {};", int_expr(tc, ctx, 2));
++            ctx.ints.push(name);
++            s
++        }
++        // let <int var> = if <bool> { <int> } else { <int> };
++        1 => {
++            let name = ctx.fresh("i");
++            let s = format!(
++                "let {name} = if {} {{ {} }} else {{ {} }};",
++                bool_expr(tc, ctx, 2),
++                int_expr(tc, ctx, 2),
++                int_expr(tc, ctx, 2)
++            );
++            ctx.ints.push(name);
++            s
++        }
++        // let <bool var> = <bool expr>;
++        2 => {
++            let name = ctx.fresh("b");
++            let s = format!("let {name} = {};", bool_expr(tc, ctx, 2));
++            ctx.bools.push(name);
++            s
++        }
++        // <existing int var> = <int expr>;
++        3 if !ctx.ints.is_empty() => {
++            let name = tc.draw(generators::sampled_from(ctx.ints.clone()));
++            format!("{name} = {};", int_expr(tc, ctx, 2))
++        }
++        // if <bool> { <assignments> } else { <assignments> }
++        4 => {
++            let cond = bool_expr(tc, ctx, 2);
++            let then_body = assignments(tc, ctx);
++            let else_body = assignments(tc, ctx);
++            format!("if {cond} {{ {then_body} }} else {{ {else_body} }}")
++        }
++        // bounded for loop over a small range
++        5 => {
++            let loop_var = ctx.fresh("k");
++            let bound = tc.draw(generators::integers::<u8>().max_value(8));
++            ctx.ints.push(loop_var.clone());
++            let body = assignments(tc, ctx);
++            ctx.ints.retain(|v| *v != loop_var);
++            format!("for {loop_var} in 0..{bound} {{ {body} }}")
++        }
++        // fallback (covers choice 3 when no int vars exist yet)
++        _ => {
++            let name = ctx.fresh("i");
++            let s = format!("let {name} = {};", int_expr(tc, ctx, 2));
++            ctx.ints.push(name);
++            s
++        }
++    }
++}
++
++/// 0..=2 assignment statements to already-declared int variables.
++fn assignments(tc: &hegel::TestCase, ctx: &ScriptCtx) -> String {
++    if ctx.ints.is_empty() {
++        return String::new();
++    }
++    let n = tc.draw(generators::integers::<u8>().max_value(2));
++    let mut out = Vec::new();
++    for _ in 0..n {
++        let name = tc.draw(generators::sampled_from(ctx.ints.clone()));
++        out.push(format!("{name} = {};", int_expr(tc, ctx, 2)));
++    }
++    out.join(" ")
++}
++
++fn int_expr(tc: &hegel::TestCase, ctx: &ScriptCtx, depth: u32) -> String {
++    if depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++        // Leaf: variable or literal.
++        if !ctx.ints.is_empty() && tc.draw(generators::booleans()) {
++            tc.draw(generators::sampled_from(ctx.ints.clone()))
++        } else {
++            format!("({})", tc.draw(int_literals()))
++        }
++    } else if tc.draw(generators::integers::<u8>().max_value(6)) == 6 {
++        format!("(-{})", int_expr(tc, ctx, depth - 1))
++    } else {
++        let op = tc.draw(generators::sampled_from(vec!["+", "-", "*", "/", "%"]));
++        format!(
++            "({} {op} {})",
++            int_expr(tc, ctx, depth - 1),
++            int_expr(tc, ctx, depth - 1)
++        )
++    }
++}
++
++fn bool_expr(tc: &hegel::TestCase, ctx: &ScriptCtx, depth: u32) -> String {
++    if depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++        // Leaf: variable or literal.
++        if !ctx.bools.is_empty() && tc.draw(generators::booleans()) {
++            tc.draw(generators::sampled_from(ctx.bools.clone()))
++        } else if tc.draw(generators::booleans()) {
++            "true".to_string()
++        } else {
++            "false".to_string()
++        }
++    } else {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => {
++                let op = tc.draw(generators::sampled_from(vec!["==", "!=", "<", "<=", ">", ">="]));
++                format!(
++                    "({} {op} {})",
++                    int_expr(tc, ctx, depth - 1),
++                    int_expr(tc, ctx, depth - 1)
++                )
++            }
++            1 => format!("(!{})", bool_expr(tc, ctx, depth - 1)),
++            2 => format!(
++                "({} && {})",
++                bool_expr(tc, ctx, depth - 1),
++                bool_expr(tc, ctx, depth - 1)
++            ),
++            _ => format!(
++                "({} || {})",
++                bool_expr(tc, ctx, depth - 1),
++                bool_expr(tc, ctx, depth - 1)
++            ),
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Token soup: script-shaped text built from real rhai tokens with random
++// whitespace, mirroring the dictionary approach of `fuzz/fuzz_targets/`.
++// Mostly does not compile; occasionally does.
++// ---------------------------------------------------------------------------
++
++pub fn token_soup(tc: &hegel::TestCase) -> String {
++    const TOKENS: &[&str] = &[
++        "let", "const", "if", "else", "fn", "private", "while", "loop", "for", "in", "do",
++        "until", "return", "throw", "try", "catch", "switch", "true", "false", "break",
++        "continue", "import", "export", "as", "global", "this",
++        "+", "-", "*", "/", "%", "**", "==", "!=", "<", "<=", ">", ">=", "&&", "||", "!", "&",
++        "|", "^", "<<", ">>", "=", "+=", "-=", "*=", "/=", "%=", "**=", "&=", "|=", "^=", "<<=",
++        ">>=", "==>", ";", ",", ".", ":", "::", "=>", "(", ")", "{", "}", "[", "]", "#{", "..",
++        "..=", "?.", "?[", "in",
++        "x", "y", "foo", "bar", "_", "abc",
++        "0", "1", "2", "42", "0x7f", "0o17", "0b101", "123456789012345678901234567890", "0.5",
++        "1e10", "9223372036854775807",
++        "\"hello\"", "'c'", "`interp ${", "}`", "// comment", "/*", "*/",
++    ];
++    const SEPS: &[&str] = &[" ", "", "\n", "\t", "  "];
++    let n = tc.draw(generators::integers::<usize>().max_value(64));
++    let mut s = String::new();
++    for _ in 0..n {
++        s.push_str(tc.draw(generators::sampled_from(TOKENS.to_vec())));
++        s.push_str(tc.draw(generators::sampled_from(SEPS.to_vec())));
++    }
++    s
++}
+diff --git a/tests/float.rs b/tests/float.rs
+index 544c4989..cb640c65 100644
+--- a/tests/float.rs
++++ b/tests/float.rs
+@@ -95,3 +95,35 @@ fn test_float_func() {
+ 
+     assert_eq!(engine.eval::<FLOAT>("sum(1.0, 2.0, 3.0, 4.0)").unwrap(), 10.0);
+ }
++
++/// Property: any finite FLOAT value printed with Rust's shortest-roundtrip
++/// `{:?}` format parses back (as a rhai float literal) to the bit-identical
++/// value.
++///
++/// Evidence: the tokenizer parses float literals with `FloatWrapper::from_str`
++/// (a thin wrapper over `FLOAT::from_str`, src/tokenizer.rs), including
++/// scientific notation, and folds a leading `-` in unary position into the
++/// literal; Rust guarantees `{:?}` output round-trips through `from_str`.
++#[hegel::test]
++fn test_float_literal_debug_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let f: FLOAT = tc.draw(
++        generators::floats::<FLOAT>()
++            .allow_nan(false)        // NaN never compares equal; no literal spelling
++            .allow_infinity(false),  // "inf" is not a rhai literal
++    );
++
++    let engine = Engine::new();
++    let script = format!("{:?}", f);
++    let result = engine
++        .eval::<FLOAT>(&script)
++        .unwrap_or_else(|e| panic!("failed to eval {}: {}", script, e));
++    assert_eq!(
++        result.to_bits(),
++        f.to_bits(),
++        "literal {:?} evaluated to {:?}",
++        script,
++        result
++    );
++}
+diff --git a/tests/math.rs b/tests/math.rs
+index a1f1b155..14f2cb21 100644
+--- a/tests/math.rs
++++ b/tests/math.rs
+@@ -57,3 +57,47 @@ fn test_math_parse() {
+     assert_eq!(engine.eval::<INT>(r#"parse_int("42", 16)"#).unwrap(), 0x42);
+     assert_eq!(engine.eval::<INT>(r#"parse_int("abcdef", 16)"#).unwrap(), 0xabcdef);
+ }
++
++mod common;
++
++/// Property: evaluating a generated integer arithmetic expression matches a
++/// Rust-side reference implementation using checked arithmetic.
++///
++/// Evidence: `src/packages/arithmetic.rs` and `src/func/builtin.rs` implement
++/// `+ - * / %` and unary `-` on INT with `checked_*` operations under
++/// `#[cfg(not(feature = "unchecked"))]`, raising `ErrorArithmetic` on
++/// overflow or division by zero.
++///
++/// Literals are bound to variables (see `render_via_lets`) so that all
++/// arithmetic goes through the runtime operators rather than the parser's
++/// constant folding, whose unary-minus-overflow-to-float behavior is
++/// deliberately different.
++#[cfg(not(feature = "unchecked"))]
++#[hegel::test]
++fn test_int_arithmetic_matches_checked_reference(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let depth = tc.draw(generators::integers::<u32>().max_value(6));
++    let expr = tc.draw(common::exprs(depth));
++    let script = expr.render_via_lets();
++
++    let mut engine = Engine::new();
++    // Evaluate at runtime rather than testing the constant folder here;
++    // optimization-level equivalence is a separate property (tests/optimizer.rs).
++    #[cfg(not(feature = "no_optimize"))]
++    engine.set_optimization_level(rhai::OptimizationLevel::None);
++
++    match (engine.eval::<INT>(&script), expr.eval_checked()) {
++        (Ok(got), Some(want)) => assert_eq!(got, want, "script: {}", script),
++        (Err(err), None) => assert!(
++            matches!(*err, EvalAltResult::ErrorArithmetic(..)),
++            "expected arithmetic error for script: {}, got: {}",
++            script,
++            err
++        ),
++        (got, want) => panic!(
++            "mismatch for script: {}\n rhai: {:?}\n reference: {:?}",
++            script, got, want
++        ),
++    }
++}
+diff --git a/tests/number_literals.rs b/tests/number_literals.rs
+index 55dd7264..1a74854f 100644
+--- a/tests/number_literals.rs
++++ b/tests/number_literals.rs
+@@ -55,3 +55,26 @@ fn test_binary_literal() {
+     #[cfg(not(feature = "no_float"))]
+     let _ = engine.compile("0b101.101").unwrap_err();
+ }
++
++/// Property: any INT value printed in decimal parses back (as a rhai number
++/// literal) to the same value.
++///
++/// Evidence: the tokenizer parses decimal literals with `INT::from_str`
++/// (src/tokenizer.rs) and folds a leading `-` in unary position into the
++/// literal, so every `INT`, including `INT::MIN`, has a literal spelling.
++#[hegel::test]
++fn test_int_literal_display_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let n: INT = tc.draw(hegel::one_of!(
++        generators::integers::<INT>(),
++        generators::sampled_from(vec![INT::MIN, INT::MIN + 1, -1, 0, 1, INT::MAX - 1, INT::MAX]),
++    ));
++
++    let engine = Engine::new();
++    let script = n.to_string();
++    assert_eq!(
++        engine.eval::<INT>(&script).unwrap_or_else(|e| panic!("failed to eval {}: {}", script, e)),
++        n
++    );
++}
+diff --git a/tests/operations.rs b/tests/operations.rs
+index 2657b9a1..0b006262 100644
+--- a/tests/operations.rs
++++ b/tests/operations.rs
+@@ -140,3 +140,74 @@ fn test_max_operations_progress() {
+         *engine.run("for x in 0..500 {}").unwrap_err(),
+         EvalAltResult::ErrorTerminated(x, ..) if x.as_int().unwrap() == 42));
+ }
++
++mod common;
++
++/// Property: any positive `max_operations` limit actually terminates an
++/// infinite loop with `ErrorTooManyOperations` (and never panics or hangs).
++///
++/// Evidence: `set_max_operations` docs ("Set the maximum number of
++/// operations allowed for a script to run to avoid consuming too much
++/// resources") and `test_max_operations` above.
++#[hegel::test]
++fn test_max_operations_terminates_infinite_loop(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    // 0 means "unlimited", so the property only holds for positive limits.
++    let limit = tc.draw(generators::integers::<u64>().min_value(1).max_value(10_000));
++
++    let mut engine = Engine::new();
++    #[cfg(not(feature = "no_optimize"))]
++    engine.set_optimization_level(rhai::OptimizationLevel::None);
++    engine.set_max_operations(limit);
++
++    let err = engine
++        .run("let x = 0; loop { x += 1; }")
++        .expect_err("an infinite loop must be stopped by max_operations");
++    assert!(
++        matches!(*err, EvalAltResult::ErrorTooManyOperations(..)),
++        "limit {}: expected ErrorTooManyOperations, got: {}",
++        limit,
++        err
++    );
++}
++
++/// Property: with resource limits configured (as in
++/// `fuzz/fuzz_targets/scripting.rs`), compiling and evaluating arbitrary
++/// script-shaped input never panics, at any optimization level. The
++/// operations limit guarantees termination.
++#[hegel::test]
++fn test_eval_arbitrary_input_with_limits_never_panics(tc: hegel::TestCase) {
++    use hegel::generators;
++    use hegel::Generator;
++
++    let script = match tc.draw(generators::integers::<u8>().max_value(2)) {
++        0 => tc.draw(generators::text()),
++        1 => common::token_soup(&tc),
++        _ => common::arbitrary_script(&tc),
++    };
++
++    let mut engine = Engine::new();
++    engine.set_max_string_size(1000);
++    engine.set_max_array_size(500);
++    engine.set_max_map_size(500);
++    engine.set_max_variables(1000);
++    engine.set_max_functions(100);
++    engine.set_max_modules(100);
++    engine.set_max_call_levels(10);
++    engine.set_max_expr_depths(50, 5);
++    engine.set_max_operations(50_000);
++    #[cfg(not(feature = "no_optimize"))]
++    {
++        let level = tc.draw((generators::sampled_from(vec![
++            rhai::OptimizationLevel::None,
++            rhai::OptimizationLevel::Simple,
++            rhai::OptimizationLevel::Full,
++        ])).print_as_debug());
++        engine.set_optimization_level(level);
++    }
++    engine.on_print(|_| ());
++    engine.on_debug(|_, _, _| ());
++
++    let _ = engine.eval::<rhai::Dynamic>(&script);
++}
+diff --git a/tests/optimizer.rs b/tests/optimizer.rs
+index 83d24cbe..7668a90e 100644
+--- a/tests/optimizer.rs
++++ b/tests/optimizer.rs
+@@ -248,3 +248,45 @@ fn test_optimizer_const_map() {
+         assert!(res, "Constant map optimization failed for expression: {} => {:?}", expr, ast);
+     }
+ }
++
++mod common;
++
++/// Property: the same well-formed script produces the same result (value, or
++/// error kind) under OptimizationLevel::None, Simple and Full.
++///
++/// Evidence: optimization is documented as semantics-preserving — the
++/// optimizer only folds constants, prunes dead code and eagerly calls pure
++/// built-ins (src/optimizer.rs); `test_optimizer_run` above runs the same
++/// scripts at all three levels expecting identical results. The generated
++/// scripts are side-effect-free, terminating and result in an INT.
++/// `set_fast_operators` is part of the generated configuration.
++#[hegel::test]
++fn test_optimization_levels_agree(tc: hegel::TestCase) {
++    use hegel::generators;
++    use std::mem::discriminant;
++
++    let script = common::arbitrary_script(&tc);
++    let fast_operators = tc.draw(generators::booleans());
++
++    let mut results = Vec::new();
++    for level in [OptimizationLevel::None, OptimizationLevel::Simple, OptimizationLevel::Full] {
++        let mut engine = Engine::new();
++        engine.set_fast_operators(fast_operators);
++        engine.set_optimization_level(level);
++        // Compare the value on success, or the error *kind* on failure
++        // (positions inside errors legitimately differ once code is folded).
++        let outcome = engine.eval::<INT>(&script).map_err(|e| discriminant(&*e));
++        results.push((level, outcome));
++    }
++
++    assert_eq!(
++        results[0].1, results[1].1,
++        "None vs Simple disagree (fast_operators={}) on script:\n{}\n{:?}",
++        fast_operators, script, results
++    );
++    assert_eq!(
++        results[0].1, results[2].1,
++        "None vs Full disagree (fast_operators={}) on script:\n{}\n{:?}",
++        fast_operators, script, results
++    );
++}
+diff --git a/tests/stack.rs b/tests/stack.rs
+index f3746abc..3e98162c 100644
+--- a/tests/stack.rs
++++ b/tests/stack.rs
+@@ -169,3 +169,98 @@ fn test_stack_overflow_ref_loop() {
+ 
+     println!("{x:?}");
+ }
++
++/// Property: with expression-depth limits configured anywhere up to the
++/// build's own defaults, compiling an arbitrarily deeply nested (but
++/// syntactically valid) expression never panics or overflows the stack — it
++/// either compiles or fails with `ParseErrorType::ExprTooDeep`.
++///
++/// Evidence: `set_max_expr_depths` exists to bound parser recursion, and
++/// `test_stack_overflow_parsing` above pins specific instances.
++///
++/// The drawn limits are capped at the build's *default* limits: an earlier
++/// version of this property drew limits up to 200 and found that e.g.
++/// `set_max_expr_depths(187, 187)` with a 185-term `1 + 1 + ...` chain
++/// overflows a standard 2 MiB test-thread stack in a debug build (see
++/// `test_expr_depth_reproducer_stack_overflow` below). That is not a
++/// violation of a documented contract — the safe limit is deliberately
++/// build-dependent (debug default 32 vs release 64, src/api/limits.rs), and
++/// matching the limit to the available stack is the caller's job — but it is
++/// why this generator does not exceed the defaults.
++#[hegel::test]
++fn test_expr_depth_limit_never_panics(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let default_engine = Engine::new();
++    let max_expr_depth = tc.draw(
++        generators::integers::<usize>()
++            .min_value(1)
++            .max_value(default_engine.max_expr_depth()),
++    );
++    #[cfg(not(feature = "no_function"))]
++    let max_fn_expr_depth = tc.draw(
++        generators::integers::<usize>()
++            .min_value(1)
++            .max_value(default_engine.max_function_expr_depth()),
++    );
++    let nesting = tc.draw(generators::integers::<usize>().max_value(400));
++
++    // Several shapes of deep nesting.
++    let script = match tc.draw(generators::integers::<u8>().max_value(3)) {
++        0 => format!("{}1{}", "(".repeat(nesting), ")".repeat(nesting)),
++        1 => format!("{}1", "1 + ".repeat(nesting)),
++        2 => format!("{}1", "- ".repeat(nesting)),
++        _ => format!("{}1{}", "!(".repeat(nesting), ")".repeat(nesting)),
++    };
++
++    let mut engine = Engine::new();
++    engine.set_max_expr_depths(
++        max_expr_depth,
++        #[cfg(not(feature = "no_function"))]
++        max_fn_expr_depth,
++    );
++
++    match engine.compile(&script) {
++        Ok(_) => (),
++        Err(err) => assert_eq!(
++            *err.err_type(),
++            ParseErrorType::ExprTooDeep,
++            "unexpected parse error for nesting {} with limit {}: {}",
++            nesting,
++            max_expr_depth,
++            err
++        ),
++    }
++}
++
++/// Minimal reproducer for a finding of the property test above when its
++/// limits generator went beyond the build's defaults: raising the expression
++/// depth limit to 187 and parsing a 185-term `+` chain overflows a 2 MiB
++/// thread stack in a debug build, aborting the whole process (which is why
++/// this cannot be left as a normally-failing test).
++///
++/// This is judged to be outside rhai's documented contract rather than a
++/// library bug — `set_max_expr_depths` makes no stack-safety promise (0 even
++/// means "unlimited"), and the deliberately smaller debug-build defaults
++/// (32/16 vs 64/32) plus the fuzz harnesses' choice of `(50, 5)` show the
++/// safe range is understood to depend on build and stack size. Kept ignored
++/// as documentation.
++#[test]
++#[ignore = "aborts the process by design of the experiment: stack overflow on a 2 MiB thread in debug builds"]
++fn test_expr_depth_reproducer_stack_overflow() {
++    std::thread::Builder::new()
++        .stack_size(2 * 1024 * 1024)
++        .spawn(|| {
++            let mut engine = Engine::new();
++            engine.set_max_expr_depths(
++                187,
++                #[cfg(not(feature = "no_function"))]
++                187,
++            );
++            let script = format!("{}1", "1 + ".repeat(185));
++            let _ = engine.compile(&script);
++        })
++        .unwrap()
++        .join()
++        .unwrap();
++}
+diff --git a/tests/string.rs b/tests/string.rs
+index 84c7c2a8..a28d3cd9 100644
+--- a/tests/string.rs
++++ b/tests/string.rs
+@@ -466,3 +466,38 @@ fn test_immutable_string() {
+     let _ssx: Box<str> = x.clone().into();
+     let _ssx: Box<str> = (&x).into();
+ }
++
++/// Property: a rhai string literal built by escaping the characters of an
++/// arbitrary Rust string evaluates back to exactly that string.
++///
++/// Evidence: the tokenizer implements `\x`/`\u`/`\U` hex escapes plus
++/// `\\`, `\"`, `\t`, `\r`, `\n` (src/tokenizer.rs, `parse_string_literal`),
++/// and `test_string` above pins individual examples (e.g. `❤`).
++/// Each character is either escaped as `\U????????` or, when it does not
++/// require escaping, included verbatim (chosen per character), exercising
++/// both the escape decoder and the verbatim path.
++#[hegel::test]
++fn test_string_literal_escape_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let s: String = tc.draw(generators::text());
++
++    let mut literal = String::from('"');
++    for ch in s.chars() {
++        // '"', '\\' and '\n' cannot appear verbatim in a normal string
++        // literal ('\n' terminates it); everything else may.
++        let must_escape = matches!(ch, '"' | '\\' | '\n');
++        if must_escape || tc.draw(generators::booleans()) {
++            literal.push_str(&format!("\\U{:08X}", ch as u32));
++        } else {
++            literal.push(ch);
++        }
++    }
++    literal.push('"');
++
++    let engine = Engine::new();
++    let result = engine
++        .eval::<String>(&literal)
++        .unwrap_or_else(|e| panic!("literal failed to evaluate: {:?}\nerror: {}", literal, e));
++    assert_eq!(result, s, "literal: {:?}", literal);
++}
+diff --git a/tests/tokens.rs b/tests/tokens.rs
+index c0b33188..356c775c 100644
+--- a/tests/tokens.rs
++++ b/tests/tokens.rs
+@@ -125,3 +125,74 @@ fn test_compact_script_operator_adjacency() {
+         engine.compile(&compacted).unwrap_or_else(|e| panic!("compacted {:?} failed to recompile: {}", compacted, e));
+     }
+ }
++
++mod common;
++
++/// Property: `Engine::compile` never panics, whatever the input text —
++/// arbitrary Unicode or script-shaped token soup.
++///
++/// Evidence: `compile` returns `ParseResult` (it promises errors, not
++/// panics), and `fuzz/fuzz_targets/scripting.rs` feeds arbitrary strings to
++/// `compile` for exactly this reason.
++#[hegel::test]
++fn test_compile_never_panics_on_arbitrary_input(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    let script = if tc.draw(generators::booleans()) {
++        tc.draw(generators::text())
++    } else {
++        common::token_soup(&tc)
++    };
++    let engine = Engine::new();
++    let _ = engine.compile(&script);
++}
++
++/// Property: `Engine::compact_script` output is semantically identical to
++/// its input, per its documentation ("The output script is semantically
++/// identical to the input script, except smaller in size.").
++///
++/// Evidence: doc-comment on `compact_script` (src/api/formatting.rs); commit
++/// fcb384fd fixed compact_script fusing adjacent operators (`< -` -> `<-`),
++/// which is exactly the bug class this property targets.
++#[hegel::test]
++fn test_compact_script_preserves_semantics(tc: hegel::TestCase) {
++    use std::mem::discriminant;
++
++    let script = common::arbitrary_script(&tc);
++    let engine = Engine::new();
++
++    let compacted = engine
++        .compact_script(&script)
++        .unwrap_or_else(|e| panic!("compact_script failed on well-formed script:\n{}\nerror: {}", script, e));
++
++    let original = engine.eval::<INT>(&script).map_err(|e| discriminant(&*e));
++    let compact = engine.eval::<INT>(&compacted).map_err(|e| discriminant(&*e));
++
++    assert_eq!(
++        original, compact,
++        "compacting changed semantics.\noriginal script:\n{}\ncompacted:\n{}",
++        script, compacted
++    );
++}
++
++/// Property: if a script compiles, then its compacted form also compiles.
++/// Runs on token soup with randomized whitespace, which explores exactly the
++/// token-adjacency space where compact_script previously produced invalid
++/// output (commit fcb384fd: `< -` fused into `<-`).
++#[hegel::test]
++fn test_compact_script_output_recompiles(tc: hegel::TestCase) {
++    let script = common::token_soup(&tc);
++    let engine = Engine::new();
++
++    if engine.compile(&script).is_ok() {
++        let compacted = engine
++            .compact_script(&script)
++            .unwrap_or_else(|e| panic!("compact_script failed on compilable script:\n{}\nerror: {}", script, e));
++        engine.compile(&compacted).unwrap_or_else(|e| {
++            panic!(
++                "compacted output no longer compiles.\noriginal:\n{}\ncompacted:\n{}\nerror: {}",
++                script, compacted, e
++            )
++        });
++    }
++}
+diff --git a/tests/var_scope.rs b/tests/var_scope.rs
+index eb3abbfb..9e97ee5c 100644
+--- a/tests/var_scope.rs
++++ b/tests/var_scope.rs
+@@ -452,3 +452,46 @@ fn test_var_scope_cloning() {
+     engine.run_with_scope(&mut scope, "let x = 42; print(x + foo.field);").unwrap();
+     assert_eq!(engine.eval_with_scope::<INT>(&mut scope, "let x = 42; x + foo.field").unwrap(), 43);
+ }
++
++/// Property: a value pushed into a `Scope` under an arbitrary valid
++/// identifier is returned unchanged when a script evaluates that identifier,
++/// and remains in the scope afterwards.
++///
++/// Evidence: `Scope::push` / `eval_with_scope` docs and `test_var_scope`
++/// above; `fuzz/fuzz_targets/scripting.rs` pushes arbitrary named variables
++/// into scopes the same way.
++#[hegel::test]
++fn test_scope_push_then_eval_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++
++    // "v_" prefix guarantees the name is a valid identifier and never a
++    // keyword or reserved symbol.
++    let name = format!(
++        "v_{}",
++        tc.draw(generators::from_regex("[A-Za-z0-9_]{0,16}").fullmatch(true))
++    );
++
++    let engine = Engine::new();
++    let mut scope = Scope::new();
++
++    match tc.draw(generators::integers::<u8>().max_value(2)) {
++        0 => {
++            let v: INT = tc.draw(generators::integers::<INT>());
++            scope.push(name.clone(), v);
++            assert_eq!(engine.eval_with_scope::<INT>(&mut scope, &name).unwrap(), v);
++            assert_eq!(scope.get_value::<INT>(&name), Some(v));
++        }
++        1 => {
++            let v: bool = tc.draw(generators::booleans());
++            scope.push(name.clone(), v);
++            assert_eq!(engine.eval_with_scope::<bool>(&mut scope, &name).unwrap(), v);
++            assert_eq!(scope.get_value::<bool>(&name), Some(v));
++        }
++        _ => {
++            let v: String = tc.draw(generators::text());
++            scope.push(name.clone(), v.clone());
++            assert_eq!(engine.eval_with_scope::<String>(&mut scope, &name).unwrap(), v);
++            assert_eq!(scope.get_value::<String>(&name), Some(v));
++        }
++    }
++}

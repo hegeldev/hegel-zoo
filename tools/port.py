@@ -444,7 +444,7 @@ def port(crate: str) -> str:
         errs = sorted(set(re.findall(r"^error(?:\[E\d+\])?: (.{0,110})", log, re.M)))
         return f"COMPILE {crate} ({nfix} composites fixed): " + " | ".join(errs[:6])
     if "BAD " in out:
-        fails = re.findall(r"^\s+(FAIL|PASS\?|MISSING|UPSTREAM)\s+(\S+)", out, re.M)
+        fails = re.findall(r"^\s+(FAIL|PASS\?|MISSING|NOTRUN|UPSTREAM)\s+(\S+)", out, re.M)
         return f"MAP     {crate}: " + ", ".join(f"{k} {n}" for k, n in fails)
     if "OK " not in out:
         return f"ERROR   {crate}: no verdict: {out.strip()[-400:]}"
