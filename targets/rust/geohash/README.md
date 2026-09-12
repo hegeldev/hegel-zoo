@@ -26,3 +26,4 @@
 - 2026-06-14: predecessor base commit `50a4b2a35ee0` (Add encode_iter variant of encode to enable avoiding allocations (#62)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/geohash.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 50a4b2a35ee0 → 7d4c402de15b (2026-08-19, "Return an error instead of panicking when decoding an empty geohash (#65)"; 0.13.2); 1 bug(s) still reproduce; fixed upstream: geohash/2. 22 tests pass. geohash/2 (decode("") shift overflow) is fixed upstream by PR #65; geohash/1 (north pole) still reproduces.
