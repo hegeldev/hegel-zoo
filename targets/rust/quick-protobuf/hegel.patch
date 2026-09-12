@@ -1,0 +1,724 @@
+diff --git a/quick-protobuf/Cargo.toml b/quick-protobuf/Cargo.toml
+index fbaa336..8428a87 100644
+--- a/quick-protobuf/Cargo.toml
++++ b/quick-protobuf/Cargo.toml
+@@ -18,6 +18,7 @@ byteorder = { version = "1.3.4", default-features = false }
+ lazy_static = "1.4.0"
+ trybuild = "1.0.71"
+ quickcheck = "1"
++hegeltest = "0.44.1"
+ 
+ [features]
+ default = ["std"]
+diff --git a/quick-protobuf/src/reader.rs b/quick-protobuf/src/reader.rs
+index 85ebdd6..7599bdb 100644
+--- a/quick-protobuf/src/reader.rs
++++ b/quick-protobuf/src/reader.rs
+@@ -1020,6 +1020,152 @@ fn test_packed_fixed_iter() {
+     assert_eq!(total, (1 + 2 + 3 + 4 + 5) * (10 + 1));
+ }
+ 
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel): untrusted-decoder robustness.
++//
++// BytesReader is the entry point for attacker-controlled bytes, so the core
++// property is: reading arbitrary or crafted-hostile input returns Ok/Err but
++// never panics, never pre-allocates based on a claimed length, never hangs,
++// and never walks the cursor past the buffer.
++// ---------------------------------------------------------------------------
++#[cfg(test)]
++mod hegel_props {
++    use super::*;
++    use crate::sizeofs::{sizeof_len, sizeof_varint};
++    use crate::writer::Writer;
++    use hegel::generators;
++
++    /// Reading varints from arbitrary bytes never panics, consumes at most 10
++    /// bytes, and never moves the cursor past the buffer.
++    #[hegel::test]
++    fn prop_read_varint_arbitrary_bytes(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(generators::binary().max_size(64));
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        let res64 = r.read_varint64(&bytes);
++        let consumed = r.start;
++        assert!(consumed <= 10, "read_varint64 consumed {} > 10 bytes", consumed);
++        assert!(consumed <= bytes.len());
++        if let Ok(v) = res64 {
++            // consistency with the sizeof/writer pair: the canonical encoding
++            // of the decoded value can never be longer than what was consumed
++            // (it can be shorter: overlong/truncating encodings are accepted).
++            assert!(sizeof_varint(v) <= consumed);
++        }
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        drop(r.read_varint32(&bytes));
++        assert!(r.start <= 10);
++        assert!(r.start <= bytes.len());
++    }
++
++    /// Over-long varints (10 continuation bytes with their high bit set,
++    /// i.e. >10 bytes total) are rejected with Error::Varint by both
++    /// read_varint32 and read_varint64 — no panic, no unbounded scan.
++    #[hegel::test]
++    fn prop_overlong_varint_errors(tc: hegel::TestCase) {
++        // 10 bytes that all claim continuation, then arbitrary junk.
++        let mut bytes: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().min_value(0x80)) // MSB set
++                .min_size(10)
++                .max_size(10),
++        );
++        let junk: Vec<u8> = tc.draw(generators::binary().max_size(8));
++        bytes.extend_from_slice(&junk);
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        assert!(matches!(r.read_varint64(&bytes), Err(Error::Varint)));
++        assert_eq!(r.start, 10, "must stop after exactly 10 bytes");
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        assert!(matches!(r.read_varint32(&bytes), Err(Error::Varint)));
++        assert_eq!(r.start, 10, "must stop after exactly 10 bytes");
++
++        // Converse: exactly 10 bytes with the final continuation bit clear is
++        // the longest accepted varint.
++        let mut ok_bytes = bytes[..9].to_vec();
++        ok_bytes.push(tc.draw(generators::integers::<u8>().max_value(0x7F)));
++        let mut r = BytesReader::from_bytes(&ok_bytes);
++        assert!(r.read_varint64(&ok_bytes).is_ok());
++        assert_eq!(r.start, 10);
++        let mut r = BytesReader::from_bytes(&ok_bytes);
++        assert!(r.read_varint32(&ok_bytes).is_ok());
++        assert_eq!(r.start, 10);
++    }
++
++    /// A length-delimited field claiming a huge length backed by a short
++    /// buffer must fail with UnexpectedEndOfBuffer — quickly, without
++    /// allocating anything proportional to the claimed length.
++    #[hegel::test]
++    fn prop_huge_length_prefix_errors(tc: hegel::TestCase) {
++        let payload: Vec<u8> = tc.draw(generators::binary().max_size(32));
++        // Claimed length is always larger than what is available.
++        let claimed = tc.draw(
++            generators::integers::<u32>()
++                .min_value(payload.len() as u32 + 1)
++                .max_value(u32::MAX),
++        );
++        let mut bytes = Vec::new();
++        Writer::new(&mut bytes).write_varint(claimed as u64).unwrap();
++        bytes.extend_from_slice(&payload);
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        assert!(matches!(r.read_bytes(&bytes), Err(Error::UnexpectedEndOfBuffer)));
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        assert!(matches!(r.read_string(&bytes), Err(Error::UnexpectedEndOfBuffer)));
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        assert!(matches!(
++            r.read_packed_fixed::<u64>(&bytes),
++            Err(Error::UnexpectedEndOfBuffer)
++        ));
++
++        let mut r = BytesReader::from_bytes(&bytes);
++        assert!(r.read_packed(&bytes, |r, b| r.read_uint64(b)).is_err());
++    }
++
++    /// Scanning arbitrary bytes as a stream of unknown fields (next_tag +
++    /// read_unknown, exactly what generated from_reader impls do for unknown
++    /// tags) terminates, never panics, and never moves the cursor past the
++    /// end of the buffer.
++    #[hegel::test]
++    fn prop_scan_unknown_fields_arbitrary_bytes(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(generators::binary().max_size(128));
++        let mut r = BytesReader::from_bytes(&bytes);
++        let mut iterations = 0usize;
++        while !r.is_eof() {
++            let before = r.start;
++            let tag = match r.next_tag(&bytes) {
++                Ok(t) => t,
++                Err(_) => break,
++            };
++            if r.read_unknown(&bytes, tag).is_err() {
++                break;
++            }
++            assert!(r.start <= bytes.len(), "cursor moved past the buffer");
++            assert!(r.start > before, "no progress: potential infinite loop");
++            iterations += 1;
++            assert!(iterations <= bytes.len(), "more fields than bytes: infinite loop");
++        }
++        assert!(r.start <= bytes.len(), "cursor moved past the buffer");
++    }
++
++    /// Position accounting: a successful read_bytes advances the cursor by
++    /// exactly sizeof_len(returned.len()) — the length prefix plus the data —
++    /// and never past the buffer.
++    #[hegel::test]
++    fn prop_read_bytes_position_accounting(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(generators::binary().max_size(128));
++        let mut r = BytesReader::from_bytes(&bytes);
++        if let Ok(s) = r.read_bytes(&bytes) {
++            assert_eq!(r.start, sizeof_len(s.len()));
++            assert!(r.start <= bytes.len());
++            assert_eq!(r.len(), bytes.len() - r.start);
++        }
++    }
++}
++
+ #[test]
+ fn test_packed_fixed_eq() {
+     let v = vec![
+diff --git a/quick-protobuf/tests/write_read.rs b/quick-protobuf/tests/write_read.rs
+index 376cff6..98cc1a7 100644
+--- a/quick-protobuf/tests/write_read.rs
++++ b/quick-protobuf/tests/write_read.rs
+@@ -96,7 +96,7 @@ fn wr_enum() {
+     assert_eq!(v, r.read_enum(&buf).unwrap());
+ }
+ 
+-#[derive(PartialEq, Eq, Debug, Clone, Default)]
++#[derive(PartialEq, Eq, Debug, Clone, Default, hegel::PrettyPrintable)]
+ struct TestMessage {
+     id: Option<u32>,
+     val: Vec<i64>,
+@@ -316,6 +316,513 @@ fn wr_packed_float() {
+     assert_eq!(pf.into_vec(), res);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// These generalize the example-based write/read tests above: every write_*/
++// read_* pair must round-trip across the full domain of its type, and the
++// sizeof_* helpers must agree with the number of bytes actually written
++// (the same property the quickcheck test `test_get_size` in
++// tests/rust_protobuf/v2/test_basic.rs checks for generated messages).
++// ---------------------------------------------------------------------------
++mod hegel_props {
++    use super::*;
++    use hegel::generators;
++    use hegel::Generator;
++    use std::panic::{self, AssertUnwindSafe};
++
++    /// Deserialize arbitrary bytes as a `TestMessage`, tolerating ONLY the
++    /// known scope-underflow panic pinned by
++    /// `known_failure_read_unknown_scope_underflow_panic` (see its doc comment).
++    /// Any other panic is a fresh bug and is re-raised so the property fails.
++    /// This is the sanctioned "exclude the known-buggy input from siblings"
++    /// pattern: it keeps these no-panic properties green and still exercising
++    /// every other input while the canonical pin documents the bug.
++    fn decode_tolerating_known_bug(bytes: &[u8]) {
++        let res = panic::catch_unwind(AssertUnwindSafe(|| {
++            drop(deserialize_from_slice::<TestMessage>(bytes));
++        }));
++        if let Err(payload) = res {
++            let msg = payload
++                .downcast_ref::<String>()
++                .map(|s| s.as_str())
++                .or_else(|| payload.downcast_ref::<&str>().copied())
++                .unwrap_or("");
++            assert!(
++                msg.contains("subtract with overflow"),
++                "unexpected panic (not the pinned scope-underflow bug): {msg}"
++            );
++        }
++    }
++
++    /// Draw a u64 from the full range, boosted toward varint length boundaries
++    /// (0x7F/0x80, 0x3FFF/0x4000, ... u64::MAX) where encoding bugs live.
++    #[hegel::composite]
++    fn varint_u64(tc: &hegel::TestCase) -> u64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<u64>(),
++            generators::sampled_from(vec![
++                0,
++                0x7F,
++                0x80,
++                0x3FFF,
++                0x4000,
++                0x1FFFFF,
++                0x200000,
++                0xFFFFFFF,
++                0x10000000,
++                u32::MAX as u64,
++                0x7FFFFFFFF,
++                0x800000000,
++                0x7FFFFFFFFFFFFFFF,
++                0x8000000000000000,
++                u64::MAX,
++            ]),
++        ))
++    }
++
++    /// Full-range i64 boosted toward MIN/MAX/0/±1.
++    #[hegel::composite]
++    fn boosted_i64(tc: &hegel::TestCase) -> i64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i64>(),
++            generators::sampled_from(vec![i64::MIN, -1, 0, 1, i64::MAX]),
++        ))
++    }
++
++    /// Full-range i32 boosted toward MIN/MAX/0/±1.
++    #[hegel::composite]
++    fn boosted_i32(tc: &hegel::TestCase) -> i32 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i32>(),
++            generators::sampled_from(vec![i32::MIN, -1, 0, 1, i32::MAX]),
++        ))
++    }
++
++    /// write_varint/read_varint64 round-trip over the full u64 range, and the
++    /// encoded length matches sizeof_varint.
++    #[hegel::test]
++    fn prop_varint_u64_roundtrip(tc: hegel::TestCase) {
++        let v = tc.draw(varint_u64());
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_varint(v).unwrap();
++        assert_eq!(buf.len(), sizeof_varint(v), "encoded length != sizeof_varint({})", v);
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(v, r.read_varint64(&buf).unwrap());
++        assert!(r.is_eof(), "read_varint64 did not consume exactly the encoding");
++    }
++
++    /// The varint-coded scalar write/read pairs (int32/int64/uint32/uint64/
++    /// bool/enum) round-trip over their full ranges, consuming exactly the
++    /// bytes written (sizeof_* agreement included where a sizeof exists).
++    #[hegel::test]
++    fn prop_varint_scalar_roundtrip(tc: hegel::TestCase) {
++        let i32v = tc.draw(boosted_i32());
++        let i64v = tc.draw(boosted_i64());
++        let u32v = tc.draw(varint_u64()) as u32;
++        let u64v = tc.draw(varint_u64());
++        let boolv = tc.draw(generators::booleans());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_int32(i32v).unwrap();
++        assert_eq!(buf.len(), sizeof_int32(i32v));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(i32v, r.read_int32(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_int64(i64v).unwrap();
++        assert_eq!(buf.len(), sizeof_int64(i64v));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(i64v, r.read_int64(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_uint32(u32v).unwrap();
++        assert_eq!(buf.len(), sizeof_uint32(u32v));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(u32v, r.read_uint32(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_uint64(u64v).unwrap();
++        assert_eq!(buf.len(), sizeof_uint64(u64v));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(u64v, r.read_uint64(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_bool(boolv).unwrap();
++        assert_eq!(buf.len(), sizeof_bool(boolv));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(boolv, r.read_bool(&buf).unwrap());
++        assert!(r.is_eof());
++    }
++
++    /// Zigzag-coded sint32/sint64 round-trip over the full range including
++    /// MIN/MAX, and the encoded length matches sizeof_sint32/sizeof_sint64.
++    #[hegel::test]
++    fn prop_zigzag_roundtrip(tc: hegel::TestCase) {
++        let v32 = tc.draw(boosted_i32());
++        let v64 = tc.draw(boosted_i64());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_sint32(v32).unwrap();
++        assert_eq!(buf.len(), sizeof_sint32(v32));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(v32, r.read_sint32(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_sint64(v64).unwrap();
++        assert_eq!(buf.len(), sizeof_sint64(v64));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(v64, r.read_sint64(&buf).unwrap());
++        assert!(r.is_eof());
++    }
++
++    /// Fixed-width scalars (fixed32/fixed64/sfixed32/sfixed64/float/double)
++    /// round-trip exactly. Floats are drawn as raw bit patterns so the whole
++    /// domain (NaNs, infinities, subnormals) is covered, and compared by bits.
++    #[hegel::test]
++    fn prop_fixed_width_roundtrip(tc: hegel::TestCase) {
++        let u32v = tc.draw(generators::integers::<u32>());
++        let u64v = tc.draw(generators::integers::<u64>());
++        let i32v = tc.draw(boosted_i32());
++        let i64v = tc.draw(boosted_i64());
++        let f32v = f32::from_bits(tc.draw(generators::integers::<u32>()));
++        let f64v = f64::from_bits(tc.draw(generators::integers::<u64>()));
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_fixed32(u32v).unwrap();
++        assert_eq!(buf.len(), 4);
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(u32v, r.read_fixed32(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_fixed64(u64v).unwrap();
++        assert_eq!(buf.len(), 8);
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(u64v, r.read_fixed64(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_sfixed32(i32v).unwrap();
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(i32v, r.read_sfixed32(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_sfixed64(i64v).unwrap();
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(i64v, r.read_sfixed64(&buf).unwrap());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_float(f32v).unwrap();
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(f32v.to_bits(), r.read_float(&buf).unwrap().to_bits());
++        assert!(r.is_eof());
++
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_double(f64v).unwrap();
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(f64v.to_bits(), r.read_double(&buf).unwrap().to_bits());
++        assert!(r.is_eof());
++    }
++
++    /// write_bytes/read_bytes round-trip for arbitrary contents including
++    /// empty, and the encoding is exactly sizeof_len(len) bytes.
++    #[hegel::test]
++    fn prop_bytes_roundtrip(tc: hegel::TestCase) {
++        let v: Vec<u8> = tc.draw(generators::binary().max_size(300));
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_bytes(&v).unwrap();
++        assert_eq!(buf.len(), sizeof_len(v.len()));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(&v[..], r.read_bytes(&buf).unwrap());
++        assert!(r.is_eof());
++    }
++
++    /// write_string/read_string round-trip for arbitrary unicode including
++    /// empty strings.
++    #[hegel::test]
++    fn prop_string_roundtrip(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text().max_size(200));
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_string(&s).unwrap();
++        assert_eq!(buf.len(), sizeof_len(s.len()));
++        let mut r = BytesReader::from_bytes(&buf);
++        assert_eq!(s, r.read_string(&buf).unwrap());
++        assert!(r.is_eof());
++    }
++
++    /// write_packed/read_packed round-trip for varint-coded elements; an empty
++    /// slice writes nothing at all (documented early-return).
++    #[hegel::test]
++    fn prop_packed_varint_roundtrip(tc: hegel::TestCase) {
++        let v: Vec<u32> = tc.draw(generators::vecs(generators::integers::<u32>()).max_size(100));
++        let mut buf = Vec::new();
++        Writer::new(&mut buf)
++            .write_packed(&v, |w, m| w.write_uint32(*m), &|m| sizeof_uint32(*m))
++            .unwrap();
++        if v.is_empty() {
++            assert!(buf.is_empty(), "empty packed field must write no bytes");
++        } else {
++            let mut r = BytesReader::from_bytes(&buf);
++            assert_eq!(v, r.read_packed(&buf, |r, b| r.read_uint32(b)).unwrap());
++            assert!(r.is_eof());
++        }
++    }
++
++    /// write_packed_fixed/read_packed_fixed round-trip (including empty, which
++    /// unlike write_packed does write a zero length prefix).
++    #[hegel::test]
++    fn prop_packed_fixed_roundtrip(tc: hegel::TestCase) {
++        let v: Vec<i32> = tc.draw(generators::vecs(boosted_i32()).max_size(100));
++        let pf: PackedFixed<i32> = v.clone().into();
++        let mut buf = Vec::new();
++        Writer::new(&mut buf).write_packed_fixed(&pf).unwrap();
++        assert_eq!(buf.len(), sizeof_len(4 * v.len()));
++        let mut r = BytesReader::from_bytes(&buf);
++        let read_back: Vec<i32> = r.read_packed_fixed(&buf).unwrap().into_vec();
++        assert_eq!(v, read_back);
++        assert!(r.is_eof());
++    }
++
++    /// One protobuf wire value, together with the tag wire-type bits it must
++    /// be written under.
++    #[derive(Debug, Clone, PartialEq, hegel::PrettyPrintable)]
++    enum WireValue {
++        Varint(u64),
++        Fixed64(u64),
++        LenDelim(Vec<u8>),
++        Fixed32(u32),
++    }
++
++    impl WireValue {
++        fn wire_type(&self) -> u32 {
++            match self {
++                WireValue::Varint(_) => 0,
++                WireValue::Fixed64(_) => 1,
++                WireValue::LenDelim(_) => 2,
++                WireValue::Fixed32(_) => 5,
++            }
++        }
++    }
++
++    #[hegel::composite]
++    fn wire_field(tc: &hegel::TestCase) -> (u32, WireValue) {
++        // Field numbers 1..=2^29-1 (the full protobuf range), boosted toward
++        // the extremes where tag varint encoding changes length.
++        let field_number = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().min_value(1).max_value(0x1FFF_FFFF),
++            generators::sampled_from(vec![1u32, 15, 16, 2047, 2048, 0x1FFF_FFFF]),
++        ));
++        let value = match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => WireValue::Varint(tc.draw(varint_u64())),
++            1 => WireValue::Fixed64(tc.draw(generators::integers::<u64>())),
++            2 => WireValue::LenDelim(tc.draw(generators::binary().max_size(60))),
++            _ => WireValue::Fixed32(tc.draw(generators::integers::<u32>())),
++        };
++        (field_number, value)
++    }
++
++    /// The crown: any sequence of (field_number, wire value) written through
++    /// Writer (tag + value) is read back exactly by a BytesReader loop
++    /// dispatching on next_tag, covering wire types 0/1/2/5 and the full
++    /// field-number range.
++    #[hegel::test]
++    fn prop_wire_sequence_roundtrip(tc: hegel::TestCase) {
++        let fields: Vec<(u32, WireValue)> = tc.draw(generators::vecs(wire_field()).max_size(30));
++
++        let mut buf = Vec::new();
++        {
++            let mut w = Writer::new(&mut buf);
++            for (fnum, val) in &fields {
++                let tag = (fnum << 3) | val.wire_type();
++                w.write_tag(tag).unwrap();
++                match val {
++                    WireValue::Varint(v) => w.write_varint(*v).unwrap(),
++                    WireValue::Fixed64(v) => w.write_fixed64(*v).unwrap(),
++                    WireValue::LenDelim(v) => w.write_bytes(v).unwrap(),
++                    WireValue::Fixed32(v) => w.write_fixed32(*v).unwrap(),
++                }
++            }
++        }
++
++        let mut r = BytesReader::from_bytes(&buf);
++        let mut read_back = Vec::with_capacity(fields.len());
++        while !r.is_eof() {
++            let tag = r.next_tag(&buf).unwrap();
++            let fnum = tag >> 3;
++            let val = match tag & 0x7 {
++                0 => WireValue::Varint(r.read_varint64(&buf).unwrap()),
++                1 => WireValue::Fixed64(r.read_fixed64(&buf).unwrap()),
++                2 => WireValue::LenDelim(r.read_bytes(&buf).unwrap().to_vec()),
++                5 => WireValue::Fixed32(r.read_fixed32(&buf).unwrap()),
++                wt => panic!("read back impossible wire type {}", wt),
++            };
++            read_back.push((fnum, val));
++        }
++        assert_eq!(fields, read_back);
++    }
++
++    #[hegel::composite]
++    fn test_message(tc: &hegel::TestCase) -> TestMessage {
++        TestMessage {
++            id: tc.draw(generators::optional(generators::integers::<u32>())),
++            val: tc.draw(generators::vecs(boosted_i64()).max_size(50)),
++        }
++    }
++
++    /// Messages round-trip through serialize_into_vec/deserialize_from_slice
++    /// and serialize_into_slice, and get_size agrees with the bytes actually
++    /// produced (hegel version of the quickcheck property `test_get_size` in
++    /// tests/rust_protobuf/v2/test_basic.rs).
++    #[hegel::test]
++    fn prop_message_roundtrip_and_get_size(tc: hegel::TestCase) {
++        let v = tc.draw((test_message()).print_as_debug());
++
++        let buf = serialize_into_vec(&v).unwrap();
++        assert_eq!(buf.len(), sizeof_len(v.get_size()), "get_size disagrees with written bytes");
++        assert_eq!(v, deserialize_from_slice(&buf).unwrap());
++
++        // serialize_into_slice succeeds with an exactly-sized buffer and
++        // produces the same encoding.
++        let mut slice_buf = vec![0u8; sizeof_len(v.get_size())];
++        serialize_into_slice(&v, &mut slice_buf).unwrap();
++        assert_eq!(buf, slice_buf);
++    }
++
++    /// Untrusted-decoder robustness: deserializing arbitrary bytes as a
++    /// message returns Ok or Err but never panics, OOMs, or hangs.
++    #[hegel::test]
++    fn prop_deserialize_arbitrary_bytes_no_panic(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(generators::binary().max_size(300));
++        decode_tolerating_known_bug(&bytes);
++    }
++
++    /// Corrupted-valid robustness: take a valid encoded message, corrupt it
++    /// (flip a byte, overwrite a byte, or truncate), and decoding must return
++    /// Ok or Err — never panic.
++    #[hegel::test]
++    fn prop_deserialize_corrupted_message_no_panic(tc: hegel::TestCase) {
++        let v = tc.draw(test_message());
++        let mut buf = serialize_into_vec(&v).unwrap();
++        tc.assume(!buf.is_empty());
++
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => {
++                // flip one bit
++                let idx = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                let bit = tc.draw(generators::integers::<u8>().max_value(7));
++                buf[idx] ^= 1 << bit;
++            }
++            1 => {
++                // overwrite one byte
++                let idx = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                buf[idx] = tc.draw(generators::integers::<u8>());
++            }
++            _ => {
++                // truncate
++                let new_len = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                buf.truncate(new_len);
++            }
++        }
++
++        decode_tolerating_known_bug(&buf);
++    }
++
++    /// A message that contains an optional nested copy of itself (field 1,
++    /// wire type 2) — the shape pb-rs generates for recursive .proto messages.
++    #[derive(Debug, Default, PartialEq)]
++    struct Recursive {
++        child: Option<Box<Recursive>>,
++    }
++
++    impl Recursive {
++        fn depth(&self) -> usize {
++            let mut d = 0;
++            let mut cur = self;
++            while let Some(c) = &cur.child {
++                d += 1;
++                cur = c;
++            }
++            d
++        }
++    }
++
++    impl<'a> MessageRead<'a> for Recursive {
++        fn from_reader(r: &mut BytesReader, bytes: &'a [u8]) -> Result<Recursive> {
++            let mut msg = Recursive::default();
++            while !r.is_eof() {
++                match r.next_tag(bytes) {
++                    Ok(10) => msg.child = Some(Box::new(r.read_message(bytes)?)),
++                    Ok(t) => {
++                        r.read_unknown(bytes, t)?;
++                    }
++                    Err(e) => return Err(e),
++                }
++            }
++            Ok(msg)
++        }
++    }
++
++    /// Craft the body bytes of a `Recursive` message nested `depth` levels
++    /// deep, without O(depth^2) copying: compute each level's length first,
++    /// then emit tags and length prefixes front to back.
++    fn nested_message_bytes(depth: usize) -> Vec<u8> {
++        let mut lens = vec![0usize; depth + 1];
++        for k in 1..=depth {
++            lens[k] = 1 + sizeof_varint(lens[k - 1] as u64) + lens[k - 1];
++        }
++        let mut buf = Vec::with_capacity(lens[depth]);
++        {
++            let mut w = Writer::new(&mut buf);
++            for k in (0..depth).rev() {
++                w.write_tag(10).unwrap(); // field 1, wire type 2
++                w.write_varint(lens[k] as u64).unwrap();
++            }
++        }
++        buf
++    }
++
++    /// Nested length-delimited messages decode correctly at any moderate
++    /// depth: the recovered structure has exactly the crafted nesting depth.
++    #[hegel::test]
++    fn prop_nested_message_moderate_depth_roundtrip(tc: hegel::TestCase) {
++        // Depth is capped here only to keep this passing test off the stack
++        // overflow documented in nested_message_deep_recursion_stack_overflow
++        // below — read_message has no recursion depth limit.
++        let depth = tc.draw(generators::integers::<usize>().max_value(500));
++        let bytes = nested_message_bytes(depth);
++        let mut r = BytesReader::from_bytes(&bytes);
++        let msg = Recursive::from_reader(&mut r, &bytes).unwrap();
++        assert_eq!(depth, msg.depth());
++    }
++
++    /// KNOWN FAILURE (process abort): quick-protobuf has no recursion depth
++    /// limit on read_message, so a small crafted input (~4 bytes per level)
++    /// with deeply nested length-delimited messages overflows the stack and
++    /// aborts the whole process. Official protobuf implementations cap
++    /// recursion (e.g. at depth 100) and return an error instead. Kept
++    /// #[ignore]d because a stack overflow cannot be caught as a test
++    /// failure; run explicitly with:
++    ///   cargo test --test write_read nested_message_deep_recursion -- --ignored
++    #[test]
++    #[ignore = "aborts the process: stack overflow, no recursion depth limit in read_message"]
++    fn nested_message_deep_recursion_stack_overflow() {
++        let bytes = nested_message_bytes(200_000);
++        let mut r = BytesReader::from_bytes(&bytes);
++        // An untrusted-input-robust decoder must return Err (or Ok) here; the
++        // process instead dies with SIGSEGV / "thread ... has overflowed its
++        // stack".
++        drop(Recursive::from_reader(&mut r, &bytes));
++    }
++}
++
+ #[test]
+ fn wr_map() {
+     let v = {
+@@ -352,3 +859,27 @@ fn wr_map() {
+     }
+     assert_eq!(v, read_back);
+ }
++
++/// KNOWN FAILURE (real bug, kept failing deliberately): decoding this 4-byte
++/// crafted input panics in debug builds with "attempt to subtract with
++/// overflow" at src/reader.rs:558 (`self.end - self.start` in
++/// `BytesReader::read_unknown`).
++///
++/// Mechanism: the length prefix (0x01) ends the message scope after one byte,
++/// but `read_u8` bounds-checks against the *whole buffer*, not the scope end,
++/// so the tag varint [0x95, 0x96, 0x01] freely crosses the scope boundary,
++/// leaving `start` (4) > `end` (2). The decoded tag 19221 has wire type 5
++/// (fixed32), so `read_unknown` computes `self.end - self.start`, which
++/// underflows: panic in debug; in release it wraps to a huge value, silently
++/// passing the bounds check. Found by the corrupted-message/arbitrary-bytes
++/// robustness properties above (prop_deserialize_corrupted_message_no_panic,
++/// prop_deserialize_arbitrary_bytes_no_panic), which can hit the same panic
++/// on unlucky draws; this test pins the minimal deterministic reproducer.
++///
++/// A robust untrusted-input decoder must return Err here instead.
++#[test]
++fn known_failure_read_unknown_scope_underflow_panic() {
++    let bytes = [0x01u8, 0x95, 0x96, 0x01];
++    // Must be Ok or Err, never panic:
++    drop(deserialize_from_slice::<TestMessage>(&bytes));
++}
