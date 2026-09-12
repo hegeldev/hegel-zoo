@@ -1,0 +1,691 @@
+diff --git a/crates/koto/Cargo.toml b/crates/koto/Cargo.toml
+index 2338c407..75638548 100644
+--- a/crates/koto/Cargo.toml
++++ b/crates/koto/Cargo.toml
+@@ -39,6 +39,7 @@ criterion = { workspace = true }
+ dunce = { workspace = true }
+ mimalloc = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
++hegeltest = "0.44.1"
+ 
+ [[bench]]
+ name = "koto_benchmark"
+diff --git a/crates/koto/tests/koto_tests.rs b/crates/koto/tests/koto_tests.rs
+index 2cb2811d..b188267f 100644
+--- a/crates/koto/tests/koto_tests.rs
++++ b/crates/koto/tests/koto_tests.rs
+@@ -108,3 +108,674 @@ mod koto_tests {
+     koto_test!(error_handling, "error_handling_module/main.koto");
+     koto_test!(import, "test_module/baz.koto", "test_module/main.koto");
+ }
++
++/// Property-based tests written with hegel.
++///
++/// These tests treat the whole `Koto` pipeline (lexer -> parser -> compiler -> VM) as the system
++/// under test, comparing its behaviour against Rust oracles for the numeric semantics that are
++/// implemented in `KNumber` and documented in the language guide.
++mod hegel_properties {
++    use hegel::generators::{self, Generator};
++    use koto::prelude::*;
++    use std::time::Duration;
++
++    /// Scripts in these tests are expected to finish almost instantly; the limit is a safety net
++    /// that turns accidentally-looping generated scripts into regular errors.
++    const EXECUTION_LIMIT: Duration = Duration::from_millis(500);
++
++    fn test_koto() -> Koto {
++        Koto::with_settings(KotoSettings::default().with_execution_limit(EXECUTION_LIMIT))
++    }
++
++    fn run_source(src: &str) -> koto::Result<KValue> {
++        test_koto().compile_and_run(src)
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Oracle for Koto's numeric semantics
++    //
++    // Koto numbers are either i64 or f64 (see `KNumber`). The documented behaviour:
++    // - `+`, `-`, `*`, `%` on two integers stay integers (wrapping on overflow)
++    // - `/` always produces a float (the language guide shows `9 / 2 == 4.5`)
++    // - any mixed int/float operation is performed as f64
++    // - `n % 0` with an integer divisor evaluates to NaN (special-cased in the VM)
++
++    #[derive(Clone, Copy, Debug, PartialEq, hegel::PrettyPrintable)]
++    enum Num {
++        I(i64),
++        F(f64),
++    }
++
++    impl Num {
++        fn as_f64(self) -> f64 {
++            match self {
++                Num::I(n) => n as f64,
++                Num::F(f) => f,
++            }
++        }
++
++        /// Renders the number as Koto source (parenthesized so it can be embedded anywhere)
++        fn to_koto_source(self) -> String {
++            match self {
++                // i64::MIN can't be written directly as a literal (the unsigned literal part
++                // overflows i64 and would be parsed as a float), so build it arithmetically.
++                Num::I(i64::MIN) => "((-9223372036854775807) - 1)".to_string(),
++                Num::I(n) => format!("({n})"),
++                // {:?} gives a shortest-roundtrip decimal/scientific form that Koto's lexer accepts
++                Num::F(f) => format!("({f:?})"),
++            }
++        }
++
++        fn matches_kvalue(self, value: &KValue) -> bool {
++            match (self, value) {
++                (Num::I(i), KValue::Number(KNumber::I64(x))) => i == *x,
++                // Compare floats by bit pattern: the oracle performs the identical IEEE ops, and
++                // bit equality also checks NaN vs non-NaN and the sign of zero.
++                (Num::F(f), KValue::Number(KNumber::F64(x))) => f.to_bits() == x.to_bits(),
++                _ => false,
++            }
++        }
++    }
++
++    #[derive(Clone, Copy, Debug, PartialEq, hegel::PrettyPrintable)]
++    enum BinOp {
++        Add,
++        Sub,
++        Mul,
++        Div,
++        Rem,
++        Pow,
++    }
++
++    impl BinOp {
++        fn symbol(self) -> &'static str {
++            match self {
++                BinOp::Add => "+",
++                BinOp::Sub => "-",
++                BinOp::Mul => "*",
++                BinOp::Div => "/",
++                BinOp::Rem => "%",
++                BinOp::Pow => "^",
++            }
++        }
++
++        fn assign_symbol(self) -> &'static str {
++            match self {
++                BinOp::Add => "+=",
++                BinOp::Sub => "-=",
++                BinOp::Mul => "*=",
++                BinOp::Div => "/=",
++                BinOp::Rem => "%=",
++                BinOp::Pow => "^=",
++            }
++        }
++
++        /// Precedence from `operator_precedence()` in koto_parser (all left-associative)
++        fn precedence(self) -> u8 {
++            match self {
++                BinOp::Add | BinOp::Sub => 1,
++                BinOp::Mul | BinOp::Div | BinOp::Rem => 2,
++                BinOp::Pow => 3,
++            }
++        }
++
++        fn apply(self, a: Num, b: Num) -> Num {
++            match self {
++                BinOp::Add => match (a, b) {
++                    (Num::I(x), Num::I(y)) => Num::I(x.wrapping_add(y)),
++                    _ => Num::F(a.as_f64() + b.as_f64()),
++                },
++                BinOp::Sub => match (a, b) {
++                    (Num::I(x), Num::I(y)) => Num::I(x.wrapping_sub(y)),
++                    _ => Num::F(a.as_f64() - b.as_f64()),
++                },
++                BinOp::Mul => match (a, b) {
++                    (Num::I(x), Num::I(y)) => Num::I(x.wrapping_mul(y)),
++                    _ => Num::F(a.as_f64() * b.as_f64()),
++                },
++                // Division always produces a float in Koto
++                BinOp::Div => Num::F(a.as_f64() / b.as_f64()),
++                BinOp::Rem => match (a, b) {
++                    // The VM special-cases `anything % 0` (integer zero divisor) as NaN
++                    (_, Num::I(0)) => Num::F(f64::NAN),
++                    (Num::I(x), Num::I(y)) => Num::I(x.wrapping_rem(y)),
++                    _ => Num::F(a.as_f64() % b.as_f64()),
++                },
++                // Mirrors KNumber::pow: int^int with a non-negative exponent is a wrapping
++                // integer power (the exponent is truncated to u32), otherwise f64 powf
++                BinOp::Pow => match (a, b) {
++                    (Num::I(x), Num::I(y)) if y >= 0 => Num::I(x.wrapping_pow(y as u32)),
++                    _ => Num::F(a.as_f64().powf(b.as_f64())),
++                },
++            }
++        }
++    }
++
++    #[derive(Clone, Debug, hegel::PrettyPrintable)]
++    enum Expr {
++        Leaf(Num),
++        Bin(BinOp, Box<Expr>, Box<Expr>),
++    }
++
++    impl Expr {
++        /// Fully-parenthesized Koto source for the expression
++        fn to_koto_source(&self) -> String {
++            match self {
++                Expr::Leaf(n) => n.to_koto_source(),
++                Expr::Bin(op, lhs, rhs) => format!(
++                    "({} {} {})",
++                    lhs.to_koto_source(),
++                    op.symbol(),
++                    rhs.to_koto_source()
++                ),
++            }
++        }
++
++        fn eval(&self) -> Num {
++            match self {
++                Expr::Leaf(n) => *n,
++                Expr::Bin(op, lhs, rhs) => op.apply(lhs.eval(), rhs.eval()),
++            }
++        }
++    }
++
++    #[hegel::composite]
++    fn integer_leaves(tc: &hegel::TestCase) -> i64 {
++        // Mix small values (which hit the parser's SmallInt path and interact interestingly with
++        // each other) with the full i64 range (which probes overflow behaviour).
++        tc.draw(hegel::one_of!(
++            generators::integers::<i64>().min_value(-9).max_value(9),
++            generators::integers::<i64>(),
++        ))
++    }
++
++    #[hegel::composite]
++    fn numbers(tc: &hegel::TestCase) -> Num {
++        if tc.draw(generators::booleans()) {
++            Num::I(tc.draw(integer_leaves()))
++        } else {
++            // Finite floats only: NaN and infinity have no literal syntax in Koto
++            Num::F(tc.draw(
++                generators::floats::<f64>()
++                    .allow_nan(false)
++                    .allow_infinity(false),
++            ))
++        }
++    }
++
++    fn arithmetic_ops() -> Vec<BinOp> {
++        vec![BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Rem]
++    }
++
++    fn arithmetic_exprs(depth: u32) -> generators::BoxedGenerator<'static, Expr> {
++        hegel::compose!(|tc| {
++            if depth == 0 || tc.draw(generators::integers::<u8>().max_value(2)) == 0 {
++                Expr::Leaf(Num::I(tc.draw(integer_leaves())))
++            } else {
++                let op = tc.draw((generators::sampled_from(arithmetic_ops())).print_as_debug());
++                let lhs = tc.draw((arithmetic_exprs(depth - 1)).print_as_debug());
++                let rhs = tc.draw((arithmetic_exprs(depth - 1)).print_as_debug());
++                Expr::Bin(op, Box::new(lhs), Box::new(rhs))
++            }
++        })
++        .boxed()
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: evaluating an arithmetic expression tree matches a Rust oracle
++
++    #[hegel::test]
++    fn arithmetic_matches_rust_oracle(tc: hegel::TestCase) {
++        let expr = tc.draw(arithmetic_exprs(5));
++        let src = expr.to_koto_source();
++        let expected = expr.eval();
++
++        match run_source(&src) {
++            Ok(value) => assert!(
++                expected.matches_kvalue(&value),
++                "script `{src}` evaluated to {value:?} ({}), expected {expected:?}",
++                display_value(&value),
++            ),
++            Err(error) => panic!("script `{src}` failed to run: {error}"),
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: operator precedence and associativity match explicit parenthesization
++    //
++    // A flat chain like `1 + 2 * 3 ^ 4` must evaluate to the same result as the explicitly
++    // parenthesized version built from the documented precedence table
++    // (`^` > `* / %` > `+ -`, all left-associative).
++
++    #[hegel::test]
++    fn operator_precedence_matches_explicit_parenthesization(tc: hegel::TestCase) {
++        let num_ops = tc.draw(generators::integers::<usize>().min_value(1).max_value(7));
++        let mut leaves = Vec::with_capacity(num_ops + 1);
++        let mut ops = Vec::with_capacity(num_ops);
++        for _ in 0..=num_ops {
++            // Non-negative leaves keep the flat rendering unambiguous (no unary minus)
++            leaves.push(tc.draw(generators::integers::<i64>().min_value(0).max_value(999)));
++        }
++        for _ in 0..num_ops {
++            ops.push(tc.draw((generators::sampled_from(vec![
++                BinOp::Add,
++                BinOp::Sub,
++                BinOp::Mul,
++                BinOp::Div,
++                BinOp::Rem,
++                BinOp::Pow,
++            ])).print_as_debug()));
++        }
++
++        // The flat form, as a user would write it
++        let mut flat = leaves[0].to_string();
++        for (op, leaf) in ops.iter().zip(&leaves[1..]) {
++            flat.push_str(&format!(" {} {leaf}", op.symbol()));
++        }
++
++        // The explicitly parenthesized form, built with a precedence-climbing shunting yard
++        // (left-associative: pop while the stacked operator's precedence is >= the incoming one)
++        let mut expr_stack: Vec<Expr> = vec![Expr::Leaf(Num::I(leaves[0]))];
++        let mut op_stack: Vec<BinOp> = Vec::new();
++        for (op, leaf) in ops.iter().zip(&leaves[1..]) {
++            while let Some(&top) = op_stack.last() {
++                if top.precedence() >= op.precedence() {
++                    op_stack.pop();
++                    let rhs = expr_stack.pop().unwrap();
++                    let lhs = expr_stack.pop().unwrap();
++                    expr_stack.push(Expr::Bin(top, Box::new(lhs), Box::new(rhs)));
++                } else {
++                    break;
++                }
++            }
++            op_stack.push(*op);
++            expr_stack.push(Expr::Leaf(Num::I(*leaf)));
++        }
++        while let Some(top) = op_stack.pop() {
++            let rhs = expr_stack.pop().unwrap();
++            let lhs = expr_stack.pop().unwrap();
++            expr_stack.push(Expr::Bin(top, Box::new(lhs), Box::new(rhs)));
++        }
++        let parenthesized = expr_stack.pop().unwrap().to_koto_source();
++
++        let flat_result = run_source(&flat);
++        let paren_result = run_source(&parenthesized);
++
++        match (&flat_result, &paren_result) {
++            (Ok(KValue::Number(a)), Ok(KValue::Number(b))) => {
++                assert_eq!(
++                    (a.is_f64(), a.to_bits()),
++                    (b.is_f64(), b.to_bits()),
++                    "`{flat}` evaluated to {a:?} but `{parenthesized}` evaluated to {b:?}",
++                );
++            }
++            other => panic!(
++                "expected two numeric results for `{flat}` vs `{parenthesized}`, got {other:?}"
++            ),
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: compound assignment (`a op= b`) agrees with the binary operator (`a op b`)
++
++    #[hegel::test]
++    fn compound_assignment_matches_binary_op(tc: hegel::TestCase) {
++        let a = tc.draw((numbers()).print_as_debug());
++        let b = tc.draw((numbers()).print_as_debug());
++        let op = tc.draw(generators::sampled_from(vec![
++            BinOp::Add,
++            BinOp::Sub,
++            BinOp::Mul,
++            BinOp::Div,
++            BinOp::Rem,
++            BinOp::Pow,
++        ]));
++
++        // KNOWN BUG (pinned by `remainder_assign_by_zero_panics_known_failure` below):
++        // `x %= 0` panics inside the VM instead of evaluating to NaN like `x % 0` does.
++        // Excluded here so this property keeps testing everything else.
++        tc.assume(!(op == BinOp::Rem && b == Num::I(0)));
++
++        let binary_src = format!("{} {} {}", a.to_koto_source(), op.symbol(), b.to_koto_source());
++        let compound_src = format!(
++            "x = {}\nx {} {}\nx",
++            a.to_koto_source(),
++            op.assign_symbol(),
++            b.to_koto_source()
++        );
++
++        let binary_result = run_source(&binary_src);
++        let compound_result = run_source(&compound_src);
++
++        match (&binary_result, &compound_result) {
++            (Ok(KValue::Number(x)), Ok(KValue::Number(y))) => {
++                assert_eq!(
++                    (x.is_f64(), x.to_bits()),
++                    (y.is_f64(), y.to_bits()),
++                    "`{binary_src}` evaluated to {x:?} but `{compound_src}` evaluated to {y:?}",
++                );
++            }
++            other => panic!(
++                "expected two numeric results for `{binary_src}` vs `{compound_src}`, got {other:?}"
++            ),
++        }
++    }
++
++    /// KNOWN FAILURE: `x %= 0` panics in the VM instead of returning NaN.
++    ///
++    /// `run_remainder` in koto_runtime's vm.rs guards against an integer zero divisor and
++    /// evaluates `n % 0` to NaN, but `run_remainder_assign` passes the raw `|a, b| a % b` closure
++    /// to `run_compound_assign_op`, so `KNumber::rem` reaches `i64::wrapping_rem` with a zero
++    /// divisor and panics ("attempt to calculate the remainder with a divisor of zero"),
++    /// aborting the interpreter on untrusted script input.
++    #[test]
++    fn remainder_assign_by_zero_panics_known_failure() {
++        match run_source("x = 1\nx %= 0\nx") {
++            Ok(KValue::Number(n)) => assert!(n.is_nan(), "expected NaN, got {n:?}"),
++            other => panic!("expected NaN result, got {other:?}"),
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: comparison operators match a Rust oracle
++
++    #[hegel::test]
++    fn comparisons_match_rust_oracle(tc: hegel::TestCase) {
++        use std::cmp::Ordering;
++
++        let a = tc.draw((numbers()).print_as_debug());
++        let b = tc.draw((numbers()).print_as_debug());
++
++        // Koto compares mixed int/float operands as f64, and int/int exactly (KNumber's Ord)
++        let ordering: Option<Ordering> = match (a, b) {
++            (Num::I(x), Num::I(y)) => Some(x.cmp(&y)),
++            _ => a.as_f64().partial_cmp(&b.as_f64()),
++        };
++        let ordering = ordering.expect("finite numbers always compare");
++
++        for (op, expected) in [
++            ("<", ordering == Ordering::Less),
++            ("<=", ordering != Ordering::Greater),
++            (">", ordering == Ordering::Greater),
++            (">=", ordering != Ordering::Less),
++            ("==", ordering == Ordering::Equal),
++            ("!=", ordering != Ordering::Equal),
++        ] {
++            let src = format!("{} {op} {}", a.to_koto_source(), b.to_koto_source());
++            match run_source(&src) {
++                Ok(KValue::Bool(result)) => assert_eq!(
++                    result, expected,
++                    "`{src}` evaluated to {result}, expected {expected}",
++                ),
++                other => panic!("expected boolean result for `{src}`, got {other:?}"),
++            }
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: a number's display output parses back to an equal number
++
++    #[hegel::test]
++    fn number_display_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(numbers());
++        let displayed = match n {
++            Num::I(i) => KNumber::from(i).to_string(),
++            Num::F(f) => KNumber::from(f).to_string(),
++        };
++
++        match run_source(&displayed) {
++            Ok(KValue::Number(parsed)) => {
++                match n {
++                    Num::I(i) => {
++                        // i64::MIN is displayed as -9223372036854775808, and the (unsigned)
++                        // literal overflows i64 during parsing, falling back to f64. The value
++                        // still compares equal, but the int-ness is lost, so the exact variant
++                        // check is limited to the other values.
++                        if i == i64::MIN {
++                            assert_eq!(parsed, KNumber::from(i), "`{displayed}` reparsed as {parsed:?}");
++                        } else {
++                            assert!(
++                                matches!(parsed, KNumber::I64(x) if x == i),
++                                "`{displayed}` reparsed as {parsed:?}, expected Int({i})",
++                            );
++                        }
++                    }
++                    Num::F(f) => match parsed {
++                        KNumber::F64(x) => assert_eq!(
++                            x.to_bits(),
++                            f.to_bits(),
++                            "`{displayed}` reparsed as {parsed:?}, expected Float({f:?})",
++                        ),
++                        other => panic!("`{displayed}` reparsed as {other:?}, expected a float"),
++                    },
++                }
++            }
++            other => panic!("display output `{displayed}` failed to reparse: {other:?}"),
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: a string literal built from arbitrary text evaluates back to the original string
++
++    /// Renders arbitrary text as a single-quoted Koto string literal, escaping everything
++    /// outside a conservative safe set with `\u{...}` escapes.
++    fn to_koto_string_literal(s: &str) -> String {
++        let mut literal = String::with_capacity(s.len() + 2);
++        literal.push('\'');
++        for c in s.chars() {
++            match c {
++                'a'..='z' | 'A'..='Z' | '0'..='9' => literal.push(c),
++                ' ' | '.' | ',' | '!' | '?' | '_' | '-' | '+' | '*' | '/' | '=' | ':' | ';'
++                | '(' | ')' | '[' | ']' | '<' | '>' | '"' => literal.push(c),
++                _ => literal.push_str(&format!("\\u{{{:x}}}", c as u32)),
++            }
++        }
++        literal.push('\'');
++        literal
++    }
++
++    #[hegel::test]
++    fn string_literal_roundtrip(tc: hegel::TestCase) {
++        let s: String = tc.draw(generators::text());
++        let literal = to_koto_string_literal(&s);
++
++        match run_source(&literal) {
++            Ok(KValue::Str(result)) => assert_eq!(
++                result.as_str(),
++                s,
++                "literal `{literal}` evaluated to a different string",
++            ),
++            other => panic!("literal `{literal}` failed to evaluate: {other:?}"),
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Property: string concatenation matches Rust
++
++    #[hegel::test]
++    fn string_concatenation_matches_rust(tc: hegel::TestCase) {
++        let a: String = tc.draw(generators::text());
++        let b: String = tc.draw(generators::text());
++        let src = format!(
++            "{} + {}",
++            to_koto_string_literal(&a),
++            to_koto_string_literal(&b)
++        );
++
++        match run_source(&src) {
++            Ok(KValue::Str(result)) => {
++                let expected = format!("{a}{b}");
++                assert_eq!(result.as_str(), expected, "`{src}` produced a different string");
++            }
++            other => panic!("`{src}` failed to evaluate: {other:?}"),
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Robustness: compiling and running arbitrary source must never panic or abort
++
++    #[hegel::test]
++    fn arbitrary_text_never_panics(tc: hegel::TestCase) {
++        let src: String = tc.draw(generators::text());
++        // Ok or Err are both fine; what's being tested is the absence of panics/aborts
++        drop(run_source(&src));
++    }
++
++    /// A vocabulary of Koto tokens for generating "token soup" that is much more likely than
++    /// arbitrary text to reach the parser's and compiler's interesting code paths.
++    fn koto_token_vocabulary() -> Vec<&'static str> {
++        vec![
++            // Keywords
++            "if", "then", "else", "else if", "match", "switch", "for", "in", "while", "until",
++            "loop", "break", "continue", "return", "yield", "throw", "try", "catch", "finally",
++            "import", "from", "export", "true", "false", "null", "self", "not", "and", "or",
++            "debug", "let",
++            // Identifiers and literals
++            "x", "y", "foo", "size", "_", "0", "1", "42", "-1", "1.5", "1e100", "0x1f", "0b11",
++            "0o17", "1_000", "'a'", "\"b\"", "'{}'",
++            // Meta keys
++            "@main", "@test", "@display", "@type", "@add", "@meta",
++            // Operators and punctuation
++            "+", "-", "*", "/", "%", "^", "==", "!=", "<", "<=", ">", ">=", "=", "+=", "-=",
++            "*=", "/=", "%=", "^=", "..", "..=", "->", ".", ",", ":", ";", "(", ")", "[", "]",
++            "{", "}", "|", "?", "#", "# comment",
++        ]
++    }
++
++    #[hegel::composite]
++    fn token_soup(tc: &hegel::TestCase) -> String {
++        let vocabulary = koto_token_vocabulary();
++        let separators = vec![" ", "  ", "\n", "\n  ", "\n    ", "\n\t", ""];
++        let num_tokens = tc.draw(generators::integers::<usize>().max_value(40));
++        let mut src = String::new();
++        for _ in 0..num_tokens {
++            src.push_str(tc.draw(generators::sampled_from(vocabulary.clone())));
++            src.push_str(tc.draw(generators::sampled_from(separators.clone())));
++        }
++        src
++    }
++
++    #[hegel::test]
++    fn token_soup_never_panics(tc: hegel::TestCase) {
++        let src = tc.draw(token_soup());
++        // Ok or Err are both fine; what's being tested is the absence of panics/aborts
++        drop(run_source(&src));
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Determinism: running the same script twice on fresh interpreters gives the same outcome
++
++    /// A comparable rendering of a script outcome, or None if the outcome shouldn't be compared
++    /// (execution limits are wall-clock based, so timeouts aren't deterministic).
++    fn outcome_repr(koto: &mut Koto, result: koto::Result<KValue>) -> Option<String> {
++        match result {
++            Ok(value) => {
++                let type_name = value.type_as_string();
++                match koto.value_to_string(value) {
++                    Ok(rendered) => Some(format!("Ok({type_name}): {rendered}")),
++                    Err(_) => Some(format!("Ok({type_name})")),
++                }
++            }
++            Err(error) => {
++                let message = error.to_string();
++                if message.contains("timed out") {
++                    None
++                } else {
++                    Some(format!("Err: {message}"))
++                }
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn token_soup_runs_deterministically(tc: hegel::TestCase) {
++        let src = tc.draw(token_soup());
++
++        let mut koto_a = test_koto();
++        let result_a = koto_a.compile_and_run(src.as_str());
++        let repr_a = outcome_repr(&mut koto_a, result_a);
++
++        let mut koto_b = test_koto();
++        let result_b = koto_b.compile_and_run(src.as_str());
++        let repr_b = outcome_repr(&mut koto_b, result_b);
++
++        if let (Some(a), Some(b)) = (repr_a, repr_b) {
++            assert_eq!(a, b, "script `{src}` produced different outcomes on two fresh runtimes");
++        }
++    }
++
++    // -------------------------------------------------------------------------------------------
++    // Robustness: deeply nested source
++
++    /// Builds source nested to the given depth in one of several shapes
++    fn nested_source(shape: usize, depth: usize) -> String {
++        match shape {
++            0 => format!("{}0{}", "(".repeat(depth), ")".repeat(depth)),
++            1 => format!("{}0{}", "[".repeat(depth), "]".repeat(depth)),
++            2 => format!("{}0{}", "{a: ".repeat(depth), "}".repeat(depth)),
++            3 => format!("0{}", ".abs()".repeat(depth)),
++            4 => format!("{}true", "not ".repeat(depth)),
++            _ => format!("{}0", "|| ".repeat(depth)),
++        }
++    }
++
++    fn display_value(value: &KValue) -> String {
++        Koto::default()
++            .value_to_string(value.clone())
++            .unwrap_or_else(|_| "<display error>".into())
++    }
++
++    /// KNOWN FAILURE (process abort): compiling deeply nested source overflows the stack.
++    ///
++    /// The Koto parser recurses without a depth limit, so `Koto::compile` on untrusted input
++    /// aborts the whole process with a stack overflow instead of returning an error.
++    /// In this environment (debug build, test thread with a 2MiB stack) the overflow triggers
++    /// between depth 50 and 100 for nested parens/lists/maps/`not`-chains, and between depth
++    /// 40 and 50 for nested lambdas (`|| || ... 0`). Larger stacks raise the threshold but the
++    /// recursion remains unbounded. Method chains (`0.abs().abs()...`) are parsed iteratively
++    /// and are fine at depth 3200+.
++    ///
++    /// This test is `#[ignore]`d because the abort would take down the whole test process;
++    /// no assertion is possible. Run it with:
++    /// `cargo test -p koto --test koto_tests deeply_nested -- --ignored --nocapture`
++    #[test]
++    #[ignore = "KNOWN FAILURE: stack overflow aborts the process (unbounded parser recursion)"]
++    fn deeply_nested_parens_overflow_the_stack_known_failure() {
++        // Expected: Err(CompileError). Actual: SIGABRT (stack overflow) during compilation.
++        let src = nested_source(0, 1000);
++        drop(test_koto().compile(src.as_str()));
++    }
++
++    /// The same nesting shapes stay panic-free below the overflow threshold.
++    /// The depth bound protects the test process from the known stack overflow pinned by
++    /// `deeply_nested_parens_overflow_the_stack_known_failure`; it is not a documented contract.
++    #[hegel::test]
++    fn modestly_nested_source_never_panics(tc: hegel::TestCase) {
++        let shape = tc.draw(generators::integers::<usize>().max_value(5));
++        let depth = tc.draw(generators::integers::<usize>().max_value(32));
++        let src = nested_source(shape, depth);
++        // Ok or Err are both fine; what's being tested is the absence of panics
++        drop(run_source(&src));
++    }
++
++    /// Exploratory probe used to find the depth at which each nesting shape crashes.
++    /// Kept ignored: it aborts the process by design. Run with e.g.:
++    /// `NESTING_SHAPE=0 NESTING_DEPTH=100 cargo test -p koto --test koto_tests \
++    ///      deep_nesting_probe -- --ignored --nocapture`
++    #[test]
++    #[ignore = "aborts the process (stack overflow) - exploratory probe"]
++    fn deep_nesting_probe() {
++        let shape: usize = std::env::var("NESTING_SHAPE").unwrap().parse().unwrap();
++        let depth: usize = std::env::var("NESTING_DEPTH").unwrap().parse().unwrap();
++        let src = nested_source(shape, depth);
++        eprintln!("shape {shape}, depth {depth}: compiling...");
++        let mut koto = test_koto();
++        let chunk = koto.compile(src.as_str());
++        eprintln!("  compile -> {}", if chunk.is_ok() { "Ok" } else { "Err" });
++        if let Ok(chunk) = chunk {
++            eprintln!("  running...");
++            let result = koto.run(chunk);
++            eprintln!("  run -> {:?}", result.map(|v| display_value(&v)));
++        }
++    }
++}
