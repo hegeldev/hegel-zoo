@@ -1,0 +1,872 @@
+diff --git a/quinn-proto/Cargo.toml b/quinn-proto/Cargo.toml
+index c018ef15..91beda61 100644
+--- a/quinn-proto/Cargo.toml
++++ b/quinn-proto/Cargo.toml
+@@ -69,6 +69,7 @@ web-time = { workspace = true }
+ 
+ [dev-dependencies]
+ assert_matches = { workspace = true }
++hegeltest = "0.44.1"
+ hex-literal = { workspace = true  }
+ rcgen = { workspace = true }
+ tracing-subscriber = { workspace = true }
+diff --git a/quinn-proto/src/cid_queue.rs b/quinn-proto/src/cid_queue.rs
+index 3ad908f7..93373ad7 100644
+--- a/quinn-proto/src/cid_queue.rs
++++ b/quinn-proto/src/cid_queue.rs
+@@ -299,4 +299,109 @@ mod tests {
+         assert_eq!(q.active(), initial_cid());
+         assert_eq!(q.active_seq(), 0);
+     }
++
++    /// Stateful test of the CID retirement protocol. Properties, grounded in the
++    /// doc comments on `insert`/`next` and in RFC 9000 §5.1.2 (an endpoint must
++    /// retire each issued CID exactly once):
++    /// - retirement ranges returned by `insert` and `next` are non-empty,
++    /// - no sequence number is ever retired twice,
++    /// - the active sequence number never decreases and is never one that was
++    ///   already retired,
++    /// - there is always an active CID (`active()` must not panic).
++    mod retirement {
++        use std::collections::BTreeSet;
++
++        use hegel::TestCase;
++        use hegel::generators;
++
++        use super::*;
++
++        struct QueueModel {
++            queue: CidQueue,
++            retired: BTreeSet<u64>,
++            last_active_seq: u64,
++        }
++
++        impl QueueModel {
++            fn note_retired(&mut self, range: Range<u64>) {
++                assert!(!range.is_empty(), "retirement ranges must be non-empty");
++                for seq in range {
++                    assert!(
++                        self.retired.insert(seq),
++                        "sequence {seq} was retired twice"
++                    );
++                }
++            }
++        }
++
++        #[hegel::state_machine]
++        impl QueueModel {
++            #[rule]
++            fn insert(&mut self, tc: TestCase) {
++                // Frame decoding guarantees retire_prior_to <= sequence and both
++                // are varints; beyond that any value may arrive off the wire.
++                // Bias towards the current window, where the interesting
++                // interactions live.
++                let offset = self.queue.active_seq();
++                let sequence = tc.draw(hegel::one_of!(
++                    generators::integers::<u64>()
++                        .min_value(offset.saturating_sub(2))
++                        .max_value(offset.saturating_add(2 * CidQueue::LEN as u64)),
++                    generators::integers::<u64>().max_value((1 << 62) - 1),
++                ));
++                let retire_prior_to = tc.draw(hegel::one_of!(
++                    generators::integers::<u64>()
++                        .min_value(offset.saturating_sub(2).min(sequence))
++                        .max_value(offset.saturating_add(2 * CidQueue::LEN as u64).min(sequence)),
++                    generators::integers::<u64>().max_value(sequence),
++                ));
++                let frame = NewConnectionId {
++                    sequence,
++                    id: ConnectionId::new(&sequence.to_be_bytes()),
++                    reset_token: ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE]),
++                    retire_prior_to,
++                };
++                match self.queue.insert(frame) {
++                    Ok(Some((retired, _token))) => self.note_retired(retired),
++                    Ok(None) => {}
++                    Err(InsertError::Retired | InsertError::ExceedsLimit) => {}
++                }
++            }
++
++            #[rule]
++            fn next(&mut self, _: TestCase) {
++                if let Some((_token, retired)) = self.queue.next() {
++                    self.note_retired(retired.clone());
++                    assert_eq!(
++                        retired.end,
++                        self.queue.active_seq(),
++                        "everything before the new active CID must have been retired"
++                    );
++                }
++            }
++
++            #[invariant]
++            fn active_cid_is_live(&mut self, _: TestCase) {
++                // active() unwraps internally: there must always be an active CID
++                let _ = self.queue.active();
++                let seq = self.queue.active_seq();
++                assert!(seq >= self.last_active_seq, "active sequence went backwards");
++                assert!(
++                    !self.retired.contains(&seq),
++                    "active CID {seq} was already retired"
++                );
++                self.last_active_seq = seq;
++            }
++        }
++
++        #[hegel::test]
++        fn cid_queue_retires_each_sequence_at_most_once(tc: TestCase) {
++            let machine = QueueModel {
++                queue: CidQueue::new(initial_cid()),
++                retired: BTreeSet::new(),
++                last_active_seq: 0,
++            };
++            hegel::stateful::machine(machine).run(tc);
++        }
++    }
+ }
+diff --git a/quinn-proto/src/frame.rs b/quinn-proto/src/frame.rs
+index 766f3f6a..6016a02d 100644
+--- a/quinn-proto/src/frame.rs
++++ b/quinn-proto/src/frame.rs
+@@ -979,6 +979,68 @@ mod test {
+         }
+     }
+ 
++    /// Roundtrip: any non-empty set of packet-number ranges, any delay, and any
++    /// ECN counts encode to a single ACK frame that decodes to exactly the same
++    /// ranges, delay, and counts. Generalizes the `ack_coding` unit test above.
++    #[hegel::test]
++    fn ack_roundtrip(tc: hegel::TestCase) {
++        use hegel::generators;
++        use crate::VarInt;
++
++        // A non-empty canonical range set of packet numbers < 2^62
++        let mut ranges = ArrayRangeSet::new();
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(20));
++        for _ in 0..n {
++            let start = tc.draw(generators::integers::<u64>().max_value(VarInt::MAX.0 - 1));
++            let len = tc.draw(
++                generators::integers::<u64>()
++                    .min_value(1)
++                    .max_value(VarInt::MAX.0 - start),
++            );
++            ranges.insert(start..start + len);
++        }
++        let delay = tc.draw(generators::integers::<u64>().max_value(VarInt::MAX.0));
++        let ecn = if tc.draw(generators::booleans()) {
++            Some(EcnCounts {
++                ect0: tc.draw(generators::integers::<u64>().max_value(VarInt::MAX.0)),
++                ect1: tc.draw(generators::integers::<u64>().max_value(VarInt::MAX.0)),
++                ce: tc.draw(generators::integers::<u64>().max_value(VarInt::MAX.0)),
++            })
++        } else {
++            None
++        };
++
++        let mut buf = Vec::new();
++        Ack::encode(delay, &ranges, ecn.as_ref(), &mut buf);
++        let decoded = frames(buf);
++        assert_eq!(decoded.len(), 1);
++        match &decoded[0] {
++            Frame::Ack(ack) => {
++                assert_eq!(ack.delay, delay);
++                assert_eq!(ack.ecn, ecn);
++                let mut got: Vec<Range<u64>> =
++                    ack.iter().map(|r| *r.start()..*r.end() + 1).collect();
++                got.sort_by_key(|r| r.start);
++                let expected: Vec<Range<u64>> = ranges.iter().collect();
++                assert_eq!(got, expected);
++            }
++            x => panic!("incorrect frame {x:?}"),
++        }
++    }
++
++    /// Parse robustness: the frame iterator must never panic on arbitrary payload
++    /// bytes — frame payloads come straight off the network after decryption.
++    #[hegel::test]
++    fn frame_iter_never_panics(tc: hegel::TestCase) {
++        use hegel::generators;
++        let bytes: Vec<u8> = tc.draw(generators::binary());
++        if let Ok(iter) = Iter::new(Bytes::from(bytes)) {
++            for frame in iter {
++                let _ = frame;
++            }
++        }
++    }
++
+     #[test]
+     fn ack_frequency_coding() {
+         let mut buf = Vec::new();
+diff --git a/quinn-proto/src/packet.rs b/quinn-proto/src/packet.rs
+index e8ab1aab..2ab218b3 100644
+--- a/quinn-proto/src/packet.rs
++++ b/quinn-proto/src/packet.rs
+@@ -934,6 +934,81 @@ mod tests {
+         }
+     }
+ 
++    /// Any encoded packet number of any width survives a wire roundtrip, its
++    /// encoding is exactly `len()` bytes, and the wire tag agrees with `len()`
++    /// via `decode_len`. Generalizes `roundtrip_packet_numbers` above.
++    #[hegel::test]
++    fn pn_wire_roundtrip(tc: hegel::TestCase) {
++        use hegel::generators;
++        let pn = match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => PacketNumber::U8(tc.draw(generators::integers::<u8>())),
++            1 => PacketNumber::U16(tc.draw(generators::integers::<u16>())),
++            2 => PacketNumber::U24(tc.draw(generators::integers::<u32>().max_value((1 << 24) - 1))),
++            _ => PacketNumber::U32(tc.draw(generators::integers::<u32>())),
++        };
++        let mut buf = Vec::new();
++        pn.encode(&mut buf);
++        assert_eq!(buf.len(), pn.len());
++        assert_eq!(PacketNumber::decode_len(pn.tag()), pn.len());
++        let decoded = PacketNumber::decode(pn.len(), &mut io::Cursor::new(&buf)).unwrap();
++        assert_eq!(decoded, pn);
++    }
++
++    /// RFC 9000 Appendix A: a packet number truncated relative to `largest_acked`
++    /// is recovered exactly by `expand(expected)` for any decoder reference point
++    /// `expected` between `largest_acked` and the packet number itself.
++    /// Generalizes the exhaustive small-range `pn_expand_roundtrip` above to the
++    /// full packet number space (packet numbers are < 2^62, RFC 9000 §12.3).
++    #[hegel::test]
++    fn pn_new_expand_recovers_original(tc: hegel::TestCase) {
++        use crate::VarInt;
++        use hegel::generators;
++        let largest_acked = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().max_value(VarInt::MAX.0),
++            generators::sampled_from(vec![0, 1, u32::MAX as u64, VarInt::MAX.0]),
++        ));
++        // PacketNumber::new supports deltas where 2 * delta fits in 32 bits
++        let max_delta = (u64::from(u32::MAX) / 2).min(VarInt::MAX.0 - largest_acked);
++        let delta = tc.draw(generators::integers::<u64>().max_value(max_delta));
++        let n = largest_acked + delta;
++        // The decoder's reference point trails the encoder's by at most the
++        // unacknowledged span; anywhere in [largest_acked, n] must recover n.
++        let expected = tc.draw(
++            generators::integers::<u64>()
++                .min_value(largest_acked)
++                .max_value(n),
++        );
++        assert_eq!(PacketNumber::new(n, largest_acked).expand(expected), n);
++    }
++
++    /// Port of `fuzz/fuzz_targets/packet.rs`: `PartialDecode::new` never panics on
++    /// arbitrary input, and on success every input byte is accounted for exactly
++    /// once between the decoded packet and the returned trailing datagram bytes.
++    #[hegel::test]
++    fn partial_decode_accounts_for_every_byte(tc: hegel::TestCase) {
++        use hegel::generators;
++        let data: Vec<u8> = tc.draw(generators::binary());
++        // The local CID length is chosen by our own endpoint and is always in
++        // 0..=MAX_CID_SIZE; the fuzz harness (fuzz/fuzz_targets/packet.rs) bounds
++        // it identically. Larger values are outside the parser's domain and only
++        // trip a debug_assert in ConnectionId::from_buf.
++        let cid_len: usize = tc.draw(generators::integers::<usize>().max_value(crate::MAX_CID_SIZE));
++        let grease_quic_bit = tc.draw(generators::booleans());
++        let len = data.len();
++        let supported_versions = crate::DEFAULT_SUPPORTED_VERSIONS.to_vec();
++        if let Ok(decoded) = PartialDecode::new(
++            BytesMut::from(&data[..]),
++            &FixedLengthConnectionIdParser::new(cid_len),
++            &supported_versions,
++            grease_quic_bit,
++        ) {
++            match decoded.1 {
++                Some(rest) => assert_eq!(len, decoded.0.len() + rest.len()),
++                None => assert_eq!(len, decoded.0.len()),
++            }
++        }
++    }
++
+     #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+     #[test]
+     fn header_encoding() {
+diff --git a/quinn-proto/src/range_set/btree_range_set.rs b/quinn-proto/src/range_set/btree_range_set.rs
+index 9b9757ec..9fc39513 100644
+--- a/quinn-proto/src/range_set/btree_range_set.rs
++++ b/quinn-proto/src/range_set/btree_range_set.rs
+@@ -392,4 +392,33 @@ mod tests {
+         assert_eq!(set.len(), 1);
+         assert_eq!(set.peek_min().unwrap(), 0..4);
+     }
++
++    /// FAILING (documents a real bug): `RangeSet::replace` does not treat an empty
++    /// input range as a no-op the way `insert`/`remove` do (both guard
++    /// `if x.is_empty() { return false; }`). Instead its `Replace` iterator's
++    /// `Drop` unconditionally inserts `range.start..range.end`, so `replace(x..x)`
++    /// stores a degenerate `x -> x` entry. Afterwards the set contains no
++    /// elements yet `is_empty()` reports `false` and `peek_min()`/`min()` report a
++    /// phantom `x..x` range — corrupting the invariant that a `RangeSet` never
++    /// holds empty ranges.
++    ///
++    /// Reachable in production: `Assembler::insert` (assembler.rs) calls
++    /// `recvd.replace(offset..offset + bytes.len())` while in unordered-read mode;
++    /// an empty STREAM frame makes `bytes.len() == 0` and passes an empty range.
++    ///
++    /// The property below is grounded in the `insert`/`remove` empty-range guards
++    /// and the documented `RangeSet` invariant.
++    #[hegel::test]
++    fn replace_empty_range_corrupts_set(tc: hegel::TestCase) {
++        use hegel::generators;
++        let x = tc.draw(generators::integers::<u64>().max_value(1_000_000));
++        let mut set = RangeSet::new();
++        // Replacing an empty range should leave the (empty) set unchanged, just
++        // like inserting or removing an empty range does.
++        let intersection: Vec<_> = set.replace(x..x).collect();
++        assert!(intersection.is_empty(), "empty range has empty intersection");
++        assert!(set.is_empty(), "set must stay empty after replacing an empty range");
++        assert_eq!(set.min(), None);
++        assert_eq!(set.peek_min(), None);
++    }
+ }
+diff --git a/quinn-proto/src/range_set/tests.rs b/quinn-proto/src/range_set/tests.rs
+index ccdd1613..a2418014 100644
+--- a/quinn-proto/src/range_set/tests.rs
++++ b/quinn-proto/src/range_set/tests.rs
+@@ -193,6 +193,183 @@ macro_rules! common_set_tests {
+ common_set_tests!(range_set, RangeSet);
+ common_set_tests!(array_range_set, ArrayRangeSet);
+ 
++/// Stateful model test: drive `RangeSet` and `ArrayRangeSet` through the same
++/// random operation sequences as a `BTreeSet<u64>` element-wise model (in the
++/// spirit of `RefRangeSet` below and the `compare_*_to_reference` tests above)
++/// and require all three to agree after every step.
++mod model {
++    use std::collections::BTreeSet;
++
++    use hegel::TestCase;
++    use hegel::generators;
++
++    use super::*;
++
++    /// Values are kept small so the element-wise model stays cheap. This bound
++    /// protects the *test's* memory, not the libraries' contract; the wire-level
++    /// u64 extremes are covered by the varint/frame tests.
++    const MAX_VALUE: u64 = 1_000;
++
++    struct SetModel {
++        btree: RangeSet,
++        array: ArrayRangeSet,
++        model: BTreeSet<u64>,
++    }
++
++    impl SetModel {
++        fn draw_range(tc: &TestCase) -> Range<u64> {
++            let start = tc.draw(generators::integers::<u64>().max_value(MAX_VALUE));
++            // Allow empty ranges: `insert`/`remove` document them as no-ops
++            let len = tc.draw(generators::integers::<u64>().max_value(MAX_VALUE - start));
++            start..start + len
++        }
++
++        fn model_insert(&mut self, range: Range<u64>) -> bool {
++            let mut changed = false;
++            for x in range {
++                changed |= self.model.insert(x);
++            }
++            changed
++        }
++
++        fn model_remove(&mut self, range: Range<u64>) -> bool {
++            let mut changed = false;
++            for x in range {
++                changed |= self.model.remove(&x);
++            }
++            changed
++        }
++    }
++
++    #[hegel::state_machine]
++    impl SetModel {
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let range = Self::draw_range(&tc);
++            let expected = self.model_insert(range.clone());
++            assert_eq!(self.btree.insert(range.clone()), expected);
++            assert_eq!(self.array.insert(range), expected);
++        }
++
++        #[rule]
++        fn insert_one(&mut self, tc: TestCase) {
++            let x = tc.draw(generators::integers::<u64>().max_value(MAX_VALUE));
++            let expected = self.model.insert(x);
++            assert_eq!(self.btree.insert_one(x), expected);
++            assert_eq!(self.array.insert_one(x), expected);
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            let range = Self::draw_range(&tc);
++            let expected = self.model_remove(range.clone());
++            assert_eq!(self.btree.remove(range.clone()), expected);
++            assert_eq!(self.array.remove(range), expected);
++        }
++
++        #[rule]
++        fn replace(&mut self, tc: TestCase) {
++            // `replace` is only implemented for the BTree-based set. Its doc
++            // contract: return the intersection of current ranges with the new
++            // one, leaving the set containing the union.
++            //
++            // NOTE: empty ranges are deliberately excluded here. Unlike `insert`
++            // and `remove`, `replace` does NOT no-op on an empty range; it stores
++            // a degenerate `x..x` entry and corrupts the set. That is a real bug,
++            // covered by the dedicated failing test
++            // `replace_empty_range_corrupts_set` below; excluding it here lets
++            // this model exercise the rest of the API in depth.
++            let start = tc.draw(generators::integers::<u64>().max_value(MAX_VALUE - 1));
++            let len = tc.draw(
++                generators::integers::<u64>()
++                    .min_value(1)
++                    .max_value(MAX_VALUE - start),
++            );
++            let range = start..start + len;
++            // Expected intersection, as maximal runs (compare structurally rather
++            // than element-wise so a buggy huge range fails cleanly instead of
++            // OOMing the test)
++            let mut expected: Vec<Range<u64>> = Vec::new();
++            for x in range.clone() {
++                if self.model.contains(&x) {
++                    match expected.last_mut() {
++                        Some(r) if r.end == x => r.end = x + 1,
++                        _ => expected.push(x..x + 1),
++                    }
++                }
++            }
++            let replaced: Vec<Range<u64>> = self.btree.replace(range.clone()).collect();
++            assert_eq!(replaced, expected, "replace() must return the intersection");
++            self.model_insert(range.clone());
++            self.array.insert(range);
++        }
++
++        #[rule]
++        fn pop_min(&mut self, _: TestCase) {
++            let expected = self.model.iter().next().copied().map(|start| {
++                let end = (start..).take_while(|x| self.model.contains(x)).last().unwrap() + 1;
++                start..end
++            });
++            if let Some(r) = &expected {
++                for x in r.clone() {
++                    self.model.remove(&x);
++                }
++            }
++            assert_eq!(self.btree.pop_min(), expected);
++            assert_eq!(self.array.pop_min(), expected);
++        }
++
++        #[rule]
++        fn contains(&mut self, tc: TestCase) {
++            let x = tc.draw(generators::integers::<u64>().max_value(MAX_VALUE));
++            let expected = self.model.contains(&x);
++            assert_eq!(self.btree.contains(x), expected);
++            assert_eq!(self.array.contains(x), expected);
++        }
++
++        #[invariant]
++        fn all_three_agree(&self, _: TestCase) {
++            // Cheap well-formedness check first: if a set ever contains a
++            // malformed or out-of-domain range, fail here rather than OOM
++            // materializing its elements below
++            for r in self.btree.iter() {
++                assert!(
++                    r.start < r.end && r.end <= MAX_VALUE + 1,
++                    "malformed range {r:?} in RangeSet"
++                );
++            }
++            for r in self.array.iter() {
++                assert!(
++                    r.start < r.end && r.end <= MAX_VALUE + 1,
++                    "malformed range {r:?} in ArrayRangeSet"
++                );
++            }
++            let expected: Vec<u64> = self.model.iter().copied().collect();
++            assert_eq!(self.btree.elts().collect::<Vec<_>>(), expected);
++            assert_eq!(self.array.elts().collect::<Vec<_>>(), expected);
++            // Both sets store canonical (maximally merged) runs, so their run
++            // counts must agree, as must their summaries
++            assert_eq!(self.btree.len(), self.array.len());
++            assert_eq!(self.btree.is_empty(), self.model.is_empty());
++            assert_eq!(self.array.is_empty(), self.model.is_empty());
++            assert_eq!(self.btree.min(), self.model.iter().next().copied());
++            assert_eq!(self.array.min(), self.model.iter().next().copied());
++            assert_eq!(self.btree.max(), self.model.iter().next_back().copied());
++            assert_eq!(self.array.max(), self.model.iter().next_back().copied());
++        }
++    }
++
++    #[hegel::test]
++    fn range_sets_match_element_model(tc: TestCase) {
++        let machine = SetModel {
++            btree: RangeSet::new(),
++            array: ArrayRangeSet::new(),
++            model: BTreeSet::new(),
++        };
++        hegel::stateful::machine(machine).run(tc);
++    }
++}
++
+ /// A very simple reference implementation of a RangeSet
+ struct RefRangeSet {
+     data: Vec<bool>,
+diff --git a/quinn-proto/src/tests/mod.rs b/quinn-proto/src/tests/mod.rs
+index 2f684260..9796b34e 100644
+--- a/quinn-proto/src/tests/mod.rs
++++ b/quinn-proto/src/tests/mod.rs
+@@ -350,6 +350,78 @@ fn finish_stream_simple() {
+     let _ = chunks.finalize();
+ }
+ 
++/// Port of `fuzz/fuzz_targets/streamid.rs`, extended per `StreamId`'s accessor
++/// docs: a stream ID built from (initiator, direction, index) returns exactly
++/// those three components, and survives the `VarInt` wire conversion. Indexes
++/// are bounded by `MAX_STREAM_COUNT` = 2^60 (RFC 9000 §4.6).
++#[hegel::test]
++fn stream_id_roundtrip(tc: hegel::TestCase) {
++    use hegel::generators;
++    use hegel::Generator;
++    let side = tc.draw((generators::sampled_from(vec![Side::Client, Side::Server])).print_as_debug());
++    let dir = tc.draw((generators::sampled_from(vec![Dir::Bi, Dir::Uni])).print_as_debug());
++    let index = tc.draw(generators::integers::<u64>().max_value(MAX_STREAM_COUNT - 1));
++    let id = StreamId::new(side, dir, index);
++    assert_eq!(id.initiator(), side);
++    assert_eq!(id.dir(), dir);
++    assert_eq!(id.index(), index);
++    let encoded: VarInt = id.into();
++    assert_eq!(StreamId::from(encoded), id);
++}
++
++/// Data integrity over the simulated network: any payload, written in arbitrary
++/// chunks with arbitrary interleaved link-driving, over a link with arbitrary
++/// MTU (>= QUIC's required 1200) and latency, is delivered exactly and in order.
++/// Built on the same `Pair` harness and stream API as `finish_stream_simple`.
++#[hegel::test(test_cases = 25)]
++fn stream_data_integrity_across_simulated_link(tc: hegel::TestCase) {
++    use hegel::generators;
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    pair.mtu = tc.draw(generators::integers::<usize>().min_value(1200).max_value(65527));
++    pair.latency =
++        Duration::from_micros(tc.draw(generators::integers::<u64>().max_value(50_000)));
++    let (client_ch, server_ch) = pair.connect();
++
++    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    let chunks: Vec<Vec<u8>> =
++        tc.draw(generators::vecs(generators::binary().max_size(4096)).max_size(8));
++    let mut sent = Vec::new();
++    for chunk in &chunks {
++        let mut written = 0;
++        while written < chunk.len() {
++            match pair.client_send(client_ch, s).write(&chunk[written..]) {
++                Ok(n) => written += n,
++                Err(WriteError::Blocked) => pair.drive(),
++                Err(e) => panic!("write failed: {e}"),
++            }
++        }
++        sent.extend_from_slice(chunk);
++        // Sometimes flush the link between writes to vary packetization
++        if tc.draw(generators::booleans()) {
++            pair.drive();
++        }
++    }
++    pair.client_send(client_ch, s).finish().unwrap();
++    pair.drive();
++
++    while pair.server_conn_mut(server_ch).poll().is_some() {}
++    assert_eq!(pair.server_streams(server_ch).accept(Dir::Uni), Some(s));
++
++    let mut recv = pair.server_recv(server_ch, s);
++    let mut recv_chunks = recv.read(true).unwrap();
++    let mut received = Vec::new();
++    loop {
++        match recv_chunks.next(usize::MAX) {
++            Ok(Some(chunk)) => received.extend_from_slice(&chunk.bytes),
++            Ok(None) => break,
++            Err(e) => panic!("read failed: {e}"),
++        }
++    }
++    let _ = recv_chunks.finalize();
++    assert_eq!(received, sent);
++}
++
+ #[test]
+ fn reset_stream() {
+     let _guard = subscribe();
+diff --git a/quinn-proto/src/transport_parameters.rs b/quinn-proto/src/transport_parameters.rs
+index f281507e..e257f9e8 100644
+--- a/quinn-proto/src/transport_parameters.rs
++++ b/quinn-proto/src/transport_parameters.rs
+@@ -866,6 +866,202 @@ mod test {
+         }
+     }
+ 
++    use hegel::generators;
++    use hegel::Generator;
++
++    #[hegel::composite]
++    fn connection_ids(tc: &hegel::TestCase) -> ConnectionId {
++        let bytes: Vec<u8> = tc.draw(generators::binary().max_size(MAX_CID_SIZE));
++        ConnectionId::new(&bytes)
++    }
++
++    #[hegel::composite]
++    fn reset_tokens(tc: &hegel::TestCase) -> ResetToken {
++        let bytes: [u8; RESET_TOKEN_SIZE] =
++            tc.draw(generators::arrays(generators::integers::<u8>()));
++        ResetToken::from(bytes)
++    }
++
++    #[hegel::composite]
++    fn preferred_addresses(tc: &hegel::TestCase) -> PreferredAddress {
++        let has_v4 = tc.draw(generators::booleans());
++        // At least one address must be present (read() rejects all-absent)
++        let has_v6 = if has_v4 {
++            tc.draw(generators::booleans())
++        } else {
++            true
++        };
++        let address_v4 = if has_v4 {
++            let ip = Ipv4Addr::from(tc.draw(generators::integers::<u32>()));
++            let mut port = tc.draw(generators::integers::<u16>());
++            if ip.is_unspecified() && port == 0 {
++                // (0.0.0.0, 0) is the wire representation of "absent"
++                port = 1;
++            }
++            Some(SocketAddrV4::new(ip, port))
++        } else {
++            None
++        };
++        let address_v6 = if has_v6 {
++            let ip = Ipv6Addr::from(tc.draw(generators::integers::<u128>()));
++            let mut port = tc.draw(generators::integers::<u16>());
++            if ip.is_unspecified() && port == 0 {
++                port = 1;
++            }
++            Some(SocketAddrV6::new(ip, port, 0, 0))
++        } else {
++            None
++        };
++        // read() rejects preferred addresses with an empty CID
++        let cid_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(MAX_CID_SIZE));
++        let cid_bytes: Vec<u8> = tc.draw(
++            generators::binary().min_size(cid_len).max_size(cid_len),
++        );
++        PreferredAddress {
++            address_v4,
++            address_v6,
++            connection_id: ConnectionId::new(&cid_bytes),
++            stateless_reset_token: tc.draw((reset_tokens()).print_as_debug()),
++        }
++    }
++
++    /// Generate arbitrary *valid* `TransportParameters` — value ranges follow the
++    /// semantic validation rules in `TransportParameters::read` (RFC 9000 §18.2)
++    /// so that an encode/decode roundtrip is expected to succeed.
++    #[hegel::composite]
++    fn arbitrary_params(tc: &hegel::TestCase) -> TransportParameters {
++        let varint = || generators::integers::<u64>().max_value(VarInt::MAX.0);
++        let max_ack_delay = tc.draw(generators::integers::<u64>().max_value((1 << 14) - 1));
++        let min_ack_delay = tc
++            .draw(generators::optional(
++                generators::integers::<u64>().max_value(max_ack_delay * 1_000),
++            ))
++            .map(|x| VarInt::from_u64(x).unwrap());
++        let grease_transport_parameter = if tc.draw(generators::booleans()) {
++            // Reserved IDs have the form 31 * N + 27 (RFC 9000 §18.1/§22.3)
++            let n = tc.draw(generators::integers::<u64>().max_value((VarInt::MAX.0 - 27) / 31));
++            let payload_len = tc
++                .draw(generators::integers::<usize>()
++                    .max_value(ReservedTransportParameter::MAX_PAYLOAD_LEN - 1));
++            let payload: [u8; ReservedTransportParameter::MAX_PAYLOAD_LEN] =
++                tc.draw(generators::arrays(generators::integers::<u8>()));
++            Some(ReservedTransportParameter {
++                id: VarInt::from_u64(31 * n + 27).unwrap(),
++                payload,
++                payload_len,
++            })
++        } else {
++            None
++        };
++        // An arbitrary serialization order over all supported parameters
++        let write_order = if tc.draw(generators::booleans()) {
++            let mut order: [u8; TransportParameterId::SUPPORTED.len()] =
++                std::array::from_fn(|i| i as u8);
++            // Fisher-Yates with hegel-drawn swap targets
++            for i in (1..order.len()).rev() {
++                let j = tc.draw(generators::integers::<usize>().max_value(i));
++                order.swap(i, j);
++            }
++            Some(order)
++        } else {
++            None
++        };
++        TransportParameters {
++            max_idle_timeout: VarInt::from_u64(tc.draw(varint())).unwrap(),
++            // read() rejects values < 1200
++            max_udp_payload_size: VarInt::from_u64(
++                tc.draw(generators::integers::<u64>().min_value(1200).max_value(VarInt::MAX.0)),
++            )
++            .unwrap(),
++            initial_max_data: VarInt::from_u64(tc.draw(varint())).unwrap(),
++            initial_max_stream_data_bidi_local: VarInt::from_u64(tc.draw(varint())).unwrap(),
++            initial_max_stream_data_bidi_remote: VarInt::from_u64(tc.draw(varint())).unwrap(),
++            initial_max_stream_data_uni: VarInt::from_u64(tc.draw(varint())).unwrap(),
++            // read() rejects stream counts > 2^60
++            initial_max_streams_bidi: VarInt::from_u64(
++                tc.draw(generators::integers::<u64>().max_value(MAX_STREAM_COUNT)),
++            )
++            .unwrap(),
++            initial_max_streams_uni: VarInt::from_u64(
++                tc.draw(generators::integers::<u64>().max_value(MAX_STREAM_COUNT)),
++            )
++            .unwrap(),
++            // read() rejects exponents > 20
++            ack_delay_exponent: VarInt::from_u64(
++                tc.draw(generators::integers::<u64>().max_value(20)),
++            )
++            .unwrap(),
++            max_ack_delay: VarInt::from_u64(max_ack_delay).unwrap(),
++            // read() rejects limits < 2
++            active_connection_id_limit: VarInt::from_u64(
++                tc.draw(generators::integers::<u64>().min_value(2).max_value(VarInt::MAX.0)),
++            )
++            .unwrap(),
++            disable_active_migration: tc.draw(generators::booleans()),
++            max_datagram_frame_size: tc
++                .draw(generators::optional(varint()))
++                .map(|x| VarInt::from_u64(x).unwrap()),
++            initial_src_cid: tc.draw((generators::optional(connection_ids())).print_as_debug()),
++            grease_quic_bit: tc.draw(generators::booleans()),
++            min_ack_delay,
++            original_dst_cid: tc.draw((generators::optional(connection_ids())).print_as_debug()),
++            retry_src_cid: tc.draw((generators::optional(connection_ids())).print_as_debug()),
++            stateless_reset_token: tc.draw((generators::optional(reset_tokens())).print_as_debug()),
++            preferred_address: tc.draw((generators::optional(preferred_addresses())).print_as_debug()),
++            grease_transport_parameter,
++            write_order,
++        }
++    }
++
++    /// Roundtrip: any valid parameter set, serialized in any parameter order and
++    /// with any grease parameter, is decoded back identically by a client.
++    /// Generalizes the `coding` unit test above; `fuzz/fuzz_targets/params.rs`
++    /// shows the maintainers consider `read` worth fuzzing.
++    #[hegel::test]
++    fn params_write_read_roundtrip(tc: hegel::TestCase) {
++        let params = tc.draw((arbitrary_params()).print_as_debug());
++        let mut buf = Vec::new();
++        params.write(&mut buf);
++        let decoded = TransportParameters::read(Side::Client, &mut buf.as_slice())
++            .expect("valid parameters must decode");
++        // Both fields are serialization-side state: the grease parameter is
++        // ignored by readers, and incoming parameters never have a write order.
++        let expected = TransportParameters {
++            write_order: None,
++            grease_transport_parameter: None,
++            ..params
++        };
++        assert_eq!(decoded, expected);
++    }
++
++    /// Port of `fuzz/fuzz_targets/params.rs`: `read` must never panic, whether fed
++    /// arbitrary garbage or a mutation of a valid encoding.
++    #[hegel::test]
++    fn params_read_never_panics(tc: hegel::TestCase) {
++        let mut bytes: Vec<u8> = if tc.draw(generators::booleans()) {
++            tc.draw(generators::binary())
++        } else {
++            // Mutated valid encoding: parses deeper than pure garbage
++            let params = tc.draw((arbitrary_params()).print_as_debug());
++            let mut buf = Vec::new();
++            params.write(&mut buf);
++            buf
++        };
++        if !bytes.is_empty() {
++            // Flip a byte and/or truncate
++            if tc.draw(generators::booleans()) {
++                let idx = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++                bytes[idx] = tc.draw(generators::integers::<u8>());
++            }
++            if tc.draw(generators::booleans()) {
++                let cut = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++                bytes.truncate(cut);
++            }
++        }
++        let side = tc.draw((generators::sampled_from(vec![Side::Client, Side::Server])).print_as_debug());
++        let _ = TransportParameters::read(side, &mut bytes.as_slice());
++    }
++
+     #[test]
+     fn resumption_params_validation() {
+         let high_limit = TransportParameters {
+diff --git a/quinn-proto/src/varint.rs b/quinn-proto/src/varint.rs
+index 863276b5..bc040940 100644
+--- a/quinn-proto/src/varint.rs
++++ b/quinn-proto/src/varint.rs
+@@ -139,6 +139,66 @@ impl<'arbitrary> Arbitrary<'arbitrary> for VarInt {
+ #[error("value too large for varint encoding")]
+ pub struct VarIntBoundsExceeded;
+ 
++#[cfg(test)]
++mod tests {
++    use std::io;
++
++    use hegel::generators;
++
++    use super::*;
++
++    /// Values just around the varint size-class boundaries (2^6, 2^14, 2^30, 2^62)
++    fn boundary_values() -> Vec<u64> {
++        vec![
++            0,
++            1,
++            (1 << 6) - 1,
++            1 << 6,
++            (1 << 14) - 1,
++            1 << 14,
++            (1 << 30) - 1,
++            1 << 30,
++            (1 << 62) - 2,
++            VarInt::MAX.0,
++        ]
++    }
++
++    /// Roundtrip: `decode(encode(x)) == x` for every representable `VarInt`, and the
++    /// encoding occupies exactly `size()` bytes. Grounded in the `Codec` contract
++    /// ("Infallible encoding and decoding of QUIC primitives") and RFC 9000 §16.
++    #[hegel::test]
++    fn varint_encode_decode_roundtrip(tc: hegel::TestCase) {
++        let x: u64 = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().max_value(VarInt::MAX.0),
++            generators::sampled_from(boundary_values()),
++        ));
++        let v = VarInt::from_u64(x).unwrap();
++        let mut buf = Vec::new();
++        v.encode(&mut buf);
++        assert_eq!(buf.len(), v.size(), "encoded length must match size()");
++        let mut cursor = io::Cursor::new(&buf);
++        let decoded = VarInt::decode(&mut cursor).unwrap();
++        assert_eq!(decoded, v);
++        assert_eq!(cursor.position() as usize, buf.len(), "decode must consume the whole encoding");
++    }
++
++    /// Parse robustness: `decode` never panics on arbitrary bytes, and any successfully
++    /// decoded value is in bounds (< 2^62, the documented invariant of the type) and
++    /// value-roundtrips through encode/decode. Grounded in `VarInt`'s "integer less
++    /// than 2^62" doc contract; varints are parsed from untrusted network data.
++    #[hegel::test]
++    fn varint_decode_arbitrary_bytes(tc: hegel::TestCase) {
++        let bytes: Vec<u8> = tc.draw(generators::binary());
++        if let Ok(v) = VarInt::decode(&mut io::Cursor::new(&bytes)) {
++            assert!(v <= VarInt::MAX);
++            let mut buf = Vec::new();
++            v.encode(&mut buf);
++            let again = VarInt::decode(&mut io::Cursor::new(&buf)).unwrap();
++            assert_eq!(again, v);
++        }
++    }
++}
++
+ impl Codec for VarInt {
+     fn decode<B: Buf>(r: &mut B) -> coding::Result<Self> {
+         if !r.has_remaining() {
