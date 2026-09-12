@@ -22,3 +22,4 @@
 - 2026-07-09: predecessor base commit `c6620d1165dd` (Merge pull request #237 from jeromefroe/jerome/prepare-0-18-1-release).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/lru.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped c6620d1165dd → 2504ad088ad7 (2026-09-02, "Merge pull request #245 from jeromefroe/jerome/prepare-0-18-4-release"; 0.18.4); 0 bug(s) still reproduce; add/add conflicts in src/lib.rs resolved by keeping both sides. 112 tests pass.
