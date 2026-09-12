@@ -27,3 +27,4 @@
 - 2026-04-15: predecessor base commit `6fafc2c60b5c` (Bump codecov/codecov-action from 5 to 6 in the actions group (#99)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/speedate.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 6fafc2c60b5c → a68ce8660d04 (2026-09-05, "Fix integer parsing with out-of-range inputs (#106)"; 0.17.0); 0 bug(s) still reproduce. 548 tests pass.
