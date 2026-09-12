@@ -86,9 +86,9 @@ def main() -> int:
     btoml.write_text(b)
     tomllib.loads(btoml.read_text())  # must still parse
 
-    unmapped = known - set(first_test)
+    unmapped = sorted(bug["id"] for bug in tomllib.loads(btoml.read_text()).get("bug", []) if not bug.get("test"))
     if unmapped:
-        print(f"note: {sorted(unmapped)} have no failing test (abort-only reproducer?)")
+        print(f"note: {unmapped} have no failing test (abort-only reproducer?)")
     if a.no_finalize:
         return 0
     return subprocess.call([str(ROOT / "tools" / "port.py"), "--finalize", a.crate])

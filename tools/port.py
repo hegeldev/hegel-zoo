@@ -122,7 +122,10 @@ def fix_stateful_run(root: Path) -> int:
     return n
 
 
-PRINT_ERR = re.compile(r"^error\[E0277\]: `([^`]+)` has no printed representation\n\s+--> (\S+?):(\d+):(\d+)", re.M)
+# two shapes: a drawn *type* that is not PrettyPrintable, and a *generator* whose printability was
+# erased (`-> impl Generator<T>` return type, `.boxed()`); both are fixed by wrapping the drawn
+# expression in `.print_as_debug()` (or, for a local type, deriving)
+PRINT_ERR = re.compile(r"^error\[E0277\]: `([^`]+)` (?:has no printed representation|cannot print the values it draws)\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 FIELD_ERR = re.compile(r"^error\[E0277\]: `[^`]+` has no printed representation, so this field cannot derive `PrettyPrintable`\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 
 
