@@ -73,6 +73,55 @@ def fix_composites(root: Path) -> int:
     return n
 
 
+STATEFUL_RUN_RE = re.compile(r"\b((?:hegel::)?stateful::)run\(")
+
+
+def fix_stateful_run(root: Path) -> int:
+    """0.42: `stateful::run(machine, tc)` became `stateful::machine(machine).run(tc)`.
+
+    The machine argument is usually a multi-line struct literal, so this scans for the
+    balanced closing paren and the top-level comma rather than using a regex for the body."""
+    n = 0
+    for f in root.rglob("*.rs"):
+        if "target" in f.parts:
+            continue
+        s = f.read_text(errors="replace")
+        out, i = [], 0
+        for m in STATEFUL_RUN_RE.finditer(s):
+            if m.start() < i:
+                continue
+            depth, j, comma, angle = 1, m.end(), None, 0
+            while j < len(s):
+                c = s[j]
+                if c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif c == "<" and s[j - 2:j] == "::":  # turbofish: `Model::<u8, Msb0>`
+                    angle += 1
+                    depth += 1
+                elif c == ">" and angle:
+                    angle -= 1
+                    depth -= 1
+                elif c == "," and depth == 1 and comma is None:
+                    comma = j
+                j += 1
+            if depth or comma is None:
+                continue
+            machine = s[m.end():comma].strip()
+            tc = s[comma + 1:j].strip().rstrip(",").strip()
+            out.append(s[i:m.start()])
+            out.append(f"{m.group(1)}machine({machine}).run({tc})")
+            i = j + 1
+            n += 1
+        if out:
+            out.append(s[i:])
+            f.write_text("".join(out))
+    return n
+
+
 PRINT_ERR = re.compile(r"^error\[E0277\]: `([^`]+)` has no printed representation\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 FIELD_ERR = re.compile(r"^error\[E0277\]: `[^`]+` has no printed representation, so this field cannot derive `PrettyPrintable`\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 
@@ -304,7 +353,7 @@ def port(crate: str) -> str:
         # the patch may have put the dev-dependency in another manifest; try them all
         if not any(rewrite_dep(c) for c in work.rglob("Cargo.toml") if "target" not in c.parts):
             return f"ERROR   {crate}: hegeltest dependency line not found"
-    nfix = fix_composites(work)
+    nfix = fix_composites(work) + fix_stateful_run(work)
     for _round in range(4):
         r = sh(str(TOOLS / "zoo"), "test", "--no-apply", f"rust/{crate}", check=False)
         out = r.stdout + r.stderr
