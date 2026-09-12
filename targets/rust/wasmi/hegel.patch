@@ -1,0 +1,884 @@
+diff --git a/crates/wasmi/Cargo.toml b/crates/wasmi/Cargo.toml
+index 6f5ba76b..5f2f7883 100644
+--- a/crates/wasmi/Cargo.toml
++++ b/crates/wasmi/Cargo.toml
+@@ -33,6 +33,7 @@ spin = { version = "0.9", default-features = false, features = [
+ [dev-dependencies]
+ assert_matches = "1.5"
+ criterion = { version = "0.5", default-features = false }
++hegeltest = "0.44.1"
+ 
+ [features]
+ default = ["stable", "std", "wat", "validate", "memory64", "auto-dispatch"]
+diff --git a/crates/wasmi/tests/integration/exprs.rs b/crates/wasmi/tests/integration/exprs.rs
+new file mode 100644
+index 00000000..3b8677e5
+--- /dev/null
++++ b/crates/wasmi/tests/integration/exprs.rs
+@@ -0,0 +1,400 @@
++//! Property-based tests that compile randomly generated Wasm arithmetic
++//! expression modules and compare Wasmi's execution results against a
++//! Rust-side reference interpreter implementing the Wasm `i32` operator
++//! semantics.
++//!
++//! These tests use the `hegel` property-based testing library.
++
++use hegel::generators::{self, Generator};
++use wasmi::{CompilationMode, Config, Engine, Linker, Module, Store, TrapCode};
++
++/// A randomly generated Wasm `i32` expression over two parameters `$a` and `$b`.
++#[derive(Debug, Clone, hegel::PrettyPrintable)]
++pub enum Expr {
++    /// An `i32.const` constant.
++    Const(i32),
++    /// A `local.get $a` of the first function parameter.
++    ParamA,
++    /// A `local.get $b` of the second function parameter.
++    ParamB,
++    /// A unary `i32` operator applied to a sub-expression.
++    Unop(Unop, Box<Expr>),
++    /// A binary `i32` operator applied to two sub-expressions.
++    Binop(Binop, Box<Expr>, Box<Expr>),
++}
++
++/// Unary Wasm `i32` operators.
++#[derive(Debug, Clone, Copy, hegel::PrettyPrintable)]
++pub enum Unop {
++    Clz,
++    Ctz,
++    Popcnt,
++    Eqz,
++}
++
++/// Binary Wasm `i32` operators.
++#[derive(Debug, Clone, Copy, hegel::PrettyPrintable)]
++pub enum Binop {
++    Add,
++    Sub,
++    Mul,
++    DivS,
++    DivU,
++    RemS,
++    RemU,
++    And,
++    Or,
++    Xor,
++    Shl,
++    ShrS,
++    ShrU,
++    Rotl,
++    Rotr,
++    Eq,
++    Ne,
++    LtS,
++    LtU,
++    GtS,
++    GtU,
++    LeS,
++    LeU,
++    GeS,
++    GeU,
++}
++
++/// All binary operators, used for `sampled_from`.
++const ALL_BINOPS: &[Binop] = &[
++    Binop::Add,
++    Binop::Sub,
++    Binop::Mul,
++    Binop::DivS,
++    Binop::DivU,
++    Binop::RemS,
++    Binop::RemU,
++    Binop::And,
++    Binop::Or,
++    Binop::Xor,
++    Binop::Shl,
++    Binop::ShrS,
++    Binop::ShrU,
++    Binop::Rotl,
++    Binop::Rotr,
++    Binop::Eq,
++    Binop::Ne,
++    Binop::LtS,
++    Binop::LtU,
++    Binop::GtS,
++    Binop::GtU,
++    Binop::LeS,
++    Binop::LeU,
++    Binop::GeS,
++    Binop::GeU,
++];
++
++impl Unop {
++    fn wat(self) -> &'static str {
++        match self {
++            Self::Clz => "i32.clz",
++            Self::Ctz => "i32.ctz",
++            Self::Popcnt => "i32.popcnt",
++            Self::Eqz => "i32.eqz",
++        }
++    }
++}
++
++impl Binop {
++    fn wat(self) -> &'static str {
++        match self {
++            Self::Add => "i32.add",
++            Self::Sub => "i32.sub",
++            Self::Mul => "i32.mul",
++            Self::DivS => "i32.div_s",
++            Self::DivU => "i32.div_u",
++            Self::RemS => "i32.rem_s",
++            Self::RemU => "i32.rem_u",
++            Self::And => "i32.and",
++            Self::Or => "i32.or",
++            Self::Xor => "i32.xor",
++            Self::Shl => "i32.shl",
++            Self::ShrS => "i32.shr_s",
++            Self::ShrU => "i32.shr_u",
++            Self::Rotl => "i32.rotl",
++            Self::Rotr => "i32.rotr",
++            Self::Eq => "i32.eq",
++            Self::Ne => "i32.ne",
++            Self::LtS => "i32.lt_s",
++            Self::LtU => "i32.lt_u",
++            Self::GtS => "i32.gt_s",
++            Self::GtU => "i32.gt_u",
++            Self::LeS => "i32.le_s",
++            Self::LeU => "i32.le_u",
++            Self::GeS => "i32.ge_s",
++            Self::GeU => "i32.ge_u",
++        }
++    }
++}
++
++impl Expr {
++    /// Renders `self` as folded Wasm text format expression.
++    pub fn to_wat(&self) -> String {
++        match self {
++            Self::Const(c) => format!("(i32.const {c})"),
++            Self::ParamA => "(local.get $a)".to_string(),
++            Self::ParamB => "(local.get $b)".to_string(),
++            Self::Unop(op, inner) => format!("({} {})", op.wat(), inner.to_wat()),
++            Self::Binop(op, lhs, rhs) => {
++                format!("({} {} {})", op.wat(), lhs.to_wat(), rhs.to_wat())
++            }
++        }
++    }
++
++    /// Reference interpreter implementing the Wasm `i32` operator semantics.
++    ///
++    /// Returns the same result (or trap) that a spec-conforming Wasm engine
++    /// must produce for the expression with parameters `a` and `b`.
++    pub fn eval(&self, a: i32, b: i32) -> Result<i32, TrapCode> {
++        Ok(match self {
++            Self::Const(c) => *c,
++            Self::ParamA => a,
++            Self::ParamB => b,
++            Self::Unop(op, inner) => {
++                let x = inner.eval(a, b)?;
++                match op {
++                    Unop::Clz => x.leading_zeros() as i32,
++                    Unop::Ctz => x.trailing_zeros() as i32,
++                    Unop::Popcnt => x.count_ones() as i32,
++                    Unop::Eqz => (x == 0) as i32,
++                }
++            }
++            Self::Binop(op, lhs, rhs) => {
++                let l = lhs.eval(a, b)?;
++                let r = rhs.eval(a, b)?;
++                match op {
++                    Binop::Add => l.wrapping_add(r),
++                    Binop::Sub => l.wrapping_sub(r),
++                    Binop::Mul => l.wrapping_mul(r),
++                    Binop::DivS => {
++                        if r == 0 {
++                            return Err(TrapCode::IntegerDivisionByZero);
++                        }
++                        if l == i32::MIN && r == -1 {
++                            return Err(TrapCode::IntegerOverflow);
++                        }
++                        l / r
++                    }
++                    Binop::DivU => {
++                        if r == 0 {
++                            return Err(TrapCode::IntegerDivisionByZero);
++                        }
++                        ((l as u32) / (r as u32)) as i32
++                    }
++                    Binop::RemS => {
++                        if r == 0 {
++                            return Err(TrapCode::IntegerDivisionByZero);
++                        }
++                        // Wasm: `i32::MIN rem_s -1` is defined as 0 (no trap).
++                        l.wrapping_rem(r)
++                    }
++                    Binop::RemU => {
++                        if r == 0 {
++                            return Err(TrapCode::IntegerDivisionByZero);
++                        }
++                        ((l as u32) % (r as u32)) as i32
++                    }
++                    Binop::And => l & r,
++                    Binop::Or => l | r,
++                    Binop::Xor => l ^ r,
++                    // Wasm masks the shift amount by 31, as does `wrapping_shl/shr`.
++                    Binop::Shl => l.wrapping_shl(r as u32),
++                    Binop::ShrS => l.wrapping_shr(r as u32),
++                    Binop::ShrU => ((l as u32).wrapping_shr(r as u32)) as i32,
++                    Binop::Rotl => l.rotate_left((r as u32) % 32),
++                    Binop::Rotr => l.rotate_right((r as u32) % 32),
++                    Binop::Eq => (l == r) as i32,
++                    Binop::Ne => (l != r) as i32,
++                    Binop::LtS => (l < r) as i32,
++                    Binop::LtU => ((l as u32) < (r as u32)) as i32,
++                    Binop::GtS => (l > r) as i32,
++                    Binop::GtU => ((l as u32) > (r as u32)) as i32,
++                    Binop::LeS => (l <= r) as i32,
++                    Binop::LeU => ((l as u32) <= (r as u32)) as i32,
++                    Binop::GeS => (l >= r) as i32,
++                    Binop::GeU => ((l as u32) >= (r as u32)) as i32,
++                }
++            }
++        })
++    }
++}
++
++/// Generator for random [`Expr`] trees of at most the given `depth`.
++///
++/// Recursive generators cannot use `#[hegel::composite]`, so this follows
++/// the `compose!` + `boxed()` pattern.
++pub fn expr_trees(depth: u32) -> generators::BoxedGenerator<'static, Expr> {
++    hegel::compose!(|tc| {
++        let make_leaf = depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) == 0;
++        if make_leaf {
++            match tc.draw(generators::integers::<u8>().max_value(3)) {
++                0 => Expr::ParamA,
++                1 => Expr::ParamB,
++                _ => Expr::Const(tc.draw(interesting_i32())),
++            }
++        } else if tc.draw(generators::integers::<u8>().max_value(4)) == 0 {
++            let op = tc.draw(generators::sampled_from(vec![
++                Unop::Clz,
++                Unop::Ctz,
++                Unop::Popcnt,
++                Unop::Eqz,
++            ]));
++            Expr::Unop(op, Box::new(tc.draw((expr_trees(depth - 1)).print_as_debug())))
++        } else {
++            let op = tc.draw(generators::sampled_from(ALL_BINOPS.to_vec()));
++            let lhs = tc.draw((expr_trees(depth - 1)).print_as_debug());
++            let rhs = tc.draw((expr_trees(depth - 1)).print_as_debug());
++            Expr::Binop(op, Box::new(lhs), Box::new(rhs))
++        }
++    })
++    .boxed()
++}
++
++/// Generator for `i32` values boosting the boundary values.
++///
++/// Boundary conjunctions (e.g. `i32::MIN / -1`) are unlikely under uniform
++/// generation, so boundaries are boosted explicitly per the hegel skill.
++#[hegel::composite]
++pub fn interesting_i32(tc: &hegel::TestCase) -> i32 {
++    tc.draw(hegel::one_of!(
++        generators::integers::<i32>(),
++        generators::sampled_from(vec![0, 1, -1, 2, 31, 32, i32::MIN, i32::MAX]),
++    ))
++}
++
++/// Draws a random expression together with its two `i32` arguments.
++pub fn draw_expr_and_args(tc: &hegel::TestCase) -> (Expr, i32, i32) {
++    let depth = tc.draw(generators::integers::<u32>().max_value(6));
++    let expr = tc.draw(expr_trees(depth));
++    let a = tc.draw(interesting_i32());
++    let b = tc.draw(interesting_i32());
++    (expr, a, b)
++}
++
++/// Wraps the expression into a Wasm module exporting it as function `"eval"`.
++pub fn expr_module_wat(expr: &Expr) -> String {
++    format!(
++        "(module (func (export \"eval\") (param $a i32) (param $b i32) (result i32) {}))",
++        expr.to_wat()
++    )
++}
++
++/// Compiles and runs the given expression module with Wasmi.
++///
++/// Returns the execution outcome (result value or trap code) and,
++/// if `fuel` is `Some`, the remaining fuel after the call.
++///
++/// # Panics
++///
++/// If the module fails to compile or instantiate: the generated modules
++/// are valid Wasm by construction, so such a failure is itself a bug.
++pub fn run_expr_module(
++    mode: CompilationMode,
++    fuel: Option<u64>,
++    wat: &str,
++    a: i32,
++    b: i32,
++) -> (Result<i32, TrapCode>, Option<u64>) {
++    let mut config = Config::default();
++    config.compilation_mode(mode);
++    config.consume_fuel(fuel.is_some());
++    let engine = Engine::new(&config);
++    let module = Module::new(&engine, wat)
++        .unwrap_or_else(|err| panic!("generated module must compile but got: {err}\nwat: {wat}"));
++    let mut store = Store::new(&engine, ());
++    if let Some(fuel) = fuel {
++        store.set_fuel(fuel).unwrap();
++    }
++    let linker = Linker::<()>::new(&engine);
++    let instance = linker
++        .instantiate_and_start(&mut store, &module)
++        .unwrap_or_else(|err| panic!("generated module must instantiate but got: {err}"));
++    let func = instance
++        .get_func(&store, "eval")
++        .unwrap()
++        .typed::<(i32, i32), i32>(&store)
++        .unwrap();
++    let result = func.call(&mut store, (a, b)).map_err(|err| {
++        err.as_trap_code()
++            .unwrap_or_else(|| panic!("expected a trap error but got: {err}"))
++    });
++    let remaining = fuel.map(|_| store.get_fuel().unwrap());
++    (result, remaining)
++}
++
++/// Property: Wasmi evaluates generated `i32` expression modules to exactly
++/// the result (or trap) computed by a Rust-side reference interpreter of the
++/// Wasm operator semantics.
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn wasmi_execution_matches_reference_interpreter(tc: hegel::TestCase) {
++    let (expr, a, b) = draw_expr_and_args(&tc);
++    let wat = expr_module_wat(&expr);
++    tc.note(&format!("wat: {wat}, a: {a}, b: {b}"));
++    let expected = expr.eval(a, b);
++    let (actual, _) = run_expr_module(CompilationMode::Eager, None, &wat, a, b);
++    assert_eq!(actual, expected);
++}
++
++/// Property: executing the same module with the same inputs always produces
++/// the same outcome (value or trap), independently of the engine instance
++/// and of the chosen compilation mode (eager vs. lazy).
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn execution_is_deterministic_across_engines_and_compilation_modes(tc: hegel::TestCase) {
++    let (expr, a, b) = draw_expr_and_args(&tc);
++    let wat = expr_module_wat(&expr);
++    tc.note(&format!("wat: {wat}, a: {a}, b: {b}"));
++    let modes = || {
++        generators::sampled_from(vec![
++            CompilationMode::Eager,
++            CompilationMode::LazyTranslation,
++            CompilationMode::Lazy,
++        ])
++    };
++    let mode1 = tc.draw((modes()).print_as_debug());
++    let mode2 = tc.draw((modes()).print_as_debug());
++    let (outcome1, _) = run_expr_module(mode1, None, &wat, a, b);
++    let (outcome2, _) = run_expr_module(mode2, None, &wat, a, b);
++    assert_eq!(
++        outcome1, outcome2,
++        "outcome differs between {mode1:?} and {mode2:?}"
++    );
++}
++
++/// Property: calling an exported function via the untyped `Func::call` API
++/// and via the `TypedFunc` API produces the same outcome.
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn typed_and_untyped_calls_agree(tc: hegel::TestCase) {
++    use wasmi::Val;
++    let (expr, a, b) = draw_expr_and_args(&tc);
++    let wat = expr_module_wat(&expr);
++    tc.note(&format!("wat: {wat}, a: {a}, b: {b}"));
++    let engine = Engine::default();
++    let module = Module::new(&engine, wat.as_str()).unwrap();
++    let mut store = Store::new(&engine, ());
++    let linker = Linker::<()>::new(&engine);
++    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
++    let func = instance.get_func(&store, "eval").unwrap();
++    // The module is stateless, so both calls run under identical conditions.
++    let untyped: Result<i32, TrapCode> = {
++        let mut results = [Val::I32(0)];
++        func.call(&mut store, &[Val::I32(a), Val::I32(b)], &mut results)
++            .map(|_| results[0].i32().unwrap())
++            .map_err(|err| err.as_trap_code().expect("expected a trap error"))
++    };
++    let typed: Result<i32, TrapCode> = func
++        .typed::<(i32, i32), i32>(&store)
++        .unwrap()
++        .call(&mut store, (a, b))
++        .map_err(|err| err.as_trap_code().expect("expected a trap error"));
++    assert_eq!(untyped, typed);
++}
+diff --git a/crates/wasmi/tests/integration/fuel_metering.rs b/crates/wasmi/tests/integration/fuel_metering.rs
+index 2659313d..496d7057 100644
+--- a/crates/wasmi/tests/integration/fuel_metering.rs
++++ b/crates/wasmi/tests/integration/fuel_metering.rs
+@@ -108,3 +108,71 @@ fn metered_i32_add_lazy_translation() {
+ fn metered_i32_add_lazy() {
+     run_test(CompilationMode::Lazy, 33)
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel) for fuel metering, using the generated
++// arithmetic expression modules from `super::exprs`.
++// ---------------------------------------------------------------------------
++
++use super::exprs::{draw_expr_and_args, expr_module_wat, run_expr_module};
++use hegel::generators;
++
++/// Plenty of fuel for any expression module generated by `draw_expr_and_args`
++/// (expression trees have well below 1000 instructions).
++const AMPLE_FUEL: u64 = 1_000_000;
++
++/// Property: enabling fuel metering (with ample fuel) never changes the
++/// execution outcome compared to unmetered execution — it only determines
++/// whether execution completes.
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn fuel_metering_does_not_change_outcome(tc: hegel::TestCase) {
++    let (expr, a, b) = draw_expr_and_args(&tc);
++    let wat = expr_module_wat(&expr);
++    tc.note(&format!("wat: {wat}, a: {a}, b: {b}"));
++    let (unmetered, _) = run_expr_module(CompilationMode::Eager, None, &wat, a, b);
++    let (metered, remaining) = run_expr_module(CompilationMode::Eager, Some(AMPLE_FUEL), &wat, a, b);
++    // Sanity: with ample fuel the metered run must not run out of fuel.
++    assert_ne!(metered, Err(TrapCode::OutOfFuel));
++    assert!(remaining.unwrap() > 0);
++    assert_eq!(metered, unmetered);
++}
++
++/// Property: giving more fuel than consumed never changes the outcome nor
++/// the amount of fuel consumed (fuel monotonicity).
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn more_fuel_never_changes_outcome_or_consumption(tc: hegel::TestCase) {
++    let (expr, a, b) = draw_expr_and_args(&tc);
++    let wat = expr_module_wat(&expr);
++    tc.note(&format!("wat: {wat}, a: {a}, b: {b}"));
++    let (outcome, remaining) = run_expr_module(CompilationMode::Eager, Some(AMPLE_FUEL), &wat, a, b);
++    assert_ne!(outcome, Err(TrapCode::OutOfFuel));
++    let consumed = AMPLE_FUEL - remaining.unwrap();
++    // `extra == 0` checks that exactly the consumed fuel is sufficient.
++    let extra = tc.draw(generators::integers::<u64>().max_value(1_000_000_000));
++    let budget = consumed + extra;
++    let (outcome2, remaining2) = run_expr_module(CompilationMode::Eager, Some(budget), &wat, a, b);
++    assert_eq!(outcome2, outcome);
++    let consumed2 = budget - remaining2.unwrap();
++    assert_eq!(consumed2, consumed);
++}
++
++/// Property: giving less fuel than the run consumes always traps with
++/// `TrapCode::OutOfFuel` — never any other outcome.
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn insufficient_fuel_always_traps_out_of_fuel(tc: hegel::TestCase) {
++    let (expr, a, b) = draw_expr_and_args(&tc);
++    let wat = expr_module_wat(&expr);
++    tc.note(&format!("wat: {wat}, a: {a}, b: {b}"));
++    let (outcome, remaining) = run_expr_module(CompilationMode::Eager, Some(AMPLE_FUEL), &wat, a, b);
++    assert_ne!(outcome, Err(TrapCode::OutOfFuel));
++    let consumed = AMPLE_FUEL - remaining.unwrap();
++    // Any call consumes at least some base fuel; reject the (unexpected)
++    // zero-consumption case instead of underflowing below.
++    tc.assume(consumed > 0);
++    let budget = tc.draw(generators::integers::<u64>().max_value(consumed - 1));
++    let (outcome2, _) = run_expr_module(CompilationMode::Eager, Some(budget), &wat, a, b);
++    assert_eq!(outcome2, Err(TrapCode::OutOfFuel));
++}
+diff --git a/crates/wasmi/tests/integration/func.rs b/crates/wasmi/tests/integration/func.rs
+index 8578657a..d8b124d2 100644
+--- a/crates/wasmi/tests/integration/func.rs
++++ b/crates/wasmi/tests/integration/func.rs
+@@ -519,3 +519,132 @@ fn static_type_check_works() {
+         ErrorKind::Func(FuncError::MismatchingResultType)
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel) for host function value roundtrips.
++// ---------------------------------------------------------------------------
++
++use hegel::generators;
++use hegel::Generator;
++use wasmi::{Linker, Module};
++
++/// Draws one of the four Wasm numeric value types.
++fn draw_num_val_type(tc: &hegel::TestCase) -> ValType {
++    tc.draw((generators::sampled_from(vec![
++        ValType::I32,
++        ValType::I64,
++        ValType::F32,
++        ValType::F64,
++    ])).print_as_debug())
++}
++
++/// Draws a [`Val`] of the given numeric [`ValType`].
++///
++/// Floats are drawn via their raw bit representation so that all bit
++/// patterns — including NaNs with arbitrary payloads — are covered.
++fn draw_val_of_type(tc: &hegel::TestCase, ty: ValType) -> Val {
++    match ty {
++        ValType::I32 => Val::I32(tc.draw(generators::integers::<i32>())),
++        ValType::I64 => Val::I64(tc.draw(generators::integers::<i64>())),
++        ValType::F32 => Val::F32(F32::from_bits(tc.draw(generators::integers::<u32>()))),
++        ValType::F64 => Val::F64(F64::from_bits(tc.draw(generators::integers::<u64>()))),
++        ty => panic!("unsupported value type: {ty:?}"),
++    }
++}
++
++/// Asserts that two numeric [`Val`]s are bitwise identical.
++///
++/// Floats are compared by bit pattern: value roundtrips must preserve
++/// NaN payloads and signed zeros exactly.
++#[track_caller]
++fn assert_val_bits_eq(lhs: &Val, rhs: &Val) {
++    match (lhs, rhs) {
++        (Val::I32(l), Val::I32(r)) => assert_eq!(l, r),
++        (Val::I64(l), Val::I64(r)) => assert_eq!(l, r),
++        (Val::F32(l), Val::F32(r)) => assert_eq!(
++            l.to_bits(),
++            r.to_bits(),
++            "f32 bits differ: {l:?} vs {r:?}"
++        ),
++        (Val::F64(l), Val::F64(r)) => assert_eq!(
++            l.to_bits(),
++            r.to_bits(),
++            "f64 bits differ: {l:?} vs {r:?}"
++        ),
++        (lhs, rhs) => panic!("value type mismatch: {lhs:?} vs {rhs:?}"),
++    }
++}
++
++/// Property: a dynamically-typed identity host function ([`Func::new`])
++/// with an arbitrary numeric signature returns all parameter values
++/// bitwise unchanged through [`Func::call`].
++#[hegel::test]
++fn host_identity_func_roundtrips_arbitrary_values(tc: hegel::TestCase) {
++    let mut store = test_setup();
++    let types: Vec<ValType> = tc.draw(
++        (generators::vecs(generators::sampled_from(vec![
++            ValType::I32,
++            ValType::I64,
++            ValType::F32,
++            ValType::F64,
++        ]))
++        .max_size(16)).print_as_debug(),
++    );
++    let params: Vec<Val> = types.iter().map(|ty| draw_val_of_type(&tc, *ty)).collect();
++    let func_ty = FuncType::new(types.iter().copied(), types.iter().copied());
++    let identity = Func::new(&mut store, func_ty, |_caller, params, results| {
++        results.clone_from_slice(params);
++        Ok(())
++    });
++    let mut results: Vec<Val> = types.iter().map(|ty| Val::default_for_ty(*ty)).collect();
++    identity.call(&mut store, &params, &mut results).unwrap();
++    assert_eq!(params.len(), results.len());
++    for (param, result) in params.iter().zip(&results) {
++        assert_val_bits_eq(param, result);
++    }
++}
++
++/// Property: a numeric value passed from the host into a Wasm function,
++/// through an imported identity host function, and back out to the host
++/// arrives bitwise unchanged (Wasm -> host -> Wasm value roundtrip).
++#[hegel::test]
++#[cfg_attr(not(feature = "wat"), ignore)]
++fn value_roundtrips_through_wasm_and_host(tc: hegel::TestCase) {
++    let ty = draw_num_val_type(&tc);
++    let value = draw_val_of_type(&tc, ty);
++    let ty_wat = match ty {
++        ValType::I32 => "i32",
++        ValType::I64 => "i64",
++        ValType::F32 => "f32",
++        ValType::F64 => "f64",
++        ty => panic!("unsupported value type: {ty:?}"),
++    };
++    let wat = format!(
++        r#"
++        (module
++            (import "env" "id" (func $id (param {ty_wat}) (result {ty_wat})))
++            (func (export "call_id") (param $x {ty_wat}) (result {ty_wat})
++                (call $id (local.get $x))
++            )
++        )"#
++    );
++    let mut store = test_setup();
++    let engine = store.engine().clone();
++    let host_id = Func::new(
++        &mut store,
++        FuncType::new([ty], [ty]),
++        |_caller, params, results| {
++            results.clone_from_slice(params);
++            Ok(())
++        },
++    );
++    let mut linker = Linker::<()>::new(&engine);
++    linker.define("env", "id", host_id).unwrap();
++    let module = Module::new(&engine, wat.as_str()).unwrap();
++    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
++    let func = instance.get_func(&store, "call_id").unwrap();
++    let mut results = [Val::default_for_ty(ty)];
++    func.call(&mut store, &[value.clone()], &mut results)
++        .unwrap();
++    assert_val_bits_eq(&value, &results[0]);
++}
+diff --git a/crates/wasmi/tests/integration/instantitation.rs b/crates/wasmi/tests/integration/instantitation.rs
+index 99b84be5..8b3c6e2f 100644
+--- a/crates/wasmi/tests/integration/instantitation.rs
++++ b/crates/wasmi/tests/integration/instantitation.rs
+@@ -19,3 +19,112 @@ fn instantiate_out_of_memory() {
+     let mut store = Store::new(&engine, ());
+     Instance::new(&mut store, &module, &[]).unwrap_err();
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel) for `Module::new` / `Module::validate`
++// robustness on arbitrary and wasm-shaped byte inputs.
++// ---------------------------------------------------------------------------
++
++use hegel::generators::{self, Generator as _};
++
++/// The Wasm binary magic bytes and version header.
++const WASM_HEADER: [u8; 8] = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
++
++/// A small, valid Wasm binary module used as a seed for byte mutations:
++///
++/// ```wat
++/// (module (func (result i32) (i32.const 42)))
++/// ```
++const SEED_MODULE: &[u8] = &[
++    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // magic + version
++    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F, // type section: () -> i32
++    0x03, 0x02, 0x01, 0x00, // function section: 1 func of type 0
++    0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2A, 0x0B, // code section: i32.const 42
++];
++
++/// Sanity anchor for the generators below: the unmutated seed is valid.
++#[test]
++fn seed_module_is_valid() {
++    let engine = Engine::default();
++    Module::new(&engine, SEED_MODULE).unwrap();
++}
++
++/// Generator for random mutations of [`SEED_MODULE`].
++///
++/// `keep_header` preserves the first 8 bytes (magic + version) so that the
++/// result stays in the Wasm *binary* format domain.
++#[hegel::composite]
++fn mutated_seed(tc: &hegel::TestCase, keep_header: bool) -> Vec<u8> {
++    let mut bytes = SEED_MODULE.to_vec();
++    let first_mutable = if keep_header { WASM_HEADER.len() } else { 0 };
++    let num_mutations = tc.draw(generators::integers::<usize>().max_value(8));
++    for _ in 0..num_mutations {
++        let idx = tc.draw(
++            generators::integers::<usize>()
++                .min_value(first_mutable)
++                .max_value(bytes.len() - 1),
++        );
++        bytes[idx] = tc.draw(generators::integers::<u8>());
++    }
++    if tc.draw(generators::booleans()) {
++        let cut = tc.draw(
++            generators::integers::<usize>()
++                .min_value(first_mutable)
++                .max_value(bytes.len()),
++        );
++        bytes.truncate(cut);
++    }
++    bytes
++}
++
++/// Generator for arbitrary bytes prefixed with the Wasm binary header.
++#[hegel::composite]
++fn header_prefixed_bytes(tc: &hegel::TestCase) -> Vec<u8> {
++    let tail: Vec<u8> = tc.draw(generators::binary().max_size(300));
++    let mut bytes = WASM_HEADER.to_vec();
++    bytes.extend(tail);
++    bytes
++}
++
++/// Property: `Module::new` never panics, whatever bytes it is fed —
++/// raw garbage (which also exercises the `wat` text frontend), bytes with
++/// a valid Wasm binary header, or mutations of a valid module.
++#[hegel::test]
++fn module_new_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++    let bytes: Vec<u8> = tc.draw(hegel::one_of!(
++        generators::binary().max_size(300).boxed(),
++        header_prefixed_bytes().boxed(),
++        mutated_seed(false).boxed(),
++    ));
++    let engine = Engine::default();
++    // Must return `Ok` or `Err`, but never panic.
++    let _ = Module::new(&engine, &bytes[..]);
++}
++
++/// Property: for Wasm *binary* inputs, `Module::validate` and `Module::new`
++/// agree on acceptance: everything that validates must also translate
++/// (see the `fuzz/translate` fuzz target) and vice versa.
++///
++/// Restricted to inputs starting with the Wasm binary header because
++/// `Module::validate` does not accept the `wat` text format that
++/// `Module::new` additionally supports.
++#[cfg(feature = "validate")]
++#[hegel::test]
++fn module_validate_agrees_with_module_new(tc: hegel::TestCase) {
++    let bytes: Vec<u8> = tc.draw(hegel::one_of!(
++        header_prefixed_bytes().boxed(),
++        mutated_seed(true).boxed(),
++    ));
++    let engine = Engine::default();
++    let validated = Module::validate(&engine, &bytes);
++    let compiled = Module::new(&engine, &bytes[..]);
++    assert_eq!(
++        validated.is_ok(),
++        compiled.is_ok(),
++        "validate: {validated:?}, new: {}",
++        match &compiled {
++            Ok(_) => "Ok".to_string(),
++            Err(err) => format!("Err({err})"),
++        },
++    );
++}
+diff --git a/crates/wasmi/tests/integration/mod.rs b/crates/wasmi/tests/integration/mod.rs
+index 9ab15ae7..b154bb85 100644
+--- a/crates/wasmi/tests/integration/mod.rs
++++ b/crates/wasmi/tests/integration/mod.rs
+@@ -1,6 +1,7 @@
+ mod call_hook;
+ mod call_host_via_engine;
+ mod disallowed_start_fn;
++mod exprs;
+ mod fuel_consumption;
+ mod fuel_metering;
+ mod func;
+diff --git a/crates/wasmi/tests/integration/multi_memory.rs b/crates/wasmi/tests/integration/multi_memory.rs
+index 8f9e94d3..a9c9667a 100644
+--- a/crates/wasmi/tests/integration/multi_memory.rs
++++ b/crates/wasmi/tests/integration/multi_memory.rs
+@@ -57,3 +57,119 @@ fn test_copying_works(
+     assert_eq!(mem1.data(&store)[ptr], 100);
+     Ok(())
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based stateful model test (hegel) for the `Memory` API.
++// ---------------------------------------------------------------------------
++
++use hegel::generators;
++
++/// The default Wasm page size in bytes.
++const PAGE_SIZE: usize = 65536;
++
++/// Stateful model test: a Wasmi [`Memory`] must behave exactly like a plain
++/// `Vec<u8>` under `read`, `write` and `grow`, including agreement on which
++/// accesses are out of bounds.
++struct MemoryMachine {
++    store: Store<()>,
++    memory: Memory,
++    /// Reference model of the full memory contents.
++    model: Vec<u8>,
++    /// The maximum size of the memory in pages.
++    max_pages: u64,
++}
++
++#[hegel::state_machine]
++impl MemoryMachine {
++    #[rule]
++    fn write(&mut self, tc: hegel::TestCase) {
++        let len = self.model.len();
++        // Offsets may point past the current size to exercise the
++        // out-of-bounds error path.
++        let offset = tc.draw(generators::integers::<usize>().max_value(len + PAGE_SIZE));
++        let data: Vec<u8> = tc.draw(generators::binary().max_size(64));
++        let result = self.memory.write(&mut self.store, offset, &data);
++        let in_bounds = offset
++            .checked_add(data.len())
++            .is_some_and(|end| end <= len);
++        assert_eq!(
++            result.is_ok(),
++            in_bounds,
++            "write of {} bytes at offset {offset} with memory size {len}: {result:?}",
++            data.len(),
++        );
++        if in_bounds {
++            self.model[offset..offset + data.len()].copy_from_slice(&data);
++        }
++    }
++
++    #[rule]
++    fn read(&mut self, tc: hegel::TestCase) {
++        let len = self.model.len();
++        let offset = tc.draw(generators::integers::<usize>().max_value(len + PAGE_SIZE));
++        let read_len = tc.draw(generators::integers::<usize>().max_value(128));
++        let mut buffer = vec![0xA5; read_len];
++        let result = self.memory.read(&self.store, offset, &mut buffer);
++        let in_bounds = offset.checked_add(read_len).is_some_and(|end| end <= len);
++        assert_eq!(
++            result.is_ok(),
++            in_bounds,
++            "read of {read_len} bytes at offset {offset} with memory size {len}: {result:?}",
++        );
++        if in_bounds {
++            assert_eq!(buffer, &self.model[offset..offset + read_len]);
++        }
++    }
++
++    #[rule]
++    fn grow(&mut self, tc: hegel::TestCase) {
++        let current_pages = self.memory.size(&self.store);
++        let delta = tc.draw(generators::integers::<u64>().max_value(6));
++        let result = self.memory.grow(&mut self.store, delta);
++        if current_pages + delta <= self.max_pages {
++            // Growing within the maximum returns the previous size in pages
++            // and zero-initializes the new pages.
++            assert_eq!(result.unwrap(), current_pages);
++            let new_len = self.model.len() + delta as usize * PAGE_SIZE;
++            self.model.resize(new_len, 0);
++        } else {
++            assert!(
++                result.is_err(),
++                "growing from {current_pages} by {delta} pages exceeds the maximum \
++                 of {} pages but succeeded",
++                self.max_pages,
++            );
++        }
++    }
++
++    #[invariant]
++    fn agrees_with_model(&self, _tc: hegel::TestCase) {
++        assert_eq!(self.memory.data_size(&self.store), self.model.len());
++        assert_eq!(
++            self.memory.size(&self.store),
++            (self.model.len() / PAGE_SIZE) as u64
++        );
++        assert_eq!(self.memory.data(&self.store), &self.model[..]);
++    }
++}
++
++/// Property: the [`Memory`] API (read/write/grow/data) behaves exactly like
++/// a plain `Vec<u8>` reference model, including out-of-bounds error cases.
++#[hegel::test]
++fn memory_behaves_like_byte_vec_model(tc: hegel::TestCase) {
++    // Small page limits keep the model comparison cheap; this protects the
++    // test's resources, not the library's contract.
++    let max_pages = tc.draw(generators::integers::<u64>().max_value(4));
++    let initial_pages = tc.draw(generators::integers::<u64>().max_value(max_pages));
++    let engine = Engine::default();
++    let mut store = Store::new(&engine, ());
++    let ty = MemoryType::new(initial_pages as u32, Some(max_pages as u32));
++    let memory = Memory::new(&mut store, ty).unwrap();
++    let machine = MemoryMachine {
++        store,
++        memory,
++        model: vec![0; initial_pages as usize * PAGE_SIZE],
++        max_pages,
++    };
++    hegel::stateful::machine(machine).run(tc);
++}

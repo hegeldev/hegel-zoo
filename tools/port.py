@@ -308,19 +308,48 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
                     n = 1
                     break
             # 2. right after the nearest `mod … {` that encloses every draw site
+            MOD_RE = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$")
             if not n:
                 for k in range(min(first, len(ls) - 1), -1, -1):
-                    mm = re.match(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$", ls[k])
+                    mm = MOD_RE.match(ls[k])
                     if mm and in_scope(k):
                         ls.insert(k + 1, f"{mm.group(1)}    use hegel::Generator;")
                         n = 1
                         break
+            # 2b. sites spread over several modules (wkt: two `#[cfg(test)] mod`s in lib.rs): one
+            #     import per enclosing module, inserted bottom-up so line numbers stay valid
+            if not n:
+                def enclosing_mod(site: int) -> int | None:
+                    bal, top = 0, 0
+                    for k in range(site - 1, -1, -1):
+                        bal += ls[k].count("{") - ls[k].count("}")
+                        if bal > top:  # this line opens a block that encloses the site
+                            top = bal
+                            if MOD_RE.match(ls[k]):
+                                return k
+                    return None
+
+                groups: dict[int, list[int]] = {}
+                for s in sites:
+                    k = enclosing_mod(s)
+                    if k is not None:
+                        groups.setdefault(k, []).append(s)
+                if groups and sum(len(g) for g in groups.values()) == len(sites):
+                    for k in sorted(groups, reverse=True):
+                        indent = MOD_RE.match(ls[k]).group(1) + "    "
+                        at = k + 1
+                        for j in range(k + 1, min(groups[k])):
+                            if re.match(r"^\s*use hegel::generators(?:::\w+)?(?: as \w+)?;", ls[j]):
+                                at = j + 1
+                        ls.insert(at, f"{indent}use hegel::Generator;")
+                    n = 1
             text = "\n".join(ls)
-            # 3. after the first `use` in the file
+            # 3. after the first `use` in the file, gated so a library's non-test build never sees
+            #    the dev-dependency (test files are compiled with cfg(test) anyway)
             if not n:
-                text, n = re.subn(r"^(\s*)(use [^\n]*;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
+                text, n = re.subn(r"^(\s*)(use [^\n]*;)", r"\1\2\n\1#[cfg(test)]\n\1use hegel::Generator;", text, count=1, flags=re.M)
             if not n:
-                text = "use hegel::Generator;\n" + text
+                text = "#[cfg(test)]\nuse hegel::Generator;\n" + text
         f.write_text(text)
     return edits
 
