@@ -1,0 +1,733 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 992a67eb..84f62dae 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -65,6 +65,7 @@ quickcheck = "1.0.3"
+ rand_distr = "0.5"
+ libc = "0.2.147"
+ hdrhistogram = "7.5"
++hegeltest = "0.44.1"
+ 
+ [[test]]
+ name = "test_crash_recovery"
+diff --git a/tests/test_tree.rs b/tests/test_tree.rs
+index 581080b3..1ea8a27c 100644
+--- a/tests/test_tree.rs
++++ b/tests/test_tree.rs
+@@ -1457,3 +1457,716 @@ fn quickcheck_tree_matches_btreemap() {
+             prop_tree_matches_btreemap as fn(Vec<Op>, bool, i32, usize) -> bool,
+         );
+ }
++
++// ===================================================================
++// Hegel property-based tests.
++//
++// These supplement (rather than replace) the quickcheck-based
++// `prop_tree_matches_btreemap` above: the hegel state machine below is
++// a port of that property with broader generators (arbitrary byte
++// values instead of `[0, v]` pairs, batches, pops, first/last), plus a
++// set of more focused properties for individual API contracts.
++// ===================================================================
++mod hegel_props {
++    use std::collections::{BTreeMap, VecDeque};
++    use std::ops::Bound;
++
++    use hegel::TestCase;
++    use hegel::generators::{self, Generator};
++
++    use sled::{Batch, Config, InlineArray};
++
++    use super::Db; // sled::Db<3> — tiny fanout forces deep trees and frequent splits/merges
++    use super::common;
++
++    // ---------------- shared generators / helpers ----------------
++
++    /// Keys, weighted toward a tiny keyspace (to force collisions with
++    /// earlier operations), with arbitrary and 0xFF-heavy branches
++    /// (the 0xFF runs exercise `scan_prefix`'s upper-bound computation
++    /// and leaf hi-key boundaries).
++    fn draw_key(tc: &TestCase) -> Vec<u8> {
++        tc.draw(hegel::one_of!(
++            generators::vecs(generators::integers::<u8>().max_value(3))
++                .max_size(3)
++                .boxed(),
++            generators::binary().max_size(30).boxed(),
++            generators::vecs(generators::integers::<u8>().min_value(250))
++                .min_size(1)
++                .max_size(6)
++                .boxed(),
++        ))
++    }
++
++    /// Small values, including empty ones.
++    fn draw_small_value(tc: &TestCase) -> Vec<u8> {
++        tc.draw(generators::binary().max_size(20))
++    }
++
++    /// Values that sometimes exceed `max_inline_value_threshold`
++    /// (default 4096), so the out-of-line blob write path is hit.
++    fn draw_value(tc: &TestCase) -> Vec<u8> {
++        tc.draw(hegel::one_of!(
++            generators::binary().max_size(20).boxed(),
++            generators::binary().max_size(20).boxed(),
++            generators::binary().min_size(4097).max_size(4200).boxed(),
++        ))
++    }
++
++    fn pair_to_vec(kv: (InlineArray, InlineArray)) -> (Vec<u8>, Vec<u8>) {
++        (kv.0.to_vec(), kv.1.to_vec())
++    }
++
++    fn model_pairs(model: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<(Vec<u8>, Vec<u8>)> {
++        model.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
++    }
++
++    fn assert_tree_matches(db: &Db, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
++        let actual: Vec<(Vec<u8>, Vec<u8>)> =
++            db.iter().map(|r| pair_to_vec(r.unwrap())).collect();
++        assert_eq!(actual, model_pairs(model));
++    }
++
++    /// Open a fresh Db in its own self-deleting temp dir (the Db holds
++    /// the Config, which holds the tempdir deleter, so the directory
++    /// outlives the Db) and populate it with up to ~150 drawn pairs.
++    fn populated(tc: &TestCase) -> (Db, BTreeMap<Vec<u8>, Vec<u8>>) {
++        let config = Config::tmp().unwrap().flush_every_ms(None);
++        let db: Db = config.open().unwrap();
++        let mut model = BTreeMap::new();
++        let n = tc.draw(generators::integers::<usize>().max_value(150));
++        for _ in 0..n {
++            let k = draw_key(tc);
++            let v = draw_small_value(tc);
++            db.insert(&k, v.clone()).unwrap();
++            model.insert(k, v);
++        }
++        (db, model)
++    }
++
++    fn draw_bound(tc: &TestCase) -> Bound<Vec<u8>> {
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => Bound::Unbounded,
++            1 => Bound::Included(draw_key(tc)),
++            _ => Bound::Excluded(draw_key(tc)),
++        }
++    }
++
++    fn in_bounds(
++        start: &Bound<Vec<u8>>,
++        end: &Bound<Vec<u8>>,
++        k: &[u8],
++    ) -> bool {
++        let lower_ok = match start {
++            Bound::Unbounded => true,
++            Bound::Included(s) => k >= s.as_slice(),
++            Bound::Excluded(s) => k > s.as_slice(),
++        };
++        let upper_ok = match end {
++            Bound::Unbounded => true,
++            Bound::Included(e) => k <= e.as_slice(),
++            Bound::Excluded(e) => k < e.as_slice(),
++        };
++        lower_ok && upper_ok
++    }
++
++    // ---------------- 1. stateful model test ----------------
++    //
++    // Port of `prop_tree_matches_btreemap` (quickcheck, above) to a
++    // hegel state machine, with arbitrary byte values, batches, and
++    // first/last checked as an invariant after every step.
++
++    struct TreeMachine {
++        // NB: `db` is declared before `config` so the Db (and its
++        // flusher thread) is dropped before the tempdir deleter.
++        db: Option<Db>,
++        model: BTreeMap<Vec<u8>, Vec<u8>>,
++        config: Config,
++    }
++
++    impl TreeMachine {
++        fn db(&self) -> &Db {
++            self.db.as_ref().unwrap()
++        }
++    }
++
++    #[hegel::state_machine]
++    impl TreeMachine {
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let v = draw_value(&tc);
++            let old = self.db().insert(&k, v.clone()).unwrap();
++            let model_old = self.model.insert(k, v);
++            assert_eq!(old.map(|o| o.to_vec()), model_old);
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let old = self.db().remove(&k).unwrap();
++            assert_eq!(old.map(|o| o.to_vec()), self.model.remove(&k));
++        }
++
++        #[rule]
++        fn get(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            assert_eq!(
++                self.db().get(&k).unwrap().map(|v| v.to_vec()),
++                self.model.get(&k).cloned(),
++            );
++        }
++
++        #[rule]
++        fn cas(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let current = self.model.get(&k).cloned();
++            let old: Option<Vec<u8>> =
++                match tc.draw(generators::integers::<u8>().max_value(2)) {
++                    0 => None,
++                    1 => current.clone(),
++                    _ => Some(draw_small_value(&tc)),
++                };
++            let new: Option<Vec<u8>> =
++                if tc.draw(generators::booleans()) {
++                    Some(draw_small_value(&tc))
++                } else {
++                    None
++                };
++            let res =
++                self.db().compare_and_swap(&k, old.as_ref(), new.clone()).unwrap();
++            if old == current {
++                let success = res.unwrap_or_else(|e| {
++                    panic!(
++                        "cas of {k:?} (old {old:?}) should have succeeded, \
++                         got {e:?}"
++                    )
++                });
++                assert_eq!(
++                    success.previous_value.map(|v| v.to_vec()),
++                    current
++                );
++                match new {
++                    Some(nv) => {
++                        self.model.insert(k, nv);
++                    }
++                    None => {
++                        self.model.remove(&k);
++                    }
++                }
++            } else {
++                let err = res.expect_err("cas should have failed");
++                assert_eq!(err.current.map(|v| v.to_vec()), current);
++            }
++        }
++
++        #[rule]
++        fn get_lt(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let expected = self
++                .model
++                .range(..k.clone())
++                .next_back()
++                .map(|(k, v)| (k.clone(), v.clone()));
++            let actual = self.db().get_lt(&k).unwrap().map(pair_to_vec);
++            assert_eq!(actual, expected, "get_lt({k:?})");
++        }
++
++        #[rule]
++        fn get_gt(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let expected = self
++                .model
++                .range((Bound::Excluded(k.clone()), Bound::Unbounded))
++                .next()
++                .map(|(k, v)| (k.clone(), v.clone()));
++            let actual = self.db().get_gt(&k).unwrap().map(pair_to_vec);
++            assert_eq!(actual, expected, "get_gt({k:?})");
++        }
++
++        #[rule]
++        fn apply_batch(&mut self, tc: TestCase) {
++            let n = tc.draw(generators::integers::<usize>().max_value(8));
++            let mut batch = Batch::default();
++            for _ in 0..n {
++                let k = draw_key(&tc);
++                if tc.draw(generators::booleans()) {
++                    let v = draw_small_value(&tc);
++                    batch.insert(k.clone(), v.clone());
++                    self.model.insert(k, v);
++                } else {
++                    batch.remove(k.clone());
++                    self.model.remove(&k);
++                }
++            }
++            self.db().apply_batch(batch).unwrap();
++        }
++
++        #[rule]
++        fn pop_first(&mut self, _tc: TestCase) {
++            let actual = self.db().pop_first().unwrap().map(pair_to_vec);
++            let expected = self.model.pop_first();
++            assert_eq!(actual, expected);
++        }
++
++        #[rule]
++        fn pop_last(&mut self, _tc: TestCase) {
++            let actual = self.db().pop_last().unwrap().map(pair_to_vec);
++            let expected = self.model.pop_last();
++            assert_eq!(actual, expected);
++        }
++
++        #[rule]
++        fn restart(&mut self, _tc: TestCase) {
++            // Drop the current handle first: two live Dbs on one path
++            // would contend on the file lock.
++            self.db = None;
++            self.db = Some(self.config.open().unwrap());
++        }
++
++        #[rule]
++        fn check_iter(&mut self, _tc: TestCase) {
++            assert_tree_matches(self.db(), &self.model);
++            let backward: Vec<(Vec<u8>, Vec<u8>)> = self
++                .db()
++                .iter()
++                .rev()
++                .map(|r| pair_to_vec(r.unwrap()))
++                .collect();
++            let mut expected = model_pairs(&self.model);
++            expected.reverse();
++            assert_eq!(backward, expected);
++        }
++
++        #[rule]
++        fn check_len(&mut self, tc: TestCase) {
++            assert_eq!(self.db().len().unwrap(), self.model.len());
++            assert_eq!(self.db().is_empty().unwrap(), self.model.is_empty());
++            let k = draw_key(&tc);
++            assert_eq!(
++                self.db().contains_key(&k).unwrap(),
++                self.model.contains_key(&k)
++            );
++        }
++
++        #[invariant]
++        fn first_last_match_model(&self, _tc: TestCase) {
++            let db = self.db();
++            assert_eq!(
++                db.first().unwrap().map(pair_to_vec),
++                self.model
++                    .first_key_value()
++                    .map(|(k, v)| (k.clone(), v.clone())),
++            );
++            assert_eq!(
++                db.last().unwrap().map(pair_to_vec),
++                self.model
++                    .last_key_value()
++                    .map(|(k, v)| (k.clone(), v.clone())),
++            );
++        }
++    }
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_tree_matches_btreemap_model(tc: TestCase) {
++        common::setup_logger();
++
++        // generate the configuration, not just the payloads
++        let flusher = tc.draw(generators::booleans());
++        let compression =
++            tc.draw(generators::sampled_from(vec![-5i32, 0, 3, 22]));
++        let cache_bytes = tc.draw(generators::sampled_from(vec![
++            0usize,
++            256,
++            1024 * 1024,
++        ]));
++
++        let config = Config::tmp()
++            .unwrap()
++            .zstd_compression_level(compression)
++            .flush_every_ms(if flusher { Some(1) } else { None })
++            .cache_capacity_bytes(cache_bytes);
++
++        let db: Db = config.open().unwrap();
++        let machine =
++            TreeMachine { db: Some(db), model: BTreeMap::new(), config };
++        hegel::stateful::machine(machine).run(tc);
++    }
++
++    // ---------------- 2. batch application vs model ----------------
++    //
++    // `apply_batch` promises the net effect of all staged writes, with
++    // later writes to the same key within a batch overriding earlier
++    // ones (Batch::insert docs). Duplicate keys inside the batch are
++    // common under the small-keyspace generator.
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_apply_batch_matches_model(tc: TestCase) {
++        let (db, mut model) = populated(&tc);
++
++        let n_ops = tc.draw(generators::integers::<usize>().max_value(30));
++        let mut batch = Batch::default();
++        for _ in 0..n_ops {
++            let k = draw_key(&tc);
++            if tc.draw(generators::booleans()) {
++                let v = draw_small_value(&tc);
++                batch.insert(k.clone(), v.clone());
++                model.insert(k, v);
++            } else {
++                batch.remove(k.clone());
++                model.remove(&k);
++            }
++        }
++
++        db.apply_batch(batch).unwrap();
++        assert_tree_matches(&db, &model);
++    }
++
++    // ---------------- 3. range bounds vs model ----------------
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_range_matches_model(tc: TestCase) {
++        let (db, model) = populated(&tc);
++
++        let start = draw_bound(&tc);
++        let end = draw_bound(&tc);
++
++        let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++            .iter()
++            .filter(|(k, _)| in_bounds(&start, &end, k))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++
++        let actual: Vec<(Vec<u8>, Vec<u8>)> = db
++            .range((start.clone(), end.clone()))
++            .map(|r| pair_to_vec(r.unwrap()))
++            .collect();
++        assert_eq!(actual, expected, "range({start:?}, {end:?})");
++
++        let actual_rev: Vec<(Vec<u8>, Vec<u8>)> = db
++            .range((start.clone(), end.clone()))
++            .rev()
++            .map(|r| pair_to_vec(r.unwrap()))
++            .collect();
++        let mut expected_rev = expected;
++        expected_rev.reverse();
++        assert_eq!(actual_rev, expected_rev, "range({start:?}, {end:?}).rev()");
++    }
++
++    // ---------------- 4. double-ended iterator alternation ----------------
++    //
++    // KNOWN FAILURE: sled's `Iter` violates the `DoubleEndedIterator`
++    // contract that "both back and forth work on the same range, and
++    // do not cross". `Iter::next()` (cursor: `next_fetch`/`prefetched`)
++    // and `Iter::next_back()` (cursor: `next_back_last_lo`/
++    // `prefetched_back`) in src/tree.rs maintain fully independent
++    // positions and never check whether the two ends have met, so
++    // mixing `next()` and `next_back()` on one iterator yields the
++    // same elements from both ends. Minimal reproducer (any fanout):
++    //
++    //   db.insert(&[][..], vec![]).unwrap();
++    //   db.insert(&[1][..], vec![]).unwrap();
++    //   db.insert(&[250][..], vec![]).unwrap();
++    //   let mut iter = db.iter();
++    //   iter.next_back(); // ([250], [])
++    //   iter.next();      // ([], [])
++    //   iter.next_back(); // ([1], [])
++    //   iter.next();      // ([1], [])  <- already yielded by next_back
++    //   iter.next();      // ([250], []) <- already yielded by next_back
++    //
++    // The generators below are boosted toward the failing region
++    // (tiny non-empty trees, short mixed-direction schedules) so the
++    // failure reproduces on every run and shrinks quickly.
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_double_ended_iteration_matches_model(tc: TestCase) {
++        let config = Config::tmp().unwrap().flush_every_ms(None);
++        let db: Db = config.open().unwrap();
++        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
++
++        let n =
++            tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        for _ in 0..n {
++            let k: Vec<u8> = tc.draw(
++                generators::vecs(generators::integers::<u8>()).max_size(2),
++            );
++            let v = draw_small_value(&tc);
++            db.insert(&k, v.clone()).unwrap();
++            model.insert(k, v);
++        }
++
++        // bounded direction schedule drawn up front, cycled below;
++        // starting with a next_back()/next() alternation lands in the
++        // known-failing region on nearly every case
++        let schedule: Vec<bool> = tc.draw(hegel::one_of!(
++            generators::just(vec![false, true]).boxed(),
++            generators::vecs(generators::booleans())
++                .min_size(1)
++                .max_size(16)
++                .boxed(),
++        ));
++
++        let mut expected: VecDeque<(Vec<u8>, Vec<u8>)> =
++            model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++        let total = expected.len() + 2; // +2 checks post-exhaustion Nones
++        let mut iter = db.iter();
++
++        for i in 0..total {
++            if schedule[i % schedule.len()] {
++                let actual =
++                    iter.next().map(|r| pair_to_vec(r.unwrap()));
++                assert_eq!(actual, expected.pop_front(), "step {i}: next()");
++            } else {
++                let actual =
++                    iter.next_back().map(|r| pair_to_vec(r.unwrap()));
++                assert_eq!(actual, expected.pop_back(), "step {i}: next_back()");
++            }
++        }
++    }
++
++    // ---------------- 5. compare_and_swap semantics ----------------
++    //
++    // cas succeeds iff the current value matches `old`; on success the
++    // key holds `new` afterwards, on failure the error carries the
++    // actual current value and the tree is unchanged.
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_compare_and_swap_semantics(tc: TestCase) {
++        let (db, model) = populated(&tc);
++
++        // probe an existing key about half the time
++        let k: Vec<u8> = if !model.is_empty() && tc.draw(generators::booleans())
++        {
++            let idx = tc.draw(
++                generators::integers::<usize>().max_value(model.len() - 1),
++            );
++            model.keys().nth(idx).unwrap().clone()
++        } else {
++            draw_key(&tc)
++        };
++
++        let current = model.get(&k).cloned();
++        let old: Option<Vec<u8>> =
++            match tc.draw(generators::integers::<u8>().max_value(2)) {
++                0 => None,
++                1 => current.clone(),
++                _ => Some(draw_small_value(&tc)),
++            };
++        let new: Option<Vec<u8>> = if tc.draw(generators::booleans()) {
++            Some(draw_small_value(&tc))
++        } else {
++            None
++        };
++
++        let res = db.compare_and_swap(&k, old.as_ref(), new.clone()).unwrap();
++
++        if old == current {
++            let success = res.unwrap_or_else(|e| {
++                panic!("cas (old == current) should succeed, got {e:?}")
++            });
++            assert_eq!(success.previous_value.map(|v| v.to_vec()), current);
++            assert_eq!(success.new_value.map(|v| v.to_vec()), new);
++            assert_eq!(db.get(&k).unwrap().map(|v| v.to_vec()), new);
++        } else {
++            let err = res.expect_err("cas (old != current) should fail");
++            assert_eq!(err.current.map(|v| v.to_vec()), current);
++            assert_eq!(err.proposed.map(|v| v.to_vec()), new);
++            assert_eq!(db.get(&k).unwrap().map(|v| v.to_vec()), current);
++        }
++    }
++
++    // ---------------- 6. reopen persistence ----------------
++    //
++    // After dropping a Db (which flushes) and reopening from the same
++    // path, all contents are intact — including values large enough to
++    // be stored out-of-line.
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_reopen_preserves_contents(tc: TestCase) {
++        common::setup_logger();
++
++        let config = Config::tmp().unwrap().flush_every_ms(None);
++        let db: Db = config.open().unwrap();
++        let mut model = BTreeMap::new();
++
++        let n = tc.draw(generators::integers::<usize>().max_value(80));
++        for _ in 0..n {
++            let k = draw_key(&tc);
++            if tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++                db.remove(&k).unwrap();
++                model.remove(&k);
++            } else {
++                let v = draw_value(&tc);
++                db.insert(&k, v.clone()).unwrap();
++                model.insert(k, v);
++            }
++        }
++
++        if tc.draw(generators::booleans()) {
++            db.flush().unwrap();
++        }
++        drop(db);
++
++        let db: Db = config.open().unwrap();
++        assert_tree_matches(&db, &model);
++    }
++
++    // ---------------- 7. scan_prefix vs model ----------------
++
++    fn draw_prefix(tc: &TestCase) -> Vec<u8> {
++        tc.draw(hegel::one_of!(
++            generators::vecs(generators::integers::<u8>().max_value(2))
++                .max_size(2)
++                .boxed(),
++            generators::binary().max_size(4).boxed(),
++            // all-0xFF prefixes exercise the "no upper bound exists"
++            // branch of scan_prefix's successor computation
++            generators::vecs(generators::just(0xFFu8))
++                .min_size(1)
++                .max_size(3)
++                .boxed(),
++        ))
++    }
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_scan_prefix_matches_model(tc: TestCase) {
++        let config = Config::tmp().unwrap().flush_every_ms(None);
++        let db: Db = config.open().unwrap();
++        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
++
++        // build keys as prefix ++ suffix so probes actually match
++        let n = tc.draw(generators::integers::<usize>().max_value(100));
++        for _ in 0..n {
++            let mut k = draw_prefix(&tc);
++            k.extend(draw_key(&tc));
++            let v = draw_small_value(&tc);
++            db.insert(&k, v.clone()).unwrap();
++            model.insert(k, v);
++        }
++
++        let probe = draw_prefix(&tc);
++        let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++            .iter()
++            .filter(|(k, _)| k.starts_with(&probe))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++
++        let actual: Vec<(Vec<u8>, Vec<u8>)> = db
++            .scan_prefix(&probe)
++            .map(|r| pair_to_vec(r.unwrap()))
++            .collect();
++        assert_eq!(actual, expected, "scan_prefix({probe:?})");
++
++        let actual_rev: Vec<(Vec<u8>, Vec<u8>)> = db
++            .scan_prefix(&probe)
++            .rev()
++            .map(|r| pair_to_vec(r.unwrap()))
++            .collect();
++        let mut expected_rev = expected;
++        expected_rev.reverse();
++        assert_eq!(actual_rev, expected_rev, "scan_prefix({probe:?}).rev()");
++    }
++
++    // ---------------- 8. pop_{first,last}_in_range drains the range ----------------
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_pop_in_range_drains_range_in_order(tc: TestCase) {
++        let (db, mut model) = populated(&tc);
++
++        let start = draw_bound(&tc);
++        let mut end = draw_bound(&tc);
++        // Documented panic: end_bound() == Excluded(K::MIN) (the empty
++        // key) is outside the contract of pop_{first,last}_in_range.
++        if matches!(&end, Bound::Excluded(e) if e.is_empty()) {
++            end = Bound::Included(vec![]);
++        }
++
++        let mut in_range: VecDeque<(Vec<u8>, Vec<u8>)> = model
++            .iter()
++            .filter(|(k, _)| in_bounds(&start, &end, k))
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++
++        let schedule: Vec<bool> = tc.draw(
++            generators::vecs(generators::booleans()).min_size(1).max_size(16),
++        );
++
++        let range = (start.clone(), end.clone());
++        let total = in_range.len() + 2;
++        for i in 0..total {
++            if schedule[i % schedule.len()] {
++                let actual =
++                    db.pop_first_in_range(range.clone()).unwrap();
++                assert_eq!(
++                    actual.map(pair_to_vec),
++                    in_range.pop_front(),
++                    "step {i}: pop_first_in_range({start:?}, {end:?})"
++                );
++            } else {
++                let actual = db.pop_last_in_range(range.clone()).unwrap();
++                assert_eq!(
++                    actual.map(pair_to_vec),
++                    in_range.pop_back(),
++                    "step {i}: pop_last_in_range({start:?}, {end:?})"
++                );
++            }
++        }
++
++        // everything outside the range is untouched
++        model.retain(|k, _| !in_bounds(&start, &end, k));
++        assert_tree_matches(&db, &model);
++    }
++
++    // ---------------- 9. checksum is history-independent ----------------
++    //
++    // Two trees holding identical contents must report the same
++    // checksum regardless of the operation history that produced them
++    // (checksum iterates in sorted order over live kv pairs only).
++
++    #[hegel::test]
++    #[cfg_attr(miri, ignore)]
++    fn hegel_checksum_is_history_independent(tc: TestCase) {
++        let mut target: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
++        let n = tc.draw(generators::integers::<usize>().max_value(80));
++        for _ in 0..n {
++            target.insert(draw_key(&tc), draw_small_value(&tc));
++        }
++
++        // junk keys that must not collide with the target contents
++        let junk: Vec<Vec<u8>> = (0..tc
++            .draw(generators::integers::<usize>().max_value(10)))
++            .map(|_| draw_key(&tc))
++            .filter(|k| !target.contains_key(k))
++            .collect();
++
++        let config_a = Config::tmp().unwrap().flush_every_ms(None);
++        let db_a: Db = config_a.open().unwrap();
++        for (k, v) in &target {
++            db_a.insert(k, v.clone()).unwrap();
++        }
++
++        let config_b = Config::tmp().unwrap().flush_every_ms(None);
++        let db_b: Db = config_b.open().unwrap();
++        for k in &junk {
++            db_b.insert(k, b"junk".to_vec()).unwrap();
++        }
++        for (k, v) in target.iter().rev() {
++            db_b.insert(k, b"placeholder".to_vec()).unwrap();
++            db_b.insert(k, v.clone()).unwrap();
++        }
++        for k in &junk {
++            db_b.remove(k).unwrap();
++        }
++
++        assert_eq!(db_a.len().unwrap(), db_b.len().unwrap());
++        assert_eq!(db_a.checksum().unwrap(), db_b.checksum().unwrap());
++    }
++}

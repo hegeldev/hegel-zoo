@@ -1,0 +1,799 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 671d0ce..218cfbe 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -36,9 +36,14 @@ perfcnt = { version = "0.8", optional = true }
+ ref-cast = "1.0"
+ 
+ [dev-dependencies]
++# float_roundtrip makes serde_json's float parsing correctly rounded so it can
++# serve as an exact oracle for the differential property tests (without it,
++# serde_json is off by 1 ULP on e.g. "7205759486745292.0"). Test builds only.
++serde_json = { version = "1", features = ["float_roundtrip"] }
+ float-cmp = "0.10"
+ getopts = "0.2"
+ core_affinity = { version = "0.8" }
++hegeltest = "0.44.1"
+ 
+ 
+ [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+diff --git a/src/tests.rs b/src/tests.rs
+index 9006a1c..e8f6a46 100644
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -250,6 +250,519 @@ fn arb_json_value() -> BoxedStrategy<Value> {
+     .boxed()
+ }
+ 
++/// Shared generators/helpers for the hegel property tests in this file and in
++/// `tests/serde.rs`. Everything generates JSON *text* by construction so the
++/// documents are valid by definition and avoid the divergences simd-json
++/// documents relative to serde_json (out-of-range integer literals, duplicate
++/// object keys, bare `-0`).
++#[cfg(not(target_arch = "wasm32"))]
++pub(crate) mod hegel_gens {
++    use hegel::generators::{self, BoxedGenerator, Generator};
++
++    /// Draw a run of JSON whitespace of length `0..=max`.
++    pub(crate) fn draw_ws(tc: &hegel::TestCase, max: usize) -> String {
++        let n = tc.draw_silent(generators::integers::<usize>().max_value(max));
++        (0..n)
++            .map(|_| tc.draw_silent(generators::sampled_from(vec![' ', '\t', '\n', '\r'])))
++            .collect()
++    }
++
++    /// Escape sequences and raw characters legal inside a JSON string literal,
++    /// as (literal-piece, decoded-piece) pairs.
++    pub(crate) fn string_pieces() -> Vec<(&'static str, &'static str)> {
++        vec![
++            ("\\\"", "\""),
++            ("\\\\", "\\"),
++            ("\\/", "/"),
++            ("\\b", "\u{8}"),
++            ("\\f", "\u{c}"),
++            ("\\n", "\n"),
++            ("\\r", "\r"),
++            ("\\t", "\t"),
++            ("\\u0000", "\u{0}"),
++            ("\\u0041", "A"),
++            ("\\u00e9", "é"),
++            ("\\u2028", "\u{2028}"),
++            ("\\ufffd", "\u{fffd}"),
++            // surrogate pair (U+1D11E)
++            ("\\ud834\\udd1e", "𝄞"),
++            // raw multi-byte UTF-8 (2, 3 and 4 byte encodings)
++            ("é", "é"),
++            ("\u{2028}", "\u{2028}"),
++            ("𝄞", "𝄞"),
++        ]
++    }
++
++    /// Replace characters that may not appear raw in a JSON string literal.
++    pub(crate) fn sanitize(s: &str) -> String {
++        s.chars()
++            .map(|c| {
++                if (c as u32) < 0x20 || c == '"' || c == '\\' {
++                    'x'
++                } else {
++                    c
++                }
++            })
++            .collect()
++    }
++
++    /// Draw the contents of a JSON string literal. Returns
++    /// (literal-without-quotes, decoded-string).
++    pub(crate) fn draw_string_contents(tc: &hegel::TestCase) -> (String, String) {
++        let n = tc.draw_silent(generators::integers::<usize>().max_value(5));
++        let mut lit = String::new();
++        let mut dec = String::new();
++        for _ in 0..n {
++            if tc.draw_silent(generators::booleans()) {
++                let (l, d) = tc.draw_silent(generators::sampled_from(string_pieces()));
++                lit.push_str(l);
++                dec.push_str(d);
++            } else {
++                let raw = sanitize(&tc.draw_silent(generators::text().max_size(20)));
++                lit.push_str(&raw);
++                dec.push_str(&raw);
++            }
++        }
++        (lit, dec)
++    }
++
++    /// Draw a number token that parses identically in serde_json and
++    /// simd-json's documented domain: integers within `i64::MIN..=u64::MAX`,
++    /// and floats that neither overflow to infinity nor are a bare `-0`.
++    pub(crate) fn draw_safe_number_token(tc: &hegel::TestCase) -> String {
++        match tc.draw_silent(generators::integers::<u8>().max_value(3)) {
++            0 => tc.draw_silent(generators::integers::<i64>()).to_string(),
++            1 => tc.draw_silent(generators::integers::<u64>()).to_string(),
++            2 => format!(
++                "{:?}",
++                tc.draw_silent(
++                    generators::floats::<f64>()
++                        .allow_nan(false)
++                        .allow_infinity(false)
++                )
++            ),
++            _ => draw_sci_number_token(tc, 280),
++        }
++    }
++
++    /// Draw a textual float in scientific/fraction notation. `max_exp` bounds
++    /// the exponent; with `max_exp <= 280` and at most 19 integer digits the
++    /// value cannot overflow to infinity (magnitude < 1e300).
++    pub(crate) fn draw_sci_number_token(tc: &hegel::TestCase, max_exp: i32) -> String {
++        let mut s = String::new();
++        if tc.draw_silent(generators::booleans()) {
++            s.push('-');
++        }
++        // integer part: "0" or a 1..=19 digit run without a leading zero
++        if tc.draw_silent(generators::booleans()) {
++            s.push('0');
++        } else {
++            let n = tc.draw_silent(generators::integers::<usize>().min_value(1).max_value(19));
++            s.push(tc.draw_silent(generators::sampled_from("123456789".chars().collect::<Vec<_>>())));
++            for _ in 1..n {
++                s.push(tc.draw_silent(generators::sampled_from("0123456789".chars().collect::<Vec<_>>())));
++            }
++        }
++        let frac = tc.draw_silent(generators::booleans());
++        if frac {
++            s.push('.');
++            let n = tc.draw_silent(generators::integers::<usize>().min_value(1).max_value(20));
++            for _ in 0..n {
++                s.push(tc.draw_silent(generators::sampled_from("0123456789".chars().collect::<Vec<_>>())));
++            }
++        }
++        let exp = tc.draw_silent(generators::booleans());
++        if exp {
++            s.push(tc.draw_silent(generators::sampled_from(vec!['e', 'E'])));
++            let e = tc.draw_silent(
++                generators::integers::<i32>()
++                    .min_value(-324)
++                    .max_value(max_exp),
++            );
++            if e >= 0 && tc.draw_silent(generators::booleans()) {
++                s.push('+');
++            }
++            s.push_str(&e.to_string());
++        }
++        if !frac && !exp {
++            // avoid producing a bare integer (in particular `-0`, which
++            // serde_json types as -0.0 while simd-json types it as 0i64)
++            s.push_str(".0");
++        }
++        s
++    }
++
++    /// Recursively generate a valid JSON document as text. Objects use unique
++    /// keys, integers stay in range, depth is bounded by `depth`.
++    pub(crate) fn json_text(depth: u32) -> BoxedGenerator<'static, String> {
++        hegel::compose!(|tc| {
++            let max_choice = if depth == 0 { 2 } else { 5 };
++            match tc.draw_silent(generators::integers::<u8>().max_value(max_choice)) {
++                0 => tc.draw_silent(generators::sampled_from(vec![
++                    "null".to_string(),
++                    "true".to_string(),
++                    "false".to_string(),
++                ])),
++                1 => draw_safe_number_token(&tc),
++                2 => {
++                    let (lit, _) = draw_string_contents(&tc);
++                    format!("\"{lit}\"")
++                }
++                3 => {
++                    // array
++                    let n = tc.draw_silent(generators::integers::<usize>().max_value(6));
++                    let items: Vec<String> =
++                        (0..n).map(|_| tc.draw(json_text(depth - 1))).collect();
++                    wrap_array(&tc, &items)
++                }
++                4 => {
++                    // object with unique keys
++                    let keys = draw_unique_keys(&tc, 6);
++                    let kvs: Vec<(String, String)> = keys
++                        .into_iter()
++                        .map(|k| (k, tc.draw(json_text(depth - 1))))
++                        .collect();
++                    wrap_object(&tc, &kvs)
++                }
++                _ => {
++                    // wide, flat container: many keys/items to exercise the
++                    // SIMD scanners over long structural runs
++                    if tc.draw_silent(generators::booleans()) {
++                        let n =
++                            tc.draw_silent(generators::integers::<usize>().max_value(60));
++                        let items: Vec<String> =
++                            (0..n).map(|_| tc.draw(json_text(0))).collect();
++                        wrap_array(&tc, &items)
++                    } else {
++                        let keys = draw_unique_keys(&tc, 50);
++                        let kvs: Vec<(String, String)> = keys
++                            .into_iter()
++                            .map(|k| (k, tc.draw(json_text(0))))
++                            .collect();
++                        wrap_object(&tc, &kvs)
++                    }
++                }
++            }
++        })
++        .boxed()
++    }
++
++    /// Draw a set of object keys that are unique *after decoding* (plain
++    /// characters only, so literal uniqueness equals decoded uniqueness).
++    fn draw_unique_keys(tc: &hegel::TestCase, max: usize) -> Vec<String> {
++        let raw: Vec<String> = tc.draw_silent(
++            generators::vecs(generators::text().max_size(10))
++                .max_size(max)
++                .unique(true),
++        );
++        let mut seen = std::collections::BTreeSet::new();
++        raw.into_iter()
++            .map(|k| sanitize(&k))
++            .filter(|k| seen.insert(k.clone()))
++            .collect()
++    }
++
++    fn wrap_array(tc: &hegel::TestCase, items: &[String]) -> String {
++        format!(
++            "[{}{}{}]",
++            draw_ws(tc, 2),
++            items.join(&format!("{},{}", draw_ws(tc, 2), draw_ws(tc, 2))),
++            draw_ws(tc, 2)
++        )
++    }
++
++    fn wrap_object(tc: &hegel::TestCase, kvs: &[(String, String)]) -> String {
++        let body = kvs
++            .iter()
++            .map(|(k, v)| format!("\"{k}\"{}:{}{v}", draw_ws(tc, 2), draw_ws(tc, 2)))
++            .collect::<Vec<_>>()
++            .join(&format!("{},{}", draw_ws(tc, 2), draw_ws(tc, 2)));
++        format!("{{{}{}{}}}", draw_ws(tc, 2), body, draw_ws(tc, 2))
++    }
++
++    /// Arbitrary input bytes: either raw binary junk or a "JSON soup" of
++    /// tokens that frequently forms valid or nearly-valid documents.
++    pub(crate) fn draw_junk_bytes(tc: &hegel::TestCase) -> Vec<u8> {
++        if tc.draw_silent(generators::booleans()) {
++            let n = tc.draw_silent(generators::integers::<usize>().max_value(2048));
++            tc.draw_silent(generators::binary().min_size(n))
++        } else {
++            let tokens = vec![
++                "{", "}", "[", "]", ":", ",", "\"", "\\", "-", "+", ".", "e", "E", "0", "1",
++                "9", "123", "9999999999", "null", "true", "false", " ", "\n", "\t", "\r", "a",
++                "ß", "\u{0}", "\u{7f}", "\u{fffd}",
++            ];
++            // Bounded token count: deeply nested valid documents crash the
++            // recursive DOM builders (see owned_value_deep_nesting_stack_overflow),
++            // so keep possible nesting well below that threshold.
++            let n = tc.draw_silent(generators::integers::<usize>().max_value(400));
++            let mut out = Vec::new();
++            for _ in 0..n {
++                out.extend_from_slice(
++                    tc.draw_silent(generators::sampled_from(tokens.clone()))
++                        .as_bytes(),
++                );
++            }
++            out
++        }
++    }
++
++    /// True if `v` (or a nested object) contains duplicate keys. simd-json
++    /// documents duplicate-key objects as having unspecified behavior for its
++    /// DOM values (see the `value-no-dup-keys` feature), so equality
++    /// assertions must skip them.
++    pub(crate) fn has_dup_keys(v: &crate::owned::Value) -> bool {
++        use crate::owned::Value;
++        match v {
++            Value::Object(o) => {
++                let mut seen = std::collections::BTreeSet::new();
++                o.iter().any(|(k, _)| !seen.insert(k.clone()))
++                    || o.iter().any(|(_, v)| has_dup_keys(v))
++            }
++            Value::Array(a) => a.iter().any(has_dup_keys),
++            _ => false,
++        }
++    }
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++mod hegel_props {
++    use super::hegel_gens::{
++        draw_junk_bytes, draw_ws, has_dup_keys, json_text, string_pieces,
++    };
++    use super::*;
++    use hegel::generators::{self, Generator};
++
++    /// Property: all of simd-json's parsing entry points agree on whether an
++    /// arbitrary input is valid JSON, and (duplicate keys aside) produce equal
++    /// values: `to_owned_value`, `to_borrowed_value`, `to_tape`, and the
++    /// serde-Deserialize path.
++    #[hegel::test(test_cases = 300)]
++    fn hegel_prop_parse_paths_agree(tc: hegel::TestCase) {
++        let input: Vec<u8> = if tc.draw(generators::booleans()) {
++            draw_junk_bytes(&tc)
++        } else {
++            tc.draw(json_text(3)).into_bytes()
++        };
++        tc.note(&format!("input: {:?}", String::from_utf8_lossy(&input)));
++
++        let mut b1 = input.clone();
++        let owned = to_owned_value(&mut b1);
++        let mut b2 = input.clone();
++        let borrowed = to_borrowed_value(&mut b2);
++        let mut b3 = input.clone();
++        let tape_ok = crate::to_tape(&mut b3).is_ok();
++
++        assert_eq!(
++            owned.is_ok(),
++            borrowed.is_ok(),
++            "owned/borrowed disagree on validity"
++        );
++        assert_eq!(owned.is_ok(), tape_ok, "owned/tape disagree on validity");
++
++        #[cfg(feature = "serde_impl")]
++        {
++            let mut b4 = input.clone();
++            let via_serde: Result<Value, _> = crate::serde::from_slice(&mut b4);
++            assert_eq!(
++                owned.is_ok(),
++                via_serde.is_ok(),
++                "value path and serde path disagree on validity"
++            );
++            if let (Ok(o), Ok(s)) = (&owned, &via_serde) {
++                if !has_dup_keys(o) {
++                    assert_eq!(o, s, "value path and serde path disagree on value");
++                }
++            }
++        }
++
++        if let (Ok(o), Ok(b)) = (&owned, &borrowed) {
++            if !has_dup_keys(o) {
++                assert_eq!(*o, *b, "owned and borrowed values disagree");
++            }
++        }
++    }
++
++    /// Property: surrounding a document with arbitrary whitespace (lengths 0..=130,
++    /// crossing the 64-byte SIMD block boundaries at every offset) never changes
++    /// the parse result.
++    #[hegel::test]
++    fn hegel_prop_whitespace_padding_invariance(tc: hegel::TestCase) {
++        let doc = tc.draw(json_text(3));
++        let lead = draw_ws(&tc, 130);
++        let trail = draw_ws(&tc, 130);
++
++        let mut plain = doc.clone().into_bytes();
++        let v_plain = to_owned_value(&mut plain).expect("generated JSON must parse");
++
++        let mut padded = format!("{lead}{doc}{trail}").into_bytes();
++        let v_padded = to_owned_value(&mut padded).expect("padded JSON must parse");
++
++        assert_eq!(v_plain, v_padded, "padding changed the parsed value");
++    }
++
++    /// Property: escape sequences and multi-byte characters are decoded
++    /// correctly regardless of their byte offset relative to the 64-byte SIMD
++    /// blocks stage1/stage2 operate on. The expected string is constructed
++    /// alongside the literal, giving an exact oracle.
++    #[hegel::test(test_cases = 300)]
++    fn hegel_prop_string_escapes_across_simd_boundaries(tc: hegel::TestCase) {
++        let n_segments = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let mut lit = String::new();
++        let mut expected = String::new();
++        for _ in 0..n_segments {
++            // filler positions the special piece at arbitrary offsets,
++            // including just before/after 64-byte boundaries
++            let filler = tc.draw_silent(generators::integers::<usize>().max_value(80));
++            lit.push_str(&"a".repeat(filler));
++            expected.push_str(&"a".repeat(filler));
++            let (l, d) = tc.draw(generators::sampled_from(string_pieces()));
++            lit.push_str(l);
++            expected.push_str(d);
++        }
++        let doc = format!("\"{lit}\"");
++        tc.note(&format!("doc: {doc:?}"));
++
++        let mut b = doc.clone().into_bytes();
++        let owned = to_owned_value(&mut b).expect("string literal must parse");
++        assert_eq!(owned, Value::from(expected.clone()));
++
++        let mut b = doc.into_bytes();
++        let borrowed = to_borrowed_value(&mut b).expect("string literal must parse");
++        assert_eq!(borrowed, crate::BorrowedValue::from(expected));
++    }
++
++    /// Recursively generate an arbitrary `OwnedValue`, *including floats*
++    /// (the existing proptest `prop_json_encode_decode` excludes them).
++    /// Non-finite floats are excluded because JSON cannot represent them.
++    fn arb_owned_value(depth: u32) -> generators::BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let max_choice = if depth == 0 { 5 } else { 7 };
++            match tc.draw_silent(generators::integers::<u8>().max_value(max_choice)) {
++                0 => Value::Static(StaticNode::Null),
++                1 => Value::from(tc.draw_silent(generators::booleans())),
++                2 => Value::from(tc.draw_silent(generators::integers::<i64>())),
++                3 => Value::from(tc.draw_silent(generators::integers::<u64>())),
++                4 => Value::from(
++                    tc.draw_silent(
++                        generators::floats::<f64>()
++                            .allow_nan(false)
++                            .allow_infinity(false),
++                    ),
++                ),
++                5 => Value::from(tc.draw_silent(generators::text().max_size(30))),
++                6 => {
++                    let n = tc.draw_silent(generators::integers::<usize>().max_value(6));
++                    let items: Vec<Value> =
++                        (0..n).map(|_| tc.draw((arb_owned_value(depth - 1)).print_as_debug())).collect();
++                    Value::from(items)
++                }
++                _ => {
++                    let keys: Vec<String> = tc.draw_silent(
++                        generators::vecs(generators::text().max_size(10))
++                            .max_size(6)
++                            .unique(true),
++                    );
++                    let mut o = Value::object();
++                    for k in keys {
++                        let v = tc.draw((arb_owned_value(depth - 1)).print_as_debug());
++                        o.insert(k, v).expect("insert into object");
++                    }
++                    o
++                }
++            }
++        })
++        .boxed()
++    }
++
++    /// Property: encode -> parse is the identity for arbitrary values,
++    /// including floats. simd-json's default number parser documents
++    /// round-trip correctness (the `approx-number-parsing` feature is the
++    /// documented opt-out, hence the cfg).
++    #[cfg(not(feature = "approx-number-parsing"))]
++    #[hegel::test(test_cases = 300)]
++    fn hegel_prop_encode_parse_roundtrip(tc: hegel::TestCase) {
++        let val = tc.draw((arb_owned_value(4)).print_as_debug());
++        let encoded = val.encode();
++        tc.note(&format!("encoded: {encoded}"));
++
++        let mut b = encoded.clone().into_bytes();
++        let owned = to_owned_value(&mut b).expect("encoded value must parse");
++        assert_eq!(val, owned, "owned round-trip changed the value");
++
++        let mut b = encoded.into_bytes();
++        let borrowed = to_borrowed_value(&mut b).expect("encoded value must parse");
++        assert_eq!(val, borrowed, "borrowed round-trip changed the value");
++    }
++
++    /// Property: the tape stage (stage1 + stage2) is fully iterative and must
++    /// handle arbitrarily deep nesting without crashing — unlike the DOM
++    /// builders (see owned_value_deep_nesting_stack_overflow below).
++    #[hegel::test(test_cases = 30)]
++    fn hegel_prop_tape_handles_deep_nesting(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(100_000));
++        let open = tc.draw(generators::sampled_from(vec![("[", "]"), ("{\"a\":", "}")]));
++        let mut doc = open.0.repeat(depth);
++        doc.push('1');
++        doc.push_str(&open.1.repeat(depth));
++        let mut b = doc.into_bytes();
++        let tape = crate::to_tape(&mut b);
++        assert!(tape.is_ok(), "tape stage failed on deep nesting: {tape:?}");
++    }
++
++    /// KNOWN BUG (deterministically pinned, kept failing on purpose):
++    ///
++    /// A lone *high* surrogate escape that is not followed by `\u` is
++    /// accepted and silently decoded to U+0000 (NUL), while a lone *low*
++    /// surrogate escape (`"\udd1e"`) is correctly rejected. serde_json and
++    /// upstream simdjson (C++) reject both. Code path:
++    /// `get_unicode_codepoint` in src/stringparse.rs returns
++    /// `Ok((0, src_offset))` when the byte after a high surrogate escape is
++    /// not `\\` or the following one is not `u` (and likewise when the second
++    /// escape's hex digits are invalid) — a mistranslation of the C++
++    /// `return false;` error path — so the caller writes code point 0 into
++    /// the output and keeps parsing. Besides accepting invalid JSON, this
++    /// injects NUL bytes into parsed strings, which is a data-corruption /
++    /// NUL-injection hazard. Found by hegel_prop_differential_junk_bytes
++    /// (which now excludes such inputs; see contains_high_surrogate_escape).
++    #[test]
++    fn lone_high_surrogate_escape_is_rejected() {
++        // Sibling sanity check that *does* hold: lone low surrogates error.
++        let mut low = br#""\udd1e""#.to_vec();
++        assert!(to_owned_value(&mut low).is_err());
++
++        // The bug: this parses to Ok(String("\0x")) instead of an error.
++        let mut high = br#""\ud834x""#.to_vec();
++        let res = to_owned_value(&mut high);
++        assert!(
++            res.is_err(),
++            "lone high surrogate escape was accepted and decoded to {res:?}"
++        );
++    }
++
++    /// KNOWN FAILURE (kept #[ignore]d because it aborts the process):
++    ///
++    /// `to_owned_value` / `to_borrowed_value` / the serde path build the DOM
++    /// with unbounded recursion (`OwnedDeserializer::parse` ->
++    /// `parse_array`/`parse_map` -> `parse`, src/value/owned.rs:307-347, same
++    /// for borrowed), so a deeply nested but *valid* document overflows the
++    /// stack and SIGABRTs the whole process. Depth 10_000 reliably aborts a
++    /// default 2 MiB test thread (threshold ~4-5k in debug builds); the tape
++    /// stage itself handles depth 1_000_000 fine (see
++    /// hegel_prop_tape_handles_deep_nesting). serde_json defends against this
++    /// with a 128-level recursion limit; simdjson (C++) uses a max-depth
++    /// parameter. This is a DoS vector for anyone parsing untrusted input
++    /// into simd-json's DOM values.
++    #[test]
++    #[ignore = "aborts the process: stack overflow in recursive DOM build on deeply nested input"]
++    fn owned_value_deep_nesting_stack_overflow() {
++        let n = 10_000;
++        let mut b = ("[".repeat(n) + &"]".repeat(n)).into_bytes();
++        // SIGABRT: stack overflow in OwnedDeserializer::parse recursion
++        let _ = to_owned_value(&mut b);
++    }
++}
++
+ #[cfg(not(target_arch = "wasm32"))]
+ proptest! {
+     #![proptest_config(ProptestConfig {
+diff --git a/src/tests/serde.rs b/src/tests/serde.rs
+index 2078e06..5070aec 100644
+--- a/src/tests/serde.rs
++++ b/src/tests/serde.rs
+@@ -1109,3 +1109,251 @@ proptest! {
+ 
+     }
+ }
++
++/// Hegel property tests: differential testing against serde_json as the
++/// oracle. serde_json's parser is an independent, widely-vetted
++/// implementation; simd-json's stated goal is "serde compatibility", so any
++/// disagreement outside the documented divergences (integer literals outside
++/// `i64::MIN..=u64::MAX`, duplicate object keys, serde_json's 128-level
++/// recursion limit, bare `-0` typing) is a bug in one of the two.
++#[cfg(not(target_arch = "wasm32"))]
++mod hegel_differential {
++    use super::super::hegel_gens::{draw_junk_bytes, draw_sci_number_token, json_text};
++    use super::from_slice;
++    use hegel::generators;
++
++    /// Structural equality on serde_json values with one documented
++    /// exception: a bare `-0` integer literal parses to the integer 0 in
++    /// simd-json but to the float -0.0 in serde_json.
++    fn json_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
++        use serde_json::Value as V;
++        match (a, b) {
++            (V::Number(x), V::Number(y)) => num_eq(x, y),
++            (V::Array(x), V::Array(y)) => {
++                x.len() == y.len() && x.iter().zip(y.iter()).all(|(v, w)| json_eq(v, w))
++            }
++            (V::Object(x), V::Object(y)) => {
++                x.len() == y.len()
++                    && x.iter()
++                        .all(|(k, v)| y.get(k).is_some_and(|w| json_eq(v, w)))
++            }
++            _ => a == b,
++        }
++    }
++
++    fn num_eq(x: &serde_json::Number, y: &serde_json::Number) -> bool {
++        if x == y {
++            return true;
++        }
++        // `-0` typing divergence: integer zero on one side, float -0.0 on the other
++        let int_zero =
++            |n: &serde_json::Number| n.as_u64() == Some(0) || n.as_i64() == Some(0);
++        let neg_zero = |n: &serde_json::Number| {
++            n.is_f64() && n.as_f64().is_some_and(|f| f == 0.0 && f.is_sign_negative())
++        };
++        (int_zero(x) && neg_zero(y)) || (int_zero(y) && neg_zero(x))
++    }
++
++    fn depth(v: &serde_json::Value) -> usize {
++        match v {
++            serde_json::Value::Array(a) => 1 + a.iter().map(depth).max().unwrap_or(0),
++            serde_json::Value::Object(o) => 1 + o.values().map(depth).max().unwrap_or(0),
++            _ => 0,
++        }
++    }
++
++    /// True if the input contains a `\uD8xx`..`\uDBxx` escape (a high
++    /// surrogate). Necessary condition for the KNOWN BUG pinned by
++    /// `lone_high_surrogate_escape_is_rejected` (src/tests.rs): simd-json
++    /// accepts a lone high surrogate escape (decoding it to U+0000) while
++    /// serde_json rejects it, so the differential property must exclude such
++    /// inputs to keep testing everything else.
++    fn contains_high_surrogate_escape(input: &[u8]) -> bool {
++        input.windows(4).any(|w| {
++            w[0] == b'\\'
++                && w[1] == b'u'
++                && (w[2] == b'd' || w[2] == b'D')
++                && matches!(w[3], b'8' | b'9' | b'a' | b'A' | b'b' | b'B')
++        })
++    }
++
++    /// A run of >= 19 ASCII digits is a necessary condition for an integer
++    /// literal outside `i64::MIN..=u64::MAX` (simd-json's documented
++    /// rejection; serde_json parses such literals as f64).
++    fn has_long_digit_run(input: &[u8]) -> bool {
++        let mut run = 0usize;
++        for &b in input {
++            if b.is_ascii_digit() {
++                run += 1;
++                if run >= 19 {
++                    return true;
++                }
++            } else {
++                run = 0;
++            }
++        }
++        false
++    }
++
++    /// Property: on arbitrary bytes, simd-json and serde_json agree — both
++    /// reject, or both accept with equal values. Divergences are allowed only
++    /// in the two documented cases (out-of-range integer literals, serde's
++    /// recursion limit).
++    #[cfg(not(any(feature = "128bit", feature = "approx-number-parsing")))]
++    #[hegel::test(test_cases = 500)]
++    fn hegel_prop_differential_junk_bytes(tc: hegel::TestCase) {
++        // Three input classes: raw junk (mostly rejected), valid documents
++        // (so the both-accept comparison branch actually fires), and valid
++        // documents with one corrupted byte (borderline accept/reject).
++        let input: Vec<u8> = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => draw_junk_bytes(&tc),
++            1 => tc.draw(json_text(3)).into_bytes(),
++            _ => {
++                let mut b = tc.draw(json_text(3)).into_bytes();
++                let i = tc.draw(generators::integers::<usize>().max_value(b.len() - 1));
++                b[i] = tc.draw(generators::integers::<u8>());
++                b
++            }
++        };
++        tc.note(&format!("input: {:?}", String::from_utf8_lossy(&input)));
++
++        let mut b = input.clone();
++        let simd: Result<serde_json::Value, _> = from_slice(&mut b);
++        let serde: Result<serde_json::Value, _> = serde_json::from_slice(&input);
++
++        match (simd, serde) {
++            (Ok(a), Ok(b)) => {
++                assert!(json_eq(&a, &b), "parsers disagree:\nsimd:  {a}\nserde: {b}");
++            }
++            (Err(_), Err(_)) => {}
++            (Ok(a), Err(e)) => {
++                // Allowed: serde_json enforces a 128-level recursion limit,
++                // and inputs containing high surrogate escapes hit the KNOWN
++                // BUG pinned by lone_high_surrogate_escape_is_rejected.
++                assert!(
++                    depth(&a) >= 128 || contains_high_surrogate_escape(&input),
++                    "simd-json accepted what serde_json rejected ({e}): {a}"
++                );
++            }
++            (Err(e), Ok(b)) => {
++                // simd-json documents rejecting integers outside i64/u64 range
++                assert!(
++                    has_long_digit_run(&input),
++                    "simd-json rejected ({e}) what serde_json accepted: {b}"
++                );
++            }
++        }
++    }
++
++    /// Property: on *valid* generated JSON documents (constructed to avoid the
++    /// documented divergences) both parsers accept and produce equal values.
++    #[cfg(not(any(feature = "128bit", feature = "approx-number-parsing")))]
++    #[hegel::test(test_cases = 300)]
++    fn hegel_prop_differential_generated_json(tc: hegel::TestCase) {
++        let doc = tc.draw(json_text(4));
++        tc.note(&format!("doc: {doc}"));
++
++        let serde_v: serde_json::Value = serde_json::from_str(&doc)
++            .expect("generator must produce JSON that serde_json accepts");
++        let mut b = doc.clone().into_bytes();
++        let simd_v: serde_json::Value =
++            from_slice(&mut b).expect("simd-json rejected valid JSON");
++
++        assert!(
++            json_eq(&simd_v, &serde_v),
++            "parsers disagree on valid JSON:\ndoc:   {doc}\nsimd:  {simd_v}\nserde: {serde_v}"
++        );
++    }
++
++    /// Property: number parsing matches serde_json exactly — same
++    /// accept/reject decision and bit-identical values — across integer
++    /// boundaries, scientific notation, subnormals, and overflow candidates.
++    #[cfg(not(any(feature = "128bit", feature = "approx-number-parsing")))]
++    #[hegel::test(test_cases = 1000)]
++    fn hegel_prop_number_parse_matches_serde_json(tc: hegel::TestCase) {
++        let token: String = match tc.draw(generators::integers::<u8>().max_value(4)) {
++            0 => tc.draw(generators::integers::<i64>()).to_string(),
++            1 => tc.draw(generators::integers::<u64>()).to_string(),
++            2 => format!(
++                "{:?}",
++                tc.draw(
++                    generators::floats::<f64>()
++                        .allow_nan(false)
++                        .allow_infinity(false)
++                )
++            ),
++            // exponent up to 400: overflow-to-infinity candidates, which both
++            // parsers must *reject* in agreement
++            3 => draw_sci_number_token(&tc, 400),
++            _ => tc.draw(generators::sampled_from(vec![
++                "-0".to_string(),
++                "-0.0".to_string(),
++                "0e-1".to_string(),
++                "9007199254740992".to_string(),  // 2^53
++                "9007199254740993".to_string(),  // 2^53 + 1
++                "-9007199254740993".to_string(),
++                "18446744073709551615".to_string(), // u64::MAX
++                "-9223372036854775808".to_string(), // i64::MIN
++                "5e-324".to_string(),               // smallest subnormal
++                "2.2250738585072014e-308".to_string(), // smallest normal
++                "2.2250738585072011e-308".to_string(), // largest subnormal
++                "1.7976931348623157e308".to_string(),  // f64::MAX
++                "1.7976931348623159e308".to_string(),  // just past f64::MAX
++                "1e309".to_string(),
++                "-1e-400".to_string(),
++                "0.000000000000000000000000000000000000000000000000000000001".to_string(),
++            ])),
++        };
++        tc.note(&format!("token: {token}"));
++
++        let mut b = token.clone().into_bytes();
++        let simd: Result<serde_json::Value, _> = from_slice(&mut b);
++        let serde: Result<serde_json::Value, _> = serde_json::from_str(&token);
++
++        assert_eq!(
++            simd.is_ok(),
++            serde.is_ok(),
++            "accept/reject disagreement on {token:?}: simd={simd:?} serde={serde:?}"
++        );
++        if let (Ok(a), Ok(b)) = (simd, serde) {
++            assert!(
++                json_eq(&a, &b),
++                "value disagreement on {token:?}: simd={a} serde={b}"
++            );
++        }
++    }
++
++    /// Property (pins documented behavior): integer literals outside
++    /// `i64::MIN..=u64::MAX` are rejected by simd-json under default features,
++    /// while serde_json parses them as f64.
++    #[cfg(not(any(feature = "128bit", feature = "big-int-as-float")))]
++    #[hegel::test]
++    fn hegel_prop_out_of_range_int_rejected(tc: hegel::TestCase) {
++        let text = if tc.draw(generators::booleans()) {
++            // positive: strictly above u64::MAX
++            tc.draw(
++                generators::integers::<u128>()
++                    .min_value(u128::from(u64::MAX) + 1),
++            )
++            .to_string()
++        } else {
++            // negative: strictly below i64::MIN
++            (-tc.draw(
++                generators::integers::<i128>()
++                    .min_value(i128::from(i64::MAX) + 2)
++                    .max_value(i128::MAX),
++            ))
++            .to_string()
++        };
++        tc.note(&format!("literal: {text}"));
++
++        let mut b = text.clone().into_bytes();
++        let simd: Result<serde_json::Value, _> = from_slice(&mut b);
++        assert!(
++            simd.is_err(),
++            "simd-json accepted out-of-range integer {text}: {simd:?}"
++        );
++        let serde: Result<serde_json::Value, _> = serde_json::from_str(&text);
++        assert!(serde.is_ok(), "serde_json rejected {text}");
++    }
++}
