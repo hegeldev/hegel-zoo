@@ -1,0 +1,990 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 082d4df..8ca21d1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,8 @@ flume = { version = "0.12.0", default-features = false }
+ nanoid = "0.4.0"
+ test-log = "0.2.18"
+ rand = "0.10.0"
++hegeltest = "0.44.1"
++env_logger = "0.11.11"
+ 
+ [package.metadata.cargo-all-features]
+ denylist = ["__internal_whitebox"]
+diff --git a/tests/batch.rs b/tests/batch.rs
+index 99b2d2c..30315bf 100644
+--- a/tests/batch.rs
++++ b/tests/batch.rs
+@@ -1,4 +1,6 @@
+ use fjall::{Database, KeyspaceCreateOptions, KvSeparationOptions};
++use hegel::generators;
++use std::collections::BTreeMap;
+ use test_log::test;
+ 
+ #[test]
+@@ -48,6 +50,71 @@ fn blob_batch_simple() -> fjall::Result<()> {
+     Ok(())
+ }
+ 
++// Property: committing a batch of inserts/removes spanning several keyspaces
++// leaves each keyspace in exactly the state obtained by applying the operations
++// in order to a per-keyspace BTreeMap (later ops on the same key win, as
++// evidenced by `batch_multi_keys` below).
++#[hegel::test]
++fn batch_commit_matches_sequential_model(tc: hegel::TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++
++    let keyspace_count = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++    let keyspaces: Vec<_> = (0..keyspace_count)
++        .map(|i| {
++            db.keyspace(&format!("ks{i}"), KeyspaceCreateOptions::default)
++                .expect("keyspace creation should work")
++        })
++        .collect();
++    let mut models: Vec<BTreeMap<Vec<u8>, Vec<u8>>> = vec![BTreeMap::new(); keyspace_count];
++
++    let op_count = tc.draw(generators::integers::<usize>().max_value(20));
++    let mut batch = db.batch();
++
++    for _ in 0..op_count {
++        let i = tc.draw(generators::integers::<usize>().max_value(keyspace_count - 1));
++        // Tiny key space on purpose: duplicate keys within one batch exercise
++        // the last-write-wins behavior.
++        let key: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().max_value(3))
++                .min_size(1)
++                .max_size(2),
++        );
++
++        if tc.draw(generators::booleans()) {
++            let value: Vec<u8> = tc.draw(generators::binary().max_size(8));
++            batch.insert(&keyspaces[i], key.as_slice(), value.as_slice());
++            models[i].insert(key, value);
++        } else {
++            batch.remove(&keyspaces[i], key.as_slice());
++            models[i].remove(&key);
++        }
++    }
++
++    // Nothing must be visible before the commit...
++    for keyspace in &keyspaces {
++        assert_eq!(0, keyspace.len().expect("len should work"));
++    }
++
++    batch.commit().expect("batch commit should work");
++
++    // ...and exactly the model state after it.
++    for (keyspace, model) in keyspaces.iter().zip(&models) {
++        let got: Vec<(Vec<u8>, Vec<u8>)> = keyspace
++            .iter()
++            .map(|guard| {
++                let (k, v) = guard.into_inner().expect("read kv");
++                (k.to_vec(), v.to_vec())
++            })
++            .collect();
++        let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++            .iter()
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++        assert_eq!(got, expected);
++    }
++}
++
+ #[test]
+ fn batch_multi_keys() -> fjall::Result<()> {
+     let folder = tempfile::tempdir()?;
+diff --git a/tests/blob_kv_simple.rs b/tests/blob_kv_simple.rs
+index f83a7ea..1d264c0 100644
+--- a/tests/blob_kv_simple.rs
++++ b/tests/blob_kv_simple.rs
+@@ -1,7 +1,75 @@
+ use fjall::{Database, KeyspaceCreateOptions, KvSeparationOptions};
++use hegel::generators;
+ use lsm_tree::AbstractTree;
++use std::collections::BTreeMap;
+ use test_log::test;
+ 
++// Property: with generated kv-separation options (separation threshold, blob
++// file target size), a keyspace returns every inserted value byte-for-byte —
++// through the memtable, after flushing to blob files, and after major
++// compaction. Values straddle the separation threshold so both the inline and
++// the separated code paths are exercised.
++#[hegel::test]
++fn blob_roundtrip_matches_model(tc: hegel::TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++
++    let separation_threshold = tc.draw(generators::integers::<u32>().min_value(1).max_value(2048));
++    let file_target_size = tc.draw(generators::integers::<u64>().min_value(1).max_value(100_000));
++
++    let keyspace = db
++        .keyspace("default", || {
++            KeyspaceCreateOptions::default().with_kv_separation(Some(
++                KvSeparationOptions::default()
++                    .separation_threshold(separation_threshold)
++                    .file_target_size(file_target_size),
++            ))
++        })
++        .expect("keyspace creation should work");
++
++    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
++
++    let op_count = tc.draw(generators::integers::<usize>().max_value(20));
++    for _ in 0..op_count {
++        let key: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(4));
++        // Sizes span the separation threshold range (0..=4096 vs threshold <= 2048).
++        let size = tc.draw(generators::integers::<usize>().max_value(4096));
++        let value: Vec<u8> = tc.draw(generators::binary().min_size(size).max_size(size));
++        keyspace
++            .insert(key.as_slice(), value.as_slice())
++            .expect("insert should work");
++        model.insert(key, value);
++    }
++
++    if tc.draw(generators::booleans()) {
++        keyspace
++            .rotate_memtable_and_wait()
++            .expect("rotation should work");
++
++        if tc.draw(generators::booleans()) {
++            keyspace.major_compact().expect("compaction should work");
++        }
++    }
++
++    for (key, value) in &model {
++        let got = keyspace.get(key.as_slice()).expect("get should work");
++        assert_eq!(Some(value.as_slice()), got.as_deref());
++    }
++
++    let got: Vec<(Vec<u8>, Vec<u8>)> = keyspace
++        .iter()
++        .map(|guard| {
++            let (k, v) = guard.into_inner().expect("read kv");
++            (k.to_vec(), v.to_vec())
++        })
++        .collect();
++    let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++        .iter()
++        .map(|(k, v)| (k.clone(), v.clone()))
++        .collect();
++    assert_eq!(got, expected);
++}
++
+ #[test]
+ fn blob_kv_simple() -> fjall::Result<()> {
+     let folder = tempfile::tempdir()?;
+diff --git a/tests/db_open.rs b/tests/db_open.rs
+index f5df966..2fd74f5 100644
+--- a/tests/db_open.rs
++++ b/tests/db_open.rs
+@@ -1,4 +1,53 @@
+ use fjall::Database;
++use hegel::generators;
++
++// Property: any keyspace name accepted by `Database::keyspace` (per
++// `is_valid_keyspace_name`: non-empty, at most 255 bytes — the implementation
++// does not restrict the character set) survives closing and reopening the
++// database, together with its data.
++#[hegel::test]
++fn accepted_keyspace_names_survive_reopen(tc: hegel::TestCase) {
++    use fjall::KeyspaceCreateOptions;
++
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++
++    // Up to 63 chars of at most 4 UTF-8 bytes each = at most 252 bytes,
++    // within the implementation's 255-byte limit.
++    let names: Vec<String> = tc.draw(
++        generators::vecs(generators::text().min_size(1).max_size(63))
++            .min_size(1)
++            .max_size(4)
++            .unique(true),
++    );
++
++    {
++        let db = Database::builder(&folder).open().expect("db should open");
++        for (i, name) in names.iter().enumerate() {
++            let keyspace = db
++                .keyspace(name, KeyspaceCreateOptions::default)
++                .expect("keyspace creation should work");
++            keyspace
++                .insert("k", i.to_be_bytes())
++                .expect("insert should work");
++        }
++    }
++
++    let db = Database::builder(&folder).open().expect("db should reopen");
++    for (i, name) in names.iter().enumerate() {
++        assert!(
++            db.keyspace_exists(name),
++            "keyspace {name:?} vanished on reopen",
++        );
++        let keyspace = db
++            .keyspace(name, KeyspaceCreateOptions::default)
++            .expect("keyspace should reopen");
++        assert_eq!(
++            Some(i.to_be_bytes().as_slice()),
++            keyspace.get("k").expect("get should work").as_deref(),
++            "keyspace {name:?} lost its data on reopen",
++        );
++    }
++}
+ 
+ #[test_log::test]
+ fn db_open() -> fjall::Result<()> {
+diff --git a/tests/journal_large_value.rs b/tests/journal_large_value.rs
+index d94fc71..a30071a 100644
+--- a/tests/journal_large_value.rs
++++ b/tests/journal_large_value.rs
+@@ -1,6 +1,40 @@
+ // Regression test for https://github.com/fjall-rs/fjall/issues/68
+ 
+ use fjall::{Database, KeyspaceCreateOptions, KvSeparationOptions};
++use hegel::generators;
++
++// Property: inserting a key within the documented size limit never panics.
++// The crate docs (src/lib.rs and `Keyspace::insert`) say "Keys are limited to
++// 65536 bytes" / "Keys may be up to 65536 bytes long" and document no panic,
++// so any key of length 0..=65536 should either be stored or produce an `Err`.
++//
++// Key sizes are boosted towards the boundaries, per the boundary-value
++// pattern: uniform sizes would practically never hit 0 or 65535/65536.
++//
++// KNOWN FAILURE (suspected library bug, intentionally left failing — see
++// HEGEL_REPORT.md): the empty key panics ("key may not be empty",
++// lsm-tree/src/value.rs:45) and a 65536-byte key panics ("keys can be 65535
++// bytes in length", lsm-tree/src/key.rs:43) even though fjall's docs allow up
++// to 65536 bytes. Both panics happen *after* the journal record was written
++// (with the key length truncated `as u16`) and leave the whole Database
++// poisoned: every following operation returns `Err(Poisoned)`.
++#[hegel::test]
++fn insert_within_documented_key_limit_does_not_panic(tc: hegel::TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++    let tree = db
++        .keyspace("default", KeyspaceCreateOptions::default)
++        .expect("keyspace creation should work");
++
++    let size: usize = tc.draw(hegel::one_of!(
++        generators::integers::<usize>().max_value(64),
++        generators::sampled_from(vec![0, 1, 65_534, 65_535, 65_536]),
++    ));
++    let key: Vec<u8> = tc.draw(generators::binary().min_size(size).max_size(size));
++
++    // Must not panic; both Ok and Err are acceptable outcomes.
++    let _ = tree.insert(key.as_slice(), "v");
++}
+ 
+ #[test_log::test]
+ fn journal_recover_large_value() -> fjall::Result<()> {
+diff --git a/tests/keyspace_recover.rs b/tests/keyspace_recover.rs
+index 9606881..07099b1 100644
+--- a/tests/keyspace_recover.rs
++++ b/tests/keyspace_recover.rs
+@@ -3,7 +3,9 @@ use fjall::config::{
+     RestartIntervalPolicy,
+ };
+ use fjall::{AbstractTree, CompressionType, Database, KeyspaceCreateOptions, KvSeparationOptions};
++use hegel::generators;
+ use lsm_tree::compaction::CompactionStrategy;
++use std::collections::BTreeMap;
+ use std::sync::Arc;
+ use test_log::test;
+ 
+@@ -230,6 +232,95 @@ fn reload_keyspace_config_blob_opts() -> fjall::Result<()> {
+     Ok(())
+ }
+ 
++// Property: after an arbitrary sequence of inserts/removes/clears/memtable
++// rotations across several keyspaces, closing and reopening the database
++// yields exactly the same contents (evidence: the `reload_*` tests below and
++// the durability claims in the crate docs — data is recovered from journal
++// and/or flushed tables).
++#[hegel::test]
++fn recover_matches_model(tc: hegel::TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++
++    let keyspace_count = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++    let mut models: Vec<BTreeMap<Vec<u8>, Vec<u8>>> = vec![BTreeMap::new(); keyspace_count];
++
++    {
++        let db = Database::builder(&folder).open().expect("db should open");
++        let keyspaces: Vec<_> = (0..keyspace_count)
++            .map(|i| {
++                db.keyspace(&format!("ks{i}"), KeyspaceCreateOptions::default)
++                    .expect("keyspace creation should work")
++            })
++            .collect();
++
++        let op_count = tc.draw(generators::integers::<usize>().max_value(40));
++        for _ in 0..op_count {
++            let i = tc.draw(generators::integers::<usize>().max_value(keyspace_count - 1));
++            let keyspace = &keyspaces[i];
++            let model = &mut models[i];
++
++            match tc.draw(generators::integers::<u8>().max_value(4)) {
++                // insert (twice as likely as the others)
++                0 | 1 => {
++                    let key: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(16));
++                    let value: Vec<u8> = tc.draw(generators::binary().max_size(16));
++                    keyspace
++                        .insert(key.as_slice(), value.as_slice())
++                        .expect("insert should work");
++                    model.insert(key, value);
++                }
++                // remove (possibly of an existing key)
++                2 => {
++                    let key: Vec<u8> = if !model.is_empty() && tc.draw(generators::booleans()) {
++                        let ki =
++                            tc.draw(generators::integers::<usize>().max_value(model.len() - 1));
++                        model.keys().nth(ki).expect("index is in range").clone()
++                    } else {
++                        tc.draw(generators::binary().min_size(1).max_size(16))
++                    };
++                    keyspace.remove(key.as_slice()).expect("remove should work");
++                    model.remove(&key);
++                }
++                // clear
++                3 => {
++                    keyspace.clear().expect("clear should work");
++                    model.clear();
++                }
++                // flush, so that recovery reads from tables, not just the journal
++                4 => {
++                    keyspace
++                        .rotate_memtable_and_wait()
++                        .expect("rotation should work");
++                }
++                _ => unreachable!(),
++            }
++        }
++
++        db.persist(fjall::PersistMode::SyncAll)
++            .expect("persist should work");
++    }
++
++    let db = Database::builder(&folder).open().expect("db should reopen");
++    for (i, model) in models.iter().enumerate() {
++        let keyspace = db
++            .keyspace(&format!("ks{i}"), KeyspaceCreateOptions::default)
++            .expect("keyspace should reopen");
++
++        let got: Vec<(Vec<u8>, Vec<u8>)> = keyspace
++            .iter()
++            .map(|guard| {
++                let (k, v) = guard.into_inner().expect("read kv");
++                (k.to_vec(), v.to_vec())
++            })
++            .collect();
++        let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++            .iter()
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++        assert_eq!(got, expected, "keyspace ks{i} lost or gained data on recovery");
++    }
++}
++
+ #[test]
+ fn reload_with_keyspaces() -> fjall::Result<()> {
+     let folder = tempfile::tempdir()?;
+diff --git a/tests/keyspace_snapshot.rs b/tests/keyspace_snapshot.rs
+index fe2371f..0475d9d 100644
+--- a/tests/keyspace_snapshot.rs
++++ b/tests/keyspace_snapshot.rs
+@@ -1,6 +1,100 @@
+ use fjall::{Database, KeyspaceCreateOptions, Readable};
++use hegel::generators;
++use std::collections::BTreeMap;
+ use test_log::test;
+ 
++// Property: a snapshot keeps showing exactly the database state from the
++// moment it was taken (per keyspace), no matter which writes, removes, clears
++// or flushes happen afterwards. Evidence: `Readable` docs ("Repeatable read"),
++// `clear_dirty_read` and `keyspace_snapshot_read` tests.
++#[hegel::test]
++fn snapshot_repeatable_read_matches_model(tc: hegel::TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++
++    let keyspace_count = tc.draw(generators::integers::<usize>().min_value(1).max_value(2));
++    let keyspaces: Vec<_> = (0..keyspace_count)
++        .map(|i| {
++            db.keyspace(&format!("ks{i}"), KeyspaceCreateOptions::default)
++                .expect("keyspace creation should work")
++        })
++        .collect();
++    let mut models: Vec<BTreeMap<Vec<u8>, Vec<u8>>> = vec![BTreeMap::new(); keyspace_count];
++
++    // Phase 1: build up some state.
++    let op_count = tc.draw(generators::integers::<usize>().max_value(20));
++    for _ in 0..op_count {
++        let i = tc.draw(generators::integers::<usize>().max_value(keyspace_count - 1));
++        let key: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(4));
++        let value: Vec<u8> = tc.draw(generators::binary().max_size(8));
++        keyspaces[i]
++            .insert(key.as_slice(), value.as_slice())
++            .expect("insert should work");
++        models[i].insert(key, value);
++    }
++
++    // Freeze: snapshot + copy of the model at this instant.
++    let snapshot = db.snapshot();
++    let frozen = models.clone();
++
++    // Phase 2: mutate the live database.
++    let op_count = tc.draw(generators::integers::<usize>().max_value(20));
++    for _ in 0..op_count {
++        let i = tc.draw(generators::integers::<usize>().max_value(keyspace_count - 1));
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 | 1 => {
++                let key: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(4));
++                let value: Vec<u8> = tc.draw(generators::binary().max_size(8));
++                keyspaces[i]
++                    .insert(key.as_slice(), value.as_slice())
++                    .expect("insert should work");
++            }
++            2 => {
++                let key: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(4));
++                keyspaces[i]
++                    .remove(key.as_slice())
++                    .expect("remove should work");
++            }
++            3 => {
++                if tc.draw(generators::booleans()) {
++                    keyspaces[i].clear().expect("clear should work");
++                } else {
++                    keyspaces[i]
++                        .rotate_memtable_and_wait()
++                        .expect("rotation should work");
++                }
++            }
++            _ => unreachable!(),
++        }
++    }
++
++    // The snapshot must still see exactly the frozen state.
++    for (i, keyspace) in keyspaces.iter().enumerate() {
++        let got: Vec<(Vec<u8>, Vec<u8>)> = snapshot
++            .iter(keyspace)
++            .map(|guard| {
++                let (k, v) = guard.into_inner().expect("read kv");
++                (k.to_vec(), v.to_vec())
++            })
++            .collect();
++        let expected: Vec<(Vec<u8>, Vec<u8>)> = frozen[i]
++            .iter()
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++        assert_eq!(got, expected, "snapshot of ks{i} is not repeatable");
++
++        // Point reads through the snapshot must agree as well.
++        let probe: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(4));
++        assert_eq!(
++            snapshot
++                .get(keyspace, probe.as_slice())
++                .expect("get should work")
++                .as_deref(),
++            frozen[i].get(&probe).map(Vec::as_slice),
++        );
++    }
++}
++
+ #[test]
+ fn keyspace_iter_dirty_read() -> fjall::Result<()> {
+     let folder = tempfile::tempdir()?;
+diff --git a/tests/model.rs b/tests/model.rs
+new file mode 100644
+index 0000000..e681104
+--- /dev/null
++++ b/tests/model.rs
+@@ -0,0 +1,324 @@
++// Stateful model test: runs random operation sequences (including cross-keyspace
++// batches, clears, memtable rotations and major compaction) against a Database
++// and diffs the observable state against a BTreeMap-per-keyspace model after
++// every step.
++//
++// Evidence for the property: fjall documents "A thread-safe BTreeMap-like API"
++// (src/lib.rs), and the Keyspace/WriteBatch docs promise ordinary map semantics
++// (insert overwrites, remove deletes, clear empties, iteration in key order).
++
++use fjall::{Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions};
++use hegel::generators;
++use hegel::TestCase;
++use std::collections::BTreeMap;
++
++type Model = BTreeMap<Vec<u8>, Vec<u8>>;
++
++/// Mix of high-collision tiny keys (so overwrites/removals of existing keys
++/// actually happen) and arbitrary binary keys.
++#[hegel::composite]
++fn arb_key(tc: &TestCase) -> Vec<u8> {
++    tc.draw(hegel::one_of!(
++        generators::vecs(generators::integers::<u8>().max_value(3))
++            .min_size(1)
++            .max_size(3),
++        generators::binary().min_size(1).max_size(64),
++    ))
++}
++
++/// Mostly small values, sometimes large enough to cross kv-separation thresholds.
++#[hegel::composite]
++fn arb_value(tc: &TestCase) -> Vec<u8> {
++    tc.draw(hegel::one_of!(
++        generators::binary().max_size(16),
++        generators::binary().min_size(900).max_size(3000),
++    ))
++}
++
++/// Draw a key, biased towards keys that are already present in the model.
++fn draw_key(tc: &TestCase, model: &Model) -> Vec<u8> {
++    if !model.is_empty() && tc.draw(generators::booleans()) {
++        let i = tc.draw(generators::integers::<usize>().max_value(model.len() - 1));
++        model.keys().nth(i).expect("index is in range").clone()
++    } else {
++        tc.draw(arb_key())
++    }
++}
++
++// Print op failures to stderr so they survive hegel's panic capture
++// (only the final replay's panic payload is shown otherwise).
++fn expect_ok<T>(r: fjall::Result<T>, what: &str) -> T {
++    match r {
++        Ok(v) => v,
++        Err(e) => {
++            eprintln!("MODEL-TEST OP FAILED: {what}: {e:?}");
++            panic!("{what} failed: {e:?}");
++        }
++    }
++}
++
++struct DatabaseMachine {
++    // NOTE: field order matters — struct fields drop in declaration order, and
++    // the TempDir must outlive the Database (deleting the directory while
++    // background flush workers are running crashes them with Io(NotFound),
++    // which poisons the database and makes `Database::drop` hang).
++    keyspaces: Vec<(Keyspace, Model)>,
++    db: Database,
++    _folder: tempfile::TempDir,
++}
++
++impl DatabaseMachine {
++    fn pick_keyspace(&self, tc: &TestCase) -> usize {
++        tc.draw(generators::integers::<usize>().max_value(self.keyspaces.len() - 1))
++    }
++}
++
++#[hegel::state_machine]
++impl DatabaseMachine {
++    /// Create an additional keyspace with generated options
++    /// (kv separation on/off, small or default write buffer).
++    #[rule]
++    fn create_keyspace(&mut self, tc: TestCase) {
++        tc.assume(self.keyspaces.len() < 4);
++
++        let name = format!("ks{}", self.keyspaces.len());
++        let kv_separated = tc.draw(generators::booleans());
++        let separation_threshold = tc.draw(generators::integers::<u32>().min_value(1).max_value(2048));
++        let small_memtable = tc.draw(generators::booleans());
++
++        let keyspace = self
++            .db
++            .keyspace(&name, || {
++                let mut opts = KeyspaceCreateOptions::default();
++                if kv_separated {
++                    opts = opts.with_kv_separation(Some(
++                        KvSeparationOptions::default().separation_threshold(separation_threshold),
++                    ));
++                }
++                if small_memtable {
++                    opts = opts.max_memtable_size(/* 8 KiB */ 8 * 1_024);
++                }
++                opts
++            })
++            .expect("keyspace creation should work");
++
++        self.keyspaces.push((keyspace, Model::new()));
++    }
++
++    #[rule]
++    fn insert(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &mut self.keyspaces[i];
++        let key = draw_key(&tc, model);
++        let value = tc.draw(arb_value());
++
++        expect_ok(keyspace.insert(key.as_slice(), value.as_slice()), "insert");
++        model.insert(key, value);
++    }
++
++    #[rule]
++    fn remove(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &mut self.keyspaces[i];
++        let key = draw_key(&tc, model);
++
++        expect_ok(keyspace.remove(key.as_slice()), "remove");
++        model.remove(&key);
++    }
++
++    /// Commit a batch of writes spanning several keyspaces atomically.
++    #[rule]
++    fn batch_commit(&mut self, tc: TestCase) {
++        let op_count = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        let mut batch = self.db.batch();
++        // (keyspace index, key, Some(value) for insert / None for remove)
++        let mut ops: Vec<(usize, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
++
++        for _ in 0..op_count {
++            let i = self.pick_keyspace(&tc);
++            let (keyspace, model) = &self.keyspaces[i];
++            let key = draw_key(&tc, model);
++
++            if tc.draw(generators::booleans()) {
++                let value = tc.draw(arb_value());
++                batch.insert(keyspace, key.as_slice(), value.as_slice());
++                ops.push((i, key, Some(value)));
++            } else {
++                batch.remove(keyspace, key.as_slice());
++                ops.push((i, key, None));
++            }
++        }
++
++        expect_ok(batch.commit(), "batch commit");
++
++        for (i, key, value) in ops {
++            let model = &mut self.keyspaces[i].1;
++            match value {
++                Some(value) => {
++                    model.insert(key, value);
++                }
++                None => {
++                    model.remove(&key);
++                }
++            }
++        }
++    }
++
++    #[rule]
++    fn clear_keyspace(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &mut self.keyspaces[i];
++        expect_ok(keyspace.clear(), "clear");
++        model.clear();
++    }
++
++    /// Force the active memtable to be flushed to a table on disk.
++    #[rule]
++    fn rotate_memtable(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        expect_ok(self.keyspaces[i].0.rotate_memtable_and_wait(), "rotate_memtable");
++    }
++
++    /// Merge all tables into one.
++    #[rule]
++    fn major_compact(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        expect_ok(self.keyspaces[i].0.major_compact(), "major_compact");
++    }
++
++    #[rule]
++    fn get_matches_model(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &self.keyspaces[i];
++        let key = draw_key(&tc, model);
++
++        let got = expect_ok(keyspace.get(key.as_slice()), "get");
++        if got.as_deref() != model.get(&key).map(Vec::as_slice) {
++            eprintln!("MODEL-TEST GET MISMATCH key={key:?} got={got:?} expected={:?}", model.get(&key));
++            panic!("get({key:?}) disagrees with model");
++        }
++    }
++
++    #[rule]
++    fn contains_key_matches_model(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &self.keyspaces[i];
++        let key = draw_key(&tc, model);
++
++        let got = expect_ok(keyspace.contains_key(key.as_slice()), "contains_key");
++        assert_eq!(got, model.contains_key(&key));
++    }
++
++    #[rule]
++    fn size_of_matches_model(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &self.keyspaces[i];
++        let key = draw_key(&tc, model);
++
++        let got = expect_ok(keyspace.size_of(key.as_slice()), "size_of");
++        assert_eq!(
++            got,
++            model.get(&key).map(|v| u32::try_from(v.len()).expect("fits")),
++        );
++    }
++
++    #[rule]
++    fn first_and_last_match_model(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &self.keyspaces[i];
++
++        let first = keyspace
++            .first_key_value()
++            .map(|guard| guard.into_inner().expect("read kv"))
++            .map(|(k, v)| (k.to_vec(), v.to_vec()));
++        assert_eq!(
++            first,
++            model.first_key_value().map(|(k, v)| (k.clone(), v.clone())),
++        );
++
++        let last = keyspace
++            .last_key_value()
++            .map(|guard| guard.into_inner().expect("read kv"))
++            .map(|(k, v)| (k.to_vec(), v.to_vec()));
++        assert_eq!(
++            last,
++            model.last_key_value().map(|(k, v)| (k.clone(), v.clone())),
++        );
++    }
++
++    #[rule]
++    fn reverse_iter_matches_model(&mut self, tc: TestCase) {
++        let i = self.pick_keyspace(&tc);
++        let (keyspace, model) = &self.keyspaces[i];
++
++        let got: Vec<(Vec<u8>, Vec<u8>)> = keyspace
++            .iter()
++            .rev()
++            .map(|guard| {
++                let (k, v) = guard.into_inner().expect("read kv");
++                (k.to_vec(), v.to_vec())
++            })
++            .collect();
++        let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++            .iter()
++            .rev()
++            .map(|(k, v)| (k.clone(), v.clone()))
++            .collect();
++        if got != expected {
++            eprintln!("MODEL-TEST REV-ITER MISMATCH got={got:?} expected={expected:?}");
++            panic!("reverse iteration disagrees with model");
++        }
++    }
++
++    /// After every step, every keyspace must contain exactly the model's
++    /// entries, in ascending key order.
++    #[invariant]
++    fn contents_match_model(&self, _tc: TestCase) {
++        for (keyspace, model) in &self.keyspaces {
++            let got: Vec<(Vec<u8>, Vec<u8>)> = keyspace
++                .iter()
++                .map(|guard| {
++                    let (k, v) = guard.into_inner().expect("read kv");
++                    (k.to_vec(), v.to_vec())
++                })
++                .collect();
++            let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++                .iter()
++                .map(|(k, v)| (k.clone(), v.clone()))
++                .collect();
++            if got != expected {
++                eprintln!(
++                    "MODEL-TEST INVARIANT MISMATCH in {:?}: got={got:?} expected={expected:?}",
++                    keyspace.name(),
++                );
++                panic!("keyspace {:?} disagrees with model", keyspace.name());
++            }
++        }
++    }
++}
++
++#[hegel::test]
++fn database_matches_btreemap_model(tc: TestCase) {
++    // Surface fjall worker-thread errors on stderr; without a logger,
++    // background flush/compaction crashes are silent.
++    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
++        .is_test(false)
++        .try_init();
++
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++
++    // Start with one keyspace so most rules apply immediately;
++    // `create_keyspace` can add more (with different configurations).
++    let keyspace = db
++        .keyspace("ks_initial", KeyspaceCreateOptions::default)
++        .expect("keyspace creation should work");
++
++    let machine = DatabaseMachine {
++        keyspaces: vec![(keyspace, Model::new())],
++        db,
++        _folder: folder,
++    };
++
++    hegel::stateful::machine(machine).run(tc);
++}
+diff --git a/tests/prefix_complex.rs b/tests/prefix_complex.rs
+index f46e4c2..40e8d88 100644
+--- a/tests/prefix_complex.rs
++++ b/tests/prefix_complex.rs
+@@ -1,6 +1,160 @@
+-use fjall::{Database, KeyspaceCreateOptions};
++use fjall::{Database, KeyspaceCreateOptions, Keyspace};
++use hegel::generators;
++use hegel::TestCase;
++use std::collections::BTreeMap;
++use std::ops::Bound;
+ use test_log::test;
+ 
++type Model = BTreeMap<Vec<u8>, Vec<u8>>;
++
++/// Sets up a keyspace filled with generated data (and a matching model).
++/// Optionally flushes so queries hit tables on disk, not just the memtable.
++fn setup_filled_keyspace(tc: &TestCase, db: &Database) -> (Keyspace, Model) {
++    let keyspace = db
++        .keyspace("default", KeyspaceCreateOptions::default)
++        .expect("keyspace creation should work");
++    let mut model = Model::new();
++
++    let op_count = tc.draw(generators::integers::<usize>().max_value(30));
++    for _ in 0..op_count {
++        let key: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(5));
++        let value: Vec<u8> = tc.draw(generators::binary().max_size(8));
++        keyspace
++            .insert(key.as_slice(), value.as_slice())
++            .expect("insert should work");
++        model.insert(key, value);
++    }
++
++    if tc.draw(generators::booleans()) {
++        keyspace
++            .rotate_memtable_and_wait()
++            .expect("rotation should work");
++    }
++
++    (keyspace, model)
++}
++
++fn collect(iter: fjall::Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
++    iter.map(|guard| {
++        let (k, v) = guard.into_inner().expect("read kv");
++        (k.to_vec(), v.to_vec())
++    })
++    .collect()
++}
++
++// Property: `keyspace.prefix(p)` returns exactly the model entries whose key
++// starts with `p`, in ascending key order (evidence: `Keyspace::prefix` docs
++// and `keyspace_prefix_carl` below).
++#[hegel::test]
++fn prefix_matches_model(tc: TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++    let (keyspace, model) = setup_filled_keyspace(&tc, &db);
++
++    // Either an arbitrary prefix (often empty/unrelated) or a prefix of an
++    // existing key, so that non-empty results are common.
++    let prefix: Vec<u8> = if !model.is_empty() && tc.draw(generators::booleans()) {
++        let ki = tc.draw(generators::integers::<usize>().max_value(model.len() - 1));
++        let key = model.keys().nth(ki).expect("index is in range");
++        let len = tc.draw(generators::integers::<usize>().max_value(key.len()));
++        key[..len].to_vec()
++    } else {
++        tc.draw(generators::binary().max_size(5))
++    };
++
++    let got = collect(keyspace.prefix(prefix.as_slice()));
++    let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++        .iter()
++        .filter(|(k, _)| k.starts_with(&prefix))
++        .map(|(k, v)| (k.clone(), v.clone()))
++        .collect();
++
++    assert_eq!(got, expected, "prefix({prefix:?}) disagrees with model");
++}
++
++// Property: `keyspace.prefix(p)` and `keyspace.range(prefix_to_range(p))`
++// agree — the util function is documented as computing the range that
++// corresponds to a prefix scan.
++#[hegel::test]
++fn prefix_agrees_with_prefix_to_range(tc: TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++    let (keyspace, model) = setup_filled_keyspace(&tc, &db);
++
++    let prefix: Vec<u8> = if !model.is_empty() && tc.draw(generators::booleans()) {
++        let ki = tc.draw(generators::integers::<usize>().max_value(model.len() - 1));
++        let key = model.keys().nth(ki).expect("index is in range");
++        let len = tc.draw(generators::integers::<usize>().max_value(key.len()));
++        key[..len].to_vec()
++    } else {
++        tc.draw(generators::binary().max_size(5))
++    };
++
++    let via_prefix = collect(keyspace.prefix(prefix.as_slice()));
++    let via_range = collect(keyspace.range(fjall::util::prefix_to_range(&prefix)));
++
++    assert_eq!(via_prefix, via_range);
++}
++
++// Property: `keyspace.range(r)` returns exactly the model entries within the
++// bounds, in ascending key order, for arbitrary Included/Excluded/Unbounded
++// bound combinations (evidence: `Keyspace::range` docs, BTreeMap-like API).
++#[hegel::test]
++fn range_matches_model(tc: TestCase) {
++    let folder = tempfile::tempdir().expect("tempdir should be created");
++    let db = Database::builder(&folder).open().expect("db should open");
++    let (keyspace, model) = setup_filled_keyspace(&tc, &db);
++
++    let draw_bound = || -> Bound<Vec<u8>> {
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => Bound::Unbounded,
++            1 => Bound::Included(tc.draw(generators::binary().min_size(1).max_size(5))),
++            2 => Bound::Excluded(tc.draw(generators::binary().min_size(1).max_size(5))),
++            _ => unreachable!(),
++        }
++    };
++
++    let mut start = draw_bound();
++    let mut end = draw_bound();
++
++    // Keep the range well-formed (start <= end), like std ranges require.
++    if let (
++        Bound::Included(s) | Bound::Excluded(s),
++        Bound::Included(e) | Bound::Excluded(e),
++    ) = (&start, &end)
++    {
++        if s > e {
++            std::mem::swap(&mut start, &mut end);
++        }
++    }
++
++    let in_range = |k: &Vec<u8>| {
++        let lower_ok = match &start {
++            Bound::Unbounded => true,
++            Bound::Included(s) => k >= s,
++            Bound::Excluded(s) => k > s,
++        };
++        let upper_ok = match &end {
++            Bound::Unbounded => true,
++            Bound::Included(e) => k <= e,
++            Bound::Excluded(e) => k < e,
++        };
++        lower_ok && upper_ok
++    };
++
++    let got = collect(keyspace.range::<Vec<u8>, _>((start.clone(), end.clone())));
++    let expected: Vec<(Vec<u8>, Vec<u8>)> = model
++        .iter()
++        .filter(|(k, _)| in_range(k))
++        .map(|(k, v)| (k.clone(), v.clone()))
++        .collect();
++
++    assert_eq!(
++        got, expected,
++        "range({start:?}..{end:?}) disagrees with model",
++    );
++}
++
+ #[test]
+ fn keyspace_prefix_carl() -> fjall::Result<()> {
+     let folder = tempfile::tempdir()?;

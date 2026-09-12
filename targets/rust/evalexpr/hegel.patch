@@ -1,0 +1,652 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 10c0f2f..00cc8f9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,7 @@ rand = ["dep:rand"]
+ ron = "0.8.1"
+ rand = "0.8.5"
+ rand_pcg = "0.3.1"
++hegeltest = "0.44.1"
+ 
+ [lints.rust]
+ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
+diff --git a/rust-toolchain.toml b/rust-toolchain.toml
+index 0f102b7..244b827 100644
+--- a/rust-toolchain.toml
++++ b/rust-toolchain.toml
+@@ -1,4 +1,6 @@
+ [toolchain]
+-channel = "1.81.0"
++# Bumped from 1.81.0: the hegeltest dev-dependency requires rustc >= 1.86.
++# The crate's own MSRV (rust-version in Cargo.toml) is unchanged.
++channel = "1.86.0"
+ profile = "minimal"
+ components = ["rustfmt", "clippy"]
+diff --git a/tests/integration.rs b/tests/integration.rs
+index f40bc38..3964baa 100644
+--- a/tests/integration.rs
++++ b/tests/integration.rs
+@@ -2610,3 +2610,623 @@ fn test_node_mutable_access() {
+     assert_eq!(node.children_mut().len(), 1);
+     assert_eq!(*node.operator_mut(), Operator::RootNode);
+ }
++
++// ============================================================================
++// Property-based tests (hegel)
++//
++// These tests generate random inputs and check evalexpr against independent
++// oracles (a reference interpreter, Rust's own semantics, or the crate's
++// documented contracts).
++//
++// KNOWN FAILURES (real bugs, deliberately left failing; see the
++// `known_failure_*` tests below for deterministic pins):
++// 1. `str::substring` slices at raw byte indices and panics when an index
++//    falls inside a multi-byte UTF-8 character (src/function/builtin.rs:295).
++// 2. `shl`/`shr` use unchecked shifts and panic (in debug builds) when the
++//    shift amount is negative or >= 64 (src/value/numeric_types/default_numeric_types.rs).
++// 3. The literal `-9223372036854775808` (i64::MIN) silently parses as a
++//    Float instead of an Int, because the tokenizer parses the unsigned part
++//    `9223372036854775808` which overflows i64 and falls back to f64.
++// 4. `len` is documented to return the *character* length of a string but
++//    returns the byte length (src/function/builtin.rs:221).
++// 5. Parsing/evaluating/dropping deeply nested expressions recurses without a
++//    depth limit and overflows the stack, aborting the whole process (~4500
++//    nesting depth in a debug build). See
++//    `known_failure_deeply_nested_expression_overflows_stack` (kept #[ignore]d
++//    because a stack overflow aborts the test process, it cannot be caught).
++// ============================================================================
++
++use hegel::generators::{self, Generator};
++
++/// Renders an i64 as an expression literal. Negative values are wrapped in
++/// parentheses so they can be embedded after another operator unambiguously
++/// (the leading `-` is a unary negation operator token, not part of the
++/// literal).
++fn int_leaf(n: i64) -> String {
++    if n < 0 {
++        format!("({})", n)
++    } else {
++        n.to_string()
++    }
++}
++
++/// Renders a finite f64 as an expression literal (see `int_leaf` for why
++/// negative values are parenthesized). `{:?}` produces a shortest-roundtrip
++/// decimal or scientific form, both of which the tokenizer accepts.
++fn float_leaf(x: f64) -> String {
++    if x.is_sign_negative() {
++        format!("({:?})", x)
++    } else {
++        format!("{:?}", x)
++    }
++}
++
++/// Quotes a string as an expression string literal, escaping the two
++/// characters the grammar requires escaping (`\` and `"`).
++fn quote(s: &str) -> String {
++    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
++}
++
++/// Identifiers for variables: must not collide with literals the tokenizer
++/// recognizes. `true`/`false` parse as booleans, and `inf`/`nan`/`infinity`
++/// parse as f64 via Rust's `FromStr` fallback, so they can never be variables.
++#[hegel::composite]
++fn identifiers(tc: &hegel::TestCase) -> String {
++    tc.draw(
++        generators::from_regex(r"[a-z_][a-z0-9_]{0,8}")
++            .fullmatch(true)
++            .filter(|s| !matches!(s.as_str(), "true" | "false" | "inf" | "nan" | "infinity")),
++    )
++}
++
++/// A random arithmetic expression tree over int and float literals.
++#[derive(Debug, Clone, hegel::PrettyPrintable)]
++enum ArithExpr {
++    Int(i64),
++    Float(f64),
++    Neg(Box<ArithExpr>),
++    Bin(char, Box<ArithExpr>, Box<ArithExpr>),
++}
++
++fn arith_exprs(depth: u32) -> generators::BoxedGenerator<'static, ArithExpr> {
++    hegel::compose!(|tc| {
++        if depth == 0 || tc.draw(generators::booleans()) {
++            if tc.draw(generators::booleans()) {
++                // i64::MIN excluded: its literal form parses as a Float, which is
++                // pinned by known_failure_i64_min_literal_parses_as_float.
++                // Boundary values are boosted explicitly so that the oracle's
++                // error paths (overflow, division by zero) fire regularly —
++                // unboosted draws almost never produce those coincidences.
++                ArithExpr::Int(tc.draw(hegel::one_of!(
++                    generators::integers::<i64>().min_value(i64::MIN + 1),
++                    generators::sampled_from(vec![0, 1, -1, i64::MAX, i64::MIN + 1]),
++                )))
++            } else {
++                // NaN/infinity excluded: the literal grammar cannot express them
++                // (`inf`/`nan` parse only via the f64 FromStr fallback, and the
++                // oracle comparison below already tolerates NaN *results*).
++                ArithExpr::Float(
++                    tc.draw(
++                        generators::floats::<f64>()
++                            .allow_nan(false)
++                            .allow_infinity(false),
++                    ),
++                )
++            }
++        } else if tc.draw(generators::integers::<u8>().max_value(6)) == 0 {
++            ArithExpr::Neg(Box::new(tc.draw((arith_exprs(depth - 1)).print_as_debug())))
++        } else {
++            let op = tc.draw(generators::sampled_from(vec!['+', '-', '*', '/', '%', '^']));
++            let left = Box::new(tc.draw((arith_exprs(depth - 1)).print_as_debug()));
++            let right = Box::new(tc.draw((arith_exprs(depth - 1)).print_as_debug()));
++            ArithExpr::Bin(op, left, right)
++        }
++    })
++    .boxed()
++}
++
++fn render_arith(e: &ArithExpr) -> String {
++    match e {
++        ArithExpr::Int(n) => int_leaf(*n),
++        ArithExpr::Float(x) => float_leaf(*x),
++        ArithExpr::Neg(inner) => format!("(-{})", render_arith(inner)),
++        ArithExpr::Bin(op, l, r) => format!("({} {} {})", render_arith(l), op, render_arith(r)),
++    }
++}
++
++/// The result of the reference interpreter: an int, a float, or "evalexpr
++/// documents this as an error" (overflow, division by zero).
++#[derive(Debug, PartialEq, Clone, Copy)]
++enum RefNum {
++    I(i64),
++    F(f64),
++}
++
++fn ref_as_f64(n: RefNum) -> f64 {
++    match n {
++        RefNum::I(i) => i as f64,
++        RefNum::F(f) => f,
++    }
++}
++
++/// Reference interpreter implementing evalexpr's documented arithmetic
++/// semantics: int op int is checked i64 arithmetic (errors on overflow and
++/// division/remainder by zero), any float operand promotes the operation to
++/// f64, and `^` always computes in f64.
++fn ref_eval(e: &ArithExpr) -> Result<RefNum, ()> {
++    Ok(match e {
++        ArithExpr::Int(n) => RefNum::I(*n),
++        ArithExpr::Float(x) => RefNum::F(*x),
++        ArithExpr::Neg(inner) => match ref_eval(inner)? {
++            RefNum::I(n) => RefNum::I(n.checked_neg().ok_or(())?),
++            RefNum::F(x) => RefNum::F(-x),
++        },
++        ArithExpr::Bin(op, l, r) => {
++            let l = ref_eval(l)?;
++            let r = ref_eval(r)?;
++            if *op == '^' {
++                RefNum::F(ref_as_f64(l).powf(ref_as_f64(r)))
++            } else if let (RefNum::I(a), RefNum::I(b)) = (l, r) {
++                RefNum::I(
++                    match op {
++                        '+' => a.checked_add(b),
++                        '-' => a.checked_sub(b),
++                        '*' => a.checked_mul(b),
++                        '/' => a.checked_div(b),
++                        '%' => a.checked_rem(b),
++                        _ => unreachable!(),
++                    }
++                    .ok_or(())?,
++                )
++            } else {
++                let (a, b) = (ref_as_f64(l), ref_as_f64(r));
++                RefNum::F(match op {
++                    '+' => a + b,
++                    '-' => a - b,
++                    '*' => a * b,
++                    '/' => a / b,
++                    '%' => a % b,
++                    _ => unreachable!(),
++                })
++            }
++        },
++    })
++}
++
++/// Property: eval never panics on completely arbitrary text. Garbage must be
++/// rejected with an Err, not a crash.
++#[hegel::test]
++fn hegel_eval_never_panics_on_arbitrary_text(tc: hegel::TestCase) {
++    let s: String = tc.draw(generators::text());
++    drop(eval(&s));
++}
++
++/// Property: eval never panics on "token soup" — sequences of valid lexical
++/// tokens in arbitrary order, which reach much deeper into the parser than
++/// plain garbage does.
++///
++/// `shl`, `shr` and `str::substring` are deliberately absent from the
++/// vocabulary: they can panic on inputs this test could assemble, which is
++/// pinned by known_failure_shift_panics_on_shift_overflow and
++/// known_failure_substring_panics_inside_multibyte_char.
++#[hegel::test]
++fn hegel_eval_never_panics_on_token_soup(tc: hegel::TestCase) {
++    let vocabulary = vec![
++        "+",
++        "-",
++        "*",
++        "/",
++        "%",
++        "^",
++        "==",
++        "!=",
++        "<",
++        ">",
++        "<=",
++        ">=",
++        "&&",
++        "||",
++        "!",
++        "(",
++        ")",
++        ",",
++        ";",
++        "=",
++        "+=",
++        "-=",
++        "*=",
++        "/=",
++        "%=",
++        "^=",
++        "&&=",
++        "||=",
++        "0",
++        "1",
++        "42",
++        "3.5",
++        "1e3",
++        "1e-3",
++        "0x1f",
++        "0b101",
++        "0o17",
++        "9223372036854775807",
++        "true",
++        "false",
++        "inf",
++        "nan",
++        "\"\"",
++        "\"abc\"",
++        "\"\\\"\"",
++        "\"\u{e4}\u{1f600}\"",
++        "a",
++        "x",
++        "foo",
++        "min",
++        "max",
++        "len",
++        "if",
++        "typeof",
++        "math::sqrt",
++        "math::abs",
++        "str::from",
++        "str::to_uppercase",
++        "contains",
++        "bitnot",
++        "//",
++        "/*",
++        "*/",
++        "\"",
++        "\\",
++    ];
++    let tokens: Vec<&str> =
++        tc.draw(generators::vecs(generators::sampled_from(vocabulary)).max_size(25));
++    let mut expression = String::new();
++    for token in tokens {
++        expression.push_str(token);
++        if tc.draw(generators::booleans()) {
++            expression.push(' ');
++        }
++    }
++    tc.note(&expression);
++    drop(eval(&expression));
++}
++
++/// Property: arithmetic over int/float literals matches an independent
++/// reference interpreter implementing the documented semantics (checked i64
++/// arithmetic, float promotion, `^` always float).
++#[hegel::test]
++fn hegel_arithmetic_matches_reference_interpreter(tc: hegel::TestCase) {
++    let depth = tc.draw(generators::integers::<u32>().max_value(4));
++    let expr = tc.draw(arith_exprs(depth));
++    let rendered = render_arith(&expr);
++    tc.note(&rendered);
++    let actual = eval(&rendered);
++    match ref_eval(&expr) {
++        Ok(RefNum::I(expected)) => {
++            assert_eq!(actual, Ok(Value::Int(expected)), "expression: {rendered}");
++        },
++        Ok(RefNum::F(expected)) => match actual {
++            Ok(Value::Float(y)) => assert!(
++                (expected.is_nan() && y.is_nan()) || expected.to_bits() == y.to_bits(),
++                "expression: {rendered}: expected {expected:?}, got {y:?}"
++            ),
++            other => panic!("expression: {rendered}: expected Float({expected:?}), got {other:?}"),
++        },
++        Err(()) => assert!(
++            actual.is_err(),
++            "expression: {rendered}: expected an error, got {actual:?}"
++        ),
++    }
++}
++
++/// Property: an unparenthesized operator chain evaluates exactly like the
++/// explicitly parenthesized version dictated by the documented precedence
++/// table (^ 120 > * / % 100 > + - 95) with left-to-right associativity.
++#[hegel::test]
++fn hegel_precedence_matches_explicit_parenthesization(tc: hegel::TestCase) {
++    fn precedence(op: &str) -> u32 {
++        match op {
++            "^" => 120,
++            "*" | "/" | "%" => 100,
++            "+" | "-" => 95,
++            _ => unreachable!(),
++        }
++    }
++
++    let op_count = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++    let mut operands = Vec::new();
++    for _ in 0..=op_count {
++        // i64::MIN excluded: pinned by known_failure_i64_min_literal_parses_as_float.
++        operands.push(tc.draw(generators::integers::<i64>().min_value(i64::MIN + 1)));
++    }
++    let mut ops = Vec::new();
++    for _ in 0..op_count {
++        ops.push(tc.draw(generators::sampled_from(vec!["+", "-", "*", "/", "%", "^"])));
++    }
++
++    let mut flat = int_leaf(operands[0]);
++    for (op, operand) in ops.iter().zip(&operands[1..]) {
++        flat.push_str(&format!(" {} {}", op, int_leaf(*operand)));
++    }
++
++    // Shunting-yard construction of the fully parenthesized equivalent.
++    let mut out = vec![int_leaf(operands[0])];
++    let mut op_stack: Vec<&str> = Vec::new();
++    for (op, operand) in ops.iter().zip(&operands[1..]) {
++        while let Some(top) = op_stack.last() {
++            if precedence(top) >= precedence(op) {
++                let r = out.pop().unwrap();
++                let l = out.pop().unwrap();
++                out.push(format!("({} {} {})", l, top, r));
++                op_stack.pop();
++            } else {
++                break;
++            }
++        }
++        op_stack.push(op);
++        out.push(int_leaf(*operand));
++    }
++    while let Some(top) = op_stack.pop() {
++        let r = out.pop().unwrap();
++        let l = out.pop().unwrap();
++        out.push(format!("({} {} {})", l, top, r));
++    }
++    let grouped = out.pop().unwrap();
++
++    let flat_result = eval(&flat);
++    let grouped_result = eval(&grouped);
++    // Value's PartialEq is false for NaN == NaN, but two NaN results agree
++    // for the purposes of this property (e.g. `^` legitimately yields NaN).
++    let both_nan = matches!(
++        (&flat_result, &grouped_result),
++        // Fully qualified: EvalexprFloat also defines an `is_nan` method.
++        (Ok(Value::Float(x)), Ok(Value::Float(y))) if f64::is_nan(*x) && f64::is_nan(*y)
++    );
++    assert!(
++        both_nan || flat_result == grouped_result,
++        "flat: {flat} = {flat_result:?} | grouped: {grouped} = {grouped_result:?}"
++    );
++}
++
++/// Property: every i64 round-trips through its literal forms (decimal, and
++/// hex/octal/binary for the non-negative range those notations cover).
++#[hegel::test]
++fn hegel_int_literal_roundtrip(tc: hegel::TestCase) {
++    // i64::MIN excluded: pinned by known_failure_i64_min_literal_parses_as_float.
++    let n = tc.draw(generators::integers::<i64>().min_value(i64::MIN + 1));
++    assert_eq!(eval(&n.to_string()), Ok(Value::Int(n)));
++    if n >= 0 {
++        assert_eq!(eval(&format!("{:#x}", n)), Ok(Value::Int(n)));
++        assert_eq!(eval(&format!("{:#o}", n)), Ok(Value::Int(n)));
++        assert_eq!(eval(&format!("{:#b}", n)), Ok(Value::Int(n)));
++    }
++}
++
++/// Property: every finite f64 round-trips bit-exactly through its shortest
++/// decimal/scientific literal form.
++#[hegel::test]
++fn hegel_float_literal_roundtrip(tc: hegel::TestCase) {
++    let x = tc.draw(
++        generators::floats::<f64>()
++            .allow_nan(false)
++            .allow_infinity(false),
++    );
++    let rendered = format!("{:?}", x);
++    match eval(&rendered) {
++        Ok(Value::Float(y)) => assert_eq!(
++            x.to_bits(),
++            y.to_bits(),
++            "literal {rendered}: expected {x:?}, got {y:?}"
++        ),
++        other => panic!("literal {rendered}: expected Float, got {other:?}"),
++    }
++}
++
++/// Property: comparison operators on integer literals agree with Rust's i64
++/// comparisons.
++#[hegel::test]
++fn hegel_comparison_operators_match_rust_on_ints(tc: hegel::TestCase) {
++    // i64::MIN excluded: its literal parses as Float (pinned by
++    // known_failure_i64_min_literal_parses_as_float), which switches the
++    // comparison to lossy f64 semantics.
++    let a = tc.draw(generators::integers::<i64>().min_value(i64::MIN + 1));
++    let b = tc.draw(generators::integers::<i64>().min_value(i64::MIN + 1));
++    let op = tc.draw(generators::sampled_from(vec![
++        "<", ">", "<=", ">=", "==", "!=",
++    ]));
++    let expected = match op {
++        "<" => a < b,
++        ">" => a > b,
++        "<=" => a <= b,
++        ">=" => a >= b,
++        "==" => a == b,
++        "!=" => a != b,
++        _ => unreachable!(),
++    };
++    let expression = format!("{} {} {}", int_leaf(a), op, int_leaf(b));
++    assert_eq!(
++        eval(&expression),
++        Ok(Value::Boolean(expected)),
++        "expression: {expression}"
++    );
++}
++
++/// Property: `&&`, `||` and `!` on boolean literals agree with Rust's boolean
++/// operators. (evalexpr evaluates both operands eagerly — this asserts
++/// truth-table agreement, not short-circuiting.)
++#[hegel::test]
++fn hegel_boolean_operators_match_rust(tc: hegel::TestCase) {
++    let a = tc.draw(generators::booleans());
++    let b = tc.draw(generators::booleans());
++    let op = tc.draw(generators::sampled_from(vec!["&&", "||"]));
++    let expected = match op {
++        "&&" => a && !b,
++        "||" => a || !b,
++        _ => unreachable!(),
++    };
++    let expression = format!("{} {} !{}", a, op, b);
++    assert_eq!(
++        eval(&expression),
++        Ok(Value::Boolean(expected)),
++        "expression: {expression}"
++    );
++}
++
++/// Property: binary operators on string literals match Rust's String
++/// semantics: `+` concatenates, comparisons use lexicographic order.
++/// This exercises string-literal tokenization (including escapes) end-to-end.
++#[hegel::test]
++fn hegel_string_operators_match_rust(tc: hegel::TestCase) {
++    let a: String = tc.draw(generators::text().max_size(30));
++    let b: String = tc.draw(generators::text().max_size(30));
++    let op = tc.draw(generators::sampled_from(vec![
++        "+", "<", ">", "<=", ">=", "==", "!=",
++    ]));
++    let expected = match op {
++        "+" => Value::String(format!("{a}{b}")),
++        "<" => Value::Boolean(a < b),
++        ">" => Value::Boolean(a > b),
++        "<=" => Value::Boolean(a <= b),
++        ">=" => Value::Boolean(a >= b),
++        "==" => Value::Boolean(a == b),
++        "!=" => Value::Boolean(a != b),
++        _ => unreachable!(),
++    };
++    let expression = format!("{} {} {}", quote(&a), op, quote(&b));
++    assert_eq!(eval(&expression), Ok(expected), "expression: {expression}");
++}
++
++/// Property: `str::substring` with byte indices on char boundaries returns
++/// exactly the Rust slice `&s[start..end]`.
++///
++/// Indices are restricted to char boundaries because non-boundary indices
++/// make the builtin panic — pinned by
++/// known_failure_substring_panics_inside_multibyte_char.
++#[hegel::test]
++fn hegel_substring_matches_rust_on_char_boundaries(tc: hegel::TestCase) {
++    let s: String = tc.draw(generators::text().max_size(30));
++    let mut boundaries: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
++    boundaries.push(s.len());
++    let a = tc.draw(generators::integers::<usize>().max_value(boundaries.len() - 1));
++    let b = tc.draw(generators::integers::<usize>().max_value(boundaries.len() - 1));
++    let (start, end) = (boundaries[a.min(b)], boundaries[a.max(b)]);
++    let expression = format!("str::substring({}, {}, {})", quote(&s), start, end);
++    assert_eq!(
++        eval(&expression),
++        Ok(Value::from(&s[start..end])),
++        "expression: {expression}"
++    );
++}
++
++/// Property: a variable stored in a context via the API is read back
++/// unchanged by evaluating the bare identifier.
++#[hegel::test]
++fn hegel_context_variable_read_returns_stored_value(tc: hegel::TestCase) {
++    let name = tc.draw(identifiers());
++    // NaN excluded from the drawn value: Value's PartialEq (used by the
++    // assertion) is false for NaN == NaN.
++    let value: Value = match tc.draw(generators::integers::<u8>().max_value(3)) {
++        0 => Value::Int(tc.draw(generators::integers::<i64>())),
++        1 => Value::Float(tc.draw(generators::floats::<f64>().allow_nan(false))),
++        2 => Value::Boolean(tc.draw(generators::booleans())),
++        _ => Value::String(tc.draw(generators::text().max_size(20))),
++    };
++    let mut context = HashMapContext::<DefaultNumericTypes>::new();
++    context.set_value(name.clone(), value.clone()).unwrap();
++    assert_eq!(
++        eval_with_context(&name, &context),
++        Ok(value),
++        "identifier: {name}"
++    );
++}
++
++/// Property: an assignment expression writes the value into the context, and
++/// a chained read returns it.
++#[hegel::test]
++fn hegel_assignment_roundtrip(tc: hegel::TestCase) {
++    let name = tc.draw(identifiers());
++    // i64::MIN excluded: pinned by known_failure_i64_min_literal_parses_as_float.
++    let n = tc.draw(generators::integers::<i64>().min_value(i64::MIN + 1));
++    let mut context = HashMapContext::<DefaultNumericTypes>::new();
++    let script = format!("{} = {}; {}", name, int_leaf(n), name);
++    assert_eq!(
++        eval_with_context_mut(&script, &mut context),
++        Ok(Value::Int(n)),
++        "script: {script}"
++    );
++    assert_eq!(context.get_value(&name), Some(&Value::Int(n)));
++}
++
++// ============================================================================
++// KNOWN FAILURES — deterministic pins of real bugs found by the properties
++// above. These tests assert the *documented/expected* behavior and therefore
++// FAIL until the bugs are fixed. Do not "fix" the tests.
++// ============================================================================
++
++/// KNOWN FAILURE: `str::substring` slices the string at raw byte indices
++/// without checking char boundaries (src/function/builtin.rs:295), so an
++/// index inside a multi-byte UTF-8 character makes `eval` PANIC instead of
++/// returning an error:
++///   byte index 1 is not a char boundary; it is inside 'ä' (bytes 0..2)
++#[test]
++fn known_failure_substring_panics_inside_multibyte_char() {
++    let result = eval("str::substring(\"\u{e4}\", 0, 1)");
++    // Any non-panicking result would be acceptable; today this line is never
++    // reached because eval panics.
++    assert!(result.is_err() || result.is_ok());
++}
++
++/// KNOWN FAILURE: the `shl`/`shr` builtins use Rust's unchecked shift
++/// operators (src/value/numeric_types/default_numeric_types.rs), which PANIC
++/// in debug builds for shift amounts >= 64 or negative (in release builds
++/// they silently mask the shift amount instead). Expected: an Err, like every
++/// other arithmetic overflow in this crate.
++#[test]
++fn known_failure_shift_panics_on_shift_overflow() {
++    let result = eval("shl(1, 64)");
++    assert!(result.is_err() || result.is_ok()); // never reached: eval panics
++    let result = eval("shr(1, 0-1)");
++    assert!(result.is_err() || result.is_ok()); // never reached: eval panics
++}
++
++/// KNOWN FAILURE: the decimal literal for i64::MIN evaluates to
++/// Float(-9.223372036854776e18) instead of Int(i64::MIN). The tokenizer
++/// parses the unsigned digits `9223372036854775808`, which overflow i64, so
++/// it silently falls back to f64 before unary negation is applied. Every
++/// other i64 round-trips (see hegel_int_literal_roundtrip).
++#[test]
++fn known_failure_i64_min_literal_parses_as_float() {
++    assert_eq!(
++        eval("-9223372036854775808"),
++        Ok(Value::Int(i64::MIN)),
++        "i64::MIN literal should be an Int; it currently evaluates to a Float"
++    );
++}
++
++/// KNOWN FAILURE: `len` is documented as "Returns the character length of a
++/// string" but returns the byte length (src/function/builtin.rs:221 uses
++/// `str::len`). "ä" is one character but two bytes.
++#[test]
++fn known_failure_len_counts_bytes_not_characters() {
++    assert_eq!(
++        eval("len(\"\u{e4}\")"),
++        Ok(Value::Int(1)),
++        "len should count characters per its documentation; it counts bytes"
++    );
++}
++
++/// KNOWN FAILURE (process-aborting, therefore #[ignore]d): parsing,
++/// evaluating and dropping the operator tree all recurse per nesting level
++/// with no depth limit. A parenthesized expression nested ~4500 deep
++/// overflows the stack in a debug build and ABORTS the whole test process
++/// (SIGABRT) — it cannot be caught, so this reproducer must stay ignored.
++///
++/// Run manually with:
++///   cargo test known_failure_deeply_nested_expression_overflows_stack -- --ignored
++#[test]
++#[ignore = "stack overflow aborts the process; run manually"]
++fn known_failure_deeply_nested_expression_overflows_stack() {
++    let depth = 10_000;
++    let expression = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
++    assert_eq!(eval(&expression), Ok(Value::Int(1)));
++}
