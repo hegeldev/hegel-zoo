@@ -137,7 +137,13 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
                 s = lines[row]
                 while k < len(s):
                     c = s[k]
-                    if c in "([{":
+                    if c == '"':  # skip string literals (they may contain brackets)
+                        k += 1
+                        while k < len(s) and s[k] != '"':
+                            k += 2 if s[k] == "\\" else 1
+                    elif s.startswith("//", k):  # skip line comments
+                        break
+                    elif c in "([{":
                         depth += 1
                     elif c in ")]}":
                         if depth == 0:
