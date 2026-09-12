@@ -8,6 +8,10 @@ Standard library only (Python 3.11+). Run from anywhere inside the repository.
   zoo test   <target>...        apply, run the tests, judge against expected_failures
   zoo save   <target>           regenerate hegel.patch from the working tree in work/
   zoo check  [<target>...]      static consistency checks (add --apply to also verify patches apply)
+  zoo drift  [<target>...]      compare base.commit with upstream's default branch (ls-remote, no clone)
+  zoo bump   <target>... [--to <commit>] [--accept-fixed] [--finish]
+                                rebase hegel.patch onto upstream HEAD (or --to), run, record the
+                                outcome: [[bug.observed]] rows, [base], README history line
   zoo bump-hegel <lang> <ver>   rewrite zoo.toml and every patch's dependency line for <lang>
   zoo report                    regenerate TROPHIES.md from all bugs.toml files
   zoo new    <lang> <name> <upstream-url>   scaffold a target directory
@@ -184,6 +188,10 @@ class Backend:
     def patch_excludes(self) -> list[str]:
         return []
 
+    def package_version(self, t: Target) -> str:
+        """Upstream's own version string at the checked-out commit ("" if unknown)."""
+        return ""
+
 
 class Rust(Backend):
     lang = "rust"
@@ -230,6 +238,23 @@ class Rust(Backend):
 
     def patch_excludes(self) -> list[str]:
         return [":(exclude,glob)**/Cargo.lock"]
+
+    def package_version(self, t: Target) -> str:
+        """[package] version of the crate in t.src, following workspace inheritance; when the
+        subdir is only a test harness (snap's test/), the root package's version."""
+        def load(p: Path) -> dict:
+            try:
+                return tomllib.loads((p / "Cargo.toml").read_text())
+            except Exception:
+                return {}
+        pkg = load(t.src).get("package", {})
+        root = load(t.work)
+        if t.src != t.work and pkg.get("name") != t.name and root.get("package", {}).get("name") == t.name:
+            pkg = root["package"]
+        v = pkg.get("version", "")
+        if isinstance(v, dict) and v.get("workspace"):
+            v = root.get("workspace", {}).get("package", {}).get("version", "")
+        return v if isinstance(v, str) else ""
 
 
 BACKENDS: dict[str, Backend] = {b.lang: b for b in (Rust(),)}
@@ -363,7 +388,9 @@ def judge(t: Target, results: dict[str, str]) -> Verdict:
     return v
 
 
-def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
+def run_tests(t: Target, test_cases: int | None, no_apply: bool) -> Verdict | None:
+    """Apply (unless no_apply), run the suite, judge it and print the verdict. None when no
+    test result could be parsed at all (build failure): the tail of the log is printed."""
     b = backend(t)
     if not no_apply:
         apply(t)
@@ -384,7 +411,7 @@ def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
     if not results:
         print(r.stdout[-4000:])
         log(f"{t.id}: no test results parsed (exit {r.returncode}); full log at {logfile}")
-        return False
+        return None
     v = judge(t, results)
     flag = "OK " if v.ok else "BAD"
     print(f"{flag} {t.id}: {len(v.passed)} passed, {len(v.expected_failed)} expected failures, "
@@ -405,7 +432,233 @@ def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
         print(f"    MISSING {n}  (expected failure not found in results)")
     if not v.ok:
         log(f"{t.id}: full log at {logfile}")
-    return v.ok
+    return v
+
+
+def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
+    v = run_tests(t, test_cases, no_apply)
+    return v is not None and v.ok
+
+
+# --------------------------------------------------------------------------- drift / bump
+
+def upstream_head(t: Target) -> tuple[str, str]:
+    """(sha, branch) of upstream's default branch, by ls-remote: no clone needed."""
+    r = run(["git", "ls-remote", "--symref", t.meta["upstream"], "HEAD"], check=False, capture=True)
+    if r.returncode != 0:
+        die(f"{t.id}: ls-remote {t.meta['upstream']} failed:\n{r.stdout.strip()}")
+    branch, sha = "", ""
+    for line in r.stdout.splitlines():
+        if line.startswith("ref: "):
+            branch = line.split()[1].removeprefix("refs/heads/")
+        elif line.endswith("\tHEAD"):
+            sha = line.split()[0]
+    if not sha:
+        die(f"{t.id}: could not read upstream HEAD from ls-remote output:\n{r.stdout}")
+    return sha, branch
+
+
+def drift(targets: list[Target]) -> int:
+    """Print, per target, whether upstream's default branch has moved past base.commit."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t: Target) -> tuple[Target, str, str]:
+        try:
+            sha, branch = upstream_head(t)
+            return t, sha, branch
+        except SystemExit as e:
+            return t, "", str(e)
+
+    behind = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for t, sha, branch in ex.map(one, targets):
+            base = t.meta["base"]["commit"]
+            if not sha:
+                print(f"?       {t.id}: {branch}")
+            elif sha == base:
+                print(f"current {t.id} {base[:12]} ({t.meta['base'].get('version', '')}, {t.meta['base'].get('date', '')})")
+            else:
+                behind += 1
+                print(f"behind  {t.id} {base[:12]} ({t.meta['base'].get('date', '')}) -> {sha[:12]} on {branch}")
+    print(f"zoo drift: {behind}/{len(targets)} targets behind upstream")
+    return behind
+
+
+def _fetch_commit(t: Target, ref: str) -> str:
+    """Fetch <ref> (sha, branch or tag) into the target's checkout; return its full sha."""
+    r = git(t, "fetch", "-q", "--depth", "1", "origin", ref, check=False, capture=True)
+    if r.returncode != 0:
+        log(f"{t.id}: shallow fetch of {ref} refused ({r.stdout.strip()[-200:]}); fetching full history")
+        git(t, "fetch", "-q", "origin")
+        return git(t, "rev-parse", "--verify", f"{ref}^{{commit}}", capture=True).stdout.strip()
+    return git(t, "rev-parse", "FETCH_HEAD", capture=True).stdout.strip()
+
+
+def _set_base(t: Target, commit: str, date: str, version: str) -> None:
+    tt = t.dir / "target.toml"
+    s = tt.read_text()
+    head, _, rest = s.partition("[base]\n")
+    block, _, tail = rest.partition("\n[")
+    if not _:
+        block, tail = rest, ""
+    block = re.sub(r'(?m)^commit = "[^"]*"', f"commit = {toml_str(commit)}", block)
+    block = re.sub(r'(?m)^date = "[^"]*"', f"date = {toml_str(date)}", block)
+    if version:
+        block = re.sub(r'(?m)^version = "[^"]*"', f"version = {toml_str(version)}", block)
+    tt.write_text(head + "[base]\n" + block + ("\n[" + tail if _ else ""))
+
+
+def _drop_expected_failures(t: Target, tests: set[str]) -> None:
+    tt = t.dir / "target.toml"
+    out, in_section = [], False
+    for line in tt.read_text().split("\n"):
+        if line.startswith("["):
+            in_section = line.strip() == "[expected_failures]"
+        m = re.match(r'^"?([^"=]+?)"?\s*=', line)
+        if in_section and m and m.group(1).strip() in tests:
+            continue
+        out.append(line)
+    tt.write_text("\n".join(out))
+
+
+def _bug_chunks(text: str) -> list[str]:
+    """Split bugs.toml into its leading text and one chunk per [[bug]] (each chunk carries its
+    [[bug.observed]] rows), preserving formatting."""
+    return re.split(r"(?m)^(?=\[\[bug\]\]\n)", text)
+
+
+def _record_observations(t: Target, commit: str, version: str, hegel: str, today: str,
+                         results: dict[str, str], fixed: set[str]) -> None:
+    """Append one [[bug.observed]] row per bug in `results`; mark bugs in `fixed` as fixed."""
+    bf = t.dir / "bugs.toml"
+    if not bf.is_file():
+        return
+    chunks = _bug_chunks(bf.read_text())
+    for i, ch in enumerate(chunks):
+        m = re.search(r'(?m)^id = "([^"]+)"', ch)
+        if not m or m.group(1) not in results:
+            continue
+        bid = m.group(1)
+        if bid in fixed:
+            ch = re.sub(r'(?m)^status = "[^"]*"', 'status = "fixed"', ch, count=1)
+            if re.search(r'(?m)^fixed_in = ""', ch):
+                ch = re.sub(r'(?m)^fixed_in = ""', f"fixed_in = {toml_str(f'{version} ({commit[:12]})')}", ch, count=1)
+            else:
+                ch = re.sub(r'(?m)^(status = "fixed"\n)', rf"\g<1>fixed_in = {toml_str(f'{version} ({commit[:12]})')}\n", ch, count=1)
+        row = (f"[[bug.observed]]\nversion = {toml_str(version)}\ncommit = {toml_str(commit[:12])}\n"
+               f"hegel = {toml_str(hegel)}\ndate = {toml_str(today)}\nresult = {toml_str(results[bid])}\n")
+        chunks[i] = ch.rstrip("\n") + "\n\n" + row
+    bf.write_text("".join(chunks).rstrip("\n") + "\n")
+    tomllib.loads(bf.read_text())  # never leave an unparsable bugs.toml behind
+
+
+def bump(t: Target, to: str | None, accept_fixed: bool, finish: bool, keep: bool) -> str:
+    """Try the patch and the suite at a newer upstream commit; land it in targets/ when clean.
+
+    Returns one of: current (nothing to do), conflict (patch does not apply; checkout left for a
+    hand rebase, then `zoo test --no-apply` and `zoo bump --finish`), failed (unexpected failures /
+    unrun tests: investigate in the checkout), decide (an expected failure passed: rerun with
+    --accept-fixed to record the bugs as fixed), bumped."""
+    base = t.meta["base"]["commit"]
+    if finish:
+        if not (t.work / ".git").is_dir():
+            die(f"{t.id}: --finish needs the checkout from an earlier `zoo bump` in {t.work}")
+        new = git(t, "rev-parse", "HEAD", capture=True).stdout.strip()
+        if new == base:
+            die(f"{t.id}: checkout is still at the base commit; nothing to finish")
+    else:
+        fetch(t)
+        if to:
+            new = _fetch_commit(t, to)
+        else:
+            new, branch = upstream_head(t)
+            if new == base:
+                print(f"current {t.id}: upstream {branch} is still {base[:12]}")
+                return "current"
+            _fetch_commit(t, new)
+        if new == base:
+            print(f"current {t.id}: already at {base[:12]}")
+            return "current"
+        git(t, "checkout", "-q", "--detach", new)
+        git(t, "reset", "-q", "--hard")
+        git(t, "clean", "-fdq")
+        r = git(t, "apply", "--3way", str(t.patch), check=False, capture=True)
+        if r.returncode != 0:
+            conflicted = git(t, "diff", "--name-only", "--diff-filter=U", capture=True).stdout.split()
+            print(f"CONFLICT {t.id}: hegel.patch does not apply at {new[:12]}"
+                  + (f"; conflicts in {', '.join(conflicted)}" if conflicted else ""))
+            print("    " + r.stdout.strip().replace("\n", "\n    ")[-1500:])
+            log(f"{t.id}: resolve in {t.work.relative_to(ROOT)}, then `zoo test --no-apply {t.id}` and `zoo bump --finish {t.id}`")
+            return "conflict"
+    subject = git(t, "log", "-1", "--format=%s", new, capture=True).stdout.strip()
+    date = git(t, "log", "-1", "--format=%cs", new, capture=True).stdout.strip()
+    log(f"{t.id}: {base[:12]} -> {new[:12]} ({date}: {subject})")
+    v = run_tests(t, None, no_apply=True)
+    if v is None:
+        print(f"FAILED  {t.id}: no test results at {new[:12]} (build broken?); checkout kept in {t.work.relative_to(ROOT)}")
+        return "failed"
+    if v.unexpected_failed or v.not_run or v.missing:
+        print(f"FAILED  {t.id} at {new[:12]}: {len(v.unexpected_failed)} unexpected failures, "
+              f"{len(v.not_run)} patch tests not run, {len(v.missing)} expected-failure tests missing; "
+              f"checkout kept in {t.work.relative_to(ROOT)} (new bug? changed API? fix, `zoo test --no-apply`, `zoo bump --finish`)")
+        return "failed"
+    if v.unexpected_passed and not accept_fixed:
+        print(f"DECIDE  {t.id} at {new[:12]}: {len(v.unexpected_passed)} expected failure(s) passed — "
+              f"{', '.join(v.unexpected_passed)}. Fixed upstream? Rerun with --accept-fixed to record that "
+              f"(or map the test elsewhere first); checkout kept in {t.work.relative_to(ROOT)}")
+        return "decide"
+    # observations per bug: reproduces if any of its tests still fails; fixed if all passed (and
+    # none is intermittent); not-reproduced for intermittent tests that happened to pass
+    exp = t.expected_failures
+    inter = t.intermittent
+    per_bug: dict[str, set[str]] = {}
+    for name in v.expected_failed:
+        per_bug.setdefault(exp[name], set()).add("reproduces")
+    for name in v.unexpected_passed:
+        per_bug.setdefault(exp[name], set()).add("passed")
+    for name in v.intermittent_passed:
+        per_bug.setdefault(exp[name], set()).add("not-reproduced")
+    results: dict[str, str] = {}
+    fixed: set[str] = set()
+    for bid, seen in per_bug.items():
+        if "reproduces" in seen:
+            results[bid] = "reproduces"
+        elif seen == {"passed"}:
+            results[bid] = "fixed"
+            fixed.add(bid)
+        else:
+            results[bid] = "not-reproduced"
+    b = backend(t)
+    version = b.package_version(t) or t.meta["base"].get("version", "")
+    hegel = t.meta["hegel"]["version"]
+    today = dt.date.today().isoformat()
+    save(t)
+    _set_base(t, new, date, version)
+    if v.unexpected_passed:
+        _drop_expected_failures(t, set(v.unexpected_passed))
+    _record_observations(t, new, version, hegel, today, results, fixed)
+    rd = t.dir / "README.md"
+    parts = [f"{sum(1 for r in results.values() if r == 'reproduces')} bug(s) still reproduce"]
+    if fixed:
+        parts.append("fixed upstream: " + ", ".join(sorted(fixed)))
+    nr = sorted(bid for bid, r in results.items() if r == "not-reproduced")
+    if nr:
+        parts.append("intermittent, not seen this run: " + ", ".join(nr))
+    unchecked = [bg["id"] for bg in t.bugs if bg.get("status") in OPEN_STATUSES and not bg.get("test")]
+    if unchecked:
+        parts.append(f"{len(unchecked)} ignored reproducer(s) not run")
+    line = (f"- {today}: base bumped {base[:12]} → {new[:12]} ({date}, \"{subject}\"; {version}); "
+            + "; ".join(parts) + f". {len(v.passed)} tests pass.\n")
+    rd.write_text(rd.read_text().rstrip("\n") + "\n" + line)
+    t2 = load_target(t.lang, t.name)
+    errs = check(t2, load_pins(), False)
+    if errs:
+        print(f"BUMPED? {t.id}: recorded, but zoo check complains: {errs}")
+        return "failed"
+    if not keep:
+        shutil.rmtree(t.work, ignore_errors=True)
+    print(f"BUMPED  {t.id}: {base[:12]} -> {new[:12]} ({version}); " + "; ".join(parts))
+    return "bumped"
 
 
 # --------------------------------------------------------------------------- check
@@ -562,6 +815,7 @@ setup = []
 # --------------------------------------------------------------------------- main
 
 def main(argv: list[str]) -> int:
+    sys.stdout.reconfigure(line_buffering=True)  # keep verdicts in step with the log() lines when piped
     ap = argparse.ArgumentParser(prog="zoo", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("fetch", "apply"):
@@ -575,6 +829,13 @@ def main(argv: list[str]) -> int:
     p = sub.add_parser("check")
     p.add_argument("targets", nargs="*")
     p.add_argument("--apply", action="store_true", help="also fetch upstream and verify the patch applies")
+    sub.add_parser("drift").add_argument("targets", nargs="*")
+    p = sub.add_parser("bump")
+    p.add_argument("targets", nargs="+")
+    p.add_argument("--to", help="upstream commit/tag/branch to move to (default: upstream HEAD); one target only")
+    p.add_argument("--accept-fixed", action="store_true", help="an expected failure that passes marks its bug fixed")
+    p.add_argument("--finish", action="store_true", help="record from the checkout as it is (after a hand rebase)")
+    p.add_argument("--keep", action="store_true", help="keep the checkout under work/ after a successful bump")
     p = sub.add_parser("bump-hegel")
     p.add_argument("lang")
     p.add_argument("version")
@@ -615,6 +876,18 @@ def main(argv: list[str]) -> int:
                     print(f"    {e}")
         print(f"zoo check: {len(ts) - bad}/{len(ts)} targets OK")
         return 1 if bad else 0
+    elif a.cmd == "drift":
+        return 1 if drift(resolve(a.targets)) else 0
+    elif a.cmd == "bump":
+        ts = resolve(a.targets)
+        if a.to and len(ts) != 1:
+            die("--to takes exactly one target")
+        outcomes = {}
+        for t in ts:
+            outcomes[t.id] = bump(t, a.to, a.accept_fixed, a.finish, a.keep)
+        if len(ts) > 1:
+            print("zoo bump: " + ", ".join(f"{k} {v}" for k, v in outcomes.items()))
+        return 0 if all(o in ("current", "bumped") for o in outcomes.values()) else 1
     elif a.cmd == "bump-hegel":
         bump_hegel(a.lang, a.version)
     elif a.cmd == "report":

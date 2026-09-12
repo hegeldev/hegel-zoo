@@ -36,3 +36,4 @@
 - 2026-03-03: predecessor base commit `65c04c355668` (Update version number.).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/ipnet.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 65c04c355668 → 13c5c5873c02 (2026-09-06, "Update RELEASES.md."; 2.12.2); 0 bug(s) still reproduce; fixed upstream: ipnet/1, ipnet/2. 105 tests pass. Upstream fixed both bugs (issue #70 in 2.12.1, #71 in 2.12.2 — filed by others, not from the zoo); the patch's test module gained `use core::cmp::min;` because upstream dropped the top-level import the tests had picked up through `use super::*`.
