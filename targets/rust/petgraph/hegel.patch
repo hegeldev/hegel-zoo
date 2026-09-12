@@ -1,0 +1,676 @@
+diff --git a/crates/petgraph/Cargo.toml b/crates/petgraph/Cargo.toml
+index 2ec3264..22cd859 100644
+--- a/crates/petgraph/Cargo.toml
++++ b/crates/petgraph/Cargo.toml
+@@ -43,6 +43,7 @@ ahash     = { workspace = true }
+ bincode   = { workspace = true }
+ defmac    = { workspace = true }
+ fxhash    = { workspace = true }
++hegeltest = "0.44.1"
+ itertools = { workspace = true }
+ odds      = { workspace = true }
+ rand      = { workspace = true, features = ["std"] }
+diff --git a/crates/petgraph/tests/graph.rs b/crates/petgraph/tests/graph.rs
+index a94e39c..989448a 100644
+--- a/crates/petgraph/tests/graph.rs
++++ b/crates/petgraph/tests/graph.rs
+@@ -3243,3 +3243,437 @@ fn test_edges_connecting_iteration_order() {
+         ]
+     );
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++use hegel::TestCase;
++use hegel::generators;
++use hegel::Generator;
++// Aliased because this file already has unit tests *named* `is_cyclic_directed`
++// and `tarjan_scc` in the same value namespace.
++use petgraph::algo::{
++    connected_components, is_cyclic_directed as algo_is_cyclic_directed, kosaraju_scc,
++    tarjan_scc as algo_tarjan_scc, toposort,
++};
++use petgraph::visit::EdgeRef;
++
++/// Generate an arbitrary directed graph with `min_nodes..=max_nodes` nodes and
++/// arbitrary `u32` edge weights. Parallel edges and self loops are included on
++/// purpose — `Graph` documents that it supports both.
++#[hegel::composite]
++fn arb_digraph(tc: &hegel::TestCase, min_nodes: usize, max_nodes: usize) -> DiGraph<(), u32> {
++    let n = tc.draw(
++        generators::integers::<usize>()
++            .min_value(min_nodes)
++            .max_value(max_nodes),
++    );
++    let mut g = DiGraph::<(), u32>::new();
++    for _ in 0..n {
++        g.add_node(());
++    }
++    if n > 0 {
++        // Draw the edge count separately so dense graphs are generated too
++        // (hegel's default collection sizes are small).
++        let m = tc.draw(generators::integers::<usize>().max_value(4 * n));
++        let edges: Vec<(usize, usize, u32)> = tc.draw(
++            generators::vecs(generators::tuples!(
++                generators::integers::<usize>().max_value(n - 1),
++                generators::integers::<usize>().max_value(n - 1),
++                generators::integers::<u32>(),
++            ))
++            .min_size(m)
++            .max_size(m),
++        );
++        for (a, b, w) in edges {
++            g.add_edge(NodeIndex::new(a), NodeIndex::new(b), w);
++        }
++    }
++    g
++}
++
++/// Naive Bellman-Ford-style reference: O(V * E) relaxation until fixpoint.
++/// Distances are computed in u64 so the sums cannot overflow
++/// (<= ~256 edges * u32::MAX < 2^40).
++fn naive_shortest_paths(g: &DiGraph<(), u32>, start: NodeIndex) -> Vec<Option<u64>> {
++    let n = g.node_count();
++    let mut dist: Vec<Option<u64>> = vec![None; n];
++    dist[start.index()] = Some(0);
++    loop {
++        let mut changed = false;
++        for e in g.edge_references() {
++            if let Some(d) = dist[e.source().index()] {
++                let nd = d + u64::from(*e.weight());
++                if dist[e.target().index()].is_none_or(|cur| nd < cur) {
++                    dist[e.target().index()] = Some(nd);
++                    changed = true;
++                }
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++    dist
++}
++
++/// All-pairs reachability by DFS from every node (a node reaches itself).
++fn all_pairs_reachability(g: &DiGraph<(), u32>) -> Vec<Vec<bool>> {
++    let n = g.node_count();
++    let mut reach = vec![vec![false; n]; n];
++    for s in 0..n {
++        reach[s][s] = true;
++        let mut stack = vec![s];
++        while let Some(u) = stack.pop() {
++            for v in g.neighbors(NodeIndex::new(u)) {
++                if !reach[s][v.index()] {
++                    reach[s][v.index()] = true;
++                    stack.push(v.index());
++                }
++            }
++        }
++    }
++    reach
++}
++
++/// Property: `dijkstra` returns exactly the shortest-path distances to every
++/// reachable node (docs: "Compute the length of the shortest path from `start`
++/// to every reachable node"), compared against a naive O(V*E) relaxation.
++/// The node bound protects the cubic-ish reference oracle's runtime, not the
++/// library's contract.
++#[hegel::test]
++fn prop_dijkstra_matches_naive_shortest_paths(tc: hegel::TestCase) {
++    let g = tc.draw((arb_digraph(1, 64)).print_as_debug());
++    let start = NodeIndex::new(tc.draw(
++        generators::integers::<usize>().max_value(g.node_count() - 1),
++    ));
++    let dist = dijkstra(&g, start, None, |e| u64::from(*e.weight()));
++    let expected = naive_shortest_paths(&g, start);
++    for i in 0..g.node_count() {
++        assert_eq!(
++            dist.get(&NodeIndex::new(i)).copied(),
++            expected[i],
++            "distance from {:?} to node {} differs",
++            start,
++            i
++        );
++    }
++}
++
++/// Property: `astar` with the trivial heuristic behaves like dijkstra (per its
++/// docs) and its returned path is a valid witness: it starts at `start`, ends
++/// at the goal, walks only existing edges, and the per-hop minimum edge
++/// weights sum to exactly the claimed cost.
++#[hegel::test]
++fn prop_astar_zero_heuristic_returns_valid_shortest_path(tc: hegel::TestCase) {
++    let g = tc.draw((arb_digraph(1, 64)).print_as_debug());
++    let start = NodeIndex::new(tc.draw(
++        generators::integers::<usize>().max_value(g.node_count() - 1),
++    ));
++    let goal = NodeIndex::new(tc.draw(
++        generators::integers::<usize>().max_value(g.node_count() - 1),
++    ));
++    let expected = naive_shortest_paths(&g, start)[goal.index()];
++    let res = astar(
++        &g,
++        start,
++        |finish| finish == goal,
++        |e| u64::from(*e.weight()),
++        |_| 0,
++    );
++    match (expected, res) {
++        (None, None) => {}
++        (Some(d), Some((cost, path))) => {
++            assert_eq!(cost, d, "astar cost differs from shortest distance");
++            assert_eq!(path.first(), Some(&start), "path must start at start");
++            assert_eq!(path.last(), Some(&goal), "path must end at goal");
++            let mut sum: u64 = 0;
++            for hop in path.windows(2) {
++                let min_w = g
++                    .edges_connecting(hop[0], hop[1])
++                    .map(|e| u64::from(*e.weight()))
++                    .min()
++                    .unwrap_or_else(|| {
++                        panic!("path uses nonexistent edge {:?} -> {:?}", hop[0], hop[1])
++                    });
++                sum += min_w;
++            }
++            // Any walk start->goal costs >= d, and the per-hop minima cost
++            // <= the edges astar actually used (= cost = d), so equality.
++            assert_eq!(sum, cost, "path is not a witness for the claimed cost");
++        }
++        (expected, got) => panic!(
++            "astar disagrees with reference on reachability: expected distance {:?}, got {:?}",
++            expected, got
++        ),
++    }
++}
++
++/// Property: `tarjan_scc` returns exactly the equivalence classes of mutual
++/// reachability (the definition of strongly connected components), with every
++/// node in exactly one component.
++#[hegel::test]
++fn prop_tarjan_scc_matches_mutual_reachability(tc: hegel::TestCase) {
++    let g = tc.draw((arb_digraph(0, 48)).print_as_debug());
++    let n = g.node_count();
++    let reach = all_pairs_reachability(&g);
++    let sccs = algo_tarjan_scc(&g);
++    let mut comp = vec![usize::MAX; n];
++    for (ci, scc) in sccs.iter().enumerate() {
++        for &v in scc {
++            assert_eq!(comp[v.index()], usize::MAX, "node {:?} in two SCCs", v);
++            comp[v.index()] = ci;
++        }
++    }
++    assert!(
++        comp.iter().all(|&c| c != usize::MAX),
++        "some node is missing from the SCC list"
++    );
++    for u in 0..n {
++        for v in 0..n {
++            assert_eq!(
++                comp[u] == comp[v],
++                reach[u][v] && reach[v][u],
++                "SCC assignment wrong for nodes {} and {}",
++                u,
++                v
++            );
++        }
++    }
++}
++
++/// Property: `kosaraju_scc` and `tarjan_scc` (two independent implementations)
++/// produce the same partition of the nodes.
++#[hegel::test]
++fn prop_kosaraju_and_tarjan_scc_agree(tc: hegel::TestCase) {
++    use std::collections::BTreeSet;
++    let g = tc.draw((arb_digraph(0, 64)).print_as_debug());
++    let canonical = |sccs: Vec<Vec<NodeIndex>>| -> BTreeSet<BTreeSet<usize>> {
++        sccs.into_iter()
++            .map(|scc| scc.into_iter().map(|v| v.index()).collect())
++            .collect()
++    };
++    assert_eq!(canonical(kosaraju_scc(&g)), canonical(algo_tarjan_scc(&g)));
++}
++
++/// Property: `connected_components` (union-find based) matches the component
++/// count of a naive DFS over the undirected view of the graph.
++#[hegel::test]
++fn prop_connected_components_matches_dfs_reference(tc: hegel::TestCase) {
++    let g = tc.draw((arb_digraph(0, 64)).print_as_debug());
++    let n = g.node_count();
++    let mut adj = vec![Vec::new(); n];
++    for e in g.edge_references() {
++        adj[e.source().index()].push(e.target().index());
++        adj[e.target().index()].push(e.source().index());
++    }
++    let mut seen = vec![false; n];
++    let mut count = 0;
++    for s in 0..n {
++        if seen[s] {
++            continue;
++        }
++        count += 1;
++        seen[s] = true;
++        let mut stack = vec![s];
++        while let Some(u) = stack.pop() {
++            for &v in &adj[u] {
++                if !seen[v] {
++                    seen[v] = true;
++                    stack.push(v);
++                }
++            }
++        }
++    }
++    assert_eq!(connected_components(&g), count);
++}
++
++/// Property: `toposort` succeeds if and only if the graph is acyclic
++/// (docs: "`toposort` returns `Err` on graphs with cycles",
++/// self loops included).
++#[hegel::test]
++fn prop_toposort_ok_iff_acyclic(tc: hegel::TestCase) {
++    let g = tc.draw((arb_digraph(0, 64)).print_as_debug());
++    assert_eq!(toposort(&g, None).is_ok(), !algo_is_cyclic_directed(&g));
++}
++
++/// Property: when `toposort` succeeds, the order is a permutation of all nodes
++/// in which every node comes before its successors (docs: "each node is
++/// ordered before its successors").
++#[hegel::test]
++fn prop_toposort_order_respects_edges(tc: hegel::TestCase) {
++    let g = tc.draw((arb_digraph(0, 64)).print_as_debug());
++    if let Ok(order) = toposort(&g, None) {
++        assert_eq!(order.len(), g.node_count(), "order must contain every node");
++        let mut pos = vec![usize::MAX; g.node_count()];
++        for (i, v) in order.iter().enumerate() {
++            assert_eq!(pos[v.index()], usize::MAX, "node {:?} appears twice", v);
++            pos[v.index()] = i;
++        }
++        for e in g.edge_references() {
++            assert!(
++                pos[e.source().index()] < pos[e.target().index()],
++                "edge {:?} -> {:?} goes backwards in the order",
++                e.source(),
++                e.target()
++            );
++        }
++    }
++}
++
++/// Stateful model test of `Graph` mutation.
++///
++/// The model is a `Vec` of node weights plus a multiset of edges. Node indices
++/// are modeled exactly: `add_node` appends and `remove_node` documents
++/// swap-remove semantics ("the last node will adopt the removed node index"),
++/// so the model mirrors them with `Vec::swap_remove`. Edge *indices* after
++/// `remove_node` depend on internal adjacency list order, which is not
++/// documented, so edges are compared as a multiset; the documented
++/// "last edge adopts the removed edge index" rule of `remove_edge` is checked
++/// directly inside the rule.
++struct GraphModelMachine {
++    g: DiGraph<u8, u8>,
++    nodes: Vec<u8>,
++    edges: Vec<(usize, usize, u8)>,
++}
++
++#[hegel::state_machine]
++impl GraphModelMachine {
++    #[rule]
++    fn add_node(&mut self, tc: TestCase) {
++        let w = tc.draw(generators::integers::<u8>());
++        let idx = self.g.add_node(w);
++        assert_eq!(idx.index(), self.nodes.len(), "add_node index not dense");
++        self.nodes.push(w);
++    }
++
++    #[rule]
++    fn add_edge(&mut self, tc: TestCase) {
++        tc.assume(!self.nodes.is_empty());
++        let a = tc.draw(generators::integers::<usize>().max_value(self.nodes.len() - 1));
++        let b = tc.draw(generators::integers::<usize>().max_value(self.nodes.len() - 1));
++        let w = tc.draw(generators::integers::<u8>());
++        let e = self.g.add_edge(NodeIndex::new(a), NodeIndex::new(b), w);
++        assert_eq!(e.index(), self.edges.len(), "add_edge index not dense");
++        self.edges.push((a, b, w));
++    }
++
++    #[rule]
++    fn remove_node(&mut self, tc: TestCase) {
++        // Draw up to len + 1 so the "node doesn't exist -> None" branch is
++        // exercised too.
++        let idx = tc.draw(generators::integers::<usize>().max_value(self.nodes.len() + 1));
++        let removed = self.g.remove_node(NodeIndex::new(idx));
++        if idx >= self.nodes.len() {
++            assert_eq!(removed, None, "removing a nonexistent node must be None");
++            return;
++        }
++        assert_eq!(
++            removed,
++            Some(self.nodes[idx]),
++            "remove_node returned the wrong weight"
++        );
++        // Mirror the documented swap-remove: the last node adopts index `idx`.
++        self.nodes.swap_remove(idx);
++        let old_last = self.nodes.len();
++        // All edges with an endpoint in the removed node disappear...
++        self.edges.retain(|&(a, b, _)| a != idx && b != idx);
++        // ...and endpoints referring to the displaced node are renumbered.
++        for (a, b, _) in &mut self.edges {
++            if *a == old_last {
++                *a = idx;
++            }
++            if *b == old_last {
++                *b = idx;
++            }
++        }
++    }
++
++    #[rule]
++    fn remove_edge(&mut self, tc: TestCase) {
++        let count = self.g.edge_count();
++        // Draw up to count + 1 so the "edge doesn't exist -> None" branch is
++        // exercised too.
++        let e = tc.draw(generators::integers::<usize>().max_value(count + 1));
++        let eidx = pg::graph::EdgeIndex::new(e);
++        let target = self.g.edge_endpoints(eidx).map(|(a, b)| {
++            (a.index(), b.index(), *self.g.edge_weight(eidx).unwrap())
++        });
++        let last_info = if count > 0 {
++            let last = pg::graph::EdgeIndex::new(count - 1);
++            Some((
++                self.g.edge_endpoints(last).unwrap(),
++                *self.g.edge_weight(last).unwrap(),
++            ))
++        } else {
++            None
++        };
++        let removed = self.g.remove_edge(eidx);
++        match target {
++            None => assert_eq!(removed, None, "removing a nonexistent edge must be None"),
++            Some((a, b, w)) => {
++                assert_eq!(removed, Some(w), "remove_edge returned the wrong weight");
++                let pos = self
++                    .edges
++                    .iter()
++                    .position(|&x| x == (a, b, w))
++                    .expect("graph edge not present in model");
++                self.edges.swap_remove(pos);
++                // Documented: "Apart from e, this invalidates the last edge
++                // index in the graph (that edge will adopt the removed edge
++                // index)."
++                if e < count - 1 {
++                    let ((la, lb), lw) = last_info.unwrap();
++                    assert_eq!(
++                        self.g.edge_endpoints(eidx),
++                        Some((la, lb)),
++                        "displaced last edge has wrong endpoints"
++                    );
++                    assert_eq!(
++                        self.g.edge_weight(eidx),
++                        Some(&lw),
++                        "displaced last edge has wrong weight"
++                    );
++                }
++            }
++        }
++    }
++
++    #[invariant]
++    fn agrees_with_model(&self, _: TestCase) {
++        assert_eq!(self.g.node_count(), self.nodes.len());
++        for (i, w) in self.nodes.iter().enumerate() {
++            assert_eq!(
++                self.g.node_weight(NodeIndex::new(i)),
++                Some(w),
++                "node weight at index {} differs from model",
++                i
++            );
++        }
++        assert_eq!(self.g.edge_count(), self.edges.len());
++        let mut graph_edges: Vec<(usize, usize, u8)> = self
++            .g
++            .edge_references()
++            .map(|e| (e.source().index(), e.target().index(), *e.weight()))
++            .collect();
++        let mut model_edges = self.edges.clone();
++        graph_edges.sort_unstable();
++        model_edges.sort_unstable();
++        assert_eq!(graph_edges, model_edges, "edge multisets differ");
++    }
++}
++
++/// Property (stateful): a `Graph` under add/remove of nodes and edges agrees
++/// with a simple vec-based model, including the documented swap-remove index
++/// semantics of `remove_node`/`remove_edge`.
++#[hegel::test]
++fn prop_graph_mutations_match_model(tc: hegel::TestCase) {
++    let machine = GraphModelMachine {
++        g: DiGraph::new(),
++        nodes: Vec::new(),
++        edges: Vec::new(),
++    };
++    hegel::stateful::machine(machine).run(tc);
++}
++
+diff --git a/crates/petgraph/tests/graph6.rs b/crates/petgraph/tests/graph6.rs
+index 6bc789b..8e17ae5 100644
+--- a/crates/petgraph/tests/graph6.rs
++++ b/crates/petgraph/tests/graph6.rs
+@@ -269,3 +269,83 @@ const TEST_CASES: [(usize, &str, &[(u16, u16)]); 20] = [
+         &[(0, 32), (0, 48), (0, 1), (0, 33), (0, 49), (0, 34), (0, 18), (0, 51), (0, 36), (0, 20), (0, 5), (0, 37), (0, 53), (0, 38), (0, 54), (0, 55), (0, 40), (0, 24), (0, 56), (0, 9), (0, 58), (0, 11), (0, 43), (0, 59), (0, 60), (0, 12), (0, 44), (0, 28), (0, 61), (0, 13), (0, 45), (0, 29), (0, 62), (0, 31), (0, 47), (1, 32), (1, 16), (1, 49), (1, 35), (1, 19), (1, 51), (1, 4), (1, 20), (1, 52), (1, 53), (1, 38), (1, 54), (1, 7), (1, 23), (1, 55), (1, 24), (1, 9), (1, 57), (1, 42), (1, 58), (1, 11), (1, 27), (1, 59), (1, 29), (1, 30), (1, 62), (1, 15), (2, 32), (2, 50), (2, 3), (2, 19), (2, 20), (2, 52), (2, 6), (2, 22), (2, 54), (2, 23), (2, 55), (2, 24), (2, 25), (2, 26), (2, 58), (2, 11), (2, 27), (2, 60), (2, 44), (2, 28), (2, 13), (2, 45), (2, 29), (2, 30), (2, 14), (3, 32), (3, 18), (3, 50), (3, 4), (3, 36), (3, 21), (3, 6), (3, 38), (3, 7), (3, 39), (3, 23), (3, 55), (3, 56), (3, 26), (3, 43), (3, 13), (3, 45), (3, 62), (3, 47), (4, 48), (4, 18), (4, 50), (4, 35), (4, 51), (4, 37), (4, 53), (4, 38), (4, 22), (4, 7), (4, 8), (4, 40), (4, 56), (4, 9), (4, 25), (4, 57), (4, 42), (4, 26), (4, 11), (4, 27), (4, 44), (4, 13), (4, 29), (4, 30), (4, 14), (4, 15), (5, 32), (5, 16), (5, 48), (5, 17), (5, 51), (5, 52), (5, 21), (5, 8), (5, 24), (5, 9), (5, 10), (5, 27), (5, 12), (5, 44), (5, 28), (5, 61), (5, 13), (5, 45), (5, 46), (5, 15), (6, 48), (6, 18), (6, 50), (6, 35), (6, 19), (6, 36), (6, 20), (6, 52), (6, 37), (6, 54), (6, 24), (6, 9), (6, 57), (6, 26), (6, 11), (6, 27), (6, 59), (6, 30), (6, 14), (6, 46), (6, 31), (6, 15), (7, 48), (7, 49), (7, 34), (7, 18), (7, 19), (7, 51), (7, 53), (7, 22), (7, 55), (7, 8), (7, 40), (7, 41), (7, 57), (7, 58), (7, 59), (7, 12), (7, 44), (7, 28), (7, 13), (7, 45), (7, 62), (7, 31), (8, 16), (8, 48), (8, 17), (8, 18), (8, 50), (8, 19), (8, 51), (8, 36), (8, 21), (8, 53), (8, 54), (8, 23), (8, 56), (8, 41), (8, 25), (8, 57), (8, 26), (8, 11), (8, 59), (8, 12), (8, 44), (8, 62), (8, 14), (8, 31), (9, 48), (9, 34), (9, 18), (9, 50), (9, 52), (9, 21), (9, 53), (9, 38), (9, 39), (9, 23), (9, 24), (9, 56), (9, 41), (9, 25), (9, 26), (9, 58), (9, 11), (9, 27), (9, 59), (9, 28), (9, 13), (9, 31), (10, 33), (10, 17), (10, 49), (10, 34), (10, 18), (10, 19), (10, 20), (10, 53), (10, 38), (10, 39), (10, 55), (10, 40), (10, 41), (10, 11), (10, 43), (10, 27), (10, 12), (10, 28), (10, 61), (10, 13), (10, 29), (10, 62), (10, 31), (11, 35), (11, 38), (11, 22), (11, 23), (11, 40), (11, 56), (11, 41), (11, 25), (11, 43), (11, 59), (11, 60), (11, 44), (11, 28), (11, 61), (11, 31), (11, 47), (12, 17), (12, 51), (12, 20), (12, 52), (12, 37), (12, 21), (12, 53), (12, 22), (12, 24), (12, 56), (12, 42), (12, 58), (12, 60), (12, 44), (12, 61), (12, 13), (12, 29), (13, 32), (13, 48), (13, 17), (13, 49), (13, 18), (13, 50), (13, 36), (13, 20), (13, 52), (13, 37), (13, 21), (13, 22), (13, 55), (13, 24), (13, 25), (13, 57), (13, 27), (13, 59), (13, 28), (13, 45), (13, 30), (14, 32), (14, 33), (14, 18), (14, 50), (14, 53), (14, 23), (14, 40), (14, 24), (14, 56), (14, 26), (14, 58), (14, 43), (14, 27), (14, 61), (14, 45), (14, 30), (14, 46), (14, 15), (14, 47), (15, 48), (15, 33), (15, 17), (15, 18), (15, 35), (15, 51), (15, 20), (15, 37), (15, 38), (15, 54), (15, 39), (15, 55), (15, 56), (15, 25), (15, 57), (15, 42), (15, 58), (15, 28), (15, 61), (16, 32), (16, 48), (16, 34), (16, 18), (16, 21), (16, 22), (16, 56), (16, 25), (16, 57), (16, 26), (16, 60), (16, 28), (16, 46), (16, 47), (17, 33), (17, 49), (17, 19), (17, 51), (17, 36), (17, 21), (17, 53), (17, 41), (17, 25), (17, 57), (17, 26), (17, 27), (17, 59), (17, 60), (17, 28), (17, 61), (17, 45), (18, 33), (18, 49), (18, 35), (18, 19), (18, 36), (18, 52), (18, 56), (18, 41), (18, 57), (18, 42), (18, 26), (18, 44), (18, 62), (18, 46), (19, 48), (19, 49), (19, 34), (19, 50), (19, 51), (19, 36), (19, 52), (19, 37), (19, 21), (19, 55), (19, 58), (19, 59), (19, 44), (19, 28), (19, 61), (19, 30), (19, 31), (20, 32), (20, 48), (20, 34), (20, 35), (20, 51), (20, 52), (20, 37), (20, 21), (20, 23), (20, 40), (20, 56), (20, 25), (20, 57), (20, 26), (20, 43), (20, 28), (21, 50), (21, 36), (21, 37), (21, 38), (21, 39), (21, 23), (21, 40), (21, 24), (21, 56), (21, 58), (21, 44), (21, 61), (21, 30), (21, 62), (21, 47), (22, 48), (22, 49), (22, 35), (22, 52), (22, 37), (22, 38), (22, 55), (22, 24), (22, 41), (22, 57), (22, 42), (22, 44), (22, 28), (22, 61), (22, 62), (22, 31), (23, 32), (23, 33), (23, 49), (23, 51), (23, 37), (23, 53), (23, 38), (23, 40), (23, 25), (23, 27), (23, 44), (23, 29), (23, 30), (23, 47), (24, 48), (24, 34), (24, 36), (24, 53), (24, 54), (24, 40), (24, 41), (24, 25), (24, 57), (24, 27), (24, 60), (24, 45), (24, 62), (24, 46), (24, 31), (24, 47), (25, 48), (25, 35), (25, 51), (25, 36), (25, 55), (25, 40), (25, 41), (25, 58), (25, 43), (25, 44), (25, 61), (25, 29), (25, 62), (25, 31), (25, 47), (26, 32), (26, 33), (26, 49), (26, 50), (26, 51), (26, 36), (26, 52), (26, 37), (26, 54), (26, 57), (26, 27), (26, 59), (26, 28), (26, 61), (26, 62), (26, 46), (26, 31), (27, 32), (27, 48), (27, 33), (27, 34), (27, 36), (27, 55), (27, 42), (27, 60), (27, 61), (27, 29), (27, 30), (27, 31), (27, 47), (28, 48), (28, 33), (28, 50), (28, 51), (28, 52), (28, 54), (28, 39), (28, 57), (28, 44), (28, 61), (28, 30), (28, 31), (28, 47), (29, 32), (29, 48), (29, 33), (29, 51), (29, 37), (29, 53), (29, 40), (29, 42), (29, 58), (29, 43), (29, 59), (29, 44), (29, 61), (29, 31), (30, 48), (30, 33), (30, 50), (30, 35), (30, 38), (30, 54), (30, 39), (30, 40), (30, 57), (30, 42), (30, 60), (30, 61), (30, 47), (31, 32), (31, 34), (31, 35), (31, 53), (31, 38), (31, 39), (31, 56), (31, 43), (31, 59), (31, 62), (31, 47), (32, 33), (32, 49), (32, 52), (32, 37), (32, 38), (32, 54), (32, 55), (32, 41), (32, 59), (32, 61), (32, 47), (33, 48), (33, 49), (33, 50), (33, 51), (33, 37), (33, 53), (33, 39), (33, 40), (33, 56), (33, 41), (33, 57), (33, 42), (33, 43), (33, 61), (33, 47), (34, 51), (34, 39), (34, 41), (34, 57), (34, 42), (34, 58), (34, 60), (34, 61), (34, 46), (35, 48), (35, 51), (35, 36), (35, 52), (35, 37), (35, 53), (35, 39), (35, 40), (35, 56), (35, 59), (35, 60), (35, 44), (35, 61), (35, 45), (36, 49), (36, 51), (36, 38), (36, 39), (36, 56), (36, 57), (36, 42), (36, 45), (37, 48), (37, 50), (37, 53), (37, 38), (37, 55), (37, 41), (37, 57), (37, 44), (37, 62), (37, 46), (38, 50), (38, 51), (38, 53), (38, 39), (38, 55), (38, 40), (38, 56), (38, 43), (38, 60), (38, 44), (38, 62), (39, 49), (39, 50), (39, 52), (39, 53), (39, 54), (39, 40), (39, 56), (39, 41), (39, 43), (39, 59), (39, 44), (39, 61), (40, 48), (40, 52), (40, 56), (40, 58), (40, 60), (40, 44), (40, 61), (40, 46), (41, 48), (41, 49), (41, 55), (41, 57), (41, 42), (41, 58), (41, 61), (41, 45), (41, 47), (42, 49), (42, 50), (42, 52), (42, 55), (42, 56), (42, 57), (42, 58), (42, 61), (42, 45), (43, 48), (43, 50), (43, 52), (43, 54), (43, 55), (43, 56), (43, 60), (43, 61), (43, 62), (43, 47), (44, 49), (44, 50), (44, 54), (44, 56), (44, 60), (44, 61), (45, 51), (45, 56), (45, 60), (45, 62), (46, 48), (46, 50), (46, 51), (46, 52), (46, 54), (46, 56), (46, 57), (46, 47), (47, 48), (47, 50), (47, 51), (47, 52), (47, 54), (47, 56), (47, 59), (47, 61), (48, 49), (48, 51), (48, 52), (48, 53), (48, 58), (48, 59), (48, 60), (48, 61), (48, 62), (49, 50), (49, 51), (49, 52), (49, 53), (49, 54), (49, 55), (49, 61), (50, 51), (50, 52), (50, 56), (50, 57), (50, 59), (50, 61), (51, 52), (52, 55), (52, 60), (52, 61), (52, 62), (53, 54), (53, 55), (53, 56), (53, 57), (53, 58), (53, 62), (54, 57), (55, 56), (55, 62), (56, 58), (56, 62), (57, 62), (58, 59), (59, 60), (59, 62)],
+     ),
+ ];
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++use std::collections::{BTreeSet, HashSet};
++
++use hegel::generators;
++use hegel::Generator;
++use petgraph::visit::EdgeRef;
++
++/// Generate an arbitrary *simple* undirected graph (no self loops, no parallel
++/// edges) — the graph6 format only represents simple undirected graphs.
++/// Node counts cross the 63-node boundary where the graph6 order encoding
++/// switches to its multi-byte form.
++#[hegel::composite]
++fn arb_simple_ungraph(tc: &hegel::TestCase) -> Graph<(), (), Undirected> {
++    let n = tc.draw(generators::integers::<usize>().max_value(80));
++    let mut g: Graph<(), (), Undirected> = Graph::default();
++    for _ in 0..n {
++        g.add_node(());
++    }
++    if n >= 2 {
++        let m = tc.draw(generators::integers::<usize>().max_value(3 * n));
++        let candidates: Vec<(usize, usize)> = tc.draw(
++            generators::vecs(generators::tuples!(
++                generators::integers::<usize>().max_value(n - 1),
++                generators::integers::<usize>().max_value(n - 1),
++            ))
++            .min_size(m)
++            .max_size(m),
++        );
++        let mut seen = HashSet::new();
++        for (a, b) in candidates {
++            if a == b {
++                continue; // no self loops in a simple graph
++            }
++            let key = (a.min(b), a.max(b));
++            if seen.insert(key) {
++                g.add_edge(
++                    petgraph::graph::NodeIndex::new(key.0),
++                    petgraph::graph::NodeIndex::new(key.1),
++                    (),
++                );
++            }
++        }
++    }
++    g
++}
++
++/// Property: encoding a simple undirected graph to graph6 and decoding it back
++/// preserves the node count and the edge set (round-trip). Grounded in the
++/// module docs (graph6 encoder/decoder for undirected graphs) and the paired
++/// `ToGraph6`/`FromGraph6` traits.
++#[hegel::test]
++fn prop_graph6_roundtrip(tc: hegel::TestCase) {
++    let g = tc.draw((arb_simple_ungraph()).print_as_debug());
++    let encoded = g.graph6_string();
++    let decoded: Graph<(), (), Undirected> = Graph::from_graph6_string(encoded.clone());
++    let edge_set = |g: &Graph<(), (), Undirected>| -> BTreeSet<(usize, usize)> {
++        g.edge_references()
++            .map(|e| {
++                let (a, b) = (e.source().index(), e.target().index());
++                (a.min(b), a.max(b))
++            })
++            .collect()
++    };
++    assert_eq!(
++        decoded.node_count(),
++        g.node_count(),
++        "node count not preserved by graph6 round-trip (encoded: {:?})",
++        encoded
++    );
++    assert_eq!(
++        edge_set(&decoded),
++        edge_set(&g),
++        "edge set not preserved by graph6 round-trip (encoded: {:?})",
++        encoded
++    );
++}
+diff --git a/crates/petgraph/tests/min_spanning_tree.rs b/crates/petgraph/tests/min_spanning_tree.rs
+index 0e29986..e1844b6 100644
+--- a/crates/petgraph/tests/min_spanning_tree.rs
++++ b/crates/petgraph/tests/min_spanning_tree.rs
+@@ -224,3 +224,129 @@ const TEST_CASES: [(&[(u32, u32, u32)], &[(u32, u32, u32)]); 4] = [
+     (&[(0, 2, 5), (0, 19, 73), (0, 12, 3), (1, 17, 145), (1, 18, 16), (1, 3, 125), (1, 5, 6), (1, 10, 76), (1, 11, 13), (1, 15, 12), (2, 7, 34), (2, 9, 118), (3, 12, 43), (3, 13, 146), (4, 7, 31), (5, 6, 62), (5, 8, 147), (6, 14, 66), (7, 16, 67), (7, 17, 48), (7, 10, 93), (7, 12, 113), (7, 14, 85), (8, 16, 40), (8, 18, 111), (9, 17, 102), (10, 16, 128), (10, 18, 120), (11, 17, 35), (11, 18, 88), (11, 13, 54), (11, 14, 36), (12, 16, 148), (13, 15, 75), (16, 17, 71), (16, 18, 10)],
+     &[(0, 12, 3), (0, 2, 5), (1, 5, 6), (16, 18, 10), (1, 15, 12), (1, 11, 13), (1, 18, 16), (4, 7, 31), (2, 7, 34), (11, 17, 35), (11, 14, 36), (8, 16, 40), (3, 12, 43), (7, 17, 48), (11, 13, 54), (5, 6, 62), (0, 19, 73), (1, 10, 76), (9, 17, 102)]),
+ ];
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++use hegel::generators;
++use hegel::Generator;
++use petgraph::algo::connected_components;
++use petgraph::data::FromElements;
++use petgraph::visit::EdgeRef;
++
++/// Generate an arbitrary undirected graph with `u32` edge weights. Parallel
++/// edges and self loops are included on purpose (both are allowed by `Graph`).
++#[hegel::composite]
++fn arb_ungraph(tc: &hegel::TestCase, max_nodes: usize) -> UnGraph<(), u32> {
++    let n = tc.draw(generators::integers::<usize>().max_value(max_nodes));
++    let mut g = UnGraph::<(), u32>::new_undirected();
++    for _ in 0..n {
++        g.add_node(());
++    }
++    if n > 0 {
++        let m = tc.draw(generators::integers::<usize>().max_value(4 * n));
++        let edges: Vec<(usize, usize, u32)> = tc.draw(
++            generators::vecs(generators::tuples!(
++                generators::integers::<usize>().max_value(n - 1),
++                generators::integers::<usize>().max_value(n - 1),
++                generators::integers::<u32>(),
++            ))
++            .min_size(m)
++            .max_size(m),
++        );
++        for (a, b, w) in edges {
++            g.add_edge(NodeIndex::new(a), NodeIndex::new(b), w);
++        }
++    }
++    g
++}
++
++/// Generate a *connected* undirected graph by construction: node i > 0 gets an
++/// edge to some earlier node, then extra arbitrary edges are added on top.
++#[hegel::composite]
++fn arb_connected_ungraph(tc: &hegel::TestCase, max_nodes: usize) -> UnGraph<(), u32> {
++    let n = tc.draw(
++        generators::integers::<usize>()
++            .min_value(1)
++            .max_value(max_nodes),
++    );
++    let mut g = UnGraph::<(), u32>::new_undirected();
++    for _ in 0..n {
++        g.add_node(());
++    }
++    for i in 1..n {
++        let j = tc.draw(generators::integers::<usize>().max_value(i - 1));
++        let w = tc.draw(generators::integers::<u32>());
++        g.add_edge(NodeIndex::new(j), NodeIndex::new(i), w);
++    }
++    let m = tc.draw(generators::integers::<usize>().max_value(2 * n));
++    let extra: Vec<(usize, usize, u32)> = tc.draw(
++        generators::vecs(generators::tuples!(
++            generators::integers::<usize>().max_value(n - 1),
++            generators::integers::<usize>().max_value(n - 1),
++            generators::integers::<u32>(),
++        ))
++        .min_size(m)
++        .max_size(m),
++    );
++    for (a, b, w) in extra {
++        g.add_edge(NodeIndex::new(a), NodeIndex::new(b), w);
++    }
++    g
++}
++
++/// Property: `min_spanning_tree` (Kruskal) produces a spanning forest of the
++/// input: same node set, exactly `|V| - c` edges where `c` is the number of
++/// connected components, the same components, and every output edge exists in
++/// the input with the same weight (witness check). Grounded in the docs
++/// ("minimum spanning forest") and the doc example's count assertions.
++#[hegel::test]
++fn prop_min_spanning_tree_is_spanning_forest(tc: hegel::TestCase) {
++    let g = tc.draw((arb_ungraph(64)).print_as_debug());
++    let mst: UnGraph<(), u32> = UnGraph::from_elements(min_spanning_tree(&g));
++    assert_eq!(mst.node_count(), g.node_count(), "node set must be preserved");
++    let components = connected_components(&g);
++    assert_eq!(
++        mst.edge_count(),
++        g.node_count() - components,
++        "a spanning forest has |V| - c edges"
++    );
++    assert_eq!(
++        connected_components(&mst),
++        components,
++        "forest must connect exactly what the input connects"
++    );
++    for e in mst.edge_references() {
++        assert!(
++            g.edges_connecting(e.source(), e.target())
++                .any(|ge| ge.weight() == e.weight()),
++            "MST edge {:?} -> {:?} (weight {}) not in input graph",
++            e.source(),
++            e.target(),
++            e.weight()
++        );
++    }
++}
++
++/// Property: Kruskal (`min_spanning_tree`) and Prim (`min_spanning_tree_prim`)
++/// agree on the total weight of the minimum spanning tree of a connected
++/// graph (all MSTs of a graph have the same total weight). Prim documents it
++/// only supports a single component, so the generator builds connected graphs
++/// by construction.
++#[hegel::test]
++fn prop_kruskal_and_prim_agree_on_total_weight(tc: hegel::TestCase) {
++    let g = tc.draw((arb_connected_ungraph(64)).print_as_debug());
++    let kruskal: UnGraph<(), u32> = UnGraph::from_elements(min_spanning_tree(&g));
++    let prim: UnGraph<(), u32> = UnGraph::from_elements(min_spanning_tree_prim(&g));
++    assert_eq!(kruskal.edge_count(), g.node_count() - 1);
++    assert_eq!(prim.edge_count(), g.node_count() - 1);
++    let total = |t: &UnGraph<(), u32>| -> u64 {
++        t.edge_references().map(|e| u64::from(*e.weight())).sum()
++    };
++    assert_eq!(
++        total(&kruskal),
++        total(&prim),
++        "Kruskal and Prim disagree on MST total weight"
++    );
++}

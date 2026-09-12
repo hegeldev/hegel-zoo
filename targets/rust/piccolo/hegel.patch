@@ -1,0 +1,1053 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 06712a6..b514e79 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -48,4 +48,5 @@ thiserror.workspace = true
+ 
+ [dev-dependencies]
+ clap = { version = "4.5", features = ["cargo"] }
++hegeltest = "0.28.2"
+ rustyline = "14.0"
+diff --git a/tests/scripts.rs b/tests/scripts.rs
+index 3f43a06..721932a 100644
+--- a/tests/scripts.rs
++++ b/tests/scripts.rs
+@@ -63,3 +63,1038 @@ fn test_scripts() {
+         panic!("one or more errors occurred");
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// These properties load and run generated Lua source through the public
++// `Lua`/`Closure::load`/`Executor` API and check the results against
++// PUC-Lua 5.4 reference semantics (transcribed from the Lua 5.4 manual and
++// lvm.c/lstrlib.c/lobject.c) or against self-consistency invariants.
++//
++// Execution is fuel-bounded (piccolo's own fuel system) so a runaway chunk
++// fails the property instead of hanging the test suite.
++// ---------------------------------------------------------------------------
++mod hegel_props {
++    use hegel::generators::{self, Generator};
++    use piccolo::{Closure, Executor, Fuel, Lua, Value, Variadic};
++
++    /// Owned snapshot of a Lua value, so results can escape the GC arena.
++    #[derive(Debug, Clone, PartialEq)]
++    enum LuaOut {
++        Nil,
++        Bool(bool),
++        Int(i64),
++        Num(f64),
++        Str(Vec<u8>),
++        Other(&'static str),
++    }
++
++    impl LuaOut {
++        fn from_value(v: Value) -> LuaOut {
++            match v {
++                Value::Nil => LuaOut::Nil,
++                Value::Boolean(b) => LuaOut::Bool(b),
++                Value::Integer(i) => LuaOut::Int(i),
++                Value::Number(n) => LuaOut::Num(n),
++                Value::String(s) => LuaOut::Str(s.as_bytes().to_vec()),
++                other => LuaOut::Other(other.type_name()),
++            }
++        }
++
++        /// Equality with NaN == NaN and floats compared bit-for-bit.
++        fn bit_eq(&self, other: &LuaOut) -> bool {
++            match (self, other) {
++                (LuaOut::Num(a), LuaOut::Num(b)) => {
++                    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
++                }
++                (a, b) => a == b,
++            }
++        }
++    }
++
++    /// Argument passed into a Lua chunk as `...`.
++    #[derive(Debug, Clone)]
++    enum LuaIn {
++        Int(i64),
++        Num(f64),
++        Str(Vec<u8>),
++    }
++
++    // The fuel budget protects the test suite from runaway generated chunks;
++    // it is not a contract of the library. All chunks in these tests are tiny,
++    // so the budget is deliberately generous.
++    const FUEL_STEP: i32 = 1 << 14;
++    const MAX_STEPS: usize = 50_000;
++
++    /// Compile `source` and run it to completion (fuel-bounded), passing
++    /// `args` as the chunk's `...`. Returns the chunk's return values, or the
++    /// stringified error (compile or runtime).
++    fn run_lua(source: &[u8], args: &[LuaIn]) -> Result<Vec<LuaOut>, String> {
++        let mut lua = Lua::core();
++
++        let exec = lua
++            .try_enter(|ctx| {
++                let closure = Closure::load(ctx, None, source)?;
++                let args: Vec<Value> = args
++                    .iter()
++                    .map(|a| match a {
++                        LuaIn::Int(i) => Value::Integer(*i),
++                        LuaIn::Num(n) => Value::Number(*n),
++                        LuaIn::Str(s) => Value::String(ctx.intern(s)),
++                    })
++                    .collect();
++                Ok(ctx.stash(Executor::start(ctx, closure.into(), Variadic(args))))
++            })
++            .map_err(|e| e.to_string())?;
++
++        let mut steps = 0usize;
++        loop {
++            let mut fuel = Fuel::with(FUEL_STEP);
++            let done = lua
++                .enter(|ctx| ctx.fetch(&exec).step(ctx, &mut fuel))
++                .expect("executor in bad thread mode");
++            if done {
++                break;
++            }
++            steps += 1;
++            assert!(steps < MAX_STEPS, "Lua chunk exceeded fuel budget");
++        }
++
++        lua.try_enter(|ctx| {
++            let vals = ctx.fetch(&exec).take_result::<Variadic<Vec<Value>>>(ctx)??;
++            Ok(vals.0.iter().map(|v| LuaOut::from_value(*v)).collect())
++        })
++        .map_err(|e| e.to_string())
++    }
++
++    /// Compile-only entry point: never executes the chunk.
++    fn compile_lua(source: &[u8]) -> Result<(), String> {
++        let mut lua = Lua::core();
++        lua.try_enter(|ctx| {
++            Closure::load(ctx, None, source)?;
++            Ok(())
++        })
++        .map(drop)
++        .map_err(|e| e.to_string())
++    }
++
++    // -----------------------------------------------------------------------
++    // PUC-Lua 5.4 reference semantics (the oracle), transcribed from the
++    // manual (§3.4.1) and lvm.c (luaV_idiv/luaV_mod/luai_nummod, LTintfloat
++    // and friends). Integer + - * wrap on overflow; // and % error on zero
++    // divisor; integer/float comparisons are mathematically exact.
++    // -----------------------------------------------------------------------
++
++    fn lua_int_idiv(a: i64, b: i64) -> Option<i64> {
++        if b == 0 {
++            return None;
++        }
++        let q = a.wrapping_div(b); // MIN // -1 wraps to MIN, as in PUC-Lua
++        let r = a.wrapping_rem(b);
++        Some(if r != 0 && ((r < 0) != (b < 0)) {
++            q - 1
++        } else {
++            q
++        })
++    }
++
++    fn lua_int_mod(a: i64, b: i64) -> Option<i64> {
++        if b == 0 {
++            return None;
++        }
++        let r = a.wrapping_rem(b); // MIN % -1 == 0, as in PUC-Lua
++        Some(if r != 0 && ((r < 0) != (b < 0)) {
++            r + b // |r| < |b| and opposite signs: cannot overflow
++        } else {
++            r
++        })
++    }
++
++    /// PUC-Lua's luai_nummod (float `%`): fmod, then bring the remainder
++    /// into the sign of the divisor. Rust's `%` on f64 is fmod, so the only
++    /// adjustment is `m += b` when the remainder and divisor have opposite
++    /// signs (matching `a - floor(a/b)*b`).
++    fn lua_num_mod(a: f64, b: f64) -> f64 {
++        let m = a % b;
++        if m != 0.0 && (m < 0.0) != (b < 0.0) {
++            m + b
++        } else {
++            m
++        }
++    }
++
++    const TWO_POW_63: f64 = 9223372036854775808.0;
++
++    /// Exact `i < f` (PUC-Lua LTintfloat semantics).
++    fn int_lt_float(i: i64, f: f64) -> bool {
++        if f.is_nan() {
++            false
++        } else if f >= TWO_POW_63 {
++            true
++        } else if f < -TWO_POW_63 {
++            false
++        } else {
++            // ceil(f) is exactly representable in i64 here
++            i < (f.ceil() as i64)
++        }
++    }
++
++    /// Exact `i <= f` (PUC-Lua LEintfloat semantics).
++    fn int_le_float(i: i64, f: f64) -> bool {
++        if f.is_nan() {
++            false
++        } else if f >= TWO_POW_63 {
++            true
++        } else if f < -TWO_POW_63 {
++            false
++        } else {
++            i <= (f.floor() as i64)
++        }
++    }
++
++    /// Exact `f < i` (PUC-Lua LTfloatint semantics).
++    fn float_lt_int(f: f64, i: i64) -> bool {
++        if f.is_nan() {
++            false
++        } else if f >= TWO_POW_63 {
++            false
++        } else if f < -TWO_POW_63 {
++            true
++        } else {
++            (f.floor() as i64) < i
++        }
++    }
++
++    /// Exact `f <= i` (PUC-Lua LEfloatint semantics).
++    fn float_le_int(f: f64, i: i64) -> bool {
++        if f.is_nan() {
++            false
++        } else if f >= TWO_POW_63 {
++            false
++        } else if f < -TWO_POW_63 {
++            true
++        } else {
++            (f.ceil() as i64) <= i
++        }
++    }
++
++    /// Exact `i == f` (PUC-Lua luaV_equalobj semantics for mixed operands).
++    fn int_eq_float(i: i64, f: f64) -> bool {
++        f >= -TWO_POW_63 && f < TWO_POW_63 && f.floor() == f && (f as i64) == i
++    }
++
++    /// PUC-Lua str_sub index handling (posrelatI/getendpos from lstrlib.c).
++    fn lua_str_sub(s: &[u8], i: i64, j: i64) -> Vec<u8> {
++        let len = s.len() as i64;
++        let start = if i > 0 {
++            i
++        } else if i >= -len {
++            // i == 0 behaves as 1; negative i counts from the end
++            if i == 0 {
++                1
++            } else {
++                len + i + 1
++            }
++        } else {
++            1
++        };
++        let end = if j > len {
++            len
++        } else if j >= 0 {
++            j
++        } else if j < -len {
++            0
++        } else {
++            len + j + 1
++        };
++        if start <= end {
++            s[(start - 1) as usize..end as usize].to_vec()
++        } else {
++            Vec::new()
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Generators
++    // -----------------------------------------------------------------------
++
++    /// Full-range i64 with boosted boundary values (MIN, MAX, 0, ±1, powers
++    /// of two around the f64 mantissa limit).
++    #[hegel::composite]
++    fn lua_integers(tc: hegel::TestCase) -> i64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i64>(),
++            generators::sampled_from(vec![
++                i64::MIN,
++                i64::MIN + 1,
++                -1,
++                0,
++                1,
++                i64::MAX - 1,
++                i64::MAX,
++                (1 << 53) - 1,
++                1 << 53,
++                (1 << 53) + 1,
++                -(1 << 53),
++                i64::MAX / 2 + 1,
++            ]),
++        ))
++    }
++
++    /// Full-range f64 including NaN/inf, with boosted values near the
++    /// int/float boundary.
++    #[hegel::composite]
++    fn lua_floats(tc: hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>(),
++            generators::sampled_from(vec![
++                TWO_POW_63,
++                -TWO_POW_63,
++                9007199254740992.0,  // 2^53
++                9007199254740993.0,  // rounds to 2^53
++                -9007199254740992.0,
++                0.5,
++                -0.5,
++                -0.0,
++            ]),
++            // floats derived from a full-range integer: lands near the
++            // exact-representability boundary where casts round
++            lua_integers().map(|i| i as f64),
++        ))
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 1: loading arbitrary source never panics.
++    //
++    // Evidence: `Closure::load` returns `Result` and piccolo is explicitly a
++    // VM for untrusted Lua; the parser has a recursion limit
++    // (src/compiler/parser.rs MAX_RECURSION) precisely to reject hostile
++    // input gracefully.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn load_arbitrary_source_never_panics(tc: hegel::TestCase) {
++        let source: Vec<u8> = tc.draw(hegel::one_of!(
++            generators::text().map(String::into_bytes),
++            generators::binary(),
++        ));
++        // Ok or Err are both fine; a panic/abort is the failure.
++        drop(compile_lua(&source));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 2: loading Lua-shaped token soup never panics.
++    //
++    // Random valid tokens exercise the parser far deeper than random bytes
++    // (which usually fail in the lexer).
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn load_token_soup_never_panics(tc: hegel::TestCase) {
++        const TOKENS: &[&str] = &[
++            "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto",
++            "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
++            "while", "+", "-", "*", "/", "//", "%", "^", "#", "&", "~", "|", "<<", ">>", "==",
++            "~=", "<=", ">=", "<", ">", "=", "(", ")", "{", "}", "[", "]", "::", ";", ":", ",",
++            ".", "..", "...", "x", "foo", "_ENV", "0", "1", "3.14", "0x1p4", "0xff", "1e10",
++            "9223372036854775807", "\"str\"", "'s'", "[[long]]", "--[[c]]", "\n",
++        ];
++        let n = tc.draw(generators::integers::<usize>().max_value(200));
++        let mut source = String::new();
++        for _ in 0..n {
++            let tok: &str = tc.draw(generators::sampled_from(TOKENS.to_vec()));
++            source.push_str(tok);
++            // Sometimes juxtapose tokens without whitespace to form new ones.
++            if tc.draw(generators::integers::<u8>().max_value(3)) != 0 {
++                source.push(' ');
++            }
++        }
++        drop(compile_lua(source.as_bytes()));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 3: deeply nested source never aborts the process.
++    //
++    // Nesting depth is drawn explicitly and swept far past the parser's
++    // MAX_RECURSION = 200 (src/compiler/parser.rs); the load must return
++    // Ok or Err("recursion limit reached"), never blow the Rust stack.
++    //
++    // NOTE: only the construct kinds whose recursion the guard *actually*
++    // bounds are swept here. Nested tables, if-blocks, function bodies, and
++    // index expressions overflow the stack at ~150 levels - BELOW the
++    // MAX_RECURSION guard - and abort the whole process; they are pinned
++    // separately in the #[ignore]d reproducer
++    // known_bug_deep_nesting_stack_overflow so they don't take down the suite.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn load_deeply_nested_source_never_aborts(tc: hegel::TestCase) {
++        // Depth is capped at 100. piccolo's guard (MAX_RECURSION = 200) is
++        // marginal: it only survives a stack overflow on a near-empty stack.
++        // Under any caller that has already consumed stack (hegel's own engine
++        // here, or a populated call stack in a real embedding), even the
++        // guarded constructs overflow at ~200 levels, and the unguarded ones
++        // (tables/if/functions/index) overflow at ~150 even standalone. Both
++        // dangers are pinned in the #[ignore]d reproducer
++        // known_bug_deep_nesting_stack_overflow; here we only confirm that
++        // *moderately* nested input (which real programs actually contain) is
++        // always handled gracefully - Ok or Err, never a panic/abort.
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(100));
++        let kind = tc.draw(generators::integers::<u8>().max_value(9));
++        let source = match kind {
++            0 => format!("return {}1{}", "(".repeat(depth), ")".repeat(depth)),
++            1 => format!("return {}{}", "{".repeat(depth), "}".repeat(depth)),
++            2 => format!("return {}true", "not ".repeat(depth)),
++            3 => format!("return {}1", "- ".repeat(depth)),
++            4 => format!("return {}0", "~".repeat(depth)),
++            // right-associative, so each `..` recurses in the parser
++            5 => format!("return {}1", "1 .. ".repeat(depth)),
++            6 => format!("{}{}", "if true then ".repeat(depth), "end ".repeat(depth)),
++            7 => format!("{}{}", "do ".repeat(depth), "end ".repeat(depth)),
++            8 => format!(
++                "return {}{}",
++                "function() return ".repeat(depth),
++                " end".repeat(depth)
++            ),
++            _ => {
++                // x[x[x[...]]] - nested index expressions
++                let mut s = "x".to_string();
++                for _ in 0..depth {
++                    s = format!("x[{}]", s);
++                }
++                format!("return {}", s)
++            }
++        };
++        drop(compile_lua(source.as_bytes()));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 4: long *flat* constructs compile (and fold) correctly.
++    //
++    // Binary operator chains parse into a flat head+tail vector
++    // (src/compiler/parser.rs parse_sub_expression), so no recursion limit
++    // applies; a long constant chain must compile and evaluate exactly.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn long_flat_chains_compile_and_evaluate(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(20_000));
++        let source = format!("return 1{}", " + 1".repeat(n));
++        let result = run_lua(source.as_bytes(), &[]);
++        assert_eq!(result, Ok(vec![LuaOut::Int(n as i64 + 1)]));
++
++        // Long statement lists must also compile without issue.
++        let m = tc.draw(generators::integers::<usize>().min_value(0).max_value(20_000));
++        let source = format!("local x {}", "x = 1 ".repeat(m));
++        drop(compile_lua(source.as_bytes()));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 5: integer arithmetic matches PUC-Lua 5.4 semantics.
++    //
++    // Evidence: piccolo implements Lua 5.4 (README, COMPATIBILITY.md);
++    // integer + - * wrap (src/constant.rs uses wrapping_*), // and % must
++    // error on a zero divisor, / always produces a float.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn integer_arithmetic_matches_puc_lua(tc: hegel::TestCase) {
++        let a = tc.draw(lua_integers());
++        let b = tc.draw(lua_integers());
++        let args = [LuaIn::Int(a), LuaIn::Int(b)];
++
++        let eval = |op: &str| run_lua(format!("local a, b = ...\nreturn a {} b", op).as_bytes(), &args);
++
++        assert_eq!(eval("+"), Ok(vec![LuaOut::Int(a.wrapping_add(b))]), "{a} + {b}");
++        assert_eq!(eval("-"), Ok(vec![LuaOut::Int(a.wrapping_sub(b))]), "{a} - {b}");
++        assert_eq!(eval("*"), Ok(vec![LuaOut::Int(a.wrapping_mul(b))]), "{a} * {b}");
++
++        // `/` is float division in Lua 5.4, never errors
++        match eval("/") {
++            Ok(v) => {
++                assert_eq!(v.len(), 1, "{a} / {b}");
++                assert!(
++                    v[0].bit_eq(&LuaOut::Num(a as f64 / b as f64)),
++                    "{a} / {b}: got {v:?}"
++                );
++            }
++            Err(e) => panic!("{a} / {b} errored: {e}"),
++        }
++
++        match lua_int_idiv(a, b) {
++            Some(q) => assert_eq!(eval("//"), Ok(vec![LuaOut::Int(q)]), "{a} // {b}"),
++            None => assert!(eval("//").is_err(), "{a} // 0 must error"),
++        }
++
++        // KNOWN BUG exclusion: piccolo's Constant::modulo computes
++        // ((a % b) + b) % b, whose intermediate `+ b` overflows i64 for many
++        // inputs (panics in debug, wrong value in release), and Rust's
++        // `i64::MIN % -1` itself overflows. See the pinned tests
++        // known_bug_integer_modulo_overflow / known_bug_integer_modulo_min_neg1.
++        let modulo_bug = b != 0
++            && ((a == i64::MIN && b == -1) || a.wrapping_rem(b).checked_add(b).is_none());
++        if !modulo_bug {
++            match lua_int_mod(a, b) {
++                Some(r) => assert_eq!(eval("%"), Ok(vec![LuaOut::Int(r)]), "{a} % {b}"),
++                None => assert!(eval("%").is_err(), "{a} % 0 must error"),
++            }
++        }
++
++        // unary minus wraps
++        assert_eq!(
++            run_lua(b"local a = ...\nreturn -a", &args[..1]),
++            Ok(vec![LuaOut::Int(a.wrapping_neg())]),
++            "-({a})"
++        );
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 6: float arithmetic is IEEE-754 (matches Rust's f64 ops).
++    //
++    // Evidence: Lua 5.4 floats are C doubles; piccolo stores Value::Number
++    // as f64 and src/constant.rs implements + - * / with the native ops and
++    // ^ as powf. Results must be bit-identical to Rust's.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn float_arithmetic_matches_rust_ieee(tc: hegel::TestCase) {
++        let a = tc.draw(lua_floats());
++        let b = tc.draw(lua_floats());
++        let args = [LuaIn::Num(a), LuaIn::Num(b)];
++
++        let eval = |op: &str| run_lua(format!("local a, b = ...\nreturn a {} b", op).as_bytes(), &args);
++
++        for (op, expected) in [
++            ("+", a + b),
++            ("-", a - b),
++            ("*", a * b),
++            ("/", a / b),
++            ("^", a.powf(b)),
++        ] {
++            match eval(op) {
++                Ok(v) => {
++                    assert_eq!(v.len(), 1, "{a:?} {op} {b:?}");
++                    assert!(
++                        v[0].bit_eq(&LuaOut::Num(expected)),
++                        "{a:?} {op} {b:?}: got {v:?}, expected {expected:?}"
++                    );
++                }
++                Err(e) => panic!("{a:?} {op} {b:?} errored: {e}"),
++            }
++        }
++
++        assert!(
++            run_lua(b"local a = ...\nreturn -a", &args[..1])
++                .unwrap()[0]
++                .bit_eq(&LuaOut::Num(-a)),
++            "-({a:?})"
++        );
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 7: float `%` follows the documented sign rule (result takes
++    // the sign of the divisor) on integer-valued float operands.
++    //
++    // piccolo implements float modulo as `((a % b) + b) % b` (src/constant.rs
++    // Constant::modulo), which is imprecise vs PUC-Lua's fmod-and-adjust
++    // (luai_nummod) for essentially any *fractional* operand, and wrong for
++    // large or infinite divisors - all pinned in known_bug_float_modulo_*.
++    // To stay on ground where the two formulas provably coincide, operands
++    // here are integer-valued floats in [-2^40, 2^40]: then `(a % b) + b` is
++    // exact integer arithmetic below 2^53. This still exercises the sign
++    // behaviour of `%` (Lua 5.4 manual 3.4.1: the result has the same sign
++    // as the divisor) across all sign combinations, as a float.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn float_modulo_matches_puc_lua(tc: hegel::TestCase) {
++        let ai = tc.draw(generators::integers::<i64>().min_value(-(1 << 40)).max_value(1 << 40));
++        let bi = tc.draw(generators::integers::<i64>().min_value(-(1 << 40)).max_value(1 << 40));
++        tc.assume(bi != 0);
++        let (a, b) = (ai as f64, bi as f64);
++
++        let expected = lua_num_mod(a, b);
++        let got = run_lua(b"local a, b = ...\nreturn a % b", &[LuaIn::Num(a), LuaIn::Num(b)]);
++        match got {
++            Ok(v) => match v[0] {
++                // compare numerically (not bitwise): the sign of a zero
++                // result is not something the Lua manual pins down
++                LuaOut::Num(n) => assert!(
++                    n == expected,
++                    "{a:?} % {b:?}: got {n:?}, expected {expected:?}"
++                ),
++                ref other => panic!("{a:?} % {b:?}: got {other:?}"),
++            },
++            Err(e) => panic!("{a:?} % {b:?} errored: {e}"),
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 8: comparisons match PUC-Lua's exact semantics.
++    //
++    // Evidence: Lua 5.4 manual 3.4.4: "if both are numbers, they are
++    // compared according to their mathematical values, regardless of their
++    // subtypes" - integer/float comparisons must be exact, with no rounding
++    // through a cast.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn number_comparisons_match_puc_lua(tc: hegel::TestCase) {
++        #[derive(Debug, Clone, Copy)]
++        enum N {
++            I(i64),
++            F(f64),
++        }
++        let draw_n = || -> N {
++            if tc.draw(generators::booleans()) {
++                N::I(tc.draw(lua_integers()))
++            } else {
++                N::F(tc.draw(lua_floats()))
++            }
++        };
++        let a = draw_n();
++        let b = draw_n();
++
++        // KNOWN BUG exclusion: piccolo compares mixed int/float operands by
++        // casting the integer with `as f64` (src/constant.rs less_than /
++        // less_equal / is_equal), which rounds for |i| >= 2^53 and gives
++        // wrong answers near the boundary. See pinned test
++        // known_bug_int_float_comparison_precision.
++        let in_cast_bug_region = |x: &N, y: &N| match (x, y) {
++            (N::I(i), N::F(_)) | (N::F(_), N::I(i)) => i.unsigned_abs() >= (1 << 53),
++            _ => false,
++        };
++        if in_cast_bug_region(&a, &b) || in_cast_bug_region(&b, &a) {
++            return;
++        }
++
++        let (lt, le, eq) = match (a, b) {
++            (N::I(x), N::I(y)) => (x < y, x <= y, x == y),
++            (N::F(x), N::F(y)) => (x < y, x <= y, x == y),
++            (N::I(x), N::F(y)) => (int_lt_float(x, y), int_le_float(x, y), int_eq_float(x, y)),
++            (N::F(x), N::I(y)) => (float_lt_int(x, y), float_le_int(x, y), int_eq_float(y, x)),
++        };
++
++        let arg = |n: &N| match n {
++            N::I(i) => LuaIn::Int(*i),
++            N::F(f) => LuaIn::Num(*f),
++        };
++        let args = [arg(&a), arg(&b)];
++        let eval = |op: &str| run_lua(format!("local a, b = ...\nreturn a {} b", op).as_bytes(), &args);
++
++        // `>` and `>=` are defined as the mirrored `<`/`<=` (manual 3.4.4)
++        for (op, expected) in [
++            ("<", lt),
++            ("<=", le),
++            ("==", eq),
++            ("~=", !eq),
++            (">", match (b, a) {
++                (N::I(x), N::I(y)) => x < y,
++                (N::F(x), N::F(y)) => x < y,
++                (N::I(x), N::F(y)) => int_lt_float(x, y),
++                (N::F(x), N::I(y)) => float_lt_int(x, y),
++            }),
++            (">=", match (b, a) {
++                (N::I(x), N::I(y)) => x <= y,
++                (N::F(x), N::F(y)) => x <= y,
++                (N::I(x), N::F(y)) => int_le_float(x, y),
++                (N::F(x), N::I(y)) => float_le_int(x, y),
++            }),
++        ] {
++            assert_eq!(
++                eval(op),
++                Ok(vec![LuaOut::Bool(expected)]),
++                "{a:?} {op} {b:?}"
++            );
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 9: string operations match reference semantics on raw bytes.
++    //
++    // Evidence: Lua strings are byte strings; # is byte length, .. is byte
++    // concatenation, string.sub/reverse/upper/lower are byte-wise
++    // (lstrlib.c); string.char(string.byte(s, 1, #s)) reassembles s.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn string_ops_match_reference(tc: hegel::TestCase) {
++        let s: Vec<u8> = tc.draw(generators::binary().max_size(64));
++        let t: Vec<u8> = tc.draw(generators::binary().max_size(64));
++        let len = s.len() as i64;
++        // indices: full range plus boosted in-and-around-the-string values
++        let idx = |tc: &hegel::TestCase| -> i64 {
++            tc.draw(hegel::one_of!(
++                generators::integers::<i64>(),
++                generators::integers::<i64>().min_value(-len - 2).max_value(len + 2),
++            ))
++        };
++        let i = idx(&tc);
++        let j = idx(&tc);
++
++        let args = [LuaIn::Str(s.clone()), LuaIn::Str(t.clone())];
++
++        // length and concatenation
++        let concat = run_lua(b"local s, t = ...\nreturn #s, s .. t, #(s .. t)", &args);
++        let mut st = s.clone();
++        st.extend_from_slice(&t);
++        assert_eq!(
++            concat,
++            Ok(vec![
++                LuaOut::Int(len),
++                LuaOut::Str(st.clone()),
++                LuaOut::Int(st.len() as i64)
++            ])
++        );
++
++        // string.sub with arbitrary indices
++        let sub = run_lua(
++            b"local s, t, i, j = ...\nreturn string.sub(s, i, j)",
++            &[
++                LuaIn::Str(s.clone()),
++                LuaIn::Str(t.clone()),
++                LuaIn::Int(i),
++                LuaIn::Int(j),
++            ],
++        );
++        assert_eq!(
++            sub,
++            Ok(vec![LuaOut::Str(lua_str_sub(&s, i, j))]),
++            "string.sub({s:?}, {i}, {j})"
++        );
++
++        // byte-wise reverse / upper / lower
++        let rul = run_lua(
++            b"local s = ...\nreturn string.reverse(s), string.upper(s), string.lower(s)",
++            &args[..1],
++        );
++        assert_eq!(
++            rul,
++            Ok(vec![
++                LuaOut::Str(s.iter().rev().copied().collect()),
++                LuaOut::Str(s.iter().map(u8::to_ascii_uppercase).collect()),
++                LuaOut::Str(s.iter().map(u8::to_ascii_lowercase).collect()),
++            ])
++        );
++
++        // string.char(string.byte(s, 1, #s)) == s
++        let roundtrip = run_lua(
++            b"local s = ...\nreturn string.char(string.byte(s, 1, #s))",
++            &args[..1],
++        );
++        assert_eq!(roundtrip, Ok(vec![LuaOut::Str(s.clone())]));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 10: tonumber(tostring(x)) preserves the numeric value.
++    //
++    // Evidence: tostring/tonumber are implemented (COMPATIBILITY.md); a
++    // number printed by the VM must re-parse to the same value. For
++    // integers the roundtrip must be exact and integer-typed.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn tostring_tonumber_roundtrip(tc: hegel::TestCase) {
++        let src: &[u8] = b"local x = ...\nreturn tonumber(tostring(x))";
++        if tc.draw(generators::booleans()) {
++            let x = tc.draw(lua_integers());
++            assert_eq!(
++                run_lua(src, &[LuaIn::Int(x)]),
++                Ok(vec![LuaOut::Int(x)]),
++                "integer {x}"
++            );
++        } else {
++            let x = tc.draw(lua_floats());
++            // KNOWN BUG exclusion: piccolo formats a float with an integral
++            // value using Rust's `{}` and drops the ".0" marker, so
++            // tostring(x) is all-digits and tonumber re-reads it as an
++            // integer. For values above 2^53 the shortest round-tripping
++            // decimal is not the exact integer either, so the roundtrip
++            // silently corrupts the value (e.g. 18014398509892952.0 ->
++            // "18014398509892950" -> 18014398509892950). Both are pinned in
++            // known_bug_float_tostring_format and
++            // known_bug_float_tostring_value_corruption; integral-valued and
++            // non-finite floats are excluded here.
++            if !x.is_finite() || x.fract() == 0.0 {
++                return;
++            }
++            let got = run_lua(src, &[LuaIn::Num(x)]);
++            match got {
++                Ok(v) => {
++                    assert_eq!(v.len(), 1, "float {x:?}");
++                    let preserved = match v[0] {
++                        LuaOut::Num(n) => n == x,
++                        LuaOut::Int(i) => int_eq_float(i, x),
++                        _ => false,
++                    };
++                    assert!(preserved, "float {x:?} roundtripped to {v:?}");
++                }
++                Err(e) => panic!("float {x:?}: {e}"),
++            }
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 11: `#` of a sequence equals its length.
++    //
++    // Evidence: Lua manual 3.4.7 - the length of a table t is defined for
++    // sequences (keys 1..n) and equals n. Built two ways: loop assignment
++    // and a table constructor.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn table_length_of_sequences(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<i64>().min_value(0).max_value(400));
++        let k = tc.draw(generators::integers::<i64>().min_value(0).max_value(n));
++
++        // fill 1..n, then truncate the top k entries: still a sequence
++        let filled = run_lua(
++            b"local n, k = ...\n\
++              local t = {}\n\
++              for i = 1, n do t[i] = i end\n\
++              local full = #t\n\
++              for i = n, n - k + 1, -1 do t[i] = nil end\n\
++              return full, #t",
++            &[LuaIn::Int(n), LuaIn::Int(k)],
++        );
++        assert_eq!(
++            filled,
++            Ok(vec![LuaOut::Int(n), LuaOut::Int(n - k)]),
++            "fill n={n}, truncate k={k}"
++        );
++
++        // table constructor with m array items
++        let m = tc.draw(generators::integers::<usize>().max_value(300));
++        let source = format!("return #{{{}}}", "true,".repeat(m));
++        assert_eq!(
++            run_lua(source.as_bytes(), &[]),
++            Ok(vec![LuaOut::Int(m as i64)]),
++            "constructor m={m}"
++        );
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 12: execution is deterministic.
++    //
++    // Evidence: a Lua chunk with no I/O, no math.random and no table
++    // iteration is pure; running the same chunk in two fresh VMs must give
++    // identical results (piccolo README: deterministic execution is a goal
++    // of the fuel/metering design).
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn execution_is_deterministic(tc: hegel::TestCase) {
++        // Random arithmetic expression tree over bounded numeric literals.
++        // Literals are bounded to keep clear of the known integer-modulo
++        // overflow bug (see known_bug_integer_modulo_overflow); the bound
++        // protects the property's focus, not any library contract.
++        fn draw_expr(tc: &hegel::TestCase, depth: u32) -> String {
++            if depth == 0 || tc.draw(generators::integers::<u8>().max_value(3)) == 0 {
++                match tc.draw(generators::integers::<u8>().max_value(2)) {
++                    0 => tc
++                        .draw(
++                            generators::integers::<i32>()
++                                .min_value(-1_000_000)
++                                .max_value(1_000_000),
++                        )
++                        .to_string(),
++                    1 => format!(
++                        "{:?}",
++                        tc.draw(
++                            generators::floats::<f64>()
++                                .min_value(-1e6)
++                                .max_value(1e6)
++                                .allow_nan(false)
++                        )
++                    ),
++                    _ => "0".to_string(),
++                }
++            } else {
++                let op = tc.draw(generators::sampled_from(vec![
++                    "+", "-", "*", "/", "//", "%", "^", "<", "<=", "==",
++                ]));
++                let l = draw_expr(tc, depth - 1);
++                let r = draw_expr(tc, depth - 1);
++                // comparisons only nest through `and`/`or`, so wrap them
++                if matches!(op, "<" | "<=" | "==") {
++                    format!("(({} {} {}) and 1 or 0)", l, op, r)
++                } else {
++                    format!("({} {} {})", l, op, r)
++                }
++            }
++        }
++        let depth = tc.draw(generators::integers::<u32>().min_value(0).max_value(5));
++        let source = format!("return {}", draw_expr(&tc, depth));
++
++        let first = run_lua(source.as_bytes(), &[]);
++        let second = run_lua(source.as_bytes(), &[]);
++        let equal = match (&first, &second) {
++            (Ok(a), Ok(b)) => {
++                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.bit_eq(y))
++            }
++            (Err(a), Err(b)) => a == b,
++            _ => false,
++        };
++        assert!(equal, "{source}: {first:?} != {second:?}");
++    }
++
++    // -----------------------------------------------------------------------
++    // Pinned KNOWN FAILURES - real bugs found by the properties above (or by
++    // reading the code they exercise). These tests are DELIBERATELY failing;
++    // each documents a divergence from PUC-Lua 5.4. Do not "fix" the tests.
++    // -----------------------------------------------------------------------
++
++    /// KNOWN FAILURE (real bug): integer `%` overflows on large divisors.
++    ///
++    /// `Constant::modulo` (src/constant.rs) computes `((a % b) + b) % b`;
++    /// the intermediate `(a % b) + b` overflows i64 whenever `a % b` and `b`
++    /// are large with the same sign. In debug builds this panics ("attempt
++    /// to add with overflow"); in release builds it wraps and returns a
++    /// wrong value (1 % maxinteger == -1 instead of 1).
++    /// PUC-Lua 5.4: 1 % math.maxinteger == 1.
++    /// Code path: src/thread/vm.rs Operation::Mod -> src/meta_ops.rs modulo
++    /// -> src/constant.rs Constant::modulo.
++    #[test]
++    fn known_bug_integer_modulo_overflow() {
++        let r = run_lua(
++            b"local a, b = ...\nreturn a % b",
++            &[LuaIn::Int(1), LuaIn::Int(i64::MAX)],
++        );
++        assert_eq!(r, Ok(vec![LuaOut::Int(1)]));
++    }
++
++    /// KNOWN FAILURE (real bug): `math.mininteger % -1` panics in debug
++    /// builds - `Constant::modulo` uses Rust's `%`, and `i64::MIN % -1`
++    /// overflows. PUC-Lua 5.4 returns 0.
++    /// Same code path as known_bug_integer_modulo_overflow.
++    #[test]
++    fn known_bug_integer_modulo_min_neg1() {
++        let r = run_lua(
++            b"local a, b = ...\nreturn a % b",
++            &[LuaIn::Int(i64::MIN), LuaIn::Int(-1)],
++        );
++        assert_eq!(r, Ok(vec![LuaOut::Int(0)]));
++    }
++
++    /// KNOWN FAILURE (real bug): mixed int/float comparisons round through
++    /// `as f64` (src/constant.rs less_than/less_equal/is_equal) instead of
++    /// comparing exactly as the Lua 5.4 manual (3.4.4) requires:
++    /// "compared according to their mathematical values".
++    ///   math.maxinteger <  2.0^63 must be true  (piccolo: false)
++    ///   math.maxinteger == 2.0^63 must be false (piccolo: true)
++    #[test]
++    fn known_bug_int_float_comparison_precision() {
++        let r = run_lua(
++            b"return math.maxinteger < 2.0^63, math.maxinteger == 2.0^63",
++            &[],
++        );
++        assert_eq!(r, Ok(vec![LuaOut::Bool(true), LuaOut::Bool(false)]));
++    }
++
++    /// KNOWN FAILURE (divergence from PUC-Lua): float `%` with an infinite
++    /// divisor. piccolo's `((a % b) + b) % b` yields NaN;
++    /// PUC-Lua 5.4 (fmod-based): 1.0 % math.huge == 1.0.
++    /// Code path: src/constant.rs Constant::modulo (float branch).
++    #[test]
++    fn known_bug_float_modulo_infinity() {
++        let r = run_lua(b"return 1.0 % math.huge", &[]);
++        assert_eq!(r, Ok(vec![LuaOut::Num(1.0)]));
++    }
++
++    /// KNOWN FAILURE (real bug): float `%` is wrong for large *finite*
++    /// divisors, not just infinity. piccolo's `((a % b) + b) % b`
++    /// (src/constant.rs Constant::modulo) rounds in the intermediate `+ b`:
++    ///   1.0 % 2^53 computes ((1 % 2^53) + 2^53) % 2^53
++    ///                     = (1.0 + 9007199254740992.0) % 2^53
++    ///                     = 9007199254740992.0 % 2^53   (1.0 lost to rounding)
++    ///                     = 0.0
++    /// PUC-Lua 5.4 (luai_nummod uses fmod): 1.0 % 2^53 == 1.0.
++    #[test]
++    fn known_bug_float_modulo_large_divisor() {
++        let r = run_lua(b"return 1.0 % (2.0^53)", &[]);
++        assert_eq!(r, Ok(vec![LuaOut::Num(1.0)]));
++    }
++
++    /// KNOWN FAILURE (divergence from PUC-Lua): tostring of a float with an
++    /// integral value drops the ".0" marker - piccolo formats floats with
++    /// Rust's `{}` (src/value.rs Value::display), so tostring(1.0) == "1"
++    /// and the float subtype is silently lost on a tostring/tonumber
++    /// roundtrip (math.type flips from "float" to "integer").
++    /// PUC-Lua 5.4: tostring(1.0) == "1.0" (lobject.c tostringbuff appends
++    /// ".0" when %.14g produces an integer-looking string).
++    #[test]
++    fn known_bug_float_tostring_format() {
++        let r = run_lua(b"return tostring(1.0)", &[]);
++        assert_eq!(r, Ok(vec![LuaOut::Str(b"1.0".to_vec())]));
++    }
++
++    /// KNOWN FAILURE (real bug, value corruption): the missing ".0" is worse
++    /// than a subtype change for large integral floats. The float
++    /// 18014398509892952.0 (the f64 nearest 1.8e16) prints via Rust's `{}`
++    /// as the shortest round-tripping decimal "18014398509892950" - which
++    /// happens NOT to be its exact integer value. Because tostring omits the
++    /// float marker, tonumber(read_integer) then parses that string as the
++    /// i64 18014398509892950, two less than the original. So
++    /// tonumber(tostring(x)) silently returns a DIFFERENT number.
++    /// PUC-Lua 5.4 prints "1.8014398509892952e+16" (with the exponent/marker
++    /// forcing a float re-parse), preserving the value.
++    /// Code path: src/value.rs Value::display (Number arm) ->
++    /// src/stdlib/base.rs tonumber -> string_utils::read_integer.
++    #[test]
++    fn known_bug_float_tostring_value_corruption() {
++        // The comparison is done in Rust, not with Lua `==`: piccolo's `==`
++        // also casts the integer through f64 and would wrongly call the
++        // corrupted integer equal to the float (the same bug pinned in
++        // known_bug_int_float_comparison_precision), masking the corruption.
++        let x = 18014398509892952.0_f64; // exact f64 nearest 1.8e16
++        let r = run_lua(b"local x = ...\nreturn tonumber(tostring(x))", &[LuaIn::Num(x)]);
++        let v = r.expect("no error");
++        let preserved = match v[0] {
++            LuaOut::Num(n) => n == x,
++            LuaOut::Int(i) => int_eq_float(i, x),
++            _ => false,
++        };
++        // piccolo returns Int(18014398509892950), two less than x.
++        assert!(preserved, "tostring/tonumber corrupted the value: {v:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// KNOWN FAILURE (real bug, process-aborting): stack overflow on deeply nested
++// source.
++//
++// #[ignore]d because a stack overflow aborts the whole process (SIGABRT) and
++// would take the entire test binary down with it - it cannot be a normal
++// failing test. Run explicitly with:
++//   cargo test --test scripts known_bug_deep_nesting_stack_overflow -- --ignored
++//
++// The parser installs a recursion guard (MAX_RECURSION = 200 in
++// src/compiler/parser.rs) whose stated purpose is to reject over-nested input
++// gracefully. For several very common constructs, though, the per-level stack
++// frames are large enough that ~150 levels of nesting overflow the stack
++// BEFORE the guard's limit of 200 is reached, so `Closure::load` aborts the
++// host process instead of returning Err. Confirmed to overflow between depth
++// 100 and 150 for:
++//   - nested table constructors:  {{{ ... }}}
++//   - nested if blocks:           if true then if true then ... end end
++//   - nested function bodies:     function() return function() ... end end
++//   - nested index expressions:   x[x[x[ ... ]]]
++// (Guarded constructs - parens, `not`, unary `-`, `~`, `..`, `do` blocks -
++// correctly return Err("recursion limit reached") even at depth 4000.)
++//
++// Untrusted Lua of a few hundred nesting levels can therefore crash any
++// piccolo embedding. Depth 1000 reproduces well within a standard 2 MiB test
++// thread stack; the exact threshold is stack-size dependent, but the guard
++// limit is simply set too high to bound these paths.
++//
++// Code path: piccolo::Closure::load -> compiler::parse_chunk ->
++// Parser::parse_table_constructor / parse_if_statement / parse_block ->
++// (recurses without the recursion_guard bounding it below the stack limit).
++// ---------------------------------------------------------------------------
++#[test]
++#[ignore = "aborts the process via stack overflow; documents a real bug"]
++fn known_bug_deep_nesting_stack_overflow() {
++    use piccolo::{Closure, Lua};
++    let depth = 1000;
++    let source = format!("return {}{}", "{".repeat(depth), "}".repeat(depth));
++    let mut lua = Lua::core();
++    let r = lua.try_enter(|ctx| {
++        Closure::load(ctx, None, source.as_bytes())?;
++        Ok(())
++    });
++    // If piccolo bounded recursion correctly this would be a graceful Err;
++    // instead the line above aborts the process before we get here.
++    assert!(
++        r.is_err(),
++        "expected a graceful recursion-limit error, not a stack overflow"
++    );
++}

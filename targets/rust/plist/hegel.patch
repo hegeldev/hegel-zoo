@@ -1,0 +1,701 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 79a7308..a622024 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,3 +28,4 @@ serde_derive = { version = "1.0.2" }
+ serde_yaml = "0.8.21"
+ trybuild = { version = "1.0.116", features = ["diff"] }
+ macrotest = "1.2.1"
++hegeltest = "0.44.1"
+diff --git a/src/value.rs b/src/value.rs
+index 90269a9..5b94326 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -867,3 +867,361 @@ mod tests {
+         assert!(value.is_err());
+     }
+ }
++
++/// Property-based tests (hegel) for the `Value` serialization round-trips.
++#[cfg(test)]
++mod hegel_tests {
++    use std::{
++        io::Cursor,
++        time::{Duration, SystemTime, UNIX_EPOCH},
++    };
++
++    use hegel::generators::{self, Generator};
++
++    use crate::{Date, Dictionary, Integer, Uid, Value};
++
++    /// Bounds (in seconds relative to the unix epoch) for generated dates, roughly
++    /// years 1019..=8942.
++    ///
++    /// This bound protects the tests, not the library's contract: `Date`s outside the
++    /// range representable by `time::OffsetDateTime` panic when formatted as XML or
++    /// even when `Debug`-printed (which hegel does for every drawn value). That bug is
++    /// pinned by `known_failure_far_future_date_xml_write_should_error_not_panic` in
++    /// tests/fuzzer.rs.
++    const MIN_UNIX_SECS: i64 = -30_000_000_000;
++    const MAX_UNIX_SECS: i64 = 220_000_000_000;
++
++    fn system_time(unix_secs: i64, subsec_nanos: u32) -> SystemTime {
++        if unix_secs >= 0 {
++            UNIX_EPOCH + Duration::new(unix_secs as u64, subsec_nanos)
++        } else {
++            UNIX_EPOCH - Duration::from_secs(unix_secs.unsigned_abs())
++                + Duration::new(0, subsec_nanos)
++        }
++    }
++
++    fn draw_integer(tc: &hegel::TestCase) -> Integer {
++        // Full i64 and u64 ranges plus explicitly boosted boundary values.
++        tc.draw((hegel::one_of!(
++            generators::integers::<i64>().map(Integer::from).boxed(),
++            generators::integers::<u64>().map(Integer::from).boxed(),
++            generators::sampled_from(vec![
++                Integer::from(i64::MIN),
++                Integer::from(-1i64),
++                Integer::from(0i64),
++                Integer::from(1i64),
++                Integer::from(i64::MAX),
++                Integer::from(i64::MAX as u64 + 1),
++                Integer::from(u64::MAX),
++            ])
++            .boxed(),
++        )).print_as_debug())
++    }
++
++    fn draw_real(tc: &hegel::TestCase) -> f64 {
++        // `from_bits` covers every bit pattern (subnormals, NaN payloads, ...);
++        // `floats` gives a friendlier distribution; plus boosted boundary values.
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>().boxed(),
++            generators::integers::<u64>().map(f64::from_bits).boxed(),
++            generators::sampled_from(vec![
++                0.0,
++                -0.0,
++                1.0,
++                -1.0,
++                f64::MIN,
++                f64::MAX,
++                f64::MIN_POSITIVE,
++                5e-324, // smallest subnormal
++                f64::INFINITY,
++                f64::NEG_INFINITY,
++                f64::NAN,
++            ])
++            .boxed(),
++        ))
++    }
++
++    /// Draws a `Date` with whole-second precision. Sub-second dates are exercised by
++    /// the dedicated date properties below: the binary format stores dates as an `f64`
++    /// so nanosecond precision is inherently lossy there.
++    fn draw_whole_second_date(tc: &hegel::TestCase) -> Date {
++        let secs = tc.draw(
++            generators::integers::<i64>()
++                .min_value(MIN_UNIX_SECS)
++                .max_value(MAX_UNIX_SECS),
++        );
++        system_time(secs, 0).into()
++    }
++
++    /// Generator over arbitrary `Value` trees.
++    ///
++    /// `allow_uid` exists because `Uid` is only supported by the binary format
++    /// (`to_writer_xml` returns `Err(UidNotSupportedInXmlPlist)` for it).
++    fn arb_value(depth: u32, allow_uid: bool) -> generators::BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let mut kinds: Vec<u8> = vec![0, 1, 2, 3, 4, 5];
++            if allow_uid {
++                kinds.push(6);
++            }
++            if depth > 0 {
++                kinds.extend([7, 8]);
++            }
++            match tc.draw(generators::sampled_from(kinds)) {
++                0 => Value::Boolean(tc.draw(generators::booleans())),
++                1 => Value::Integer(draw_integer(&tc)),
++                2 => Value::Real(draw_real(&tc)),
++                3 => Value::String(tc.draw(generators::text())),
++                4 => Value::Data(tc.draw(generators::binary())),
++                5 => Value::Date(draw_whole_second_date(&tc)),
++                6 => Value::Uid(Uid::new(tc.draw(generators::integers::<u64>()))),
++                7 => Value::Array(tc.draw((generators::vecs(arb_value(depth - 1, allow_uid))).print_as_debug())),
++                8 => {
++                    let pairs: Vec<(String, Value)> = tc.draw((generators::vecs(
++                        generators::tuples!(generators::text(), arb_value(depth - 1, allow_uid)),
++                    )).print_as_debug());
++                    let mut dict = Dictionary::new();
++                    for (k, v) in pairs {
++                        dict.insert(k, v);
++                    }
++                    Value::Dictionary(dict)
++                }
++                _ => unreachable!(),
++            }
++        })
++        .boxed()
++    }
++
++    /// Structural equality that is stricter than `Value: PartialEq` where it matters
++    /// for round-trips:
++    /// - `Real`s are compared bit-exactly (`PartialEq` says `NaN != NaN` and
++    ///   `-0.0 == 0.0`).
++    /// - Dictionaries are compared in iteration order (`IndexMap`'s `PartialEq` is
++    ///   order-independent, but both plist encodings preserve key order).
++    ///
++    /// If `canonical_nan` is true, any NaN is considered equal to any other NaN: the
++    /// XML format serializes every NaN as the string "NaN", so payload and sign bits
++    /// are documented-lossy there. The binary format is bit-exact and uses `false`.
++    fn value_eq(a: &Value, b: &Value, canonical_nan: bool) -> bool {
++        match (a, b) {
++            (Value::Real(x), Value::Real(y)) => {
++                x.to_bits() == y.to_bits() || (canonical_nan && x.is_nan() && y.is_nan())
++            }
++            (Value::Array(x), Value::Array(y)) => {
++                x.len() == y.len()
++                    && x.iter()
++                        .zip(y.iter())
++                        .all(|(a, b)| value_eq(a, b, canonical_nan))
++            }
++            (Value::Dictionary(x), Value::Dictionary(y)) => {
++                x.len() == y.len()
++                    && x.iter()
++                        .zip(y.iter())
++                        .all(|((ka, va), (kb, vb))| ka == kb && value_eq(va, vb, canonical_nan))
++            }
++            _ => a == b,
++        }
++    }
++
++    fn to_xml_bytes(value: &Value) -> Vec<u8> {
++        let mut buf = Vec::new();
++        value.to_writer_xml(&mut buf).expect("XML write failed");
++        buf
++    }
++
++    fn to_binary_bytes(value: &Value) -> Vec<u8> {
++        let mut buf = Vec::new();
++        value.to_writer_binary(&mut buf).expect("binary write failed");
++        buf
++    }
++
++    /// Property: writing a `Value` as XML and reading it back yields an equal `Value`,
++    /// and re-serializing yields byte-identical XML (round-trip is a fixpoint).
++    #[hegel::test]
++    fn xml_roundtrip_recovers_value(tc: hegel::TestCase) {
++        let value = tc.draw((arb_value(3, false)).print_as_debug());
++
++        let xml = to_xml_bytes(&value);
++        let read_back = Value::from_reader_xml(Cursor::new(&xml))
++            .unwrap_or_else(|err| panic!("failed to read back generated XML: {err}\n{value:?}"));
++        assert!(
++            value_eq(&value, &read_back, true),
++            "XML round-trip changed the value:\n before: {value:?}\n after:  {read_back:?}\n xml:\n{}",
++            String::from_utf8_lossy(&xml),
++        );
++
++        let xml2 = to_xml_bytes(&read_back);
++        assert_eq!(
++            String::from_utf8_lossy(&xml),
++            String::from_utf8_lossy(&xml2),
++            "XML round-trip is not a fixpoint"
++        );
++    }
++
++    /// Property: writing a `Value` as a binary plist and reading it back yields a
++    /// bit-exact equal `Value`, and re-serializing yields identical bytes.
++    #[hegel::test]
++    fn binary_roundtrip_recovers_value(tc: hegel::TestCase) {
++        let value = tc.draw((arb_value(3, true)).print_as_debug());
++
++        let bytes = to_binary_bytes(&value);
++        let read_back = Value::from_reader(Cursor::new(&bytes)).unwrap_or_else(|err| {
++            panic!("failed to read back generated binary plist: {err}\n{value:?}")
++        });
++        assert!(
++            value_eq(&value, &read_back, false),
++            "binary round-trip changed the value:\n before: {value:?}\n after:  {read_back:?}",
++        );
++
++        let bytes2 = to_binary_bytes(&read_back);
++        assert_eq!(bytes, bytes2, "binary round-trip is not a fixpoint");
++    }
++
++    /// Property: a `Value` written as XML and as binary reads back to the same value
++    /// from both encodings.
++    #[hegel::test]
++    fn xml_and_binary_encodings_agree(tc: hegel::TestCase) {
++        let value = tc.draw((arb_value(3, false)).print_as_debug());
++
++        let via_xml = Value::from_reader_xml(Cursor::new(to_xml_bytes(&value)))
++            .expect("failed to read back generated XML");
++        let via_binary = Value::from_reader(Cursor::new(to_binary_bytes(&value)))
++            .expect("failed to read back generated binary plist");
++
++        // `canonical_nan` because the XML encoding canonicalizes NaN payloads while
++        // the binary encoding preserves them.
++        assert!(
++            value_eq(&via_xml, &via_binary, true),
++            "encodings disagree:\n via XML:    {via_xml:?}\n via binary: {via_binary:?}\n original:   {value:?}",
++        );
++    }
++
++    /// Property: boundary integers (i64::MIN/MAX, u64::MAX, 0, ±1, ...) round-trip
++    /// exactly through both encodings.
++    #[hegel::test]
++    fn integer_boundary_values_roundtrip_both_formats(tc: hegel::TestCase) {
++        let value = Value::Integer(draw_integer(&tc));
++
++        let via_xml =
++            Value::from_reader_xml(Cursor::new(to_xml_bytes(&value))).expect("XML read failed");
++        assert_eq!(value, via_xml, "XML integer round-trip");
++
++        let via_binary =
++            Value::from_reader(Cursor::new(to_binary_bytes(&value))).expect("binary read failed");
++        assert_eq!(value, via_binary, "binary integer round-trip");
++    }
++
++    /// Property: every `f64` bit pattern round-trips bit-exactly through the binary
++    /// encoding, and through the XML encoding up to NaN canonicalization.
++    #[hegel::test]
++    fn real_boundary_values_roundtrip_both_formats(tc: hegel::TestCase) {
++        let real = draw_real(&tc);
++        let value = Value::Real(real);
++
++        let via_binary = Value::from_reader(Cursor::new(to_binary_bytes(&value)))
++            .expect("binary read failed");
++        assert!(
++            value_eq(&value, &via_binary, false),
++            "binary real round-trip not bit-exact: {:#x} -> {:?}",
++            real.to_bits(),
++            via_binary,
++        );
++
++        let via_xml =
++            Value::from_reader_xml(Cursor::new(to_xml_bytes(&value))).expect("XML read failed");
++        assert!(
++            value_eq(&value, &via_xml, true),
++            "XML real round-trip changed the value: {:#x} -> {:?}",
++            real.to_bits(),
++            via_xml,
++        );
++    }
++
++    /// Property: dates with nanosecond precision round-trip exactly through the XML
++    /// encoding (RFC 3339 carries up to 9 subsecond digits).
++    #[hegel::test]
++    fn date_with_nanoseconds_roundtrips_xml_exactly(tc: hegel::TestCase) {
++        let secs = tc.draw(
++            generators::integers::<i64>()
++                .min_value(MIN_UNIX_SECS)
++                .max_value(MAX_UNIX_SECS),
++        );
++        let nanos = tc.draw(generators::integers::<u32>().max_value(999_999_999));
++        let value = Value::Date(system_time(secs, nanos).into());
++
++        let read_back =
++            Value::from_reader_xml(Cursor::new(to_xml_bytes(&value))).expect("XML read failed");
++        assert_eq!(value, read_back, "XML date round-trip");
++    }
++
++    /// Property: dates round-trip through the binary encoding to within the precision
++    /// of the format. The binary format stores dates as an `f64` of seconds since the
++    /// year 2001, so sub-second precision inherently degrades with distance from that
++    /// epoch (~4µs per ULP at 545 years away, found by a high-count run of this test);
++    /// the round-trip error must never exceed ~2 ULPs of that representation.
++    #[hegel::test]
++    fn date_binary_roundtrip_within_f64_precision(tc: hegel::TestCase) {
++        let secs = tc.draw(
++            generators::integers::<i64>()
++                .min_value(MIN_UNIX_SECS)
++                .max_value(MAX_UNIX_SECS),
++        );
++        let nanos = tc.draw(generators::integers::<u32>().max_value(999_999_999));
++        let value = Value::Date(system_time(secs, nanos).into());
++
++        let read_back =
++            Value::from_reader(Cursor::new(to_binary_bytes(&value))).expect("binary read failed");
++
++        let before: SystemTime = value.as_date().unwrap().into();
++        let after: SystemTime = read_back.as_date().unwrap().into();
++        let diff = match before.duration_since(after) {
++            Ok(d) => d,
++            Err(e) => e.duration(),
++        };
++
++        // Seconds relative to the plist epoch (2001-01-01), which is what the format
++        // stores as an f64. Tolerance: 2 ULPs of that value plus the reader's <=1ns
++        // fract truncation.
++        let plist_epoch = UNIX_EPOCH + Duration::from_secs(978_307_200);
++        let secs_from_plist_epoch = match before.duration_since(plist_epoch) {
++            Ok(d) => d.as_secs_f64(),
++            Err(e) => e.duration().as_secs_f64(),
++        };
++        let tolerance_secs = 2.0 * f64::EPSILON * secs_from_plist_epoch.max(1.0) + 1e-9;
++        assert!(
++            diff.as_secs_f64() <= tolerance_secs,
++            "binary date round-trip drifted by {diff:?} (tolerance {tolerance_secs:e}s): {value:?} -> {read_back:?}",
++        );
++    }
++
++    /// Property: strings built from arbitrary codepoints — deliberately including
++    /// ASCII controls, C1 controls, unicode line separators and non-characters, which
++    /// sit just outside the XML writer's escape set and on the boundary between the
++    /// binary format's ASCII and UTF-16 representations — round-trip through both
++    /// encodings.
++    #[hegel::test]
++    fn string_edge_codepoints_roundtrip_both_formats(tc: hegel::TestCase) {
++        let chars: Vec<char> = tc.draw(generators::vecs(hegel::one_of!(
++            // ASCII controls and low ASCII
++            generators::integers::<u32>().max_value(0x7F).boxed(),
++            // C1 controls and Latin-1
++            generators::integers::<u32>().min_value(0x80).max_value(0xFF).boxed(),
++            // interesting exact codepoints
++            generators::sampled_from(vec![
++                0x0Au32, 0x0D, 0x09, 0x85, 0x2028, 0x2029, 0xFFFD, 0xFFFE, 0xFFFF,
++            ])
++            .boxed(),
++            // rest of the BMP and supplementary planes (surrogates mapped to U+FFFD)
++            generators::integers::<u32>().max_value(0x10_FFFF).boxed(),
++        )
++        .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}'))));
++        let value = Value::String(chars.into_iter().collect());
++
++        let via_xml =
++            Value::from_reader_xml(Cursor::new(to_xml_bytes(&value))).expect("XML read failed");
++        assert_eq!(value, via_xml, "XML string round-trip");
++
++        let via_binary =
++            Value::from_reader(Cursor::new(to_binary_bytes(&value))).expect("binary read failed");
++        assert_eq!(value, via_binary, "binary string round-trip");
++    }
++}
+diff --git a/tests/fuzzer.rs b/tests/fuzzer.rs
+index df5d81a..ae38a77 100644
+--- a/tests/fuzzer.rs
++++ b/tests/fuzzer.rs
+@@ -85,3 +85,321 @@ fn test_fuzzer_data_ok(data: &[u8]) {
+ fn test_fuzzer_data_err(data: &[u8]) {
+     assert!(test_fuzzer_data(data).is_err());
+ }
++
++/// Property-based tests (hegel) for decoder robustness against untrusted input.
++mod hegel_robustness {
++    use hegel::generators::{self, Generator};
++    use plist::{Dictionary, Value};
++    use std::io::Cursor;
++
++    /// Byte layout of the binary plist trailer (last 32 bytes of the file):
++    /// 6 bytes padding, 1 byte offset size, 1 byte object ref size,
++    /// 8 bytes (BE) number of objects, 8 bytes (BE) root object ref,
++    /// 8 bytes (BE) file offset of the object offset table.
++    const TRAILER_LEN: usize = 32;
++
++    /// A compact `Value` generator for producing valid plists to corrupt.
++    ///
++    /// This intentionally duplicates a slimmed-down version of the generator in
++    /// `src/value.rs`'s `hegel_tests` module: unit tests and integration tests cannot
++    /// share `#[cfg(test)]` helpers. Dates are omitted here (they are covered by the
++    /// round-trip properties; `Debug`-printing extreme dates panics, see the known
++    /// failure test below).
++    fn arb_value(depth: u32) -> generators::BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let mut kinds: Vec<u8> = vec![0, 1, 2, 3, 4];
++            if depth > 0 {
++                kinds.extend([5, 6]);
++            }
++            match tc.draw(generators::sampled_from(kinds)) {
++                0 => Value::Boolean(tc.draw(generators::booleans())),
++                1 => Value::Integer(tc.draw(generators::integers::<i64>()).into()),
++                2 => Value::Real(f64::from_bits(tc.draw(generators::integers::<u64>()))),
++                3 => Value::String(tc.draw(generators::text())),
++                4 => Value::Data(tc.draw(generators::binary())),
++                5 => Value::Array(tc.draw((generators::vecs(arb_value(depth - 1))).print_as_debug())),
++                6 => {
++                    let pairs: Vec<(String, Value)> = tc.draw((generators::vecs(
++                        generators::tuples!(generators::text(), arb_value(depth - 1)),
++                    )).print_as_debug());
++                    let mut dict = Dictionary::new();
++                    for (k, v) in pairs {
++                        dict.insert(k, v);
++                    }
++                    Value::Dictionary(dict)
++                }
++                _ => unreachable!(),
++            }
++        })
++        .boxed()
++    }
++
++    fn to_binary_bytes(value: &Value) -> Vec<u8> {
++        let mut buf = Vec::new();
++        value.to_writer_binary(&mut buf).expect("binary write failed");
++        buf
++    }
++
++    fn to_xml_bytes(value: &Value) -> Vec<u8> {
++        let mut buf = Vec::new();
++        value.to_writer_xml(&mut buf).expect("XML write failed");
++        buf
++    }
++
++    /// Property: decoding arbitrary bytes returns `Ok` or `Err` but never panics,
++    /// hangs or makes an unbounded allocation. This supplements the libFuzzer targets
++    /// in fuzz/fuzz_targets with an always-on version, and additionally boosts inputs
++    /// that start with the binary plist magic so the binary reader (offset table,
++    /// trailer parsing) is exercised, not just format detection.
++    #[hegel::test]
++    fn arbitrary_bytes_decode_never_panics(tc: hegel::TestCase) {
++        let mut bytes = tc.draw(generators::binary());
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => (),
++            1 => {
++                let mut prefixed = b"bplist00".to_vec();
++                prefixed.append(&mut bytes);
++                bytes = prefixed;
++            }
++            2 => {
++                let mut prefixed = b"<?xml version=\"1.0\"?><plist>".to_vec();
++                prefixed.append(&mut bytes);
++                bytes = prefixed;
++            }
++            _ => unreachable!(),
++        }
++
++        drop(Value::from_reader(Cursor::new(&bytes)));
++        drop(Value::from_reader_xml(Cursor::new(&bytes)));
++        drop(Value::from_reader_ascii(Cursor::new(&bytes)));
++    }
++
++    /// Property: a valid binary plist whose trailer fields (offset size, ref size,
++    /// object count, root object ref, offset table offset — all attacker-controlled)
++    /// are overwritten with arbitrary values must be handled gracefully: `Ok` or
++    /// `Err`, never a panic or an allocation driven by the corrupted field.
++    #[hegel::test]
++    fn corrupted_binary_trailer_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw((arb_value(2)).print_as_debug());
++        let mut bytes = to_binary_bytes(&value);
++        let trailer_start = bytes.len() - TRAILER_LEN;
++
++        // A u64 generator boosted towards interesting boundary values.
++        let file_len = bytes.len() as u64;
++        let u64_gen = || {
++            hegel::one_of!(
++                generators::integers::<u64>().boxed(),
++                generators::sampled_from(vec![
++                    0u64,
++                    1,
++                    file_len,
++                    file_len - 1,
++                    file_len.wrapping_sub(TRAILER_LEN as u64),
++                    u32::MAX as u64,
++                    u64::MAX,
++                    i64::MAX as u64,
++                ])
++                .boxed(),
++            )
++        };
++
++        match tc.draw(generators::integers::<u8>().max_value(4)) {
++            // offset size
++            0 => bytes[trailer_start + 6] = tc.draw(generators::integers::<u8>()),
++            // object ref size
++            1 => bytes[trailer_start + 7] = tc.draw(generators::integers::<u8>()),
++            // number of objects
++            2 => bytes[trailer_start + 8..trailer_start + 16]
++                .copy_from_slice(&tc.draw(u64_gen()).to_be_bytes()),
++            // root object ref
++            3 => bytes[trailer_start + 16..trailer_start + 24]
++                .copy_from_slice(&tc.draw(u64_gen()).to_be_bytes()),
++            // offset table offset
++            4 => bytes[trailer_start + 24..trailer_start + 32]
++                .copy_from_slice(&tc.draw(u64_gen()).to_be_bytes()),
++            _ => unreachable!(),
++        }
++
++        // Must return without panicking; the result value (if any) must also be
++        // droppable without incident.
++        drop(Value::from_reader(Cursor::new(&bytes)));
++    }
++
++    /// Property: inflating the trailer's object count beyond the real one is always
++    /// rejected with an error (the offset table cannot contain that many entries), and
++    /// in particular a huge count must not cause a huge up-front allocation.
++    #[hegel::test]
++    fn inflated_object_count_is_rejected(tc: hegel::TestCase) {
++        let value = tc.draw((arb_value(2)).print_as_debug());
++        let mut bytes = to_binary_bytes(&value);
++        let trailer_start = bytes.len() - TRAILER_LEN;
++
++        let num_objects = u64::from_be_bytes(
++            bytes[trailer_start + 8..trailer_start + 16]
++                .try_into()
++                .unwrap(),
++        );
++        let extra = tc.draw(hegel::one_of!(
++            generators::integers::<u64>()
++                .min_value(1)
++                .max_value(u64::MAX - num_objects)
++                .boxed(),
++            // boost the classic attack: an enormous object count
++            generators::sampled_from(vec![u64::MAX - num_objects]).boxed(),
++        ));
++        let inflated = num_objects + extra;
++        bytes[trailer_start + 8..trailer_start + 16].copy_from_slice(&inflated.to_be_bytes());
++
++        assert!(
++            Value::from_reader(Cursor::new(&bytes)).is_err(),
++            "binary plist with object count inflated from {num_objects} to {inflated} was accepted",
++        );
++    }
++
++    /// Property: flipping or truncating bytes of a valid plist (either encoding) is
++    /// handled gracefully — `Ok` or `Err`, never a panic.
++    #[hegel::test]
++    fn corrupted_valid_plist_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw((arb_value(2)).print_as_debug());
++        let mut bytes = if tc.draw(generators::booleans()) {
++            to_binary_bytes(&value)
++        } else {
++            to_xml_bytes(&value)
++        };
++
++        if tc.draw(generators::booleans()) {
++            // Truncate
++            let len = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++            bytes.truncate(len);
++        } else {
++            // Flip bits in a single byte
++            let idx = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++            let mask = tc.draw(generators::integers::<u8>().min_value(1));
++            bytes[idx] ^= mask;
++        }
++
++        drop(Value::from_reader(Cursor::new(&bytes)));
++    }
++
++    /// Dismantles a `Value` iteratively.
++    ///
++    /// `Value`'s derived `Drop` glue recurses, so simply dropping a deeply nested
++    /// value overflows the stack (see
++    /// `known_failure_deeply_nested_value_drop_overflows_stack`). This helper lets the
++    /// deep-nesting property below verify *parsing* at depths well beyond the drop
++    /// glue's limit.
++    fn dismantle(value: Value) {
++        let mut stack = vec![value];
++        while let Some(v) = stack.pop() {
++            match v {
++                Value::Array(arr) => stack.extend(arr),
++                Value::Dictionary(dict) => stack.extend(dict.into_iter().map(|(_k, v)| v)),
++                _ => (),
++            }
++        }
++    }
++
++    /// Property: deeply nested XML plists (arrays or dicts) parse without stack
++    /// overflow — `Ok` when well formed, `Err` when unclosed — at depths into the tens
++    /// of thousands.
++    #[hegel::test]
++    fn deeply_nested_xml_parses_without_stack_overflow(tc: hegel::TestCase) {
++        // Draw the depth directly: uniform recursive generation never reaches
++        // interesting depths.
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(20_000));
++        let use_dict = tc.draw(generators::booleans());
++        let well_formed = tc.draw(generators::booleans());
++
++        let mut xml = String::new();
++        for _ in 0..depth {
++            if use_dict {
++                xml.push_str("<dict><key>k</key>");
++            } else {
++                xml.push_str("<array>");
++            }
++        }
++        if well_formed {
++            xml.push_str("<true/>");
++            for _ in 0..depth {
++                xml.push_str(if use_dict { "</dict>" } else { "</array>" });
++            }
++        }
++
++        let result = Value::from_reader_xml(Cursor::new(xml.as_bytes()));
++        if well_formed {
++            let value = result.unwrap_or_else(|err| {
++                panic!("well-formed XML nested {depth} deep failed to parse: {err}")
++            });
++            dismantle(value);
++        } else {
++            match result {
++                Err(_) => (),
++                Ok(value) => {
++                    dismantle(value);
++                    panic!("unclosed XML nested {depth} deep parsed successfully");
++                }
++            }
++        }
++    }
++
++    /// KNOWN FAILURE (kept failing deliberately — do not "fix" the test):
++    ///
++    /// A `Value::Date` outside `time::OffsetDateTime`'s representable range panics
++    /// ("overflow adding duration to date", inside the `time` crate) when written as
++    /// XML, instead of returning an `Err`. `Date`'s `Debug` impl takes the same path,
++    /// so even `println!("{:?}", value)` aborts with a panic.
++    ///
++    /// The full untrusted-input chain reproduced here: a *valid* binary plist
++    /// containing a far-future date (the binary format stores dates as f64 seconds, so
++    /// such dates are representable and `Value::from_reader` accepts them) round-trips
++    /// through `Value` fine, but re-serializing it as XML panics. `Date::to_xml_format`
++    /// (src/date.rs) unwraps the RFC 3339 formatting result and the
++    /// `SystemTime -> OffsetDateTime` conversion panics before that.
++    #[test]
++    fn known_failure_far_future_date_xml_write_should_error_not_panic() {
++        use std::time::{Duration, UNIX_EPOCH};
++
++        // Year ~11470, beyond OffsetDateTime's +9999 limit but perfectly
++        // representable as a SystemTime and as a binary plist date.
++        let date = UNIX_EPOCH + Duration::from_secs(300_000_000_000);
++        let value = Value::Date(date.into());
++
++        let mut binary = Vec::new();
++        value
++            .to_writer_binary(&mut binary)
++            .expect("binary write of far-future date succeeds");
++        let read_back =
++            Value::from_reader(Cursor::new(&binary)).expect("binary read of far-future date succeeds");
++
++        // BUG: this panics inside the `time` crate instead of returning Err.
++        let mut xml = Vec::new();
++        let _ = read_back.to_writer_xml(&mut xml);
++    }
++
++    /// KNOWN PROCESS-ABORTING BUG (reproducer kept `#[ignore]`d because a stack
++    /// overflow aborts the whole test process — run with `--ignored` to reproduce):
++    ///
++    /// Parsing a deeply nested XML plist succeeds (the parser and `Value` builder are
++    /// iterative), but *dropping* the resulting `Value` overflows the stack: the
++    /// derived drop glue for `Value`/`Vec<Value>`/`Dictionary` recurses once per
++    /// nesting level. A ~700KB XML input of 100,000 nested `<array>`s parses fine and
++    /// then aborts the process when the value goes out of scope. `Clone` and
++    /// `PartialEq` recurse the same way (they overflow around depth 2,000 in debug
++    /// builds).
++    #[test]
++    #[ignore = "stack overflow (SIGABRT): Value's recursive drop glue; parse succeeds, drop aborts"]
++    fn known_failure_deeply_nested_value_drop_overflows_stack() {
++        let depth = 100_000;
++        let mut xml = String::with_capacity(depth * 16);
++        for _ in 0..depth {
++            xml.push_str("<array>");
++        }
++        for _ in 0..depth {
++            xml.push_str("</array>");
++        }
++
++        let value = Value::from_reader_xml(Cursor::new(xml.as_bytes())).expect("parses fine");
++        // The implicit drop of `value` here overflows the stack and aborts.
++        drop(value);
++    }
++}
