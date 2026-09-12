@@ -1,0 +1,870 @@
+diff --git a/crates/steel-core/Cargo.toml b/crates/steel-core/Cargo.toml
+index 72a9b8ce..170317fb 100644
+--- a/crates/steel-core/Cargo.toml
++++ b/crates/steel-core/Cargo.toml
+@@ -123,6 +123,7 @@ which = "8.0.0"
+ [dev-dependencies]
+ proptest = "1.1.0"
+ criterion = "0.5.1"
++hegeltest = "0.44.1"
+ 
+ [features]
+ # TODO: Deprecate the modules feature flag, it no longer does anything
+diff --git a/crates/steel-core/tests/testbench.rs b/crates/steel-core/tests/testbench.rs
+index a055aa7b..ab327a7e 100644
+--- a/crates/steel-core/tests/testbench.rs
++++ b/crates/steel-core/tests/testbench.rs
+@@ -451,3 +451,853 @@ fn filter_test() {
+     let e = &mut evaluator;
+     test_line("(filter even? (list 1 2 3 4 5))", &["(2 4)"], e);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// These exercise the public `Engine` API (`Engine::new().run(...)`) with
++// generated inputs: robustness of the reader/compiler/VM on arbitrary and
++// deeply nested source, exact integer/rational arithmetic against
++// num-bigint/num-rational oracles, display->read round trips, comparison
++// semantics, evaluation determinism, and list operations against a Vec
++// oracle.
++//
++// KNOWN BUGS PINNED BY THESE TESTS (left failing / ignored on purpose):
++//
++// 1. `equal?` is wrong for Rational / BigRational / ByteVector values stored
++//    inside containers: `(equal? (list 1/2) (list 1/2))` evaluates to #false
++//    while `(equal? 1/2 1/2)` is #true. Root cause: the container equality
++//    walker `RecursiveEqualityHandler::visit` in src/rvals/cycles.rs has
++//    match arms for IntV/NumV/BigNum/... but none for `Rational`,
++//    `BigRational`, `Complex` or `ByteVector`, so the `(_, _) => return
++//    false` catch-all fires. Pinned (deterministically failing) by
++//    `equal_on_rationals_inside_containers_known_failure` below.
++//
++// 2. Reading/compiling deeply nested source overflows the native stack and
++//    aborts the whole process (SIGABRT) in the default build (the optional
++//    `stacker` feature is off by default). E.g. `"(".repeat(1500) +
++//    ")".repeat(1500)`, or 1000 nested `(lambda () ...)` / `(let () ...)`
++//    forms. Untrusted source of a few kilobytes can kill the host process.
++//    Pinned by the `#[ignore]`d `deeply_nested_input_aborts_process_reproducer`
++//    below (it cannot be a normally-failing test because it takes the test
++//    runner down with it).
++//
++// 3. `read` leaks parser state across unrelated ports. The kernel's `read`
++//    (src/scheme/kernel.scm, `(define *reader* (reader.new-reader))`) keeps
++//    one global reader per engine, and an *incomplete* expression read from a
++//    string port is left buffered instead of being discarded/reset. After
++//    `(read (open-input-string "'"))`, a later `(read (open-input-string
++//    "42"))` returns `(quote 42)`; after `(read (open-input-string "("))`,
++//    every later `read` on any port returns `(eof)` forever. Pinned
++//    (deterministically failing) by
++//    `read_does_not_leak_state_across_ports_known_failure` below.
++//
++// 4. `(/ a b)` PANICS (does not return Err) whenever the divisor is exactly
++//    i32::MIN, e.g. `(/ 1 -2147483648)` -- even when the result would be an
++//    integer, e.g. `(/ -2147483648 -2147483648)`. Root cause:
++//    `divide_primitive` (src/primitives/numbers.rs, `Rational32::new(1, n)`)
++//    builds the reciprocal before checking divisibility, and num-rational's
++//    sign normalization negates the i32::MIN denominator, which overflows
++//    (panic with overflow checks on; silent wraparound in pure release
++//    builds). Found by the 10x exploratory run of
++//    `exact_division_matches_rational_oracle`; pinned (deterministically
++//    failing) by `division_by_i32_min_panics_known_failure` below.
++//
++// 5. `to-string` produces unreadable output for values with *shared* (not
++//    cyclic!) substructure under a vector: the empty list is an interned
++//    singleton, so `(to-string (vector (list) (list)))` yields
++//    "#0=()\n#(#0# #0#)" -- datum labels plus a stray definition line --
++//    instead of "#(() ())". `read` cannot parse it back. Found by the 10x
++//    exploratory run of `display_read_roundtrip_is_equal`; pinned
++//    (deterministically failing) by
++//    `to_string_of_shared_substructure_is_readable_known_failure` below.
++// ---------------------------------------------------------------------------
++mod hegel_properties {
++    use hegel::generators;
++    use hegel::Hegel;
++    use num_bigint::BigInt;
++    use num_rational::BigRational;
++    use steel::steel_vm::engine::Engine;
++    use steel::SteelVal;
++
++    /// Run `src` and return the value of the last top-level expression.
++    fn run_last(engine: &mut Engine, src: String) -> Result<SteelVal, steel::SteelErr> {
++        engine
++            .run(src)
++            .map(|vals| vals.into_iter().last().unwrap_or(SteelVal::Void))
++    }
++
++    fn scheme_string_literal(s: &str) -> String {
++        let mut out = String::from("\"");
++        for c in s.chars() {
++            match c {
++                '"' => out.push_str("\\\""),
++                '\\' => out.push_str("\\\\"),
++                _ => out.push(c),
++            }
++        }
++        out.push('"');
++        out
++    }
++
++    fn scheme_char_literal(c: char) -> String {
++        match c {
++            ' ' => "#\\space".to_string(),
++            '\n' => "#\\newline".to_string(),
++            '\t' => "#\\tab".to_string(),
++            c => format!("#\\{c}"),
++        }
++    }
++
++    /// A char that is safe to write as `#\<c>` (no whitespace/control chars,
++    /// which need named literals).
++    fn draw_safe_char(tc: &hegel::TestCase) -> char {
++        let n: u32 = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().min_value(0x21).max_value(0x7E),
++            generators::integers::<u32>()
++                .min_value(0xA1)
++                .max_value(0x10_FFFF),
++        ));
++        char::from_u32(n)
++            .filter(|c| !c.is_whitespace() && !c.is_control())
++            .unwrap_or('q')
++    }
++
++    /// An arbitrary atom of Scheme-ish source text.
++    fn draw_atom(tc: &hegel::TestCase) -> String {
++        match tc.draw(generators::integers::<u8>().max_value(6)) {
++            0 => tc.draw(generators::integers::<i64>()).to_string(),
++            1 => format!(
++                "{:?}",
++                tc.draw(
++                    generators::floats::<f64>()
++                        .allow_nan(false)
++                        .allow_infinity(false)
++                )
++            ),
++            2 => {
++                let n = tc.draw(generators::integers::<i64>());
++                let d = tc.draw(generators::integers::<i64>().min_value(1));
++                format!("{n}/{d}")
++            }
++            3 => scheme_string_literal(&tc.draw(generators::text().max_size(15))),
++            4 => scheme_char_literal(draw_safe_char(tc)),
++            5 => if tc.draw(generators::booleans()) {
++                "#true"
++            } else {
++                "#false"
++            }
++            .to_string(),
++            _ => tc
++                .draw(generators::sampled_from(vec![
++                    "x",
++                    "y",
++                    "foo",
++                    "lst",
++                    "car",
++                    "cdr",
++                    "+",
++                    "list",
++                    "undefined-identifier-xyz",
++                    "quote",
++                    "lambda",
++                    "let",
++                ]))
++                .to_string(),
++        }
++    }
++
++    /// Scheme-shaped s-expression soup: structurally list-like but with no
++    /// guarantee of being well-formed or well-typed. Exercises the reader,
++    /// the expander/compiler, and the VM's error paths.
++    fn draw_soup(tc: &hegel::TestCase, depth: u32) -> String {
++        if depth == 0 || tc.draw(generators::integers::<u8>().max_value(2)) == 0 {
++            return draw_atom(tc);
++        }
++        let arity: usize = tc.draw(generators::integers::<usize>().max_value(3));
++        let children: Vec<String> = (0..arity).map(|_| draw_soup(tc, depth - 1)).collect();
++        let joined = children.join(" ");
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => format!("({joined})"),
++            1 => {
++                let head = tc.draw(generators::sampled_from(vec![
++                    "+",
++                    "-",
++                    "*",
++                    "/",
++                    "list",
++                    "cons",
++                    "car",
++                    "cdr",
++                    "append",
++                    "reverse",
++                    "length",
++                    "equal?",
++                    "<",
++                    "if",
++                    "begin",
++                    "quote",
++                    "not",
++                    "vector",
++                    "string-append",
++                ]));
++                format!("({head} {joined})")
++            }
++            2 => format!("(lambda (x) {joined})"),
++            _ => {
++                let bound = draw_atom(tc);
++                format!("(let ([x {bound}]) {joined})")
++            }
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 1: running completely arbitrary text returns Ok or Err, but
++    // never panics. (The engine's entry point is exposed to untrusted source.)
++    // -----------------------------------------------------------------------
++    #[test]
++    fn run_on_arbitrary_text_never_panics() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let src: String = tc.draw(generators::text().max_size(300));
++            drop(engine.run(src));
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 2: running Scheme-shaped s-expression soup returns Ok or Err,
++    // but never panics.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn run_on_sexpr_soup_never_panics() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let depth = tc.draw(generators::integers::<u32>().max_value(5));
++            let src = draw_soup(&tc, depth);
++            tc.note(&format!("source: {src}"));
++            drop(engine.run(src));
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 3: nested source of bounded depth never panics/aborts.
++    //
++    // The depth here is capped at 200 because deeper nesting (~1000-1500,
++    // depending on the form) overflows the native stack and ABORTS the
++    // process -- that known bug is pinned by the #[ignore]d reproducer below.
++    // The bound protects the test process, it is not a contract of the
++    // library.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn nested_source_of_bounded_depth_never_panics() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let n: usize = tc.draw(generators::integers::<usize>().min_value(1).max_value(200));
++            let form: &str = tc.draw(generators::sampled_from(vec![
++                "parens",
++                "quote-char",
++                "quote-list",
++                "lambda",
++                "let",
++                "vector",
++                "if",
++                "plus",
++                "list",
++            ]));
++            let src = match form {
++                "parens" => "(".repeat(n) + &")".repeat(n),
++                "quote-char" => "'".repeat(n) + "a",
++                "quote-list" => "(quote ".repeat(n) + "a" + &")".repeat(n),
++                "lambda" => "(lambda () ".repeat(n) + "1" + &")".repeat(n),
++                "let" => "(let () ".repeat(n) + "1" + &")".repeat(n),
++                "vector" => "#(".repeat(n) + &")".repeat(n),
++                "if" => "(if #t ".repeat(n) + "1 2" + &" 2)".repeat(n),
++                "plus" => "(+ 1 ".repeat(n) + "1" + &")".repeat(n),
++                _ => "(list ".repeat(n) + "1" + &")".repeat(n),
++            };
++            tc.note(&format!("form: {form}, depth: {n}"));
++            drop(engine.run(src));
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // KNOWN FAILURE (process abort) -- kept #[ignore]d because it takes the
++    // whole test runner down with SIGABRT rather than failing an assertion.
++    //
++    // Reading/compiling deeply nested source recurses without any depth
++    // limit, so a few kilobytes of untrusted input kill the host process
++    // with a native stack overflow in the default build (no `stacker`
++    // feature). Reproduces for every nesting form; thresholds observed in a
++    // 2 MiB test thread: "(" x n at n >= ~1500, nested `(lambda () ...)` and
++    // `(let () ...)` at n >= ~1000, nested quotes/vectors/applications at
++    // n >= ~1500.
++    //
++    // Run manually with:
++    //   cargo test -p steel-core --test testbench -- --ignored deeply_nested
++    // -----------------------------------------------------------------------
++    #[test]
++    #[ignore = "KNOWN BUG: aborts the process (native stack overflow) on deeply nested input"]
++    fn deeply_nested_input_aborts_process_reproducer() {
++        let mut engine = Engine::new();
++        let n = 10_000;
++        let src = "(".repeat(n) + &")".repeat(n);
++        // This never returns: the process dies with SIGABRT (stack overflow
++        // in the reader) before `run` can produce a Result.
++        drop(engine.run(src));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 4: integer arithmetic (+ - *) matches a num-bigint oracle,
++    // including promotion past isize::MAX/MIN into bignums.
++    // -----------------------------------------------------------------------
++
++    /// Draw a random `(+ - *)` expression tree over i64 leaves; returns the
++    /// source and the exact expected value.
++    fn draw_int_expr(tc: &hegel::TestCase, depth: u32) -> (String, BigInt) {
++        if depth == 0 || tc.draw(generators::integers::<u8>().max_value(2)) == 0 {
++            let n = tc.draw(generators::integers::<i64>());
++            return (n.to_string(), BigInt::from(n));
++        }
++        let op: &str = tc.draw(generators::sampled_from(vec!["+", "-", "*"]));
++        // `(-)` is an arity error in steel; `(+)` => 0 and `(*)` => 1 are legal.
++        let min_arity = if op == "-" { 1 } else { 0 };
++        let arity: usize = tc.draw(
++            generators::integers::<usize>()
++                .min_value(min_arity)
++                .max_value(4),
++        );
++        let children: Vec<(String, BigInt)> =
++            (0..arity).map(|_| draw_int_expr(tc, depth - 1)).collect();
++        let value = match op {
++            "+" => children.iter().fold(BigInt::from(0), |acc, c| acc + &c.1),
++            "*" => children.iter().fold(BigInt::from(1), |acc, c| acc * &c.1),
++            _ => {
++                if children.len() == 1 {
++                    -children[0].1.clone()
++                } else {
++                    children[1..]
++                        .iter()
++                        .fold(children[0].1.clone(), |acc, c| acc - &c.1)
++                }
++            }
++        };
++        let src = format!(
++            "({op} {})",
++            children
++                .iter()
++                .map(|c| c.0.as_str())
++                .collect::<Vec<_>>()
++                .join(" ")
++        );
++        (src, value)
++    }
++
++    #[test]
++    fn integer_arithmetic_matches_bigint_oracle() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let depth = tc.draw(generators::integers::<u32>().min_value(1).max_value(3));
++            let (src, expected) = draw_int_expr(&tc, depth);
++            tc.note(&format!("source: {src}"));
++            let result = run_last(&mut engine, src).expect("integer arithmetic must not error");
++            assert_eq!(format!("{result}"), expected.to_string());
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 5: exact division matches a num-rational oracle; division by
++    // zero is an Err, never a panic. Steel displays exact results reduced,
++    // with the sign on the numerator and no denominator when it is 1 --
++    // exactly `BigRational`'s Display.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn exact_division_matches_rational_oracle() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let a = tc.draw(generators::integers::<i64>());
++            // Boost 0 so the division-by-zero branch is exercised often.
++            let b = tc.draw(hegel::one_of!(
++                generators::just(0i64),
++                generators::integers::<i64>(),
++            ));
++            // Divisor exactly i32::MIN panics the engine -- known bug (4),
++            // pinned by `division_by_i32_min_panics_known_failure`. Excluded
++            // here so this property keeps checking everything else.
++            tc.assume(b != i32::MIN as i64);
++            let src = format!("(/ {a} {b})");
++            if b == 0 {
++                assert!(
++                    engine.run(src).is_err(),
++                    "(/ {a} 0) must be an error, not a panic or a value"
++                );
++            } else {
++                let result = run_last(&mut engine, src).expect("exact division must not error");
++                let expected = BigRational::new(BigInt::from(a), BigInt::from(b));
++                assert_eq!(format!("{result}"), expected.to_string());
++            }
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 6: numeric tower exactness and contagion. Integer ops stay
++    // exact; mixing in a float is contagious and matches Rust f64 semantics;
++    // exact->inexact of a rational equals the correctly rounded f64 quotient.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn numeric_tower_exactness_and_contagion() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let a = tc.draw(generators::integers::<i64>());
++            let b = tc.draw(generators::integers::<i64>());
++
++            // Exact stays exact.
++            let exact = run_last(&mut engine, format!("(exact? (+ {a} {b}))")).unwrap();
++            assert_eq!(exact, SteelVal::BoolV(true), "(+ int int) must stay exact");
++
++            // Float contagion, and the result agrees with Rust f64 arithmetic.
++            let contagion = run_last(&mut engine, format!("(+ {a} 0.5)")).unwrap();
++            match contagion {
++                SteelVal::NumV(x) => assert_eq!(x, a as f64 + 0.5),
++                other => panic!("(+ {a} 0.5) must be inexact, got {other:?}"),
++            }
++
++            // exact->inexact on a rational is the correctly rounded quotient.
++            // i32 operands are exactly representable in f64, so Rust's
++            // `a as f64 / b as f64` is the correctly rounded reference.
++            let n = tc.draw(generators::integers::<i32>());
++            let d = tc.draw(generators::integers::<i32>());
++            // d == i32::MIN panics the engine -- known bug (4), pinned by
++            // `division_by_i32_min_panics_known_failure`.
++            tc.assume(d != 0 && d != i32::MIN);
++            let inexact = run_last(&mut engine, format!("(exact->inexact (/ {n} {d}))")).unwrap();
++            match inexact {
++                SteelVal::NumV(x) => assert_eq!(x, n as f64 / d as f64),
++                other => panic!("(exact->inexact (/ {n} {d})) must be a float, got {other:?}"),
++            }
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 7: display->read round trip. A value written with `to-string`
++    // re-reads (via `read` on a string port) to an `equal?` value.
++    //
++    // Rationals are deliberately excluded from the generated values: any
++    // rational inside a container breaks `equal?` itself -- that known bug is
++    // pinned by `equal_on_rationals_inside_containers_known_failure` below.
++    //
++    // The top-level value is always a container: `to-string` renders *bare*
++    // atoms with display semantics (`(to-string "a")` is `a`, unquoted), which
++    // is not readable text and not a round-trip contract. Inside a container
++    // the elements are rendered write-style (`("a")`), which is.
++    // -----------------------------------------------------------------------
++
++    /// Draw a *readable* value as a constructor expression: atoms plus nested
++    /// list/vector structure.
++    fn draw_readable_value(tc: &hegel::TestCase, depth: u32) -> String {
++        if depth == 0 || tc.draw(generators::integers::<u8>().max_value(2)) == 0 {
++            return match tc.draw(generators::integers::<u8>().max_value(5)) {
++                0 => tc.draw(generators::integers::<i64>()).to_string(),
++                1 => format!(
++                    "{:?}",
++                    tc.draw(
++                        generators::floats::<f64>()
++                            .allow_nan(false)
++                            .allow_infinity(false)
++                    )
++                ),
++                2 => scheme_string_literal(&tc.draw(generators::text().max_size(15))),
++                3 => scheme_char_literal(draw_safe_char(tc)),
++                4 => if tc.draw(generators::booleans()) {
++                    "#true"
++                } else {
++                    "#false"
++                }
++                .to_string(),
++                _ => format!(
++                    "'{}",
++                    tc.draw(generators::sampled_from(vec![
++                        "sym", "foo-bar", "x1", "list?", "a"
++                    ]))
++                ),
++            };
++        }
++        let ctor = if tc.draw(generators::booleans()) {
++            "list"
++        } else {
++            "vector"
++        };
++        let arity: usize = tc.draw(generators::integers::<usize>().max_value(4));
++        let children: Vec<String> = (0..arity)
++            .map(|_| draw_readable_value(tc, depth - 1))
++            .collect();
++        format!("({ctor} {})", children.join(" "))
++    }
++
++    #[test]
++    fn display_read_roundtrip_is_equal() {
++        Hegel::new(|tc| {
++            // A fresh engine per case: `read` keeps global state per engine,
++            // and a poisoned reader (bug 3 in the header) would otherwise
++            // leak between generated cases and make failures
++            // history-dependent ("flaky" in hegel's eyes).
++            let mut engine = Engine::new();
++            let depth = tc.draw(generators::integers::<u32>().max_value(3));
++            let arity: usize = tc.draw(generators::integers::<usize>().max_value(4));
++            let children: Vec<String> = (0..arity)
++                .map(|_| draw_readable_value(&tc, depth))
++                .collect();
++            // Always a container at the top level -- see the display-vs-write
++            // note above.
++            let literal = format!("(list {})", children.join(" "));
++            // Known bug (5): the empty list is an interned singleton, so two
++            // occurrences of it in a tree that also contains a vector make
++            // to-string emit unreadable datum labels ("#0=()\n..."). Excluded
++            // here so the property keeps checking everything else; pinned by
++            // `to_string_of_shared_substructure_is_readable_known_failure`.
++            let empty_lists = literal.matches("(list )").count();
++            tc.assume(!(literal.contains("(vector") && empty_lists >= 2));
++            let src = format!(
++                "(let ([v {literal}]) (equal? v (read (open-input-string (to-string v)))))"
++            );
++            tc.note(&format!("value: {literal}"));
++            let result = run_last(&mut engine, src).expect("roundtrip source must evaluate");
++            assert_eq!(
++                result,
++                SteelVal::BoolV(true),
++                "value {literal} did not survive to-string -> read"
++            );
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // KNOWN FAILURE -- pins bug (4) from the header comment. Dividing by
++    // exactly i32::MIN panics inside `divide_primitive` (num-rational's sign
++    // normalization negates the denominator, overflowing i32) instead of
++    // returning the correct exact result. The engine must never panic on
++    // valid arithmetic. Fails deterministically on every case.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn division_by_i32_min_panics_known_failure() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            // Any numerator in 1..=1000 keeps the quotient non-integral and
++            // i32-representable, which routes into the Rational32 path.
++            let n = tc.draw(generators::integers::<i64>().min_value(1).max_value(1000));
++            let result = run_last(&mut engine, format!("(/ {n} {})", i32::MIN));
++            // The exact expected value: n / -2^31, sign on the numerator.
++            let expected = BigRational::new(BigInt::from(n), BigInt::from(i32::MIN));
++            assert_eq!(format!("{}", result.unwrap()), expected.to_string());
++        })
++        .settings(hegel::Settings::new().test_cases(2))
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // KNOWN FAILURE -- pins bug (5) from the header comment. `to-string` of a
++    // value whose tree contains the (interned, pointer-shared) empty list
++    // more than once under a vector emits datum labels and a stray
++    // definition line -- "#0=()\n#(#0# #0#)" -- which `read` cannot parse
++    // back. Shared acyclic substructure must print as plain nested data.
++    // Fails deterministically on every case.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn to_string_of_shared_substructure_is_readable_known_failure() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            // Two or more empty lists inside a vector trigger the labels.
++            let k = tc.draw(generators::integers::<usize>().min_value(2).max_value(4));
++            let elems = vec!["(list)"; k].join(" ");
++            let src = format!(
++                "(let ([v (vector {elems})]) (equal? v (read (open-input-string (to-string v)))))"
++            );
++            let result = run_last(&mut engine, src).expect("roundtrip source must evaluate");
++            assert_eq!(
++                result,
++                SteelVal::BoolV(true),
++                "KNOWN BUG: to-string of (vector {elems}) is not readable"
++            );
++        })
++        .settings(hegel::Settings::new().test_cases(2))
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // KNOWN FAILURE -- pins bug (3) from the header comment. Reading an
++    // incomplete expression from one string port must not change what `read`
++    // returns for a *different, well-formed* port afterwards. Today the
++    // engine's single global `*reader*` keeps the incomplete state: after
++    // reading "'" a later read of "42" yields `(quote 42)` (and after "(",
++    // every later read yields `(eof)`). Fails deterministically on every
++    // case. Found by `display_read_roundtrip_is_equal`, whose shared engine
++    // had its reader poisoned by an earlier generated case.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn read_does_not_leak_state_across_ports_known_failure() {
++        Hegel::new(|tc| {
++            // A fresh engine per case: the whole point is that this engine's
++            // reader gets poisoned.
++            let mut engine = Engine::new();
++            // A fixed value keeps the shrink space trivial: with an
++            // Engine::new per attempt, shrinking a wide integer draw here
++            // took minutes for no benefit -- the bug is input-independent.
++            let n = 42i64;
++            let poison: &str = tc.draw(generators::sampled_from(vec!["'", "("]));
++            // Reading an incomplete expression just returns eof...
++            run_last(
++                &mut engine,
++                format!("(read (open-input-string {}))", scheme_string_literal(poison)),
++            )
++            .unwrap();
++            // ...but must not affect a later read from a fresh port.
++            let result = run_last(
++                &mut engine,
++                format!("(read (open-input-string \"{n}\"))"),
++            )
++            .unwrap();
++            assert_eq!(
++                result,
++                SteelVal::IntV(n as isize),
++                "KNOWN BUG: read leaked state from a previous port (poison: {poison:?})"
++            );
++        })
++        // The failure needs no exploration to find; keep the (expensive,
++        // Engine::new-per-case) run short.
++        .settings(hegel::Settings::new().test_cases(2))
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // KNOWN FAILURE -- pins bug (1) from the header comment. `equal?` returns
++    // #false for equal rationals stored inside a container, because the
++    // container equality walker in src/rvals/cycles.rs has no match arm for
++    // Rational (nor BigRational / ByteVector), so its catch-all returns
++    // false. Fails deterministically on every generated case; top-level
++    // `(equal? r r)` on the same rational passes.
++    //
++    // Same root cause, also #false today:
++    //   (equal? (list (/ 5000000000 3)) (list (/ 5000000000 3)))   ; BigRational
++    //   (equal? (list (bytes 1 2)) (list (bytes 1 2)))             ; ByteVector
++    // -----------------------------------------------------------------------
++    #[test]
++    fn equal_on_rationals_inside_containers_known_failure() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            // 0 < r < d guarantees the fraction is a genuine (non-integer)
++            // rational, so it stays a Rational after reduction.
++            let d = tc.draw(generators::integers::<i32>().min_value(2).max_value(10_000));
++            let r = tc.draw(generators::integers::<i32>().min_value(1).max_value(d - 1));
++            // Sanity: top-level equality on the same rational holds.
++            let top = run_last(&mut engine, format!("(equal? {r}/{d} {r}/{d})")).unwrap();
++            assert_eq!(top, SteelVal::BoolV(true));
++            // ... but inside a list it must also hold, and today it does not.
++            let nested =
++                run_last(&mut engine, format!("(equal? (list {r}/{d}) (list {r}/{d}))")).unwrap();
++            assert_eq!(
++                nested,
++                SteelVal::BoolV(true),
++                "KNOWN BUG: (equal? (list {r}/{d}) (list {r}/{d})) is #false"
++            );
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 8: integer comparisons match Rust's.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn integer_comparisons_match_rust() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let a = tc.draw(generators::integers::<i64>());
++            // Boost equal and nearly-equal pairs, which uniform draws almost
++            // never produce.
++            let b = tc.draw(hegel::one_of!(
++                generators::just(a),
++                generators::integers::<i64>()
++                    .min_value(a.saturating_sub(2))
++                    .max_value(a.saturating_add(2)),
++                generators::integers::<i64>(),
++            ));
++            let (op, expected): (&str, bool) = match tc
++                .draw(generators::integers::<u8>().max_value(4))
++            {
++                0 => ("<", a < b),
++                1 => ("<=", a <= b),
++                2 => (">", a > b),
++                3 => (">=", a >= b),
++                _ => ("=", a == b),
++            };
++            let result = run_last(&mut engine, format!("({op} {a} {b})")).unwrap();
++            assert_eq!(
++                result,
++                SteelVal::BoolV(expected),
++                "({op} {a} {b}) disagrees with Rust"
++            );
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 9: evaluation is deterministic. The same sequence of sources
++    // fed to two independently created engines produces identical results
++    // (values compared by display, errors by message).
++    // -----------------------------------------------------------------------
++    #[test]
++    fn evaluation_is_deterministic_across_engines() {
++        let mut e1 = Engine::new();
++        let mut e2 = Engine::new();
++        Hegel::new(|tc| {
++            let depth = tc.draw(generators::integers::<u32>().max_value(4));
++            let src = draw_soup(&tc, depth);
++            tc.note(&format!("source: {src}"));
++            let r1 = e1.run(src.clone());
++            let r2 = e2.run(src);
++            match (r1, r2) {
++                (Ok(a), Ok(b)) => {
++                    let show = |vals: Vec<SteelVal>| {
++                        vals.iter()
++                            .map(|v| format!("{v}"))
++                            .collect::<Vec<_>>()
++                            .join(", ")
++                    };
++                    assert_eq!(show(a), show(b));
++                }
++                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
++                (a, b) => panic!(
++                    "engines disagree about success: {:?} vs {:?}",
++                    a.is_ok(),
++                    b.is_ok()
++                ),
++            }
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 10: list operations match a Vec oracle.
++    // -----------------------------------------------------------------------
++    fn list_literal(xs: &[i64]) -> String {
++        format!(
++            "(list {})",
++            xs.iter()
++                .map(|x| x.to_string())
++                .collect::<Vec<_>>()
++                .join(" ")
++        )
++    }
++
++    /// How steel displays a proper list of integers.
++    fn displayed_list(xs: &[i64]) -> String {
++        format!(
++            "({})",
++            xs.iter()
++                .map(|x| x.to_string())
++                .collect::<Vec<_>>()
++                .join(" ")
++        )
++    }
++
++    #[test]
++    fn list_operations_match_vec_oracle() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let xs: Vec<i64> = tc.draw(generators::vecs(generators::integers::<i64>()).max_size(30));
++            let lx = list_literal(&xs);
++            match tc.draw(generators::integers::<u8>().max_value(5)) {
++                0 => {
++                    let result = run_last(&mut engine, format!("(length {lx})")).unwrap();
++                    assert_eq!(format!("{result}"), xs.len().to_string());
++                }
++                1 => {
++                    let result = run_last(&mut engine, format!("(reverse {lx})")).unwrap();
++                    let expected: Vec<i64> = xs.iter().rev().copied().collect();
++                    assert_eq!(format!("{result}"), displayed_list(&expected));
++                }
++                2 => {
++                    let ys: Vec<i64> =
++                        tc.draw(generators::vecs(generators::integers::<i64>()).max_size(30));
++                    let result =
++                        run_last(&mut engine, format!("(append {lx} {})", list_literal(&ys)))
++                            .unwrap();
++                    let expected: Vec<i64> = xs.iter().chain(ys.iter()).copied().collect();
++                    assert_eq!(format!("{result}"), displayed_list(&expected));
++                }
++                3 => {
++                    let result = run_last(&mut engine, format!("(car {lx})"));
++                    match xs.first() {
++                        None => assert!(result.is_err(), "(car '()) must error"),
++                        Some(first) => {
++                            assert_eq!(format!("{}", result.unwrap()), first.to_string())
++                        }
++                    }
++                }
++                4 => {
++                    let result = run_last(&mut engine, format!("(cdr {lx})"));
++                    if xs.is_empty() {
++                        assert!(result.is_err(), "(cdr '()) must error");
++                    } else {
++                        assert_eq!(format!("{}", result.unwrap()), displayed_list(&xs[1..]));
++                    }
++                }
++                _ => {
++                    // Index may run past the end: in-bounds must agree with
++                    // the Vec, out-of-bounds must be an Err.
++                    let idx: usize =
++                        tc.draw(generators::integers::<usize>().max_value(xs.len() + 2));
++                    let result = run_last(&mut engine, format!("(list-ref {lx} {idx})"));
++                    match xs.get(idx) {
++                        Some(v) => assert_eq!(format!("{}", result.unwrap()), v.to_string()),
++                        None => assert!(result.is_err(), "out-of-bounds list-ref must error"),
++                    }
++                }
++            }
++        })
++        .run();
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 11: lexical scope. let-shadowing resolves to the innermost
++    // binding, restores the outer binding afterwards, and lambda application
++    // binds parameters correctly.
++    // -----------------------------------------------------------------------
++    #[test]
++    fn let_and_lambda_scope_resolve_correctly() {
++        let mut engine = Engine::new();
++        Hegel::new(|tc| {
++            let a = tc.draw(generators::integers::<i64>());
++            let b = tc.draw(generators::integers::<i64>());
++
++            let inner =
++                run_last(&mut engine, format!("(let ([x {a}]) (let ([x {b}]) x))")).unwrap();
++            assert_eq!(format!("{inner}"), b.to_string(), "inner binding must win");
++
++            let outer = run_last(
++                &mut engine,
++                format!("(let ([x {a}]) (begin (let ([x {b}]) x) x))"),
++            )
++            .unwrap();
++            assert_eq!(
++                format!("{outer}"),
++                a.to_string(),
++                "outer binding must be restored after the inner let"
++            );
++
++            let lambda = run_last(&mut engine, format!("((lambda (x) x) {a})")).unwrap();
++            assert_eq!(format!("{lambda}"), a.to_string());
++
++            // Two independent bindings in one let; subtraction checked
++            // against an exact oracle (i64 subtraction may overflow, i128
++            // cannot -- this protects the oracle, not the library).
++            let diff = run_last(&mut engine, format!("(let ([x {a}] [y {b}]) (- x y))")).unwrap();
++            assert_eq!(format!("{diff}"), (a as i128 - b as i128).to_string());
++        })
++        .run();
++    }
++}
