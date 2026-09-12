@@ -97,7 +97,13 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             # local type with a derive: add PrettyPrintable to it
             m = re.search(rf"^(\s*)#\[derive\(([^)]*)\)\]\n(\s*(?:pub(?:\([^)]*\))? )?(?:enum|struct) {re.escape(tyname)}\b)",
                           "\n".join(lines), re.M)
-            if m and tyname not in derived:
+            # only derive on test-only types: hegel is a dev-dependency, so a derive on a library
+            # type breaks the non-test build. Test-only = file under tests/ or a tests.rs, or the
+            # definition comes after a #[cfg(test)] in the file.
+            in_test_code = bool(m) and (
+                "tests" in f.parts or f.name in ("tests.rs", "test.rs") or f.name.endswith("_tests.rs")
+                or "#[cfg(test)]" in "\n".join(lines)[: m.start()])
+            if m and in_test_code and tyname not in derived:
                 if "PrettyPrintable" not in m.group(2):
                     text = "\n".join(lines)
                     text = text[:m.start()] + f"{m.group(1)}#[derive({m.group(2)}, hegel::PrettyPrintable)]\n{m.group(3)}" + text[m.end():]
@@ -145,9 +151,22 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
         text = "\n".join(lines)
         already = re.search(r"^\s*use hegel::(?:generators::)?(?:\{[^}]*\b|)Generator\b", text, re.M)
         if need_import and not already:
-            # put the import next to the nearest `use hegel::generators…` so it lands in the right module
+            # The import must land in the module that draws, and never at file scope of library
+            # code (hegel is a dev-dependency). Prefer: after a `use hegel::generators…` line;
+            # else right after the nearest `mod … {` above the first draw site; else after the
+            # first `use` in the file (integration-test files).
             text, n = re.subn(r"^(\s*)(use hegel::generators(?:::\w+)?(?: as \w+)?;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
-            if not n:  # else after the first `use` (never above `//!` inner docs)
+            if not n:
+                first = min(l for l, _, _ in locs) - 1
+                ls = text.split("\n")
+                for k in range(min(first, len(ls) - 1), -1, -1):
+                    mm = re.match(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$", ls[k])
+                    if mm:
+                        ls.insert(k + 1, f"{mm.group(1)}    use hegel::Generator;")
+                        n = 1
+                        break
+                text = "\n".join(ls)
+            if not n:
                 text, n = re.subn(r"^(\s*)(use [^\n]*;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
             if not n:
                 text = "use hegel::Generator;\n" + text
