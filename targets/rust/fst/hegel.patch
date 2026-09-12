@@ -1,0 +1,584 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index ca49748..a368333 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,7 @@ utf8-ranges = { version = "1.0.4", optional = true }
+ [dev-dependencies]
+ doc-comment = "0.3.1"
+ fnv = "1.0.6"
++hegeltest = "0.44.1"
+ memmap2 = "0.5.10"
+ quickcheck = { version = "0.9.2", default-features = false }
+ rand = "0.7.3"
+diff --git a/src/bytes.rs b/src/bytes.rs
+index 35da411..2137a7d 100644
+--- a/src/bytes.rs
++++ b/src/bytes.rs
+@@ -146,4 +146,28 @@ mod tests {
+             .gen(StdGen::new(::rand::thread_rng(), 257)) // pick byte boundary
+             .quickcheck(p as fn(u64) -> bool);
+     }
++
++    // Hegel port of prop_pack_in_out. Unlike the quickcheck version (which
++    // capped values at 257 to hit the one/two-byte boundary), this covers the
++    // full u64 range and explicitly boosts every pack_size byte boundary,
++    // since boundary conjunctions are where pack/unpack bugs would hide.
++    #[hegel::test]
++    fn prop_pack_in_out_hegel(tc: hegel::TestCase) {
++        use hegel::generators::{self, Generator};
++
++        let boundaries: Vec<u64> = (1..8u32)
++            .map(|i| 1u64 << (8 * i))
++            .flat_map(|b| vec![b - 1, b, b + 1])
++            .chain(vec![0, u64::MAX])
++            .collect();
++        let num: u64 = tc.draw(hegel::one_of!(
++            generators::integers::<u64>().boxed(),
++            generators::sampled_from(boundaries).boxed(),
++        ));
++
++        let mut buf = io::Cursor::new(vec![]);
++        let size = pack_uint(&mut buf, num).unwrap();
++        buf.set_position(0);
++        assert_eq!(num, unpack_uint(buf.get_ref(), size));
++    }
+ }
+diff --git a/src/raw/tests.rs b/src/raw/tests.rs
+index c9e77a5..76d02a8 100644
+--- a/src/raw/tests.rs
++++ b/src/raw/tests.rs
+@@ -569,6 +569,126 @@ fn verify_ok_empty() {
+     assert!(map.verify().is_ok());
+ }
+ 
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod hegel_props {
++    use std::collections::BTreeMap;
++
++    use hegel::generators::{self, Generator};
++
++    use crate::error::Error;
++    use crate::raw::{self, Builder, Fst, Output};
++    use crate::raw::tests::fst_inputs_outputs;
++
++    /// A single FST key: a mix of a tiny alphabet (deep shared prefixes) and
++    /// arbitrary binary.
++    #[hegel::composite]
++    fn arbitrary_key(tc: &hegel::TestCase) -> Vec<u8> {
++        tc.draw(hegel::one_of!(
++            generators::vecs(generators::integers::<u8>().max_value(2))
++                .max_size(12)
++                .boxed(),
++            generators::binary().boxed(),
++        ))
++    }
++
++    /// A model map with sorted unique keys and arbitrary u64 values. Size is
++    /// drawn separately so large (multi-level) automata are exercised.
++    #[hegel::composite]
++    fn arbitrary_model_map(tc: &hegel::TestCase) -> BTreeMap<Vec<u8>, u64> {
++        let n = tc.draw(generators::integers::<usize>().max_value(200));
++        let keys: Vec<Vec<u8>> =
++            tc.draw(generators::vecs(arbitrary_key()).min_size(n));
++        let mut model = BTreeMap::new();
++        for key in keys {
++            let value = tc.draw(generators::integers::<u64>());
++            model.insert(key, value);
++        }
++        model
++    }
++
++    /// Property: writing an FST to bytes (Builder::into_inner) and reading it
++    /// back (Fst::new) is lossless — the read FST has the same length,
++    /// contents (in order), and per-key outputs, and its checksum verifies.
++    #[hegel::test]
++    fn prop_fst_bytes_roundtrip(tc: hegel::TestCase) {
++        let model = tc.draw(arbitrary_model_map());
++        let mut builder = Builder::memory();
++        for (key, &value) in &model {
++            builder.insert(key, value).unwrap();
++        }
++        let bytes = builder.into_inner().unwrap();
++        let fst = Fst::new(bytes).unwrap();
++
++        assert!(fst.verify().is_ok());
++        assert_eq!(fst.len(), model.len());
++        let expected: Vec<(Vec<u8>, u64)> =
++            model.iter().map(|(k, &v)| (k.clone(), v)).collect();
++        assert_eq!(fst_inputs_outputs(&fst), expected);
++        for (key, &value) in &model {
++            assert_eq!(fst.get(key), Some(Output::new(value)));
++        }
++    }
++
++    /// Property: building an FST is deterministic — two Builders fed the
++    /// same sorted unique (key, value) pairs produce byte-identical FSTs.
++    /// Evidence: construction is a pure function of the input sequence (the
++    /// node registry hashes node contents, with no randomized seeds), and the
++    /// CRC32C checksum footer (verify()) only makes sense for a deterministic
++    /// serialization.
++    #[hegel::test]
++    fn prop_fst_build_deterministic(tc: hegel::TestCase) {
++        let model = tc.draw(arbitrary_model_map());
++        let build = |model: &BTreeMap<Vec<u8>, u64>| -> Vec<u8> {
++            let mut builder = Builder::memory();
++            for (key, &value) in model {
++                builder.insert(key, value).unwrap();
++            }
++            builder.into_inner().unwrap()
++        };
++        assert_eq!(build(&model), build(&model));
++    }
++
++    /// Property: Builder::insert enforces its documented contract — keys must
++    /// be inserted in strictly increasing lexicographic order. Inserting a
++    /// key smaller than the previous one fails with OutOfOrder, a duplicate
++    /// fails with DuplicateKey, and a larger key succeeds.
++    #[hegel::test]
++    fn prop_builder_insert_order_contract(tc: hegel::TestCase) {
++        let model = tc.draw(arbitrary_model_map());
++        tc.assume(!model.is_empty());
++        let mut builder = Builder::memory();
++        for (key, &value) in &model {
++            builder.insert(key, value).unwrap();
++        }
++        let last = model.keys().next_back().unwrap().clone();
++
++        let probe = tc.draw(arbitrary_key());
++        let result = builder.insert(&probe, 0);
++        match probe.cmp(&last) {
++            std::cmp::Ordering::Less => match result {
++                Err(Error::Fst(raw::Error::OutOfOrder { .. })) => {}
++                other => panic!(
++                    "expected OutOfOrder for probe {:?} after {:?}, got {:?}",
++                    probe, last, other
++                ),
++            },
++            std::cmp::Ordering::Equal => match result {
++                Err(Error::Fst(raw::Error::DuplicateKey { .. })) => {}
++                other => panic!(
++                    "expected DuplicateKey for probe {:?}, got {:?}",
++                    probe, other
++                ),
++            },
++            std::cmp::Ordering::Greater => {
++                result.unwrap();
++            }
++        }
++    }
++}
++
+ #[test]
+ fn verify_err() {
+     let mut b = Builder::memory();
+diff --git a/tests/test.rs b/tests/test.rs
+index c7d733c..17a8972 100644
+--- a/tests/test.rs
++++ b/tests/test.rs
+@@ -183,3 +183,403 @@ fn implements_default() {
+     let set: fst::Set<Vec<u8>> = Default::default();
+     assert!(set.is_empty());
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod hegel_props {
++    use std::collections::{BTreeMap, BTreeSet};
++
++    #[cfg(feature = "levenshtein")]
++    use fst::automaton::Levenshtein;
++    use fst::automaton::{Str, Subsequence};
++    use fst::set::OpBuilder;
++    use fst::{Automaton, IntoStreamer, Map, Set, Streamer};
++    use hegel::generators::{self, Generator};
++
++    /// A single FST key. Mixes a tiny alphabet (which produces sets of keys
++    /// with lots of shared prefixes, giving deep shared automaton structure)
++    /// with arbitrary binary (which exercises the full byte range, including
++    /// the empty key and invalid UTF-8).
++    #[hegel::composite]
++    fn arbitrary_key(tc: &hegel::TestCase) -> Vec<u8> {
++        tc.draw(hegel::one_of!(
++            generators::vecs(generators::integers::<u8>().max_value(2))
++                .max_size(12)
++                .boxed(),
++            generators::binary().boxed(),
++        ))
++    }
++
++    /// A set of keys. The size is drawn separately so that hegel regularly
++    /// produces large key sets (multi-level automata) rather than the small
++    /// default collection sizes.
++    #[hegel::composite]
++    fn arbitrary_keys(tc: &hegel::TestCase) -> BTreeSet<Vec<u8>> {
++        let n = tc.draw(generators::integers::<usize>().max_value(200));
++        let keys: Vec<Vec<u8>> =
++            tc.draw(generators::vecs(arbitrary_key()).min_size(n));
++        keys.into_iter().collect()
++    }
++
++    /// A model map: sorted unique keys, each with an arbitrary u64 value.
++    #[hegel::composite]
++    fn arbitrary_model_map(tc: &hegel::TestCase) -> BTreeMap<Vec<u8>, u64> {
++        let keys = tc.draw(arbitrary_keys());
++        let mut model = BTreeMap::new();
++        for key in keys {
++            let value = tc.draw(generators::integers::<u64>());
++            model.insert(key, value);
++        }
++        model
++    }
++
++    /// Several key sets for testing streaming set operations.
++    #[hegel::composite]
++    fn arbitrary_key_sets(tc: &hegel::TestCase) -> Vec<BTreeSet<Vec<u8>>> {
++        let count = tc.draw(
++            generators::integers::<usize>().min_value(1).max_value(4),
++        );
++        let mut sets = Vec::with_capacity(count);
++        for _ in 0..count {
++            let n = tc.draw(generators::integers::<usize>().max_value(100));
++            let keys: Vec<Vec<u8>> =
++                tc.draw(generators::vecs(arbitrary_key()).min_size(n));
++            sets.push(keys.into_iter().collect());
++        }
++        sets
++    }
++
++    /// Draw a probe key that is biased towards keys actually present in the
++    /// model (so membership/boundary hits happen often), but can also be any
++    /// arbitrary key.
++    fn draw_probe(tc: &hegel::TestCase, model: &BTreeSet<Vec<u8>>) -> Vec<u8> {
++        if !model.is_empty() && tc.draw(generators::booleans()) {
++            let keys: Vec<Vec<u8>> = model.iter().cloned().collect();
++            tc.draw(generators::sampled_from(keys))
++        } else {
++            tc.draw(arbitrary_key())
++        }
++    }
++
++    fn build_set(keys: &BTreeSet<Vec<u8>>) -> Set<Vec<u8>> {
++        Set::from_iter(keys.iter()).unwrap()
++    }
++
++    fn build_map(model: &BTreeMap<Vec<u8>, u64>) -> Map<Vec<u8>> {
++        Map::from_iter(model.iter().map(|(k, &v)| (k, v))).unwrap()
++    }
++
++    /// Property: a Set built from sorted unique keys agrees with a BTreeSet
++    /// oracle on len/is_empty, iteration order/content, and membership.
++    #[hegel::test]
++    fn prop_set_agrees_with_btreeset(tc: hegel::TestCase) {
++        let keys = tc.draw(arbitrary_keys());
++        let set = build_set(&keys);
++
++        assert_eq!(set.len(), keys.len());
++        assert_eq!(set.is_empty(), keys.is_empty());
++
++        let streamed = set.stream().into_bytes();
++        let expected: Vec<Vec<u8>> = keys.iter().cloned().collect();
++        assert_eq!(streamed, expected);
++
++        for key in &keys {
++            assert!(set.contains(key), "missing member key {:?}", key);
++        }
++        let probe = draw_probe(&tc, &keys);
++        assert_eq!(set.contains(&probe), keys.contains(&probe));
++    }
++
++    /// Property: a Map built from sorted unique keys agrees with a BTreeMap
++    /// oracle on len, iteration (keys and values), get, and contains_key.
++    #[hegel::test]
++    fn prop_map_agrees_with_btreemap(tc: hegel::TestCase) {
++        let model = tc.draw(arbitrary_model_map());
++        let map = build_map(&model);
++
++        assert_eq!(map.len(), model.len());
++
++        let streamed = map.stream().into_byte_vec();
++        let expected: Vec<(Vec<u8>, u64)> =
++            model.iter().map(|(k, &v)| (k.clone(), v)).collect();
++        assert_eq!(streamed, expected);
++
++        for (key, &value) in &model {
++            assert!(map.contains_key(key));
++            assert_eq!(map.get(key), Some(value));
++        }
++        let keys: BTreeSet<Vec<u8>> = model.keys().cloned().collect();
++        let probe = draw_probe(&tc, &keys);
++        assert_eq!(map.get(&probe), model.get(&probe).copied());
++    }
++
++    /// Property: range queries (any combination of ge/gt/le/lt/unbounded)
++    /// return exactly the keys a BTreeMap oracle says are in range, in order.
++    #[hegel::test]
++    fn prop_map_range_agrees_with_btreemap(tc: hegel::TestCase) {
++        let model = tc.draw(arbitrary_model_map());
++        let map = build_map(&model);
++        let keys: BTreeSet<Vec<u8>> = model.keys().cloned().collect();
++
++        // (bound key, inclusive?) for each end, or None for unbounded.
++        let min: Option<(Vec<u8>, bool)> =
++            if tc.draw(generators::booleans()) {
++                Some((draw_probe(&tc, &keys), tc.draw(generators::booleans())))
++            } else {
++                None
++            };
++        let max: Option<(Vec<u8>, bool)> =
++            if tc.draw(generators::booleans()) {
++                Some((draw_probe(&tc, &keys), tc.draw(generators::booleans())))
++            } else {
++                None
++            };
++
++        let mut builder = map.range();
++        if let Some((ref b, inclusive)) = min {
++            builder =
++                if inclusive { builder.ge(b) } else { builder.gt(b) };
++        }
++        if let Some((ref b, inclusive)) = max {
++            builder =
++                if inclusive { builder.le(b) } else { builder.lt(b) };
++        }
++        let got = builder.into_stream().into_byte_vec();
++
++        let expected: Vec<(Vec<u8>, u64)> = model
++            .iter()
++            .filter(|(k, _)| {
++                let lo_ok = match min {
++                    None => true,
++                    Some((ref b, true)) => *k >= b,
++                    Some((ref b, false)) => *k > b,
++                };
++                let hi_ok = match max {
++                    None => true,
++                    Some((ref b, true)) => *k <= b,
++                    Some((ref b, false)) => *k < b,
++                };
++                lo_ok && hi_ok
++            })
++            .map(|(k, &v)| (k.clone(), v))
++            .collect();
++        assert_eq!(got, expected);
++    }
++
++    fn stream_op_keys(mut stream: impl for<'a> Streamer<'a, Item = &'a [u8]>) -> Vec<Vec<u8>> {
++        let mut keys = vec![];
++        while let Some(key) = stream.next() {
++            keys.push(key.to_vec());
++        }
++        keys
++    }
++
++    /// Property: streaming union of several sets equals the BTreeSet union.
++    #[hegel::test]
++    fn prop_set_union_agrees_with_oracle(tc: hegel::TestCase) {
++        let models = tc.draw(arbitrary_key_sets());
++        let sets: Vec<Set<Vec<u8>>> = models.iter().map(build_set).collect();
++        let mut op = OpBuilder::new();
++        for set in &sets {
++            op.push(set);
++        }
++        let got = stream_op_keys(op.union());
++
++        let expected: Vec<Vec<u8>> = models
++            .iter()
++            .flat_map(|m| m.iter().cloned())
++            .collect::<BTreeSet<Vec<u8>>>()
++            .into_iter()
++            .collect();
++        assert_eq!(got, expected);
++    }
++
++    /// Property: streaming intersection of several sets equals the BTreeSet
++    /// intersection.
++    #[hegel::test]
++    fn prop_set_intersection_agrees_with_oracle(tc: hegel::TestCase) {
++        let models = tc.draw(arbitrary_key_sets());
++        let sets: Vec<Set<Vec<u8>>> = models.iter().map(build_set).collect();
++        let mut op = OpBuilder::new();
++        for set in &sets {
++            op.push(set);
++        }
++        let got = stream_op_keys(op.intersection());
++
++        let expected: Vec<Vec<u8>> = models[0]
++            .iter()
++            .filter(|k| models[1..].iter().all(|m| m.contains(*k)))
++            .cloned()
++            .collect();
++        assert_eq!(got, expected);
++    }
++
++    /// Property: streaming difference is "keys in the first set that are in
++    /// no other set" (per the OpBuilder::difference docs).
++    #[hegel::test]
++    fn prop_set_difference_agrees_with_oracle(tc: hegel::TestCase) {
++        let models = tc.draw(arbitrary_key_sets());
++        let sets: Vec<Set<Vec<u8>>> = models.iter().map(build_set).collect();
++        let mut op = OpBuilder::new();
++        for set in &sets {
++            op.push(set);
++        }
++        let got = stream_op_keys(op.difference());
++
++        let expected: Vec<Vec<u8>> = models[0]
++            .iter()
++            .filter(|k| !models[1..].iter().any(|m| m.contains(*k)))
++            .cloned()
++            .collect();
++        assert_eq!(got, expected);
++    }
++
++    /// Property: streaming symmetric difference yields keys that occur in an
++    /// odd number of the input sets (per the OpBuilder docs).
++    #[hegel::test]
++    fn prop_set_symmetric_difference_agrees_with_oracle(tc: hegel::TestCase) {
++        let models = tc.draw(arbitrary_key_sets());
++        let sets: Vec<Set<Vec<u8>>> = models.iter().map(build_set).collect();
++        let mut op = OpBuilder::new();
++        for set in &sets {
++            op.push(set);
++        }
++        let got = stream_op_keys(op.symmetric_difference());
++
++        let all_keys: BTreeSet<Vec<u8>> =
++            models.iter().flat_map(|m| m.iter().cloned()).collect();
++        let expected: Vec<Vec<u8>> = all_keys
++            .into_iter()
++            .filter(|k| {
++                models.iter().filter(|m| m.contains(k)).count() % 2 == 1
++            })
++            .collect();
++        assert_eq!(got, expected);
++    }
++
++    /// Property: searching with Str(query).starts_with() returns exactly the
++    /// keys with `query` as a byte prefix, in lexicographic order.
++    #[hegel::test]
++    fn prop_prefix_search_agrees_with_filter(tc: hegel::TestCase) {
++        let keys = tc.draw(arbitrary_keys());
++        let set = build_set(&keys);
++
++        // Bias the query towards prefixes of keys actually in the set. The
++        // query must be a &str, so lossy-decode; the oracle uses the query's
++        // final bytes, so the property stays exact either way.
++        let candidate = draw_probe(&tc, &keys);
++        let cut = tc.draw(
++            generators::integers::<usize>().max_value(candidate.len()),
++        );
++        let query = String::from_utf8_lossy(&candidate[..cut]).into_owned();
++
++        let got = set
++            .search(Str::new(&query).starts_with())
++            .into_stream()
++            .into_bytes();
++        let expected: Vec<Vec<u8>> = keys
++            .iter()
++            .filter(|k| k.starts_with(query.as_bytes()))
++            .cloned()
++            .collect();
++        assert_eq!(got, expected, "query: {:?}", query);
++    }
++
++    fn is_subsequence(needle: &[u8], hay: &[u8]) -> bool {
++        let mut hay = hay.iter();
++        needle.iter().all(|b| hay.any(|h| h == b))
++    }
++
++    /// Property: searching with a Subsequence automaton returns exactly the
++    /// keys containing the query as a byte subsequence.
++    #[hegel::test]
++    fn prop_subsequence_search_agrees_with_filter(tc: hegel::TestCase) {
++        let keys = tc.draw(arbitrary_keys());
++        let set = build_set(&keys);
++
++        // Bias the query towards actual subsequences of member keys.
++        let candidate = draw_probe(&tc, &keys);
++        let mut sub = Vec::with_capacity(candidate.len());
++        for &b in &candidate {
++            if tc.draw(generators::booleans()) {
++                sub.push(b);
++            }
++        }
++        let query = String::from_utf8_lossy(&sub).into_owned();
++
++        let got = set
++            .search(Subsequence::new(&query))
++            .into_stream()
++            .into_bytes();
++        let expected: Vec<Vec<u8>> = keys
++            .iter()
++            .filter(|k| is_subsequence(query.as_bytes(), k))
++            .cloned()
++            .collect();
++        assert_eq!(got, expected, "query: {:?}", query);
++    }
++
++    /// Character-level Levenshtein distance (dynamic programming oracle).
++    #[cfg(feature = "levenshtein")]
++    fn lev_distance(a: &str, b: &str) -> usize {
++        let a: Vec<char> = a.chars().collect();
++        let b: Vec<char> = b.chars().collect();
++        let mut prev: Vec<usize> = (0..=b.len()).collect();
++        for (i, ca) in a.iter().enumerate() {
++            let mut cur = vec![i + 1];
++            for (j, cb) in b.iter().enumerate() {
++                let cost = if ca == cb { 0 } else { 1 };
++                cur.push(
++                    (prev[j] + cost)
++                        .min(prev[j + 1] + 1)
++                        .min(cur[j] + 1),
++                );
++            }
++            prev = cur;
++        }
++        prev[b.len()]
++    }
++
++    /// A short string over a small alphabet (including multi-byte characters,
++    /// which exercise the UTF-8 range handling in the Levenshtein automaton).
++    #[cfg(feature = "levenshtein")]
++    fn draw_lev_string(tc: &hegel::TestCase, max_len: usize) -> String {
++        let len =
++            tc.draw(generators::integers::<usize>().max_value(max_len));
++        let mut s = String::new();
++        for _ in 0..len {
++            s.push(tc.draw(generators::sampled_from(vec![
++                'a', 'b', 'c', 'é', '☃',
++            ])));
++        }
++        s
++    }
++
++    /// Property: Levenshtein automaton search returns exactly the keys whose
++    /// character-level edit distance from the query is <= the given distance,
++    /// per a naive DP oracle.
++    #[cfg(feature = "levenshtein")]
++    #[hegel::test]
++    fn prop_levenshtein_search_agrees_with_naive(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(50));
++        let mut keys = BTreeSet::new();
++        for _ in 0..n {
++            keys.insert(draw_lev_string(&tc, 8));
++        }
++        let set = Set::from_iter(keys.iter()).unwrap();
++
++        let query = draw_lev_string(&tc, 6);
++        let distance = tc.draw(generators::integers::<u32>().max_value(2));
++        let lev = Levenshtein::new(&query, distance).unwrap();
++
++        let got = set.search(&lev).into_stream().into_strs().unwrap();
++        let expected: Vec<String> = keys
++            .iter()
++            .filter(|k| lev_distance(k, &query) <= distance as usize)
++            .cloned()
++            .collect();
++        assert_eq!(got, expected, "query: {:?}, distance: {}", query, distance);
++    }
++}
