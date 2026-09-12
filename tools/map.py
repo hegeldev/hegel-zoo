@@ -80,11 +80,9 @@ def main() -> int:
         if m and m.group(1) in first_test and "[[bug.observed]]" not in blk:
             blk = blk.rstrip("\n") + (
                 f'\n\n[[bug.observed]]\nversion = "{version}"\ncommit = "{commit}"\n'
-                f'hegel = "{pin}"\ndate = "{today}"\nresult = "reproduces"\n')
+                f'hegel = "{pin}"\ndate = "{today}"\nresult = "reproduces"\n\n')
         out.append(blk)
-    b = "".join(out)
-    if not b.endswith("\n"):
-        b += "\n"
+    b = "".join(out).rstrip("\n") + "\n"
     btoml.write_text(b)
     tomllib.loads(btoml.read_text())  # must still parse
 

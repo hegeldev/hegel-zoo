@@ -369,13 +369,22 @@ def port(crate: str) -> str:
     if not sum(rewrite_dep(c) for c in work.rglob("Cargo.toml") if "target" not in c.parts):
         return f"ERROR   {crate}: hegeltest dependency line not found"
     nfix = fix_composites(work) + fix_stateful_run(work)
-    for _round in range(4):
+
+    def run_tests() -> tuple[str, str]:
         r = sh(str(TOOLS / "zoo"), "test", "--no-apply", f"rust/{crate}", check=False)
-        out = r.stdout + r.stderr
-        log = (WORK / f"{crate}.log").read_text(errors="replace") if (WORK / f"{crate}.log").exists() else ""
+        log_path = WORK / f"{crate}.log"
+        return r.stdout + r.stderr, (log_path.read_text(errors="replace") if log_path.exists() else "")
+
+    # fixer rounds: each compile reports one file's worth of printable errors, so a target with
+    # several files (or field errors, fixed one round at a time) needs several rounds; the last
+    # edit must always be followed by a compile, or the outcome describes a stale log
+    for _round in range(8):
+        out, log = run_tests()
         if not (PRINT_ERR.search(log) or FIELD_ERR.search(log)) or not fix_printable(work, log, pkg_dir):
             break
         nfix += 1
+    else:
+        out, log = run_tests()
     if re.search(r"^error(\[E\d+\])?: ", log, re.M) and "test result" not in log:
         errs = sorted(set(re.findall(r"^error(?:\[E\d+\])?: (.{0,110})", log, re.M)))
         return f"COMPILE {crate} ({nfix} composites fixed): " + " | ".join(errs[:6])
