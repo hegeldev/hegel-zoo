@@ -1,0 +1,506 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6c07eab..a966a8f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,6 +20,7 @@ serde = { version = "1.0", optional = true }
+ 
+ [dev-dependencies]
+ criterion = "0.3"
++hegeltest = "0.44.1"
+ quickcheck = "1.0"
+ rand = "0.8"
+ serde_test = "1.0"
+diff --git a/src/qc_test.rs b/src/qc_test.rs
+index f6e990b..0cbfa62 100644
+--- a/src/qc_test.rs
++++ b/src/qc_test.rs
+@@ -272,3 +272,489 @@ fn values_iter() {
+     }
+     quickcheck(prop as fn(RandomKeys) -> bool);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests using hegel, differential against a BTreeMap oracle
++// (and, for the prefix queries, against brute-force scans of the key set).
++// ---------------------------------------------------------------------------
++mod hegel_tests {
++    use crate::{Trie, TrieCommon};
++    use hegel::generators;
++    use std::collections::{BTreeMap, BTreeSet, HashSet};
++
++    /// Keys drawn mostly from a tiny alphabet with short lengths, to force
++    /// deep shared prefixes and near-collisions (where radix-trie bugs hide),
++    /// mixed with arbitrary unicode strings.
++    #[hegel::composite]
++    fn trie_key(tc: &hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::from_regex(r"[ab]{0,8}"),
++            generators::from_regex(r"[abc]{0,12}"),
++            generators::text().max_size(6),
++        ))
++    }
++
++    /// A set of keys with heavy prefix sharing: most keys extend a previously
++    /// generated key (mirroring the existing quickcheck `RandomKeys`
++    /// generator, which the maintainers use for exactly this reason).
++    #[hegel::composite]
++    fn key_set(tc: &hegel::TestCase) -> Vec<String> {
++        let n = tc.draw(generators::integers::<usize>().max_value(60));
++        let mut keys: Vec<String> = vec![tc.draw(trie_key())];
++        for _ in 0..n {
++            let fresh = tc.draw(generators::integers::<u8>().max_value(9)) == 0;
++            let key = if fresh {
++                tc.draw(trie_key())
++            } else {
++                let i = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++                format!("{}{}", keys[i], tc.draw(trie_key()))
++            };
++            keys.push(key);
++        }
++        keys
++    }
++
++    /// Insert every key with a drawn value into both a fresh trie and a fresh
++    /// oracle map, checking that `insert` reports the same previous value.
++    fn build(tc: &hegel::TestCase, keys: &[String]) -> (Trie<String, i32>, BTreeMap<String, i32>) {
++        let mut trie = Trie::new();
++        let mut model = BTreeMap::new();
++        for k in keys {
++            let v = tc.draw(generators::integers::<i32>());
++            assert_eq!(trie.insert(k.clone(), v), model.insert(k.clone(), v));
++        }
++        (trie, model)
++    }
++
++    /// Draw a query string related to the stored keys: a fresh string, an
++    /// exact key, an extension of a key, or a truncation of a key.
++    fn draw_query(tc: &hegel::TestCase, keys: &[String]) -> String {
++        let choice = tc.draw(generators::integers::<u8>().max_value(3));
++        if keys.is_empty() || choice == 0 {
++            return tc.draw(trie_key());
++        }
++        let i = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++        let k = &keys[i];
++        match choice {
++            1 => k.clone(),
++            2 => format!("{}{}", k, tc.draw(trie_key())),
++            _ => {
++                let chars: Vec<char> = k.chars().collect();
++                let m = if chars.is_empty() {
++                    0
++                } else {
++                    tc.draw(generators::integers::<usize>().max_value(chars.len()))
++                };
++                chars[..m].iter().collect()
++            }
++        }
++    }
++
++    /// Brute-force ground truth for `get_ancestor`: the longest stored key
++    /// that is a byte-prefix of the query.
++    fn longest_stored_prefix<'a>(
++        model: &'a BTreeMap<String, i32>,
++        q: &str,
++    ) -> Option<(&'a String, &'a i32)> {
++        model
++            .iter()
++            .filter(|(k, _)| q.as_bytes().starts_with(k.as_bytes()))
++            .max_by_key(|(k, _)| k.len())
++    }
++
++    fn nibbles(s: &str) -> Vec<u8> {
++        s.bytes().flat_map(|b| [b >> 4, b & 0x0f]).collect()
++    }
++
++    fn lcp_len(a: &[u8], b: &[u8]) -> usize {
++        a.iter().zip(b).take_while(|(x, y)| x == y).count()
++    }
++
++    /// The set of node paths (in nibbles) of a radix trie built by inserting
++    /// `keys`: the root, every stored key, and every pairwise
++    /// longest-common-prefix (the branch points).
++    fn node_paths(keys: &BTreeMap<String, i32>) -> HashSet<Vec<u8>> {
++        let nibs: Vec<Vec<u8>> = keys.keys().map(|k| nibbles(k)).collect();
++        let mut paths = HashSet::new();
++        paths.insert(Vec::new());
++        for (i, a) in nibs.iter().enumerate() {
++            paths.insert(a.clone());
++            for b in &nibs[i + 1..] {
++                paths.insert(a[..lcp_len(a, b)].to_vec());
++            }
++        }
++        paths
++    }
++
++    fn nibblet_to_vec(nv: &nibble_vec::Nibblet) -> Vec<u8> {
++        (0..nv.len()).map(|i| nv.get(i)).collect()
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 1: stateful model test — a drawn sequence of operations is
++    // applied to both the Trie and a BTreeMap oracle; after every operation
++    // the two must agree on return values, length, and full contents.
++    // -----------------------------------------------------------------------
++
++    struct TrieModelMachine {
++        trie: Trie<String, i32>,
++        model: BTreeMap<String, i32>,
++        /// Keys used so far, so later operations can hit existing keys and
++        /// their extensions instead of always missing.
++        pool: Vec<String>,
++    }
++
++    fn draw_model_key(tc: &hegel::TestCase, pool: &[String]) -> String {
++        let choice = tc.draw(generators::integers::<u8>().max_value(3));
++        if pool.is_empty() || choice == 0 {
++            return tc.draw(trie_key());
++        }
++        let i = tc.draw(generators::integers::<usize>().max_value(pool.len() - 1));
++        match choice {
++            1 => format!("{}{}", pool[i], tc.draw(trie_key())),
++            _ => pool[i].clone(),
++        }
++    }
++
++    #[hegel::state_machine]
++    impl TrieModelMachine {
++        #[rule]
++        fn insert(&mut self, tc: hegel::TestCase) {
++            let k = draw_model_key(&tc, &self.pool);
++            let v = tc.draw(generators::integers::<i32>());
++            assert_eq!(
++                self.trie.insert(k.clone(), v),
++                self.model.insert(k.clone(), v)
++            );
++            self.pool.push(k);
++        }
++
++        #[rule]
++        fn remove(&mut self, tc: hegel::TestCase) {
++            let k = draw_model_key(&tc, &self.pool);
++            assert_eq!(self.trie.remove(&k), self.model.remove(&k));
++        }
++
++        #[rule]
++        fn get(&mut self, tc: hegel::TestCase) {
++            let k = draw_model_key(&tc, &self.pool);
++            assert_eq!(self.trie.get(&k), self.model.get(&k));
++        }
++
++        #[rule]
++        fn get_mut(&mut self, tc: hegel::TestCase) {
++            let k = draw_model_key(&tc, &self.pool);
++            let delta = tc.draw(generators::integers::<i32>());
++            let t = self.trie.get_mut(&k);
++            let m = self.model.get_mut(&k);
++            assert_eq!(t.as_deref(), m.as_deref());
++            if let (Some(tv), Some(mv)) = (t, m) {
++                *tv = tv.wrapping_add(delta);
++                *mv = mv.wrapping_add(delta);
++            }
++        }
++
++        #[rule]
++        fn get_ancestor(&mut self, tc: hegel::TestCase) {
++            let q = draw_model_key(&tc, &self.pool);
++            let expected = longest_stored_prefix(&self.model, &q);
++            assert_eq!(self.trie.get_ancestor_value(&q), expected.map(|(_, v)| v));
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _: hegel::TestCase) {
++            assert_eq!(self.trie.len(), self.model.len());
++            assert!(self.trie.check_integrity());
++            let got: BTreeMap<String, i32> =
++                self.trie.iter().map(|(k, v)| (k.clone(), *v)).collect();
++            assert_eq!(got, self.model);
++        }
++    }
++
++    #[hegel::test]
++    fn hegel_stateful_model_vs_btreemap(tc: hegel::TestCase) {
++        let machine = TrieModelMachine {
++            trie: Trie::new(),
++            model: BTreeMap::new(),
++            pool: Vec::new(),
++        };
++        hegel::stateful::machine(machine).run(tc);
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 2: insert/get/get_mut/remove consistency on a single key, on
++    // top of an arbitrary pre-populated trie.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_insert_get_remove_consistency(tc: hegel::TestCase) {
++        let keys = tc.draw(key_set());
++        let (mut trie, mut model) = build(&tc, &keys);
++        let k = draw_query(&tc, &keys);
++        let v = tc.draw(generators::integers::<i32>());
++
++        // Insert returns the previous value, exactly like the oracle.
++        assert_eq!(trie.insert(k.clone(), v), model.insert(k.clone(), v));
++        assert_eq!(trie.len(), model.len());
++        assert_eq!(trie.get(&k), Some(&v));
++
++        // get_mut sees the same value and writes through.
++        let v2 = tc.draw(generators::integers::<i32>());
++        *trie.get_mut(&k).unwrap() = v2;
++        *model.get_mut(&k).unwrap() = v2;
++        assert_eq!(trie.get(&k), Some(&v2));
++
++        // Remove returns the stored value; the key is gone afterwards.
++        assert_eq!(trie.remove(&k), Some(v2));
++        model.remove(&k);
++        assert_eq!(trie.get(&k), None);
++        assert_eq!(trie.len(), model.len());
++
++        // Removing a missing key is a no-op.
++        assert_eq!(trie.remove(&k), None);
++        assert_eq!(trie.len(), model.len());
++        assert!(trie.check_integrity());
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 3: get_ancestor / get_ancestor_value return the longest stored
++    // key that is a prefix of the query (vs a brute-force scan).
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_get_ancestor_is_longest_stored_prefix(tc: hegel::TestCase) {
++        let keys = tc.draw(key_set());
++        let (trie, model) = build(&tc, &keys);
++        let q = draw_query(&tc, &keys);
++
++        let expected = longest_stored_prefix(&model, &q);
++
++        match trie.get_ancestor(&q) {
++            Some(anc) => {
++                let (ek, ev) = expected
++                    .expect("get_ancestor returned Some but no stored key is a prefix of the query");
++                assert_eq!(anc.key(), Some(ek));
++                assert_eq!(anc.value(), Some(ev));
++            }
++            None => assert_eq!(expected, None),
++        }
++        assert_eq!(trie.get_ancestor_value(&q), expected.map(|(_, v)| v));
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 4: get_raw_ancestor returns the deepest trie *node* whose path
++    // is a prefix of the query. Ground truth: node paths of a radix trie are
++    // exactly the root, the stored keys, and all pairwise LCPs (in nibbles).
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_get_raw_ancestor_is_deepest_node_prefix(tc: hegel::TestCase) {
++        let keys = tc.draw(key_set());
++        let (trie, model) = build(&tc, &keys);
++        let q = draw_query(&tc, &keys);
++        let qn = nibbles(&q);
++
++        let expected = node_paths(&model)
++            .into_iter()
++            .filter(|p| qn.starts_with(p))
++            .max_by_key(|p| p.len())
++            .expect("the root path is always a prefix of the query");
++
++        let anc = trie.get_raw_ancestor(&q);
++        assert_eq!(nibblet_to_vec(&anc.prefix), expected);
++
++        // The node carries a key exactly when its path is a stored key.
++        let stored = model.keys().find(|k| nibbles(k) == expected);
++        assert_eq!(anc.key(), stored);
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 5: get_raw_descendant's subtrie contains exactly the stored
++    // keys that have the query as a prefix (vs a brute-force filter), and its
++    // prefix is the shallowest node path extending the query.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_get_raw_descendant_is_the_prefix_filter(tc: hegel::TestCase) {
++        let keys = tc.draw(key_set());
++        let (trie, model) = build(&tc, &keys);
++        let q = draw_query(&tc, &keys);
++        let qn = nibbles(&q);
++
++        let expected: BTreeMap<String, i32> = model
++            .iter()
++            .filter(|(k, _)| k.as_bytes().starts_with(q.as_bytes()))
++            .map(|(k, v)| (k.clone(), *v))
++            .collect();
++
++        match trie.get_raw_descendant(&q) {
++            Some(desc) => {
++                let got: BTreeMap<String, i32> =
++                    desc.iter().map(|(k, v)| (k.clone(), *v)).collect();
++                assert_eq!(got, expected);
++                assert_eq!(desc.len(), expected.len());
++
++                let expected_prefix = node_paths(&model)
++                    .into_iter()
++                    .filter(|p| p.starts_with(&qn))
++                    .min_by_key(|p| p.len())
++                    .expect("descendant node returned but no node path extends the query");
++                assert_eq!(nibblet_to_vec(&desc.prefix), expected_prefix);
++            }
++            None => assert!(
++                expected.is_empty(),
++                "keys with the query prefix exist but get_raw_descendant returned None"
++            ),
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 6: the subtrie at a stored key contains exactly the stored
++    // keys extending it; subtrie values agree with the oracle everywhere.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_subtrie_of_stored_key_is_the_prefix_filter(tc: hegel::TestCase) {
++        let keys = tc.draw(key_set());
++        let (trie, model) = build(&tc, &keys);
++
++        // A stored key always has a node: its subtrie holds exactly the
++        // stored keys extending it.
++        let i = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++        let k = &keys[i];
++        let st = trie.subtrie(k).expect("stored key must have a subtrie node");
++        assert_eq!(st.value(), model.get(k));
++        let got: BTreeMap<String, i32> = st.iter().map(|(k2, v)| (k2.clone(), *v)).collect();
++        let expected: BTreeMap<String, i32> = model
++            .iter()
++            .filter(|(k2, _)| k2.as_bytes().starts_with(k.as_bytes()))
++            .map(|(k2, v)| (k2.clone(), *v))
++            .collect();
++        assert_eq!(got, expected);
++        assert_eq!(st.len(), expected.len());
++
++        // For an arbitrary query: if a subtrie node exists, its value agrees
++        // with the oracle; if none exists, the query is not a stored key.
++        let q = draw_query(&tc, &keys);
++        match trie.subtrie(&q) {
++            Some(st) => assert_eq!(st.value(), model.get(&q)),
++            None => assert!(!model.contains_key(&q)),
++        }
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 7: iter/keys/values yield exactly the oracle's contents
++    // (compared as sets/maps — iteration order is not part of the contract).
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_iteration_matches_oracle(tc: hegel::TestCase) {
++        let keys = tc.draw(key_set());
++        let (trie, model) = build(&tc, &keys);
++
++        assert_eq!(trie.len(), model.len());
++
++        let got: BTreeMap<String, i32> = trie.iter().map(|(k, v)| (k.clone(), *v)).collect();
++        assert_eq!(trie.iter().count(), got.len(), "iter yielded duplicate keys");
++        assert_eq!(got, model);
++
++        let got_keys: BTreeSet<String> = trie.keys().cloned().collect();
++        let expected_keys: BTreeSet<String> = model.keys().cloned().collect();
++        assert_eq!(got_keys, expected_keys);
++
++        let mut got_values: Vec<i32> = trie.values().cloned().collect();
++        let mut expected_values: Vec<i32> = model.values().cloned().collect();
++        got_values.sort_unstable();
++        expected_values.sort_unstable();
++        assert_eq!(got_values, expected_values);
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 8: len counts distinct keys (duplicate inserts don't grow it),
++    // the last write wins per key, and an empty trie is really empty.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_len_counts_distinct_keys(tc: hegel::TestCase) {
++        // Draw keys from a small pool so duplicate inserts are common.
++        let pool = tc.draw(key_set());
++        let n = tc.draw(generators::integers::<usize>().max_value(100));
++        let mut trie = Trie::new();
++        let mut model = BTreeMap::new();
++
++        // Empty-trie behaviour.
++        assert_eq!(trie.len(), 0);
++        assert!(trie.is_empty());
++        assert_eq!(trie.get(&pool[0]), None);
++        assert_eq!(trie.remove(&pool[0]), None);
++        assert_eq!(trie.get_ancestor_value(&pool[0]), None);
++
++        for _ in 0..n {
++            let i = tc.draw(generators::integers::<usize>().max_value(pool.len() - 1));
++            let k = pool[i].clone();
++            let v = tc.draw(generators::integers::<i32>());
++            assert_eq!(trie.insert(k.clone(), v), model.insert(k, v));
++            assert_eq!(trie.len(), model.len());
++        }
++
++        // len == number of distinct inserted keys; last write wins per key.
++        for (k, v) in &model {
++            assert_eq!(trie.get(k), Some(v));
++        }
++        assert!(trie.check_integrity());
++    }
++
++    // -----------------------------------------------------------------------
++    // Property 9: prefix-chain edge cases — a chain of keys each a strict
++    // prefix of the next (possibly rooted at the empty key) plus a sibling
++    // differing from the deepest key only in its last byte. Removing any one
++    // chain key must leave every other key untouched.
++    // -----------------------------------------------------------------------
++    #[hegel::test]
++    fn hegel_prefix_chain_and_near_collision_edge_cases(tc: hegel::TestCase) {
++        let mut key = if tc.draw(generators::booleans()) {
++            String::new()
++        } else {
++            tc.draw(trie_key())
++        };
++        let mut chain = vec![key.clone()];
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(5));
++        for _ in 0..depth {
++            let ext: String = tc.draw(generators::from_regex(r"[ab]{1,3}"));
++            key = format!("{key}{ext}");
++            chain.push(key.clone());
++        }
++        // Sibling of the deepest key, differing only in the last byte (the
++        // last char is 'a' or 'b' by construction).
++        let mut sibling = chain.last().unwrap().clone();
++        sibling.pop();
++        sibling.push('c');
++
++        let mut trie = Trie::new();
++        let mut model = BTreeMap::new();
++        for (i, k) in chain.iter().enumerate() {
++            assert_eq!(
++                trie.insert(k.clone(), i as i32),
++                model.insert(k.clone(), i as i32)
++            );
++        }
++        assert_eq!(trie.insert(sibling.clone(), -1), model.insert(sibling.clone(), -1));
++        assert_eq!(trie.len(), model.len());
++        assert!(trie.check_integrity());
++
++        for (k, v) in &model {
++            assert_eq!(trie.get(k), Some(v));
++        }
++
++        // Ancestor queries along the chain agree with brute force.
++        let probe = format!("{}c", chain.last().unwrap());
++        assert_eq!(
++            trie.get_ancestor_value(&probe),
++            longest_stored_prefix(&model, &probe).map(|(_, v)| v)
++        );
++
++        // Remove one drawn chain key; every other key must be unaffected.
++        let i = tc.draw(generators::integers::<usize>().max_value(chain.len() - 1));
++        let removed = chain[i].clone();
++        assert_eq!(trie.remove(&removed), model.remove(&removed));
++        assert_eq!(trie.len(), model.len());
++        assert_eq!(trie.get(&removed), None);
++        for (k, v) in &model {
++            assert_eq!(trie.get(k), Some(v));
++        }
++        assert!(trie.check_integrity());
++    }
++}

@@ -1,0 +1,470 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8a09c38..6b39cd1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -120,6 +120,9 @@ pretty_assertions.workspace = true
+ rasn-pkix = { path = "standards/pkix", default-features = false }
+ rasn-its = { path = "standards/its", default-features = false }
+ serde = {version="1.0.228", features=["derive"]}
++hegeltest = "0.44.1"
++num-bigint = "0.4"
++chrono = "0.4"
+ 
+ # Assume that we need these dependencies only when benching manually on specific targets
+ [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dev-dependencies]
+diff --git a/tests/fuzz.rs b/tests/fuzz.rs
+index 8d021d4..15ff56a 100644
+--- a/tests/fuzz.rs
++++ b/tests/fuzz.rs
+@@ -272,3 +272,451 @@ fn havoc_rep_2() {
+         assert_eq!(value, der::decode(&der::encode(&value).unwrap()).unwrap());
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel / hegeltest)
++//
++// These supplement the corpus-replay fuzz tests above. They target the same
++// bug classes the `fuzzing/` AFL targets exercise (decode robustness,
++// encode->decode roundtrip, DER canonicity) but generate structured ASN.1
++// values and adversarial byte strings directly.
++// ---------------------------------------------------------------------------
++#[allow(clippy::unwrap_used, clippy::disallowed_names)]
++mod hegel_props {
++    use core::str::FromStr;
++    use hegel::generators::{self, Generator};
++    use num_bigint::BigInt;
++    use rasn::prelude::*;
++    use rasn::{ber, cer, coer, der, oer};
++    use std::boxed::Box;
++
++    // ---- generators ------------------------------------------------------
++
++    // Arbitrary rasn Integer: machine-int boundaries (MIN/MAX/0 of every width)
++    // plus digit strings wider than any machine type to force the BigInt path.
++    #[hegel::composite]
++    fn arb_integer(tc: &hegel::TestCase) -> Integer {
++        tc.draw((hegel::one_of!(
++            generators::integers::<i128>().map(Integer::from),
++            generators::integers::<u128>().map(Integer::from),
++            generators::sampled_from(vec![
++                Integer::from(0),
++                Integer::from(i128::MIN),
++                Integer::from(i128::MAX),
++                Integer::from(u128::MAX),
++                Integer::from(-1),
++                Integer::from(1),
++            ]),
++            generators::from_regex(r"-?[1-9][0-9]{0,79}")
++                .map(|s: String| Integer::from(BigInt::from_str(&s).unwrap())),
++        )).print_as_debug())
++    }
++
++    #[hegel::composite]
++    fn arb_octet(tc: &hegel::TestCase) -> OctetString {
++        let bytes = tc.draw(generators::binary().max_size(64));
++        OctetString::from(bytes)
++    }
++
++    #[hegel::composite]
++    fn arb_bitstring(tc: &hegel::TestCase) -> BitString {
++        let bytes = tc.draw(generators::binary().max_size(32));
++        let mut bv = BitString::from_vec(bytes);
++        // Truncate to a non-byte-aligned bit length to exercise "unused bits".
++        let bits = bv.len();
++        if bits > 0 {
++            let keep = tc.draw(generators::integers::<usize>().max_value(bits));
++            bv.truncate(keep);
++        }
++        bv
++    }
++
++    #[hegel::composite]
++    fn arb_visible(tc: &hegel::TestCase) -> VisibleString {
++        // VisibleString permits printable ASCII 0x20..=0x7E.
++        let n = tc.draw(generators::integers::<usize>().max_value(48));
++        let mut s = String::new();
++        for _ in 0..n {
++            let c = tc.draw(generators::integers::<u8>().min_value(0x20).max_value(0x7E));
++            s.push(c as char);
++        }
++        VisibleString::try_from(s).unwrap()
++    }
++
++    // A valid OID that this crate's encoder can encode losslessly.
++    // Constraint rationale: `ObjectIdentifier::new` only checks `first <= 2`,
++    // but the BER encoder computes `first * 40 + second`, so we keep the
++    // combined first/second arc within a range that both roundtrips and does
++    // not overflow. (The values this excludes are pinned as bugs below.)
++    #[hegel::composite]
++    fn arb_safe_oid(tc: &hegel::TestCase) -> ObjectIdentifier {
++        let first = tc.draw(generators::integers::<u32>().max_value(2));
++        let second = if first < 2 {
++            tc.draw(generators::integers::<u32>().max_value(39))
++        } else {
++            // first == 2: second may be large, but first*40 + second must fit u32.
++            tc.draw(generators::integers::<u32>().max_value(u32::MAX - 80))
++        };
++        let extra = tc.draw(generators::integers::<usize>().max_value(6));
++        let mut arcs = vec![first, second];
++        for _ in 0..extra {
++            arcs.push(tc.draw(generators::integers::<u32>()));
++        }
++        ObjectIdentifier::new(arcs).unwrap()
++    }
++
++    // A UtcTime that roundtrips: whole seconds, year within the 2-digit-year
++    // representable window (1970..2049), which is UTCTime's documented domain.
++    #[hegel::composite]
++    fn arb_utc_time(tc: &hegel::TestCase) -> UtcTime {
++        let secs = tc.draw(generators::integers::<i64>().min_value(0).max_value(2_524_607_999));
++        chrono::DateTime::from_timestamp(secs, 0).unwrap()
++    }
++
++    // A GeneralizedTime that roundtrips: 4-digit year range, sub-second kept.
++    #[hegel::composite]
++    fn arb_generalized_time(tc: &hegel::TestCase) -> GeneralizedTime {
++        let secs = tc.draw(generators::integers::<i64>().min_value(0).max_value(253_402_300_799));
++        let nanos = tc.draw(generators::integers::<u32>().max_value(999_999_999));
++        chrono::DateTime::from_timestamp(secs, nanos)
++            .unwrap()
++            .fixed_offset()
++    }
++
++    // Draw an arbitrary `Open` value, recursion-bounded for the InstanceOf arm.
++    fn draw_open(tc: &hegel::TestCase, depth: u32) -> Open {
++        let n_variants: u8 = if depth == 0 { 10 } else { 11 };
++        let choice = tc.draw(generators::integers::<u8>().max_value(n_variants - 1));
++        match choice {
++            0 => Open::BitString(tc.draw((arb_bitstring()).print_as_debug())),
++            1 => Open::Bool(tc.draw(generators::booleans())),
++            2 => Open::GeneralizedTime(tc.draw((arb_generalized_time()).print_as_debug())),
++            3 => Open::Integer(tc.draw((arb_integer()).print_as_debug())),
++            4 => Open::Null,
++            5 => Open::ObjectIdentifier(tc.draw((arb_safe_oid()).print_as_debug())),
++            6 => Open::OctetString(tc.draw((arb_octet()).print_as_debug())),
++            7 => {
++                let n = tc.draw(generators::integers::<usize>().max_value(24));
++                let mut s = String::new();
++                for _ in 0..n {
++                    let cp = tc.draw(hegel::one_of!(
++                        generators::integers::<u32>().max_value(0x7F),
++                        generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++                        generators::integers::<u32>().min_value(0x1_0000).max_value(0x10_FFFF),
++                    ));
++                    s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
++                }
++                Open::UniversalString(UniversalString::new(s))
++            }
++            8 => Open::UtcTime(tc.draw((arb_utc_time()).print_as_debug())),
++            9 => Open::VisibleString(tc.draw((arb_visible()).print_as_debug())),
++            _ => {
++                let inner = draw_open(tc, depth - 1);
++                Open::InstanceOf(Box::new(InstanceOf {
++                    type_id: tc.draw((arb_safe_oid()).print_as_debug()),
++                    value: inner,
++                }))
++            }
++        }
++    }
++
++    #[hegel::composite]
++    fn arb_open(tc: &hegel::TestCase) -> Open {
++        draw_open(&tc, 3)
++    }
++
++    // A structured user-defined model exercising SEQUENCE / SEQUENCE OF /
++    // CHOICE / ENUMERATED / Option in one type.
++    #[derive(AsnType, Debug, Clone, PartialEq, Decode, Encode, Copy, hegel::PrettyPrintable)]
++    #[rasn(enumerated)]
++    enum Color {
++        Red,
++        Green,
++        Blue,
++    }
++
++    #[derive(AsnType, Debug, Clone, PartialEq, Decode, Encode, hegel::PrettyPrintable)]
++    #[rasn(automatic_tags)]
++    struct Model {
++        #[pretty(debug)]
++        int: Integer,
++        flag: bool,
++        #[pretty(debug)]
++        maybe: Option<OctetString>,
++        list: SequenceOf<bool>,
++        color: Color,
++    }
++
++    #[derive(AsnType, Debug, Clone, PartialEq, Decode, Encode, hegel::PrettyPrintable)]
++    #[rasn(choice, automatic_tags)]
++    enum Payload {
++        Num(#[pretty(debug)] Integer),
++        Text(Utf8String),
++        Flag(bool),
++        Body(Model),
++    }
++
++    #[hegel::composite]
++    fn arb_model(tc: &hegel::TestCase) -> Model {
++        let int = tc.draw((arb_integer()).print_as_debug());
++        let flag = tc.draw(generators::booleans());
++        let maybe = if tc.draw(generators::booleans()) {
++            Some(tc.draw((arb_octet()).print_as_debug()))
++        } else {
++            None
++        };
++        let n = tc.draw(generators::integers::<usize>().max_value(16));
++        let mut list = Vec::new();
++        for _ in 0..n {
++            list.push(tc.draw(generators::booleans()));
++        }
++        let color = tc.draw(generators::sampled_from(vec![Color::Red, Color::Green, Color::Blue]));
++        Model { int, flag, maybe, list, color }
++    }
++
++    #[hegel::composite]
++    fn arb_payload(tc: &hegel::TestCase) -> Payload {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => Payload::Num(tc.draw((arb_integer()).print_as_debug())),
++            1 => Payload::Text(tc.draw(generators::text().max_size(48))),
++            2 => Payload::Flag(tc.draw(generators::booleans())),
++            _ => Payload::Body(tc.draw((arb_model()).print_as_debug())),
++        }
++    }
++
++    // ---- Property 1: encode -> decode roundtrip, per codec (crown) --------
++
++    #[hegel::test]
++    fn open_roundtrip_ber(tc: hegel::TestCase) {
++        let value = tc.draw((arb_open()).print_as_debug());
++        let bytes = ber::encode(&value).unwrap();
++        assert_eq!(value, ber::decode::<Open>(&bytes).unwrap());
++    }
++
++    #[hegel::test]
++    fn open_roundtrip_der(tc: hegel::TestCase) {
++        let value = tc.draw((arb_open()).print_as_debug());
++        let bytes = der::encode(&value).unwrap();
++        assert_eq!(value, der::decode::<Open>(&bytes).unwrap());
++    }
++
++    #[hegel::test]
++    fn open_roundtrip_cer(tc: hegel::TestCase) {
++        let value = tc.draw((arb_open()).print_as_debug());
++        let bytes = cer::encode(&value).unwrap();
++        assert_eq!(value, cer::decode::<Open>(&bytes).unwrap());
++    }
++
++    #[hegel::test]
++    fn model_roundtrip_all_codecs(tc: hegel::TestCase) {
++        let value = tc.draw(arb_model());
++        for name in ["ber", "der", "cer", "oer", "coer"] {
++            let (bytes, decoded) = match name {
++                "ber" => (ber::encode(&value).unwrap(), ber::decode::<Model>(&ber::encode(&value).unwrap())),
++                "der" => (der::encode(&value).unwrap(), der::decode::<Model>(&der::encode(&value).unwrap())),
++                "cer" => (cer::encode(&value).unwrap(), cer::decode::<Model>(&cer::encode(&value).unwrap())),
++                "oer" => (oer::encode(&value).unwrap(), oer::decode::<Model>(&oer::encode(&value).unwrap())),
++                _ => (coer::encode(&value).unwrap(), coer::decode::<Model>(&coer::encode(&value).unwrap())),
++            };
++            let _ = bytes;
++            assert_eq!(value, decoded.unwrap(), "roundtrip failed for codec {name}");
++        }
++    }
++
++    #[hegel::test]
++    fn choice_roundtrip_ber_der(tc: hegel::TestCase) {
++        let value = tc.draw(arb_payload());
++        assert_eq!(value, ber::decode::<Payload>(&ber::encode(&value).unwrap()).unwrap());
++        assert_eq!(value, der::decode::<Payload>(&der::encode(&value).unwrap()).unwrap());
++    }
++
++    // ---- Property 2: cross-codec / DER canonicity -------------------------
++
++    // A value encoded in DER (a strict subset of BER) must decode under BER
++    // to the same value.
++    #[hegel::test]
++    fn der_encoding_decodes_under_ber(tc: hegel::TestCase) {
++        let value = tc.draw((arb_open()).print_as_debug());
++        let der_bytes = der::encode(&value).unwrap();
++        assert_eq!(value, ber::decode::<Open>(&der_bytes).unwrap());
++    }
++
++    // DER is canonical: re-encoding a DER-decoded value reproduces the exact
++    // same bytes (fixpoint). Oracle-independent.
++    #[hegel::test]
++    fn der_is_canonical_fixpoint(tc: hegel::TestCase) {
++        let value = tc.draw((arb_open()).print_as_debug());
++        let bytes = der::encode(&value).unwrap();
++        let decoded = der::decode::<Open>(&bytes).unwrap();
++        let reencoded = der::encode(&decoded).unwrap();
++        assert_eq!(bytes, reencoded, "DER re-encode is not a fixpoint");
++    }
++
++    // ---- Property 3: arbitrary-bytes decode robustness (untrusted input) --
++
++    // The key untrusted target: decoding attacker-controlled bytes must return
++    // Ok or Err, never panic / OOM / hang. Length fields are attacker-controlled.
++    #[hegel::test(test_cases = 400)]
++    fn arbitrary_bytes_never_panic(tc: hegel::TestCase) {
++        let data = tc.draw(generators::binary().max_size(256));
++        // Sweep the primitive decoders and the open/structured decoders.
++        let _ = ber::decode::<Open>(&data);
++        let _ = der::decode::<Open>(&data);
++        let _ = cer::decode::<Open>(&data);
++        let _ = ber::decode::<bool>(&data);
++        let _ = der::decode::<Integer>(&data);
++        let _ = ber::decode::<OctetString>(&data);
++        let _ = der::decode::<ObjectIdentifier>(&data);
++        let _ = ber::decode::<BitString>(&data);
++        let _ = der::decode::<Model>(&data);
++        let _ = der::decode::<Payload>(&data);
++        let _ = oer::decode::<Model>(&data);
++    }
++
++    // ---- Property 4: corrupted valid encoding -----------------------------
++
++    // Encode a valid value, then flip a byte or truncate; decoding must be
++    // Ok or Err, never panic.
++    #[hegel::test]
++    fn corrupted_encoding_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw((arb_open()).print_as_debug());
++        let mut bytes = der::encode(&value).unwrap();
++        if !bytes.is_empty() {
++            match tc.draw(generators::integers::<u8>().max_value(1)) {
++                0 => {
++                    // flip a byte
++                    let idx = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++                    let delta = tc.draw(generators::integers::<u8>().min_value(1));
++                    bytes[idx] = bytes[idx].wrapping_add(delta);
++                }
++                _ => {
++                    // truncate
++                    let keep = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++                    bytes.truncate(keep);
++                }
++            }
++        }
++        let _ = der::decode::<Open>(&bytes);
++        let _ = ber::decode::<Open>(&bytes);
++    }
++
++    // ---- Property 5: length-prefix attacks --------------------------------
++
++    // A long-form length declaring gigabytes of content, with only a few
++    // content bytes present, must be rejected (Err) without pre-allocating or
++    // aborting. Oracle-independent (a panic/OOM would abort the process).
++    #[hegel::test]
++    fn huge_declared_length_is_rejected(tc: hegel::TestCase) {
++        // tag byte (OCTET STRING = 0x04) then long-form length. Use >= 3 length
++        // bytes with a nonzero most-significant byte so the declared length is
++        // always >= 2^16 (>> the 2 content bytes we actually supply).
++        let n_len_bytes = tc.draw(generators::integers::<u8>().min_value(3).max_value(8));
++        let mut data = vec![0x04u8, 0x80 | n_len_bytes];
++        data.push(tc.draw(generators::integers::<u8>().min_value(1))); // MSB, nonzero
++        for _ in 1..n_len_bytes {
++            data.push(tc.draw(generators::integers::<u8>()));
++        }
++        // Provide only a couple of content bytes — far fewer than declared.
++        data.push(0xAA);
++        data.push(0xBB);
++        let r = ber::decode::<OctetString>(&data);
++        assert!(r.is_err(), "huge declared length should be rejected, got {r:?}");
++    }
++
++    // A structural depth bomb: deeply nested indefinite-length constructed
++    // TLVs. Must not stack-overflow; the decoder either rejects (depth guard)
++    // or errors on structure. The property is that the call returns at all.
++    #[hegel::test]
++    fn nested_length_bomb_is_graceful(tc: hegel::TestCase) {
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(4000));
++        let mut data = Vec::with_capacity(depth * 2 + depth * 2);
++        for _ in 0..depth {
++            data.push(0x30); // constructed SEQUENCE
++            data.push(0x80); // indefinite length
++        }
++        for _ in 0..depth {
++            data.push(0x00); // end-of-contents
++            data.push(0x00);
++        }
++        // If this stack-overflows, the process aborts (test fails hard);
++        // reaching the assert means it returned gracefully.
++        let r = ber::decode::<Open>(&data);
++        assert!(r.is_err(), "deeply nested SEQUENCE bytes should error, not decode");
++    }
++
++    // ---- Property 6: primitive edge cases ---------------------------------
++
++    // INTEGER roundtrip including bignum, negative and boundary values, across
++    // the codecs that support unconstrained INTEGER.
++    #[hegel::test]
++    fn integer_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw((arb_integer()).print_as_debug());
++        assert_eq!(value, ber::decode::<Integer>(&ber::encode(&value).unwrap()).unwrap());
++        assert_eq!(value, der::decode::<Integer>(&der::encode(&value).unwrap()).unwrap());
++        assert_eq!(value, cer::decode::<Integer>(&cer::encode(&value).unwrap()).unwrap());
++        assert_eq!(value, oer::decode::<Integer>(&oer::encode(&value).unwrap()).unwrap());
++    }
++
++    // DER INTEGER is canonical: re-encoding a decoded INTEGER is a fixpoint
++    // (this catches non-minimal integer encodings surviving a roundtrip).
++    #[hegel::test]
++    fn integer_der_fixpoint(tc: hegel::TestCase) {
++        let value = tc.draw((arb_integer()).print_as_debug());
++        let bytes = der::encode(&value).unwrap();
++        let decoded = der::decode::<Integer>(&bytes).unwrap();
++        assert_eq!(bytes, der::encode(&decoded).unwrap());
++    }
++
++    // OCTET STRING roundtrip, empty included.
++    #[hegel::test]
++    fn octet_string_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw((arb_octet()).print_as_debug());
++        assert_eq!(value, der::decode::<OctetString>(&der::encode(&value).unwrap()).unwrap());
++        assert_eq!(value, ber::decode::<OctetString>(&ber::encode(&value).unwrap()).unwrap());
++    }
++
++    // Safe-OID roundtrip (well-formed OIDs the encoder handles).
++    #[hegel::test]
++    fn safe_oid_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw((arb_safe_oid()).print_as_debug());
++        assert_eq!(value, der::decode::<ObjectIdentifier>(&der::encode(&value).unwrap()).unwrap());
++        assert_eq!(value, ber::decode::<ObjectIdentifier>(&ber::encode(&value).unwrap()).unwrap());
++    }
++
++    // ---- Pinned real bugs (KNOWN FAILURES) --------------------------------
++
++    // KNOWN FAILURE (BUG 1): `ObjectIdentifier::new` accepts an OID whose first
++    // arc is 0 or 1 with a second arc >= 40, but X.660 requires second < 40 in
++    // that case. The BER encoder packs `first*40 + second` into one subidentifier,
++    // and the decoder unpacks it as `first = min(value/40, 2)`, so e.g. `0.999`
++    // round-trips to `2.919` — silent value corruption. Deterministic: every
++    // drawn value has first in {0,1} and second >= 40, so the roundtrip always
++    // corrupts.
++    #[hegel::test(test_cases = 50)]
++    fn bug_oid_low_first_arc_roundtrip_corruption(tc: hegel::TestCase) {
++        let first = tc.draw(generators::integers::<u32>().max_value(1));
++        let second = tc.draw(generators::integers::<u32>().min_value(40).max_value(10_000));
++        let oid = ObjectIdentifier::new(vec![first, second]).unwrap();
++        let bytes = der::encode(&oid).unwrap();
++        let decoded = der::decode::<ObjectIdentifier>(&bytes).unwrap();
++        assert_eq!(oid, decoded, "OID {oid:?} round-tripped to {decoded:?}");
++    }
++
++    // KNOWN FAILURE (BUG 2): the BER OID encoder computes `first * 40 + second`
++    // in `u32` without overflow checks. `ObjectIdentifier::new` accepts first==2
++    // with an arbitrary u32 second arc, so `2.(u32::MAX)` triggers
++    // `attempt to add with overflow` (panic in debug / wraparound in release) in
++    // `object_identifier_as_bytes`. Deterministic: `2 * 40 + second` overflows
++    // u32 for every drawn `second`.
++    #[hegel::test(test_cases = 50)]
++    fn bug_oid_second_arc_overflow(tc: hegel::TestCase) {
++        let second = tc.draw(generators::integers::<u32>().min_value(u32::MAX - 79));
++        let oid = ObjectIdentifier::new(vec![2u32, second]).unwrap();
++        // In a debug build `2 * 40 + second` panics with "attempt to add with
++        // overflow" inside `object_identifier_as_bytes`. In a release build it
++        // wraps silently and produces a corrupt encoding, so we also assert the
++        // roundtrip to catch the bug regardless of overflow-checks profile.
++        let bytes = der::encode(&oid).unwrap();
++        assert_eq!(oid, der::decode::<ObjectIdentifier>(&bytes).unwrap());
++    }
++}

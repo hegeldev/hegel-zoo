@@ -152,6 +152,30 @@ PRINT_ERR = re.compile(r"^error\[E0277\]: `([^`]+)` (?:has no printed representa
 FIELD_ERR = re.compile(r"^error\[E0277\]: `[^`]+` has no printed representation, so this field cannot derive `PrettyPrintable`\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 
 
+_FIELD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))? )?\w+\s*:\s*[\w:<>\[\]&' ,()]+,?\s*$")
+# a variant declaration holds types (`Num(Integer)`, `Pair(u8, Option<Foo>)`): no dots, no calls —
+# `Some(tc.draw(gen()))` on a line of its own is an expression, not a variant
+_TUPLE_VARIANT = re.compile(r"^(\s*)([A-Z]\w*)\(([\w:<>\[\]&' ,]+)\)(,?)\s*$")
+
+
+def mark_field_debug(ls: list[str], i: int) -> bool:
+    """Mark the field declared at line i `#[pretty(debug)]`: above a named field, or inside the
+    parens of an enum tuple variant (`Num(Integer)` → `Num(#[pretty(debug)] Integer)`, since the
+    attribute applies to fields, not variants). Returns False if already marked."""
+    m = _TUPLE_VARIANT.match(ls[i])
+    if m and not _FIELD_DECL.match(ls[i]):
+        if "#[pretty(debug)]" in ls[i]:
+            return False
+        fields = [f.strip() for f in re.split(r",(?![^<(]*[>)])", m.group(3)) if f.strip()]
+        ls[i] = f"{m.group(1)}{m.group(2)}({', '.join('#[pretty(debug)] ' + f for f in fields)}){m.group(4)}"
+        return True
+    if i > 0 and "#[pretty(debug)]" in ls[i - 1]:
+        return False
+    indent = re.match(r"\s*", ls[i]).group(0)
+    ls.insert(i, f"{indent}#[pretty(debug)]")
+    return True
+
+
 def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
     """hegeltest 0.33+: drawn values must be printable. For a type defined in the same file, add
     `hegel::PrettyPrintable` to its derive; otherwise wrap the drawn generator expression in
@@ -171,9 +195,7 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             continue
         ls = path.read_text(errors="replace").split("\n")
         i = line - 1
-        if 0 <= i < len(ls) and "#[pretty(debug)]" not in ls[i - 1]:
-            indent = re.match(r"\s*", ls[i]).group(0)
-            ls.insert(i, f"{indent}#[pretty(debug)]")
+        if 0 <= i < len(ls) and mark_field_debug(ls, i):
             path.write_text("\n".join(ls))
             edits += 1
     if edits:
@@ -206,9 +228,11 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             i, j = line - 1, col - 1
             if i >= len(lines) or j > len(lines[i]):
                 continue
-            # a site on a field declaration is a derive that failed for a type this pass could
-            # not find (an item shape the regex misses): leave it for a human, do not wrap a field
-            if re.match(r"^\s*(?:pub(?:\([^)]*\))? )?\w+\s*:\s*[\w:<>\[\]&' ,()]+,?\s*$", lines[i]):
+            # a site on a field (or tuple-variant) declaration: the enclosing type derives
+            # PrettyPrintable and this field's type is foreign — mark the field #[pretty(debug)]
+            if _FIELD_DECL.match(lines[i]) or _TUPLE_VARIANT.match(lines[i]):
+                if mark_field_debug(lines, i):
+                    edits += 1
                 continue
             # find the end of the expression: first ')' or ',' at depth 0 from (i, j), across lines
             depth, k, row = 0, j, i
