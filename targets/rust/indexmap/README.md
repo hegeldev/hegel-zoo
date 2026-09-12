@@ -26,3 +26,4 @@
 - 2026-07-10: predecessor base commit `571943c5b3ec` (Merge pull request #445 from maxtaran2010/fix/typos).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/indexmap.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 571943c5b3ec → 41a870887c4c (2026-09-05, "Merge pull request #450 from cuviper/macros"; 2.14.2); 0 bug(s) still reproduce. 235 tests pass.
