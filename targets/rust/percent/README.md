@@ -25,3 +25,4 @@
 - 2026-07-08: predecessor base commit `25137be1fc1d` (fix percent-encode of caret in path (#1140) (#1141)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/percent.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 25137be1fc1d → 00a6ce58d02f (2026-07-31, "Fix hostname preservation in file: URLs that contain drive letters (#1127)"; 2.3.2); 0 bug(s) still reproduce. 32 tests pass.

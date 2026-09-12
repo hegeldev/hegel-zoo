@@ -151,9 +151,17 @@ zoo test   <target>…     apply + run; honours expected_failures; prints a per-
 zoo check  [<target>…]   static: target.toml valid, patch applies cleanly, hegel.version == pin,
                          every expected_failures entry names an open bug, every open bug has
                          a test, README present
-zoo bump   <target> <commit|tag>
-                         rebase the patch onto a new upstream commit (3-way; stops on conflict),
-                         run, append [[bug.observed]] rows, update [base]
+zoo drift  [<target>…]   ls-remote upstream's default branch and say which targets' base.commit
+                         is behind it (no clone; ~10 s for 158 targets)
+zoo bump   <target>… [--to <commit>] [--accept-fixed] [--finish] [--keep]
+                         rebase the patch onto upstream HEAD (3-way), run, and land the result:
+                         hegel.patch regenerated, [base] advanced, one [[bug.observed]] row per
+                         bug whose test ran, a README history line. Stops without landing on a
+                         conflict (resolve in work/, `zoo test --no-apply`, `zoo bump --finish`),
+                         on unexpected failures / unrun tests (investigate there), or when an
+                         expected failure passes (rerun with --accept-fixed: status = fixed,
+                         fixed_in set, the test leaves expected_failures). Intermittent expected
+                         failures that pass are recorded as not-reproduced and do not block.
 zoo bump-hegel <lang> <version>
                          update zoo.toml and every patch's dependency line for that language
 zoo report               regenerate TROPHIES.md

@@ -36,9 +36,16 @@ tools/zoo test rust                # every Rust target
 tools/zoo check                    # static consistency of all targets
 tools/zoo apply rust/foo           # materialise work/rust/foo to edit tests in place …
 tools/zoo save rust/foo            # … and write the result back to hegel.patch
+tools/zoo drift rust               # which targets' base commit is behind upstream (ls-remote only)
+tools/zoo bump rust/foo            # rebase the patch onto upstream HEAD, run, record the outcome
 tools/zoo bump-hegel rust 0.45.0   # move a language to a new Hegel release
 tools/zoo report                   # regenerate TROPHIES.md
 ```
+
+`zoo bump` is the zoo's long-running loop: it advances `[base]`, regenerates `hegel.patch`, appends
+a `[[bug.observed]]` row per bug (`reproduces` / `fixed` / `not-reproduced`) and a dated line to the
+target's README. It lands nothing when the patch conflicts, a test fails unexpectedly or a known
+bug stops reproducing — those need a look (`--accept-fixed` records a fix once confirmed).
 
 Upstream checkouts go under `work/` (gitignored). You need the language's toolchain
 (`cargo` for Rust, and so on) and network access for the first fetch of each target.

@@ -42,3 +42,4 @@
 - 2026-06-28: predecessor base commit `e29daecac529` (Merge pull request #619 from mgeisler/rename-master-to-main).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/textwrap.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped e29daecac529 → 7d1435f71454 (2026-09-12, "Merge pull request #628 from xtqqczze/msrv-reduce"; 0.16.3); 1 bug(s) still reproduce. 234 tests pass.
