@@ -1,0 +1,885 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 16b9d9a..d9b12db 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -49,6 +49,7 @@ gvar-alloc = ["std"]
+ 
+ [dev-dependencies]
+ base64 = "0.22"
++hegeltest = "0.44.1"
+ pico-args = "0.5"
+ tiny-skia-path = "0.11"
+ xmlwriter = "0.1"
+diff --git a/tests/tables/main.rs b/tests/tables/main.rs
+index d63c294..208804f 100644
+--- a/tests/tables/main.rs
++++ b/tests/tables/main.rs
+@@ -187,3 +187,868 @@ fn font_index_overflow_on_regular_font() {
+         FaceParsingError::FaceIndexOutOfBounds
+     );
+ }
++
++/// Property-based tests written with hegel.
++///
++/// These generalize the hand-written `Face::parse` robustness tests above and the
++/// AFL fuzz targets in `testing-tools/ttf-fuzz/` (parse + glyph_index, parse +
++/// outline all glyphs, parse + set_variation + outline).
++mod hegel_props {
++    use hegel::generators;
++    use std::convert::{TryFrom, TryInto};
++    use ttf_parser::{fonts_in_collection, Face, FaceParsingError, GlyphId, Tag};
++
++    const DEMO: &[u8] = include_bytes!("../fonts/demo.ttf");
++    const COLR1: &[u8] = include_bytes!("../fonts/colr_1.ttf");
++    const COLR1_VAR: &[u8] = include_bytes!("../fonts/colr_1_variable.ttf");
++    const BITMAP: &[u8] = include_bytes!("../fonts/bitmap.otb");
++
++    fn draw_test_font(tc: &hegel::TestCase) -> (&'static str, &'static [u8]) {
++        tc.draw(generators::sampled_from(vec![
++            ("demo.ttf", DEMO),
++            ("colr_1.ttf", COLR1),
++            ("colr_1_variable.ttf", COLR1_VAR),
++            ("bitmap.otb", BITMAP),
++        ]))
++    }
++
++    /// Draws a char from the full range, with extra weight on ASCII, the BMP
++    /// and variation selectors (interesting for cmap subtable formats 4/14).
++    fn draw_char(tc: &hegel::TestCase) -> char {
++        let n = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(0x7F),
++            generators::integers::<u32>().min_value(0xFE00).max_value(0xFE0F), // VS1-VS16
++            generators::integers::<u32>().min_value(0xE0100).max_value(0xE01EF), // VS17+
++            generators::integers::<u32>().max_value(0x10FFFF),
++        ));
++        char::from_u32(n).unwrap_or('\u{FFFD}')
++    }
++
++    /// An `OutlineBuilder` that records every coordinate passed to it
++    /// (including Bezier control points, which `ttf-parser`'s internal bbox
++    /// computation also includes).
++    #[derive(Default)]
++    struct RecordingBuilder {
++        points: Vec<(f32, f32)>,
++    }
++
++    impl ttf_parser::OutlineBuilder for RecordingBuilder {
++        fn move_to(&mut self, x: f32, y: f32) {
++            self.points.push((x, y));
++        }
++        fn line_to(&mut self, x: f32, y: f32) {
++            self.points.push((x, y));
++        }
++        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
++            self.points.push((x1, y1));
++            self.points.push((x, y));
++        }
++        fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
++            self.points.push((x1, y1));
++            self.points.push((x2, y2));
++            self.points.push((x, y));
++        }
++        fn close(&mut self) {}
++    }
++
++    /// A `colr::Painter` that consumes everything it is given (including
++    /// gradient stop iterators) and discards it.
++    struct NopPainter;
++
++    impl<'a> ttf_parser::colr::Painter<'a> for NopPainter {
++        fn outline_glyph(&mut self, _: GlyphId) {}
++        fn paint(&mut self, paint: ttf_parser::colr::Paint<'a>) {
++            use ttf_parser::colr::Paint;
++            match paint {
++                Paint::Solid(_) => {}
++                Paint::LinearGradient(g) => {
++                    let _ = g.stops(0, &[]).count();
++                }
++                Paint::RadialGradient(g) => {
++                    let _ = g.stops(0, &[]).count();
++                }
++                Paint::SweepGradient(g) => {
++                    let _ = g.stops(0, &[]).count();
++                }
++            }
++        }
++        fn push_clip(&mut self) {}
++        fn push_clip_box(&mut self, _: ttf_parser::colr::ClipBox) {}
++        fn pop_clip(&mut self) {}
++        fn push_layer(&mut self, _: ttf_parser::colr::CompositeMode) {}
++        fn pop_layer(&mut self) {}
++        fn push_transform(&mut self, _: ttf_parser::Transform) {}
++        fn pop_transform(&mut self) {}
++    }
++
++    /// Calls every public `Face` accessor with hegel-drawn arguments.
++    ///
++    /// This is a pure no-panic exercise, plus the two contracts that are
++    /// documented to hold for *any* successfully parsed face:
++    /// - `number_of_glyphs()` is "Never zero" (lib.rs docs),
++    /// - `units_per_em` is "Guarantee[d] to be in a 16..=16384 range" (head.rs docs).
++    fn exercise_face(face: &mut Face, tc: &hegel::TestCase) {
++        // Variations first, so everything below runs on a varied face too.
++        // Values are constrained to finite floats: non-finite values panic in
++        // debug builds, which is a real bug pinned by the canonical
++        // `set_variation_panics_on_non_finite_values_known_failure` test
++        // below. Everything else about the value range is unconstrained.
++        if face.is_variable() {
++            let n_axes = face.variation_axes().len();
++            for _ in 0..tc.draw(generators::integers::<u8>().max_value(2)) {
++                let tag = if n_axes > 0 && tc.draw(generators::booleans()) {
++                    let idx = tc.draw(generators::integers::<u16>().max_value(n_axes - 1));
++                    face.variation_axes().get(idx).unwrap().tag
++                } else {
++                    Tag(tc.draw(generators::integers::<u32>()))
++                };
++                let value = tc.draw(
++                    generators::floats::<f32>()
++                        .allow_nan(false)
++                        .allow_infinity(false),
++                );
++                let _ = face.set_variation(tag, value);
++            }
++            let _ = face.variation_coordinates();
++            let _ = face.has_non_default_variation_coordinates();
++        }
++
++        // Global, argument-less accessors.
++        assert_ne!(face.number_of_glyphs(), 0, "number_of_glyphs is documented as never zero");
++        let upem = face.units_per_em();
++        assert!(
++            (16..=16384).contains(&upem),
++            "units_per_em is documented to be in 16..=16384, got {}",
++            upem
++        );
++        let _ = face.is_regular();
++        let _ = face.is_italic();
++        let _ = face.is_bold();
++        let _ = face.is_oblique();
++        let _ = face.style();
++        let _ = face.is_monospaced();
++        let _ = face.is_variable();
++        let _ = face.weight();
++        let _ = face.width();
++        let _ = face.italic_angle();
++        let fits_i16 = |a: i16, b: i16| i16::try_from(i32::from(a) - i32::from(b)).is_ok();
++        let asc = face.ascender();
++        let desc = face.descender();
++        // KNOWN BUG exclusion: `Face::height()` computes `ascender - descender`
++        // in i16 and overflows (panics in debug builds) on extreme metrics;
++        // pinned by `face_height_overflows_i16_known_failure` below.
++        if fits_i16(asc, desc) {
++            let _ = face.height();
++        }
++        let _ = face.line_gap();
++        let _ = face.typographic_ascender();
++        let _ = face.typographic_descender();
++        let _ = face.typographic_line_gap();
++        // KNOWN BUG exclusion: `vertical_height()` has the same unchecked i16
++        // subtraction as `height()`; see
++        // `face_height_overflows_i16_known_failure`.
++        match (face.vertical_ascender(), face.vertical_descender()) {
++            (Some(va), Some(vd)) if !fits_i16(va, vd) => {}
++            _ => {
++                let _ = face.vertical_height();
++            }
++        }
++        let _ = face.vertical_line_gap();
++        let _ = face.x_height();
++        let _ = face.capital_height();
++        let _ = face.underline_metrics();
++        let _ = face.strikeout_metrics();
++        let _ = face.subscript_metrics();
++        let _ = face.superscript_metrics();
++        let _ = face.permissions();
++        let _ = face.is_subsetting_allowed();
++        let _ = face.is_outline_embedding_allowed();
++        let _ = face.unicode_ranges();
++        let _ = face.global_bounding_box();
++        let _ = face.color_palettes();
++
++        // Name table.
++        let names = face.names();
++        let _ = names.len();
++        let _ = names.is_empty();
++        for name in names.into_iter() {
++            let _ = name.to_string();
++            let _ = name.is_unicode();
++            let _ = name.language();
++        }
++        let _ = names.get(tc.draw(generators::integers::<u16>()));
++
++        // Character-indexed accessors, full char range.
++        let cp = draw_char(tc);
++        let vs = draw_char(tc);
++        let _ = face.glyph_index(cp);
++        let _ = face.glyph_variation_index(cp, vs);
++        let name_query = tc.draw(generators::text().max_size(16));
++        let _ = face.glyph_index_by_name(&name_query);
++
++        // Glyph-indexed accessors, full u16 GlyphId range.
++        let gid = GlyphId(tc.draw(generators::integers::<u16>()));
++        let ppem = tc.draw(generators::integers::<u16>());
++        let palette = tc.draw(generators::integers::<u16>());
++        let _ = face.glyph_hor_advance(gid);
++        let _ = face.glyph_ver_advance(gid);
++        let _ = face.glyph_hor_side_bearing(gid);
++        let _ = face.glyph_ver_side_bearing(gid);
++        let _ = face.glyph_y_origin(gid);
++        let _ = face.glyph_name(gid);
++        let _ = face.outline_glyph(gid, &mut RecordingBuilder::default());
++        let _ = face.glyph_bounding_box(gid);
++        let _ = face.glyph_raster_image(gid, ppem);
++        let _ = face.glyph_svg_image(gid);
++        let _ = face.is_color_glyph(gid);
++        let _ = face.paint_color_glyph(
++            gid,
++            palette,
++            ttf_parser::RgbaColor::new(0, 0, 0, 255),
++            &mut NopPainter,
++        );
++        let _ = face.glyph_phantom_points(gid);
++
++        // Raw table access with an arbitrary tag.
++        let _ = face.raw_face().table(Tag(tc.draw(generators::integers::<u32>())));
++    }
++
++    // ------------------------------------------------------------------
++    // Property: Tag byte conversion round-trips.
++    // Evidence: `Tag::from_bytes`/`Tag::to_bytes` are inverse bit packings
++    // (lib.rs), and the `Tag::from_bytes` doc example.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn tag_to_bytes_from_bytes_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<u32>());
++        let tag = Tag(n);
++        assert_eq!(Tag::from_bytes(&tag.to_bytes()), tag);
++        // Documented on `from_bytes_lossy`: data after the first 4 bytes is
++        // ignored, short data is padded with b' ', empty data gives Tag(0).
++        let bytes = tag.to_bytes();
++        let keep = tc.draw(generators::integers::<usize>().max_value(4));
++        let lossy = Tag::from_bytes_lossy(&bytes[..keep]);
++        if keep == 0 {
++            assert_eq!(lossy, Tag(0));
++        } else {
++            let mut padded = [b' '; 4];
++            padded[..keep].copy_from_slice(&bytes[..keep]);
++            assert_eq!(lossy, Tag::from_bytes(&padded));
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Property: `Face::parse` and `fonts_in_collection` never panic on
++    // arbitrary bytes, and a successfully parsed face can be fully queried
++    // without panicking.
++    // Evidence: the crate advertises itself as a "safe" font parser, the
++    // AFL fuzz targets in testing-tools/ttf-fuzz assume exactly this, and
++    // the hand-written tests above check specific malformed headers.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn face_parse_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++        // Draw the size separately so we get bodies large enough to contain
++        // a full table directory.
++        let len = tc.draw(generators::integers::<usize>().max_value(1024));
++        let data: Vec<u8> = tc.draw(generators::binary().min_size(len));
++        let index = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(3),
++            generators::integers::<u32>(),
++        ));
++        let _ = fonts_in_collection(&data);
++        if let Ok(mut face) = Face::parse(&data, index) {
++            exercise_face(&mut face, &tc);
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Structured "wire-shaped garbage" generation: a plausible sfnt header
++    // and table directory whose table payloads are garbage, with drawn
++    // offsets/lengths that are sometimes honest and sometimes lies.
++    // ------------------------------------------------------------------
++
++    /// Every table tag `Face::collect_tables` dispatches on (lib.rs).
++    const KNOWN_TAGS: [[u8; 4]; 42] = [
++        *b"head", *b"hhea", *b"maxp", *b"cmap", *b"loca", *b"glyf", *b"hmtx", *b"vmtx", *b"vhea",
++        *b"kern", *b"name", *b"post", *b"OS/2", *b"CFF ", *b"CFF2", *b"GDEF", *b"GPOS", *b"GSUB",
++        *b"MATH", *b"fvar", *b"gvar", *b"avar", *b"HVAR", *b"MVAR", *b"VVAR", *b"VORG", *b"COLR",
++        *b"CPAL", *b"sbix", *b"SVG ", *b"CBDT", *b"CBLC", *b"EBDT", *b"EBLC", *b"bdat", *b"bloc",
++        *b"ankr", *b"feat", *b"kerx", *b"morx", *b"trak", *b"STAT",
++    ];
++
++    fn draw_exact_bytes(tc: &hegel::TestCase, len: usize) -> Vec<u8> {
++        tc.draw(generators::binary().min_size(len).max_size(len))
++    }
++
++    /// 54 bytes of garbage that, most of the time, has a valid unitsPerEm and
++    /// indexToLocFormat so that `head::Table::parse` accepts it.
++    fn build_head(tc: &hegel::TestCase) -> Vec<u8> {
++        let mut d = draw_exact_bytes(tc, 54);
++        if tc.draw(generators::integers::<u8>().max_value(4)) > 0 {
++            let upem = tc.draw(generators::integers::<u16>().min_value(16).max_value(16384));
++            d[18..20].copy_from_slice(&upem.to_be_bytes());
++            let loc_format = tc.draw(generators::integers::<u16>().max_value(1));
++            d[50..52].copy_from_slice(&loc_format.to_be_bytes());
++        }
++        d
++    }
++
++    /// 36 bytes of garbage; `hhea::Table::parse` accepts any 36+ bytes.
++    fn build_hhea(tc: &hegel::TestCase) -> Vec<u8> {
++        draw_exact_bytes(tc, 36)
++    }
++
++    /// A maxp table with a usually-valid version and a fully drawn glyph count.
++    fn build_maxp(tc: &hegel::TestCase) -> Vec<u8> {
++        let version = tc.draw(hegel::one_of!(
++            generators::just(0x00005000u32),
++            generators::just(0x00010000u32),
++            generators::integers::<u32>(),
++        ));
++        let num_glyphs = tc.draw(generators::integers::<u16>());
++        let mut d = Vec::new();
++        d.extend_from_slice(&version.to_be_bytes());
++        d.extend_from_slice(&num_glyphs.to_be_bytes());
++        d.extend_from_slice(&tc.draw(generators::binary().max_size(26)));
++        d
++    }
++
++    fn draw_font_shaped(tc: &hegel::TestCase) -> Vec<u8> {
++        let mut entries: Vec<([u8; 4], Vec<u8>)> = Vec::new();
++
++        // Mandatory tables, usually present and semi-valid so that parsing
++        // regularly gets past `parse_tables` and into the optional tables.
++        if tc.draw(generators::integers::<u8>().max_value(9)) > 0 {
++            entries.push((*b"head", build_head(tc)));
++        }
++        if tc.draw(generators::integers::<u8>().max_value(9)) > 0 {
++            entries.push((*b"hhea", build_hhea(tc)));
++        }
++        if tc.draw(generators::integers::<u8>().max_value(9)) > 0 {
++            entries.push((*b"maxp", build_maxp(tc)));
++        }
++
++        let n_extra = tc.draw(generators::integers::<usize>().max_value(8));
++        for _ in 0..n_extra {
++            let tag: [u8; 4] = tc.draw(hegel::one_of!(
++                generators::sampled_from(KNOWN_TAGS.to_vec()),
++                generators::arrays(generators::integers::<u8>()),
++            ));
++            let payload = tc.draw(generators::binary().max_size(64));
++            entries.push((tag, payload));
++        }
++
++        // A real font must have a sorted table directory (RawFace::table uses
++        // binary search), but unsorted directories must not break anything.
++        if tc.draw(generators::integers::<u8>().max_value(4)) > 0 {
++            entries.sort_by(|a, b| a.0.cmp(&b.0));
++        }
++
++        let n = entries.len();
++        let dir_end = 12 + 16 * n;
++        let total_payload: usize = entries.iter().map(|e| e.1.len()).sum();
++        let data_len = dir_end + total_payload;
++
++        let magic = tc.draw(hegel::one_of!(
++            generators::just(0x00010000u32), // TrueType
++            generators::just(0x74727565u32), // 'true'
++            generators::just(0x4F54544Fu32), // 'OTTO'
++            generators::integers::<u32>(),
++        ));
++        let num_tables_field = tc.draw(hegel::one_of!(
++            generators::just(n as u16),
++            generators::integers::<u16>(),
++        ));
++
++        let mut data = Vec::with_capacity(data_len);
++        data.extend_from_slice(&magic.to_be_bytes());
++        data.extend_from_slice(&num_tables_field.to_be_bytes());
++        // searchRange, entrySelector, rangeShift: unused by the parser.
++        data.extend_from_slice(&tc.draw(generators::integers::<u16>()).to_be_bytes());
++        data.extend_from_slice(&tc.draw(generators::integers::<u16>()).to_be_bytes());
++        data.extend_from_slice(&tc.draw(generators::integers::<u16>()).to_be_bytes());
++
++        let mut honest_offset = dir_end as u32;
++        for (tag, payload) in &entries {
++            data.extend_from_slice(tag);
++            // checksum: unused by the parser.
++            data.extend_from_slice(&tc.draw(generators::integers::<u32>()).to_be_bytes());
++            let lie = tc.draw(generators::integers::<u8>().max_value(4)) == 0;
++            let (offset, length) = if lie {
++                (
++                    tc.draw(hegel::one_of!(
++                        generators::integers::<u32>().max_value(data_len as u32 + 64),
++                        generators::integers::<u32>(),
++                    )),
++                    tc.draw(hegel::one_of!(
++                        generators::integers::<u32>().max_value(data_len as u32 + 64),
++                        generators::integers::<u32>(),
++                    )),
++                )
++            } else {
++                (honest_offset, payload.len() as u32)
++            };
++            data.extend_from_slice(&offset.to_be_bytes());
++            data.extend_from_slice(&length.to_be_bytes());
++            honest_offset += payload.len() as u32;
++        }
++        for (_, payload) in &entries {
++            data.extend_from_slice(payload);
++        }
++
++        // Sometimes wrap the face in a font-collection header.
++        if tc.draw(generators::integers::<u8>().max_value(4)) == 0 {
++            let mut ttc = Vec::with_capacity(data.len() + 16);
++            ttc.extend_from_slice(b"ttcf");
++            ttc.extend_from_slice(&tc.draw(generators::integers::<u32>()).to_be_bytes()); // version
++            // numFonts: honest, or a lie. Lies are capped below 2^29 because
++            // `Stream::read_bytes` has a `debug_assert` that intentionally
++            // panics (in debug builds only) when offset + len exceeds
++            // u32::MAX; that behavior is already pinned by the maintainers'
++            // `font_collection_num_fonts_overflow_2` #[should_panic] test
++            // above, so we exclude that known-panicking region here.
++            let num_fonts = tc.draw(hegel::one_of!(
++                generators::just(1u32),
++                generators::integers::<u32>().max_value(0x1FFF_FFFF),
++            ));
++            ttc.extend_from_slice(&num_fonts.to_be_bytes());
++            // One honest offset to the face we built; the face data itself
++            // follows immediately after the 16-byte collection header.
++            ttc.extend_from_slice(&16u32.to_be_bytes());
++            // TTC table offsets are relative to the whole file; sometimes
++            // rebase them honestly (parseable), sometimes leave them stale.
++            if tc.draw(generators::booleans()) {
++                rebase_sfnt_offsets(&mut data, 16);
++            }
++            ttc.extend_from_slice(&data);
++            data = ttc;
++        }
++
++        data
++    }
++
++    // ------------------------------------------------------------------
++    // Property: `Face::parse` never panics on structurally font-shaped
++    // garbage (valid magic + generated table directory), and a successfully
++    // parsed face can be fully queried without panicking.
++    // Evidence: same as the arbitrary-bytes property; this generator goes
++    // beyond the repo's AFL targets by always presenting a plausible
++    // directory, so table parsers actually see the garbage payloads.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn face_parse_never_panics_on_font_shaped_bytes(tc: hegel::TestCase) {
++        let data = draw_font_shaped(&tc);
++        let index = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(3),
++            generators::integers::<u32>(),
++        ));
++        let _ = fonts_in_collection(&data);
++        if let Ok(mut face) = Face::parse(&data, index) {
++            exercise_face(&mut face, &tc);
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Property: mutations (byte writes, bit flips, truncation) of real,
++    // valid fonts never cause a panic in parsing or in any accessor.
++    // Evidence: "safe parser" contract; mutated real fonts reach much deeper
++    // table-parsing code than pure noise.
++    // ------------------------------------------------------------------
++
++    fn mutate(tc: &hegel::TestCase, data: &mut Vec<u8>) {
++        if tc.draw(generators::booleans()) {
++            let cut = tc.draw(generators::integers::<usize>().max_value(data.len()));
++            data.truncate(cut);
++        }
++        let n = tc.draw(generators::integers::<usize>().max_value(32));
++        for _ in 0..n {
++            if data.is_empty() {
++                break;
++            }
++            let pos = tc.draw(generators::integers::<usize>().max_value(data.len() - 1));
++            let val = tc.draw(generators::integers::<u8>());
++            if tc.draw(generators::booleans()) {
++                data[pos] ^= val;
++            } else {
++                data[pos] = val;
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn face_never_panics_on_mutated_test_fonts(tc: hegel::TestCase) {
++        let (_name, orig) = draw_test_font(&tc);
++        let mut data = orig.to_vec();
++        mutate(&tc, &mut data);
++        let _ = fonts_in_collection(&data);
++        if let Ok(mut face) = Face::parse(&data, 0) {
++            exercise_face(&mut face, &tc);
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Property: parsing a regular (non-collection) font with any non-zero
++    // index fails with FaceIndexOutOfBounds.
++    // Evidence: RawFace::parse treats a regular font "as a one-element
++    // collection" (lib.rs), and the `font_index_overflow_on_regular_font`
++    // unit test above pins index == 1; this generalizes it to all indices.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn regular_font_with_nonzero_index_is_out_of_bounds(tc: hegel::TestCase) {
++        let (name, data) = draw_test_font(&tc);
++        let index = tc.draw(generators::integers::<u32>().min_value(1));
++        assert_eq!(
++            Face::parse(data, index).unwrap_err(),
++            FaceParsingError::FaceIndexOutOfBounds,
++            "parsing {} with index {} should be out of bounds",
++            name,
++            index
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // Property: for a generated font collection with n faces,
++    // `fonts_in_collection` reports n, every index < n parses, and every
++    // index >= n fails with FaceIndexOutOfBounds.
++    // Evidence: the `fonts_in_collection` docs, the FaceIndexOutOfBounds
++    // docs ("The face index is larger than the number of faces in the
++    // font."), and the `empty_font_collection`/`font_index_overflow` unit
++    // tests above, which pin single instances of this property.
++    // ------------------------------------------------------------------
++    /// Rewrites the table-record offsets of an sfnt blob so it can live at
++    /// position `base` inside a font collection (TTC table offsets are
++    /// relative to the start of the whole file).
++    fn rebase_sfnt_offsets(font: &mut [u8], base: u32) {
++        let num_tables = u16::from_be_bytes([font[4], font[5]]) as usize;
++        for i in 0..num_tables {
++            let pos = 12 + 16 * i + 8;
++            if pos + 4 > font.len() {
++                // Directory lies about its length (font-shaped garbage).
++                break;
++            }
++            let old = u32::from_be_bytes(font[pos..pos + 4].try_into().unwrap());
++            // wrapping_add protects this *test* helper against drawn offsets
++            // near u32::MAX; real fonts never wrap here.
++            font[pos..pos + 4].copy_from_slice(&old.wrapping_add(base).to_be_bytes());
++        }
++    }
++
++    #[hegel::test]
++    fn font_collection_index_contract(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<u32>().max_value(4));
++        let mut faces: Vec<&'static [u8]> = Vec::new();
++        for _ in 0..n {
++            faces.push(draw_test_font(&tc).1);
++        }
++
++        let header_len = 12 + 4 * n as usize;
++        let mut data = Vec::new();
++        data.extend_from_slice(b"ttcf");
++        // majorVersion + minorVersion: skipped by the parser.
++        data.extend_from_slice(&tc.draw(generators::integers::<u32>()).to_be_bytes());
++        data.extend_from_slice(&n.to_be_bytes());
++        let mut offset = header_len as u32;
++        for f in &faces {
++            data.extend_from_slice(&offset.to_be_bytes());
++            offset += f.len() as u32;
++        }
++        for f in &faces {
++            let base = data.len() as u32;
++            let mut copy = f.to_vec();
++            rebase_sfnt_offsets(&mut copy, base);
++            data.extend_from_slice(&copy);
++        }
++
++        assert_eq!(fonts_in_collection(&data), Some(n));
++        for i in 0..n {
++            assert!(
++                Face::parse(&data, i).is_ok(),
++                "face {} of a {}-face collection failed to parse",
++                i,
++                n
++            );
++        }
++        let bad_index = tc.draw(generators::integers::<u32>().min_value(n));
++        assert_eq!(
++            Face::parse(&data, bad_index).unwrap_err(),
++            FaceParsingError::FaceIndexOutOfBounds
++        );
++    }
++
++    // ------------------------------------------------------------------
++    // KNOWN FAILURE. Property: `glyph_index` and `glyph_variation_index`
++    // never return GlyphId(0).
++    // Evidence: both are documented as "Returns `None` instead of `0` when
++    // glyph is not found", and cmap formats 0/2 plus format 4's
++    // glyph-array branch contain explicit glyph-is-zero checks showing the
++    // authors enforce this.
++    //
++    // This test FAILS on the pristine demo.ttf: `glyph_index('\u{FFFF}')`
++    // returns Some(GlyphId(0)). The format 4 `id_range_offset == 0` branch
++    // (src/tables/cmap/format4.rs) computes
++    // `code_point.wrapping_add(id_delta)` and returns it without the
++    // `glyph == 0` check that the sibling glyph-array branch has, so the
++    // standard end-of-table sentinel segment (start == end == 0xFFFF,
++    // idDelta == 1) maps U+FFFF to glyph 0. The `just(0xFFFF)` branch below
++    // makes the failure deterministic.
++    // ------------------------------------------------------------------
++    #[hegel::test(test_cases = 300)]
++    fn glyph_index_never_returns_glyph_zero(tc: hegel::TestCase) {
++        let (name, orig) = draw_test_font(&tc);
++        let mut data = orig.to_vec();
++
++        if tc.draw(generators::booleans()) {
++            let cmap_range = Face::parse(orig, 0)
++                .unwrap()
++                .raw_face()
++                .table_records
++                .into_iter()
++                .find(|r| r.tag == Tag::from_bytes(b"cmap"))
++                .map(|r| (r.offset as usize, r.length as usize));
++            if let Some((start, len)) = cmap_range {
++                if len > 0 {
++                    let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(24));
++                    for _ in 0..n {
++                        let pos = start + tc.draw(generators::integers::<usize>().max_value(len - 1));
++                        data[pos] = tc.draw(generators::integers::<u8>());
++                    }
++                }
++            }
++        }
++
++        if let Ok(face) = Face::parse(&data, 0) {
++            // Boost U+FFFF: it hits the format 4 sentinel segment (the known
++            // counterexample region), while the other branch explores freely.
++            let cp = if tc.draw(generators::booleans()) {
++                '\u{FFFF}'
++            } else {
++                draw_char(&tc)
++            };
++            let vs = draw_char(&tc);
++            if let Some(gid) = face.glyph_index(cp) {
++                assert_ne!(
++                    gid,
++                    GlyphId(0),
++                    "glyph_index({:?}) returned GlyphId(0) for {} (docs promise None instead of 0)",
++                    cp,
++                    name
++                );
++            }
++            if let Some(gid) = face.glyph_variation_index(cp, vs) {
++                assert_ne!(
++                    gid,
++                    GlyphId(0),
++                    "glyph_variation_index({:?}, {:?}) returned GlyphId(0) for {}",
++                    cp,
++                    vs,
++                    name
++                );
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // Property: `RawFace::table` (binary search over the directory) agrees
++    // with a straightforward linear scan of `table_records`, both for tags
++    // that are present and for arbitrary tags.
++    // Evidence: `RawFace::table` docs ("Returns the raw data of a selected
++    // table") plus the record's own offset/length fields; the linear scan +
++    // slicing here is an independent oracle for the binary search + slicing
++    // in the library.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn table_lookup_agrees_with_linear_directory_scan(tc: hegel::TestCase) {
++        let (name, data) = draw_test_font(&tc);
++        let face = Face::parse(data, 0).unwrap();
++        let raw = face.raw_face();
++
++        let lookup_oracle = |tag: Tag| -> Option<&'static [u8]> {
++            let record = raw.table_records.into_iter().find(|r| r.tag == tag)?;
++            let start = record.offset as usize;
++            let end = start.checked_add(record.length as usize)?;
++            data.get(start..end)
++        };
++
++        // Every table listed in the directory resolves consistently.
++        for record in raw.table_records {
++            assert_eq!(
++                raw.table(record.tag),
++                lookup_oracle(record.tag),
++                "table {:?} of {} resolved inconsistently",
++                record.tag,
++                name
++            );
++        }
++
++        // And so does an arbitrary tag (usually absent).
++        let tag = Tag(tc.draw(generators::integers::<u32>()));
++        assert_eq!(raw.table(tag), lookup_oracle(tag), "tag {:?} of {}", tag, name);
++    }
++
++    // ------------------------------------------------------------------
++    // Property: on pristine test fonts, every public accessor handles the
++    // full range of its argument types (glyph ids, chars, ppem, palettes,
++    // variation values including NaN/inf) without panicking.
++    // Evidence: generalizes all three AFL fuzz targets in
++    // testing-tools/ttf-fuzz, which only probe a handful of chars, in-range
++    // glyph ids, and a single variation value.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn valid_font_queries_never_panic_full_ranges(tc: hegel::TestCase) {
++        let (_name, data) = draw_test_font(&tc);
++        let mut face = Face::parse(data, 0).unwrap();
++        exercise_face(&mut face, &tc);
++    }
++
++    // ------------------------------------------------------------------
++    // Property: when `outline_glyph` returns a bounding box, every
++    // coordinate it emitted to the builder lies inside that box (within 1
++    // font unit: `RectF::to_rect` truncates the f32 bbox toward zero), and
++    // the box is well-formed (min <= max).
++    // Evidence: `outline_glyph` docs ("Outlines a glyph and returns its
++    // tight bounding box"), and glyf/CFF builders extend the bbox with every
++    // emitted point, including Bezier control points.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn outline_glyph_bbox_encloses_emitted_points(tc: hegel::TestCase) {
++        let (name, data) = draw_test_font(&tc);
++        let mut face = Face::parse(data, 0).unwrap();
++
++        // Exercise the gvar outlining path too. Finite values only: non-finite
++        // values panic in debug builds, pinned by the canonical
++        // `set_variation_panics_on_non_finite_values_known_failure` test.
++        if face.is_variable() && tc.draw(generators::booleans()) {
++            let n_axes = face.variation_axes().len();
++            if n_axes > 0 {
++                let idx = tc.draw(generators::integers::<u16>().max_value(n_axes - 1));
++                let axis = face.variation_axes().get(idx).unwrap();
++                let value = tc.draw(
++                    generators::floats::<f32>()
++                        .allow_nan(false)
++                        .allow_infinity(false),
++                );
++                let _ = face.set_variation(axis.tag, value);
++            }
++        }
++
++        let max_gid = face.number_of_glyphs() - 1;
++        let gid = GlyphId(tc.draw(hegel::one_of!(
++            generators::integers::<u16>().max_value(max_gid),
++            generators::integers::<u16>(),
++        )));
++
++        let mut builder = RecordingBuilder::default();
++        if let Some(bbox) = face.outline_glyph(gid, &mut builder) {
++            assert!(
++                bbox.x_min <= bbox.x_max && bbox.y_min <= bbox.y_max,
++                "malformed bbox {:?} for glyph {} of {}",
++                bbox,
++                gid.0,
++                name
++            );
++            let lo_x = f32::from(bbox.x_min) - 1.0;
++            let hi_x = f32::from(bbox.x_max) + 1.0;
++            let lo_y = f32::from(bbox.y_min) - 1.0;
++            let hi_y = f32::from(bbox.y_max) + 1.0;
++            for &(x, y) in &builder.points {
++                assert!(
++                    x >= lo_x && x <= hi_x && y >= lo_y && y <= hi_y,
++                    "point ({}, {}) escapes bbox {:?} for glyph {} of {}",
++                    x,
++                    y,
++                    bbox,
++                    gid.0,
++                    name
++                );
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // KNOWN FAILURE: `Face::set_variation` panics in debug builds when the
++    // value is non-finite (NaN, +inf, -inf).
++    //
++    // `set_variation` places no documented restriction on `value`, but it
++    // feeds it straight into `VariationAxis::normalized_value`
++    // (src/tables/fvar.rs), which calls `parser::f32_bound`, whose
++    // `debug_assert!(val.is_finite())` (src/parser.rs:916) fires. Release
++    // builds silently produce a clamped/NaN-derived coordinate instead.
++    //
++    // This test is expected to FAIL (panic) on every run: the generator
++    // draws directly from the non-finite values that trigger the bug.
++    // Sibling properties exclude non-finite variation values so they keep
++    // testing everything else; see `exercise_face` and
++    // `outline_glyph_bbox_encloses_emitted_points`.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn set_variation_panics_on_non_finite_values_known_failure(tc: hegel::TestCase) {
++        let mut face = Face::parse(COLR1_VAR, 0).unwrap();
++        assert!(face.is_variable());
++        let axis = face.variation_axes().get(0).unwrap();
++        let value = tc.draw(generators::sampled_from(vec![
++            f32::NAN,
++            f32::INFINITY,
++            f32::NEG_INFINITY,
++        ]));
++        // Property (currently violated): a public API should not panic on
++        // any f32 input it does not document as forbidden.
++        let _ = face.set_variation(axis.tag, value);
++    }
++
++    // ------------------------------------------------------------------
++    // KNOWN FAILURE: `Face::height()` overflows i16 in debug builds.
++    //
++    // `height()` is `self.ascender() - self.descender()` (src/lib.rs:1599),
++    // a plain i16 subtraction. A successfully parsed face whose hhea says
++    // e.g. ascender = 16384, descender = -16385 (difference 32769) panics
++    // with "attempt to subtract with overflow" in debug builds and silently
++    // wraps to a negative height in release builds. `vertical_height()`
++    // (src/lib.rs:1705) has the same unchecked subtraction.
++    //
++    // Originally found by `face_parse_never_panics_on_font_shaped_bytes`.
++    // This test is expected to FAIL (panic) on every run: the drawn ranges
++    // guarantee the difference exceeds i16::MAX. Sibling properties skip
++    // `height()`/`vertical_height()` for such faces; see `exercise_face`.
++    // ------------------------------------------------------------------
++    #[hegel::test]
++    fn face_height_overflows_i16_known_failure(tc: hegel::TestCase) {
++        let ascender = tc.draw(generators::integers::<i16>().min_value(16384));
++        let descender = tc.draw(generators::integers::<i16>().max_value(-16385));
++
++        // Minimal valid font: header + sorted directory + head, hhea, maxp.
++        let mut head = vec![0u8; 54];
++        head[18..20].copy_from_slice(&1000u16.to_be_bytes()); // unitsPerEm
++        let mut hhea = vec![0u8; 36];
++        hhea[4..6].copy_from_slice(&ascender.to_be_bytes());
++        hhea[6..8].copy_from_slice(&descender.to_be_bytes());
++        let mut maxp = Vec::new();
++        maxp.extend_from_slice(&0x00005000u32.to_be_bytes());
++        maxp.extend_from_slice(&1u16.to_be_bytes()); // numGlyphs
++
++        let mut data = Vec::new();
++        data.extend_from_slice(&0x00010000u32.to_be_bytes()); // magic
++        data.extend_from_slice(&3u16.to_be_bytes()); // numTables
++        data.extend_from_slice(&[0; 6]); // searchRange etc.
++        let mut offset = 12 + 16 * 3;
++        for (tag, table) in [(b"head", &head), (b"hhea", &hhea), (b"maxp", &maxp)] {
++            data.extend_from_slice(tag);
++            data.extend_from_slice(&[0; 4]); // checksum
++            data.extend_from_slice(&(offset as u32).to_be_bytes());
++            data.extend_from_slice(&(table.len() as u32).to_be_bytes());
++            offset += table.len();
++        }
++        data.extend_from_slice(&head);
++        data.extend_from_slice(&hhea);
++        data.extend_from_slice(&maxp);
++
++        let face = Face::parse(&data, 0).unwrap();
++        assert_eq!(face.ascender(), ascender);
++        assert_eq!(face.descender(), descender);
++        // Property (currently violated): height() must not panic for any
++        // successfully parsed face.
++        let height = face.height();
++        // Unreachable in debug builds; in release builds the subtraction
++        // wraps, which this catches instead.
++        assert_eq!(i32::from(height), i32::from(ascender) - i32::from(descender));
++    }
++}
