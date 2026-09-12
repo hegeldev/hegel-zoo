@@ -35,7 +35,9 @@ WORK = ROOT / "work" / "rust"
 PIN = tomllib.loads((ROOT / "zoo.toml").read_text())["rust"]["version"]
 TODAY = dt.date.today().isoformat()
 
-DEP_RE = re.compile(r'^(\s*hegeltest\s*=\s*)(?:"[^"]+"|(\{[^}\n]*?version\s*=\s*)"[^"]+")', re.M)
+# hegeltest = "x" | hegeltest = { version = "x", .. } | [dev-dependencies.hegeltest] version = "x"
+DEP_RE = re.compile(r'^(\s*hegeltest\s*=\s*)(?:"[^"]+"|(\{[^}\n]*?version\s*=\s*)"[^"]+")'
+                    r'|^(\[dev-dependencies\.hegeltest\]\n(?:(?!\[)[^\n]*\n)*?version\s*=\s*)"[^"]+"', re.M)
 COMPOSITE_RE = re.compile(r"(#\[(?:hegel::)?composite\][^\n]*\n(?:\s*//[^\n]*\n)*\s*(?:pub(?:\([^)]*\))? )?fn \w+(?:<[^>]*>)?\([^)]*?\btc: )(hegel::)?TestCase\b")
 
 
@@ -47,6 +49,8 @@ def rewrite_dep(cargo: Path) -> bool:
     s = cargo.read_text()
 
     def sub(m: re.Match) -> str:
+        if m.group(3):
+            return f'{m.group(3)}"{PIN}"'
         if m.group(2):
             return f'{m.group(1)}{m.group(2)}"{PIN}"'
         return f'{m.group(1)}"{PIN}"'
