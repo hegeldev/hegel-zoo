@@ -39,3 +39,4 @@
 - 2026-07-19: predecessor base commit `fbe9aeb4db17` (Merge pull request #652 from sgued/rem-perf).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/heapless.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1. Four upstream `assert_eq!(x, [])` on byte slices in `#[cfg(test)]` code (`src/c_string.rs`, `src/history_buf.rs`) rewritten as `assert!(x.is_empty())`: hegeltest 0.44 pulls in `serde_json`, whose `PartialEq` impls make the literal ambiguous (E0282/E0283).
+- 2026-09-12: base bumped fbe9aeb4db17 → f008da8b34aa (2026-08-08, "Merge pull request #668 from Conaclos/binaryheap_retain"; 0.9.3); 0 bug(s) still reproduce; fixed upstream: heapless/1. 462 tests pass. heapless/1 is fixed upstream (`make_contiguous` no longer sets `back = N` on a full wrapped deque; regression test added there).
