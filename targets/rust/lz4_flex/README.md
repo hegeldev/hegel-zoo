@@ -11,7 +11,7 @@
 - `test_fast_short_slice_copy`: (no doc comment)
 
 **`tests/tests.rs`**
-- `?`: Port of the old `proptest_roundtrip` test to hegel. Property: compress ∘ decompress is the identity, for the raw block format, the size-prepended block format, the frame format (both block modes), and cross-checked against the C++ lz4 implementation (see `test_roundtrip`).
+- `hegel_roundtrip_block_and_frame`: Port of the old `proptest_roundtrip` test to hegel. Property: compress ∘ decompress is the identity, for the raw block format, the size-prepended block format, the frame format (both block modes), and cross-checked against the C++ lz4 implementation (see `test_roundtrip`).
 - `hegel_prepend_size_consistency`: Property: `compress_prepend_size` output is documented to be the uncompressed size as a little-endian u32 followed by the regular compressed data, and `uncompressed_size` is documented to read that size back and return the rest.
 - `hegel_roundtrip_with_dict`: Property: dictionary roundtrip. `compress_prepend_size_with_dict` is documented to be usable in conjunction with `decompress_size_prepended_with_dict` (with the same dictionary on both sides).
 - `hegel_compress_into_max_output_size_is_sufficient`: Property: a buffer of exactly `get_maximum_output_size(input.len())` bytes is documented to be large enough for `compress_into` ("output should be preallocated with a size of `get_maximum_output_size`"), so compression into such a buffer must succeed and report a length within the buffer.

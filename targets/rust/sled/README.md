@@ -5,15 +5,15 @@
 ## What is tested
 
 **`tests/test_tree.rs`**
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
-- `?`: (no doc comment)
+- `hegel_tree_matches_btreemap_model`: (no doc comment)
+- `hegel_apply_batch_matches_model`: (no doc comment)
+- `hegel_range_matches_model`: (no doc comment)
+- `hegel_double_ended_iteration_matches_model`: (no doc comment)
+- `hegel_compare_and_swap_semantics`: (no doc comment)
+- `hegel_reopen_preserves_contents`: (no doc comment)
+- `hegel_scan_prefix_matches_model`: (no doc comment)
+- `hegel_pop_in_range_drains_range_in_order`: (no doc comment)
+- `hegel_checksum_is_history_independent`: (no doc comment)
 
 ## Oracles
 

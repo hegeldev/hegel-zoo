@@ -9,7 +9,7 @@
 
 **`tests/loopback.rs`**
 - `prop_rich_message_roundtrip`: (no doc comment)
-- `?`: (no doc comment)
+- `$name` (macro `varint_roundtrip_props!`, instances `prop_varint_roundtrip_u8`, `prop_varint_roundtrip_u16`, `prop_varint_roundtrip_u32`): (no doc comment)
 - `prop_unsigned_varint_encoding_matches_leb128_reference`: Spec conformance: unsigned integers encode as canonical LEB128 (independent reference implementation as the oracle).
 - `prop_signed_varint_encoding_matches_zigzag_leb128_reference`: Spec conformance: signed integers are zigzag-encoded, then encoded as canonical LEB128 (independent reference implementation).
 - `prop_varint_noncanonical_padding_accepted_within_max_len`: Spec "Canonicalization" table: non-canonical encodings (excess `0x80` continuation bytes) are accepted while the total length stays within the type's maximum encoded length (5 for u32), and rejected once it exceeds it.

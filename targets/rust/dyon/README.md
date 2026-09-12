@@ -12,7 +12,7 @@
 - `prop_boolean_logic_matches_rust`: (no doc comment)
 - `prop_run_is_deterministic`: (no doc comment)
 - `prop_array_indexing_and_bounds`: (no doc comment)
-- `?`: (no doc comment)
+- `prop_float_literal_parse_correctly_rounded_KNOWN_FAILURE`: (no doc comment)
 - `prop_load_never_panics_on_arbitrary_text`: (no doc comment)
 - `prop_load_never_panics_on_token_soup`: (no doc comment)
 - `prop_shallow_nesting_no_abort`: (no doc comment)

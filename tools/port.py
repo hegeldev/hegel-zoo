@@ -357,12 +357,18 @@ def doc_bullets(root: Path) -> list[str]:
         for i, line in enumerate(lines):
             if not re.match(r"\s*#\[hegel::test", line):
                 continue
-            m = re.match(r"\s*fn (\w+)", lines[i + 1]) if i + 1 < len(lines) else None
+            # other attributes may sit between #[hegel::test] and the fn (#[cfg_attr(miri, ignore)])
+            k = i + 1
+            while k < len(lines) and re.match(r"\s*#\[", lines[k]):
+                k += 1
+            # `fn $name` inside a macro_rules! body is listed as `$name` (the instances follow it)
+            m = re.match(r"\s*(?:pub(?:\([^)]*\))? )?(?:async )?fn (\$?\w+)", lines[k]) if k < len(lines) else None
             name = m.group(1) if m else "?"
+            # the description is the /// (or plain //) comment block directly above the attribute
             doc = []
             j = i - 1
-            while j >= 0 and re.match(r"\s*///", lines[j]):
-                doc.insert(0, re.sub(r"^\s*///\s?", "", lines[j]))
+            while j >= 0 and re.match(r"\s*//", lines[j]):
+                doc.insert(0, re.sub(r"^\s*///?\s?", "", lines[j]))
                 j -= 1
             text = " ".join(d for d in doc if d.strip()) or "(no doc comment)"
             items.append(f"- `{name}`: {text}")

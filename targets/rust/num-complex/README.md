@@ -26,7 +26,7 @@
 - `prop_sqrt_principal_branch`: (no doc comment)
 - `prop_powu2_is_mul`: (no doc comment)
 - `prop_powf_half_matches_sqrt`: (no doc comment)
-- `?`: (no doc comment)
+- `prop_display_fromstr_roundtrip`: (no doc comment)
 - `prop_fromstr_never_panics`: (no doc comment)
 
 ## Oracles
