@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""zoo — fetch, apply, run and check the Hegel zoo's targets.
+
+Standard library only (Python 3.11+). Run from anywhere inside the repository.
+
+  zoo fetch  <target>...        clone upstream into work/<lang>/<name> at the pinned base commit
+  zoo apply  <target>...        fetch, reset to base, git apply hegel.patch
+  zoo test   <target>...        apply, run the tests, judge against expected_failures
+  zoo save   <target>           regenerate hegel.patch from the working tree in work/
+  zoo check  [<target>...]      static consistency checks (add --apply to also verify patches apply)
+  zoo bump-hegel <lang> <ver>   rewrite zoo.toml and every patch's dependency line for <lang>
+  zoo report                    regenerate TROPHIES.md from all bugs.toml files
+  zoo new    <lang> <name> <upstream-url>   scaffold a target directory
+  zoo list   [<lang>]           list targets
+
+A <target> is "<lang>/<name>" (e.g. rust/humantime), or "<lang>" for every target in that
+language, or "all".
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+LANGUAGES = ("rust", "go", "typescript", "java", "cpp", "ocaml")
+OPEN_STATUSES = {"open", "reported", "duplicate", "disputed"}  # bug still present upstream
+ALL_STATUSES = OPEN_STATUSES | {"fixed", "wontfix", "retired"}
+
+
+# --------------------------------------------------------------------------- helpers
+
+def find_root() -> Path:
+    p = Path.cwd().resolve()
+    for cand in (p, *p.parents):
+        if (cand / "zoo.toml").is_file() and (cand / "targets").is_dir():
+            return cand
+    sys.exit("zoo: not inside the zoo (no zoo.toml above the current directory)")
+
+
+ROOT = find_root()
+TARGETS = ROOT / "targets"
+WORK = ROOT / "work"
+
+
+def die(msg: str) -> None:
+    sys.exit(f"zoo: {msg}")
+
+
+def log(msg: str) -> None:
+    print(f"zoo: {msg}", file=sys.stderr, flush=True)
+
+
+def run(cmd: list[str], cwd: Path | None = None, check: bool = True, capture: bool = False,
+        env: dict | None = None) -> subprocess.CompletedProcess:
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, env=full_env,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.STDOUT if capture else None)
+
+
+def toml_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# --------------------------------------------------------------------------- model
+
+@dataclass
+class Target:
+    lang: str
+    name: str
+    dir: Path
+    meta: dict
+    bugs: list[dict] = field(default_factory=list)
+
+    @property
+    def id(self) -> str:
+        return f"{self.lang}/{self.name}"
+
+    @property
+    def patch(self) -> Path:
+        return self.dir / "hegel.patch"
+
+    @property
+    def work(self) -> Path:
+        return WORK / self.lang / self.name
+
+    @property
+    def src(self) -> Path:
+        """Directory inside the checkout where the package lives and tests run."""
+        sub = self.meta.get("subdir", "")
+        return self.work / sub if sub else self.work
+
+    @property
+    def expected_failures(self) -> dict[str, str]:
+        return dict(self.meta.get("expected_failures", {}))
+
+
+def load_pins() -> dict:
+    return tomllib.loads((ROOT / "zoo.toml").read_text())
+
+
+def load_target(lang: str, name: str) -> Target:
+    d = TARGETS / lang / name
+    tf = d / "target.toml"
+    if not tf.is_file():
+        die(f"no such target {lang}/{name} ({tf} missing)")
+    meta = tomllib.loads(tf.read_text())
+    bugs = []
+    bf = d / "bugs.toml"
+    if bf.is_file():
+        bugs = tomllib.loads(bf.read_text()).get("bug", [])
+    return Target(lang, name, d, meta, bugs)
+
+
+def all_targets(lang: str | None = None) -> list[Target]:
+    out = []
+    for ld in sorted(TARGETS.iterdir()):
+        if not ld.is_dir() or (lang and ld.name != lang):
+            continue
+        for td in sorted(ld.iterdir()):
+            if (td / "target.toml").is_file():
+                out.append(load_target(ld.name, td.name))
+    return out
+
+
+def resolve(specs: list[str]) -> list[Target]:
+    if not specs or specs == ["all"]:
+        return all_targets()
+    out: list[Target] = []
+    for s in specs:
+        if s in LANGUAGES:
+            out.extend(all_targets(s))
+        elif "/" in s:
+            lang, name = s.split("/", 1)
+            out.append(load_target(lang, name))
+        else:
+            die(f"bad target spec {s!r}: use <lang>/<name>, <lang> or all")
+    return out
+
+
+# --------------------------------------------------------------------------- backends
+
+class Backend:
+    """Per-language mechanics. Subclasses override what differs."""
+    lang = ""
+    dep_re: re.Pattern  # matches the dependency line in a patch, group 'v' = version
+
+    def patch_versions(self, patch_text: str) -> set[str]:
+        return {m.group("v") for m in self.dep_re.finditer(patch_text)}
+
+    def rewrite_version(self, patch_text: str, new: str) -> str:
+        return self.dep_re.sub(lambda m: m.group(0).replace(m.group("v"), new), patch_text)
+
+    def default_command(self, t: Target) -> list[str]:
+        raise NotImplementedError(f"no {self.lang} backend yet")
+
+    def default_env(self, t: Target) -> dict:
+        return {}
+
+    def parse_results(self, output: str) -> dict[str, str]:
+        """test name -> 'ok' | 'FAILED' | 'ignored'."""
+        raise NotImplementedError
+
+    def patch_excludes(self) -> list[str]:
+        return []
+
+
+class Rust(Backend):
+    lang = "rust"
+    # +hegeltest = "0.44.1"   |   +hegeltest = { version = "0.44.1", features = [...] }
+    dep_re = re.compile(r'^\+\s*hegeltest\s*=\s*(?:"(?P<v>[^"]+)"|\{[^}\n]*version\s*=\s*"(?P<v2>[^"]+)")',
+                        re.M)
+
+    def patch_versions(self, patch_text: str) -> set[str]:
+        return {m.group("v") or m.group("v2") for m in self.dep_re.finditer(patch_text)}
+
+    def rewrite_version(self, patch_text: str, new: str) -> str:
+        def sub(m: re.Match) -> str:
+            old = m.group("v") or m.group("v2")
+            return m.group(0).replace(f'"{old}"', f'"{new}"', 1)
+        return self.dep_re.sub(sub, patch_text)
+
+    def default_command(self, t: Target) -> list[str]:
+        cmd = ["cargo", "test", "--no-fail-fast"]
+        if pkg := t.meta.get("package"):
+            cmd += ["-p", pkg]
+        return cmd
+
+    def default_env(self, t: Target) -> dict:
+        # Cargo is happy to build a crate whose rust-version is older than hegeltest's MSRV;
+        # tell it not to fail resolution on that (predecessor patches were made this way).
+        return {"CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS": "allow", "CARGO_TERM_COLOR": "never"}
+
+    # "test a::b ... ok" | "test a::b - should panic ... ok" | "test src/x.rs - f (line 3) ... ok"
+    _line = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$", re.M)
+
+    def parse_results(self, output: str) -> dict[str, str]:
+        res: dict[str, str] = {}
+        for m in self._line.finditer(output):
+            name, verdict = m.group(1), m.group(2)
+            # a name seen twice with different verdicts (two test binaries) — keep the worse
+            if name in res and res[name] == "FAILED":
+                continue
+            res[name] = verdict
+        return res
+
+    def patch_excludes(self) -> list[str]:
+        return [":(exclude)Cargo.lock", ":(exclude)**/Cargo.lock"]
+
+
+BACKENDS: dict[str, Backend] = {b.lang: b for b in (Rust(),)}
+
+
+def backend(t: Target) -> Backend:
+    b = BACKENDS.get(t.lang)
+    if b is None:
+        die(f"{t.id}: no backend for language {t.lang!r} yet")
+    return b
+
+
+# --------------------------------------------------------------------------- git plumbing
+
+def git(t: Target, *args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    return run(["git", *args], cwd=t.work, check=check, capture=capture)
+
+
+def fetch(t: Target) -> None:
+    base = t.meta["base"]["commit"]
+    upstream = t.meta["upstream"]
+    w = t.work
+    if not (w / ".git").is_dir():
+        w.mkdir(parents=True, exist_ok=True)
+        run(["git", "init", "-q"], cwd=w)
+        run(["git", "remote", "add", "origin", upstream], cwd=w)
+    have = git(t, "cat-file", "-e", f"{base}^{{commit}}", check=False, capture=True).returncode == 0
+    if not have:
+        log(f"{t.id}: fetching {base[:12]} from {upstream}")
+        r = git(t, "fetch", "-q", "--depth", "1", "origin", base, check=False)
+        if r.returncode != 0:  # server refuses fetch-by-sha; take the whole history
+            log(f"{t.id}: shallow fetch refused, fetching full history")
+            git(t, "fetch", "-q", "origin")
+    git(t, "checkout", "-q", "--detach", base)
+
+
+def reset_to_base(t: Target) -> None:
+    base = t.meta["base"]["commit"]
+    git(t, "checkout", "-q", "--detach", base)
+    git(t, "reset", "-q", "--hard")
+    # -d for directories, no -x: keep ignored build artefacts (target/, node_modules/) for speed
+    git(t, "clean", "-fdq")
+
+
+def apply(t: Target) -> None:
+    fetch(t)
+    reset_to_base(t)
+    if not t.patch.is_file() or t.patch.stat().st_size == 0:
+        die(f"{t.id}: hegel.patch missing or empty")
+    r = git(t, "apply", "--3way", str(t.patch), check=False, capture=True)
+    if r.returncode != 0:
+        print(r.stdout)
+        die(f"{t.id}: hegel.patch does not apply to {t.meta['base']['commit'][:12]}")
+
+
+def save(t: Target) -> None:
+    if not (t.work / ".git").is_dir():
+        die(f"{t.id}: nothing in {t.work}; run `zoo apply` and edit there first")
+    git(t, "add", "-N", "--all")  # make new files show up in diff
+    excludes = backend(t).patch_excludes()
+    r = git(t, "diff", "--binary", "--", ".", *excludes, capture=True)
+    text = r.stdout
+    if not text.strip():
+        die(f"{t.id}: working tree in {t.work} has no changes against base")
+    t.patch.write_text(text)
+    log(f"{t.id}: wrote {t.patch.relative_to(ROOT)} ({text.count(chr(10))} lines)")
+
+
+# --------------------------------------------------------------------------- test
+
+@dataclass
+class Verdict:
+    passed: list[str]
+    expected_failed: list[str]
+    unexpected_failed: list[str]
+    unexpected_passed: list[str]   # listed as expected failures but passed: bug fixed?
+    missing: list[str]             # expected failures that did not run at all
+    ignored: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return not (self.unexpected_failed or self.unexpected_passed or self.missing)
+
+
+def judge(t: Target, results: dict[str, str]) -> Verdict:
+    exp = t.expected_failures
+    v = Verdict([], [], [], [], [], [])
+    for name, r in results.items():
+        if r == "ignored":
+            v.ignored.append(name)
+        elif r == "FAILED":
+            (v.expected_failed if name in exp else v.unexpected_failed).append(name)
+        elif name in exp:
+            v.unexpected_passed.append(name)
+        else:
+            v.passed.append(name)
+    v.missing = [n for n in exp if n not in results]
+    return v
+
+
+def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
+    b = backend(t)
+    if not no_apply:
+        apply(t)
+    for step in t.meta.get("run", {}).get("setup", []):
+        log(f"{t.id}: setup: {step}")
+        subprocess.run(step, shell=True, cwd=t.src, check=True)
+    cmd_s = t.meta.get("run", {}).get("command")
+    cmd = cmd_s.split() if cmd_s else b.default_command(t)
+    env = b.default_env(t)
+    env.update(t.meta.get("run", {}).get("env", {}))
+    if test_cases:
+        env["HEGEL_TEST_CASES"] = str(test_cases)
+    log(f"{t.id}: running {' '.join(cmd)} in {t.src.relative_to(ROOT)}")
+    r = run(cmd, cwd=t.src, check=False, capture=True, env=env)
+    logfile = WORK / t.lang / f"{t.name}.log"
+    logfile.write_text(r.stdout)
+    results = b.parse_results(r.stdout)
+    if not results:
+        print(r.stdout[-4000:])
+        log(f"{t.id}: no test results parsed (exit {r.returncode}); full log at {logfile}")
+        return False
+    v = judge(t, results)
+    flag = "OK " if v.ok else "BAD"
+    print(f"{flag} {t.id}: {len(v.passed)} passed, {len(v.expected_failed)} expected failures, "
+          f"{len(v.ignored)} ignored, {len(v.unexpected_failed)} unexpected failures, "
+          f"{len(v.unexpected_passed)} unexpected passes, {len(v.missing)} expected-failure tests missing")
+    for n in v.unexpected_failed:
+        print(f"    FAIL  {n}")
+    for n in v.unexpected_passed:
+        print(f"    PASS? {n}  (listed as expected failure for {t.expected_failures[n]} — fixed upstream?)")
+    for n in v.missing:
+        print(f"    MISSING {n}  (expected failure not found in results)")
+    if not v.ok:
+        log(f"{t.id}: full log at {logfile}")
+    return v.ok
+
+
+# --------------------------------------------------------------------------- check
+
+def check(t: Target, pins: dict, do_apply: bool) -> list[str]:
+    errs: list[str] = []
+    m = t.meta
+    for k in ("name", "language", "upstream", "base", "hegel"):
+        if k not in m:
+            errs.append(f"target.toml missing [{k}]")
+    if errs:
+        return errs
+    if m["name"] != t.name or m["language"] != t.lang:
+        errs.append("target.toml name/language disagree with directory")
+    if not re.fullmatch(r"[0-9a-f]{40}", m["base"].get("commit", "")):
+        errs.append("base.commit must be a full 40-hex sha")
+    if not (t.dir / "README.md").is_file():
+        errs.append("README.md missing")
+    if not t.patch.is_file() or t.patch.stat().st_size == 0:
+        errs.append("hegel.patch missing or empty")
+        return errs
+    text = t.patch.read_text()
+    if "HEGEL_REPORT.md" in text:
+        errs.append("hegel.patch adds HEGEL_REPORT.md (strip it)")
+    b = BACKENDS.get(t.lang)
+    pin = pins.get(t.lang, {}).get("version", "")
+    if b:
+        vers = b.patch_versions(text)
+        if not vers:
+            errs.append("hegel.patch does not add the Hegel dependency (or in a form zoo does not recognise)")
+        elif vers != {pin}:
+            errs.append(f"hegel.patch pins {sorted(vers)} but zoo.toml pins {pin!r}")
+    if m["hegel"].get("version") != pin:
+        errs.append(f"target.toml hegel.version {m['hegel'].get('version')!r} != zoo.toml {pin!r}")
+    ids = {}
+    for bug in t.bugs:
+        bid = bug.get("id", "")
+        if not bid.startswith(f"{t.name}/"):
+            errs.append(f"bug id {bid!r} should start with {t.name}/")
+        if bid in ids:
+            errs.append(f"duplicate bug id {bid}")
+        ids[bid] = bug
+        if bug.get("status") not in ALL_STATUSES:
+            errs.append(f"bug {bid}: bad status {bug.get('status')!r}")
+        for k in ("title", "kind", "found"):
+            if k not in bug:
+                errs.append(f"bug {bid}: missing {k}")
+    for test_name, bid in t.expected_failures.items():
+        if bid not in ids:
+            errs.append(f"expected_failures: {test_name} -> unknown bug {bid}")
+        elif ids[bid].get("status") not in OPEN_STATUSES:
+            errs.append(f"expected_failures: {test_name} -> bug {bid} has status {ids[bid]['status']}; drop it")
+    listed = set(t.expected_failures.values())
+    for bid, bug in ids.items():
+        if bug.get("status") in OPEN_STATUSES and bug.get("test") and bid not in listed:
+            errs.append(f"bug {bid} is {bug['status']} with a test but not in expected_failures")
+    if do_apply and not errs:
+        try:
+            apply(t)
+        except SystemExit as e:
+            errs.append(str(e))
+    return errs
+
+
+# --------------------------------------------------------------------------- bump-hegel
+
+def bump_hegel(lang: str, version: str) -> None:
+    if lang not in BACKENDS:
+        die(f"no backend for {lang}")
+    b = BACKENDS[lang]
+    zt = ROOT / "zoo.toml"
+    text = zt.read_text()
+    new, n = re.subn(rf'(\[{lang}\]\n(?:.*\n)*?version = )"[^"]*"', rf'\g<1>"{version}"', text)
+    if n != 1:
+        die(f"could not find [{lang}] version in zoo.toml")
+    zt.write_text(new)
+    for t in all_targets(lang):
+        pt = t.patch.read_text()
+        t.patch.write_text(b.rewrite_version(pt, version))
+        tt = t.dir / "target.toml"
+        tt.write_text(re.sub(r'(\[hegel\]\n(?:.*\n)*?version = )"[^"]*"', rf'\g<1>"{version}"', tt.read_text()))
+    log(f"{lang}: pinned {version} in zoo.toml and {len(all_targets(lang))} targets; now run `zoo test {lang}`")
+
+
+# --------------------------------------------------------------------------- report
+
+def report() -> None:
+    rows = []
+    for t in all_targets():
+        for bug in t.bugs:
+            rows.append((t, bug))
+    by_status: dict[str, int] = {}
+    for _, bug in rows:
+        by_status[bug["status"]] = by_status.get(bug["status"], 0) + 1
+    out = ["# Trophies", "",
+           "Every bug found by a test in the zoo, generated by `tools/zoo report` from the",
+           "`bugs.toml` files under `targets/`. Do not edit by hand.", "",
+           f"{len(rows)} bugs across {len({t.id for t, _ in rows})} targets: "
+           + ", ".join(f"{k} {v}" for k, v in sorted(by_status.items())) + ".", ""]
+    for lang in LANGUAGES:
+        lrows = [(t, b) for t, b in rows if t.lang == lang]
+        if not lrows:
+            continue
+        out += [f"## {lang}", "", "| id | title | kind | severity | found at | status | upstream |", "|---|---|---|---|---|---|---|"]
+        for t, b in lrows:
+            f = b.get("found", {})
+            found = f"{f.get('version', '')} ({f.get('commit', '')[:9]})".strip()
+            up = b.get("upstream_issue", "")
+            up = f"[issue]({up})" if up else ""
+            fixed = f" (fixed in {b['fixed_in']})" if b.get("fixed_in") else ""
+            out.append(f"| [{b['id']}](targets/{t.lang}/{t.name}/bugs.toml) | {b['title']} | {b.get('kind', '')} | "
+                       f"{b.get('severity', '')} | {found} | {b['status']}{fixed} | {up} |")
+        out.append("")
+    (ROOT / "TROPHIES.md").write_text("\n".join(out))
+    log(f"wrote TROPHIES.md ({len(rows)} bugs)")
+
+
+# --------------------------------------------------------------------------- new
+
+def new(lang: str, name: str, upstream: str) -> None:
+    if lang not in LANGUAGES:
+        die(f"unknown language {lang}")
+    d = TARGETS / lang / name
+    if d.exists():
+        die(f"{d} exists")
+    d.mkdir(parents=True)
+    pin = load_pins()[lang]["version"]
+    today = dt.date.today().isoformat()
+    (d / "target.toml").write_text(f'''name = {toml_str(name)}
+language = {toml_str(lang)}
+upstream = {toml_str(upstream)}
+subdir = ""
+license = ""
+ai_policy_checked = {toml_str(today)}
+
+[base]
+commit = ""
+date = ""
+version = ""
+
+[hegel]
+version = {toml_str(pin)}
+
+[run]
+setup = []
+
+[expected_failures]
+''')
+    (d / "README.md").write_text(f"# {name}\n\n## What is tested\n\n## Oracles\n\n## Not tested\n\n## History\n\n- {today}: created.\n")
+    (d / "hegel.patch").touch()
+    log(f"scaffolded {d.relative_to(ROOT)}; fill in base.commit, then `zoo fetch {lang}/{name}`, write tests in work/, `zoo save`")
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="zoo", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for c in ("fetch", "apply"):
+        sub.add_parser(c).add_argument("targets", nargs="+")
+    p = sub.add_parser("test")
+    p.add_argument("targets", nargs="+")
+    p.add_argument("--test-cases", type=int, help="override HEGEL_TEST_CASES")
+    p.add_argument("--no-apply", action="store_true", help="run against work/ as it is (while porting)")
+    sub.add_parser("save").add_argument("target")
+    p = sub.add_parser("check")
+    p.add_argument("targets", nargs="*")
+    p.add_argument("--apply", action="store_true", help="also fetch upstream and verify the patch applies")
+    p = sub.add_parser("bump-hegel")
+    p.add_argument("lang")
+    p.add_argument("version")
+    sub.add_parser("report")
+    p = sub.add_parser("new")
+    p.add_argument("lang")
+    p.add_argument("name")
+    p.add_argument("upstream")
+    sub.add_parser("list").add_argument("lang", nargs="?")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "fetch":
+        for t in resolve(a.targets):
+            fetch(t)
+    elif a.cmd == "apply":
+        for t in resolve(a.targets):
+            apply(t)
+            log(f"{t.id}: applied at {t.work.relative_to(ROOT)}")
+    elif a.cmd == "test":
+        ok = True
+        for t in resolve(a.targets):
+            ok &= test(t, a.test_cases, a.no_apply)
+        return 0 if ok else 1
+    elif a.cmd == "save":
+        save(resolve([a.target])[0])
+    elif a.cmd == "check":
+        pins = load_pins()
+        bad = 0
+        ts = resolve(a.targets)
+        for t in ts:
+            errs = check(t, pins, a.apply)
+            if errs:
+                bad += 1
+                print(f"BAD {t.id}")
+                for e in errs:
+                    print(f"    {e}")
+        print(f"zoo check: {len(ts) - bad}/{len(ts)} targets OK")
+        return 1 if bad else 0
+    elif a.cmd == "bump-hegel":
+        bump_hegel(a.lang, a.version)
+    elif a.cmd == "report":
+        report()
+    elif a.cmd == "new":
+        new(a.lang, a.name, a.upstream)
+    elif a.cmd == "list":
+        for t in all_targets(a.lang):
+            print(t.id)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
