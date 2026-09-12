@@ -154,17 +154,27 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             # code (hegel is a dev-dependency). Prefer: after a `use hegel::generators…` line;
             # else right after the nearest `mod … {` above the first draw site; else after the
             # first `use` in the file (integration-test files).
-            text, n = re.subn(r"^(\s*)(use hegel::generators(?:::\w+)?(?: as \w+)?;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
+            first = min(l for l, _, _ in locs) - 1
+            ls = text.split("\n")
+            n = 0
+            # 1. right after the nearest enclosing `mod … {` above the first draw site (the
+            #    import must be visible in the module that draws; `use hegel::generators…` lines
+            #    can be function-local, so they are not a reliable anchor)
+            for k in range(min(first, len(ls) - 1), -1, -1):
+                mm = re.match(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$", ls[k])
+                if mm:
+                    ls.insert(k + 1, f"{mm.group(1)}    use hegel::Generator;")
+                    n = 1
+                    break
+            # 2. no enclosing module (integration-test file): after a file-scope `use hegel::generators…`
             if not n:
-                first = min(l for l, _, _ in locs) - 1
-                ls = text.split("\n")
                 for k in range(min(first, len(ls) - 1), -1, -1):
-                    mm = re.match(r"^(\s*)(?:pub(?:\([^)]*\))? )?mod \w+\s*\{\s*$", ls[k])
-                    if mm:
-                        ls.insert(k + 1, f"{mm.group(1)}    use hegel::Generator;")
+                    if re.match(r"^use hegel::generators(?:::\w+)?(?: as \w+)?;", ls[k]):
+                        ls.insert(k + 1, "use hegel::Generator;")
                         n = 1
                         break
-                text = "\n".join(ls)
+            text = "\n".join(ls)
+            # 3. after the first `use` in the file
             if not n:
                 text, n = re.subn(r"^(\s*)(use [^\n]*;)", r"\1\2\n\1use hegel::Generator;", text, count=1, flags=re.M)
             if not n:
