@@ -74,6 +74,7 @@ def fix_composites(root: Path) -> int:
 
 
 PRINT_ERR = re.compile(r"^error\[E0277\]: `([^`]+)` has no printed representation\n\s+--> (\S+?):(\d+):(\d+)", re.M)
+FIELD_ERR = re.compile(r"^error\[E0277\]: `[^`]+` has no printed representation, so this field cannot derive `PrettyPrintable`\n\s+--> (\S+?):(\d+):(\d+)", re.M)
 
 
 def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
@@ -87,6 +88,21 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
         path = next((p for p in (pkg_dir / file, work / file) if p.is_file()), work / file)
         sites.setdefault(path, []).append((line, col, ty.split("::")[-1].split("<")[0]))
     edits = 0
+    # a derived PrettyPrintable whose field has a foreign type: mark the field #[pretty(debug)]
+    for m in FIELD_ERR.finditer(log):
+        file, line = m.group(1), int(m.group(2))
+        path = next((p for p in (pkg_dir / file, work / file) if pkg_dir and p.is_file()), work / file)
+        if not path.is_file():
+            continue
+        ls = path.read_text(errors="replace").split("\n")
+        i = line - 1
+        if 0 <= i < len(ls) and "#[pretty(debug)]" not in ls[i - 1]:
+            indent = re.match(r"\s*", ls[i]).group(0)
+            ls.insert(i, f"{indent}#[pretty(debug)]")
+            path.write_text("\n".join(ls))
+            edits += 1
+    if edits:
+        return edits  # line numbers shifted; let the next compile report the rest
     for f, locs in sites.items():
         if not f.is_file():
             continue
@@ -287,7 +303,7 @@ def port(crate: str) -> str:
         r = sh(str(TOOLS / "zoo"), "test", "--no-apply", f"rust/{crate}", check=False)
         out = r.stdout + r.stderr
         log = (WORK / f"{crate}.log").read_text(errors="replace") if (WORK / f"{crate}.log").exists() else ""
-        if not PRINT_ERR.search(log) or not fix_printable(work, log, pkg_dir):
+        if not (PRINT_ERR.search(log) or FIELD_ERR.search(log)) or not fix_printable(work, log, pkg_dir):
             break
         nfix += 1
     if re.search(r"^error(\[E\d+\])?: ", log, re.M) and "test result" not in log:
