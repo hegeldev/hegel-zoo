@@ -349,10 +349,9 @@ def port(crate: str) -> str:
     subdir = meta.get("subdir", "")
     work = WORK / crate
     pkg_dir = work / subdir if subdir else work
-    if not rewrite_dep(pkg_dir / "Cargo.toml"):
-        # the patch may have put the dev-dependency in another manifest; try them all
-        if not any(rewrite_dep(c) for c in work.rglob("Cargo.toml") if "target" not in c.parts):
-            return f"ERROR   {crate}: hegeltest dependency line not found"
+    # the patch may add the dev-dependency to several manifests (workspace members): all of them
+    if not sum(rewrite_dep(c) for c in work.rglob("Cargo.toml") if "target" not in c.parts):
+        return f"ERROR   {crate}: hegeltest dependency line not found"
     nfix = fix_composites(work) + fix_stateful_run(work)
     for _round in range(4):
         r = sh(str(TOOLS / "zoo"), "test", "--no-apply", f"rust/{crate}", check=False)
