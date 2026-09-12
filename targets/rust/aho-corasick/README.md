@@ -28,3 +28,4 @@
 - 2026-04-21: predecessor base commit `c82178696b9d` (build(deps): bump actions/checkout in the actions group (#171)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/aho-corasick.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped c82178696b9d → 6c0abf5681bf (2026-08-10, "lint: remove uses of deprecated module integer constants"; 1.1.5); 2 bug(s) still reproduce. 276 tests pass.
