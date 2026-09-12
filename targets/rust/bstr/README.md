@@ -42,3 +42,4 @@
 - 2026-07-15: predecessor base commit `08a77375dfa8` (doc: add AI Policy (#232)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/bstr.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 08a77375dfa8 → 134195be38c7 (2026-08-10, "1.13.1"; 1.13.1); 1 bug(s) still reproduce. 263 tests pass.
