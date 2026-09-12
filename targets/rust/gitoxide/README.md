@@ -1,0 +1,20 @@
+# gitoxide
+
+[GitoxideLabs/gitoxide](https://github.com/GitoxideLabs/gitoxide).
+
+## What is tested
+
+**`tests/url/parse/mod.rs`**
+- `parsed_urls_roundtrip_through_to_bstring`: Property: `Url::to_bstring()` is documented to serialize "losslessly, ready to be parsed again" (see `Url::write_to()`), so any successfully parsed URL must reparse from its own serialization to an equal `Url`. This is `assert_url_roundtrip()` generalized over generated inputs.
+- `from_parts_preserves_components`: Property: the field docs on `Url` state that `user`, `password` and `path` are stored in decoded form and re-encoded during canonical serialization, and `Url::from_parts()` validates by parsing the serialized form back. Therefore constructing a URL from valid parts must preserve each component (modulo the documented `/~` path normalization for ssh/git).
+- `users_with_colons_roundtrip_through_to_bstring`: KNOWN FAILURE: pins a real bug — `Url::to_bstring()` is not lossless for users containing `:`. `parse("http://a%3Ab@host/")` percent-decodes the user to `a:b` (as documented on `Url::user`), but `USERINFO_ENCODE_SET` in `write_canonical_form_to()` (src/lib.rs) does not include `:`, so `to_bstring()` yields `http://a:b@host/` which reparses as user `a` with password `b`. This violates the documented contract of `write_to()`: "Write this URL losslessly to `out`, ready to be parsed again". A colon inside the user component must be percent-encoded because the first unencoded `:` in userinfo delimits user from password.
+
+## Oracles
+
+## Not tested
+
+## History
+
+- 2026-07-22: predecessor base commit `2315ede714da` (Merge pull request #2737 from GitoxideLabs/encoding-fallback-pony).
+- 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/gitoxide.patch`).
+- 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.

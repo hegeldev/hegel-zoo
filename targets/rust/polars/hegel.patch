@@ -1,0 +1,417 @@
+diff --git a/crates/polars-row/Cargo.toml b/crates/polars-row/Cargo.toml
+index 0059dadcf1..b317954d7d 100644
+--- a/crates/polars-row/Cargo.toml
++++ b/crates/polars-row/Cargo.toml
+@@ -21,6 +21,7 @@ arrow = { workspace = true }
+ 
+ [dev-dependencies]
+ arrow = { workspace = true, features = ["proptest"] }
++hegeltest = "0.44.1"
+ proptest = { workspace = true }
+ 
+ [lints]
+diff --git a/crates/polars-row/src/encode.rs b/crates/polars-row/src/encode.rs
+index f2f75a58a4..399b8d34ab 100644
+--- a/crates/polars-row/src/encode.rs
++++ b/crates/polars-row/src/encode.rs
+@@ -1019,4 +1019,400 @@ mod tests {
+             convert_columns_no_order(arrays[0].len(), &arrays, &dicts);
+         }
+     }
++
++    // ---------------------------------------------------------------------
++    // Hegel property-based tests.
++    //
++    // The row format's core contract (see the crate docs in lib.rs) is that
++    // the encoded rows are memcmp-orderable: comparing two encoded rows
++    // byte-lexicographically must give the same result as comparing the
++    // original values under the requested sort options. The tests below check
++    // that contract directly against simple oracles, plus encode/decode
++    // round-trips.
++    // ---------------------------------------------------------------------
++
++    use std::cmp::Ordering;
++
++    use arrow::offset::OffsetsBuffer;
++    use hegel::generators;
++    use hegel::Generator;
++    use polars_utils::total_ord::canonical_f64;
++
++    use crate::decode::decode_rows;
++
++    /// Order-preserving row encoding options: all combinations of DESCENDING
++    /// and NULLS_LAST, never NO_ORDER.
++    #[hegel::composite]
++    fn sorted_opts(tc: &hegel::TestCase) -> RowEncodingOptions {
++        let descending = tc.draw(generators::booleans());
++        let nulls_last = tc.draw(generators::booleans());
++        RowEncodingOptions::new_sorted(descending, nulls_last)
++    }
++
++    /// Any row encoding options, including NO_ORDER.
++    #[hegel::composite]
++    fn any_opts(tc: &hegel::TestCase) -> RowEncodingOptions {
++        let mut opt = tc.draw((sorted_opts()).print_as_debug());
++        if tc.draw(generators::booleans()) {
++            opt |= RowEncodingOptions::NO_ORDER;
++        }
++        opt
++    }
++
++    /// Full-range i64 with boosted probability of the boundary values where
++    /// the sign-bit flip in the encoding could go wrong.
++    #[hegel::composite]
++    fn boundary_heavy_i64(tc: &hegel::TestCase) -> i64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i64>(),
++            generators::sampled_from(vec![
++                i64::MIN,
++                i64::MIN + 1,
++                -1,
++                0,
++                1,
++                i64::MAX - 1,
++                i64::MAX
++            ]),
++        ))
++    }
++
++    /// Full-range f64 (including NaN and infinities) with boosted probability
++    /// of the special values that the float encoding canonicalizes.
++    #[hegel::composite]
++    fn boundary_heavy_f64(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>(),
++            generators::sampled_from(vec![
++                0.0,
++                -0.0,
++                f64::NAN,
++                -f64::NAN,
++                f64::INFINITY,
++                f64::NEG_INFINITY,
++                f64::MIN,
++                f64::MAX,
++                f64::MIN_POSITIVE,
++                -f64::MIN_POSITIVE,
++                5e-324,  // smallest positive subnormal
++                -5e-324, // largest negative subnormal
++                1.0,
++                -1.0,
++            ]),
++        ))
++    }
++
++    /// Strings biased towards a tiny alphabet so that prefix relationships
++    /// ("a" vs "ab") and equal values occur often — that is where the
++    /// terminator-byte logic of the string encoding is stressed — while still
++    /// covering arbitrary unicode via `text()`.
++    #[hegel::composite]
++    fn collision_prone_string(tc: &hegel::TestCase) -> String {
++        tc.draw(hegel::one_of!(
++            generators::text(),
++            generators::from_regex(r"[ab]{0,4}"),
++            generators::sampled_from(vec![
++                String::new(),
++                "\u{0}".to_string(),
++                "\u{0}\u{0}".to_string(),
++                "\u{10FFFF}".to_string(),
++            ]),
++        ))
++    }
++
++    fn encode_column(array: &dyn Array, opt: RowEncodingOptions) -> RowsEncoded {
++        convert_columns(array.len(), &[array.to_boxed()], &[opt], &[None])
++    }
++
++    /// Reference comparison of two optional values under the given sort
++    /// options: NULLS_LAST positions nulls independently of DESCENDING, and
++    /// DESCENDING reverses the order of the non-null values.
++    fn oracle_cmp<T>(
++        a: &Option<T>,
++        b: &Option<T>,
++        opt: RowEncodingOptions,
++        cmp: impl Fn(&T, &T) -> Ordering,
++    ) -> Ordering {
++        let nulls_last = opt.contains(RowEncodingOptions::NULLS_LAST);
++        let descending = opt.contains(RowEncodingOptions::DESCENDING);
++        match (a, b) {
++            (None, None) => Ordering::Equal,
++            (None, Some(_)) => {
++                if nulls_last {
++                    Ordering::Greater
++                } else {
++                    Ordering::Less
++                }
++            },
++            (Some(_), None) => {
++                if nulls_last {
++                    Ordering::Less
++                } else {
++                    Ordering::Greater
++                }
++            },
++            (Some(x), Some(y)) => {
++                let ord = cmp(x, y);
++                if descending { ord.reverse() } else { ord }
++            },
++        }
++    }
++
++    /// Assert that byte-lexicographic comparison of every pair of encoded
++    /// rows matches the oracle comparison of the corresponding values.
++    fn assert_rows_match_oracle<T: std::fmt::Debug>(
++        values: &[Option<T>],
++        rows_encoded: &RowsEncoded,
++        opt: RowEncodingOptions,
++        cmp: impl Fn(&T, &T) -> Ordering,
++    ) {
++        let rows: Vec<&[u8]> = rows_encoded.iter().collect();
++        assert_eq!(rows.len(), values.len());
++        for i in 0..values.len() {
++            for j in 0..values.len() {
++                let expected = oracle_cmp(&values[i], &values[j], opt, &cmp);
++                let actual = rows[i].cmp(rows[j]);
++                assert_eq!(
++                    expected, actual,
++                    "row order mismatch under {opt:?}:\n values[{i}] = {:?}\n values[{j}] = {:?}\n rows[{i}] = {:?}\n rows[{j}] = {:?}",
++                    values[i], values[j], rows[i], rows[j],
++                );
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn row_encode_i64_is_order_preserving(tc: hegel::TestCase) {
++        let values: Vec<Option<i64>> = tc.draw(
++            generators::vecs(generators::optional(boundary_heavy_i64())).max_size(40),
++        );
++        let opt = tc.draw((sorted_opts()).print_as_debug());
++        let array: PrimitiveArray<i64> = values.iter().copied().collect();
++        let rows = encode_column(&array, opt);
++        assert_rows_match_oracle(&values, &rows, opt, |a, b| a.cmp(b));
++    }
++
++    #[hegel::test]
++    fn row_encode_f64_is_order_preserving(tc: hegel::TestCase) {
++        let values: Vec<Option<f64>> = tc.draw(
++            generators::vecs(generators::optional(boundary_heavy_f64())).max_size(40),
++        );
++        let opt = tc.draw((sorted_opts()).print_as_debug());
++        let array: PrimitiveArray<f64> = values.iter().copied().collect();
++        let rows = encode_column(&array, opt);
++        // Oracle for the total order documented in lib.rs:
++        // -inf < neg < -0.0 = 0.0 < pos < inf < nan, all nans equal.
++        assert_rows_match_oracle(&values, &rows, opt, |a, b| {
++            canonical_f64(*a).total_cmp(&canonical_f64(*b))
++        });
++    }
++
++    #[hegel::test]
++    fn row_encode_str_is_order_preserving(tc: hegel::TestCase) {
++        let values: Vec<Option<String>> = tc.draw(
++            generators::vecs(generators::optional(collision_prone_string())).max_size(30),
++        );
++        let opt = tc.draw((sorted_opts()).print_as_debug());
++        let array = Utf8ViewArray::from_slice(&values);
++        let rows = encode_column(&array, opt);
++        assert_rows_match_oracle(&values, &rows, opt, |a, b| a.as_bytes().cmp(b.as_bytes()));
++    }
++
++    /// Multi-column rows must sort like the tuple (col0, col1) where each
++    /// column uses its own sort options. The variable-length string column is
++    /// put first so that the property also checks that its encoding is
++    /// self-delimiting (no ordering leak across the column boundary).
++    #[hegel::test]
++    fn row_encode_multi_column_is_lexicographic(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(20));
++        let strs: Vec<Option<String>> = tc.draw(
++            generators::vecs(generators::optional(collision_prone_string()))
++                .min_size(n)
++                .max_size(n),
++        );
++        let ints: Vec<Option<i64>> = tc.draw(
++            generators::vecs(generators::optional(boundary_heavy_i64()))
++                .min_size(n)
++                .max_size(n),
++        );
++        let opt_str = tc.draw((sorted_opts()).print_as_debug());
++        let opt_int = tc.draw((sorted_opts()).print_as_debug());
++
++        let str_arr = Utf8ViewArray::from_slice(&strs);
++        let int_arr: PrimitiveArray<i64> = ints.iter().copied().collect();
++        let rows_encoded = convert_columns(
++            n,
++            &[str_arr.to_boxed(), int_arr.to_boxed()],
++            &[opt_str, opt_int],
++            &[None, None],
++        );
++        let rows: Vec<&[u8]> = rows_encoded.iter().collect();
++
++        for i in 0..n {
++            for j in 0..n {
++                let expected =
++                    oracle_cmp(&strs[i], &strs[j], opt_str, |a, b| a.as_bytes().cmp(b.as_bytes()))
++                        .then_with(|| oracle_cmp(&ints[i], &ints[j], opt_int, |a, b| a.cmp(b)));
++                let actual = rows[i].cmp(rows[j]);
++                assert_eq!(
++                    expected, actual,
++                    "multi-column row order mismatch under ({opt_str:?}, {opt_int:?}):\n \
++                     row {i} = ({:?}, {:?})\n row {j} = ({:?}, {:?})\n \
++                     rows[{i}] = {:?}\n rows[{j}] = {:?}",
++                    strs[i], ints[i], strs[j], ints[j], rows[i], rows[j],
++                );
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn row_encode_decode_roundtrip_i64(tc: hegel::TestCase) {
++        let values: Vec<Option<i64>> = tc.draw(
++            generators::vecs(generators::optional(boundary_heavy_i64())).max_size(40),
++        );
++        let opt = tc.draw((any_opts()).print_as_debug());
++        let array: PrimitiveArray<i64> = values.iter().copied().collect();
++        let rows_encoded = encode_column(&array, opt);
++        let mut rows: Vec<&[u8]> = rows_encoded.iter().collect();
++        let decoded =
++            unsafe { decode_rows(&mut rows, &[opt], &[None], &[ArrowDataType::Int64]) };
++        let decoded = decoded[0]
++            .as_any()
++            .downcast_ref::<PrimitiveArray<i64>>()
++            .unwrap();
++        assert_eq!(decoded, &array, "roundtrip mismatch under {opt:?}");
++    }
++
++    /// The float encoding canonicalizes -0.0 to 0.0 and all NaNs to the
++    /// canonical quiet NaN, so decode must return exactly the canonical form
++    /// of the input (compared bit-for-bit).
++    #[hegel::test]
++    fn row_encode_decode_roundtrip_f64_canonical(tc: hegel::TestCase) {
++        let values: Vec<Option<f64>> = tc.draw(
++            generators::vecs(generators::optional(boundary_heavy_f64())).max_size(40),
++        );
++        let opt = tc.draw((any_opts()).print_as_debug());
++        let array: PrimitiveArray<f64> = values.iter().copied().collect();
++        let rows_encoded = encode_column(&array, opt);
++        let mut rows: Vec<&[u8]> = rows_encoded.iter().collect();
++        let decoded =
++            unsafe { decode_rows(&mut rows, &[opt], &[None], &[ArrowDataType::Float64]) };
++        let decoded = decoded[0]
++            .as_any()
++            .downcast_ref::<PrimitiveArray<f64>>()
++            .unwrap();
++        assert_eq!(decoded.len(), values.len());
++        for (i, v) in values.iter().enumerate() {
++            let d = decoded.is_valid(i).then(|| decoded.value(i));
++            match (v, d) {
++                (None, None) => {},
++                (Some(v), Some(d)) => assert_eq!(
++                    canonical_f64(*v).to_bits(),
++                    d.to_bits(),
++                    "roundtrip of {v:?} gave {d:?} under {opt:?}",
++                ),
++                (v, d) => panic!("validity mismatch at {i}: {v:?} vs {d:?} under {opt:?}"),
++            }
++        }
++    }
++
++    #[hegel::test]
++    fn row_encode_decode_roundtrip_str(tc: hegel::TestCase) {
++        let values: Vec<Option<String>> = tc.draw(
++            generators::vecs(generators::optional(collision_prone_string())).max_size(30),
++        );
++        let opt = tc.draw((any_opts()).print_as_debug());
++        let array = Utf8ViewArray::from_slice(&values);
++        let rows_encoded = encode_column(&array, opt);
++        let mut rows: Vec<&[u8]> = rows_encoded.iter().collect();
++        let decoded =
++            unsafe { decode_rows(&mut rows, &[opt], &[None], &[ArrowDataType::Utf8View]) };
++        let decoded = decoded[0]
++            .as_any()
++            .downcast_ref::<Utf8ViewArray>()
++            .unwrap();
++        assert_eq!(decoded.len(), values.len());
++        for (i, v) in values.iter().enumerate() {
++            let d = decoded.is_valid(i).then(|| decoded.value(i));
++            assert_eq!(
++                v.as_deref(),
++                d,
++                "roundtrip mismatch at {i} under {opt:?}"
++            );
++        }
++    }
++
++    #[hegel::test]
++    fn row_encode_decode_roundtrip_list_i64(tc: hegel::TestCase) {
++        let lists: Vec<Option<Vec<Option<i64>>>> = tc.draw(
++            generators::vecs(generators::optional(
++                generators::vecs(generators::optional(boundary_heavy_i64())).max_size(6),
++            ))
++            .max_size(12),
++        );
++        let opt = tc.draw((any_opts()).print_as_debug());
++
++        // Build a LargeList<i64> array, distinguishing empty lists from null
++        // lists (null entries keep a zero-length slot in the offsets).
++        let mut flat: Vec<Option<i64>> = Vec::new();
++        let mut offsets: Vec<i64> = vec![0];
++        let mut validity: Vec<bool> = Vec::new();
++        for item in &lists {
++            if let Some(inner) = item {
++                flat.extend(inner.iter().copied());
++                validity.push(true);
++            } else {
++                validity.push(false);
++            }
++            offsets.push(flat.len() as i64);
++        }
++        let values: PrimitiveArray<i64> = flat.iter().copied().collect();
++        let dtype = ListArray::<i64>::default_datatype(ArrowDataType::Int64);
++        let validity = if validity.iter().all(|v| *v) {
++            None
++        } else {
++            Some(Bitmap::from_iter(validity))
++        };
++        let array = ListArray::<i64>::new(
++            dtype.clone(),
++            OffsetsBuffer::try_from(offsets).unwrap(),
++            values.to_boxed(),
++            validity,
++        );
++
++        let rows_encoded = encode_column(&array, opt);
++        let mut rows: Vec<&[u8]> = rows_encoded.iter().collect();
++        let decoded = unsafe { decode_rows(&mut rows, &[opt], &[None], &[dtype]) };
++        assert_eq!(
++            decoded[0].as_ref(),
++            &array as &dyn Array,
++            "list roundtrip mismatch under {opt:?} for {lists:?}",
++        );
++    }
++
++    /// NO_ORDER drops order preservation but is documented to keep
++    /// uniqueness: two rows encode to the same bytes iff the values are equal.
++    #[hegel::test]
++    fn row_encode_no_order_keeps_uniqueness_str(tc: hegel::TestCase) {
++        let values: Vec<Option<String>> = tc.draw(
++            generators::vecs(generators::optional(collision_prone_string())).max_size(30),
++        );
++        let nulls_last = tc.draw(generators::booleans());
++        let mut opt = RowEncodingOptions::new_unsorted();
++        opt.set(RowEncodingOptions::NULLS_LAST, nulls_last);
++        let array = Utf8ViewArray::from_slice(&values);
++        let rows_encoded = encode_column(&array, opt);
++        let rows: Vec<&[u8]> = rows_encoded.iter().collect();
++        for i in 0..values.len() {
++            for j in 0..values.len() {
++                assert_eq!(
++                    values[i] == values[j],
++                    rows[i] == rows[j],
++                    "uniqueness violation under {opt:?}:\n values[{i}] = {:?}\n values[{j}] = {:?}\n \
++                     rows[{i}] = {:?}\n rows[{j}] = {:?}",
++                    values[i], values[j], rows[i], rows[j],
++                );
++            }
++        }
++    }
+ }
