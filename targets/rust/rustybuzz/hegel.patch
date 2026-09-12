@@ -1,0 +1,670 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 0bb6c62..3aceb01 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -49,3 +49,4 @@ wasm-shaper = ["std", "dep:wasmi"]
+ [dev-dependencies]
+ pico-args = { version = "0.5", features = ["eq-separator"] }
+ libc = "0.2"
++hegeltest = "0.44.1"
+diff --git a/tests/shaping/main.rs b/tests/shaping/main.rs
+index 2ec8478..3e9f43b 100644
+--- a/tests/shaping/main.rs
++++ b/tests/shaping/main.rs
+@@ -196,3 +196,656 @@ pub fn shape(font_path: &str, text: &str, options: &str) -> String {
+ 
+     glyph_buffer.serialize(&face, format_flags)
+ }
++
++/// Property-based tests (hegel) for the public shaping API.
++///
++/// The C harfbuzz library is not available in this environment, so these are
++/// standalone properties (no differential testing): no-panic robustness,
++/// determinism, documented cluster invariants, buffer-reuse equivalence and
++/// spec-string parsing.
++mod properties {
++    use std::collections::HashSet;
++    use std::str::FromStr;
++    use std::sync::OnceLock;
++
++    use hegel::generators::{self, Generator};
++    use rustybuzz::ttf_parser::Tag;
++    use rustybuzz::{
++        script, BufferClusterLevel, BufferFlags, Direction, Face, Feature, Language,
++        SerializeFlags, UnicodeBuffer, Variation,
++    };
++
++    /// A spread of the repo's test fonts covering the different shapers:
++    /// OpenType (GSUB/GPOS-heavy AOTS fonts), complex scripts (Arabic, Indic,
++    /// USE, Myanmar), AAT (morx/kerx/trak) and variable fonts.
++    const PROPERTY_FONTS: &[&str] = &[
++        "tests/fonts/rb_custom/NotoSansCJK.subset1.otf",
++        "tests/fonts/rb_custom/NotoSansMalayalam.subset1.ttf",
++        "tests/fonts/rb_custom/NotoSansMyanmarUI-Regular.subset1.otf",
++        "tests/fonts/rb_custom/NotoSansSinhala.subset1.otf",
++        "tests/fonts/rb_custom/OpenSans.subset1.ttf",
++        "tests/fonts/rb_custom/Rasa.subset1.otf",
++        "tests/fonts/in-house/NotoNastaliqUrdu-Regular.ttf",
++        "tests/fonts/in-house/HBTest-VF.ttf",
++        "tests/fonts/in-house/TRAK.ttf",
++        "tests/fonts/in-house/MORXTwentyeight.ttf",
++        "tests/fonts/text-rendering-tests/NotoSansBalinese-Regular.ttf",
++        "tests/fonts/text-rendering-tests/NotoSansKannada-Regular.ttf",
++        "tests/fonts/text-rendering-tests/AdobeVFPrototype-Subset.otf",
++        "tests/fonts/text-rendering-tests/Zycon.ttf",
++        "tests/fonts/text-rendering-tests/TestShapeEthi.ttf",
++        "tests/fonts/text-rendering-tests/TestShapeLana.ttf",
++        "tests/fonts/text-rendering-tests/TestCMAP14.otf",
++        "tests/fonts/aots/gsub4_1_multiple_ligatures_f1.otf",
++        "tests/fonts/aots/gpos2_1_lookupflag_f1.otf",
++    ];
++
++    fn font_data() -> &'static Vec<Vec<u8>> {
++        static DATA: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
++        DATA.get_or_init(|| {
++            PROPERTY_FONTS
++                .iter()
++                .map(|p| std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {}", p, e)))
++                .collect()
++        })
++    }
++
++    /// Unicode blocks matching the scripts of `PROPERTY_FONTS`, plus a few
++    /// generic ones. Complex shapers only kick in when several characters of
++    /// the same script appear in a run, so most characters of a generated
++    /// string come from one block.
++    const SCRIPT_BLOCKS: &[(u32, u32)] = &[
++        (0x0020, 0x007E),   // ASCII
++        (0x00A0, 0x00FF),   // Latin-1
++        (0x0300, 0x036F),   // combining marks
++        (0x0590, 0x05FF),   // Hebrew
++        (0x0600, 0x06FF),   // Arabic
++        (0x0900, 0x097F),   // Devanagari
++        (0x0C80, 0x0CFF),   // Kannada
++        (0x0D00, 0x0D7F),   // Malayalam
++        (0x0D80, 0x0DFF),   // Sinhala
++        (0x0E00, 0x0E7F),   // Thai
++        (0x1000, 0x109F),   // Myanmar
++        (0x1100, 0x11FF),   // Hangul Jamo
++        (0x1200, 0x137F),   // Ethiopic
++        (0x1A20, 0x1AAF),   // Tai Tham
++        (0x1B00, 0x1B7F),   // Balinese
++        (0x4E00, 0x4E7F),   // CJK
++        (0xAC00, 0xAC7F),   // Hangul syllables
++        (0x1F300, 0x1F6FF), // emoji
++    ];
++
++    /// Characters with special meaning to the shapers: joiners, default
++    /// ignorables, variation selectors, dotted circle, tatweel, matras,
++    /// newlines and NUL.
++    const SPECIAL_CHARS: &[char] = &[
++        '\u{200C}', '\u{200D}', '\u{00AD}', '\u{25CC}', '\u{FE00}', '\u{FE0F}', '\u{FFFD}', '\n',
++        '\r', '\t', '\u{0640}', '\u{093F}', '\u{0E33}', '\u{1B35}', '\u{0}', ' ',
++    ];
++
++    fn draw_codepoint_in(tc: &hegel::TestCase, lo: u32, hi: u32) -> char {
++        let n = tc.draw(generators::integers::<u32>().min_value(lo).max_value(hi));
++        char::from_u32(n).unwrap_or('\u{FFFD}')
++    }
++
++    /// Draws text biased towards a single script run with occasional special
++    /// characters and fully arbitrary codepoints mixed in.
++    fn draw_text(tc: &hegel::TestCase, max_len: usize) -> String {
++        if tc.draw(generators::integers::<u8>().max_value(4)) == 0 {
++            return tc.draw(generators::text().max_size(max_len));
++        }
++        let block = tc.draw(generators::sampled_from(SCRIPT_BLOCKS.to_vec()));
++        let len = tc.draw(generators::integers::<usize>().max_value(max_len));
++        let mut text = String::new();
++        for _ in 0..len {
++            let c = match tc.draw(generators::integers::<u8>().max_value(9)) {
++                0 => tc.draw(generators::sampled_from(SPECIAL_CHARS.to_vec())),
++                1 => draw_codepoint_in(tc, 0, 0x10FFFF),
++                _ => draw_codepoint_in(tc, block.0, block.1),
++            };
++            text.push(c);
++        }
++        text
++    }
++
++    const COMMON_FEATURE_TAGS: &[&[u8; 4]] = &[
++        b"kern", b"liga", b"dlig", b"smcp", b"calt", b"ccmp", b"mark", b"mkmk", b"rlig", b"init",
++        b"medi", b"fina", b"isol", b"ss01", b"aalt", b"vert", b"frac", b"locl",
++    ];
++
++    const VARIATION_TAGS: &[&[u8; 4]] = &[b"wght", b"wdth", b"slnt", b"ital", b"opsz", b"CNTR"];
++
++    fn draw_tag(tc: &hegel::TestCase, common: &[&'static [u8; 4]]) -> Tag {
++        if tc.draw(generators::booleans()) {
++            Tag::from_bytes(tc.draw(generators::sampled_from(common.to_vec())))
++        } else {
++            let bytes: [u8; 4] = tc.draw(generators::arrays(generators::integers::<u8>()));
++            Tag::from_bytes(&bytes)
++        }
++    }
++
++    fn draw_features(tc: &hegel::TestCase) -> Vec<Feature> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3));
++        (0..n)
++            .map(|_| {
++                let tag = draw_tag(tc, COMMON_FEATURE_TAGS);
++                let value = tc.draw(hegel::one_of!(
++                    generators::integers::<u32>().max_value(1),
++                    generators::integers::<u32>(),
++                ));
++                let (start, end) = if tc.draw(generators::booleans()) {
++                    (0, u32::MAX)
++                } else {
++                    (
++                        tc.draw(generators::integers::<u32>()),
++                        tc.draw(generators::integers::<u32>()),
++                    )
++                };
++                Feature {
++                    tag,
++                    value,
++                    start,
++                    end,
++                }
++            })
++            .collect()
++    }
++
++    fn draw_variations(tc: &hegel::TestCase) -> Vec<Variation> {
++        let n = tc.draw(generators::integers::<usize>().max_value(3));
++        (0..n)
++            .map(|_| Variation {
++                tag: draw_tag(tc, VARIATION_TAGS),
++                // Non-finite values are excluded because they panic in debug
++                // builds — see the canonical pinned failing test
++                // `known_failure_set_variations_non_finite_value_panics`.
++                value: tc.draw(
++                    generators::floats::<f32>()
++                        .allow_nan(false)
++                        .allow_infinity(false),
++                ),
++            })
++            .collect()
++    }
++
++    /// KNOWN FAILURE: `Face::set_variations` panics (in debug builds) when a
++    /// variation value is non-finite and the font actually has that axis.
++    ///
++    /// Found by hegel via `shape_never_panics_on_arbitrary_input`; minimal
++    /// counterexample pinned here deterministically. `Variation::value` has no
++    /// documented finiteness requirement, and HarfBuzz clamps out-of-range
++    /// values instead of crashing. The panic is ttf-parser's
++    /// `debug_assert!(val.is_finite())` in `f32_bound` (parser.rs:916),
++    /// reached through `ttf_parser::Face::set_variation` ->
++    /// `VariationAxis::normalized_value`. NaN behaves the same as infinity.
++    /// Sibling property tests exclude non-finite variation values so they can
++    /// keep testing everything else.
++    #[test]
++    fn known_failure_set_variations_non_finite_value_panics() {
++        let data = std::fs::read("tests/fonts/rb_custom/NotoSansMalayalam.subset1.ttf").unwrap();
++        let mut face = Face::from_slice(&data, 0).unwrap();
++        face.set_variations(&[Variation {
++            tag: Tag::from_bytes(b"wght"),
++            value: f32::INFINITY,
++        }]);
++        // If set_variations survived, shaping should too.
++        let mut buffer = UnicodeBuffer::new();
++        buffer.push_str("\u{0D15}");
++        let _ = rustybuzz::shape(&face, &[], buffer);
++    }
++
++    const DIRECTIONS: &[Direction] = &[
++        Direction::LeftToRight,
++        Direction::RightToLeft,
++        Direction::TopToBottom,
++        Direction::BottomToTop,
++    ];
++
++    const SCRIPTS: &[rustybuzz::Script] = &[
++        script::LATIN,
++        script::ARABIC,
++        script::HEBREW,
++        script::DEVANAGARI,
++        script::KANNADA,
++        script::MALAYALAM,
++        script::SINHALA,
++        script::MYANMAR,
++        script::BALINESE,
++        script::TAI_THAM,
++        script::ETHIOPIC,
++        script::HAN,
++        script::HANGUL,
++        script::THAI,
++        script::COMMON,
++        script::UNKNOWN,
++    ];
++
++    #[derive(Debug, Clone)]
++    struct BufferSettings {
++        direction: Option<Direction>,
++        script: Option<rustybuzz::Script>,
++        language: Option<Language>,
++        cluster_level: BufferClusterLevel,
++        flags: BufferFlags,
++    }
++
++    const CLUSTER_LEVELS: &[BufferClusterLevel] = &[
++        BufferClusterLevel::MonotoneGraphemes,
++        BufferClusterLevel::MonotoneCharacters,
++        BufferClusterLevel::Characters,
++    ];
++
++    fn draw_settings(tc: &hegel::TestCase) -> BufferSettings {
++        let direction = tc.draw((generators::optional(generators::sampled_from(
++            DIRECTIONS.to_vec(),
++        ))).print_as_debug());
++        let script = tc.draw((generators::optional(generators::sampled_from(
++            SCRIPTS.to_vec(),
++        ))).print_as_debug());
++        let language = if tc.draw(generators::booleans()) {
++            let lang = tc.draw(generators::sampled_from(vec![
++                "en", "ar", "hi", "tr", "ja", "URD", "zh-cn", "az-ir",
++            ]));
++            Some(Language::from_str(lang).unwrap())
++        } else {
++            None
++        };
++        let cluster_level = tc.draw((generators::sampled_from(CLUSTER_LEVELS.to_vec())).print_as_debug());
++        let flags = BufferFlags::from_bits_truncate(tc.draw(generators::integers::<u32>()));
++        BufferSettings {
++            direction,
++            script,
++            language,
++            cluster_level,
++            flags,
++        }
++    }
++
++    fn fill_buffer(mut buffer: UnicodeBuffer, text: &str, s: &BufferSettings) -> UnicodeBuffer {
++        buffer.push_str(text);
++        if let Some(d) = s.direction {
++            buffer.set_direction(d);
++        }
++        if let Some(sc) = s.script {
++            buffer.set_script(sc);
++        }
++        if let Some(l) = &s.language {
++            buffer.set_language(l.clone());
++        }
++        buffer.set_cluster_level(s.cluster_level);
++        buffer.set_flags(s.flags);
++        buffer
++    }
++
++    fn draw_font_index(tc: &hegel::TestCase) -> usize {
++        tc.draw(generators::integers::<usize>().max_value(PROPERTY_FONTS.len() - 1))
++    }
++
++    /// KNOWN FAILURE: shaping panics (in debug builds) when
++    /// `set_not_found_variation_selector_glyph` is given a value above
++    /// `u16::MAX` and the text contains a variation selector missing from the
++    /// font's cmap.
++    ///
++    /// Found by hegel via `shape_never_panics_on_arbitrary_input`; minimal
++    /// counterexample pinned here deterministically. The API takes `u32`
++    /// (matching HarfBuzz, where glyph ids are 32-bit), but
++    /// `deal_with_variation_selectors` (src/hb/ot_shape.rs) writes the value
++    /// straight into `hb_glyph_info_t::glyph_id`, whose documentation
++    /// guarantees `<= u16::MAX`, and `as_glyph()` (src/hb/buffer.rs:246)
++    /// debug-asserts that. In release builds the documented guarantee is
++    /// silently broken instead. Sibling property tests bound the value to
++    /// `u16::MAX` so they can keep testing everything else.
++    #[test]
++    fn known_failure_not_found_variation_selector_glyph_above_u16_max() {
++        let data = std::fs::read("tests/fonts/rb_custom/NotoSansCJK.subset1.otf").unwrap();
++        let face = Face::from_slice(&data, 0).unwrap();
++        let mut buffer = UnicodeBuffer::new();
++        buffer.push_str("\u{200C}\u{FE00}");
++        buffer.set_not_found_variation_selector_glyph(0x10000);
++        let glyphs = rustybuzz::shape(&face, &[], buffer);
++        // The glyph_id doc guarantees `<= u16::MAX`; `as_glyph` debug-asserts
++        // it, e.g. via `serialize`.
++        assert!(glyphs.glyph_infos().iter().all(|i| i.glyph_id <= 0xFFFF));
++        let _ = glyphs.serialize(&face, SerializeFlags::default());
++    }
++
++    /// Property: `shape()` (and `GlyphBuffer::serialize`) never panics, for
++    /// any Unicode text, any of the repo's test fonts, and any combination of
++    /// features, variations, ptem/ppem, buffer settings and pre/post context.
++    #[test]
++    fn shape_never_panics_on_arbitrary_input() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let mut face = Face::from_slice(&fonts[idx], 0).unwrap();
++            face.set_points_per_em(tc.draw(generators::optional(generators::floats::<f32>())));
++            if tc.draw(generators::booleans()) {
++                let x = tc.draw(generators::integers::<u16>());
++                let y = tc.draw(generators::integers::<u16>());
++                face.set_pixels_per_em(Some((x, y)));
++            }
++            let variations = draw_variations(&tc);
++            face.set_variations(&variations);
++
++            let text = draw_text(&tc, 24);
++            let settings = draw_settings(&tc);
++            let mut buffer = fill_buffer(UnicodeBuffer::new(), &text, &settings);
++            if tc.draw(generators::booleans()) {
++                buffer.set_pre_context(&draw_text(&tc, 8));
++            }
++            if tc.draw(generators::booleans()) {
++                buffer.set_post_context(&draw_text(&tc, 8));
++            }
++            if tc.draw(generators::booleans()) {
++                // Values above u16::MAX are excluded because they panic in
++                // debug builds — see the canonical pinned failing test
++                // `known_failure_not_found_variation_selector_glyph_above_u16_max`.
++                buffer.set_not_found_variation_selector_glyph(
++                    tc.draw(generators::integers::<u32>().max_value(u32::from(u16::MAX))),
++                );
++            }
++
++            let features = draw_features(&tc);
++            let glyphs = rustybuzz::shape(&face, &features, buffer);
++            drop(glyphs.serialize(
++                &face,
++                SerializeFlags::GLYPH_EXTENTS | SerializeFlags::GLYPH_FLAGS,
++            ));
++        })
++        .run();
++    }
++
++    /// Property: shaping is deterministic — the same face, text, features and
++    /// buffer settings always produce identical glyph infos and positions.
++    #[test]
++    fn shape_is_deterministic() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let variations = draw_variations(&tc);
++            let text = draw_text(&tc, 24);
++            let settings = draw_settings(&tc);
++            let features = draw_features(&tc);
++
++            let run = || {
++                let mut face = Face::from_slice(&fonts[idx], 0).unwrap();
++                face.set_variations(&variations);
++                let buffer = fill_buffer(UnicodeBuffer::new(), &text, &settings);
++                let glyphs = rustybuzz::shape(&face, &features, buffer);
++                format!("{:?}", glyphs)
++            };
++            assert_eq!(run(), run());
++        })
++        .run();
++    }
++
++    /// Property: with the monotone cluster levels, output cluster values are
++    /// monotone: non-decreasing for forward directions (LTR/TTB) and
++    /// non-increasing for backward ones (RTL/BTT).
++    /// See https://harfbuzz.github.io/clusters.html.
++    #[test]
++    fn clusters_are_monotone_for_monotone_cluster_levels() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let mut face = Face::from_slice(&fonts[idx], 0).unwrap();
++            face.set_variations(&draw_variations(&tc));
++
++            let text = draw_text(&tc, 24);
++            let direction = tc.draw((generators::sampled_from(DIRECTIONS.to_vec())).print_as_debug());
++            let level = tc.draw((generators::sampled_from(vec![
++                BufferClusterLevel::MonotoneGraphemes,
++                BufferClusterLevel::MonotoneCharacters,
++            ])).print_as_debug());
++            let mut buffer = UnicodeBuffer::new();
++            buffer.push_str(&text);
++            buffer.set_direction(direction);
++            buffer.set_cluster_level(level);
++
++            let features = draw_features(&tc);
++            let glyphs = rustybuzz::shape(&face, &features, buffer);
++            let clusters: Vec<u32> = glyphs.glyph_infos().iter().map(|i| i.cluster).collect();
++            let forward = matches!(direction, Direction::LeftToRight | Direction::TopToBottom);
++            for w in clusters.windows(2) {
++                if forward {
++                    assert!(w[0] <= w[1], "non-monotone clusters: {:?}", clusters);
++                } else {
++                    assert!(w[0] >= w[1], "non-monotone clusters: {:?}", clusters);
++                }
++            }
++        })
++        .run();
++    }
++
++    /// Property: `UnicodeBuffer::push_str` assigns each character's byte
++    /// offset as its cluster value, and shaping only merges or copies
++    /// clusters, so every output cluster must be one of those byte offsets.
++    #[test]
++    fn cluster_values_map_to_input_char_offsets() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let mut face = Face::from_slice(&fonts[idx], 0).unwrap();
++            face.set_variations(&draw_variations(&tc));
++
++            let text = draw_text(&tc, 24);
++            let settings = draw_settings(&tc);
++            let buffer = fill_buffer(UnicodeBuffer::new(), &text, &settings);
++            let features = draw_features(&tc);
++            let glyphs = rustybuzz::shape(&face, &features, buffer);
++
++            let offsets: HashSet<u32> = text.char_indices().map(|(i, _)| i as u32).collect();
++            for info in glyphs.glyph_infos() {
++                assert!(
++                    offsets.contains(&info.cluster),
++                    "cluster {} is not a char byte offset of {:?}",
++                    info.cluster,
++                    text
++                );
++            }
++        })
++        .run();
++    }
++
++    /// Property: non-empty text produces at least one glyph — codepoints
++    /// missing from the font map to .notdef (glyph 0) rather than vanishing.
++    /// REMOVE_DEFAULT_IGNORABLES is excluded: it legitimately deletes glyphs
++    /// (an all-ZWJ string can shape to nothing under that flag).
++    #[test]
++    fn nonempty_text_shapes_to_at_least_one_glyph() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let mut face = Face::from_slice(&fonts[idx], 0).unwrap();
++            face.set_variations(&draw_variations(&tc));
++
++            let text = draw_text(&tc, 24);
++            tc.assume(!text.is_empty());
++            let mut settings = draw_settings(&tc);
++            settings.flags &= !BufferFlags::REMOVE_DEFAULT_IGNORABLES;
++            let buffer = fill_buffer(UnicodeBuffer::new(), &text, &settings);
++            let features = draw_features(&tc);
++            let glyphs = rustybuzz::shape(&face, &features, buffer);
++            assert!(
++                !glyphs.is_empty(),
++                "shaping non-empty text {:?} produced no glyphs",
++                text
++            );
++        })
++        .run();
++    }
++
++    /// Property: shaping with a mutated (byte-flipped and/or truncated) font
++    /// never panics: `Face::from_slice` either rejects the data or shaping
++    /// handles the broken tables gracefully.
++    #[test]
++    fn shaping_with_mutated_fonts_never_panics() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let mut data = fonts[idx].clone();
++            if tc.draw(generators::booleans()) {
++                let new_len = tc.draw(generators::integers::<usize>().max_value(data.len()));
++                data.truncate(new_len);
++            }
++            let n_mutations = tc.draw(generators::integers::<usize>().max_value(16));
++            for _ in 0..n_mutations {
++                if data.is_empty() {
++                    break;
++                }
++                let offset = tc.draw(generators::integers::<usize>().max_value(data.len() - 1));
++                data[offset] = tc.draw(generators::integers::<u8>());
++            }
++
++            let face = match Face::from_slice(&data, 0) {
++                Some(face) => face,
++                None => return,
++            };
++            let text = draw_text(&tc, 12);
++            let settings = draw_settings(&tc);
++            let buffer = fill_buffer(UnicodeBuffer::new(), &text, &settings);
++            let features = draw_features(&tc);
++            let glyphs = rustybuzz::shape(&face, &features, buffer);
++            drop(glyphs.serialize(&face, SerializeFlags::default()));
++        })
++        .run();
++    }
++
++    /// Property: `GlyphBuffer::clear` is documented to return an empty
++    /// `UnicodeBuffer` reusing the allocation — shaping a second text in the
++    /// reused buffer gives exactly the same result as in a fresh buffer.
++    #[test]
++    fn reusing_buffer_after_clear_matches_fresh_buffer() {
++        let fonts = font_data();
++        hegel::Hegel::new(|tc| {
++            let idx = draw_font_index(&tc);
++            let face = Face::from_slice(&fonts[idx], 0).unwrap();
++            let text_a = draw_text(&tc, 24);
++            let text_b = draw_text(&tc, 24);
++            let settings = draw_settings(&tc);
++            let features = draw_features(&tc);
++
++            let first = rustybuzz::shape(
++                &face,
++                &features,
++                fill_buffer(UnicodeBuffer::new(), &text_a, &settings),
++            );
++            // `clear` resets direction/script/language/cluster level, so the
++            // settings are re-applied by fill_buffer in both branches.
++            let reused = fill_buffer(first.clear(), &text_b, &settings);
++            let reused_result = format!("{:?}", rustybuzz::shape(&face, &features, reused));
++
++            let fresh = fill_buffer(UnicodeBuffer::new(), &text_b, &settings);
++            let fresh_result = format!("{:?}", rustybuzz::shape(&face, &features, fresh));
++
++            assert_eq!(reused_result, fresh_result);
++        })
++        .run();
++    }
++
++    /// Property: the `FromStr` spec-string parsers (`Feature`, `Variation`,
++    /// `Language`, `Direction`) return an error rather than panicking, for
++    /// both arbitrary strings and strings shaped like feature/variation specs.
++    #[hegel::test]
++    fn spec_string_parsers_never_panic(tc: hegel::TestCase) {
++        let s: String = tc.draw(hegel::one_of!(
++            generators::text().max_size(32).boxed(),
++            generators::from_regex(
++                r#"[+-]?['\x22]?[A-Za-z0-9_]{0,6}['\x22]?(\[[0-9:;-]{0,8}\])?(=(-?[0-9]{0,12}|on|off|[0-9]*\.[0-9]*))?"#
++            )
++            .fullmatch(true)
++            .boxed(),
++        ));
++        let _ = Feature::from_str(&s);
++        let _ = Variation::from_str(&s);
++        drop(Language::from_str(&s));
++        let _ = Direction::from_str(&s);
++    }
++
++    /// Property: `Feature::from_str` parses the documented spec forms
++    /// (`kern`, `+kern`, `-kern`, `kern=2`, `kern[3:5]`, `kern[3:5]=2`,
++    /// `kern=on/off`) into the documented tag/value/range.
++    #[hegel::test]
++    fn feature_from_str_parses_constructed_feature_strings(tc: hegel::TestCase) {
++        let tag: String = tc.draw(
++            generators::from_regex(r"[A-Za-z0-9_]{4}")
++                .fullmatch(true),
++        );
++        let prefix = tc.draw(generators::sampled_from(vec!["", "+", "-"]));
++
++        let range = if tc.draw(generators::booleans()) {
++            let start = tc.draw(generators::integers::<i32>());
++            let end = tc.draw(generators::integers::<i32>());
++            Some((start, end))
++        } else {
++            None
++        };
++
++        // None = no `=` suffix; Some(Ok(v)) = `=v`; Some(Err(b)) = `=on`/`=off`.
++        let value: Option<Result<i32, bool>> = if tc.draw(generators::booleans()) {
++            if tc.draw(generators::booleans()) {
++                Some(Ok(tc.draw(generators::integers::<i32>())))
++            } else {
++                Some(Err(tc.draw(generators::booleans())))
++            }
++        } else {
++            None
++        };
++
++        let mut s = format!("{prefix}{tag}");
++        if let Some((start, end)) = range {
++            s.push_str(&format!("[{start}:{end}]"));
++        }
++        if let Some(v) = value {
++            match v {
++                Ok(v) => s.push_str(&format!("={v}")),
++                Err(true) => s.push_str("=on"),
++                Err(false) => s.push_str("=off"),
++            }
++        }
++
++        let f = Feature::from_str(&s).unwrap_or_else(|e| panic!("parsing {:?} failed: {}", s, e));
++        let expected_tag = Tag::from_bytes(tag.as_bytes().try_into().unwrap());
++        assert_eq!(f.tag, expected_tag, "tag of {:?}", s);
++
++        let expected_value = match value {
++            Some(Ok(v)) => v as u32,
++            Some(Err(b)) => b as u32,
++            None => (prefix != "-") as u32,
++        };
++        assert_eq!(f.value, expected_value, "value of {:?}", s);
++
++        let (expected_start, expected_end) = match range {
++            Some((start, end)) => (start as u32, end as u32),
++            None => (0, u32::MAX),
++        };
++        assert_eq!(f.start, expected_start, "start of {:?}", s);
++        assert_eq!(f.end, expected_end, "end of {:?}", s);
++    }
++
++    /// Property: `guess_segment_properties` always resolves a direction and is
++    /// idempotent — a second call never changes direction, script or language.
++    #[hegel::test]
++    fn guess_segment_properties_is_idempotent(tc: hegel::TestCase) {
++        let text = draw_text(&tc, 24);
++        let mut buffer = UnicodeBuffer::new();
++        buffer.push_str(&text);
++        if tc.draw(generators::booleans()) {
++            buffer.set_direction(tc.draw((generators::sampled_from(DIRECTIONS.to_vec())).print_as_debug()));
++        }
++        if tc.draw(generators::booleans()) {
++            buffer.set_script(tc.draw((generators::sampled_from(SCRIPTS.to_vec())).print_as_debug()));
++        }
++
++        buffer.guess_segment_properties();
++        let direction = buffer.direction();
++        let script = buffer.script();
++        let language = buffer.language();
++        assert_ne!(direction, Direction::Invalid);
++
++        buffer.guess_segment_properties();
++        assert_eq!(buffer.direction(), direction);
++        assert_eq!(buffer.script(), script);
++        assert_eq!(buffer.language(), language);
++    }
++}
