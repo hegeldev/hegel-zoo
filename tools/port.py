@@ -163,7 +163,8 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
         need_import = False
         for line, col, tyname in sorted(set(locs), reverse=True):
             # local type with a derive: add PrettyPrintable to it
-            m = re.search(rf"^(\s*)#\[derive\(([^)]*)\)\]\n(\s*(?:pub(?:\([^)]*\))? )?(?:enum|struct) {re.escape(tyname)}\b)",
+            # other attributes may sit between the derive and the item (`#[borsh(...)]`, `#[repr(u8)]`)
+            m = re.search(rf"^(\s*)#\[derive\(([^)]*)\)\]\n((?:\s*#\[[^\n]*\]\n)*\s*(?:pub(?:\([^)]*\))? )?(?:enum|struct) {re.escape(tyname)}\b)",
                           "\n".join(lines), re.M)
             # only derive on test-only types: hegel is a dev-dependency, so a derive on a library
             # type breaks the non-test build. Test-only = a file under tests/ or a tests.rs; a
@@ -181,6 +182,10 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             # otherwise wrap the generator expression that starts at (line, col)
             i, j = line - 1, col - 1
             if i >= len(lines) or j > len(lines[i]):
+                continue
+            # a site on a field declaration is a derive that failed for a type this pass could
+            # not find (an item shape the regex misses): leave it for a human, do not wrap a field
+            if re.match(r"^\s*(?:pub(?:\([^)]*\))? )?\w+\s*:\s*[\w:<>\[\]&' ,()]+,?\s*$", lines[i]):
                 continue
             # find the end of the expression: first ')' or ',' at depth 0 from (i, j), across lines
             depth, k, row = 0, j, i
