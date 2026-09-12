@@ -1,0 +1,435 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 1ede2d3..d7f6cad 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -34,6 +34,7 @@ env_logger = "0.11"
+ serde_derive = "1.0"
+ rstest = { version = "0.26", default-features = false }
+ criterion = { version = "0.7", features = ["html_reports"] }
++hegeltest = "0.44.1"
+ 
+ [[bench]]
+ name = "basic"
+diff --git a/src/xlsx/mod.rs b/src/xlsx/mod.rs
+index bd3854e..b6dea33 100644
+--- a/src/xlsx/mod.rs
++++ b/src/xlsx/mod.rs
+@@ -3974,6 +3974,201 @@ impl<'a, RS: Read + Seek + 'a> Iterator for PivotCacheIter<'a, RS> {
+ // -----------------------------------------------------------------------
+ // Unit tests for Xlsx.
+ // -----------------------------------------------------------------------
++#[cfg(test)]
++mod hegel_tests {
++    //! Property-based tests (hegel) for the internal XLSX cell-reference and
++    //! dimension parsing helpers. These parse untrusted worksheet XML, so the
++    //! key properties are: never panic on arbitrary bytes, and round-trip
++    //! consistency between the index->name and name->index directions.
++    use super::{
++        column_number_to_name, get_dimension, get_row, get_row_column, Reference, MAX_COLUMNS,
++        MAX_ROWS,
++    };
++    use crate::utils::push_column;
++    use hegel::generators;
++
++    // A generator for byte strings biased toward the alphabet the cell-reference
++    // grammar actually uses (letters, digits, `$`, `:`) plus arbitrary bytes.
++    // Building from these characters reaches the interesting parser states far
++    // more often than uniform bytes, while still allowing garbage through.
++    fn ref_like_bytes(tc: &hegel::TestCase) -> Vec<u8> {
++        let n = tc.draw(generators::integers::<usize>().max_value(24));
++        let mut out = Vec::with_capacity(n);
++        for _ in 0..n {
++            let b = tc.draw(hegel::one_of!(
++                generators::sampled_from(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec()),
++                generators::sampled_from(b"abcdefghijklmnopqrstuvwxyz".to_vec()),
++                generators::sampled_from(b"0123456789".to_vec()),
++                generators::sampled_from(b"$:".to_vec()),
++                generators::integers::<u8>(),
++            ));
++            out.push(b);
++        }
++        out
++    }
++
++    // PROPERTY: `column_number_to_name` produces a name that parses back to the
++    // same column index, for every valid column (0..MAX_COLUMNS). This is the
++    // cell-reference index<->name round-trip; it should hold for the entire
++    // valid column range including the XFD (MAX_COLUMNS-1) boundary.
++    #[hegel::test]
++    fn column_name_roundtrips(tc: hegel::TestCase) {
++        let col = tc.draw(generators::integers::<u32>().max_value(MAX_COLUMNS - 1));
++        let mut buf = Vec::new();
++        column_number_to_name(col, &mut buf).expect("valid column must encode");
++        match Reference::parse(&buf) {
++            Ok(Reference::Column { col: c, absolute }) => {
++                assert_eq!(c, col, "column name {buf:?} parsed to wrong index");
++                assert!(!absolute);
++            }
++            other => panic!("column name {buf:?} did not parse as a column: {other:?}"),
++        }
++    }
++
++    // PROPERTY: a Reference (cell / column / row) formatted to text parses back
++    // to an equal Reference. Round-trip over the whole valid coordinate space,
++    // including absolute (`$`) markers and the MAX_ROWS / MAX_COLUMNS boundaries.
++    #[hegel::test]
++    fn reference_format_parse_roundtrip(tc: hegel::TestCase) {
++        let col = tc.draw(generators::integers::<u32>().max_value(MAX_COLUMNS - 1));
++        let row = tc.draw(generators::integers::<u32>().max_value(MAX_ROWS - 1));
++        let abs_col = tc.draw(generators::booleans());
++        let abs_row = tc.draw(generators::booleans());
++        let kind = tc.draw(generators::integers::<u8>().max_value(2));
++        let reference = match kind {
++            0 => Reference::Cell {
++                row,
++                col,
++                absolute_row: abs_row,
++                absolute_col: abs_col,
++            },
++            1 => Reference::Column {
++                col,
++                absolute: abs_col,
++            },
++            _ => Reference::Row {
++                row,
++                absolute: abs_row,
++            },
++        };
++        let mut buf = Vec::new();
++        reference.format(&mut buf).expect("valid reference formats");
++        let parsed = Reference::parse(&buf).expect("formatted reference re-parses");
++        // Reference doesn't derive PartialEq, so check the round-trip via a
++        // format fixpoint: re-formatting the parsed reference must reproduce the
++        // exact same text.
++        let mut buf2 = Vec::new();
++        parsed.format(&mut buf2).expect("parsed reference formats");
++        assert_eq!(buf, buf2, "roundtrip changed reference text");
++    }
++
++    // PROPERTY (parse robustness): `Reference::parse` must return Ok or Err on
++    // ANY byte string, never panic.
++    #[hegel::test]
++    fn reference_parse_never_panics(tc: hegel::TestCase) {
++        let bytes = ref_like_bytes(&tc);
++        let _ = Reference::parse(&bytes);
++    }
++
++    // PROPERTY (parse robustness): `get_row` / `get_row_column` (used on the
++    // untrusted worksheet cell `r="A1"` attribute and on dimension strings) must
++    // never panic on arbitrary bytes.
++    //
++    // KNOWN FAILURE — real bug. `get_row_and_optional_column` accumulates the
++    // column with unchecked `col = col * 26 + ...` and the row with unchecked
++    // `row = row * 10 + ...`, so an over-long reference such as the 7-letter
++    // column "MWLQKWV" (or a long digit run) overflows u32 and panics in a
++    // debug/overflow-checked build instead of returning an Err. The sibling
++    // parser `Reference::parse` deliberately uses `wrapping_mul`/`wrapping_add`
++    // to avoid exactly this, so `get_row_column` is the inconsistent, panicking
++    // path. Oracle-independent panic. Pinned by drawing long letter-only refs.
++    #[hegel::test(test_cases = 300)]
++    fn get_row_column_never_panics(tc: hegel::TestCase) {
++        // Draw a fairly long run of uppercase letters (a giant column ref); 6+
++        // letters overflow u32, so the panic reproduces on essentially every run.
++        let n = tc.draw(generators::integers::<usize>().min_value(6).max_value(12));
++        let mut bytes = Vec::with_capacity(n);
++        for _ in 0..n {
++            bytes.push(tc.draw(generators::sampled_from(
++                b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec(),
++            )));
++        }
++        let _ = get_row(&bytes);
++        let _ = get_row_column(&bytes);
++    }
++
++    // PROPERTY: `column_number_to_name` never panics on any u32 and enforces its
++    // documented bound (rejects col >= MAX_COLUMNS, succeeds below it).
++    #[hegel::test]
++    fn column_number_to_name_bounds(tc: hegel::TestCase) {
++        let col = tc.draw(generators::integers::<u32>());
++        let mut buf = Vec::new();
++        let res = column_number_to_name(col, &mut buf);
++        if col >= MAX_COLUMNS {
++            assert!(res.is_err(), "col {col} >= MAX_COLUMNS must be rejected");
++        } else {
++            assert!(res.is_ok(), "col {col} < MAX_COLUMNS must encode");
++            assert!(!buf.is_empty());
++        }
++    }
++
++    // PROPERTY (parse robustness): `get_dimension` (called on the untrusted
++    // `<dimension ref="...">` string) must never panic on arbitrary bytes.
++    //
++    // KNOWN FAILURE — real bug. `get_dimension` computes `end - start` with
++    // unchecked subtraction, so a reversed dimension such as `A2:A1` (a corrupt
++    // but syntactically valid worksheet dimension) underflows and panics
++    // ("attempt to subtract with overflow") in a debug/overflow-checked build
++    // instead of returning an Err. This is an oracle-independent robustness bug
++    // reachable from a crafted xlsx. Deterministically pinned by boosting toward
++    // reversed two-cell dimensions.
++    #[hegel::test(test_cases = 400)]
++    fn get_dimension_never_panics(tc: hegel::TestCase) {
++        // Boost heavily toward well-formed but possibly-reversed `X:Y` dimensions
++        // so the underflow reproduces on every run.
++        let start_col = tc.draw(generators::integers::<u32>().max_value(50));
++        let start_row = tc.draw(generators::integers::<u32>().min_value(1).max_value(50));
++        let end_col = tc.draw(generators::integers::<u32>().max_value(50));
++        let end_row = tc.draw(generators::integers::<u32>().min_value(1).max_value(50));
++        let mut a = Vec::new();
++        column_number_to_name(start_col, &mut a).unwrap();
++        a.extend(start_row.to_string().into_bytes());
++        let mut b = Vec::new();
++        column_number_to_name(end_col, &mut b).unwrap();
++        b.extend(end_row.to_string().into_bytes());
++        let mut dim = a;
++        dim.push(b':');
++        dim.extend(b);
++        let _ = get_dimension(&dim);
++    }
++
++    // PROPERTY: `push_column` (used to render column references in XLS/XLSB
++    // formulas) must agree with the crate's own `column_number_to_name` (used
++    // for XLSX and validated by unit tests to match Excel's A/Z/AA/XFD scheme).
++    //
++    // KNOWN FAILURE — real bug. `push_column` drops the high-order digit for
++    // columns >= 26: it renders column 26 as "A" (not "AA") and column 27 as
++    // "B" (not "AB"). It is therefore also NOT injective — push_column(0) and
++    // push_column(26) both yield "A" — so distinct columns collide to the same
++    // formula reference. Oracle-independent (non-injective index->name mapping).
++    // Deterministically pinned: any column >= 26 fails, which is almost the
++    // entire drawn range.
++    #[hegel::test(test_cases = 300)]
++    fn push_column_matches_column_number_to_name(tc: hegel::TestCase) {
++        let col = tc.draw(generators::integers::<u32>().max_value(MAX_COLUMNS - 1));
++        let mut expected = Vec::new();
++        column_number_to_name(col, &mut expected).unwrap();
++        let mut actual = String::new();
++        push_column(col, &mut actual);
++        assert_eq!(
++            actual.as_bytes(),
++            expected.as_slice(),
++            "push_column({col}) = {actual:?}, expected {:?}",
++            std::str::from_utf8(&expected).unwrap()
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/tests/test.rs b/tests/test.rs
+index 246ebb5..812d893 100644
+--- a/tests/test.rs
++++ b/tests/test.rs
+@@ -3587,3 +3587,212 @@ fn too_small_xls() {
+ fn test_xlsx_strict_iso_paths() {
+     let _: Xlsx<_> = wb("strict_iso_paths.xlsx");
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel).
++//
++// calamine reads spreadsheets from untrusted files, so the highest-value
++// properties are decoder-robustness ones: opening arbitrary / corrupted bytes
++// must return an Err (never panic, hang, or OOM), and the public numeric/date
++// value conversions must not panic on boundary values.
++// ---------------------------------------------------------------------------
++#[cfg(test)]
++mod hegel_props {
++    use calamine::{
++        expand_shared_formula, open_workbook_auto_from_rs, Data, DataType, ExcelDateTime,
++        ExcelDateTimeType, Ods, Reader, Xls, Xlsb, Xlsx,
++    };
++    use hegel::generators;
++    use std::io::Cursor;
++
++    // Arbitrary byte buffer, size-capped so the test's own resource use stays
++    // bounded (this cap protects the test, not calamine's contract; the reader
++    // is expected to handle inputs of any size gracefully).
++    fn arbitrary_bytes(tc: &hegel::TestCase) -> Vec<u8> {
++        tc.draw(generators::binary().max_size(4096))
++    }
++
++    fn cursor(bytes: Vec<u8>) -> Cursor<Vec<u8>> {
++        Cursor::new(bytes)
++    }
++
++    // PROPERTY (arbitrary-bytes robustness): every statically-typed reader
++    // constructor must return Ok or Err on arbitrary bytes, never panic/hang.
++    #[hegel::test]
++    fn readers_never_panic_on_arbitrary_bytes(tc: hegel::TestCase) {
++        let bytes = arbitrary_bytes(&tc);
++        let _ = <Xlsx<_> as Reader<_>>::new(cursor(bytes.clone()));
++        let _ = <Xlsb<_> as Reader<_>>::new(cursor(bytes.clone()));
++        let _ = <Xls<_> as Reader<_>>::new(cursor(bytes.clone()));
++        let _ = <Ods<_> as Reader<_>>::new(cursor(bytes));
++    }
++
++    // PROPERTY (arbitrary-bytes robustness): the format-sniffing entry point
++    // must not panic on arbitrary bytes; if it returns a workbook, iterating its
++    // sheets must also stay panic-free.
++    #[hegel::test]
++    fn auto_open_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++        let bytes = arbitrary_bytes(&tc);
++        if let Ok(mut wb) = open_workbook_auto_from_rs(cursor(bytes)) {
++            let names = wb.sheet_names().to_owned();
++            for name in names.iter().take(8) {
++                let _ = wb.worksheet_range(name);
++            }
++        }
++    }
++
++    // PROPERTY (arbitrary-bytes robustness): bytes that begin with the ZIP local
++    // file header magic reach deeper into the zip/xlsx and ods decoders. They
++    // must still never panic. A crafted ZIP with a huge declared size must not
++    // OOM (the 4 KiB input cap keeps the test bounded either way).
++    #[hegel::test]
++    fn zip_magic_prefixed_bytes_never_panic(tc: hegel::TestCase) {
++        let mut bytes = b"PK\x03\x04".to_vec();
++        bytes.extend(arbitrary_bytes(&tc));
++        let _ = <Xlsx<_> as Reader<_>>::new(cursor(bytes.clone()));
++        let _ = <Ods<_> as Reader<_>>::new(cursor(bytes));
++    }
++
++    // PROPERTY (valid-file-then-corrupt): start from a real, valid xlsx fixture,
++    // then flip bytes or truncate it. Opening the mutated file and reading every
++    // sheet must return Err gracefully, never panic.
++    #[hegel::test]
++    fn corrupted_valid_xlsx_never_panics(tc: hegel::TestCase) {
++        let original = std::fs::read("tests/minimal_package.xlsx")
++            .expect("fixture tests/minimal_package.xlsx must exist");
++        let mut bytes = original.clone();
++        // Apply between 1 and 8 mutations, each either a byte flip or a truncation.
++        let n_muts = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++        for _ in 0..n_muts {
++            if bytes.is_empty() {
++                break;
++            }
++            if tc.draw(generators::booleans()) {
++                // Flip a byte.
++                let idx = tc.draw(
++                    generators::integers::<usize>()
++                        .min_value(0)
++                        .max_value(bytes.len() - 1),
++                );
++                let xor = tc.draw(generators::integers::<u8>().min_value(1));
++                bytes[idx] ^= xor;
++            } else {
++                // Truncate.
++                let new_len = tc.draw(
++                    generators::integers::<usize>()
++                        .min_value(0)
++                        .max_value(bytes.len()),
++                );
++                bytes.truncate(new_len);
++            }
++        }
++        if let Ok(mut wb) = <Xlsx<_> as Reader<_>>::new(cursor(bytes)) {
++            let names = wb.sheet_names().to_owned();
++            for name in &names {
++                let _ = wb.worksheet_range(name);
++                let _ = wb.worksheet_formula(name);
++            }
++        }
++    }
++
++    // PROPERTY (parse robustness): `expand_shared_formula` is public and parses
++    // an untrusted formula template plus arbitrary source/target positions. It
++    // must return Ok or Err on any input, never panic.
++    #[hegel::test]
++    fn expand_shared_formula_never_panics(tc: hegel::TestCase) {
++        // Bias toward formula-shaped strings (cell refs, `$`, operators) while
++        // still allowing arbitrary text through.
++        let n = tc.draw(generators::integers::<usize>().max_value(40));
++        let mut formula = String::new();
++        for _ in 0..n {
++            let piece: String = tc.draw(hegel::one_of!(
++                generators::sampled_from(
++                    ["A1", "$B$2", "ZZ99", "+", "-", "*", "(", ")", ":", ",", "SUM", "1", "AAA1000"]
++                        .iter()
++                        .map(|s| s.to_string())
++                        .collect::<Vec<_>>()
++                ),
++                generators::text().max_size(4)
++            ));
++            formula.push_str(&piece);
++        }
++        let start = (
++            tc.draw(generators::integers::<u32>().max_value(2_000_000)),
++            tc.draw(generators::integers::<u32>().max_value(40_000)),
++        );
++        let end = (
++            tc.draw(generators::integers::<u32>().max_value(2_000_000)),
++            tc.draw(generators::integers::<u32>().max_value(40_000)),
++        );
++        let _ = expand_shared_formula(&formula, start, end);
++    }
++
++    // PROPERTY (Data conversions): the accessor/predicate methods on `Data` must
++    // be internally consistent and never panic. If `is_int` holds then
++    // `get_int` is Some; likewise for float/bool/string; and `as_string` never
++    // panics on any variant.
++    #[hegel::test]
++    fn data_accessors_are_consistent(tc: hegel::TestCase) {
++        let value = tc.draw(generators::integers::<u8>().max_value(6));
++        let data = match value {
++            0 => Data::Int(tc.draw(generators::integers::<i64>())),
++            1 => Data::Float(tc.draw(generators::floats::<f64>())),
++            2 => Data::Bool(tc.draw(generators::booleans())),
++            3 => Data::String(tc.draw(generators::text().max_size(32))),
++            4 => Data::DateTime(ExcelDateTime::new(
++                tc.draw(generators::floats::<f64>().allow_nan(false).allow_infinity(false)),
++                ExcelDateTimeType::DateTime,
++                tc.draw(generators::booleans()),
++            )),
++            5 => Data::Empty,
++            _ => Data::Bool(tc.draw(generators::booleans())),
++        };
++        // Predicate implies accessor.
++        if data.is_int() {
++            assert!(data.get_int().is_some());
++        }
++        if data.is_float() {
++            assert!(data.get_float().is_some());
++        }
++        if data.is_bool() {
++            assert!(data.get_bool().is_some());
++        }
++        if data.is_string() {
++            assert!(data.get_string().is_some());
++        }
++        // These must never panic for any variant.
++        let _ = data.as_string();
++        let _ = data.as_i64();
++        let _ = data.as_f64();
++        let _ = data.is_empty();
++    }
++
++    // PROPERTY (boundary values): `ExcelDateTime::to_ymd_hms_milli` is documented
++    // to "always return a date, even if the serial value is outside Excel's
++    // range". It must therefore never panic on any finite or non-finite f64.
++    //
++    // KNOWN FAILURE — real bug. For very large or infinite serials the internal
++    // `excel_datetime.floor() as u64` saturates to u64::MAX, and the subsequent
++    // `days += 109_572` overflows and panics ("attempt to add with overflow") in
++    // a debug/overflow-checked build instead of returning a (garbage-but-valid)
++    // date as documented. Oracle-independent panic. Pinned by boosting toward
++    // infinity / f64::MAX.
++    #[hegel::test(test_cases = 300)]
++    fn exceldatetime_to_ymd_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw(hegel::one_of!(
++            generators::sampled_from(vec![
++                f64::INFINITY,
++                f64::NEG_INFINITY,
++                f64::MAX,
++                f64::MIN,
++                1e19,
++                1e300,
++            ]),
++            generators::floats::<f64>(),
++            generators::floats::<f64>().min_value(0.0).max_value(2_958_465.0),
++        ));
++        let is_1904 = tc.draw(generators::booleans());
++        let dt = ExcelDateTime::new(value, ExcelDateTimeType::DateTime, is_1904);
++        let _ = dt.to_ymd_hms_milli();
++    }
++}
