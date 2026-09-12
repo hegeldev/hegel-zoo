@@ -98,11 +98,10 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
             m = re.search(rf"^(\s*)#\[derive\(([^)]*)\)\]\n(\s*(?:pub(?:\([^)]*\))? )?(?:enum|struct) {re.escape(tyname)}\b)",
                           "\n".join(lines), re.M)
             # only derive on test-only types: hegel is a dev-dependency, so a derive on a library
-            # type breaks the non-test build. Test-only = file under tests/ or a tests.rs, or the
-            # definition comes after a #[cfg(test)] in the file.
+            # type breaks the non-test build. Test-only = a file under tests/ or a tests.rs; a
+            # type in a library file (even inside a #[cfg(test)] mod) gets the wrap instead.
             in_test_code = bool(m) and (
-                "tests" in f.parts or f.name in ("tests.rs", "test.rs") or f.name.endswith("_tests.rs")
-                or "#[cfg(test)]" in "\n".join(lines)[: m.start()])
+                "tests" in f.parts or f.name in ("tests.rs", "test.rs") or f.name.endswith("_tests.rs"))
             if m and in_test_code and tyname not in derived:
                 if "PrettyPrintable" not in m.group(2):
                     text = "\n".join(lines)
@@ -285,7 +284,7 @@ def port(crate: str) -> str:
         errs = sorted(set(re.findall(r"^error(?:\[E\d+\])?: (.{0,110})", log, re.M)))
         return f"COMPILE {crate} ({nfix} composites fixed): " + " | ".join(errs[:6])
     if "BAD " in out:
-        fails = re.findall(r"^\s+(FAIL|PASS\?|MISSING)\s+(\S+)", out, re.M)
+        fails = re.findall(r"^\s+(FAIL|PASS\?|MISSING|UPSTREAM)\s+(\S+)", out, re.M)
         return f"MAP     {crate}: " + ", ".join(f"{k} {n}" for k, n in fails)
     if "OK " not in out:
         return f"ERROR   {crate}: no verdict: {out.strip()[-400:]}"

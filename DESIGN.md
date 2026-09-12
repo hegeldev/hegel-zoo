@@ -134,6 +134,11 @@ those keep a skipped minimal reproducer in the patch, since an abort takes the w
 
 `TROPHIES.md` at the root is generated from all `bugs.toml` files by `zoo report`.
 
+Only the tests the patch adds are judged. Upstream's own suite runs alongside (the patch sits
+in its test files) and can fail for reasons that are not the zoo's: patches exclude lockfiles,
+so dependencies float, and toolchains drift. Such failures are reported as `UPSTREAM` and do not
+make the run BAD; a failing test that *is* ours is either an expected failure or a problem.
+
 ## The runner: `tools/zoo`
 
 A single Python script run with `uv run` (this machine and CI have python3 + uv; no other
