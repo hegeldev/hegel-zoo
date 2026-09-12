@@ -1,0 +1,746 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 28a57d5..45df1a0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,6 +39,7 @@ tempfile = "3.5.0"
+ redb2_6 = { version = "=2.6.0", package = "redb" }
+ uuid = { version= "1.17.0", features = ["v4"] }
+ redb-derive = { path = "./crates/redb-derive" }
++hegeltest = "0.44.1"
+ 
+ [features]
+ # Enables log messages
+diff --git a/tests/basic_tests.rs b/tests/basic_tests.rs
+index 0d02bd1..5e87274 100644
+--- a/tests/basic_tests.rs
++++ b/tests/basic_tests.rs
+@@ -3308,3 +3308,278 @@ fn u8_array_serialization() {
+         assert_eq!(ref_order, generic_order);
+     }
+ }
++
++// ==== Hegel property-based tests ====
++
++use hegel::generators::{self, Generator};
++use std::collections::BTreeMap;
++use std::ops::Bound;
++
++type NestedComposite = Vec<(Option<i64>, String)>;
++
++// Property: `Value::from_bytes` and `Value::as_bytes` are inverses, per the contract documented
++// on `Value::as_bytes` ("Implementations must ensure that as_bytes() and from_bytes() are
++// inverses"). Exercised through a nested composite type so the varint length encoding
++// (complex_types.rs), tuple encoding (tuple_types.rs), and Option encoding (types.rs) all
++// participate.
++#[hegel::test]
++fn hegel_value_roundtrip_nested_composite(tc: hegel::TestCase) {
++    let v: Vec<(Option<i64>, String)> = tc.draw(generators::vecs(generators::tuples!(
++        generators::optional(generators::integers::<i64>()),
++        generators::text(),
++    )));
++    let bytes = <NestedComposite as Value>::as_bytes(&v);
++    let decoded = <NestedComposite as Value>::from_bytes(bytes.as_ref());
++    assert_eq!(decoded, v);
++    let reencoded = <NestedComposite as Value>::as_bytes(&decoded);
++    assert_eq!(reencoded.as_ref() as &[u8], bytes.as_ref() as &[u8]);
++}
++
++type TupleKey = (u16, String, Option<i64>);
++
++// Property: the `Key::compare` implementation for tuple keys agrees with Rust's natural
++// lexicographic tuple ordering. Evidence: types.rs implements integer/str/Option compare by
++// decoding and delegating to `Ord`, and tuple_types.rs compares element-wise in order, so the
++// composed order must equal `Ord for (u16, String, Option<i64>)`. Range queries rely on this.
++#[hegel::test]
++fn hegel_key_compare_matches_rust_ordering(tc: hegel::TestCase) {
++    let a: (u16, String, Option<i64>) = tc.draw(generators::tuples!(
++        generators::integers::<u16>(),
++        generators::text(),
++        generators::optional(generators::integers::<i64>()),
++    ));
++    let b: (u16, String, Option<i64>) = tc.draw(generators::tuples!(
++        generators::integers::<u16>(),
++        generators::text(),
++        generators::optional(generators::integers::<i64>()),
++    ));
++    let a_bytes = <TupleKey as Value>::as_bytes(&a);
++    let b_bytes = <TupleKey as Value>::as_bytes(&b);
++    assert_eq!(
++        <TupleKey as Key>::compare(a_bytes.as_ref(), b_bytes.as_ref()),
++        a.cmp(&b)
++    );
++}
++
++fn assert_fixed_width_holds<T: Value>(value: &T::SelfType<'_>) {
++    let width = T::fixed_width().expect("only call this for fixed width types");
++    assert_eq!(
++        T::as_bytes(value).as_ref().len(),
++        width,
++        "fixed_width() does not match serialized length for {:?}",
++        T::type_name().name()
++    );
++}
++
++// Property: for every type whose `Value::fixed_width()` returns `Some(n)`, `as_bytes` produces
++// exactly `n` bytes. Evidence: the doc on `fixed_width` ("Width of a fixed type"), and the
++// B-tree layout code that omits per-entry length metadata for fixed width types, which is only
++// sound if every serialized value has that exact width.
++#[hegel::test]
++fn hegel_fixed_width_matches_serialized_len(tc: hegel::TestCase) {
++    let c: char = tc.draw(
++        generators::text()
++            .min_size(1)
++            .map(|s: String| s.chars().next().unwrap()),
++    );
++    assert_fixed_width_holds::<char>(&c);
++    let oc: Option<char> = tc.draw(generators::optional(
++        generators::text()
++            .min_size(1)
++            .map(|s: String| s.chars().next().unwrap()),
++    ));
++    assert_fixed_width_holds::<Option<char>>(&oc);
++    let t: (u32, i64) = tc.draw(generators::tuples!(
++        generators::integers::<u32>(),
++        generators::integers::<i64>(),
++    ));
++    assert_fixed_width_holds::<(u32, i64)>(&t);
++    let arr: [u16; 4] = tc.draw(generators::arrays(generators::integers::<u16>()));
++    assert_fixed_width_holds::<[u16; 4]>(&arr);
++    let b: bool = tc.draw(generators::booleans());
++    assert_fixed_width_holds::<bool>(&b);
++    let u: u128 = tc.draw(generators::integers::<u128>());
++    assert_fixed_width_holds::<u128>(&u);
++}
++
++const HEGEL_STR_TABLE: TableDefinition<&str, u64> = TableDefinition::new("hegel_str_range");
++
++// Property: `Table::range` over string keys returns exactly the entries `BTreeMap::range`
++// returns, in the same order, for arbitrary bound kinds, forward and reversed. Evidence:
++// `Key for &str` compares with `str::cmp`, and the `ReadableTable::range` doc example shows
++// BTreeMap-like range semantics.
++#[hegel::test]
++fn hegel_str_range_matches_btreemap(tc: hegel::TestCase) {
++    let entries: Vec<(String, u64)> = tc.draw(
++        generators::vecs(generators::tuples!(
++            generators::text().max_size(20),
++            generators::integers::<u64>(),
++        ))
++        .max_size(40),
++    );
++    let mut model: BTreeMap<String, u64> = BTreeMap::new();
++    let tmpfile = create_tempfile();
++    let db = Database::create(tmpfile.path()).unwrap();
++    let txn = db.begin_write().unwrap();
++    {
++        let mut table = txn.open_table(HEGEL_STR_TABLE).unwrap();
++        for (k, v) in &entries {
++            // Both sides use insert-overwrites-existing semantics, so duplicate keys agree.
++            table.insert(k.as_str(), v).unwrap();
++            model.insert(k.clone(), *v);
++        }
++    }
++    txn.commit().unwrap();
++
++    let mut lo: String = tc.draw(generators::text().max_size(20));
++    let mut hi: String = tc.draw(generators::text().max_size(20));
++    if lo > hi {
++        std::mem::swap(&mut lo, &mut hi);
++    }
++    let lo_kind: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++    let hi_kind: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++    // BTreeMap::range (the oracle) panics on start == end with both bounds excluded.
++    tc.assume(!(lo == hi && lo_kind == 2 && hi_kind == 2));
++    let start: Bound<&str> = match lo_kind {
++        0 => Bound::Unbounded,
++        1 => Bound::Included(lo.as_str()),
++        _ => Bound::Excluded(lo.as_str()),
++    };
++    let end: Bound<&str> = match hi_kind {
++        0 => Bound::Unbounded,
++        1 => Bound::Included(hi.as_str()),
++        _ => Bound::Excluded(hi.as_str()),
++    };
++    let reversed: bool = tc.draw(generators::booleans());
++
++    let read_txn = db.begin_read().unwrap();
++    let table = read_txn.open_table(HEGEL_STR_TABLE).unwrap();
++    let actual: Vec<(String, u64)> = if reversed {
++        table
++            .range::<&str>((start, end))
++            .unwrap()
++            .rev()
++            .map(|r| {
++                let (k, v) = r.unwrap();
++                (k.value().to_string(), v.value())
++            })
++            .collect()
++    } else {
++        table
++            .range::<&str>((start, end))
++            .unwrap()
++            .map(|r| {
++                let (k, v) = r.unwrap();
++                (k.value().to_string(), v.value())
++            })
++            .collect()
++    };
++    let expected: Vec<(String, u64)> = if reversed {
++        model
++            .range::<str, _>((start, end))
++            .rev()
++            .map(|(k, v)| (k.clone(), *v))
++            .collect()
++    } else {
++        model
++            .range::<str, _>((start, end))
++            .map(|(k, v)| (k.clone(), *v))
++            .collect()
++    };
++    assert_eq!(actual, expected);
++}
++
++const HEGEL_U64_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("hegel_u64_bytes");
++
++// Property: data committed to a database file is intact after dropping the Database and
++// reopening it with `Database::open`. Evidence: the crate's core persistence contract
++// ("ACID, embedded key-value store", lib.rs docs) and `Database::open`'s documented behavior.
++#[hegel::test]
++fn hegel_reopen_preserves_contents(tc: hegel::TestCase) {
++    let entries: Vec<(u64, Vec<u8>)> = tc.draw(
++        generators::vecs(generators::tuples!(
++            generators::integers::<u64>(),
++            generators::binary().max_size(100),
++        ))
++        .max_size(50),
++    );
++    let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
++    let tmpfile = create_tempfile();
++    {
++        let db = Database::create(tmpfile.path()).unwrap();
++        let txn = db.begin_write().unwrap();
++        {
++            let mut table = txn.open_table(HEGEL_U64_TABLE).unwrap();
++            for (k, v) in &entries {
++                table.insert(k, v.as_slice()).unwrap();
++                model.insert(*k, v.clone());
++            }
++        }
++        txn.commit().unwrap();
++    }
++
++    let db = Database::open(tmpfile.path()).unwrap();
++    let read_txn = db.begin_read().unwrap();
++    let table = read_txn.open_table(HEGEL_U64_TABLE).unwrap();
++    let actual: Vec<(u64, Vec<u8>)> = table
++        .iter()
++        .unwrap()
++        .map(|r| {
++            let (k, v) = r.unwrap();
++            (k.value(), v.value().to_vec())
++        })
++        .collect();
++    let expected: Vec<(u64, Vec<u8>)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
++    assert_eq!(actual, expected);
++}
++
++// Property: `Database::compact` preserves the logical contents of the database and leaves it
++// in a state that passes `check_integrity`. Evidence: `compact`'s documentation describes it
++// as a space-reclaiming operation, not a mutating one.
++#[hegel::test]
++fn hegel_compact_preserves_contents(tc: hegel::TestCase) {
++    let entries: Vec<(u64, Vec<u8>)> = tc.draw(
++        generators::vecs(generators::tuples!(
++            generators::integers::<u64>(),
++            generators::binary().max_size(200),
++        ))
++        .max_size(60),
++    );
++    let modulus: u64 = tc.draw(generators::integers::<u64>().min_value(1).max_value(8));
++    let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
++    let tmpfile = create_tempfile();
++    let mut db = Database::create(tmpfile.path()).unwrap();
++    let txn = db.begin_write().unwrap();
++    {
++        let mut table = txn.open_table(HEGEL_U64_TABLE).unwrap();
++        for (k, v) in &entries {
++            table.insert(k, v.as_slice()).unwrap();
++            model.insert(*k, v.clone());
++        }
++    }
++    txn.commit().unwrap();
++    // Delete some entries so compaction has free pages to reclaim.
++    let txn = db.begin_write().unwrap();
++    {
++        let mut table = txn.open_table(HEGEL_U64_TABLE).unwrap();
++        table.retain(|k, _| k % modulus != 0).unwrap();
++        model.retain(|k, _| k % modulus != 0);
++    }
++    txn.commit().unwrap();
++
++    db.compact().unwrap();
++    assert!(db.check_integrity().unwrap());
++
++    let read_txn = db.begin_read().unwrap();
++    let table = read_txn.open_table(HEGEL_U64_TABLE).unwrap();
++    let actual: Vec<(u64, Vec<u8>)> = table
++        .iter()
++        .unwrap()
++        .map(|r| {
++            let (k, v) = r.unwrap();
++            (k.value(), v.value().to_vec())
++        })
++        .collect();
++    let expected: Vec<(u64, Vec<u8>)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
++    assert_eq!(actual, expected);
++}
+diff --git a/tests/integration_tests.rs b/tests/integration_tests.rs
+index 6b3ad04..3396ecb 100644
+--- a/tests/integration_tests.rs
++++ b/tests/integration_tests.rs
+@@ -4443,3 +4443,335 @@ fn multimap_table_definition_new_panics_on_empty_name() {
+     let name = String::new();
+     let _def: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new(&name);
+ }
++
++// ==== Hegel property-based tests ====
++
++use hegel::TestCase;
++use hegel::generators;
++use redb::Savepoint;
++use redb::backends::InMemoryBackend;
++use std::collections::BTreeMap;
++use std::ops::Bound;
++
++const HEGEL_MODEL_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("hegel_model");
++// Bound the number of live savepoints so the test doesn't retain unbounded pages;
++// this protects the test's resources, not the library's contract.
++const HEGEL_MAX_SAVEPOINTS: usize = 5;
++
++// Stateful model test: run arbitrary interleavings of inserts, removes, gets, pops, range
++// scans, commits, aborts, and ephemeral savepoint create/restore against both a redb
++// `Database` and a `BTreeMap` model, asserting they agree after every step. The invariant
++// additionally checks after every rule that a fresh read transaction sees exactly the last
++// committed state (snapshot isolation). Evidence: redb's documented BTreeMap-based API
++// (lib.rs), the ACID transaction contract (`commit`/`abort` docs), the savepoint docs
++// ("Creates a snapshot of the current database state, which can be used to rollback the
++// database"; "Calling this method invalidates all Savepoints created after savepoint"),
++// and the maintainers' fuzzer (fuzz/fuzz_targets/fuzz_redb.rs) which maintains the same
++// reference model including savepoint snapshots.
++struct DbModelMachine {
++    // Field order matters for drop order: the open transaction and savepoints must be dropped
++    // before `db`, because `Database::drop` makes a final cleanup write transaction and blocks
++    // until any live `WriteTransaction` finishes.
++    txn: Option<WriteTransaction>,
++    savepoints: Vec<(Savepoint, BTreeMap<u64, Vec<u8>>)>,
++    db: Database,
++    committed: BTreeMap<u64, Vec<u8>>,
++    uncommitted: BTreeMap<u64, Vec<u8>>,
++    // Whether a table has been opened in the current write transaction (savepoint creation
++    // requires a non-dirty transaction, per `ephemeral_savepoint` docs).
++    txn_dirty: bool,
++}
++
++impl DbModelMachine {
++    // Draw a key, biased towards keys currently in the model so operations actually collide,
++    // with the full u64 range (including MIN/MAX) still reachable.
++    fn arb_key(&self, tc: &TestCase) -> u64 {
++        let keys: Vec<u64> = self.uncommitted.keys().copied().collect();
++        if !keys.is_empty() && tc.draw(generators::booleans()) {
++            tc.draw(generators::sampled_from(keys))
++        } else {
++            tc.draw(hegel::one_of!(
++                generators::integers::<u64>().max_value(500),
++                generators::integers::<u64>(),
++            ))
++        }
++    }
++}
++
++#[hegel::state_machine]
++impl DbModelMachine {
++    #[rule]
++    fn begin_txn(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_none());
++        self.txn = Some(self.db.begin_write().unwrap());
++        self.uncommitted = self.committed.clone();
++        self.txn_dirty = false;
++    }
++
++    #[rule]
++    fn commit(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        self.txn.take().unwrap().commit().unwrap();
++        self.committed = self.uncommitted.clone();
++    }
++
++    #[rule]
++    fn abort(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        self.txn.take().unwrap().abort().unwrap();
++        self.uncommitted = self.committed.clone();
++    }
++
++    #[rule]
++    fn insert(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let key = self.arb_key(&tc);
++        let value: Vec<u8> = tc.draw(generators::binary().max_size(400));
++        let txn = self.txn.as_ref().unwrap();
++        let mut table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let previous = table
++            .insert(&key, value.as_slice())
++            .unwrap()
++            .map(|g| g.value().to_vec());
++        let model_previous = self.uncommitted.insert(key, value);
++        assert_eq!(previous, model_previous);
++        self.txn_dirty = true;
++    }
++
++    // Insert a run of consecutive keys so the B-tree actually grows multiple levels.
++    #[rule]
++    fn insert_many(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let n: u64 = tc.draw(generators::integers::<u64>().max_value(300));
++        // The subtraction bounds `start + n` away from overflow in the *test's* arithmetic;
++        // it does not restrict the library's domain.
++        let start: u64 = tc.draw(generators::integers::<u64>().max_value(u64::MAX - 301));
++        let txn = self.txn.as_ref().unwrap();
++        let mut table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        for key in start..(start + n) {
++            let value = key.to_le_bytes();
++            table.insert(&key, value.as_slice()).unwrap();
++            self.uncommitted.insert(key, value.to_vec());
++        }
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn remove(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let key = self.arb_key(&tc);
++        let txn = self.txn.as_ref().unwrap();
++        let mut table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let removed = table.remove(&key).unwrap().map(|g| g.value().to_vec());
++        assert_eq!(removed, self.uncommitted.remove(&key));
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn get(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let key = self.arb_key(&tc);
++        let txn = self.txn.as_ref().unwrap();
++        let table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let value = table.get(&key).unwrap().map(|g| g.value().to_vec());
++        assert_eq!(value, self.uncommitted.get(&key).cloned());
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn len_check(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let txn = self.txn.as_ref().unwrap();
++        let table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        assert_eq!(table.len().unwrap(), self.uncommitted.len() as u64);
++        assert_eq!(table.is_empty().unwrap(), self.uncommitted.is_empty());
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn pop_first(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let txn = self.txn.as_ref().unwrap();
++        let mut table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let popped = table
++            .pop_first()
++            .unwrap()
++            .map(|(k, v)| (k.value(), v.value().to_vec()));
++        assert_eq!(popped, self.uncommitted.pop_first());
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn pop_last(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let txn = self.txn.as_ref().unwrap();
++        let mut table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let popped = table
++            .pop_last()
++            .unwrap()
++            .map(|(k, v)| (k.value(), v.value().to_vec()));
++        assert_eq!(popped, self.uncommitted.pop_last());
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn first_last_check(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let txn = self.txn.as_ref().unwrap();
++        let table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let first = table
++            .first()
++            .unwrap()
++            .map(|(k, v)| (k.value(), v.value().to_vec()));
++        let last = table
++            .last()
++            .unwrap()
++            .map(|(k, v)| (k.value(), v.value().to_vec()));
++        let model_first = self
++            .uncommitted
++            .first_key_value()
++            .map(|(k, v)| (*k, v.clone()));
++        let model_last = self
++            .uncommitted
++            .last_key_value()
++            .map(|(k, v)| (*k, v.clone()));
++        assert_eq!(first, model_first);
++        assert_eq!(last, model_last);
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn range_check(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some());
++        let mut lo: u64 = tc.draw(generators::integers::<u64>());
++        let mut hi: u64 = tc.draw(generators::integers::<u64>());
++        if lo > hi {
++            std::mem::swap(&mut lo, &mut hi);
++        }
++        let lo_kind: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++        let hi_kind: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++        // BTreeMap::range (the oracle) panics on start == end with both bounds excluded.
++        tc.assume(!(lo == hi && lo_kind == 2 && hi_kind == 2));
++        let start: Bound<u64> = match lo_kind {
++            0 => Bound::Unbounded,
++            1 => Bound::Included(lo),
++            _ => Bound::Excluded(lo),
++        };
++        let end: Bound<u64> = match hi_kind {
++            0 => Bound::Unbounded,
++            1 => Bound::Included(hi),
++            _ => Bound::Excluded(hi),
++        };
++        let reversed: bool = tc.draw(generators::booleans());
++        let txn = self.txn.as_ref().unwrap();
++        let table = txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        let map_entry =
++            |r: Result<(AccessGuard<'_, u64>, AccessGuard<'_, &[u8]>), StorageError>| {
++                let (k, v) = r.unwrap();
++                (k.value(), v.value().to_vec())
++            };
++        let actual: Vec<(u64, Vec<u8>)> = if reversed {
++            table
++                .range::<u64>((start, end))
++                .unwrap()
++                .rev()
++                .map(map_entry)
++                .collect()
++        } else {
++            table
++                .range::<u64>((start, end))
++                .unwrap()
++                .map(map_entry)
++                .collect()
++        };
++        let expected: Vec<(u64, Vec<u8>)> = if reversed {
++            self.uncommitted
++                .range((start, end))
++                .rev()
++                .map(|(k, v)| (*k, v.clone()))
++                .collect()
++        } else {
++            self.uncommitted
++                .range((start, end))
++                .map(|(k, v)| (*k, v.clone()))
++                .collect()
++        };
++        assert_eq!(actual, expected);
++        self.txn_dirty = true;
++    }
++
++    #[rule]
++    fn create_savepoint(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some() && !self.txn_dirty);
++        let savepoint = self.txn.as_ref().unwrap().ephemeral_savepoint().unwrap();
++        self.savepoints.push((savepoint, self.uncommitted.clone()));
++        if self.savepoints.len() > HEGEL_MAX_SAVEPOINTS {
++            self.savepoints.remove(0);
++        }
++    }
++
++    #[rule]
++    fn restore_savepoint(&mut self, tc: TestCase) {
++        tc.assume(self.txn.is_some() && !self.savepoints.is_empty());
++        let index: usize =
++            tc.draw(generators::integers::<usize>().max_value(self.savepoints.len() - 1));
++        let (savepoint, snapshot) = &self.savepoints[index];
++        self.txn
++            .as_mut()
++            .unwrap()
++            .restore_savepoint(savepoint)
++            .unwrap();
++        self.uncommitted = snapshot.clone();
++        // Restoring invalidates all savepoints created after this one (restore_savepoint docs).
++        self.savepoints.truncate(index + 1);
++        self.txn_dirty = true;
++    }
++
++    // Snapshot isolation: a fresh read transaction must see exactly the last committed state,
++    // regardless of any in-flight write transaction.
++    #[invariant]
++    fn committed_state_visible_to_readers(&self, _: TestCase) {
++        let read_txn = self.db.begin_read().unwrap();
++        let table = read_txn.open_table(HEGEL_MODEL_TABLE).unwrap();
++        assert_eq!(table.len().unwrap(), self.committed.len() as u64);
++        let actual: Vec<(u64, Vec<u8>)> = table
++            .iter()
++            .unwrap()
++            .map(|r| {
++                let (k, v) = r.unwrap();
++                (k.value(), v.value().to_vec())
++            })
++            .collect();
++        let expected: Vec<(u64, Vec<u8>)> = self
++            .committed
++            .iter()
++            .map(|(k, v)| (*k, v.clone()))
++            .collect();
++        assert_eq!(actual, expected);
++    }
++}
++
++#[hegel::test]
++fn hegel_model_matches_btreemap_across_transactions_and_savepoints(tc: TestCase) {
++    // Generate part of the database configuration too: a tiny cache forces page eviction.
++    // (`set_page_size` is cfg(test/fuzzing)-gated and not available to integration tests.)
++    let cache_size: usize = tc.draw(generators::sampled_from(vec![50_000usize, 1 << 30]));
++    let db = Database::builder()
++        .set_cache_size(cache_size)
++        .create_with_backend(InMemoryBackend::new())
++        .unwrap();
++    // Create the table up front so read transactions can always open it.
++    let txn = db.begin_write().unwrap();
++    drop(txn.open_table(HEGEL_MODEL_TABLE).unwrap());
++    txn.commit().unwrap();
++
++    let machine = DbModelMachine {
++        txn: None,
++        savepoints: Vec::new(),
++        db,
++        committed: BTreeMap::new(),
++        uncommitted: BTreeMap::new(),
++        txn_dirty: false,
++    };
++    hegel::stateful::machine(machine).run(tc);
++}
+diff --git a/tests/multimap_tests.rs b/tests/multimap_tests.rs
+index 2038446..946013d 100644
+--- a/tests/multimap_tests.rs
++++ b/tests/multimap_tests.rs
+@@ -647,3 +647,106 @@ fn multimap_remove_nonexistent_value_from_subtree_does_not_churn() {
+     assert_eq!(table.len().unwrap(), 1000);
+     assert_eq!(table.get(&0u64).unwrap().len(), 1000);
+ }
++
++// ==== Hegel property-based tests ====
++
++use hegel::generators;
++use std::collections::{BTreeMap, BTreeSet};
++
++const HEGEL_MM_TABLE: MultimapTableDefinition<u64, &[u8]> =
++    MultimapTableDefinition::new("hegel_multimap");
++
++// Property: an arbitrary sequence of multimap operations (insert / remove / remove_all / get)
++// agrees with a BTreeMap<u64, BTreeSet<Vec<u8>>> model after every operation: the returned
++// "was present" booleans match, removed/fetched value iterators yield exactly the model's
++// values in sorted order, and len() equals the total number of key-value pairs. Evidence:
++// `MultimapTable::insert`/`remove` docs ("Returns true if the key-value pair was present"),
++// `len` docs, and the maintainers' own fuzzer (fuzz/fuzz_targets/fuzz_redb.rs) which uses the
++// same reference model.
++#[hegel::test]
++fn hegel_multimap_matches_model(tc: hegel::TestCase) {
++    let tmpfile = create_tempfile();
++    let db = Database::create(tmpfile.path()).unwrap();
++    let mut model: BTreeMap<u64, BTreeSet<Vec<u8>>> = BTreeMap::new();
++    let txn = db.begin_write().unwrap();
++    {
++        let mut table = txn.open_multimap_table(HEGEL_MM_TABLE).unwrap();
++        let num_ops: usize = tc.draw(generators::integers::<usize>().max_value(60));
++        for _ in 0..num_ops {
++            // Mostly draw from a small key space so operations collide, but keep the full
++            // u64 range reachable.
++            let key: u64 = tc.draw(hegel::one_of!(
++                generators::integers::<u64>().max_value(15),
++                generators::integers::<u64>(),
++            ));
++            let op: u8 = tc.draw(generators::integers::<u8>().max_value(3));
++            match op {
++                0 => {
++                    let value: Vec<u8> = tc.draw(generators::binary().max_size(16));
++                    let existed = table.insert(&key, value.as_slice()).unwrap();
++                    let model_existed = !model.entry(key).or_default().insert(value);
++                    assert_eq!(existed, model_existed);
++                }
++                1 => {
++                    // Bias towards values that are actually present under this key.
++                    let candidates: Vec<Vec<u8>> = model
++                        .get(&key)
++                        .map(|s| s.iter().cloned().collect())
++                        .unwrap_or_default();
++                    let value: Vec<u8> =
++                        if !candidates.is_empty() && tc.draw(generators::booleans()) {
++                            tc.draw(generators::sampled_from(candidates))
++                        } else {
++                            tc.draw(generators::binary().max_size(16))
++                        };
++                    let existed = table.remove(&key, value.as_slice()).unwrap();
++                    let model_existed = model
++                        .get_mut(&key)
++                        .map(|s| s.remove(&value))
++                        .unwrap_or(false);
++                    if model.get(&key).is_some_and(|s| s.is_empty()) {
++                        model.remove(&key);
++                    }
++                    assert_eq!(existed, model_existed);
++                }
++                2 => {
++                    let removed_iter = table.remove_all(&key).unwrap();
++                    let removed: Vec<Vec<u8>> =
++                        removed_iter.map(|r| r.unwrap().value().to_vec()).collect();
++                    let expected: Vec<Vec<u8>> =
++                        model.remove(&key).unwrap_or_default().into_iter().collect();
++                    assert_eq!(removed, expected);
++                }
++                _ => {
++                    let got: Vec<Vec<u8>> = table
++                        .get(&key)
++                        .unwrap()
++                        .map(|r| r.unwrap().value().to_vec())
++                        .collect();
++                    let expected: Vec<Vec<u8>> = model
++                        .get(&key)
++                        .map(|s| s.iter().cloned().collect())
++                        .unwrap_or_default();
++                    assert_eq!(got, expected);
++                }
++            }
++            let model_len: u64 = model.values().map(|s| s.len() as u64).sum();
++            assert_eq!(table.len().unwrap(), model_len);
++        }
++    }
++    txn.commit().unwrap();
++
++    // Full comparison of committed state against the model.
++    let read_txn = db.begin_read().unwrap();
++    let table = read_txn.open_multimap_table(HEGEL_MM_TABLE).unwrap();
++    let mut model_iter = model.iter();
++    for item in table.iter().unwrap() {
++        let (key, values) = item.unwrap();
++        let (model_key, model_values) = model_iter.next().unwrap();
++        assert_eq!(key.value(), *model_key);
++        let actual_values: Vec<Vec<u8>> = values.map(|r| r.unwrap().value().to_vec()).collect();
++        let expected_values: Vec<Vec<u8>> = model_values.iter().cloned().collect();
++        assert_eq!(actual_values, expected_values);
++    }
++    assert!(model_iter.next().is_none());
++}
