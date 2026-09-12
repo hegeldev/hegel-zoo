@@ -38,3 +38,4 @@
 - 2025-11-30: predecessor base commit `7a496cb5186d` (release 1.2.2).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/cbor4ii.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 7a496cb5186d → b08f1b162168 (2026-09-07, "release 1.2.3"; 1.2.3); 1 bug(s) still reproduce; fixed upstream: cbor4ii/1. 56 tests pass. cbor4ii/1 (big negative integers) is fixed upstream in 1.2.3; cbor4ii/2 still reproduces.
