@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -227,6 +228,8 @@ def finalize(crate: str) -> str:
     r = sh(str(TOOLS / "zoo"), "check", f"rust/{crate}", check=False)
     if r.returncode:
         return f"ERROR   {crate}: check failed:\n{r.stdout.strip()}"
+    # the disk is small and a Rust target/ dir is 1-3 GB: drop the checkout once the patch is saved
+    shutil.rmtree(work, ignore_errors=True)
     return f"PORTED  {crate} ({version or '?'}, {license_ or '?'})"
 
 

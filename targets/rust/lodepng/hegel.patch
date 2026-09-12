@@ -1,0 +1,503 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 3ce33d0..3d1ba94 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -47,3 +47,6 @@ ngzlib = ["flate2/zlib-ng-compat"]
+ c_ffi = ["dep:libc"]
+ # Enable `c_ffi` explicitly
+ _deprecated_c_ffi_default_ = ["dep:libc"]
++
++[dev-dependencies]
++hegeltest = "0.44.1"
+diff --git a/tests/roundtrip/roundtrip_test.rs b/tests/roundtrip/roundtrip_test.rs
+index dad2a94..c99ad5d 100644
+--- a/tests/roundtrip/roundtrip_test.rs
++++ b/tests/roundtrip/roundtrip_test.rs
+@@ -95,3 +95,79 @@ fn assert_img_equals<T>(img: &Bitmap<T>, buffer: &[u8], width: usize, height: us
+     assert_eq!(img.height, height);
+     assert_eq!(data, buffer);
+ }
++
++use hegel::generators;
++
++use hegel::Generator;
++
++// Property: for every valid non-palette (colortype, bitdepth) combination —
++// including the 1/2/4-bit GREY depths the exhaustive tests above skip — with
++// generated dimensions, interlace mode and filter configuration, encode
++// followed by decode reproduces the raw pixel buffer exactly. Evidence:
++// roundtrip_color above and fuzz/fuzz_targets/reencode24.rs assert the same
++// for the 8/16-bit modes.
++#[hegel::test]
++fn roundtrip_generated_color_config(tc: hegel::TestCase) {
++    let (colortype, bitdepth) = tc.draw((generators::sampled_from(crate::color_configs())).print_as_debug());
++    let width = tc.draw(generators::integers::<usize>().min_value(1).max_value(33));
++    let height = tc.draw(generators::integers::<usize>().min_value(1).max_value(33));
++    let interlace: u8 = tc.draw(generators::integers::<u8>().max_value(1));
++    let raw = crate::draw_raw_pixels(&tc, width, height, colortype, bitdepth);
++
++    let mut enc = crate::configured_encoder(colortype, bitdepth, interlace);
++    crate::configure_filters(&tc, &mut enc, height);
++    let png = enc.encode(&raw, width, height).unwrap();
++
++    let img = lodepng::decode_memory(&png, colortype, bitdepth).unwrap();
++    assert_eq!(img.width(), width);
++    assert_eq!(img.height(), height);
++    assert_eq!(img.bytes(), &raw[..]);
++}
++
++// Property: palette images roundtrip exactly — the packed indices and the
++// palette itself survive encode + decode (color_convert(false)), and decoding
++// to RGBA maps every index through the palette (independent oracle for the
++// palette-expansion path).
++#[hegel::test]
++fn roundtrip_generated_palette(tc: hegel::TestCase) {
++    let bitdepth: u32 = tc.draw(generators::sampled_from(vec![1, 2, 4, 8]));
++    let max_len = 1usize << bitdepth; // 2, 4, 16, 256
++    let pal_len = tc.draw(generators::integers::<usize>().min_value(1).max_value(max_len));
++    let palette: Vec<RGBA> = crate::draw_pixel_bytes(&tc, pal_len * 4)
++        .chunks_exact(4)
++        .map(|c| RGBA::new(c[0], c[1], c[2], c[3]))
++        .collect();
++
++    let width = tc.draw(generators::integers::<usize>().min_value(1).max_value(33));
++    let height = tc.draw(generators::integers::<usize>().min_value(1).max_value(33));
++    let interlace: u8 = tc.draw(generators::integers::<u8>().max_value(1));
++    // indices must stay in range of the palette
++    let indices: Vec<u8> = crate::draw_pixel_bytes(&tc, width * height)
++        .iter()
++        .map(|&v| (v as usize % pal_len) as u8)
++        .collect();
++    let raw = crate::pack_bits(&indices, bitdepth);
++
++    let mut enc = Encoder::new();
++    enc.set_auto_convert(false);
++    enc.set_palette(&palette).unwrap();
++    enc.info_raw_mut().set_bitdepth(bitdepth);
++    enc.info_png_mut().color.set_bitdepth(bitdepth);
++    enc.info_png_mut().interlace_method = interlace;
++    let png = enc.encode(&raw, width, height).unwrap();
++
++    // decode without color conversion: exact index and palette roundtrip
++    let mut dec = Decoder::new();
++    dec.color_convert(false);
++    let img = dec.decode(&png).unwrap();
++    assert_eq!(img.width(), width);
++    assert_eq!(img.height(), height);
++    assert_eq!(img.bytes(), &raw[..]);
++    assert_eq!(dec.info_png().color.palette(), &palette[..]);
++
++    // decode to RGBA: every pixel must be the palette entry its index points to
++    let rgba = lodepng::decode32(&png).unwrap();
++    for (px, &idx) in rgba.buffer.iter().zip(&indices) {
++        assert_eq!(*px, palette[usize::from(idx)]);
++    }
++}
+diff --git a/tests/tests.rs b/tests/tests.rs
+index cd7a5a5..4003fb5 100644
+--- a/tests/tests.rs
++++ b/tests/tests.rs
+@@ -5,6 +5,392 @@ mod roundtrip {
+     mod roundtrip_test;
+ }
+ 
++use hegel::generators;
++
++use hegel::Generator;
++
++// ---------------------------------------------------------------------------
++// Shared helpers for the hegel property-based tests (also used by
++// roundtrip/roundtrip_test.rs via `crate::`).
++// ---------------------------------------------------------------------------
++
++/// All valid non-palette (colortype, bitdepth) combinations from the PNG spec.
++/// PALETTE is handled separately because decoding back to palette mode needs a
++/// palette in the target color mode.
++pub fn color_configs() -> Vec<(ColorType, u32)> {
++    let mut v = Vec::new();
++    for bd in [1, 2, 4, 8, 16] {
++        v.push((ColorType::GREY, bd));
++    }
++    for bd in [8, 16] {
++        v.push((ColorType::RGB, bd));
++        v.push((ColorType::GREY_ALPHA, bd));
++        v.push((ColorType::RGBA, bd));
++    }
++    v
++}
++
++/// Draw `n` bytes of structured pixel data. PNG filters exploit inter-pixel
++/// correlation, so constants, tiles, gradients and runs exercise the filter
++/// heuristics much harder than uniform noise (which the tiled-chunk mode still
++/// provides for small images).
++pub fn draw_pixel_bytes(tc: &hegel::TestCase, n: usize) -> Vec<u8> {
++    let mode = tc.draw(generators::integers::<u8>().max_value(3));
++    match mode {
++        0 => {
++            // constant image
++            let b = tc.draw(generators::integers::<u8>());
++            vec![b; n]
++        }
++        1 => {
++            // tiled chunk: covers stripes, periodic patterns, and raw noise
++            let chunk: Vec<u8> = tc.draw(
++                generators::vecs(generators::integers::<u8>())
++                    .min_size(1)
++                    .max_size(64),
++            );
++            (0..n).map(|i| chunk[i % chunk.len()]).collect()
++        }
++        2 => {
++            // wrapping gradient
++            let start = tc.draw(generators::integers::<u8>());
++            let step = tc.draw(generators::integers::<u8>());
++            (0..n)
++                .map(|i| start.wrapping_add((i as u8).wrapping_mul(step)))
++                .collect()
++        }
++        _ => {
++            // run-length structured data
++            let runs: Vec<(u8, usize)> = tc.draw(
++                generators::vecs(generators::tuples!(
++                    generators::integers::<u8>(),
++                    generators::integers::<usize>().min_value(1).max_value(32),
++                ))
++                .min_size(1)
++                .max_size(8),
++            );
++            let mut out = Vec::with_capacity(n);
++            'outer: loop {
++                for &(v, len) in &runs {
++                    for _ in 0..len {
++                        if out.len() == n {
++                            break 'outer;
++                        }
++                        out.push(v);
++                    }
++                }
++            }
++            out
++        }
++    }
++}
++
++/// Pack per-pixel sample values (already masked to `bits`) MSB-first into the
++/// continuous bitstream lodepng uses for raw buffers with bitdepth < 8
++/// (no per-scanline padding; only the final byte is zero-padded).
++pub fn pack_bits(values: &[u8], bits: u32) -> Vec<u8> {
++    assert!(matches!(bits, 1 | 2 | 4 | 8));
++    if bits == 8 {
++        return values.to_vec();
++    }
++    let bits = bits as usize;
++    let mut out = vec![0u8; (values.len() * bits + 7) / 8];
++    for (i, &v) in values.iter().enumerate() {
++        let bitpos = i * bits;
++        out[bitpos / 8] |= (v & ((1u16 << bits) - 1) as u8) << (8 - bits - bitpos % 8);
++    }
++    out
++}
++
++/// Draw a raw pixel buffer of exactly `ColorMode::raw_size` bytes for the
++/// given color mode. For bitdepth < 8, per-pixel values are drawn and packed
++/// so the final byte's padding bits stay zero (as the decoder produces them).
++pub fn draw_raw_pixels(tc: &hegel::TestCase, w: usize, h: usize, colortype: ColorType, bitdepth: u32) -> Vec<u8> {
++    let bpp = colortype.bpp(bitdepth) as usize;
++    if bpp >= 8 {
++        draw_pixel_bytes(tc, w * h * bpp / 8)
++    } else {
++        let mask = ((1u16 << bpp) - 1) as u8;
++        let vals: Vec<u8> = draw_pixel_bytes(tc, w * h).iter().map(|v| v & mask).collect();
++        pack_bits(&vals, bitdepth)
++    }
++}
++
++/// Encoder with auto_convert off and identical raw/png color modes.
++pub fn configured_encoder(colortype: ColorType, bitdepth: u32, interlace: u8) -> Encoder {
++    let mut enc = Encoder::new();
++    enc.set_auto_convert(false);
++    enc.info_raw_mut().set_colortype(colortype);
++    enc.info_raw_mut().set_bitdepth(bitdepth);
++    enc.info_png_mut().color.set_colortype(colortype);
++    enc.info_png_mut().color.set_bitdepth(bitdepth);
++    enc.info_png_mut().interlace_method = interlace;
++    enc
++}
++
++/// Draw either a filter strategy or explicit per-scanline predefined filters.
++pub fn configure_filters(tc: &hegel::TestCase, enc: &mut Encoder, height: usize) {
++    if tc.draw(generators::booleans()) {
++        let filters: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().max_value(4))
++                .min_size(height)
++                .max_size(height),
++        );
++        enc.set_predefined_filters(filters);
++    } else {
++        let strategy = tc.draw((generators::sampled_from(vec![
++            FilterStrategy::ZERO,
++            FilterStrategy::MINSUM,
++            FilterStrategy::ENTROPY,
++            FilterStrategy::BRUTE_FORCE,
++        ])).print_as_debug());
++        let palette_filter_zero = tc.draw(generators::booleans());
++        enc.set_filter_strategy(strategy, palette_filter_zero);
++    }
++}
++
++fn draw_dimension(tc: &hegel::TestCase, max: usize) -> usize {
++    tc.draw(generators::integers::<usize>().min_value(1).max_value(max))
++}
++
++// ---------------------------------------------------------------------------
++// Hegel property-based tests
++// ---------------------------------------------------------------------------
++
++// Property: decoding a low-bitdepth GREY png to RGBA scales every sample by
++// 255/(2^bd - 1) into all three channels with opaque alpha (independent oracle
++// for the sample-scaling conversion; evolved from test_low_bpp above).
++// For 16-bit input the 8-bit output is the most significant byte.
++#[hegel::test]
++fn grey_decode32_matches_sample_scaling(tc: hegel::TestCase) {
++    let bitdepth: u32 = tc.draw(generators::sampled_from(vec![1, 2, 4, 8, 16]));
++    let width = draw_dimension(&tc, 33);
++    let height = draw_dimension(&tc, 33);
++    let interlace: u8 = tc.draw(generators::integers::<u8>().max_value(1));
++    let n = width * height;
++
++    let (raw, expected): (Vec<u8>, Vec<u8>) = if bitdepth == 16 {
++        // big-endian 16-bit samples; 16->8 conversion keeps the MSB
++        let bytes = draw_pixel_bytes(&tc, n * 2);
++        let expected = bytes.iter().step_by(2).copied().collect();
++        (bytes, expected)
++    } else {
++        let mask = ((1u16 << bitdepth) - 1) as u8;
++        let factor = (255 / u16::from(mask)) as u8; // 255, 85, 17, 1
++        let vals: Vec<u8> = draw_pixel_bytes(&tc, n).iter().map(|v| v & mask).collect();
++        let expected = vals.iter().map(|&v| v * factor).collect();
++        (pack_bits(&vals, bitdepth), expected)
++    };
++
++    let enc = configured_encoder(ColorType::GREY, bitdepth, interlace);
++    let png = enc.encode(&raw, width, height).unwrap();
++    let img = decode32(&png).unwrap();
++    assert_eq!(img.width, width);
++    assert_eq!(img.height, height);
++    for (px, &e) in img.buffer.iter().zip(&expected) {
++        assert_eq!(*px, RGBA::new(e, e, e, 255));
++    }
++}
++
++// Property: encoding RGBA with auto_convert (the default) is lossless no
++// matter which output mode the encoder picks (grey / palette / color-key /
++// rgb / grey-alpha). Evidence: docs describe auto_convert as picking the
++// smallest mode that can represent the image exactly; bgr/low_bpp tests rely
++// on the same.
++#[hegel::test]
++fn auto_convert_encode_is_lossless(tc: hegel::TestCase) {
++    let width = draw_dimension(&tc, 32);
++    let height = draw_dimension(&tc, 32);
++    let n = width * height;
++    // Bias pixel shapes so different auto-chosen output modes are hit:
++    // arbitrary, opaque, greyscale, grey+alpha, binary transparency (color key).
++    let shape = tc.draw(generators::integers::<u8>().max_value(4));
++    let bytes = draw_pixel_bytes(&tc, n * 4);
++    let pixels: Vec<RGBA> = bytes
++        .chunks_exact(4)
++        .map(|c| match shape {
++            0 => RGBA::new(c[0], c[1], c[2], c[3]),
++            1 => RGBA::new(c[0], c[1], c[2], 255),
++            2 => RGBA::new(c[0], c[0], c[0], 255),
++            3 => RGBA::new(c[0], c[0], c[0], c[1]),
++            _ => RGBA::new(c[0], c[1], c[2], if c[3] & 1 == 0 { 0 } else { 255 }),
++        })
++        .collect();
++
++    let mut enc = Encoder::new();
++    enc.set_auto_convert(true);
++    enc.info_raw_mut().set_colortype(ColorType::RGBA);
++    enc.info_raw_mut().set_bitdepth(8);
++    let png = enc.encode(&pixels, width, height).unwrap();
++
++    let img = decode32(&png).unwrap();
++    assert_eq!(img.width, width);
++    assert_eq!(img.height, height);
++    assert_eq!(pixels, img.buffer);
++}
++
++// Property: the decoder returns an error (never panics, never aborts) on
++// arbitrary bytes, including inputs that start with a valid PNG signature or
++// a valid signature+IHDR. PNG decoders are a classic fuzz target and this
++// crate is a port of C code.
++#[hegel::test]
++fn decode_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++    let (colortype, bitdepth) = tc.draw((generators::sampled_from(color_configs())).print_as_debug());
++    let mut data = match tc.draw(generators::integers::<u8>().max_value(2)) {
++        0 => Vec::new(),
++        1 => b"\x89PNG\r\n\x1a\n".to_vec(),
++        _ => {
++            // valid signature + IHDR of a real 1x1 png, then garbage
++            let valid = encode_memory(&[0u8], 1, 1, ColorType::GREY, 8).unwrap();
++            valid[..33].to_vec()
++        }
++    };
++    data.extend_from_slice(&tc.draw(generators::binary().max_size(300)));
++    drop(decode_memory(&data, colortype, bitdepth));
++}
++
++// Property: corrupting bytes of a valid PNG must never make the default
++// decoder panic or abort. The CRC check rejects a corrupt header before any
++// image-sized allocation, so this exercises the inflate/unfilter/conversion
++// code on damaged payloads and must always return an error, never crash.
++#[hegel::test]
++fn decode_corrupted_png_never_panics(tc: hegel::TestCase) {
++    let (colortype, bitdepth) = tc.draw((generators::sampled_from(color_configs())).print_as_debug());
++    let width = draw_dimension(&tc, 16);
++    let height = draw_dimension(&tc, 16);
++    let interlace: u8 = tc.draw(generators::integers::<u8>().max_value(1));
++    let raw = draw_raw_pixels(&tc, width, height, colortype, bitdepth);
++    let enc = configured_encoder(colortype, bitdepth, interlace);
++    let mut png = enc.encode(&raw, width, height).unwrap();
++
++    let mutations: Vec<(usize, u8)> = tc.draw(
++        generators::vecs(generators::tuples!(
++            generators::integers::<usize>(),
++            generators::integers::<u8>(),
++        ))
++        .min_size(1)
++        .max_size(8),
++    );
++    for &(pos, val) in &mutations {
++        let len = png.len();
++        png[pos % len] = val;
++    }
++
++    drop(decode_memory(&png, colortype, bitdepth));
++}
++
++// KNOWN FAILURE (process abort — kept #[ignore]d so it never runs in the
++// suite; running it OOM-kills the whole test binary).
++//
++// A corrupt IHDR that declares huge dimensions makes the decoder attempt an
++// image-sized buffer allocation. On the CRC-checked default path this is
++// rejected at the IHDR checksum, but with `ignore_crc = true` the oversized
++// header reaches decode_generic. The crate deliberately uses
++// `try_reserve_exact` there to fail such allocations gracefully (and it DOES
++// return Error 83 when a hard limit is in force, e.g. `ulimit -v`), but under
++// Linux memory overcommit the reservation succeeds and the subsequent
++// zero-fill (`Vec::resize(size, 0)`) touches every page, so the process is
++// OOM-killed instead of returning an error.
++//
++// Reproducer: a valid 1x1 RGBA-16 PNG whose IHDR width/height are overwritten
++// with 0xFFFF each (~4.3e9 pixels x 8 bytes ~= 34 GiB) and decoded with CRC
++// checking disabled. Deterministic — no randomness. The assertion is what the
++// decoder *should* do (return an error); under overcommit it never gets there.
++#[test]
++#[ignore = "OOM-kills the process under Linux overcommit; see comment"]
++fn decode_ignore_crc_oversized_header_ooms() {
++    // Valid 1x1 RGBA 16-bit PNG.
++    let mut png = encode_memory(&[0u16, 0, 0, 0], 1, 1, ColorType::RGBA, 16).unwrap();
++    // Overwrite IHDR width (bytes 16..20) and height (bytes 20..24) with 0xFFFF.
++    png[16..24].copy_from_slice(&[0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF]);
++
++    #[allow(deprecated)]
++    let mut state = lodepng::State::default();
++    state.decoder.ignore_crc = true;
++    #[allow(deprecated)]
++    let result = state.decode(&png);
++    // Correct behaviour would be a graceful error; the bug is that this line is
++    // never reached because the process is OOM-killed first.
++    assert!(result.is_err(), "expected an error for an oversized corrupt header");
++}
++
++// Property: any strict prefix of a valid PNG is rejected with an error (the
++// IEND chunk can never be complete in a strict prefix, and the decoder
++// requires it — rustimpl.rs returns error 52 when IEND is missing).
++#[hegel::test]
++fn decode_truncated_png_errors(tc: hegel::TestCase) {
++    let (colortype, bitdepth) = tc.draw((generators::sampled_from(color_configs())).print_as_debug());
++    let width = draw_dimension(&tc, 16);
++    let height = draw_dimension(&tc, 16);
++    let raw = draw_raw_pixels(&tc, width, height, colortype, bitdepth);
++    let enc = configured_encoder(colortype, bitdepth, 0);
++    let png = enc.encode(&raw, width, height).unwrap();
++
++    let cut = tc.draw(generators::integers::<usize>().max_value(png.len() - 1));
++    let result = decode_memory(&png[..cut], colortype, bitdepth);
++    assert!(result.is_err(), "decoding a {}-byte prefix of a {}-byte png succeeded", cut, png.len());
++}
++
++// Property: Decoder::inspect reports the encoded width/height and the exact
++// color type, bit depth and interlace method the encoder was configured with
++// (evolved from the metadata assertions in test_low_bpp).
++#[hegel::test]
++fn inspect_reports_encoder_metadata(tc: hegel::TestCase) {
++    let (colortype, bitdepth) = tc.draw((generators::sampled_from(color_configs())).print_as_debug());
++    let width = draw_dimension(&tc, 33);
++    let height = draw_dimension(&tc, 33);
++    let interlace: u8 = tc.draw(generators::integers::<u8>().max_value(1));
++    let raw = draw_raw_pixels(&tc, width, height, colortype, bitdepth);
++    let enc = configured_encoder(colortype, bitdepth, interlace);
++    let png = enc.encode(&raw, width, height).unwrap();
++
++    let mut dec = Decoder::new();
++    let (w, h) = dec.inspect(&png).unwrap();
++    assert_eq!((w, h), (width, height));
++    assert_eq!(dec.info_png().color.colortype(), colortype);
++    assert_eq!(dec.info_png().color.bitdepth(), bitdepth);
++    assert_eq!(dec.info_png().interlace_method, interlace);
++}
++
++// Property: the file-based convenience API agrees with the in-memory API:
++// encode_file + decode_file through a real file produce the same image as
++// encode_memory + decode_memory, and both reproduce the raw pixels.
++//
++// The free encode functions always auto-convert, so the PNG's color mode can
++// differ from the input mode. Decoding back to a grey mode with bitdepth != 8
++// is only supported when the modes match exactly (error 56 guard in
++// rustimpl.rs lodepng_decode), so this property draws only from the modes the
++// converter supports unconditionally.
++#[hegel::test]
++fn file_and_memory_apis_agree(tc: hegel::TestCase) {
++    let (colortype, bitdepth) = tc.draw((generators::sampled_from(vec![
++        (ColorType::GREY, 8),
++        (ColorType::GREY_ALPHA, 8),
++        (ColorType::RGB, 8),
++        (ColorType::RGB, 16),
++        (ColorType::RGBA, 8),
++        (ColorType::RGBA, 16),
++    ])).print_as_debug());
++    let width = draw_dimension(&tc, 24);
++    let height = draw_dimension(&tc, 24);
++    let raw = draw_raw_pixels(&tc, width, height, colortype, bitdepth);
++
++    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
++        .join(format!("hegel-file-vs-memory-{}.png", std::process::id()));
++
++    let png_mem = encode_memory(&raw, width, height, colortype, bitdepth).unwrap();
++    encode_file(&path, &raw, width, height, colortype, bitdepth).unwrap();
++
++    let img_mem = decode_memory(&png_mem, colortype, bitdepth).unwrap();
++    let img_file = decode_file(&path, colortype, bitdepth).unwrap();
++    std::fs::remove_file(&path).ok();
++
++    assert_eq!((img_mem.width(), img_mem.height()), (width, height));
++    assert_eq!((img_file.width(), img_file.height()), (width, height));
++    assert_eq!(img_mem.bytes(), img_file.bytes());
++    assert_eq!(img_mem.bytes(), &raw[..]);
++}
++
+ fn encode<T: lodepng::Pod>(pixels: &[T], in_type: ColorType, out_type: ColorType) -> Result<Vec<u8>, Error> {
+     let mut state = Encoder::new();
+     state.set_auto_convert(true);
+@@ -159,8 +545,8 @@ fn test_low_bpp(bitdepth: u8, interlace: bool) {
+ 
+     let mut d = lodepng::Decoder::new();
+     d.inspect(&file).unwrap();
+-    assert_eq!(d.info_png().color.bitdepth(), bitdepth.into());
+-    assert_eq!(d.info_png().interlace_method, interlace.into());
++    assert_eq!(d.info_png().color.bitdepth(), u32::from(bitdepth));
++    assert_eq!(d.info_png().interlace_method, u8::from(interlace));
+ 
+     let check = lodepng::decode_memory(&file, ColorType::GREY, 8).unwrap();
+     assert_eq!(50, check.width());
