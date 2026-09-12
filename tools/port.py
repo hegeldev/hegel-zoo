@@ -73,6 +73,29 @@ def fix_composites(root: Path) -> int:
     return n
 
 
+# 0.28 → 0.44 API drift that is a plain textual rewrite. `exclude_min(true)` still compiles in
+# 0.44 but panics at draw time ("has been removed"), so the compiler never points at it.
+DRIFT_RES = [
+    (re.compile(r"\.min_value\(([^()]*(?:\([^()]*\)[^()]*)*)\)\.exclude_min\(true\)"), r".min_value_exclusive(\1)"),
+    (re.compile(r"\.max_value\(([^()]*(?:\([^()]*\)[^()]*)*)\)\.exclude_max\(true\)"), r".max_value_exclusive(\1)"),
+]
+
+
+def fix_drift(root: Path) -> int:
+    n = 0
+    for f in root.rglob("*.rs"):
+        if "target" in f.parts:
+            continue
+        s = f.read_text(errors="replace")
+        new = s
+        for rx, repl in DRIFT_RES:
+            new, k = rx.subn(repl, new)
+            n += k
+        if new != s:
+            f.write_text(new)
+    return n
+
+
 STATEFUL_RUN_RE = re.compile(r"\b((?:hegel::)?stateful::)run\(")
 
 
@@ -376,7 +399,7 @@ def port(crate: str) -> str:
     # the patch may add the dev-dependency to several manifests (workspace members): all of them
     if not sum(rewrite_dep(c) for c in work.rglob("Cargo.toml") if "target" not in c.parts):
         return f"ERROR   {crate}: hegeltest dependency line not found"
-    nfix = fix_composites(work) + fix_stateful_run(work)
+    nfix = fix_composites(work) + fix_stateful_run(work) + fix_drift(work)
 
     def run_tests() -> tuple[str, str]:
         r = sh(str(TOOLS / "zoo"), "test", "--no-apply", f"rust/{crate}", check=False)

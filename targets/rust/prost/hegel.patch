@@ -1,0 +1,573 @@
+diff --git a/prost/Cargo.toml b/prost/Cargo.toml
+index ea589d3..3cf4851 100644
+--- a/prost/Cargo.toml
++++ b/prost/Cargo.toml
+@@ -27,6 +27,7 @@ prost-derive = { version = "0.14.4", path = "../prost-derive", optional = true }
+ 
+ [dev-dependencies]
+ criterion = { version = "0.8", default-features = false }
++hegeltest = "0.44.1"
+ proptest = "1"
+ rand = "0.10"
+ 
+diff --git a/prost/src/encoding/varint.rs b/prost/src/encoding/varint.rs
+index a9ee3c9..3f1c1a0 100644
+--- a/prost/src/encoding/varint.rs
++++ b/prost/src/encoding/varint.rs
+@@ -275,4 +275,141 @@ mod test {
+         let mut copy = U64_MAX_PLUS_ONE;
+         decode_varint_slow(&mut copy).expect_err("slow decoding u64::MAX + 1 succeeded");
+     }
++
++    use ::bytes::BytesMut;
++    use hegel::generators;
++
++    /// Independent LEB128 reference encoder, used as an oracle for `encode_varint`.
++    ///
++    /// Written directly from the wire-format spec
++    /// (<https://protobuf.dev/programming-guides/encoding/#varints>): emit the value in
++    /// little-endian 7-bit groups, setting the continuation bit on all but the last byte.
++    fn leb128_reference(mut value: u64) -> Vec<u8> {
++        let mut out = Vec::new();
++        while value >= 0x80 {
++            out.push((value as u8 & 0x7F) | 0x80);
++            value >>= 7;
++        }
++        out.push(value as u8);
++        out
++    }
++
++    /// Generates a `u64` biased toward the LEB128 encoded-length boundaries
++    /// (`2^(7k) - 1`, `2^(7k)`, `2^(7k) + 1`), where off-by-one bugs in
++    /// `encoded_len_varint`/`encode_varint` live, while still covering the full range.
++    #[hegel::composite]
++    fn varint_values(tc: &hegel::TestCase) -> u64 {
++        let mut boundaries = alloc::vec![0u64, 1, u64::MAX - 1, u64::MAX];
++        for k in 1..=9u32 {
++            let b = 1u64 << (7 * k);
++            boundaries.push(b - 1);
++            boundaries.push(b);
++            boundaries.push(b + 1);
++        }
++        tc.draw(hegel::one_of!(
++            generators::integers::<u64>(),
++            generators::sampled_from(boundaries),
++        ))
++    }
++
++    /// Property: `encode_varint` produces exactly the bytes the LEB128 spec prescribes,
++    /// and `encoded_len_varint` agrees with the actual encoded length.
++    #[hegel::test]
++    fn hegel_encode_varint_matches_leb128_reference(tc: hegel::TestCase) {
++        let value = tc.draw(varint_values());
++
++        let expected = leb128_reference(value);
++        let mut buf = Vec::with_capacity(10);
++        encode_varint(value, &mut buf);
++
++        assert_eq!(buf, expected);
++        assert_eq!(encoded_len_varint(value), expected.len());
++    }
++
++    /// Property: all three decoding paths (`decode_varint`, the unrolled
++    /// `decode_varint_slice`, and the fallback `decode_varint_slow`) round-trip every
++    /// encoded varint back to the original value and consume exactly its bytes.
++    #[hegel::test]
++    fn hegel_varint_decode_paths_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw(varint_values());
++        let mut buf = Vec::with_capacity(10);
++        encode_varint(value, &mut buf);
++
++        let mut fast = &buf[..];
++        assert_eq!(decode_varint(&mut fast).expect("decode_varint failed"), value);
++        assert!(fast.is_empty(), "decode_varint did not consume all bytes");
++
++        // Safety precondition of `decode_varint_slice` holds: an encoded varint is
++        // non-empty and its final byte is < 0x80.
++        let (slice_value, advance) =
++            decode_varint_slice(&buf).expect("decode_varint_slice failed");
++        assert_eq!(slice_value, value);
++        assert_eq!(advance, buf.len());
++
++        let mut slow = &buf[..];
++        assert_eq!(
++            decode_varint_slow(&mut slow).expect("decode_varint_slow failed"),
++            value
++        );
++        assert!(slow.is_empty(), "decode_varint_slow did not consume all bytes");
++    }
++
++    /// Property: on *arbitrary* bytes the optimized decoder (`decode_varint`, which
++    /// dispatches to the unrolled slice decoder) and the simple loop decoder
++    /// (`decode_varint_slow`) agree — same Ok/Err outcome, same value, same number of
++    /// bytes consumed on success — and neither panics.
++    #[hegel::test]
++    fn hegel_varint_decoders_agree_on_arbitrary_bytes(tc: hegel::TestCase) {
++        // Bias toward continuation bytes (>= 0x80) so long, truncated, and overflowing
++        // varints are common; uniform bytes terminate after ~2 bytes on average.
++        let bytes: Vec<u8> = tc.draw(
++            generators::vecs(hegel::one_of!(
++                generators::integers::<u8>(),
++                generators::integers::<u8>().min_value(0x80),
++            ))
++            .max_size(24),
++        );
++
++        let mut fast = &bytes[..];
++        let fast_result = decode_varint(&mut fast);
++        let mut slow = &bytes[..];
++        let slow_result = decode_varint_slow(&mut slow);
++
++        match (fast_result, slow_result) {
++            (Ok(f), Ok(s)) => {
++                assert_eq!(f, s, "decoders returned different values");
++                assert_eq!(
++                    fast.len(),
++                    slow.len(),
++                    "decoders consumed different numbers of bytes"
++                );
++            }
++            (Err(_), Err(_)) => {}
++            (fast_result, slow_result) => panic!(
++                "decoders disagree on {bytes:?}: fast={fast_result:?}, slow={slow_result:?}"
++            ),
++        }
++    }
++
++    /// Property: decoding a varint split across two non-contiguous `Buf` chunks (via
++    /// `Buf::chain`) yields the same value as contiguous decoding, for every value and
++    /// every split point. Generalizes the hand-picked cases in
++    /// `encoding::test::split_varint_decoding`, which is kept as a cheap pin.
++    #[hegel::test]
++    fn hegel_varint_split_buffer_decode(tc: hegel::TestCase) {
++        let value = tc.draw(varint_values());
++        let mut buf = BytesMut::with_capacity(10);
++        encode_varint(value, &mut buf);
++        let len = buf.len();
++
++        let split = tc.draw(generators::integers::<usize>().max_value(len));
++        let b2 = buf.split_off(split);
++        let mut chained = buf.chain(b2);
++
++        assert_eq!(
++            decode_varint(&mut chained).expect("split-buffer decode failed"),
++            value
++        );
++        assert_eq!(chained.remaining(), 0);
++    }
+ }
+diff --git a/prost/tests/derived_message_properties.rs b/prost/tests/derived_message_properties.rs
+new file mode 100644
+index 0000000..69246fb
+--- /dev/null
++++ b/prost/tests/derived_message_properties.rs
+@@ -0,0 +1,409 @@
++//! Property-based tests (hegel) for the derived `Message` implementation, exercising the
++//! full wire format through a message that uses every field kind the derive supports:
++//! all scalar types (including sint/sfixed), optionals, packed and unpacked repeated
++//! fields, strings, bytes (`Vec<u8>` and `Bytes`), enumerations, nested messages, maps,
++//! a oneof, and a field at the maximum tag.
++//!
++//! These generalize the crate's per-field-type proptest round-trips in
++//! `src/encoding.rs` to whole derived messages.
++
++use std::collections::BTreeMap;
++
++use hegel::generators;
++use hegel::Generator;
++use prost::bytes::Bytes;
++use prost::encoding::{encode_key, encode_varint, WireType};
++use prost::{Enumeration, Message, Oneof};
++
++#[derive(Clone, Copy, Debug, PartialEq, Enumeration)]
++pub enum TestEnum {
++    Zero = 0,
++    One = 1,
++    Two = 2,
++    Three = 3,
++}
++
++#[derive(Clone, PartialEq, Message, hegel::PrettyPrintable)]
++pub struct Nested {
++    #[prost(sint64, tag = "1")]
++    pub value: i64,
++    #[prost(string, tag = "2")]
++    pub label: String,
++}
++
++#[derive(Clone, PartialEq, Oneof, hegel::PrettyPrintable)]
++pub enum TestOneof {
++    #[prost(fixed64, tag = "31")]
++    Fixed(u64),
++    #[prost(string, tag = "32")]
++    Name(String),
++}
++
++/// Highest tag used by [`TestAll`]; unknown-field tests generate tags above the other
++/// fields but below this one is not possible, so they use the range in between.
++const MAX_TAG: u32 = 536_870_911; // 2^29 - 1
++
++#[derive(Clone, PartialEq, Message, hegel::PrettyPrintable)]
++pub struct TestAll {
++    #[prost(int32, tag = "1")]
++    pub int32: i32,
++    #[prost(int64, tag = "2")]
++    pub int64: i64,
++    #[prost(uint32, tag = "3")]
++    pub uint32: u32,
++    #[prost(uint64, tag = "4")]
++    pub uint64: u64,
++    #[prost(sint32, tag = "5")]
++    pub sint32: i32,
++    #[prost(sint64, tag = "6")]
++    pub sint64: i64,
++    #[prost(fixed32, tag = "7")]
++    pub fixed32: u32,
++    #[prost(fixed64, tag = "8")]
++    pub fixed64: u64,
++    #[prost(sfixed32, tag = "9")]
++    pub sfixed32: i32,
++    #[prost(sfixed64, tag = "10")]
++    pub sfixed64: i64,
++    #[prost(float, tag = "11")]
++    pub float: f32,
++    #[prost(double, tag = "12")]
++    pub double: f64,
++    #[prost(bool, tag = "13")]
++    pub boolean: bool,
++    #[prost(string, tag = "14")]
++    pub string: String,
++    #[prost(bytes = "vec", tag = "15")]
++    pub bytes_vec: Vec<u8>,
++    #[prost(bytes = "bytes", tag = "16")]
++    #[pretty(debug)]
++    pub bytes_buf: Bytes,
++    #[prost(int32, optional, tag = "17")]
++    pub optional_int32: Option<i32>,
++    #[prost(string, optional, tag = "18")]
++    pub optional_string: Option<String>,
++    #[prost(enumeration = "TestEnum", tag = "19")]
++    pub enumeration: i32,
++    #[prost(sint64, repeated, tag = "20")]
++    pub packed_sint64: Vec<i64>,
++    #[prost(double, repeated, tag = "21")]
++    pub packed_double: Vec<f64>,
++    #[prost(fixed32, repeated, packed = "false", tag = "22")]
++    pub unpacked_fixed32: Vec<u32>,
++    #[prost(string, repeated, tag = "23")]
++    pub repeated_string: Vec<String>,
++    #[prost(message, optional, tag = "24")]
++    pub nested: Option<Nested>,
++    #[prost(message, repeated, tag = "25")]
++    pub repeated_nested: Vec<Nested>,
++    #[prost(btree_map = "int32, string", tag = "26")]
++    pub map_int32_string: BTreeMap<i32, String>,
++    #[prost(btree_map = "string, message", tag = "27")]
++    pub map_string_nested: BTreeMap<String, Nested>,
++    #[prost(oneof = "TestOneof", tags = "31, 32")]
++    pub oneof: Option<TestOneof>,
++    #[prost(bool, tag = "536870911")]
++    pub max_tag_bool: bool,
++}
++
++#[hegel::composite]
++fn nested(tc: &hegel::TestCase) -> Nested {
++    Nested {
++        value: tc.draw(generators::integers::<i64>()),
++        label: tc.draw(generators::text()),
++    }
++}
++
++#[hegel::composite]
++fn test_oneof(tc: &hegel::TestCase) -> TestOneof {
++    if tc.draw(generators::booleans()) {
++        TestOneof::Fixed(tc.draw(generators::integers::<u64>()))
++    } else {
++        TestOneof::Name(tc.draw(generators::text()))
++    }
++}
++
++/// Generates a fully arbitrary [`TestAll`].
++///
++/// `allow_nan` controls whether float fields may be NaN: `==`-based properties must
++/// exclude NaN (NaN != NaN), while byte-level properties keep it.
++#[hegel::composite]
++fn test_all(tc: &hegel::TestCase, allow_nan: bool) -> TestAll {
++    TestAll {
++        int32: tc.draw(generators::integers::<i32>()),
++        int64: tc.draw(generators::integers::<i64>()),
++        uint32: tc.draw(generators::integers::<u32>()),
++        uint64: tc.draw(generators::integers::<u64>()),
++        sint32: tc.draw(generators::integers::<i32>()),
++        sint64: tc.draw(generators::integers::<i64>()),
++        fixed32: tc.draw(generators::integers::<u32>()),
++        fixed64: tc.draw(generators::integers::<u64>()),
++        sfixed32: tc.draw(generators::integers::<i32>()),
++        sfixed64: tc.draw(generators::integers::<i64>()),
++        float: tc.draw(generators::floats::<f32>().allow_nan(allow_nan)),
++        double: tc.draw(generators::floats::<f64>().allow_nan(allow_nan)),
++        boolean: tc.draw(generators::booleans()),
++        string: tc.draw(generators::text()),
++        bytes_vec: tc.draw(generators::binary()),
++        bytes_buf: Bytes::from(tc.draw(generators::binary())),
++        optional_int32: tc.draw(generators::optional(generators::integers::<i32>())),
++        optional_string: tc.draw(generators::optional(generators::text())),
++        // Open enum: any i32 is a valid enumeration field value on the wire.
++        enumeration: tc.draw(generators::integers::<i32>()),
++        packed_sint64: tc.draw(generators::vecs(generators::integers::<i64>())),
++        packed_double: tc.draw(generators::vecs(
++            generators::floats::<f64>().allow_nan(allow_nan),
++        )),
++        unpacked_fixed32: tc.draw(generators::vecs(generators::integers::<u32>())),
++        repeated_string: tc.draw(generators::vecs(generators::text())),
++        nested: tc.draw((generators::optional(nested())).print_as_debug()),
++        repeated_nested: tc.draw((generators::vecs(nested())).print_as_debug()),
++        map_int32_string: tc
++            .draw(generators::vecs(generators::tuples!(
++                generators::integers::<i32>(),
++                generators::text(),
++            )))
++            .into_iter()
++            .collect(),
++        map_string_nested: tc
++            .draw(generators::vecs(generators::tuples!(
++                generators::text(),
++                nested(),
++            )))
++            .into_iter()
++            .collect(),
++        oneof: tc.draw(generators::optional(test_oneof())),
++        max_tag_bool: tc.draw(generators::booleans()),
++    }
++}
++
++/// Property: `decode(encode(m)) == m` for a message covering every derived field kind,
++/// and `encoded_len` reports exactly the number of bytes `encode` produces.
++///
++/// NaN is excluded because the property is `==`-based; NaN payloads are covered by
++/// `hegel_reencode_of_decoded_message_is_identical`.
++#[hegel::test]
++fn hegel_derived_message_roundtrip(tc: hegel::TestCase) {
++    let msg = tc.draw((test_all(false)).print_as_debug());
++
++    let encoded = msg.encode_to_vec();
++    assert_eq!(
++        encoded.len(),
++        msg.encoded_len(),
++        "encoded_len disagrees with the actual encoding"
++    );
++
++    let decoded = TestAll::decode(encoded.as_slice()).expect("decode of a valid encoding failed");
++    assert_eq!(decoded, msg);
++}
++
++/// Property: re-encoding a decoded message reproduces the original bytes
++/// (`encode(decode(encode(m))) == encode(m)`). Holds bit-for-bit even for NaN floats,
++/// so the generator keeps them.
++#[hegel::test]
++fn hegel_reencode_of_decoded_message_is_identical(tc: hegel::TestCase) {
++    let msg = tc.draw((test_all(true)).print_as_debug());
++
++    let encoded = msg.encode_to_vec();
++    let decoded = TestAll::decode(encoded.as_slice()).expect("decode of a valid encoding failed");
++
++    assert_eq!(decoded.encode_to_vec(), encoded);
++}
++
++/// Property: `decode` returns `Ok` or `Err` but never panics, both on completely
++/// arbitrary bytes and on valid encodings corrupted at a single position (which reach
++/// much deeper into the decoding paths than uniform garbage).
++#[hegel::test]
++fn hegel_decode_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++    let bytes: Vec<u8> = if tc.draw(generators::booleans()) {
++        tc.draw(generators::binary().max_size(256))
++    } else {
++        let msg = tc.draw((test_all(true)).print_as_debug());
++        let mut encoded = msg.encode_to_vec();
++        if encoded.is_empty() {
++            tc.draw(generators::binary().max_size(256))
++        } else {
++            let index = tc.draw(generators::integers::<usize>().max_value(encoded.len() - 1));
++            encoded[index] = tc.draw(generators::integers::<u8>());
++            encoded
++        }
++    };
++
++    // Must not panic; both outcomes are acceptable.
++    drop(TestAll::decode(bytes.as_slice()));
++}
++
++/// Appends one syntactically valid field, with a tag `TestAll` does not use, to `buf`.
++/// Covers every wire type, including a group with one inner field.
++fn append_unknown_field(tc: &hegel::TestCase, buf: &mut Vec<u8>) {
++    // Tags 33..=536_870_909 are unused by `TestAll` (fields use 1..=32 and MAX_TAG);
++    // keep one below MAX_TAG - 1 so the group's inner tag stays valid.
++    let tag = tc.draw(
++        generators::integers::<u32>()
++            .min_value(33)
++            .max_value(MAX_TAG - 2),
++    );
++    match tc.draw(generators::integers::<u8>().max_value(4)) {
++        0 => {
++            encode_key(tag, WireType::Varint, buf);
++            encode_varint(tc.draw(generators::integers::<u64>()), buf);
++        }
++        1 => {
++            encode_key(tag, WireType::ThirtyTwoBit, buf);
++            buf.extend_from_slice(&tc.draw(generators::integers::<u32>()).to_le_bytes());
++        }
++        2 => {
++            encode_key(tag, WireType::SixtyFourBit, buf);
++            buf.extend_from_slice(&tc.draw(generators::integers::<u64>()).to_le_bytes());
++        }
++        3 => {
++            let payload: Vec<u8> = tc.draw(generators::binary().max_size(32));
++            encode_key(tag, WireType::LengthDelimited, buf);
++            encode_varint(payload.len() as u64, buf);
++            buf.extend_from_slice(&payload);
++        }
++        _ => {
++            encode_key(tag, WireType::StartGroup, buf);
++            encode_key(tag + 1, WireType::Varint, buf);
++            encode_varint(tc.draw(generators::integers::<u64>()), buf);
++            encode_key(tag, WireType::EndGroup, buf);
++        }
++    }
++}
++
++/// Property: unknown fields of every wire type are skipped per the spec
++/// (<https://protobuf.dev/programming-guides/encoding/#structure>): decoding a valid
++/// encoding with unknown fields prepended and/or appended yields the same message.
++#[hegel::test]
++fn hegel_unknown_fields_are_skipped(tc: hegel::TestCase) {
++    let msg = tc.draw((test_all(false)).print_as_debug());
++
++    let mut bytes = Vec::new();
++    // 0 = before, 1 = after, 2 = both.
++    let placement = tc.draw(generators::integers::<u8>().max_value(2));
++    if placement != 1 {
++        append_unknown_field(&tc, &mut bytes);
++    }
++    bytes.extend_from_slice(&msg.encode_to_vec());
++    if placement != 0 {
++        append_unknown_field(&tc, &mut bytes);
++    }
++
++    let decoded =
++        TestAll::decode(bytes.as_slice()).expect("decode with unknown fields present failed");
++    assert_eq!(decoded, msg);
++}
++
++fn merge_nested_oracle(a: &Nested, b: &Nested) -> Nested {
++    Nested {
++        value: if b.value != 0 { b.value } else { a.value },
++        label: if !b.label.is_empty() {
++            b.label.clone()
++        } else {
++            a.label.clone()
++        },
++    }
++}
++
++/// Independent oracle for protobuf merge semantics
++/// (<https://protobuf.dev/programming-guides/encoding/#last-one-wins> and message
++/// merging): scalars keep `b`'s value when `b` encodes one (i.e. it is non-default),
++/// optionals prefer `b` when set, repeated fields concatenate, maps take the union with
++/// `b` winning per key, nested messages merge recursively, and the oneof keeps `b`'s
++/// variant when set.
++fn merge_oracle(a: &TestAll, b: &TestAll) -> TestAll {
++    fn scalar<T: Default + PartialEq + Clone>(a: &T, b: &T) -> T {
++        if *b != T::default() {
++            b.clone()
++        } else {
++            a.clone()
++        }
++    }
++    fn concat<T: Clone>(a: &[T], b: &[T]) -> Vec<T> {
++        a.iter().chain(b.iter()).cloned().collect()
++    }
++
++    TestAll {
++        int32: scalar(&a.int32, &b.int32),
++        int64: scalar(&a.int64, &b.int64),
++        uint32: scalar(&a.uint32, &b.uint32),
++        uint64: scalar(&a.uint64, &b.uint64),
++        sint32: scalar(&a.sint32, &b.sint32),
++        sint64: scalar(&a.sint64, &b.sint64),
++        fixed32: scalar(&a.fixed32, &b.fixed32),
++        fixed64: scalar(&a.fixed64, &b.fixed64),
++        sfixed32: scalar(&a.sfixed32, &b.sfixed32),
++        sfixed64: scalar(&a.sfixed64, &b.sfixed64),
++        // A field is encoded iff it differs from the default (0.0); note -0.0 == 0.0,
++        // so -0.0 is treated as default, matching the encoder.
++        float: if b.float != 0.0 { b.float } else { a.float },
++        double: if b.double != 0.0 { b.double } else { a.double },
++        boolean: scalar(&a.boolean, &b.boolean),
++        string: scalar(&a.string, &b.string),
++        bytes_vec: scalar(&a.bytes_vec, &b.bytes_vec),
++        bytes_buf: scalar(&a.bytes_buf, &b.bytes_buf),
++        optional_int32: b.optional_int32.or(a.optional_int32),
++        optional_string: b.optional_string.clone().or_else(|| a.optional_string.clone()),
++        enumeration: scalar(&a.enumeration, &b.enumeration),
++        packed_sint64: concat(&a.packed_sint64, &b.packed_sint64),
++        packed_double: concat(&a.packed_double, &b.packed_double),
++        unpacked_fixed32: concat(&a.unpacked_fixed32, &b.unpacked_fixed32),
++        repeated_string: concat(&a.repeated_string, &b.repeated_string),
++        nested: match (&a.nested, &b.nested) {
++            (Some(x), Some(y)) => Some(merge_nested_oracle(x, y)),
++            (Some(x), None) => Some(x.clone()),
++            (None, y) => y.clone(),
++        },
++        repeated_nested: concat(&a.repeated_nested, &b.repeated_nested),
++        map_int32_string: {
++            let mut merged = a.map_int32_string.clone();
++            merged.extend(b.map_int32_string.clone());
++            merged
++        },
++        map_string_nested: {
++            // Map entries are replaced wholesale, not recursively merged.
++            let mut merged = a.map_string_nested.clone();
++            merged.extend(b.map_string_nested.clone());
++            merged
++        },
++        oneof: b.oneof.clone().or_else(|| a.oneof.clone()),
++        max_tag_bool: scalar(&a.max_tag_bool, &b.max_tag_bool),
++    }
++}
++
++/// Property: decoding the concatenation of two encodings merges the messages per the
++/// protobuf spec, checked against an independently written merge oracle.
++#[hegel::test]
++fn hegel_concatenated_encodings_merge_per_spec(tc: hegel::TestCase) {
++    let a = tc.draw((test_all(false)).print_as_debug());
++    let b = tc.draw((test_all(false)).print_as_debug());
++
++    let mut bytes = a.encode_to_vec();
++    bytes.extend_from_slice(&b.encode_to_vec());
++
++    let decoded = TestAll::decode(bytes.as_slice()).expect("decode of concatenation failed");
++    assert_eq!(decoded, merge_oracle(&a, &b));
++}
++
++/// Property: a stream of length-delimited messages written with
++/// `encode_length_delimited` reads back, in order, via `decode_length_delimited` —
++/// the framing determines every message boundary.
++#[hegel::test]
++fn hegel_length_delimited_stream_roundtrip(tc: hegel::TestCase) {
++    let msgs: Vec<TestAll> = tc.draw(generators::vecs(test_all(false)).max_size(4));
++
++    let mut buf = Vec::new();
++    for msg in &msgs {
++        msg.encode_length_delimited(&mut buf)
++            .expect("encode_length_delimited to a Vec failed");
++    }
++
++    let mut cursor = &buf[..];
++    let mut decoded = Vec::new();
++    while !cursor.is_empty() {
++        decoded.push(
++            TestAll::decode_length_delimited(&mut cursor).expect("framed decode failed"),
++        );
++    }
++    assert_eq!(decoded, msgs);
++}
