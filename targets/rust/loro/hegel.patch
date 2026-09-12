@@ -1,0 +1,955 @@
+diff --git a/crates/loro/Cargo.toml b/crates/loro/Cargo.toml
+index 534f1b16..6adcdd69 100644
+--- a/crates/loro/Cargo.toml
++++ b/crates/loro/Cargo.toml
+@@ -35,6 +35,7 @@ pretty_assertions = "1.4.0"
+ loom = "0.7"
+ base64 = "0.22.1"
+ serial_test = "3"
++hegeltest = "0.44.1"
+ 
+ [features]
+ default = ["counter"]
+diff --git a/crates/loro/tests/loro_rust_test.rs b/crates/loro/tests/loro_rust_test.rs
+index 42df863d..c547a20a 100644
+--- a/crates/loro/tests/loro_rust_test.rs
++++ b/crates/loro/tests/loro_rust_test.rs
+@@ -3642,3 +3642,938 @@ fn has_container_test() {
+     assert!(doc.has_container(&text.id()));
+     assert!(doc.has_container(&list.id()));
+ }
++
++/// Property-based tests written with hegel (https://hegel.dev).
++///
++/// These cover the core CRDT contracts of the public `loro` API:
++/// convergence of concurrent replicas, encode/decode round-trips,
++/// idempotent imports, container semantics against naive models,
++/// and time-travel determinism.
++mod hegel_pbt {
++    use hegel::generators;
++    use hegel::TestCase;
++    use loro::{
++        ExportMode, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroText, LoroValue, ToJson,
++    };
++    use pretty_assertions::assert_eq;
++
++    // ---------- generators / helpers ----------
++
++    fn draw_char(tc: &TestCase) -> char {
++        let cp = tc.draw(hegel::one_of!(
++            // ASCII printable — keeps most strings readable in counterexamples
++            generators::integers::<u32>().min_value(0x20).max_value(0x7E),
++            // full codepoint range, including multi-byte UTF-8 and astral-plane
++            // chars whose utf8/utf16/unicode widths all differ
++            generators::integers::<u32>().max_value(0x10FFFF),
++        ));
++        char::from_u32(cp).unwrap_or('\u{FFFD}')
++    }
++
++    fn draw_string(tc: &TestCase) -> String {
++        let n = tc.draw(generators::integers::<usize>().max_value(8));
++        (0..n).map(|_| draw_char(tc)).collect()
++    }
++
++    fn draw_value(tc: &TestCase) -> LoroValue {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => LoroValue::from(tc.draw(generators::integers::<i64>())),
++            1 => LoroValue::from(tc.draw(generators::booleans())),
++            2 => LoroValue::from(draw_string(tc)),
++            _ => LoroValue::Null,
++        }
++    }
++
++    fn draw_key(tc: &TestCase) -> String {
++        if tc.draw(generators::booleans()) {
++            // small pool so concurrent edits actually collide on the same key
++            tc.draw(generators::sampled_from(vec!["a", "b", "c", "d"]))
++                .to_string()
++        } else {
++            draw_string(tc)
++        }
++    }
++
++    /// Materialize all root containers used by `apply_random_edit`.
++    ///
++    /// Accessing a root container (e.g. `get_text`) registers it in the
++    /// *local* doc state (so it shows up in `get_deep_value` as an empty
++    /// container) without creating any op, and containers are never removed
++    /// from the state once registered. This local-only materialization is
++    /// documented loro behavior (`set_hide_empty_root_containers` exists for
++    /// it, and the upstream fuzzer's `assert_value_eq` normalizes empty
++    /// containers away). To keep deep-value comparisons sound we materialize
++    /// the same fixed set of roots on every doc that takes part in a
++    /// comparison, instead of weakening the equality check.
++    fn touch_roots(doc: &LoroDoc) {
++        let _ = doc.get_text("text");
++        let _ = doc.get_list("list");
++        let _ = doc.get_movable_list("mlist");
++        let _ = doc.get_map("map");
++        let _ = doc.get_counter("counter");
++    }
++
++    /// Apply one randomly drawn edit to one of the doc's root containers.
++    fn apply_random_edit(tc: &TestCase, doc: &LoroDoc) {
++        match tc.draw(generators::integers::<u8>().max_value(4)) {
++            0 => {
++                let text = doc.get_text("text");
++                let len = text.len_unicode();
++                if len == 0 || tc.draw(generators::booleans()) {
++                    let pos = tc.draw(generators::integers::<usize>().max_value(len));
++                    text.insert(pos, &draw_string(tc)).unwrap();
++                } else {
++                    let pos = tc.draw(generators::integers::<usize>().max_value(len - 1));
++                    let dlen = tc.draw(
++                        generators::integers::<usize>()
++                            .min_value(1)
++                            .max_value(len - pos),
++                    );
++                    text.delete(pos, dlen).unwrap();
++                }
++            }
++            1 => {
++                let list = doc.get_list("list");
++                let len = list.len();
++                if len == 0 || tc.draw(generators::booleans()) {
++                    let pos = tc.draw(generators::integers::<usize>().max_value(len));
++                    list.insert(pos, draw_value(tc)).unwrap();
++                } else {
++                    let pos = tc.draw(generators::integers::<usize>().max_value(len - 1));
++                    let dlen = tc.draw(
++                        generators::integers::<usize>()
++                            .min_value(1)
++                            .max_value(len - pos),
++                    );
++                    list.delete(pos, dlen).unwrap();
++                }
++            }
++            2 => {
++                let mlist = doc.get_movable_list("mlist");
++                let len = mlist.len();
++                let choice = if len == 0 {
++                    0
++                } else {
++                    tc.draw(generators::integers::<u8>().max_value(3))
++                };
++                match choice {
++                    0 => {
++                        let pos = tc.draw(generators::integers::<usize>().max_value(len));
++                        mlist.insert(pos, draw_value(tc)).unwrap();
++                    }
++                    1 => {
++                        let pos = tc.draw(generators::integers::<usize>().max_value(len - 1));
++                        let dlen = tc.draw(
++                            generators::integers::<usize>()
++                                .min_value(1)
++                                .max_value(len - pos),
++                        );
++                        mlist.delete(pos, dlen).unwrap();
++                    }
++                    2 => {
++                        let from = tc.draw(generators::integers::<usize>().max_value(len - 1));
++                        let to = tc.draw(generators::integers::<usize>().max_value(len - 1));
++                        mlist.mov(from, to).unwrap();
++                    }
++                    _ => {
++                        let pos = tc.draw(generators::integers::<usize>().max_value(len - 1));
++                        mlist.set(pos, draw_value(tc)).unwrap();
++                    }
++                }
++            }
++            3 => {
++                let map = doc.get_map("map");
++                let key = draw_key(tc);
++                if tc.draw(generators::booleans()) {
++                    map.insert(&key, draw_value(tc)).unwrap();
++                } else {
++                    // deleting a missing key is documented to be a no-op-ish Ok(())
++                    map.delete(&key).unwrap();
++                }
++            }
++            _ => {
++                let counter = doc.get_counter("counter");
++                // integer-valued increments keep f64 sums exact regardless of
++                // the order replicas apply them in (this bound protects the
++                // test's convergence oracle, not the library's contract)
++                let v = tc.draw(
++                    generators::integers::<i32>()
++                        .min_value(-1000)
++                        .max_value(1000),
++                );
++                counter.increment(v as f64).unwrap();
++            }
++        }
++    }
++
++    /// One-way sync `from -> to` using a drawn transport encoding.
++    fn sync_one_way(tc: &TestCase, from: &LoroDoc, to: &LoroDoc) {
++        from.commit();
++        let bytes = match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => from.export(ExportMode::updates(&to.oplog_vv())).unwrap(),
++            1 => from.export(ExportMode::all_updates()).unwrap(),
++            _ => from.export(ExportMode::Snapshot).unwrap(),
++        };
++        to.import(&bytes).unwrap();
++    }
++
++    /// Build a doc with a random (possibly multi-peer, merged) history.
++    /// Peer ids are `peer_base..peer_base + n`.
++    fn build_random_doc(tc: &TestCase, peer_base: u64) -> LoroDoc {
++        let n_peers = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let docs: Vec<LoroDoc> = (0..n_peers)
++            .map(|i| {
++                let d = LoroDoc::new();
++                d.set_peer_id(peer_base + i as u64).unwrap();
++                d
++            })
++            .collect();
++        let n_edits = tc.draw(generators::integers::<usize>().max_value(15));
++        for _ in 0..n_edits {
++            let i = tc.draw(generators::integers::<usize>().max_value(n_peers - 1));
++            apply_random_edit(tc, &docs[i]);
++        }
++        for d in &docs {
++            d.commit();
++        }
++        for d in docs.iter().skip(1) {
++            let bytes = d.export(ExportMode::all_updates()).unwrap();
++            docs[0].import(&bytes).unwrap();
++        }
++        docs.into_iter().next().unwrap()
++    }
++
++    // ---------- Property 1 (crown): concurrent replicas converge ----------
++    //
++    // Several replicas edit concurrently, occasionally exchanging partial
++    // updates mid-stream (in drawn directions and drawn encodings). After a
++    // full mesh exchange they must be deep-equal and agree on version info.
++    #[hegel::test]
++    fn prop_concurrent_replicas_converge(tc: TestCase) {
++        let n_peers = tc.draw(generators::integers::<usize>().min_value(2).max_value(4));
++        let docs: Vec<LoroDoc> = (0..n_peers)
++            .map(|i| {
++                let d = LoroDoc::new();
++                d.set_peer_id(i as u64 + 1).unwrap();
++                // make locally-materialized empty root containers symmetric
++                // across replicas (see `touch_roots`)
++                touch_roots(&d);
++                d
++            })
++            .collect();
++
++        let n_actions = tc.draw(generators::integers::<usize>().min_value(1).max_value(40));
++        for _ in 0..n_actions {
++            let i = tc.draw(generators::integers::<usize>().max_value(n_peers - 1));
++            if tc.draw(generators::integers::<u8>().max_value(4)) == 0 {
++                // partial sync i -> j (j != i), leaving replicas divergent
++                let j_raw = tc.draw(generators::integers::<usize>().max_value(n_peers - 2));
++                let j = if j_raw >= i { j_raw + 1 } else { j_raw };
++                sync_one_way(&tc, &docs[i], &docs[j]);
++            } else {
++                apply_random_edit(&tc, &docs[i]);
++            }
++        }
++
++        // Full mesh exchange: every ordered pair, in a drawn order, twice.
++        // A single pass over all ordered pairs already delivers every
++        // replica's own ops to every other replica directly.
++        let mut pairs: Vec<(usize, usize)> = Vec::new();
++        for a in 0..n_peers {
++            for b in 0..n_peers {
++                if a != b {
++                    pairs.push((a, b));
++                }
++            }
++        }
++        for _pass in 0..2 {
++            for i in (1..pairs.len()).rev() {
++                let j = tc.draw(generators::integers::<usize>().max_value(i));
++                pairs.swap(i, j);
++            }
++            for &(a, b) in &pairs {
++                sync_one_way(&tc, &docs[a], &docs[b]);
++            }
++        }
++
++        let v0 = docs[0].get_deep_value();
++        let vv0 = docs[0].oplog_vv();
++        let f0 = docs[0].oplog_frontiers();
++        for d in docs.iter().skip(1) {
++            assert_eq!(v0, d.get_deep_value());
++            assert_eq!(vv0, d.oplog_vv());
++            assert_eq!(f0, d.oplog_frontiers());
++        }
++    }
++
++    // ---------- Property 2: snapshot encode -> decode preserves state ----------
++    //
++    // Every snapshot-flavoured export mode, imported into a fresh doc, must
++    // reproduce the exporter's current deep value; full snapshots must also
++    // reproduce the exact version info.
++    #[hegel::test]
++    fn prop_snapshot_modes_preserve_state(tc: TestCase) {
++        let doc = build_random_doc(&tc, 1);
++        doc.commit();
++        let frontiers = doc.oplog_frontiers();
++        let mut mode = tc.draw(generators::integers::<u8>().max_value(3));
++        // KNOWN BUG EXCLUSION: shallow-snapshot-flavoured exports (ShallowSnapshot
++        // and StateOnly both go through `calc_shallow_doc_start`) can produce
++        // unimportable bytes when the frontiers have >= 3 concurrent tips.
++        // See `prop_shallow_snapshot_of_concurrent_tips_is_importable_known_bug`
++        // for the canonical pinned failure.
++        if (mode == 1 || mode == 2) && frontiers.len() >= 3 {
++            mode = 3;
++        }
++        let bytes = match mode {
++            0 => doc.export(ExportMode::Snapshot),
++            1 => doc.export(ExportMode::shallow_snapshot(&frontiers)),
++            2 => doc.export(ExportMode::state_only(None)),
++            _ => doc.export(ExportMode::snapshot_at(&frontiers)),
++        }
++        .unwrap();
++        let restored = if mode == 0 && tc.draw(generators::booleans()) {
++            LoroDoc::from_snapshot(&bytes).unwrap()
++        } else {
++            let d = LoroDoc::new();
++            d.import(&bytes).unwrap();
++            d
++        };
++        // normalize locally-materialized empty roots on both sides
++        touch_roots(&doc);
++        touch_roots(&restored);
++        assert_eq!(doc.get_deep_value(), restored.get_deep_value());
++        if mode == 0 || mode == 3 {
++            assert_eq!(doc.oplog_vv(), restored.oplog_vv());
++            assert_eq!(doc.oplog_frontiers(), restored.oplog_frontiers());
++        }
++    }
++
++    // ---------- Property 3: update (oplog) export/import round-trip ----------
++    #[hegel::test]
++    fn prop_all_updates_roundtrip(tc: TestCase) {
++        let doc = build_random_doc(&tc, 1);
++        doc.commit();
++        let bytes = doc.export(ExportMode::all_updates()).unwrap();
++        let restored = LoroDoc::new();
++        restored.import(&bytes).unwrap();
++        // normalize locally-materialized empty roots on both sides
++        touch_roots(&doc);
++        touch_roots(&restored);
++        assert_eq!(doc.get_deep_value(), restored.get_deep_value());
++        assert_eq!(doc.oplog_vv(), restored.oplog_vv());
++        assert_eq!(doc.oplog_frontiers(), restored.oplog_frontiers());
++    }
++
++    // ---------- Property 4: importing the same blob again is a no-op ----------
++    #[hegel::test]
++    fn prop_import_is_idempotent(tc: TestCase) {
++        let source = build_random_doc(&tc, 1);
++        source.commit();
++        let bytes = if tc.draw(generators::booleans()) {
++            source.export(ExportMode::all_updates()).unwrap()
++        } else {
++            source.export(ExportMode::Snapshot).unwrap()
++        };
++        // target may already have its own (disjoint-peer) history
++        let target = if tc.draw(generators::booleans()) {
++            build_random_doc(&tc, 100)
++        } else {
++            LoroDoc::new()
++        };
++        target.import(&bytes).unwrap();
++        let value_once = target.get_deep_value();
++        let vv_once = target.oplog_vv();
++        let frontiers_once = target.oplog_frontiers();
++        let n_extra = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        for _ in 0..n_extra {
++            target.import(&bytes).unwrap();
++        }
++        assert_eq!(value_once, target.get_deep_value());
++        assert_eq!(vv_once, target.oplog_vv());
++        assert_eq!(frontiers_once, target.oplog_frontiers());
++    }
++
++    // ---------- Property 5: LoroText behaves like a string (model test) ----------
++
++    fn utf8_offset(model: &[char], char_idx: usize) -> usize {
++        model[..char_idx].iter().map(|c| c.len_utf8()).sum()
++    }
++
++    fn utf16_offset(model: &[char], char_idx: usize) -> usize {
++        model[..char_idx].iter().map(|c| c.len_utf16()).sum()
++    }
++
++    struct TextVsString {
++        _doc: LoroDoc,
++        text: LoroText,
++        model: Vec<char>,
++    }
++
++    #[hegel::state_machine]
++    impl TextVsString {
++        #[rule]
++        fn insert_unicode(&mut self, tc: TestCase) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let s = draw_string(&tc);
++            self.text.insert(pos, &s).unwrap();
++            self.model.splice(pos..pos, s.chars());
++        }
++
++        #[rule]
++        fn delete_unicode(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let len = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(self.model.len() - pos),
++            );
++            self.text.delete(pos, len).unwrap();
++            self.model.drain(pos..pos + len);
++        }
++
++        #[rule]
++        fn insert_utf8(&mut self, tc: TestCase) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let s = draw_string(&tc);
++            self.text.insert_utf8(utf8_offset(&self.model, pos), &s).unwrap();
++            self.model.splice(pos..pos, s.chars());
++        }
++
++        #[rule]
++        fn delete_utf8(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let len = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(self.model.len() - pos),
++            );
++            let b0 = utf8_offset(&self.model, pos);
++            let b1 = utf8_offset(&self.model, pos + len);
++            self.text.delete_utf8(b0, b1 - b0).unwrap();
++            self.model.drain(pos..pos + len);
++        }
++
++        #[rule]
++        fn insert_utf16(&mut self, tc: TestCase) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let s = draw_string(&tc);
++            self.text
++                .insert_utf16(utf16_offset(&self.model, pos), &s)
++                .unwrap();
++            self.model.splice(pos..pos, s.chars());
++        }
++
++        #[rule]
++        fn delete_utf16(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let len = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(self.model.len() - pos),
++            );
++            let u0 = utf16_offset(&self.model, pos);
++            let u1 = utf16_offset(&self.model, pos + len);
++            self.text.delete_utf16(u0, u1 - u0).unwrap();
++            self.model.drain(pos..pos + len);
++        }
++
++        #[rule]
++        fn splice_returns_deleted(&mut self, tc: TestCase) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let len = tc.draw(generators::integers::<usize>().max_value(self.model.len() - pos));
++            let s = draw_string(&tc);
++            let expected_removed: String = self.model[pos..pos + len].iter().collect();
++            let removed = self.text.splice(pos, len, &s).unwrap();
++            assert_eq!(expected_removed, removed);
++            self.model.splice(pos..pos + len, s.chars());
++        }
++
++        #[rule]
++        fn push_str(&mut self, tc: TestCase) {
++            let s = draw_string(&tc);
++            self.text.push_str(&s).unwrap();
++            self.model.extend(s.chars());
++        }
++
++        #[rule]
++        fn char_at_agrees(&self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            assert_eq!(self.model[pos], self.text.char_at(pos).unwrap());
++        }
++
++        #[rule]
++        fn slice_agrees(&self, tc: TestCase) {
++            let start = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let end = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(start)
++                    .max_value(self.model.len()),
++            );
++            let expected: String = self.model[start..end].iter().collect();
++            assert_eq!(expected, self.text.slice(start, end).unwrap());
++        }
++
++        #[rule]
++        fn misaligned_utf8_insert_errors(&mut self, tc: TestCase) {
++            // invalid external input must return Err, not panic (see AGENTS.md)
++            let mut bad_offsets = Vec::new();
++            let mut off = 0;
++            for c in &self.model {
++                let w = c.len_utf8();
++                for d in 1..w {
++                    bad_offsets.push(off + d);
++                }
++                off += w;
++            }
++            tc.assume(!bad_offsets.is_empty());
++            let idx = tc.draw(generators::integers::<usize>().max_value(bad_offsets.len() - 1));
++            assert!(self.text.insert_utf8(bad_offsets[idx], "x").is_err());
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _tc: TestCase) {
++            let expected: String = self.model.iter().collect();
++            assert_eq!(expected, self.text.to_string());
++            assert_eq!(self.model.len(), self.text.len_unicode());
++            assert_eq!(expected.len(), self.text.len_utf8());
++            assert_eq!(
++                self.model.iter().map(|c| c.len_utf16()).sum::<usize>(),
++                self.text.len_utf16()
++            );
++        }
++    }
++
++    #[hegel::test]
++    fn prop_text_matches_string_model(tc: TestCase) {
++        let doc = LoroDoc::new();
++        let text = doc.get_text("text");
++        hegel::stateful::machine(TextVsString {
++                _doc: doc,
++                text,
++                model: Vec::new(),
++            }).run(tc);
++    }
++
++    // ---------- Property 6: LoroList behaves like a Vec (model test) ----------
++
++    struct ListVsVec {
++        _doc: LoroDoc,
++        list: LoroList,
++        model: Vec<LoroValue>,
++    }
++
++    #[hegel::state_machine]
++    impl ListVsVec {
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let v = draw_value(&tc);
++            self.list.insert(pos, v.clone()).unwrap();
++            self.model.insert(pos, v);
++        }
++
++        #[rule]
++        fn delete(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let len = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(self.model.len() - pos),
++            );
++            self.list.delete(pos, len).unwrap();
++            self.model.drain(pos..pos + len);
++        }
++
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            let v = draw_value(&tc);
++            self.list.push(v.clone()).unwrap();
++            self.model.push(v);
++        }
++
++        #[rule]
++        fn pop_agrees(&mut self, _tc: TestCase) {
++            assert_eq!(self.model.pop(), self.list.pop().unwrap());
++        }
++
++        #[rule]
++        fn get_agrees(&self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            assert_eq!(
++                self.model[pos],
++                self.list.get(pos).unwrap().get_deep_value()
++            );
++        }
++
++        #[rule]
++        fn clear(&mut self, _tc: TestCase) {
++            self.list.clear().unwrap();
++            self.model.clear();
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _tc: TestCase) {
++            assert_eq!(self.model, self.list.to_vec());
++            assert_eq!(self.model.len(), self.list.len());
++            assert_eq!(self.model.is_empty(), self.list.is_empty());
++        }
++    }
++
++    #[hegel::test]
++    fn prop_list_matches_vec_model(tc: TestCase) {
++        let doc = LoroDoc::new();
++        let list = doc.get_list("list");
++        hegel::stateful::machine(ListVsVec {
++                _doc: doc,
++                list,
++                model: Vec::new(),
++            }).run(tc);
++    }
++
++    // ---------- Property 7: LoroMovableList behaves like a Vec (model test) ----------
++
++    struct MovableListVsVec {
++        _doc: LoroDoc,
++        list: LoroMovableList,
++        model: Vec<LoroValue>,
++    }
++
++    #[hegel::state_machine]
++    impl MovableListVsVec {
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len()));
++            let v = draw_value(&tc);
++            self.list.insert(pos, v.clone()).unwrap();
++            self.model.insert(pos, v);
++        }
++
++        #[rule]
++        fn delete(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let len = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(self.model.len() - pos),
++            );
++            self.list.delete(pos, len).unwrap();
++            self.model.drain(pos..pos + len);
++        }
++
++        #[rule]
++        fn set(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let v = draw_value(&tc);
++            self.list.set(pos, v.clone()).unwrap();
++            self.model[pos] = v;
++        }
++
++        #[rule]
++        fn mov(&mut self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let from = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            let to = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            self.list.mov(from, to).unwrap();
++            let v = self.model.remove(from);
++            self.model.insert(to, v);
++        }
++
++        #[rule]
++        fn push(&mut self, tc: TestCase) {
++            let v = draw_value(&tc);
++            self.list.push(v.clone()).unwrap();
++            self.model.push(v);
++        }
++
++        #[rule]
++        fn pop_agrees(&mut self, _tc: TestCase) {
++            assert_eq!(
++                self.model.pop(),
++                self.list.pop().unwrap().map(|v| v.get_deep_value())
++            );
++        }
++
++        #[rule]
++        fn get_agrees(&self, tc: TestCase) {
++            tc.assume(!self.model.is_empty());
++            let pos = tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++            assert_eq!(
++                self.model[pos],
++                self.list.get(pos).unwrap().get_deep_value()
++            );
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _tc: TestCase) {
++            assert_eq!(self.model, self.list.to_vec());
++            assert_eq!(self.model.len(), self.list.len());
++        }
++    }
++
++    #[hegel::test]
++    fn prop_movable_list_matches_vec_model(tc: TestCase) {
++        let doc = LoroDoc::new();
++        let list = doc.get_movable_list("mlist");
++        hegel::stateful::machine(MovableListVsVec {
++                _doc: doc,
++                list,
++                model: Vec::new(),
++            }).run(tc);
++    }
++
++    // ---------- Property 8: LoroMap behaves like a HashMap (model test) ----------
++
++    struct MapVsHashMap {
++        _doc: LoroDoc,
++        map: LoroMap,
++        model: std::collections::HashMap<String, LoroValue>,
++    }
++
++    impl MapVsHashMap {
++        fn draw_existing_key(&self, tc: &TestCase) -> Option<String> {
++            if self.model.is_empty() {
++                return None;
++            }
++            let mut keys: Vec<&String> = self.model.keys().collect();
++            keys.sort();
++            let idx = tc.draw(generators::integers::<usize>().max_value(keys.len() - 1));
++            Some(keys[idx].clone())
++        }
++    }
++
++    #[hegel::state_machine]
++    impl MapVsHashMap {
++        #[rule]
++        fn insert(&mut self, tc: TestCase) {
++            let k = draw_key(&tc);
++            let v = draw_value(&tc);
++            self.map.insert(&k, v.clone()).unwrap();
++            self.model.insert(k, v);
++        }
++
++        #[rule]
++        fn delete_existing(&mut self, tc: TestCase) {
++            let Some(k) = self.draw_existing_key(&tc) else {
++                tc.reject()
++            };
++            self.map.delete(&k).unwrap();
++            self.model.remove(&k);
++        }
++
++        #[rule]
++        fn delete_arbitrary(&mut self, tc: TestCase) {
++            // deleting a key that may not exist must still be Ok and leave
++            // the visible state consistent with the model
++            let k = draw_key(&tc);
++            self.map.delete(&k).unwrap();
++            self.model.remove(&k);
++        }
++
++        #[rule]
++        fn get_agrees(&self, tc: TestCase) {
++            let k = if tc.draw(generators::booleans()) {
++                match self.draw_existing_key(&tc) {
++                    Some(k) => k,
++                    None => draw_key(&tc),
++                }
++            } else {
++                draw_key(&tc)
++            };
++            assert_eq!(
++                self.model.get(&k).cloned(),
++                self.map.get(&k).map(|v| v.get_deep_value())
++            );
++        }
++
++        #[invariant]
++        fn agrees_with_model(&self, _tc: TestCase) {
++            let expected = serde_json::Value::Object(
++                self.model
++                    .iter()
++                    .map(|(k, v)| (k.clone(), v.to_json_value()))
++                    .collect(),
++            );
++            assert_eq!(expected, self.map.get_value().to_json_value());
++            assert_eq!(self.model.len(), self.map.len());
++            assert_eq!(self.model.is_empty(), self.map.is_empty());
++        }
++    }
++
++    #[hegel::test]
++    fn prop_map_matches_hashmap_model(tc: TestCase) {
++        let doc = LoroDoc::new();
++        let map = doc.get_map("map");
++        hegel::stateful::machine(MapVsHashMap {
++                _doc: doc,
++                map,
++                model: std::collections::HashMap::new(),
++            }).run(tc);
++    }
++
++    // ---------- Property 9: checkout time-travel reproduces recorded states ----------
++    #[hegel::test]
++    fn prop_checkout_reproduces_recorded_states(tc: TestCase) {
++        let doc = build_random_doc(&tc, 1);
++        // Materialize all roots before recording the first checkpoint:
++        // containers are never removed from the state, so checking out to a
++        // version before a container was created leaves it present-but-empty.
++        // Recording checkpoints with all roots already materialized makes the
++        // recorded values comparable with post-checkout values.
++        touch_roots(&doc);
++        doc.commit();
++        let mut checkpoints = vec![(doc.state_frontiers(), doc.get_deep_value())];
++        let n_edits = tc.draw(generators::integers::<usize>().min_value(1).max_value(15));
++        for _ in 0..n_edits {
++            apply_random_edit(&tc, &doc);
++            doc.commit();
++            checkpoints.push((doc.state_frontiers(), doc.get_deep_value()));
++        }
++        let latest = doc.get_deep_value();
++        let n_checks = tc.draw(generators::integers::<usize>().min_value(1).max_value(5));
++        for _ in 0..n_checks {
++            let idx =
++                tc.draw(generators::integers::<usize>().max_value(checkpoints.len() - 1));
++            let (frontiers, expected) = &checkpoints[idx];
++            doc.checkout(frontiers).unwrap();
++            assert_eq!(*expected, doc.get_deep_value());
++        }
++        doc.checkout_to_latest();
++        assert_eq!(latest, doc.get_deep_value());
++        assert!(!doc.is_detached());
++    }
++
++    // ---------- Property 10: frontiers <-> version-vector duality ----------
++    #[hegel::test]
++    fn prop_frontiers_vv_roundtrip(tc: TestCase) {
++        let doc = build_random_doc(&tc, 1);
++        doc.commit();
++        let frontiers = doc.oplog_frontiers();
++        let vv = doc.oplog_vv();
++        assert_eq!(Some(vv.clone()), doc.frontiers_to_vv(&frontiers));
++        assert_eq!(frontiers, doc.vv_to_frontiers(&vv));
++    }
++
++    // ---------- Pinned known failures (real bugs, deliberately left failing) ----------
++
++    // KNOWN FAILURE: replicas with identical oplogs can render different
++    // deep values depending on how the same updates were batched into
++    // `import` calls.
++    //
++    // A counter whose increments sum to (approximately) zero within one
++    // imported batch never materializes the container on the receiving
++    // replica: `InternalDiff::Counter(c).is_empty()` treats `|c| < f64::EPSILON`
++    // as empty (crates/loro-internal/src/event.rs, `InternalDiff::is_empty`),
++    // and `DiffCalculator::calc_diff_internal`
++    // (crates/loro-internal/src/diff_calc.rs, `if !diff.is_empty() || bring_back`)
++    // then drops the diff entirely, so the container is never created in the
++    // receiver's state. A replica that receives the same ops split across two
++    // imports (each with a non-zero net diff) *does* create the container.
++    // Snapshot imports materialize it as well. The upstream fuzzer masks this
++    // by normalizing missing keys to `Double(0.)` in `assert_value_eq`
++    // (crates/fuzz/src/actor.rs).
++    //
++    // Minimal counterexample: peer 1 does `increment(v); commit; decrement(v);
++    // commit`. A replica importing both changes in one blob shows `{}`; a
++    // replica importing them as two blobs shows `{"counter": 0.0}`. Both have
++    // identical version vectors.
++    #[hegel::test]
++    fn prop_counter_zero_sum_import_batching_diverges_known_bug(tc: TestCase) {
++        let v = tc.draw(
++            generators::integers::<i32>()
++                .min_value(1)
++                .max_value(1000),
++        ) as f64;
++        let origin = LoroDoc::new();
++        origin.set_peer_id(1).unwrap();
++        let counter = origin.get_counter("counter");
++        counter.increment(v).unwrap();
++        origin.commit();
++        let mid_vv = origin.oplog_vv();
++        counter.decrement(v).unwrap();
++        origin.commit();
++
++        let two_batches = LoroDoc::new();
++        two_batches.set_peer_id(2).unwrap();
++        two_batches
++            .import(&origin.export(ExportMode::updates_till(&mid_vv)).unwrap())
++            .unwrap();
++        two_batches
++            .import(&origin.export(ExportMode::updates(&mid_vv)).unwrap())
++            .unwrap();
++
++        let one_batch = LoroDoc::new();
++        one_batch.set_peer_id(3).unwrap();
++        one_batch
++            .import(&origin.export(ExportMode::all_updates()).unwrap())
++            .unwrap();
++
++        // Same history on both replicas...
++        assert_eq!(two_batches.oplog_vv(), one_batch.oplog_vv());
++        // ...but different visible state (two_batches has {"counter": 0.0},
++        // one_batch has {}). This assertion fails deterministically.
++        assert_eq!(two_batches.get_deep_value(), one_batch.get_deep_value());
++    }
++
++    // KNOWN FAILURE: `export(ExportMode::ShallowSnapshot(frontiers))` can
++    // succeed yet produce bytes that *cannot be imported*
++    // (`Err(SwitchToVersionBeforeShallowRoot)`), losing the document.
++    //
++    // With >= 3 concurrent frontier tips, `calc_shallow_doc_start`
++    // (crates/loro-internal/src/encoding/shallow_snapshot.rs) reduces the
++    // frontiers by pairwise common ancestors; when a pair of concurrent tips
++    // has an empty GCA the pair is dropped and the odd tip out is kept, so
++    // the loop converges to a single tip that does NOT dominate the others
++    // (instead of falling back to empty frontiers / full history as the
++    // fallback comment intends). The exported snapshot is then shallow-rooted
++    // at a version concurrent with retained ops, and importing it fails.
++    // The trigger needs the surviving tip's change to have counter > 0, and
++    // the upstream fuzzer ignores shallow export/import errors
++    // (`let _ = ...export(...)` in crates/fuzz/src/crdt_fuzzer.rs), so it
++    // never sees this.
++    //
++    // Minimal counterexample: peer 1 inserts then deletes one char (tip 1@1),
++    // peers 2 and 3 each insert one char concurrently (tips 0@2, 0@3); merge
++    // everything into peer 1's doc and export a shallow snapshot at the
++    // doc's own current frontiers. Import into a fresh doc fails.
++    #[hegel::test]
++    fn prop_shallow_snapshot_of_concurrent_tips_is_importable_known_bug(tc: TestCase) {
++        let c = draw_char(&tc).to_string();
++        let d1 = LoroDoc::new();
++        d1.set_peer_id(1).unwrap();
++        d1.get_text("text").insert(0, &c).unwrap();
++        d1.get_text("text").delete(0, 1).unwrap();
++        d1.commit();
++        let d2 = LoroDoc::new();
++        d2.set_peer_id(2).unwrap();
++        d2.get_text("text").insert(0, &c).unwrap();
++        d2.commit();
++        let d3 = LoroDoc::new();
++        d3.set_peer_id(3).unwrap();
++        d3.get_text("text").insert(0, &c).unwrap();
++        d3.commit();
++        d1.import(&d2.export(ExportMode::all_updates()).unwrap())
++            .unwrap();
++        d1.import(&d3.export(ExportMode::all_updates()).unwrap())
++            .unwrap();
++
++        let frontiers = d1.oplog_frontiers();
++        assert_eq!(frontiers.len(), 3);
++        let bytes = d1.export(ExportMode::shallow_snapshot(&frontiers)).unwrap();
++        let fresh = LoroDoc::new();
++        // Fails deterministically with Err(SwitchToVersionBeforeShallowRoot):
++        // the export succeeded but its output is unimportable.
++        fresh.import(&bytes).unwrap();
++        touch_roots(&d1);
++        touch_roots(&fresh);
++        assert_eq!(d1.get_deep_value(), fresh.get_deep_value());
++    }
++}
