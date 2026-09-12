@@ -1,0 +1,873 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 82746c91..a1c8240b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -139,6 +139,7 @@ elapsed = "0.1.2"
+ flate2 = { version = "1", features = [
+   "zlib-ng-compat",
+ ], default-features = false }
++hegeltest = "0.44.1"
+ itertools = "0.15"
+ # required to be able to run tests without specifying --features=test_utils
+ # see https://github.com/rust-lang/cargo/issues/2911#issuecomment-749580481
+diff --git a/src/kd_tree/mod.rs b/src/kd_tree/mod.rs
+index dbb92803..7020cd60 100644
+--- a/src/kd_tree/mod.rs
++++ b/src/kd_tree/mod.rs
+@@ -1320,4 +1320,856 @@ mod tests {
+             sort_entries_u16(entries)
+         );
+     }
++
++    /// Property-based tests (hegel) comparing tree queries against brute-force
++    /// oracles, and tree mutation against a `Vec` model.
++    mod hegel_props {
++        use std::num::NonZeroUsize;
++
++        use hegel::generators;
++
++        use crate::dist::DistanceMetricScalar;
++        use crate::kd_tree::{KdTree, MutationError};
++        use crate::leaf_strategy::{FlatVec, VecOfArrays};
++        use crate::{Chebyshev, Eytzinger, Manhattan, SquaredEuclidean};
++
++        // Small bucket sizes so a couple of hundred points produce several stem
++        // levels, exercising deep traversal and backtracking paths.
++        type ImmutableTree2D = KdTree<f64, u32, Eytzinger, FlatVec<f64, u32, 2, 4>, 2, 4>;
++        type ImmutableTree3D = KdTree<f64, u32, Eytzinger, FlatVec<f64, u32, 3, 8>, 3, 8>;
++        type MutableTree2D = KdTree<f64, u32, Eytzinger, VecOfArrays<f64, u32, 2, 4>, 2, 4>;
++
++        /// A finite f64 coordinate: unit-scale, mid-scale, and extreme-but-finite
++        /// magnitudes, plus exact special values.
++        ///
++        /// Infinities are excluded because coordinates equal to `A::max_value()`
++        /// (the stem sentinel, `+inf` for floats) are unsupported pending checked
++        /// ingress APIs — see the TODO on `KdTree::new_from_slice`. NaN is outside
++        /// the domain of a kd-tree coordinate (`Axis::cmp` assumes ordered values).
++        #[hegel::composite]
++        fn coord(tc: &hegel::TestCase) -> f64 {
++            tc.draw(hegel::one_of!(
++                generators::floats::<f64>().min_value(-1.0).max_value(1.0),
++                generators::floats::<f64>().min_value(-1e9).max_value(1e9),
++                generators::floats::<f64>().min_value(-f64::MAX).max_value(f64::MAX),
++                generators::sampled_from(vec![
++                    0.0,
++                    -0.0,
++                    1.0,
++                    -1.0,
++                    0.5,
++                    1e-300,
++                    1e300,
++                    -1e300,
++                    f64::MAX,
++                    -f64::MAX,
++                ]),
++            ))
++        }
++
++        fn draw_point<const K: usize>(tc: &hegel::TestCase) -> [f64; K] {
++            let mut point = [0.0f64; K];
++            for slot in point.iter_mut() {
++                *slot = tc.draw(coord());
++            }
++            point
++        }
++
++        /// Draws `min_n..=max_n` points with a bias towards exact duplicates of
++        /// earlier points (duplicate points must land in the same leaf and stress
++        /// splitting and boundary handling).
++        fn draw_points<const K: usize>(
++            tc: &hegel::TestCase,
++            min_n: usize,
++            max_n: usize,
++        ) -> Vec<[f64; K]> {
++            let n = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(min_n)
++                    .max_value(max_n),
++            );
++            let mut points: Vec<[f64; K]> = Vec::with_capacity(n);
++            for _ in 0..n {
++                let duplicate =
++                    !points.is_empty() && tc.draw(generators::integers::<u8>().max_value(3)) == 0;
++                if duplicate {
++                    let idx =
++                        tc.draw(generators::integers::<usize>().max_value(points.len() - 1));
++                    points.push(points[idx]);
++                } else {
++                    points.push(draw_point(tc));
++                }
++            }
++            points
++        }
++
++        /// Query point: fresh coordinates, or an exact copy of a tree point
++        /// (distance-zero queries probe tie and boundary handling).
++        fn draw_query<const K: usize>(tc: &hegel::TestCase, points: &[[f64; K]]) -> [f64; K] {
++            if !points.is_empty() && tc.draw(generators::booleans()) {
++                let idx = tc.draw(generators::integers::<usize>().max_value(points.len() - 1));
++                points[idx]
++            } else {
++                draw_point(tc)
++            }
++        }
++
++        /// Brute-force oracle: every (distance, item) pair, sorted by distance
++        /// then item index. Uses the same scalar metric implementation as the
++        /// tree (`DistanceMetricScalar::dist_raw`), so distances are exactly
++        /// comparable; the tree's traversal/pruning/collection logic is what is
++        /// being tested.
++        fn brute_force<D, const K: usize>(points: &[[f64; K]], query: &[f64; K]) -> Vec<(f64, u32)>
++        where
++            D: DistanceMetricScalar<f64, Output = f64>,
++        {
++            let mut all: Vec<(f64, u32)> = points
++                .iter()
++                .enumerate()
++                .map(|(idx, point)| (D::dist_raw(query, point), idx as u32))
++                .collect();
++            all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
++            all
++        }
++
++        /// All items whose distance ties the minimum (candidates a nearest_one
++        /// query may legitimately return).
++        fn tied_nearest(ranked: &[(f64, u32)]) -> Vec<u32> {
++            let best = ranked[0].0;
++            ranked
++                .iter()
++                .take_while(|(dist, _)| *dist == best)
++                .map(|(_, item)| *item)
++                .collect()
++        }
++
++        /// Radius for within-style queries: the exact distance of a drawn point
++        /// (boundary snapping), a slightly perturbed exact distance, or an
++        /// arbitrary non-negative value.
++        fn draw_radius(tc: &hegel::TestCase, ranked: &[(f64, u32)]) -> f64 {
++            if !ranked.is_empty() && tc.draw(generators::booleans()) {
++                let idx = tc.draw(generators::integers::<usize>().max_value(ranked.len() - 1));
++                let dist = ranked[idx].0;
++                match tc.draw(generators::integers::<u8>().max_value(2)) {
++                    0 => dist,
++                    1 => dist * (1.0 + 1e-9),
++                    _ => dist * (1.0 - 1e-9),
++                }
++            } else {
++                tc.draw(
++                    generators::floats::<f64>()
++                        .min_value(0.0)
++                        .max_value(f64::MAX),
++                )
++            }
++        }
++
++        // ------------------------------------------------------------------
++        // Property: nearest_one returns the true minimum distance and one of
++        // the items that achieve it, for each supported bundled metric.
++        //
++        // (When all distances overflow to +inf the tree fabricates item
++        // `T::default()` — see the known-bug test
++        // `hegel_nearest_one_overflowed_distance_fabricates_default_item_known_bug`.
++        // Here items are slice indices 0..n, so item 0 exists and is a
++        // legitimate member of the all-tied-at-inf candidate set; no
++        // exclusion is needed for this property to be sound.)
++        // ------------------------------------------------------------------
++        macro_rules! nearest_one_oracle_test {
++            ($name:ident, $metric:ty) => {
++                #[hegel::test]
++                fn $name(tc: hegel::TestCase) {
++                    let points: Vec<[f64; 2]> = draw_points(&tc, 1, 200);
++                    let query = draw_query(&tc, &points);
++                    let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++                    let ranked = brute_force::<$metric, 2>(&points, &query);
++
++                    let result = tree.query(&query).nearest_one::<$metric>().execute();
++
++                    assert_eq!(
++                        result.distance, ranked[0].0,
++                        "nearest_one distance mismatch: expected {} got {} (query={query:?})",
++                        ranked[0].0, result.distance
++                    );
++                    let tied = tied_nearest(&ranked);
++                    assert!(
++                        tied.contains(&result.item),
++                        "nearest_one returned item {} which does not achieve the minimum \
++                         distance {}; candidates: {tied:?}",
++                        result.item,
++                        ranked[0].0
++                    );
++                }
++            };
++        }
++
++        nearest_one_oracle_test!(
++            hegel_nearest_one_matches_brute_force_squared_euclidean,
++            SquaredEuclidean<f64>
++        );
++        nearest_one_oracle_test!(hegel_nearest_one_matches_brute_force_manhattan, Manhattan<f64>);
++        nearest_one_oracle_test!(hegel_nearest_one_matches_brute_force_chebyshev, Chebyshev<f64>);
++
++        // ------------------------------------------------------------------
++        // Property: nearest_n returns exactly the k smallest distances in
++        // ascending order, with distinct items whose true distances match the
++        // reported ones (3D tree, so a different K than the other tests).
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_nearest_n_matches_brute_force(tc: hegel::TestCase) {
++            let points: Vec<[f64; 3]> = draw_points(&tc, 0, 200);
++            let query = draw_query(&tc, &points);
++            let max_qty = tc.draw(generators::integers::<usize>().min_value(1).max_value(50));
++            let tree = ImmutableTree3D::new_from_slice(&points).unwrap();
++            let ranked = brute_force::<SquaredEuclidean<f64>, 3>(&points, &query);
++
++            let results = tree
++                .query(&query)
++                .nearest_n::<SquaredEuclidean<f64>>(NonZeroUsize::new(max_qty).unwrap())
++                .execute();
++
++            let expected_len = max_qty.min(points.len());
++            assert_eq!(results.len(), expected_len, "nearest_n result length");
++            for (rank, result) in results.iter().enumerate() {
++                assert_eq!(
++                    result.distance, ranked[rank].0,
++                    "nearest_n distance at rank {rank}: expected {} got {}",
++                    ranked[rank].0, result.distance
++                );
++                let true_dist = <SquaredEuclidean<f64> as DistanceMetricScalar<f64>>::dist_raw(
++                    &query,
++                    &points[result.item as usize],
++                );
++                assert_eq!(
++                    result.distance, true_dist,
++                    "nearest_n reported distance {} for item {} whose true distance is {}",
++                    result.distance, result.item, true_dist
++                );
++            }
++            let mut items: Vec<u32> = results.iter().map(|result| result.item).collect();
++            items.sort_unstable();
++            items.dedup();
++            assert_eq!(items.len(), expected_len, "nearest_n returned duplicate items");
++        }
++
++        // ------------------------------------------------------------------
++        // Property: within (sorted, inclusive) returns exactly the items with
++        // distance <= radius, in ascending distance order.
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_within_inclusive_matches_brute_force(tc: hegel::TestCase) {
++            let points: Vec<[f64; 2]> = draw_points(&tc, 0, 250);
++            let query = draw_query(&tc, &points);
++            let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++            let ranked = brute_force::<Manhattan<f64>, 2>(&points, &query);
++            let radius = draw_radius(&tc, &ranked);
++
++            let results = tree
++                .query(&query)
++                .within::<Manhattan<f64>>(radius)
++                .execute();
++
++            for window in results.windows(2) {
++                assert!(
++                    window[0].distance <= window[1].distance,
++                    "within results not sorted by distance: {} then {}",
++                    window[0].distance,
++                    window[1].distance
++                );
++            }
++            let mut got_items: Vec<u32> = results.iter().map(|result| result.item).collect();
++            got_items.sort_unstable();
++            let mut expected_items: Vec<u32> = ranked
++                .iter()
++                .filter(|(dist, _)| *dist <= radius)
++                .map(|(_, item)| *item)
++                .collect();
++            expected_items.sort_unstable();
++            assert_eq!(
++                got_items, expected_items,
++                "within item set mismatch at radius {radius} (query={query:?})"
++            );
++            for result in &results {
++                let true_dist = <Manhattan<f64> as DistanceMetricScalar<f64>>::dist_raw(
++                    &query,
++                    &points[result.item as usize],
++                );
++                assert_eq!(result.distance, true_dist, "within reported wrong distance");
++            }
++        }
++
++        // ------------------------------------------------------------------
++        // Property: within with exclusive_boundaries returns exactly the items
++        // with distance < radius ("strict `< radius` semantics" per the
++        // builder docs).
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_within_exclusive_matches_brute_force(tc: hegel::TestCase) {
++            let points: Vec<[f64; 2]> = draw_points(&tc, 0, 250);
++            let query = draw_query(&tc, &points);
++            let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++            let ranked = brute_force::<SquaredEuclidean<f64>, 2>(&points, &query);
++            let radius = draw_radius(&tc, &ranked);
++
++            let results = tree
++                .query(&query)
++                .within::<SquaredEuclidean<f64>>(radius)
++                .exclusive_boundaries()
++                .execute();
++
++            let mut got_items: Vec<u32> = results.iter().map(|result| result.item).collect();
++            got_items.sort_unstable();
++            let mut expected_items: Vec<u32> = ranked
++                .iter()
++                .filter(|(dist, _)| *dist < radius)
++                .map(|(_, item)| *item)
++                .collect();
++            expected_items.sort_unstable();
++            assert_eq!(
++                got_items, expected_items,
++                "exclusive within item set mismatch at radius {radius} (query={query:?})"
++            );
++        }
++
++        // ------------------------------------------------------------------
++        // Property: within().unsorted() returns the same item set as the
++        // inclusive brute-force filter (separate traversal/collection path
++        // from the sorted variant).
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_within_unsorted_matches_brute_force(tc: hegel::TestCase) {
++            let points: Vec<[f64; 2]> = draw_points(&tc, 0, 250);
++            let query = draw_query(&tc, &points);
++            let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++            let ranked = brute_force::<SquaredEuclidean<f64>, 2>(&points, &query);
++            let radius = draw_radius(&tc, &ranked);
++
++            let results = tree
++                .query(&query)
++                .within::<SquaredEuclidean<f64>>(radius)
++                .unsorted()
++                .execute();
++
++            let mut got_items: Vec<u32> = results.iter().map(|result| result.item).collect();
++            got_items.sort_unstable();
++            let mut expected_items: Vec<u32> = ranked
++                .iter()
++                .filter(|(dist, _)| *dist <= radius)
++                .map(|(_, item)| *item)
++                .collect();
++            expected_items.sort_unstable();
++            assert_eq!(
++                got_items, expected_items,
++                "unsorted within item set mismatch at radius {radius} (query={query:?})"
++            );
++        }
++
++        // ------------------------------------------------------------------
++        // Property: nearest_n(..).within(r) returns the first
++        // min(n, |within r|) entries of the distance ranking, all within the
++        // radius.
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_nearest_n_within_matches_brute_force(tc: hegel::TestCase) {
++            let points: Vec<[f64; 2]> = draw_points(&tc, 0, 250);
++            let query = draw_query(&tc, &points);
++            let max_qty = tc.draw(generators::integers::<usize>().min_value(1).max_value(40));
++            let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++            let ranked = brute_force::<SquaredEuclidean<f64>, 2>(&points, &query);
++            let radius = draw_radius(&tc, &ranked);
++            let within: Vec<(f64, u32)> = ranked
++                .iter()
++                .copied()
++                .filter(|(dist, _)| *dist <= radius)
++                .collect();
++
++            let results = tree
++                .query(&query)
++                .nearest_n::<SquaredEuclidean<f64>>(NonZeroUsize::new(max_qty).unwrap())
++                .within(radius)
++                .execute();
++
++            let expected_len = max_qty.min(within.len());
++            assert_eq!(
++                results.len(),
++                expected_len,
++                "nearest_n_within length mismatch at radius {radius}"
++            );
++            for (rank, result) in results.iter().enumerate() {
++                assert_eq!(
++                    result.distance, within[rank].0,
++                    "nearest_n_within distance at rank {rank}"
++                );
++                assert!(
++                    result.distance <= radius,
++                    "nearest_n_within returned distance {} beyond radius {radius}",
++                    result.distance
++                );
++                let true_dist = <SquaredEuclidean<f64> as DistanceMetricScalar<f64>>::dist_raw(
++                    &query,
++                    &points[result.item as usize],
++                );
++                assert_eq!(result.distance, true_dist, "nearest_n_within wrong distance");
++            }
++            let mut items: Vec<u32> = results.iter().map(|result| result.item).collect();
++            items.sort_unstable();
++            items.dedup();
++            assert_eq!(items.len(), expected_len, "nearest_n_within duplicate items");
++        }
++
++        // ------------------------------------------------------------------
++        // Property: best_n_within keeps the max_qty in-radius entries with the
++        // smallest item values ("keeps the best `max_qty` entries by item
++        // ordering" per the builder docs; matches the v6 fuzz-suite oracle).
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_best_n_within_matches_brute_force(tc: hegel::TestCase) {
++            let points: Vec<[f64; 2]> = draw_points(&tc, 0, 250);
++            let query = draw_query(&tc, &points);
++            let max_qty = tc.draw(generators::integers::<usize>().min_value(1).max_value(40));
++            let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++            let ranked = brute_force::<SquaredEuclidean<f64>, 2>(&points, &query);
++            let radius = draw_radius(&tc, &ranked);
++
++            let results = tree
++                .query(&query)
++                .best_n_within::<SquaredEuclidean<f64>>(radius, NonZeroUsize::new(max_qty).unwrap())
++                .execute()
++                .into_sorted_vec();
++
++            let mut expected_items: Vec<u32> = ranked
++                .iter()
++                .filter(|(dist, _)| *dist <= radius)
++                .map(|(_, item)| *item)
++                .collect();
++            expected_items.sort_unstable();
++            expected_items.truncate(max_qty);
++            let got_items: Vec<u32> = results.iter().map(|result| result.item).collect();
++            assert_eq!(
++                got_items, expected_items,
++                "best_n_within item mismatch at radius {radius} (query={query:?})"
++            );
++            for result in &results {
++                let true_dist = <SquaredEuclidean<f64> as DistanceMetricScalar<f64>>::dist_raw(
++                    &query,
++                    &points[result.item as usize],
++                );
++                assert_eq!(result.distance, true_dist, "best_n_within wrong distance");
++            }
++        }
++
++        // ------------------------------------------------------------------
++        // Property: approximate nearest-one is never better than exact, and
++        // always reports the true distance of an item actually in the tree
++        // ("may not return the true nearest neighbour; searches only the leaf
++        // that the query point falls into").
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_approx_nearest_one_never_better_than_exact(tc: hegel::TestCase) {
++            let points: Vec<[f64; 2]> = draw_points(&tc, 1, 200);
++            let query = draw_query(&tc, &points);
++            let tree = ImmutableTree2D::new_from_slice(&points).unwrap();
++
++            let exact = tree
++                .query(&query)
++                .nearest_one::<SquaredEuclidean<f64>>()
++                .execute();
++            let approx = tree
++                .query(&query)
++                .nearest_one::<SquaredEuclidean<f64>>()
++                .approx()
++                .execute();
++
++            assert!(
++                approx.distance >= exact.distance,
++                "approx nearest_one distance {} beats exact {}",
++                approx.distance,
++                exact.distance
++            );
++            assert!(
++                (approx.item as usize) < points.len(),
++                "approx nearest_one returned out-of-range item {}",
++                approx.item
++            );
++            // When the scanned leaf's distances all overflow to +inf, the
++            // approx path fabricates `T::default()` as the item, exactly like
++            // exact nearest_one — a known bug pinned by
++            // `hegel_nearest_one_overflowed_distance_fabricates_default_item_known_bug`.
++            // Skip only the reported-distance check for that case.
++            if approx.distance.is_finite() {
++                let true_dist = <SquaredEuclidean<f64> as DistanceMetricScalar<f64>>::dist_raw(
++                    &query,
++                    &points[approx.item as usize],
++                );
++                assert_eq!(
++                    approx.distance, true_dist,
++                    "approx nearest_one reported distance {} for item {} whose true distance is {}",
++                    approx.distance, approx.item, true_dist
++                );
++            }
++        }
++
++        // ------------------------------------------------------------------
++        // Property: a fixed-point tree agrees exactly with the f64 brute-force
++        // oracle on inputs representable in both (lattice of multiples of
++        // 1/256, small enough that squared distances stay in range).
++        // ------------------------------------------------------------------
++        #[hegel::test]
++        fn hegel_fixed_point_nearest_one_agrees_with_f64_oracle(tc: hegel::TestCase) {
++            use fixed::types::extra::U16;
++            use fixed::FixedI32;
++
++            type Fx = FixedI32<U16>;
++            type FixedTree2D = KdTree<Fx, u32, Eytzinger, FlatVec<Fx, u32, 2, 4>, 2, 4>;
++
++            // |coord| <= 5 so squared-euclidean distances stay well inside
++            // FixedI32<U16>'s range (this bound protects the metric's output
++            // type, not the tree).
++            let lattice = generators::integers::<i32>().min_value(-1280).max_value(1280);
++            let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(150));
++            let mut points_f64: Vec<[f64; 2]> = Vec::with_capacity(n);
++            for _ in 0..n {
++                let x = tc.draw(
++                    generators::integers::<i32>()
++                        .min_value(-1280)
++                        .max_value(1280),
++                );
++                let y = tc.draw(
++                    generators::integers::<i32>()
++                        .min_value(-1280)
++                        .max_value(1280),
++                );
++                points_f64.push([f64::from(x) / 256.0, f64::from(y) / 256.0]);
++            }
++            let qx = tc.draw(lattice);
++            let qy = tc.draw(
++                generators::integers::<i32>()
++                    .min_value(-1280)
++                    .max_value(1280),
++            );
++            let query_f64 = [f64::from(qx) / 256.0, f64::from(qy) / 256.0];
++
++            let points_fx: Vec<[Fx; 2]> = points_f64
++                .iter()
++                .map(|point| [Fx::from_num(point[0]), Fx::from_num(point[1])])
++                .collect();
++            let query_fx = [Fx::from_num(query_f64[0]), Fx::from_num(query_f64[1])];
++
++            let tree = FixedTree2D::new_from_slice(&points_fx).unwrap();
++            let result = tree
++                .query(&query_fx)
++                .nearest_one::<SquaredEuclidean<Fx>>()
++                .execute();
++
++            let ranked = brute_force::<SquaredEuclidean<f64>, 2>(&points_f64, &query_f64);
++            assert_eq!(
++                result.distance.to_num::<f64>(),
++                ranked[0].0,
++                "fixed-point nearest_one distance disagrees with f64 oracle"
++            );
++            let tied = tied_nearest(&ranked);
++            assert!(
++                tied.contains(&result.item),
++                "fixed-point nearest_one item {} not among f64-oracle candidates {tied:?}",
++                result.item
++            );
++        }
++
++        // ------------------------------------------------------------------
++        // Property (stateful model test): a mutable tree driven by
++        // add/remove/replace_item agrees with a Vec of (item, point) entries
++        // after every operation, both in contents and in nearest_one results.
++        // ------------------------------------------------------------------
++        struct TreeVsVecModel {
++            tree: MutableTree2D,
++            model: Vec<(u32, [f64; 2])>,
++            // Coordinate values (canonical bits) already present per dimension;
++            // see the comment on the `add` rule.
++            used_coords: [std::collections::HashSet<u64>; 2],
++        }
++
++        fn canon_coord_bits(value: f64) -> u64 {
++            if value == 0.0 {
++                0u64
++            } else {
++                value.to_bits()
++            }
++        }
++
++        impl TreeVsVecModel {
++            /// A point that often coincides exactly with an existing entry, to
++            /// exercise removal/replacement of real entries as well as misses.
++            fn draw_model_point(&self, tc: &hegel::TestCase) -> [f64; 2] {
++                if !self.model.is_empty() && tc.draw(generators::booleans()) {
++                    let idx =
++                        tc.draw(generators::integers::<usize>().max_value(self.model.len() - 1));
++                    self.model[idx].1
++                } else {
++                    draw_point(tc)
++                }
++            }
++
++            /// Small item space so (point, item) collisions are common.
++            fn draw_item(tc: &hegel::TestCase) -> u32 {
++                tc.draw(generators::integers::<u32>().max_value(7))
++            }
++        }
++
++        #[hegel::state_machine]
++        impl TreeVsVecModel {
++            #[rule]
++            fn add(&mut self, tc: hegel::TestCase) {
++                let point = draw_point::<2>(&tc);
++                // KNOWN BUG exclusion (canonical failing test:
++                // `hegel_mutable_add_split_scrambles_items_known_bug`):
++                // splitting a full leaf whose below-median entries all share
++                // the split-dimension coordinate scrambles item/point
++                // pairings. Only add points whose coordinates are new in
++                // every dimension so add() can never reach that path; the
++                // duplicate-coordinate case is pinned by the canonical test.
++                if point
++                    .iter()
++                    .enumerate()
++                    .any(|(dim, value)| self.used_coords[dim].contains(&canon_coord_bits(*value)))
++                {
++                    return;
++                }
++                let item = Self::draw_item(&tc);
++                match self.tree.add(&point, item) {
++                    Ok(()) => {
++                        for (dim, value) in point.iter().enumerate() {
++                            self.used_coords[dim].insert(canon_coord_bits(*value));
++                        }
++                        self.model.push((item, point));
++                    }
++                    Err(err) => {
++                        // UnsplittableBucket requires a full leaf of entries
++                        // sharing the split-dimension value, which the
++                        // uniqueness guard above rules out.
++                        panic!("unexpected add error: {err:?}");
++                    }
++                }
++            }
++
++            #[rule]
++            fn remove(&mut self, tc: hegel::TestCase) {
++                let point = self.draw_model_point(&tc);
++                let item = Self::draw_item(&tc);
++                self.tree.remove(&point, item);
++                // remove() drops every exact (point, item) match in the target
++                // leaf; duplicates of a point always share a leaf.
++                self.model
++                    .retain(|(m_item, m_point)| !(*m_item == item && *m_point == point));
++            }
++
++            #[rule]
++            fn replace_item(&mut self, tc: hegel::TestCase) {
++                let point = self.draw_model_point(&tc);
++                let old_item = Self::draw_item(&tc);
++                let new_item = Self::draw_item(&tc);
++                let result = self.tree.replace_item(&point, old_item, new_item);
++                let model_pos = self
++                    .model
++                    .iter()
++                    .position(|(m_item, m_point)| *m_item == old_item && *m_point == point);
++                match model_pos {
++                    Some(pos) => {
++                        assert_eq!(
++                            result,
++                            Ok(()),
++                            "replace_item failed for an entry present in the model"
++                        );
++                        self.model[pos].0 = new_item;
++                    }
++                    None => {
++                        assert_eq!(
++                            result,
++                            Err(MutationError::EntryNotFound),
++                            "replace_item succeeded for an entry absent from the model"
++                        );
++                    }
++                }
++            }
++
++            #[rule]
++            fn check_nearest_one(&mut self, tc: hegel::TestCase) {
++                tc.assume(!self.model.is_empty());
++                let query = self.draw_model_point(&tc);
++                let result = self
++                    .tree
++                    .query(&query)
++                    .nearest_one::<SquaredEuclidean<f64>>()
++                    .execute();
++
++                let mut ranked: Vec<(f64, u32)> = self
++                    .model
++                    .iter()
++                    .map(|(item, point)| {
++                        (
++                            <SquaredEuclidean<f64> as DistanceMetricScalar<f64>>::dist_raw(
++                                &query, point,
++                            ),
++                            *item,
++                        )
++                    })
++                    .collect();
++                ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
++                assert_eq!(
++                    result.distance, ranked[0].0,
++                    "nearest_one distance mismatch against model"
++                );
++                // When every distance overflows to +inf, nearest_one fabricates
++                // `T::default()` as the item — a known bug pinned by
++                // `hegel_nearest_one_overflowed_distance_fabricates_default_item_known_bug`.
++                // Skip only the item check for that case so this rule keeps
++                // testing everything else.
++                if ranked[0].0.is_finite() {
++                    let tied = tied_nearest(&ranked);
++                    assert!(
++                        tied.contains(&result.item),
++                        "nearest_one returned item {} not among model candidates {tied:?}",
++                        result.item
++                    );
++                }
++            }
++
++            #[invariant]
++            fn contents_match_model(&self, _tc: hegel::TestCase) {
++                assert_eq!(self.tree.size(), self.model.len(), "size mismatch vs model");
++                // Bit-exact comparison key, except that -0.0 is normalized to
++                // +0.0: the tree compares coordinates with PartialOrd (where
++                // -0.0 == 0.0) and a leaf split may exchange the stored
++                // representations of equal-comparing coordinates between
++                // entries, which is unobservable through the tree's own
++                // comparison semantics and not part of its contract.
++                let canon_bits = |value: f64| if value == 0.0 { 0u64 } else { value.to_bits() };
++                let key = |(item, point): (u32, [f64; 2])| {
++                    (item, [canon_bits(point[0]), canon_bits(point[1])])
++                };
++                let mut got: Vec<_> = self.tree.iter().map(key).collect();
++                let mut expected: Vec<_> = self.model.iter().copied().map(key).collect();
++                got.sort_unstable();
++                expected.sort_unstable();
++                assert_eq!(got, expected, "tree contents diverge from model");
++            }
++        }
++
++        // ------------------------------------------------------------------
++        // KNOWN FAILURE: `nearest_one` fabricates `T::default()` as the result
++        // item when the true minimum distance overflows to `+inf`.
++        //
++        // The leaf scan updates its best candidate with a strict
++        // `dist < best_dist` comparison (src/leaf_view_chunked/nearest_one.rs)
++        // starting from `best_dist = A::max_value()` (`+inf` for floats) and
++        // `best_item = T::default()`. When every reachable point's metric
++        // distance overflows to `+inf` (e.g. squared-euclidean between
++        // coordinates of magnitude ~1e300, which the crate otherwise accepts),
++        // no candidate ever satisfies `inf < inf`, so the query reports
++        // distance `+inf` with item `T::default()` — an item that need not
++        // exist in the tree at all. `nearest_n`, `within`, and `best_n_within`
++        // handle the same inputs correctly (they collect the inf-distance
++        // entries with their real items), so this is specific to the
++        // nearest-one collector; `approx()` shares it.
++        //
++        // Every generated case below fails, so the failure is deterministic
++        // regardless of seed. Sibling properties that could only fail through
++        // this same root cause skip that one assertion, with a comment
++        // pointing here.
++        #[hegel::test]
++        fn hegel_nearest_one_overflowed_distance_fabricates_default_item_known_bug(
++            tc: hegel::TestCase,
++        ) {
++            // Entries whose items are never 0 (= u32::default()), all at
++            // squared-euclidean distance +inf from the query.
++            let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(5));
++            let mut entries: Vec<(u32, [f64; 2])> = Vec::with_capacity(n);
++            for offset in 0..n {
++                let item = tc.draw(generators::integers::<u32>().min_value(1));
++                entries.push((item, [1e300, offset as f64]));
++            }
++            let tree = ImmutableTree2D::new_from_entries(&entries).unwrap();
++            let query = [-1e300f64, 0.0];
++
++            let result = tree
++                .query(&query)
++                .nearest_one::<SquaredEuclidean<f64>>()
++                .execute();
++
++            assert_eq!(result.distance, f64::INFINITY);
++            assert!(
++                entries.iter().any(|(item, _)| *item == result.item),
++                "nearest_one returned item {} which is not in the tree (entries: {:?})",
++                result.item,
++                entries.iter().map(|(item, _)| *item).collect::<Vec<_>>()
++            );
++        }
++
++        // ------------------------------------------------------------------
++        // KNOWN FAILURE: `add()` can scramble item/point pairings when it
++        // splits a full leaf whose below-median entries all share the
++        // split-dimension coordinate.
++        //
++        // `VecOfArrays::split_leaf` (src/leaf_strategy/vec_of_arrays.rs) sorts
++        // the split-dimension coordinates with `mirror_select_nth_unstable_by`
++        // and applies the recorded permutation to the other dimensions and
++        // items. When the chosen pivot walks down to index 0 (all entries
++        // below the median equal the split value), it re-sorts — but it
++        // *reuses* the already-populated `mirror` array. The second
++        // `mirror_select_nth_unstable_by` call composes the second
++        // permutation onto the first, and that composed permutation is then
++        // applied to arrays that have already had the first permutation
++        // applied. The first permutation therefore gets applied twice to
++        // items/other dimensions but only once to the split-dimension
++        // coordinates, silently corrupting item<->point associations (points
++        // migrate between items; subsequent queries return wrong items and
++        // remove() can miss entries). Found by the mutable-tree model test;
++        // sequence below is the hegel-shrunk counterexample. Items are drawn
++        // afresh each case (any distinct values expose the scramble), and the
++        // fixed geometry makes every case fail, so the failure is
++        // deterministic regardless of seed.
++        #[hegel::test]
++        fn hegel_mutable_add_split_scrambles_items_known_bug(tc: hegel::TestCase) {
++            let base = tc.draw(generators::integers::<u32>());
++            let item = |offset: u32| base.wrapping_add(offset);
++            // Leaf fills with three entries at x=0 and one at x=1; the fifth
++            // add splits on x, the pivot walks down to 0, and the buggy
++            // re-sort detaches `item(2)` from [1.0, 0.0].
++            let entries = [
++                (item(0), [0.0f64, 0.0]),
++                (item(1), [0.0, 0.0]),
++                (item(2), [1.0, 0.0]),
++                (item(3), [0.0, 0.0]),
++                (item(4), [0.0, 0.0]),
++            ];
++            let mut tree = MutableTree2D::default();
++            for (item, point) in entries {
++                tree.add(&point, item).unwrap();
++            }
++
++            let key = |(item, point): (u32, [f64; 2])| {
++                (item, [point[0].to_bits(), point[1].to_bits()])
++            };
++            let mut got: Vec<_> = tree.iter().map(key).collect();
++            let mut expected: Vec<_> = entries.into_iter().map(key).collect();
++            got.sort_unstable();
++            expected.sort_unstable();
++            assert_eq!(
++                got, expected,
++                "add() split scrambled item/point pairings"
++            );
++        }
++
++        #[hegel::test]
++        fn hegel_mutable_tree_agrees_with_vec_model(tc: hegel::TestCase) {
++            let machine = TreeVsVecModel {
++                tree: MutableTree2D::default(),
++                model: Vec::new(),
++                used_coords: [
++                    std::collections::HashSet::new(),
++                    std::collections::HashSet::new(),
++                ],
++            };
++            hegel::stateful::machine(machine).run(tc);
++        }
++    }
+ }
