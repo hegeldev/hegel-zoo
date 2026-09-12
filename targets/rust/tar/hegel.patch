@@ -1,0 +1,715 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 258f3ab..3e7e4c1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,7 @@ filetime = "0.2.8"
+ 
+ [dev-dependencies]
+ astral-tokio-tar = "0.6.2"
++hegeltest = "0.44.1"
+ rand = { version = "0.8", features = ["small_rng"] }
+ tempfile = "3"
+ tokio = { version = "1", features = ["macros", "rt"] }
+diff --git a/tests/all.rs b/tests/all.rs
+index eaeb839..dde0284 100644
+--- a/tests/all.rs
++++ b/tests/all.rs
+@@ -2168,3 +2168,517 @@ async fn pax_extension_header_matches_astral_tokio_tar() {
+         "astral-tokio-tar produced unexpected entries\ngot: {async_entries:?}"
+     );
+ }
++
++// ===========================================================================
++// Property-based tests (hegel)
++//
++// These tests focus on two things:
++//  * write -> read round-trips through `Builder` and `Archive`
++//  * decoder robustness on untrusted input (arbitrary, truncated, and
++//    corrupted archives; hostile header fields)
++// ===========================================================================
++pub mod hegel_props {
++    use super::*;
++    use hegel::generators;
++
++    /// Draw a single path component: 1-12 characters mixing ASCII and
++    /// multi-byte Unicode. Never produces "." or ".." (which tar normalizes
++    /// away or rejects), never contains '/' or NUL.
++    pub fn draw_component(tc: &hegel::TestCase) -> String {
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(12));
++        let mut s = String::new();
++        for _ in 0..n {
++            let c = tc.draw(hegel::one_of!(
++                // a-z
++                generators::integers::<u32>()
++                    .min_value(0x61)
++                    .max_value(0x7a),
++                // assorted interesting characters: upper, digit, punctuation,
++                // space, Latin-1, CJK, an astral-plane emoji
++                generators::sampled_from(vec![
++                    'A' as u32, '9' as u32, '.' as u32, '_' as u32, '-' as u32, ' ' as u32,
++                    0xe9,     // é
++                    0x4e16,   // 世
++                    0x1F600,  // 😀
++                ]),
++            ));
++            s.push(char::from_u32(c).unwrap());
++        }
++        // "." and ".." (and "...") are special; make sure we return a normal
++        // component instead.
++        if s.bytes().all(|b| b == b'.') {
++            s.push('x');
++        }
++        s
++    }
++
++    /// Draw a relative path of 1-4 components. When `allow_long` is set, a
++    /// >100-byte component is sometimes appended so the GNU long-name
++    /// extension code path gets exercised.
++    pub fn draw_rel_path(tc: &hegel::TestCase, allow_long: bool) -> String {
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let mut parts = Vec::new();
++        for _ in 0..n {
++            parts.push(draw_component(tc));
++        }
++        if allow_long && tc.draw(generators::booleans()) {
++            let len = tc.draw(generators::integers::<usize>().min_value(101).max_value(250));
++            let c = tc.draw(generators::sampled_from(vec!['a', 'é', '世']));
++            parts.push(std::iter::repeat(c).take(len).collect());
++        }
++        parts.join("/")
++    }
++
++    /// One drawn archive entry for round-trip tests.
++    pub struct DrawnEntry {
++        pub path: String,
++        pub data: Vec<u8>,
++        pub mode: u32,
++        pub uid: u64,
++        pub gid: u64,
++        pub mtime: u64,
++    }
++
++    pub fn draw_entry(tc: &hegel::TestCase, allow_long: bool) -> DrawnEntry {
++        DrawnEntry {
++            path: draw_rel_path(tc, allow_long),
++            data: tc.draw(generators::binary().max_size(2048)),
++            // Bounded to 7 octal digits: `set_mode` silently truncates larger
++            // values (see prop_header_mode_roundtrip_full_range in
++            // tests/header/mod.rs, a pinned known failure).
++            mode: tc.draw(generators::integers::<u32>().max_value(0o7777777)),
++            // Bounded to i64::MAX: an 8-byte base-256 field cannot represent
++            // values with bit 63 set (see prop_header_uid_roundtrip_full_range
++            // in tests/header/mod.rs, a pinned known failure).
++            uid: tc.draw(generators::integers::<u64>().max_value(i64::MAX as u64)),
++            gid: tc.draw(generators::integers::<u64>().max_value(i64::MAX as u64)),
++            mtime: tc.draw(generators::integers::<u64>()),
++        }
++    }
++
++    /// Build a finished in-memory archive from drawn entries.
++    pub fn build_archive(entries: &[DrawnEntry]) -> Vec<u8> {
++        let mut builder = Builder::new(Vec::new());
++        for e in entries {
++            let mut header = Header::new_gnu();
++            header.set_size(e.data.len() as u64);
++            header.set_mode(e.mode);
++            header.set_uid(e.uid);
++            header.set_gid(e.gid);
++            header.set_mtime(e.mtime);
++            header.set_entry_type(EntryType::Regular);
++            builder
++                .append_data(&mut header, &e.path, &e.data[..])
++                .unwrap();
++        }
++        builder.into_inner().unwrap()
++    }
++
++    /// The crown round-trip: any set of entries written with `Builder`
++    /// (paths with `/`, Unicode, and >100-byte names forcing the GNU
++    /// long-name extension; arbitrary contents and metadata) reads back
++    /// byte-for-byte identical through `Archive::entries()`.
++    #[hegel::test]
++    fn prop_archive_write_read_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().max_value(6));
++        let mut expected = Vec::new();
++        for _ in 0..n {
++            expected.push(draw_entry(&tc, true));
++        }
++        let bytes = build_archive(&expected);
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        let mut count = 0;
++        for (i, entry) in ar.entries().unwrap().enumerate() {
++            let mut entry = entry.unwrap();
++            let want = &expected[i];
++            assert_eq!(entry.path_bytes().as_ref(), want.path.as_bytes());
++            assert_eq!(entry.header().entry_type(), EntryType::Regular);
++            assert_eq!(entry.header().mode().unwrap(), want.mode);
++            assert_eq!(entry.header().uid().unwrap(), want.uid);
++            assert_eq!(entry.header().gid().unwrap(), want.gid);
++            assert_eq!(entry.header().mtime().unwrap(), want.mtime);
++            assert_eq!(entry.size(), want.data.len() as u64);
++            let mut buf = Vec::new();
++            entry.read_to_end(&mut buf).unwrap();
++            assert_eq!(buf, want.data);
++            count += 1;
++        }
++        assert_eq!(count, expected.len());
++    }
++
++    /// Hard links and symlinks round-trip their path and link target,
++    /// including >100-byte targets that force the GNU long-link extension.
++    #[hegel::test]
++    fn prop_link_name_roundtrip(tc: hegel::TestCase) {
++        let path = draw_rel_path(&tc, true);
++        // Link targets, unlike entry paths, may be absolute or contain "..".
++        let mut target = draw_rel_path(&tc, true);
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            1 => target = format!("/{}", target),
++            2 => target = format!("../{}", target),
++            _ => {}
++        }
++        let ty = EntryType::new(tc.draw(generators::sampled_from(vec![b'1', b'2'])));
++
++        let mut header = Header::new_gnu();
++        header.set_entry_type(ty);
++        header.set_size(0);
++        let mut builder = Builder::new(Vec::new());
++        builder.append_link(&mut header, &path, &target).unwrap();
++        let bytes = builder.into_inner().unwrap();
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        let mut entries = ar.entries().unwrap();
++        let entry = entries.next().unwrap().unwrap();
++        assert_eq!(entry.header().entry_type(), ty);
++        assert_eq!(entry.path_bytes().as_ref(), path.as_bytes());
++        assert_eq!(
++            entry.link_name_bytes().expect("link name missing").as_ref(),
++            target.as_bytes()
++        );
++        assert!(entries.next().is_none());
++    }
++
++    /// PAX extended headers written with `append_pax_extensions` come back
++    /// unchanged (keys and values, in order) via `Entry::pax_extensions`.
++    #[hegel::test]
++    fn prop_pax_extensions_roundtrip(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(5));
++        let mut kvs: Vec<(String, Vec<u8>)> = Vec::new();
++        for _ in 0..n {
++            let mut key: String = tc.draw(
++                generators::from_regex(r"[A-Za-z0-9_.\-]{1,16}").fullmatch(true),
++            );
++            // Keys the reader itself interprets (overriding size/uid/gid/paths
++            // or triggering sparse/xattr handling) are remapped: this property
++            // tests transport of opaque keys, not their semantics.
++            if matches!(
++                key.as_str(),
++                "size" | "uid" | "gid" | "path" | "linkpath" | "mtime" | "atime" | "ctime"
++            ) || key.starts_with("GNU.")
++                || key.starts_with("SCHILY.")
++            {
++                key = format!("x.{}", key);
++            }
++            // '\n' terminates a PAX record and the writer does not escape it,
++            // so values containing '\n' are outside the encodable domain.
++            let value: Vec<u8> = tc
++                .draw(generators::binary().max_size(64))
++                .into_iter()
++                .map(|b| if b == b'\n' { b'#' } else { b })
++                .collect();
++            kvs.push((key, value));
++        }
++
++        let mut builder = Builder::new(Vec::new());
++        builder
++            .append_pax_extensions(kvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
++            .unwrap();
++        let mut header = Header::new_gnu();
++        header.set_size(2);
++        header.set_entry_type(EntryType::Regular);
++        builder.append_data(&mut header, "file", &b"hi"[..]).unwrap();
++        let bytes = builder.into_inner().unwrap();
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        let mut entries = ar.entries().unwrap();
++        let mut entry = entries.next().unwrap().unwrap();
++        let got: Vec<(Vec<u8>, Vec<u8>)> = entry
++            .pax_extensions()
++            .unwrap()
++            .expect("pax extensions missing")
++            .map(|ext| {
++                let ext = ext.unwrap();
++                (ext.key_bytes().to_vec(), ext.value_bytes().to_vec())
++            })
++            .collect();
++        let want: Vec<(Vec<u8>, Vec<u8>)> = kvs
++            .iter()
++            .map(|(k, v)| (k.as_bytes().to_vec(), v.clone()))
++            .collect();
++        assert_eq!(got, want);
++        assert!(entries.next().is_none());
++    }
++
++    /// Read every entry of a possibly-hostile archive with bounded memory.
++    ///
++    /// Panics are the failure mode under test; `Err` is always acceptable.
++    /// For non-sparse entries the total bytes read must never exceed the
++    /// input length (a crafted size field must not fabricate data). Sparse
++    /// entries may legitimately expand (holes read as zeros), so reads are
++    /// capped to protect the test's memory, not the library's contract.
++    fn read_all_entries_bounded(bytes: &[u8]) {
++        let input_len = bytes.len() as u64;
++        let mut ar = Archive::new(Cursor::new(bytes));
++        let entries = match ar.entries() {
++            Ok(entries) => entries,
++            Err(_) => return,
++        };
++        for entry in entries {
++            let mut entry = match entry {
++                Ok(entry) => entry,
++                Err(_) => return,
++            };
++            let sparse = entry.header().entry_type().is_gnu_sparse();
++            let mut total: u64 = 0;
++            let mut buf = [0u8; 4096];
++            loop {
++                match entry.read(&mut buf) {
++                    Ok(0) => break,
++                    Ok(n) => {
++                        total += n as u64;
++                        if sparse {
++                            // Cap: protects the test's memory/runtime only.
++                            if total > 4 * 1024 * 1024 {
++                                break;
++                            }
++                        } else {
++                            assert!(
++                                total <= input_len,
++                                "read {} bytes from a {}-byte archive",
++                                total,
++                                input_len
++                            );
++                        }
++                    }
++                    Err(_) => return,
++                }
++            }
++        }
++    }
++
++    /// Decoder robustness (key untrusted-input property): iterating and
++    /// reading entries from arbitrary bytes, corrupted valid archives, or
++    /// checksum-valid headers with hostile size/sparse fields never panics,
++    /// never reads more data than exists, and always terminates.
++    #[hegel::test]
++    fn prop_hostile_archive_bytes_never_panic(tc: hegel::TestCase) {
++        let variant = tc.draw(generators::integers::<u8>().max_value(2));
++        let bytes: Vec<u8> = match variant {
++            0 => {
++                // Entirely arbitrary bytes.
++                tc.draw(generators::binary().max_size(4096))
++            }
++            1 => {
++                // A valid archive with a handful of corrupted bytes.
++                let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++                let mut entries = Vec::new();
++                for _ in 0..n {
++                    entries.push(draw_entry(&tc, false));
++                }
++                let mut bytes = build_archive(&entries);
++                let k = tc.draw(generators::integers::<usize>().min_value(1).max_value(8));
++                for _ in 0..k {
++                    let i = tc.draw(
++                        generators::integers::<usize>().max_value(bytes.len() - 1),
++                    );
++                    bytes[i] = tc.draw(generators::integers::<u8>());
++                }
++                bytes
++            }
++            _ => {
++                // A checksum-valid header whose size/sparse fields are
++                // attacker-controlled bytes (octal garbage, huge base-256
++                // values), followed by arbitrary trailing bytes. The valid
++                // checksum forces the decoder past the cheap reject.
++                let mut header = Header::new_gnu();
++                header.as_old_mut().name[0] = b'x';
++                let et = tc.draw(generators::sampled_from(vec![
++                    b'0', b'5', b'2', b'S', b'L', b'K', b'x', b'g',
++                ]));
++                header.set_entry_type(EntryType::new(et));
++                let size_field: Vec<u8> =
++                    tc.draw(generators::binary().min_size(12).max_size(12));
++                header.as_old_mut().size.copy_from_slice(&size_field);
++                if et == b'S' {
++                    let gnu = header.as_gnu_mut().unwrap();
++                    let realsize: Vec<u8> =
++                        tc.draw(generators::binary().min_size(12).max_size(12));
++                    gnu.realsize.copy_from_slice(&realsize);
++                    gnu.isextended[0] = tc.draw(generators::integers::<u8>().max_value(1));
++                    for sparse in gnu.sparse.iter_mut() {
++                        let chunk: Vec<u8> =
++                            tc.draw(generators::binary().min_size(24).max_size(24));
++                        sparse.offset.copy_from_slice(&chunk[..12]);
++                        sparse.numbytes.copy_from_slice(&chunk[12..]);
++                    }
++                }
++                header.set_cksum();
++                let mut bytes = header.as_bytes().to_vec();
++                let tail: Vec<u8> = tc.draw(generators::binary().max_size(2048));
++                bytes.extend(tail);
++                bytes
++            }
++        };
++        read_all_entries_bounded(&bytes);
++    }
++
++    /// Truncating a valid archive at any byte offset is handled gracefully:
++    /// entries before the cut still decode, and the decoder returns `Err` or
++    /// stops (never panics) at the damage.
++    #[hegel::test]
++    fn prop_truncated_archive_never_panics(tc: hegel::TestCase) {
++        let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let mut entries = Vec::new();
++        for _ in 0..n {
++            entries.push(draw_entry(&tc, true));
++        }
++        let bytes = build_archive(&entries);
++        let cut = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++        read_all_entries_bounded(&bytes[..cut]);
++    }
++
++    /// Corrupting any single checksummed byte of the leading header block
++    /// makes the decoder reject the entry with an error (checksum property).
++    #[hegel::test]
++    fn prop_corrupted_header_rejected(tc: hegel::TestCase) {
++        let entry = draw_entry(&tc, false);
++        let mut bytes = build_archive(&[entry]);
++        // Any byte of the first header block except the checksum field
++        // itself (bytes 148..156), which is stored as octal text with
++        // several equivalent encodings.
++        let idx = tc.draw(hegel::one_of!(
++            generators::integers::<usize>().max_value(147),
++            generators::integers::<usize>().min_value(156).max_value(511),
++        ));
++        let new_byte = tc.draw(generators::integers::<u8>());
++        tc.assume(bytes[idx] != new_byte);
++        bytes[idx] = new_byte;
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        let first = ar.entries().unwrap().next();
++        match first {
++            Some(Err(_)) => {}
++            Some(Ok(_)) => panic!("corrupted header byte {} was accepted", idx),
++            None => panic!("corrupted archive treated as empty"),
++        }
++    }
++
++    /// Concatenated archives: by default reading stops at the first
++    /// end-of-archive marker; with `set_ignore_zeros(true)` both archives'
++    /// entries appear, in order.
++    #[hegel::test]
++    fn prop_concat_ignore_zeros(tc: hegel::TestCase) {
++        let mut names_a = Vec::new();
++        let mut names_b = Vec::new();
++        let na = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let nb = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let mut entries_a = Vec::new();
++        let mut entries_b = Vec::new();
++        for _ in 0..na {
++            let e = draw_entry(&tc, false);
++            names_a.push(e.path.clone());
++            entries_a.push(e);
++        }
++        for _ in 0..nb {
++            let e = draw_entry(&tc, false);
++            names_b.push(e.path.clone());
++            entries_b.push(e);
++        }
++        let mut bytes = build_archive(&entries_a);
++        bytes.extend(build_archive(&entries_b));
++
++        fn decode_names(ar: &mut Archive<Cursor<&Vec<u8>>>) -> Vec<Vec<u8>> {
++            ar.entries()
++                .unwrap()
++                .map(|e| e.unwrap().path_bytes().to_vec())
++                .collect()
++        }
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        let stop_names = decode_names(&mut ar);
++        assert_eq!(
++            stop_names,
++            names_a.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>()
++        );
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        ar.set_ignore_zeros(true);
++        let all_names = decode_names(&mut ar);
++        let want: Vec<Vec<u8>> = names_a
++            .iter()
++            .chain(names_b.iter())
++            .map(|s| s.as_bytes().to_vec())
++            .collect();
++        assert_eq!(all_names, want);
++    }
++
++    /// Path-traversal safety: unpacking an entry whose raw header name
++    /// contains ".." components (bypassing the writer's validation) never
++    /// creates anything outside the destination directory.
++    #[hegel::test]
++    fn prop_unpack_in_never_escapes(tc: hegel::TestCase) {
++        // Craft a hostile name. Escape depth <= 3; dst is nested three
++        // directories below the tempdir root so a failed guard would still
++        // land inside the tempdir instead of polluting the real filesystem.
++        let canary = format!(
++            "esc{}",
++            tc.draw(generators::integers::<u32>().max_value(999))
++        );
++        let depth = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let mut name = String::new();
++        if tc.draw(generators::booleans()) {
++            name.push_str("a/");
++        }
++        for _ in 0..depth {
++            name.push_str("../");
++        }
++        name.push_str(&canary);
++        assert!(name.len() <= 100);
++
++        let data = b"boom";
++        let mut header = Header::new_gnu();
++        // Bypass set_path validation by writing the raw name field.
++        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
++        header.set_size(data.len() as u64);
++        header.set_mode(0o644);
++        header.set_entry_type(EntryType::Regular);
++        header.set_cksum();
++        let mut builder = Builder::new(Vec::new());
++        builder.append(&header, &data[..]).unwrap();
++        let bytes = builder.into_inner().unwrap();
++
++        let root = TempBuilder::new()
++            .prefix("hegel-unpack")
++            .tempdir()
++            .unwrap();
++        let dst = root.path().join("l1").join("l2").join("dst");
++        fs::create_dir_all(&dst).unwrap();
++
++        let mut ar = Archive::new(Cursor::new(&bytes));
++        for entry in ar.entries().unwrap() {
++            let mut entry = entry.unwrap();
++            // Entries with ".." must be skipped (Ok(false)) or rejected.
++            match entry.unpack_in(&dst) {
++                Ok(unpacked) => assert!(
++                    !unpacked,
++                    "entry with `..` in {:?} was unpacked",
++                    name
++                ),
++                Err(_) => {}
++            }
++        }
++
++        // Nothing may exist outside dst: walk the tempdir root.
++        let allowed = [
++            root.path().join("l1"),
++            root.path().join("l1").join("l2"),
++            dst.clone(),
++        ];
++        let mut stack = vec![root.path().to_path_buf()];
++        while let Some(dir) = stack.pop() {
++            for e in fs::read_dir(&dir).unwrap() {
++                let p = e.unwrap().path();
++                assert!(
++                    allowed.contains(&p) || p.starts_with(&dst),
++                    "path escaped the destination: {:?}",
++                    p
++                );
++                if p.is_dir() {
++                    stack.push(p);
++                }
++            }
++        }
++    }
++}
+diff --git a/tests/header/mod.rs b/tests/header/mod.rs
+index 1884a7d..ce100de 100644
+--- a/tests/header/mod.rs
++++ b/tests/header/mod.rs
+@@ -261,3 +261,176 @@ fn byte_slice_conversion() {
+     let b_conv: &[u8] = Header::from_byte_slice(h.as_bytes()).as_bytes();
+     assert_eq!(b, b_conv);
+ }
++
++// ===========================================================================
++// Property-based tests (hegel) for Header field encoding/decoding.
++// ===========================================================================
++
++use crate::hegel_props::draw_rel_path;
++use hegel::generators;
++
++/// Draw one of the three header flavors this crate can construct.
++fn draw_header(tc: &hegel::TestCase) -> Header {
++    match tc.draw(generators::integers::<u8>().max_value(2)) {
++        0 => Header::new_gnu(),
++        1 => Header::new_ustar(),
++        _ => Header::new_old(),
++    }
++}
++
++/// Draw a u64 with the octal/base-256 encoding boundaries boosted: 2^21 and
++/// 2^33 are where `num_field_wrapper_into` switches representations for
++/// 8- and 12-byte fields respectively.
++fn draw_boundary_boosted_u64(tc: &hegel::TestCase) -> u64 {
++    tc.draw(hegel::one_of!(
++        generators::integers::<u64>(),
++        generators::sampled_from(vec![
++            0,
++            1,
++            0o7777777,          // 2^21 - 1: largest 7-digit octal (8-byte field)
++            0o7777777 + 1,      // first value forcing base-256 in 8-byte fields
++            0o77777777777,      // 2^33 - 1: largest 11-digit octal (12-byte field)
++            0o77777777777 + 1,  // first value forcing base-256 in 12-byte fields
++            i64::MAX as u64,
++            u64::MAX,
++        ]),
++    ))
++}
++
++/// size and mtime (12-byte numeric fields) round-trip over the full u64
++/// range, across the octal/base-256 representation boundary.
++#[hegel::test]
++fn prop_header_size_mtime_roundtrip(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let size = draw_boundary_boosted_u64(&tc);
++    let mtime = draw_boundary_boosted_u64(&tc);
++    h.set_size(size);
++    h.set_mtime(mtime);
++    assert_eq!(h.entry_size().unwrap(), size);
++    assert_eq!(h.mtime().unwrap(), mtime);
++}
++
++/// uid and gid (8-byte numeric fields) round-trip for all values that fit in
++/// 63 bits. Values with bit 63 set are excluded: the base-256 marker bit
++/// collides with the data (see the pinned known failure below).
++#[hegel::test]
++fn prop_header_uid_gid_roundtrip(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let uid = draw_boundary_boosted_u64(&tc) & (i64::MAX as u64);
++    let gid = draw_boundary_boosted_u64(&tc) & (i64::MAX as u64);
++    h.set_uid(uid);
++    h.set_gid(gid);
++    assert_eq!(h.uid().unwrap(), uid);
++    assert_eq!(h.gid().unwrap(), gid);
++}
++
++/// KNOWN FAILURE: `set_uid` silently corrupts values >= 2^63.
++///
++/// An 8-byte base-256 numeric field stores the extension marker in bit 63 of
++/// the field, which is also bit 63 of the value: `numeric_extended_into`
++/// does `dst[0] |= 0x80`, so `set_uid(u64::MAX ^ (1 << 63))` and
++/// `set_uid(u64::MAX)` produce identical bytes and `uid()` returns the
++/// bit-63-set reading for both. There is no error; the value is silently
++/// changed. `set_gid` shares the code path. The generator pins the failing
++/// region deterministically.
++#[hegel::test]
++fn prop_header_uid_roundtrip_full_range(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let uid = tc.draw(
++        generators::integers::<u64>().min_value(1 << 63),
++    );
++    h.set_uid(uid);
++    assert_eq!(h.uid().unwrap(), uid);
++}
++
++/// mode round-trips for values up to 7 octal digits (the field is 8 bytes of
++/// octal text; larger values are a pinned known failure below).
++#[hegel::test]
++fn prop_header_mode_roundtrip(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let mode = tc.draw(generators::integers::<u32>().max_value(0o7777777));
++    h.set_mode(mode);
++    assert_eq!(h.mode().unwrap(), mode);
++}
++
++/// KNOWN FAILURE: `set_mode` silently truncates values >= 2^21 (0o10000000).
++///
++/// The mode field is 8 bytes of octal text (7 digits + NUL). `octal_into`
++/// zips the digits against the field and silently drops the most significant
++/// digits that do not fit, so e.g. `set_mode(0o10000000)` stores 0 and
++/// `mode()` returns 0 with no error. Unlike uid/gid/size/mtime, `set_mode`
++/// never falls back to the base-256 extension. `set_device_major` and
++/// `set_device_minor` (also 8-byte octal, u32-valued) share this defect.
++/// The generator pins the failing region deterministically.
++#[hegel::test]
++fn prop_header_mode_roundtrip_full_range(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let mode = tc.draw(generators::integers::<u32>().min_value(0o7777777 + 1));
++    h.set_mode(mode);
++    assert_eq!(h.mode().unwrap(), mode);
++}
++
++/// If `set_path` accepts a path, `path_bytes` returns exactly the same
++/// bytes — for all three header flavors, including the ustar prefix/name
++/// split for paths over 100 bytes.
++#[hegel::test]
++fn prop_header_set_path_roundtrip(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let path = draw_rel_path(&tc, true);
++    match h.set_path(&path) {
++        Ok(()) => assert_eq!(h.path_bytes().as_ref(), path.as_bytes()),
++        Err(_) => {
++            // Too long for this header flavor. Anything that fits in the
++            // plain name field must be accepted, so an error there would
++            // mean the property fails vacuously.
++            assert!(path.len() > 100, "short path {:?} rejected", path);
++        }
++    }
++}
++
++/// `set_path` rejects absolute paths and any path containing a `..`
++/// component, for every header flavor.
++#[hegel::test]
++fn prop_header_set_path_rejects_traversal(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    let a = draw_rel_path(&tc, false);
++    let b = draw_rel_path(&tc, false);
++    let evil = match tc.draw(generators::integers::<u8>().max_value(3)) {
++        0 => format!("../{}", a),
++        1 => format!("/{}", a),
++        2 => format!("{}/../{}", a, b),
++        _ => format!("{}/..", a),
++    };
++    assert!(
++        h.set_path(&evil).is_err(),
++        "unsafe path accepted: {:?}",
++        evil
++    );
++}
++
++/// `set_cksum` writes the checksum the tar spec defines: the unsigned sum of
++/// all 512 header bytes with the checksum field counted as eight spaces.
++#[hegel::test]
++fn prop_header_set_cksum_matches_spec(tc: hegel::TestCase) {
++    let mut h = draw_header(&tc);
++    h.set_size(draw_boundary_boosted_u64(&tc));
++    h.set_mtime(draw_boundary_boosted_u64(&tc));
++    h.set_uid(draw_boundary_boosted_u64(&tc) & (i64::MAX as u64));
++    h.set_gid(draw_boundary_boosted_u64(&tc) & (i64::MAX as u64));
++    h.set_mode(tc.draw(generators::integers::<u32>().max_value(0o7777777)));
++    h.set_entry_type(tar::EntryType::new(tc.draw(generators::integers::<u8>())));
++    let path = draw_rel_path(&tc, false);
++    if path.len() <= 100 {
++        let _ = h.set_path(&path);
++    }
++    h.set_cksum();
++
++    let bytes = h.as_bytes();
++    let spec_sum: u32 = bytes[..148]
++        .iter()
++        .chain(&bytes[156..])
++        .map(|&b| b as u32)
++        .sum::<u32>()
++        + 8 * b' ' as u32;
++    assert_eq!(h.cksum().unwrap(), spec_sum);
++}
