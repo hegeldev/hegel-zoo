@@ -1,0 +1,762 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8252569..7f33d19 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -43,6 +43,7 @@ rand_distr = "0.5"
+ walkdir = "2.5"
+ # internal
+ libqoi = { path = "libqoi" }
++hegeltest = "0.44.1"
+ 
+ [lib]
+ name = "qoi"
+diff --git a/tests/common.rs b/tests/common.rs
+index cc1eff1..40a5964 100644
+--- a/tests/common.rs
++++ b/tests/common.rs
+@@ -10,3 +10,97 @@ pub fn hash<const N: usize>(px: [u8; N]) -> u8 {
+     let am = a.wrapping_mul(11);
+     rm.wrapping_add(gm).wrapping_add(bm).wrapping_add(am) % 64
+ }
++
++#[allow(unused)]
++use hegel::generators::{self, Generator};
++
++/// Draw image dimensions with `width * height <= max_pixels` (and both >= 1).
++///
++/// The bound protects the *test's* time/memory budget, not the library's
++/// contract (which allows up to 400Mp); boundary-sized headers are covered
++/// separately by the header property tests.
++#[allow(unused)]
++pub fn draw_dims(tc: &hegel::TestCase, max_pixels: u32) -> (u32, u32) {
++    let width = tc.draw(generators::integers::<u32>().min_value(1).max_value(max_pixels));
++    let height = tc.draw(generators::integers::<u32>().min_value(1).max_value(max_pixels / width));
++    (width, height)
++}
++
++/// Draw a raw pixel buffer of exactly `n_pixels` pixels with `channels` (3 or 4)
++/// bytes per pixel, structured so that all QOI chunk types get exercised:
++///
++/// - fresh random pixels        -> QOI_OP_RGB / QOI_OP_RGBA
++/// - runs of identical pixels   -> QOI_OP_RUN (lengths cross the 62/124 limits)
++/// - small per-channel deltas   -> QOI_OP_DIFF
++/// - luma-style deltas          -> QOI_OP_LUMA
++/// - revisiting earlier pixels  -> QOI_OP_INDEX
++/// - alpha-only changes (4ch)   -> QOI_OP_RGBA with equal RGB
++///
++/// Individual draws are silent to keep counterexample output readable; the
++/// assembled buffer is what failing assertions display.
++#[allow(unused)]
++pub fn draw_pixels(tc: &hegel::TestCase, n_pixels: usize, channels: usize) -> Vec<u8> {
++    assert!(channels == 3 || channels == 4);
++    let mut px: [u8; 4] = [0, 0, 0, 0xff];
++    let mut seen: Vec<[u8; 4]> = Vec::new();
++    let mut out: Vec<u8> = Vec::with_capacity(n_pixels * channels);
++    let mut n = 0_usize;
++    let max_kind = if channels == 4 { 5 } else { 4 };
++    while n < n_pixels {
++        let mut reps = 1_usize;
++        match tc.draw_silent(generators::integers::<u8>().max_value(max_kind)) {
++            0 => {
++                // fresh pixel
++                px[0] = tc.draw_silent(generators::integers::<u8>());
++                px[1] = tc.draw_silent(generators::integers::<u8>());
++                px[2] = tc.draw_silent(generators::integers::<u8>());
++                if channels == 4 {
++                    px[3] = tc.draw_silent(generators::integers::<u8>());
++                }
++            }
++            1 => {
++                // run of identical pixels; 70 > 62 so run-splitting is exercised
++                reps = tc.draw_silent(
++                    generators::integers::<usize>().min_value(1).max_value(70),
++                );
++            }
++            2 => {
++                // small diff (each channel -2..=1, the QOI_OP_DIFF range)
++                for c in px.iter_mut().take(3) {
++                    let d = tc.draw_silent(generators::integers::<u8>().max_value(3));
++                    *c = c.wrapping_add(d).wrapping_sub(2);
++                }
++            }
++            3 => {
++                // luma-style diff (dg in -32..=31, dr/db in dg-8..=dg+7)
++                let dg = tc.draw_silent(generators::integers::<u8>().max_value(63)).wrapping_sub(32);
++                let dr =
++                    tc.draw_silent(generators::integers::<u8>().max_value(15)).wrapping_sub(8).wrapping_add(dg);
++                let db =
++                    tc.draw_silent(generators::integers::<u8>().max_value(15)).wrapping_sub(8).wrapping_add(dg);
++                px[0] = px[0].wrapping_add(dr);
++                px[1] = px[1].wrapping_add(dg);
++                px[2] = px[2].wrapping_add(db);
++            }
++            4 => {
++                // revisit a previously seen pixel (palette-like repetition)
++                if !seen.is_empty() {
++                    let i = tc.draw_silent(
++                        generators::integers::<usize>().max_value(seen.len() - 1),
++                    );
++                    px = seen[i];
++                }
++            }
++            _ => {
++                // alpha-only change (4-channel images only)
++                px[3] = tc.draw_silent(generators::integers::<u8>());
++            }
++        }
++        seen.push(px);
++        for _ in 0..reps.min(n_pixels - n) {
++            out.extend_from_slice(&px[..channels]);
++            n += 1;
++        }
++    }
++    out
++}
+diff --git a/tests/test_gen.rs b/tests/test_gen.rs
+index fd015c5..716abfa 100644
+--- a/tests/test_gen.rs
++++ b/tests/test_gen.rs
+@@ -307,3 +307,254 @@ fn test_generated() {
+         n_pixels += size;
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++#[cfg(target_endian = "little")]
++mod hegel_props {
++    use super::common::{draw_dims, draw_pixels, hash};
++    use hegel::generators::{self, Generator};
++    use libqoi::qoi_decode;
++    use qoi::consts::{
++        QOI_OP_DIFF, QOI_OP_INDEX, QOI_OP_LUMA, QOI_OP_RGB, QOI_OP_RGBA, QOI_OP_RUN, QOI_PADDING,
++    };
++    use qoi::{decode_to_vec, Channels, ColorSpace, Encoder, Header};
++
++    /// QOI is lossless: encode -> decode is the identity on the pixel buffer,
++    /// and the header roundtrips the full configuration (dimensions, both
++    /// channel counts, both colorspaces).
++    #[hegel::test]
++    fn prop_encode_decode_roundtrip(tc: hegel::TestCase) {
++        let channels = tc.draw((generators::sampled_from(vec![Channels::Rgb, Channels::Rgba])).print_as_debug());
++        let colorspace =
++            tc.draw((generators::sampled_from(vec![ColorSpace::Srgb, ColorSpace::Linear])).print_as_debug());
++        let (width, height) = draw_dims(&tc, 2048);
++        let pixels = draw_pixels(&tc, (width * height) as usize, channels.as_u8() as usize);
++
++        let encoder = Encoder::new(&pixels, width, height).unwrap().with_colorspace(colorspace);
++        assert_eq!(encoder.channels(), channels);
++        let encoded = encoder.encode_to_vec().unwrap();
++
++        let (header, decoded) = decode_to_vec(&encoded).unwrap();
++        assert_eq!((header.width, header.height), (width, height));
++        assert_eq!(header.channels, channels);
++        assert_eq!(header.colorspace, colorspace);
++        assert_eq!(decoded, pixels, "pixel buffer not bit-exact after roundtrip");
++    }
++
++    /// The reference C implementation (qoi.h) decodes qoi-rust's output back
++    /// to the original pixels: our encoder emits spec-conformant streams.
++    #[hegel::test]
++    fn prop_c_reference_decodes_our_encoding(tc: hegel::TestCase) {
++        let channels = tc.draw(generators::sampled_from(vec![3_u8, 4]));
++        let (width, height) = draw_dims(&tc, 2048);
++        let pixels = draw_pixels(&tc, (width * height) as usize, channels as usize);
++
++        let encoded = qoi::encode_to_vec(&pixels, width, height).unwrap();
++        let (desc, decoded_c) = qoi_decode(&encoded, channels).unwrap();
++        assert_eq!((desc.width, desc.height), (width, height));
++        assert_eq!(desc.channels, channels);
++        assert_eq!(decoded_c.as_ref(), pixels.as_slice());
++    }
++
++    /// Draw an arbitrary syntactically-valid QOI chunk stream (ops only, no
++    /// header/padding) producing exactly the returned number of pixels. This
++    /// covers op interleavings a conformant encoder would never emit
++    /// (INDEX-after-RUN, self-referential INDEX, no-op DIFFs, ...).
++    ///
++    /// The generator simulates the spec (qoi.h) decoder to track the color
++    /// index table state as the stream grows.
++    ///
++    /// Restrictions, each excluding inputs pinned as known bugs by the
++    /// KNOWN FAILURE tests below:
++    /// - QOI_OP_INDEX chunks only reference table slots that have been
++    ///   written. Referencing an uninitialized slot is well-defined per the
++    ///   spec (zero-initialized table) but qoi-rust diverges from qoi.h on
++    ///   it, for two independent reasons: qoi.h re-registers the fetched
++    ///   pixel in the table (a no-op except for uninitialized slots, whose
++    ///   zero value is not stored at its own hash position) while qoi-rust
++    ///   never writes the table on INDEX chunks -- see
++    ///   `prop_decode_uninit_index_slot_diverges_from_c_reference`; and in
++    ///   3-channel mode the fetched alpha=0 enters qoi.h's hash state, which
++    ///   qoi-rust's `Pixel<3>` decoder cannot represent -- see
++    ///   `prop_decode_3ch_uninit_index_diverges_from_c_reference`.
++    /// - No QOI_OP_RGBA chunks in streams whose header declares 3 channels:
++    ///   qoi-rust's `decode_impl_slice::<3, false>` does not process them at
++    ///   all, while qoi.h decodes them regardless of the declared channel
++    ///   count (the spec calls the header field purely informative).
++    fn draw_op_stream(tc: &hegel::TestCase, channels: u8) -> (Vec<u8>, usize) {
++        let allow_rgba_ops = channels == 4;
++        let target = tc.draw(generators::integers::<usize>().min_value(1).max_value(400));
++        let mut ops = Vec::new();
++        let mut n_pixels = 0_usize;
++        // spec-decoder simulation state (qoi.h semantics)
++        let mut px: [u8; 4] = [0, 0, 0, 255];
++        let mut table: [[u8; 4]; 64] = [[0; 4]; 64];
++        let mut written_slots: Vec<u8> = Vec::new();
++        while n_pixels < target {
++            let max_kind = if allow_rgba_ops { 5 } else { 4 };
++            let mut kind = tc.draw_silent(generators::integers::<u8>().max_value(max_kind));
++            if kind == 0 && written_slots.is_empty() {
++                kind = 4; // no written slot to reference yet; emit RGB instead
++            }
++            match kind {
++                0 => {
++                    let i = tc.draw_silent(
++                        generators::integers::<usize>().max_value(written_slots.len() - 1),
++                    );
++                    let slot = written_slots[i];
++                    ops.push(QOI_OP_INDEX | slot);
++                    px = table[slot as usize];
++                    n_pixels += 1;
++                }
++                1 => {
++                    // run lengths 1..=62 (biased encoding: 0x00 -> run of 1)
++                    let r = tc.draw_silent(generators::integers::<u8>().max_value(61));
++                    ops.push(QOI_OP_RUN | r);
++                    n_pixels += r as usize + 1;
++                }
++                2 => {
++                    let d = tc.draw_silent(generators::integers::<u8>().max_value(63));
++                    ops.push(QOI_OP_DIFF | d);
++                    px[0] = px[0].wrapping_add((d >> 4) & 0x03).wrapping_sub(2);
++                    px[1] = px[1].wrapping_add((d >> 2) & 0x03).wrapping_sub(2);
++                    px[2] = px[2].wrapping_add(d & 0x03).wrapping_sub(2);
++                    n_pixels += 1;
++                }
++                3 => {
++                    let b1 = tc.draw_silent(generators::integers::<u8>().max_value(63));
++                    let b2 = tc.draw_silent(generators::integers::<u8>());
++                    ops.push(QOI_OP_LUMA | b1);
++                    ops.push(b2);
++                    let vg = b1.wrapping_sub(32);
++                    let vg_8 = vg.wrapping_sub(8);
++                    px[0] = px[0].wrapping_add(vg_8.wrapping_add((b2 >> 4) & 0x0f));
++                    px[1] = px[1].wrapping_add(vg);
++                    px[2] = px[2].wrapping_add(vg_8.wrapping_add(b2 & 0x0f));
++                    n_pixels += 1;
++                }
++                4 => {
++                    ops.push(QOI_OP_RGB);
++                    for c in 0..3 {
++                        px[c] = tc.draw_silent(generators::integers::<u8>());
++                        ops.push(px[c]);
++                    }
++                    n_pixels += 1;
++                }
++                _ => {
++                    ops.push(QOI_OP_RGBA);
++                    for c in 0..4 {
++                        px[c] = tc.draw_silent(generators::integers::<u8>());
++                        ops.push(px[c]);
++                    }
++                    n_pixels += 1;
++                }
++            }
++            // qoi.h writes index[hash(px)] = px after every chunk
++            let h = hash(px);
++            table[h as usize] = px;
++            if !written_slots.contains(&h) {
++                written_slots.push(h);
++            }
++        }
++        (ops, n_pixels)
++    }
++
++    /// Differential test of the decoder against the reference C decoder on
++    /// arbitrary valid chunk streams (not just encoder outputs).
++    #[hegel::test]
++    fn prop_decode_arbitrary_streams_matches_c_reference(tc: hegel::TestCase) {
++        let channels = tc.draw(generators::sampled_from(vec![3_u8, 4]));
++        let (ops, n_pixels) = draw_op_stream(&tc, channels);
++
++        let header = Header::try_new(
++            n_pixels as u32,
++            1,
++            Channels::try_from(channels).unwrap(),
++            ColorSpace::Srgb,
++        )
++        .unwrap();
++        let mut data = header.encode().to_vec();
++        data.extend_from_slice(&ops);
++        data.extend_from_slice(&QOI_PADDING);
++
++        let (hdr, out_rust) = decode_to_vec(&data).unwrap();
++        assert_eq!(hdr, header);
++        let (desc, out_c) = qoi_decode(&data, channels).unwrap();
++        assert_eq!((desc.width as usize, desc.height), (n_pixels, 1));
++        assert_eq!(out_rust.as_slice(), out_c.as_ref());
++    }
++
++    /// KNOWN FAILURE (real bug, do not "fix" the test): on a valid 3-channel
++    /// stream, qoi-rust's decoder diverges from the reference C decoder
++    /// (qoi.h) once a QOI_OP_INDEX chunk references an uninitialized index
++    /// slot. The spec zero-initializes the table, so such a reference is
++    /// well-defined and yields {0,0,0,0} -- alpha 0. qoi.h carries that alpha
++    /// into subsequent index-hash computations, but qoi-rust's 3-channel
++    /// decoder (`decode_impl_slice::<3, false>`, src/decode.rs) tracks pixels
++    /// as `Pixel<3>` and hashes via `as_rgba(0xff)`, so later QOI_OP_INDEX
++    /// chunks resolve to different slots than the spec prescribes. Same root
++    /// cause as `prop_decode_rgba_as_rgb_drops_alpha` in tests/test_misc.rs:
++    /// the 3-channel decode paths discard alpha state.
++    ///
++    /// The op stream [INDEX(i), DIFF(d), INDEX(hash(px, alpha=0))] is built
++    /// directly so the test fails deterministically on every case.
++    #[hegel::test]
++    fn prop_decode_3ch_uninit_index_diverges_from_c_reference(tc: hegel::TestCase) {
++        let i = tc.draw(generators::integers::<u8>().max_value(63));
++        // d != 0b101010 so the DIFF produces a pixel with RGB != (0,0,0)
++        let d = tc.draw(generators::integers::<u8>().max_value(63).filter(|&d| d != 0b10_1010));
++        let px = [
++            ((d >> 4) & 0x03).wrapping_sub(2),
++            ((d >> 2) & 0x03).wrapping_sub(2),
++            (d & 0x03).wrapping_sub(2),
++            0, // alpha inherited from the uninitialized index entry
++        ];
++        let ops = [QOI_OP_INDEX | i, QOI_OP_DIFF | d, QOI_OP_INDEX | hash(px)];
++
++        let header = Header::try_new(3, 1, Channels::Rgb, ColorSpace::Srgb).unwrap();
++        let mut data = header.encode().to_vec();
++        data.extend_from_slice(&ops);
++        data.extend_from_slice(&QOI_PADDING);
++
++        let (_, out_rust) = decode_to_vec(&data).unwrap();
++        let (_, out_c) = qoi_decode(&data, 3).unwrap();
++        assert_eq!(out_rust.as_slice(), out_c.as_ref());
++    }
++
++    /// KNOWN FAILURE (real bug, do not "fix" the test): the alpha-independent
++    /// half of the uninitialized-index divergence, on a 4-channel stream.
++    ///
++    /// The reference decoder re-registers every decoded pixel in the color
++    /// index, *including* pixels produced by QOI_OP_INDEX chunks. That write
++    /// is a no-op when the referenced slot was previously written (table
++    /// entries sit at their own hash position), but a reference to an
++    /// uninitialized slot yields {0,0,0,0}, whose hash position is slot 0 --
++    /// qoi.h then stores {0,0,0,0} into slot 0, clobbering whatever was
++    /// there. qoi-rust's decoders never write the index on QOI_OP_INDEX
++    /// chunks (`decode_impl_slice`'s INDEX arm `continue`s), so a later
++    /// QOI_OP_INDEX(0) chunk reads different values.
++    ///
++    /// Ops: [RGBA(0,0,0,a) with hash 0, INDEX(j) uninitialized, INDEX(0)];
++    /// constructed directly so the test fails deterministically on every
++    /// case.
++    #[hegel::test]
++    fn prop_decode_uninit_index_slot_diverges_from_c_reference(tc: hegel::TestCase) {
++        // hash4(0,0,0,a) = 11a mod 64 = 0 for these; pixel != (0,0,0,0)
++        let a = tc.draw(generators::sampled_from(vec![64_u8, 128, 192]));
++        // slot j stays uninitialized: the only written slot is 0
++        let j = tc.draw(generators::integers::<u8>().min_value(1).max_value(63));
++        let ops = [QOI_OP_RGBA, 0, 0, 0, a, QOI_OP_INDEX | j, QOI_OP_INDEX | 0];
++
++        let header = Header::try_new(3, 1, Channels::Rgba, ColorSpace::Srgb).unwrap();
++        let mut data = header.encode().to_vec();
++        data.extend_from_slice(&ops);
++        data.extend_from_slice(&QOI_PADDING);
++
++        let (_, out_rust) = decode_to_vec(&data).unwrap();
++        let (_, out_c) = qoi_decode(&data, 4).unwrap();
++        assert_eq!(out_rust.as_slice(), out_c.as_ref());
++    }
++}
+diff --git a/tests/test_misc.rs b/tests/test_misc.rs
+index c08e0c0..32dab9b 100644
+--- a/tests/test_misc.rs
++++ b/tests/test_misc.rs
+@@ -1,3 +1,5 @@
++mod common;
++
+ use qoi::{
+     consts::{QOI_OP_INDEX, QOI_OP_RGB, QOI_OP_RUN},
+     decode_to_vec, Channels, ColorSpace, Header, Result,
+@@ -99,3 +101,378 @@ fn test_big_endian() {
+     // so we can see it in the CI logs
+     assert_eq!(u16::to_be_bytes(1), [0, 1]);
+ }
++
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++// ---------------------------------------------------------------------------
++
++mod hegel_props {
++    use super::common::{draw_dims, draw_pixels};
++    use hegel::generators::{self, Generator};
++    use qoi::consts::{QOI_HEADER_SIZE, QOI_PIXELS_MAX};
++    use qoi::{
++        decode_to_vec, encode_max_len, Channels, ColorSpace, Decoder, Encoder, Error, Header,
++    };
++    use std::io::Cursor;
++
++    fn channels_gen() -> impl Generator<Channels> {
++        generators::sampled_from(vec![Channels::Rgb, Channels::Rgba])
++    }
++
++    fn colorspace_gen() -> impl Generator<ColorSpace> {
++        generators::sampled_from(vec![ColorSpace::Srgb, ColorSpace::Linear])
++    }
++
++    /// Draw a structured image plus a colorspace and return
++    /// `(pixels, width, height, channels, colorspace)`.
++    fn draw_image(tc: &hegel::TestCase) -> (Vec<u8>, u32, u32, Channels, ColorSpace) {
++        let channels = tc.draw((channels_gen()).print_as_debug());
++        let colorspace = tc.draw((colorspace_gen()).print_as_debug());
++        let (width, height) = draw_dims(tc, 2048);
++        let pixels = draw_pixels(tc, (width * height) as usize, channels.as_u8() as usize);
++        (pixels, width, height, channels, colorspace)
++    }
++
++    /// Header::decode is the inverse of Header::encode over the full domain of
++    /// valid headers (dimensions up to the documented 400Mp limit, both channel
++    /// counts, both colorspaces).
++    #[hegel::test]
++    fn prop_header_encode_decode_roundtrip(tc: hegel::TestCase) {
++        let width =
++            tc.draw(generators::integers::<u32>().min_value(1).max_value(QOI_PIXELS_MAX as u32));
++        let height = tc.draw(
++            generators::integers::<u32>()
++                .min_value(1)
++                .max_value((QOI_PIXELS_MAX / width as usize) as u32),
++        );
++        let channels = tc.draw((channels_gen()).print_as_debug());
++        let colorspace = tc.draw((colorspace_gen()).print_as_debug());
++        let header = Header::try_new(width, height, channels, colorspace).unwrap();
++        let decoded = Header::decode(header.encode()).unwrap();
++        assert_eq!(decoded, header);
++    }
++
++    /// Corrupting any single semantic field of a valid header makes
++    /// Header::decode return the matching error (validation/rejection check).
++    #[hegel::test]
++    fn prop_header_decode_rejects_corrupt_fields(tc: hegel::TestCase) {
++        let width = tc.draw(generators::integers::<u32>().min_value(1).max_value(20_000));
++        let height = tc.draw(generators::integers::<u32>().min_value(1).max_value(20_000));
++        let channels = tc.draw((channels_gen()).print_as_debug());
++        let colorspace = tc.draw((colorspace_gen()).print_as_debug());
++        let header = Header::try_new(width, height, channels, colorspace).unwrap();
++        let mut bytes = header.encode();
++
++        match tc.draw(generators::integers::<u8>().max_value(4)) {
++            0 => {
++                // corrupt magic
++                let i = tc.draw(generators::integers::<usize>().max_value(3));
++                let mask = tc.draw(generators::integers::<u8>().min_value(1));
++                bytes[i] ^= mask;
++                assert!(matches!(Header::decode(bytes), Err(Error::InvalidMagic { .. })));
++            }
++            1 => {
++                // invalid channels byte
++                let c = tc.draw(generators::integers::<u8>().filter(|&c| c != 3 && c != 4));
++                bytes[12] = c;
++                assert!(matches!(Header::decode(bytes), Err(Error::InvalidChannels { .. })));
++            }
++            2 => {
++                // invalid colorspace byte
++                let c = tc.draw(generators::integers::<u8>().min_value(2));
++                bytes[13] = c;
++                assert!(matches!(Header::decode(bytes), Err(Error::InvalidColorSpace { .. })));
++            }
++            3 => {
++                // zero dimension
++                if tc.draw(generators::booleans()) {
++                    bytes[4..8].copy_from_slice(&[0; 4]);
++                } else {
++                    bytes[8..12].copy_from_slice(&[0; 4]);
++                }
++                assert!(matches!(Header::decode(bytes), Err(Error::InvalidImageDimensions { .. })));
++            }
++            _ => {
++                // pixel count above the 400Mp limit
++                let w = tc.draw(
++                    generators::integers::<u32>().min_value(QOI_PIXELS_MAX as u32 + 1),
++                );
++                let h = tc.draw(generators::integers::<u32>().min_value(1));
++                bytes[4..8].copy_from_slice(&w.to_be_bytes());
++                bytes[8..12].copy_from_slice(&h.to_be_bytes());
++                assert!(matches!(Header::decode(bytes), Err(Error::InvalidImageDimensions { .. })));
++            }
++        }
++    }
++
++    /// Decoding a valid (bounded-size) header followed by arbitrary garbage
++    /// never panics; when it succeeds, the output length matches the header.
++    #[hegel::test]
++    fn prop_decode_garbage_body_never_panics(tc: hegel::TestCase) {
++        let (width, height) = draw_dims(&tc, 4096);
++        let channels = tc.draw((channels_gen()).print_as_debug());
++        let colorspace = tc.draw((colorspace_gen()).print_as_debug());
++        let header = Header::try_new(width, height, channels, colorspace).unwrap();
++        let mut data = header.encode().to_vec();
++        let body: Vec<u8> = tc.draw(generators::binary().max_size(512));
++        data.extend_from_slice(&body);
++
++        if let Ok((hdr, out)) = decode_to_vec(&data) {
++            assert_eq!(hdr, header);
++            assert_eq!(out.len(), header.n_bytes());
++        }
++        // the independent stream-decoder implementation must not panic either
++        if let Ok(mut dec) = Decoder::from_stream(Cursor::new(&data)) {
++            let _ = dec.decode_to_vec();
++        }
++    }
++
++    /// A truncated valid encoding (any strict prefix) always errors and never
++    /// panics: the declared pixel count can no longer be satisfied.
++    #[hegel::test]
++    fn prop_decode_truncated_encoding_errors(tc: hegel::TestCase) {
++        let (pixels, width, height, _, _) = draw_image(&tc);
++        let encoded = encode_to_vec_checked(&pixels, width, height);
++        let cut = tc.draw(generators::integers::<usize>().max_value(encoded.len() - 1));
++        assert!(decode_to_vec(&encoded[..cut]).is_err());
++    }
++
++    /// Inflating the declared dimensions of a valid encoding (header promises
++    /// more pixels than the chunk stream provides) makes decoding error.
++    #[hegel::test]
++    fn prop_decode_rejects_header_larger_than_data(tc: hegel::TestCase) {
++        let (pixels, width, height, channels, colorspace) = draw_image(&tc);
++        let mut encoded = encode_to_vec_checked(&pixels, width, height);
++        // strictly increase the pixel count, staying within valid header bounds
++        let extra = tc.draw(generators::integers::<u32>().min_value(1).max_value(4096));
++        let inflated = Header::try_new(width, height + extra, channels, colorspace).unwrap();
++        encoded[..QOI_HEADER_SIZE].copy_from_slice(&inflated.encode());
++        assert!(decode_to_vec(&encoded).is_err());
++    }
++
++    /// Flipping any single bit of a valid encoding past the dimension fields
++    /// never panics the decoder. (Bytes 4..12 are skipped only to keep the
++    /// test from allocating multi-hundred-MB buffers for legally-huge
++    /// dimensions -- this protects the test's memory, not the library's
++    /// contract; header-field corruption is covered by
++    /// prop_header_decode_rejects_corrupt_fields.)
++    #[hegel::test]
++    fn prop_decode_bit_flipped_encoding_never_panics(tc: hegel::TestCase) {
++        let (pixels, width, height, _, _) = draw_image(&tc);
++        let mut encoded = encode_to_vec_checked(&pixels, width, height);
++        let idx = tc.draw(hegel::one_of!(
++            generators::integers::<usize>().max_value(3),
++            generators::integers::<usize>().min_value(12).max_value(encoded.len() - 1),
++        ));
++        let bit = tc.draw(generators::integers::<u8>().max_value(7));
++        encoded[idx] ^= 1 << bit;
++
++        if let Ok((hdr, out)) = decode_to_vec(&encoded) {
++            assert_eq!(out.len(), hdr.n_bytes());
++        }
++        if let Ok(mut dec) = Decoder::from_stream(Cursor::new(&encoded)) {
++            let _ = dec.decode_to_vec();
++        }
++    }
++
++    /// The three encoding APIs (to_vec, to_buf, to_stream) produce identical
++    /// bytes, and the result never exceeds encode_max_len.
++    #[hegel::test]
++    fn prop_encode_vec_buf_stream_agree(tc: hegel::TestCase) {
++        let (pixels, width, height, channels, colorspace) = draw_image(&tc);
++        let encoder = Encoder::new(&pixels, width, height).unwrap().with_colorspace(colorspace);
++        assert_eq!(encoder.channels(), channels);
++
++        let vec_out = encoder.encode_to_vec().unwrap();
++        assert!(vec_out.len() <= encode_max_len(width, height, channels));
++
++        let mut buf = vec![0_u8; encoder.required_buf_len()];
++        let n_buf = encoder.encode_to_buf(&mut buf).unwrap();
++        assert_eq!(&buf[..n_buf], vec_out.as_slice());
++
++        let mut stream_out = Vec::new();
++        let n_stream = encoder.encode_to_stream(&mut stream_out).unwrap();
++        assert_eq!(n_stream, stream_out.len());
++        assert_eq!(stream_out, vec_out);
++    }
++
++    /// The slice decoder and the (independently implemented) stream decoder
++    /// agree, for every (source channels, requested channels) combination.
++    ///
++    /// For the (Rgba -> Rgb) combination, alpha values are restricted to the
++    /// hash-preserving set {63, 127, 191, 255}: outside it the two decoders
++    /// genuinely disagree -- pinned as a known bug by
++    /// `test_decode_slice_vs_stream_divergence` below.
++    #[hegel::test]
++    fn prop_decode_slice_vs_stream_agree(tc: hegel::TestCase) {
++        let source = tc.draw((channels_gen()).print_as_debug());
++        let target = tc.draw((channels_gen()).print_as_debug());
++        let (width, height) = draw_dims(&tc, 2048);
++        let mut pixels =
++            draw_pixels(&tc, (width * height) as usize, source.as_u8() as usize);
++        if source == Channels::Rgba && target == Channels::Rgb {
++            for px in pixels.chunks_exact_mut(4) {
++                px[3] = [63, 127, 191, 255][(px[3] >> 6) as usize];
++            }
++        }
++        let encoded = encode_to_vec_checked(&pixels, width, height);
++
++        let mut slice_dec = Decoder::new(&encoded).unwrap().with_channels(target);
++        let mut stream_dec =
++            Decoder::from_stream(Cursor::new(&encoded)).unwrap().with_channels(target);
++        assert_eq!(slice_dec.header(), stream_dec.header());
++
++        let out_slice = slice_dec.decode_to_vec().unwrap();
++        let out_stream = stream_dec.decode_to_vec().unwrap();
++        assert_eq!(out_slice, out_stream);
++    }
++
++    /// KNOWN FAILURE (real bug, do not "fix" the test): the two public
++    /// decoders disagree with each other when decoding a valid, qoi-rust
++    /// encoded RGBA image with `with_channels(Rgb)`.
++    ///
++    /// Mechanism (found by prop_decode_slice_vs_stream_agree, minimized
++    /// separately): both 3-channel decode paths lose alpha state (see
++    /// prop_decode_rgba_as_rgb_drops_alpha above), so a QOI_OP_INDEX chunk can
++    /// pull in a zero pixel from an uninitialized slot -- a pixel that is
++    /// *not* stored at its own hash position. A subsequent QOI_OP_RUN then
++    /// behaves differently in the two implementations:
++    /// `decode_impl_stream` writes `index[hash(px)] = px` in its RUN arm,
++    /// clobbering slot hash3(0,0,0) = 53, while `decode_impl_slice` performs
++    /// no index writes on runs. The next QOI_OP_INDEX(53) reads different
++    /// values.
++    ///
++    /// In the 9-pixel image below (encoder ops annotated), the final pixel
++    /// decodes as (3,1,254) via the slice decoder but (0,0,0) via the stream
++    /// decoder.
++    ///
++    /// Note: reproduces with default features. Under `--features reference`
++    /// the encoder emits RUN instead of INDEX for the length-1 run at pixel 2
++    /// and this particular stream no longer triggers the divergence (the
++    /// decoder flaw itself is feature-independent).
++    #[test]
++    fn test_decode_slice_vs_stream_divergence() {
++        #[rustfmt::skip]
++        let pixels: [[u8; 4]; 9] = [
++            [0, 2, 3, 2], // RGBA     -> index slot hash4 = 53 (encoder), 20 (decoders)
++            [0, 2, 3, 2], // RUN(1), encoded as INDEX(53); decoders read uninit slot -> (0,0,0)
++            [3, 3, 1, 2], // LUMA; decoders apply it to (0,0,0) -> (3,1,254), stored at slot 53
++            [1, 0, 0, 3], // RGBA
++            [2, 2, 0, 0], // RGBA
++            [1, 0, 0, 3], // INDEX(36); uninit in decoders -> px = (0,0,0), not at its hash slot
++            [1, 0, 0, 3], // RUN(2)... stream decoder RUN arm writes (0,0,0) into slot 53,
++            [1, 0, 0, 3], //           slice decoder writes nothing
++            [3, 3, 1, 2], // INDEX(53): slice reads (3,1,254), stream reads (0,0,0)
++        ];
++        let pixels: Vec<u8> = pixels.concat();
++        let encoded = qoi::encode_to_vec(&pixels, 9, 1).unwrap();
++
++        let out_slice = Decoder::new(&encoded)
++            .unwrap()
++            .with_channels(Channels::Rgb)
++            .decode_to_vec()
++            .unwrap();
++        let out_stream = Decoder::from_stream(Cursor::new(&encoded))
++            .unwrap()
++            .with_channels(Channels::Rgb)
++            .decode_to_vec()
++            .unwrap();
++        assert_eq!(out_slice, out_stream);
++    }
++
++    /// Decoding an RGB image with `with_channels(Rgba)` equals the native RGB
++    /// decode with an opaque alpha byte appended to each pixel (documented:
++    /// "the alpha channel will be set to 255").
++    #[hegel::test]
++    fn prop_decode_rgb_as_rgba_adds_opaque_alpha(tc: hegel::TestCase) {
++        let colorspace = tc.draw((colorspace_gen()).print_as_debug());
++        let (width, height) = draw_dims(&tc, 2048);
++        let pixels = draw_pixels(&tc, (width * height) as usize, 3);
++        let encoded = Encoder::new(&pixels, width, height)
++            .unwrap()
++            .with_colorspace(colorspace)
++            .encode_to_vec()
++            .unwrap();
++
++        let converted =
++            Decoder::new(&encoded).unwrap().with_channels(Channels::Rgba).decode_to_vec().unwrap();
++        let expected: Vec<u8> =
++            pixels.chunks_exact(3).flat_map(|px| [px[0], px[1], px[2], 0xff]).collect();
++        assert_eq!(converted, expected);
++    }
++
++    /// KNOWN FAILURE (real bug, do not "fix" the test): decoding an RGBA image
++    /// with `with_channels(Rgb)` does NOT equal the native RGBA decode with the
++    /// alpha byte dropped, contradicting the documented behavior ("the alpha
++    /// channel will be ignored").
++    ///
++    /// Root cause: `decode_impl_slice::<3, true>` (src/decode.rs) tracks pixels
++    /// as `Pixel<3>` and rebuilds the color index via `px.as_rgba(0xff)`, i.e.
++    /// it hashes with alpha=255. The encoder indexed the same pixels with their
++    /// *true* alpha, so a `QOI_OP_INDEX` chunk referencing a pixel whose alpha
++    /// is not hash-equivalent to 255 (alpha not in {63, 127, 191, 255}, since
++    /// the hash is 3r+5g+7b+11a mod 64) looks up a slot the decoder never
++    /// wrote, producing wrong RGB values. The stream decoder
++    /// (`decode_impl_stream::<_, 3, true>`) has the same flaw (index of
++    /// `Pixel<3>`), and on top of it diverges from the slice decoder -- see
++    /// `test_decode_slice_vs_stream_divergence` below.
++    ///
++    /// The generator below constructs the counterexample family [A, B, A]
++    /// directly so the test fails deterministically on every case:
++    /// the encoder emits QOI_OP_INDEX for the third pixel, and the decoder's
++    /// alpha-255 index cannot resolve it to A's RGB values.
++    #[hegel::test]
++    fn prop_decode_rgba_as_rgb_drops_alpha(tc: hegel::TestCase) {
++        // alpha of A must not be hash-equivalent to 255 (11*(255-a) % 64 != 0)
++        let alpha = tc
++            .draw(generators::integers::<u8>().filter(|&a| ![63, 127, 191, 255].contains(&a)));
++        let r = tc.draw(generators::integers::<u8>());
++        let g = tc.draw(generators::integers::<u8>());
++        let b = tc.draw(generators::integers::<u8>());
++        // A's RGB must differ from the zero-initialized index entries
++        tc.assume(!(r == 0 && g == 0 && b == 0));
++        // B differs from A in red only; dr in 1..=63 keeps hash(B) != hash(A)
++        let dr = tc.draw(generators::integers::<u8>().min_value(1).max_value(63));
++        let a_px = [r, g, b, alpha];
++        let b_px = [r.wrapping_add(dr), g, b, alpha];
++        let pixels: Vec<u8> = [a_px, b_px, a_px].concat();
++
++        let encoded = qoi::encode_to_vec(&pixels, 3, 1).unwrap();
++        let converted =
++            Decoder::new(&encoded).unwrap().with_channels(Channels::Rgb).decode_to_vec().unwrap();
++        let expected: Vec<u8> =
++            pixels.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
++        assert_eq!(converted, expected);
++    }
++
++    /// Green sibling of prop_decode_rgba_as_rgb_drops_alpha (see the KNOWN
++    /// FAILURE comment there): the RGBA -> RGB conversion property does hold
++    /// when every alpha value is hash-equivalent to 255 (a in {63, 127, 191,
++    /// 255}), because then the decoder's alpha-255 index lands on the same
++    /// slots the encoder used. Restricting alpha this way keeps QOI_OP_RGBA
++    /// chunks and index reuse in play while excluding the known-buggy inputs.
++    #[hegel::test]
++    fn prop_decode_rgba_as_rgb_drops_alpha_hash_preserving(tc: hegel::TestCase) {
++        let colorspace = tc.draw((colorspace_gen()).print_as_debug());
++        let (width, height) = draw_dims(&tc, 2048);
++        let mut pixels = draw_pixels(&tc, (width * height) as usize, 4);
++        for px in pixels.chunks_exact_mut(4) {
++            px[3] = [63, 127, 191, 255][(px[3] >> 6) as usize];
++        }
++        let encoded = Encoder::new(&pixels, width, height)
++            .unwrap()
++            .with_colorspace(colorspace)
++            .encode_to_vec()
++            .unwrap();
++
++        let converted =
++            Decoder::new(&encoded).unwrap().with_channels(Channels::Rgb).decode_to_vec().unwrap();
++        let expected: Vec<u8> =
++            pixels.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
++        assert_eq!(converted, expected);
++    }
++
++    fn encode_to_vec_checked(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
++        qoi::encode_to_vec(pixels, width, height).unwrap()
++    }
++}
