@@ -89,8 +89,8 @@ def fix_printable(work: Path, log: str, pkg_dir: Path | None = None) -> int:
         sites.setdefault(path, []).append((line, col, ty.split("::")[-1].split("<")[0]))
     edits = 0
     # a derived PrettyPrintable whose field has a foreign type: mark the field #[pretty(debug)]
-    for m in FIELD_ERR.finditer(log):
-        file, line = m.group(1), int(m.group(2))
+    field_sites = sorted({(m.group(1), int(m.group(2))) for m in FIELD_ERR.finditer(log)}, reverse=True)
+    for file, line in field_sites:  # bottom-up so earlier insertions do not shift later lines
         path = next((p for p in (pkg_dir / file, work / file) if pkg_dir and p.is_file()), work / file)
         if not path.is_file():
             continue

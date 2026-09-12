@@ -1,0 +1,486 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9088bb5..3463dd6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -63,4 +63,5 @@ branch = "master"
+ repository = "m4b/goblin"
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ stderrlog = "0.6.0"
+diff --git a/tests/hegel_robustness.rs b/tests/hegel_robustness.rs
+new file mode 100644
+index 0000000..c95aeba
+--- /dev/null
++++ b/tests/hegel_robustness.rs
+@@ -0,0 +1,470 @@
++//! Property-based decoder-robustness tests for goblin, written with hegel
++//! (`hegeltest`).
++//!
++//! goblin parses UNTRUSTED binaries (ELF/PE/Mach-O/archive), so the key
++//! contract is that *no attacker-controlled byte buffer* can make a parser
++//! panic, over-read, hang, or OOM: every parse entry point must return `Err`
++//! on garbage, never abort the process. These are oracle-independent
++//! properties (a panic/OOM/over-read needs no external judge), which the
++//! hegel skill ranks highest-value for a hardened parser like this one.
++//!
++//! There is no pre-existing cross-format robustness test file to extend
++//! (`tests/elf.rs`, `tests/pe.rs`, ... are per-format example tests and
++//! `lib.rs` holds only unit tests), so these cross-cutting properties over
++//! `Object::parse` and the four format entry points live together here.
++//!
++//! The crate's own fuzz targets (`fuzz/fuzz_targets/parse.rs`,
++//! `parse_elf.rs`) cover `Object::parse` and ELF section/note iteration but
++//! do NOT deeply iterate a parsed PE or Mach-O; several properties below
++//! target that gap.
++
++use goblin::Object;
++use hegel::generators;
++use std::path::PathBuf;
++
++// ---------------------------------------------------------------------------
++// Fixtures: real, valid binaries shipped with the crate.
++// ---------------------------------------------------------------------------
++
++/// Paths (relative to the crate manifest) of real binary fixtures of every
++/// format goblin understands.
++fn fixture_paths() -> Vec<&'static str> {
++    vec![
++        // ELF (32 and 64 bit; shared objects and executables)
++        "tests/bins/elf/gnu_hash/hello.so",
++        "tests/bins/elf/gnu_hash/hello32.so",
++        "tests/bins/elf/symver/lib64.so",
++        "tests/bins/elf/symver/lib32.so",
++        "tests/bins/elf/symver/prog64",
++        "tests/bins/elf/symver/prog32",
++        // PE
++        "tests/bins/pe/well_formed_import.exe.bin",
++        "tests/bins/pe/has_res_full_version_and_manifest.exe.bin",
++        "tests/bins/pe/debug_directories-msvc.exe.bin",
++        "tests/bins/pe/System.Xml.XDocument.dll",
++        "tests/bins/pe/lld_with_tls_64.exe.bin",
++        // TE
++        "tests/bins/te/test_image.te",
++        // Mach-O (fat)
++        "assets/hello_world_fat_binaries",
++        // .NET PE
++        "assets/dotnet_executable_example.dll",
++    ]
++}
++
++fn read_fixture(rel: &str) -> Vec<u8> {
++    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    p.push(rel);
++    std::fs::read(&p).unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", p.display()))
++}
++
++fn all_fixtures() -> Vec<Vec<u8>> {
++    fixture_paths().iter().map(|p| read_fixture(p)).collect()
++}
++
++/// An `ar` archive fixture, embedded as a byte array in the repo.
++fn archive_fixture() -> Vec<u8> {
++    let bytes: Vec<u8> = include!("../etc/crt1a.rs");
++    bytes
++}
++
++// ---------------------------------------------------------------------------
++// Deep-exercise helpers: after a successful parse, walk every attacker-
++// controlled collection/offset the API exposes. Merely returning `Ok` isn't
++// enough — the interesting over-reads live in lazy iterators (notes, exports,
++// imports, relocations) that only touch the buffer when driven.
++// ---------------------------------------------------------------------------
++
++fn exercise_object(bytes: &[u8]) {
++    let obj = match Object::parse(bytes) {
++        Ok(o) => o,
++        Err(_) => return,
++    };
++    match obj {
++        Object::Elf(elf) => exercise_elf(&elf, bytes),
++        Object::PE(pe) => exercise_pe(&pe),
++        Object::TE(_te) => {}
++        Object::COFF(coff) => {
++            for s in &coff.sections {
++                let _ = s.name();
++            }
++        }
++        Object::Mach(mach) => exercise_mach(&mach, bytes),
++        Object::Archive(ar) => exercise_archive(&ar, bytes),
++        Object::Unknown(_) => {}
++        _ => {}
++    }
++}
++
++fn exercise_elf(elf: &goblin::elf::Elf, data: &[u8]) {
++    for sh in &elf.section_headers {
++        let _ = elf.shdr_strtab.get_at(sh.sh_name);
++    }
++    for ph in &elf.program_headers {
++        let _ = ph.p_type;
++    }
++    for sym in &elf.syms {
++        let _ = elf.strtab.get_at(sym.st_name);
++    }
++    for sym in &elf.dynsyms {
++        let _ = elf.dynstrtab.get_at(sym.st_name);
++    }
++    for r in &elf.dynrelas {
++        let _ = r.r_offset;
++    }
++    for r in &elf.dynrels {
++        let _ = r.r_offset;
++    }
++    for r in &elf.pltrelocs {
++        let _ = r.r_offset;
++    }
++    for (_, rs) in &elf.shdr_relocs {
++        for r in rs {
++            let _ = r.r_offset;
++        }
++    }
++    let _ = &elf.libraries;
++    let _ = &elf.soname;
++    let _ = &elf.interpreter;
++    let _ = &elf.rpaths;
++    let _ = &elf.runpaths;
++    // Lazy note iterators read `data` on demand — drive them to completion.
++    if let Some(mut it) = elf.iter_note_headers(data) {
++        while let Some(Ok(_)) = it.next() {}
++    }
++    if let Some(mut it) = elf.iter_note_sections(data, None) {
++        while let Some(Ok(_)) = it.next() {}
++    }
++}
++
++fn exercise_pe(pe: &goblin::pe::PE) {
++    for s in &pe.sections {
++        let _ = s.name();
++        let _ = s.name_offset();
++    }
++    for imp in &pe.imports {
++        let _ = &imp.name;
++    }
++    for exp in &pe.exports {
++        let _ = &exp.name;
++    }
++    let _ = &pe.libraries;
++    let _ = &pe.export_data;
++    let _ = &pe.import_data;
++    let _ = &pe.debug_data;
++    let _ = &pe.tls_data;
++    let _ = &pe.exception_data;
++    let _ = &pe.load_config_data;
++}
++
++fn exercise_mach(mach: &goblin::mach::Mach, _bytes: &[u8]) {
++    use goblin::mach::Mach;
++    match mach {
++        Mach::Binary(macho) => {
++            for _sym in macho.symbols() {}
++            let _ = macho.relocations();
++            let _ = macho.exports();
++            let _ = macho.imports();
++            for seg in &macho.segments {
++                let _ = seg.name();
++                let _ = seg.sections();
++            }
++            let _ = &macho.libs;
++            let _ = &macho.rpaths;
++        }
++        Mach::Fat(multi) => {
++            let _ = multi.arches();
++            for arch in multi {
++                let _ = arch;
++            }
++        }
++    }
++}
++
++fn exercise_archive(ar: &goblin::archive::Archive, bytes: &[u8]) {
++    for name in ar.members() {
++        let _ = ar.extract(name, bytes);
++        let _ = ar.member_of_symbol(name);
++    }
++    let _ = ar.summarize();
++    let mut i = 0;
++    while let Some(m) = ar.get_at(i) {
++        let _ = m.extended_name();
++        let _ = m.raw_name();
++        let _ = m.size();
++        i += 1;
++    }
++}
++
++// ===========================================================================
++// P1. Object::parse on ARBITRARY bytes never panics, and deep iteration of
++//     anything that parses is likewise panic-free.
++// ===========================================================================
++#[hegel::test]
++fn object_parse_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++    let bytes = tc.draw(generators::binary().max_size(4096));
++    exercise_object(&bytes);
++}
++
++// ===========================================================================
++// P2. Each direct format entry point (elf/pe/mach/archive/TE/COFF) tolerates
++//     arbitrary bytes. Object::parse only reaches a parser when the magic
++//     matches; calling them directly exercises the full parser on garbage.
++// ===========================================================================
++#[hegel::test]
++fn format_parsers_arbitrary_bytes_never_panic(tc: hegel::TestCase) {
++    let bytes = tc.draw(generators::binary().max_size(4096));
++    let which = tc.draw(generators::integers::<u8>().max_value(5));
++    match which {
++        0 => {
++            let _ = goblin::elf::Elf::parse(&bytes);
++        }
++        1 => {
++            let _ = goblin::pe::PE::parse(&bytes);
++        }
++        2 => {
++            let _ = goblin::mach::Mach::parse(&bytes);
++        }
++        3 => {
++            let _ = goblin::archive::Archive::parse(&bytes);
++        }
++        4 => {
++            let _ = goblin::pe::TE::parse(&bytes);
++        }
++        _ => {
++            let _ = goblin::pe::Coff::parse(&bytes);
++        }
++    }
++}
++
++// ===========================================================================
++// P3. Crafted ELF header counts/offsets. Header fields are attacker-
++//     controlled; a huge program/section-header count or an out-of-range
++//     table offset must not pre-allocate gigabytes, index out of bounds, or
++//     panic — it must return Err. We take a real ELF and overwrite exactly
++//     the count/offset fields with drawn values (including MAX), preserving
++//     valid magic so the crafted header reaches the table parsers.
++// ===========================================================================
++fn elf_fixture_bytes(tc: &hegel::TestCase) -> Vec<u8> {
++    let elf_paths: Vec<&str> = fixture_paths()
++        .into_iter()
++        .filter(|p| p.contains("/elf/"))
++        .collect();
++    let idx = tc.draw(generators::integers::<usize>().max_value(elf_paths.len() - 1));
++    read_fixture(elf_paths[idx])
++}
++
++#[hegel::test(test_cases = 300)]
++fn elf_crafted_header_counts_and_offsets_never_panic(tc: hegel::TestCase) {
++    let mut bytes = elf_fixture_bytes(&tc);
++    if bytes.len() < 64 {
++        return;
++    }
++    let is_64 = bytes[4] == 2; // EI_CLASS: 1 = ELFCLASS32, 2 = ELFCLASS64
++    let little_endian = bytes[5] == 1; // EI_DATA: 1 = LSB
++
++    // Draw values that span the whole range, biased toward boundaries where
++    // count*entsize overflow / gigantic preallocation would bite.
++    let phnum = tc.draw(generators::integers::<u16>());
++    let shnum = tc.draw(generators::integers::<u16>());
++    let phoff = tc.draw(hegel::one_of!(
++        generators::integers::<u64>(),
++        generators::sampled_from(vec![0u64, u64::MAX, bytes.len() as u64]),
++    ));
++    let shoff = tc.draw(hegel::one_of!(
++        generators::integers::<u64>(),
++        generators::sampled_from(vec![0u64, u64::MAX, bytes.len() as u64]),
++    ));
++
++    let w16 = |b: &mut [u8], at: usize, v: u16| {
++        let le = v.to_le_bytes();
++        let be = v.to_be_bytes();
++        b[at..at + 2].copy_from_slice(if little_endian { &le } else { &be });
++    };
++    let w32 = |b: &mut [u8], at: usize, v: u32| {
++        let le = v.to_le_bytes();
++        let be = v.to_be_bytes();
++        b[at..at + 4].copy_from_slice(if little_endian { &le } else { &be });
++    };
++    let w64 = |b: &mut [u8], at: usize, v: u64| {
++        let le = v.to_le_bytes();
++        let be = v.to_be_bytes();
++        b[at..at + 8].copy_from_slice(if little_endian { &le } else { &be });
++    };
++
++    if is_64 {
++        w64(&mut bytes, 32, phoff); // e_phoff
++        w64(&mut bytes, 40, shoff); // e_shoff
++        w16(&mut bytes, 56, phnum); // e_phnum
++        w16(&mut bytes, 60, shnum); // e_shnum
++    } else {
++        w32(&mut bytes, 28, phoff as u32); // e_phoff
++        w32(&mut bytes, 32, shoff as u32); // e_shoff
++        w16(&mut bytes, 44, phnum); // e_phnum
++        w16(&mut bytes, 48, shnum); // e_shnum
++    }
++
++    // Must not panic/OOM. Deep-iterate whatever parses.
++    exercise_object(&bytes);
++}
++
++// ===========================================================================
++// P4. Valid-then-corrupt. Take a real binary, flip a drawn number of bytes at
++//     drawn positions to drawn values, and confirm parse+iterate is graceful
++//     (Err or Ok, never a panic/over-read).
++// ===========================================================================
++#[hegel::test]
++fn valid_binary_byte_corruption_never_panics(tc: hegel::TestCase) {
++    let fixtures = all_fixtures();
++    let fi = tc.draw(generators::integers::<usize>().max_value(fixtures.len() - 1));
++    let mut bytes = fixtures[fi].clone();
++    if bytes.is_empty() {
++        return;
++    }
++
++    let n_flips = tc.draw(generators::integers::<usize>().max_value(16));
++    for _ in 0..n_flips {
++        let pos = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++        let val = tc.draw(generators::integers::<u8>());
++        bytes[pos] = val;
++    }
++    exercise_object(&bytes);
++}
++
++// ===========================================================================
++// P5. Truncation. Every strict prefix of a real binary must parse to Err (or
++//     an internally-consistent Ok) without panicking. Truncation is where
++//     "read a length, then read that many bytes" parsers over-read.
++// ===========================================================================
++#[hegel::test]
++fn truncated_binary_never_panics(tc: hegel::TestCase) {
++    let fixtures = all_fixtures();
++    let fi = tc.draw(generators::integers::<usize>().max_value(fixtures.len() - 1));
++    let full = &fixtures[fi];
++    if full.is_empty() {
++        return;
++    }
++    let len = tc.draw(generators::integers::<usize>().max_value(full.len()));
++    let prefix = &full[..len];
++    exercise_object(prefix);
++}
++
++// ===========================================================================
++// P6. Magic / format dispatch consistency. When Object::parse succeeds, the
++//     returned variant must be consistent with the leading magic bytes.
++//     Oracle-independent structural invariant: goblin classifies by magic, so
++//     an ELF result whose buffer doesn't start with the ELF magic (etc.) is a
++//     dispatch bug. Exercised over both arbitrary bytes and mutated fixtures.
++// ===========================================================================
++#[hegel::test]
++fn object_dispatch_matches_magic(tc: hegel::TestCase) {
++    // Mix arbitrary bytes with lightly-corrupted real binaries so Ok results
++    // actually occur.
++    let bytes = if tc.draw(generators::booleans()) {
++        tc.draw(generators::binary().max_size(2048))
++    } else {
++        let fixtures = all_fixtures();
++        let fi = tc.draw(generators::integers::<usize>().max_value(fixtures.len() - 1));
++        let mut b = fixtures[fi].clone();
++        if !b.is_empty() {
++            let pos = tc.draw(generators::integers::<usize>().max_value(b.len() - 1));
++            b[pos] = tc.draw(generators::integers::<u8>());
++        }
++        b
++    };
++
++    let obj = match Object::parse(&bytes) {
++        Ok(o) => o,
++        Err(_) => return,
++    };
++
++    match obj {
++        Object::Elf(_) => {
++            assert_eq!(&bytes[0..4], b"\x7fELF", "Elf variant without ELF magic");
++        }
++        Object::Archive(_) => {
++            assert_eq!(
++                &bytes[0..8],
++                b"!<arch>\x0a",
++                "Archive variant without archive magic"
++            );
++        }
++        Object::PE(_) | Object::TE(_) | Object::COFF(_) => {
++            // All three are reached only via the DOS/TE/COFF machine magics in
++            // the first two bytes; whatever the sub-classification, the buffer
++            // must have been at least 16 bytes (hint window) and start with a
++            // recognized 2-byte magic.
++            assert!(bytes.len() >= 16, "PE-family result on <16-byte buffer");
++        }
++        Object::Mach(_) => {
++            assert!(bytes.len() >= 16, "Mach result on <16-byte buffer");
++        }
++        Object::Unknown(_) => {}
++        _ => {}
++    }
++}
++
++// ===========================================================================
++// P7. Archive member offsets/sizes stay within the input buffer.
++//     Oracle-independent field-consistency: a parsed member whose header
++//     offset points outside the buffer, or whose extract() over-reads, is a
++//     bug. Exercised over the real archive fixture plus byte corruptions of
++//     it (corruptions that still parse Ok must still have in-bounds members).
++// ===========================================================================
++#[hegel::test]
++fn archive_member_offsets_within_bounds(tc: hegel::TestCase) {
++    let mut bytes = archive_fixture();
++    let n_flips = tc.draw(generators::integers::<usize>().max_value(8));
++    for _ in 0..n_flips {
++        if bytes.is_empty() {
++            break;
++        }
++        let pos = tc.draw(generators::integers::<usize>().max_value(bytes.len() - 1));
++        bytes[pos] = tc.draw(generators::integers::<u8>());
++    }
++
++    let ar = match goblin::archive::Archive::parse(&bytes) {
++        Ok(a) => a,
++        Err(_) => return,
++    };
++
++    let len = bytes.len() as u64;
++    let mut i = 0;
++    while let Some(m) = ar.get_at(i) {
++        // The header always lies inside the buffer (its fields were read).
++        assert!(
++            m.header_offset <= len,
++            "member header_offset {} exceeds buffer len {}",
++            m.header_offset,
++            len
++        );
++        assert!(
++            m.offset <= len,
++            "member data offset {} exceeds buffer len {}",
++            m.offset,
++            len
++        );
++        // extract() preads offset..offset+size; it must not panic/over-read
++        // (it returns Err if out of range).
++        let _ = ar.extract(m.extended_name(), &bytes);
++        i += 1;
++    }
++}
++
++// ===========================================================================
++// P8. Structured near-valid input: prepend valid archive magic to arbitrary
++//     bytes. This drives the archive member loop (which reads member headers,
++//     decimal sizes, and advances a cursor) far more often than uniform
++//     random bytes would, targeting the member-iteration cursor arithmetic.
++// ===========================================================================
++#[hegel::test]
++fn archive_magic_prefixed_arbitrary_never_panics(tc: hegel::TestCase) {
++    let mut bytes = goblin::archive::MAGIC.to_vec();
++    let rest = tc.draw(generators::binary().max_size(2048));
++    bytes.extend_from_slice(&rest);
++    let ar = match goblin::archive::Archive::parse(&bytes) {
++        Ok(a) => a,
++        Err(_) => return,
++    };
++    exercise_archive(&ar, &bytes);
++}
