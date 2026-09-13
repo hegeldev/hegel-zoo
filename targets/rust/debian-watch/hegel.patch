@@ -1,0 +1,1339 @@
+diff --git a/debian-watch/Cargo.toml b/debian-watch/Cargo.toml
+index bf02677..d6b6167 100644
+--- a/debian-watch/Cargo.toml
++++ b/debian-watch/Cargo.toml
+@@ -32,6 +32,8 @@ sequoia-openpgp = { version = "2.0", optional = true, default-features = false,
+ anyhow = { version = "1.0", optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
+ maplit = "1.0.2"
+ tokio = { version = "1", features = ["macros", "rt"] }
+ tiny_http = "0.12"
+diff --git a/debian-watch/tests/hegel.rs b/debian-watch/tests/hegel.rs
+new file mode 100644
+index 0000000..a9ea8c9
+--- /dev/null
++++ b/debian-watch/tests/hegel.rs
+@@ -0,0 +1,1320 @@
++//! Hegel property tests for debian-watch, checked against uscan itself
++//! (devscripts' `Devscripts::Uscan::Utils::safe_replace` for the mangling
++//! rules and the substitution constants of `Devscripts::Uscan::WatchFile`,
++//! driven as a persistent Perl child) and python-debian's `debian.watch`
++//! (`WatchFile.from_lines`, `expand`; a persistent Python child), plus the
++//! generators' own model of the line-based watch file grammar.
++#![allow(clippy::all, dead_code)]
++
++use debian_watch::linebased::{parse_watch_file, Entry, EntryBuilder, WatchFile};
++use debian_watch::mangle::{apply_mangle, parse_mangle_expr};
++use debian_watch::subst::subst;
++use debian_watch::{
++    ComponentType, Compression, GitExport, GitMode, Mode, PgpMode, SearchMode, VersionPolicy,
++};
++use hegel::generators::{self, Generator};
++use std::collections::BTreeSet;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracles
++// ---------------------------------------------------------------------------
++
++const PYTHON_SCRIPT: &str = r#"
++import sys, json, binascii
++from debian.watch import WatchFile, expand
++def h(x): return binascii.unhexlify(x).decode('utf-8')
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd = parts[0]
++    try:
++        if cmd == 'P':
++            text = h(parts[1])
++            wf = WatchFile.from_lines(text.splitlines(True), strict=True)
++            if wf is None:
++                out = {'empty': True}
++            else:
++                out = {'version': wf.version, 'options': wf.options,
++                       'entries': [{'url': e.url, 'matching_pattern': e.matching_pattern,
++                                    'version': e.version, 'script': e.script,
++                                    'options': list(e.options)} for e in wf.entries]}
++        elif cmd == 'E':
++            out = {'text': expand(h(parts[1]), h(parts[2]))}
++        else:
++            out = {'error': 'unknown command'}
++    except Exception as e:
++        out = {'error': repr(e)}
++    sys.stdout.write(json.dumps(out) + '\n')
++    sys.stdout.flush()
++"#;
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use JSON::PP;
++use Devscripts::Uscan::Utils;
++use Devscripts::Uscan::Output;
++use Devscripts::Uscan::WatchFile;
++$Devscripts::Output::verbose = 0;
++$| = 1;
++my $json = JSON::PP->new->canonical->utf8;
++sub h { my $s = pack('H*', shift); utf8::decode($s); return $s; }
++while (my $line = <STDIN>) {
++    chomp $line;
++    my @p = split / /, $line;
++    my $cmd = shift @p;
++    my $out;
++    if ($cmd eq 'M') {
++        my ($rule, $in) = (h($p[0]), h($p[1]));
++        my $ok = eval { safe_replace(\$in, $rule) };
++        if ($@) { $out = { ok => 0, error => "$@" } }
++        else { $out = { ok => $ok ? 1 : 0, out => $in } }
++    } elsif ($cmd eq 'X') {
++        my ($tmpl, $in, $pkg) = (h($p[0]), h($p[1]), h($p[2]));
++        my $re = $tmpl;
++        $re =~ s/\@PACKAGE\@/$pkg/g;
++        $re =~ s/\@ANY_VERSION\@/Devscripts::Uscan::WatchFile::ANY_VERSION/ge;
++        $re =~ s/\@ARCHIVE_EXT\@/Devscripts::Uscan::WatchFile::ARCHIVE_EXT/ge;
++        $re =~ s/\@SIGNATURE_EXT\@/Devscripts::Uscan::WatchFile::SIGNATURE_EXT/ge;
++        $re =~ s/\@DEB_EXT\@/Devscripts::Uscan::WatchFile::DEB_EXT/ge;
++        my ($m, $cap) = eval { if ($in =~ /^$re$/) { (1, $1) } else { (0, undef) } };
++        if ($@) { $out = { error => "$@" } }
++        else { $out = { match => $m, cap => $cap, re => $re } }
++    } else {
++        $out = { error => 'unknown command' };
++    }
++    print $json->encode($out), "\n";
++}
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn ask(c: &mut Child2, cmd: &str, args: &[&str]) -> serde_json::Value {
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    writeln!(c.stdin, "{line}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut reply = String::new();
++    c.stdout.read_line(&mut reply).unwrap();
++    assert!(!reply.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&reply).unwrap_or_else(|e| panic!("bad oracle reply {reply:?}: {e}"))
++}
++
++fn python() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("/usr/bin/python3", &["-c", PYTHON_SCRIPT])))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++/// uscan's `safe_replace`: Ok(mangled) or Err(()) when uscan refuses the rule.
++fn uscan_mangle(rule: &str, input: &str) -> Result<String, String> {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "M", &[rule, input]);
++    if v["ok"].as_i64() == Some(1) {
++        Ok(v["out"].as_str().unwrap().to_string())
++    } else {
++        Err(v["error"].as_str().unwrap_or("refused").to_string())
++    }
++}
++
++/// uscan's expansion of a template and an anchored match against `input`:
++/// (matched, first capture, expanded regex).
++fn uscan_match(template: &str, input: &str, package: &str) -> (bool, Option<String>, String) {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "X", &[template, input, package]);
++    if let Some(e) = v.get("error") {
++        panic!("uscan regex error for {template:?}: {e}");
++    }
++    (
++        v["match"].as_i64() == Some(1),
++        v["cap"].as_str().map(|s| s.to_string()),
++        v["re"].as_str().unwrap().to_string(),
++    )
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct PyEntry {
++    url: String,
++    matching_pattern: Option<String>,
++    version: Option<String>,
++    script: Option<String>,
++    options: Vec<String>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct PyWatch {
++    version: u32,
++    options: Vec<String>,
++    entries: Vec<PyEntry>,
++}
++
++fn py_watch(text: &str) -> Result<Option<PyWatch>, String> {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "P", &[text]);
++    if let Some(e) = v.get("error") {
++        return Err(e.to_string());
++    }
++    if v.get("empty").is_some() {
++        return Ok(None);
++    }
++    let strs = |a: &serde_json::Value| -> Vec<String> {
++        a.as_array().unwrap().iter().map(|s| s.as_str().unwrap().trim().to_string()).collect()
++    };
++    // python-debian leaves a leading space on the field after a quoted
++    // `opts="…" \` continuation; fields never start with whitespace.
++    let opt = |x: &serde_json::Value| x.as_str().map(|s| s.trim().to_string());
++    Ok(Some(PyWatch {
++        version: v["version"].as_u64().unwrap() as u32,
++        options: strs(&v["options"]),
++        entries: v["entries"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|e| PyEntry {
++                url: e["url"].as_str().unwrap().trim().to_string(),
++                matching_pattern: opt(&e["matching_pattern"]),
++                version: opt(&e["version"]),
++                script: opt(&e["script"]),
++                options: strs(&e["options"]),
++            })
++            .collect(),
++    }))
++}
++
++fn py_expand(text: &str, package: &str) -> String {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "E", &[text, package]);
++    v["text"].as_str().unwrap_or_else(|| panic!("python expand failed: {v}")).to_string()
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn subset<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T], max: usize) -> Vec<T> {
++    let n = tc.draw(int!(0, max.min(items.len()) as i64)) as usize;
++    let mut out: Vec<T> = Vec::new();
++    let mut idx: Vec<usize> = (0..items.len()).collect();
++    for _ in 0..n {
++        let i = tc.draw(int!(0, idx.len() as i64 - 1)) as usize;
++        out.push(items[idx.remove(i)].clone());
++    }
++    out
++}
++
++/// A regex in the dialect Perl and the regex crate share, with `groups`
++/// capturing groups.
++#[derive(Clone, Debug)]
++struct GenRegex {
++    text: String,
++    groups: usize,
++    /// Every atom is optional, so the regex matches the empty string.
++    nullable: bool,
++}
++
++const LITERALS: &[&str] = &["a", "b", "c", "x", "1", "2", "0", "-", "_", "~", "\\.", "\\+", "\\d", "\\w", "[0-9]", "[a-z]", "[.-]", "."];
++
++#[hegel::composite]
++fn arb_regex(tc: &hegel::TestCase, max_groups: usize) -> GenRegex {
++    let n = tc.draw(int!(1, 4)) as usize;
++    let mut text = String::new();
++    let mut groups = 0;
++    let mut nullable = true;
++    if tc.draw(int!(0, 4)) == 0 {
++        text.push('^');
++    }
++    for _ in 0..n {
++        let mut atom = pick(tc, LITERALS).to_string();
++        if let Some(q) = pick(tc, &[None, None, None, Some("+"), Some("*"), Some("?")]) {
++            atom.push_str(q);
++            if q == "+" {
++                nullable = false;
++            }
++        } else {
++            nullable = false;
++        }
++        if groups < max_groups && tc.draw(int!(0, 2)) == 0 {
++            atom = format!("({atom})");
++            groups += 1;
++        }
++        text.push_str(&atom);
++    }
++    if tc.draw(int!(0, 4)) == 0 {
++        text.push('$');
++    }
++    GenRegex { text, groups, nullable }
++}
++
++/// A replacement in the subset Perl and the regex crate agree on: literal
++/// characters and `${N}` group references (a bare `$N` only at the end).
++#[hegel::composite]
++fn arb_replacement(tc: &hegel::TestCase, groups: usize) -> String {
++    let n = tc.draw(int!(0, 3)) as usize;
++    let mut s = String::new();
++    for i in 0..n {
++        if groups > 0 && tc.draw(int!(0, 2)) == 0 {
++            let g = tc.draw(int!(1, groups as i64));
++            if i == n - 1 && tc.draw(generators::booleans()) {
++                s.push_str(&format!("${g}"));
++            } else {
++                s.push_str(&format!("${{{g}}}"));
++            }
++        } else {
++            s.push_str(pick(tc, &["A", "b", "-", ".", "0", "z", "_"]));
++        }
++    }
++    s
++}
++
++const DELIMS: &[char] = &['/', '|', '#', '!', '%', '@', ','];
++
++#[derive(Clone, Debug)]
++struct SubstRule {
++    delim: char,
++    pattern: GenRegex,
++    replacement: String,
++    flags: String,
++}
++
++impl SubstRule {
++    fn text(&self) -> String {
++        let d = self.delim;
++        format!("s{d}{}{d}{}{d}{}", self.pattern.text, self.replacement, self.flags)
++    }
++}
++
++#[hegel::composite]
++fn arb_subst_rule(tc: &hegel::TestCase, global_only: bool) -> SubstRule {
++    let delim = pick(tc, DELIMS);
++    let pattern = tc.draw(arb_regex(2).print_as_debug());
++    let replacement = tc.draw(arb_replacement(pattern.groups));
++    let flags = if global_only {
++        pick(tc, &["", "g"]).to_string()
++    } else {
++        pick(tc, &["", "g", "i", "gi", "x", "gx"]).to_string()
++    };
++    SubstRule { delim, pattern, replacement, flags }
++}
++
++/// Characters and ranges for `tr` lists.
++#[hegel::composite]
++fn arb_tr_list(tc: &hegel::TestCase) -> (String, usize) {
++    let n = tc.draw(int!(1, 3)) as usize;
++    let mut s = String::new();
++    let mut len = 0;
++    for _ in 0..n {
++        match tc.draw(int!(0, 3)) {
++            0 => {
++                s.push_str("a-c");
++                len += 3;
++            }
++            1 => {
++                s.push_str("0-2");
++                len += 3;
++            }
++            _ => {
++                s.push(pick(tc, &['x', 'y', 'z', '.', '_', 'q']));
++                len += 1;
++            }
++        }
++    }
++    (s, len)
++}
++
++/// Strings mangling rules are applied to.
++#[hegel::composite]
++fn arb_input(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0, 2)) {
++        0 => pick(
++            tc,
++            &["1.2.3", "v1.2.3", "1.0+ds", "1.0+dfsg1", "foo-1.2.3.tar.gz", "https://x.org/archive/v0.9.4.tar.gz", "2.0~rc1", "1_2_3", "release-1.2", "0.0.1-beta.2", "abc", ""],
++        )
++        .to_string(),
++        _ => {
++            let n = tc.draw(int!(0, 8)) as usize;
++            (0..n).map(|_| pick(tc, &['a', 'b', 'c', 'x', '1', '2', '0', '.', '-', '_', '~', '+', '/'])).collect()
++        }
++    }
++}
++
++// Watch files ----------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++struct WOption {
++    key: String,
++    value: Option<String>,
++}
++
++impl WOption {
++    fn text(&self) -> String {
++        match &self.value {
++            Some(v) => format!("{}={v}", self.key),
++            None => self.key.clone(),
++        }
++    }
++}
++
++const FLAG_KEYS: &[&str] = &["bare", "repack", "decompress", "passive", "active"];
++const VALUE_KEYS: &[(&str, &[&str])] = &[
++    ("compression", &["xz", "gz", "gzip", "bzip2", "bz2", "lzma", "default"]),
++    ("mode", &["git", "lwp", "svn"]),
++    ("pretty", &["0.0~git%cd.%h", "describe"]),
++    ("component", &["foo", "js-lib"]),
++    ("searchmode", &["plain", "html"]),
++    ("pgpmode", &["auto", "default", "mangle", "next", "previous", "self", "gittag"]),
++    ("gitmode", &["shallow", "full"]),
++    ("gitexport", &["all", "default"]),
++    ("ctype", &["perl", "nodejs"]),
++    ("repacksuffix", &["+ds", "+dfsg"]),
++    ("date", &["%Y%m%d", "%Y-%m-%d"]),
++    ("pgpsigurlmangle", &["s/$/.asc/", "s/$/.sig/"]),
++    // debian-watch/12: a value with `=` is truncated, so none here (pinned).
++    ("filenamemangle", &["s/.+\\/v?(\\d\\S+)\\.tar\\.gz/foo-$1.tar.gz/", "s/.*\\/(\\d\\S+)\\.zip/foo-$1.zip/"]),
++    ("uversionmangle", &["s/\\+ds//", "s/-rc/~rc/", "s/_/./g"]),
++    ("dversionmangle", &["s/\\+ds//", "s/\\+dfsg\\d*$//"]),
++    ("versionmangle", &["s/-/./g"]),
++    ("dirversionmangle", &["s/v(\\d)/$1/"]),
++    ("unzipopt", &["-a"]),
++];
++
++#[hegel::composite]
++fn arb_options(tc: &hegel::TestCase) -> Vec<WOption> {
++    let flags = subset(tc, FLAG_KEYS, 2);
++    let valued = subset(tc, VALUE_KEYS, 3);
++    let mut out: Vec<WOption> = Vec::new();
++    for f in flags {
++        out.push(WOption { key: f.to_string(), value: None });
++    }
++    for (k, vals) in valued {
++        out.push(WOption { key: k.to_string(), value: Some(pick(tc, vals).to_string()) });
++    }
++    // debian-watch/7: a flag option ending the list is a parse error, so
++    // the general properties keep a valued option last (pinned separately).
++    if out.last().map_or(false, |o| o.value.is_none()) {
++        out.push(WOption { key: "compression".to_string(), value: Some("xz".to_string()) });
++    }
++    out
++}
++
++fn valued_only(options: &[WOption]) -> Vec<WOption> {
++    options.iter().filter(|o| o.value.is_some()).cloned().collect()
++}
++
++const URLS: &[&str] = &[
++    "https://h.example.org/releases/",
++    "https://github.com/@PACKAGE@/tags",
++    "https://pypi.debian.net/@PACKAGE@/@PACKAGE@-(.+)\\.tar\\.gz",
++    "ftp://ftp.example.org/pub/foo/",
++    "https://example.org/dl?per_page=100",
++    "https://example.org/dir/foo-(\\d[\\d.]*)\\.tar\\.gz",
++];
++const PATTERNS: &[&str] = &[
++    ".*/v?(\\d\\S+)\\.tar\\.gz",
++    "foo-(\\d[\\d.]*)@ARCHIVE_EXT@",
++    "(?:.*?/)?v?(\\d[\\d.]*)\\.tar\\.gz",
++    "@PACKAGE@-@ANY_VERSION@@ARCHIVE_EXT@",
++    ".*?v=(\\d+)",
++];
++const POLICIES: &[&str] = &["debian", "same", "previous", "ignore", "group", "checksum", "version-1.2"];
++const SCRIPTS: &[&str] = &["uupdate", "debian/orig-tar.sh"];
++
++#[derive(Clone, Debug)]
++struct WEntry {
++    options: Vec<WOption>,
++    quoted: bool,
++    /// Space after the comma inside quoted options.
++    quoted_spaces: bool,
++    /// Line continuation between the options and the URL.
++    cont_after_opts: bool,
++    url: String,
++    pattern: Option<String>,
++    policy: Option<String>,
++    script: Option<String>,
++    sep: String,
++}
++
++impl WEntry {
++    fn url_has_pattern(&self) -> bool {
++        py_split_url(&self.url).is_some()
++    }
++    fn opts_text(&self) -> Option<String> {
++        if self.options.is_empty() {
++            return None;
++        }
++        let joiner = if self.quoted && self.quoted_spaces { ", " } else { "," };
++        let inner = self.options.iter().map(|o| o.text()).collect::<Vec<_>>().join(joiner);
++        Some(if self.quoted { format!("opts=\"{inner}\"") } else { format!("opts={inner}") })
++    }
++    fn text(&self) -> String {
++        let mut s = String::new();
++        if let Some(o) = self.opts_text() {
++            s.push_str(&o);
++            if self.cont_after_opts {
++                s.push_str(" \\\n  ");
++            } else {
++                s.push_str(&self.sep);
++            }
++        }
++        s.push_str(&self.url);
++        for f in [&self.pattern, &self.policy, &self.script].into_iter().flatten() {
++            s.push_str(&self.sep);
++            s.push_str(f);
++        }
++        s
++    }
++    fn option_texts(&self) -> Vec<String> {
++        self.options.iter().map(|o| o.text()).collect()
++    }
++    fn get(&self, key: &str) -> Option<Option<String>> {
++        self.options.iter().find(|o| o.key == key).map(|o| o.value.clone())
++    }
++}
++
++/// python-debian splits a filename pattern off the URL when the last path
++/// component contains parentheses.
++fn py_split_url(url: &str) -> Option<(String, String)> {
++    let idx = url.rfind('/')?;
++    let comp = &url[idx + 1..];
++    let open = comp.find('(')?;
++    comp[open..].find(')')?;
++    Some((url[..idx].to_string(), comp.to_string()))
++}
++
++#[hegel::composite]
++fn arb_wentry(tc: &hegel::TestCase) -> WEntry {
++    let options = tc.draw(arb_options().print_as_debug());
++    let url = pick(tc, URLS).to_string();
++    let in_url = py_split_url(&url).is_some();
++    let pattern = if in_url || tc.draw(int!(0, 3)) == 0 { None } else { Some(pick(tc, PATTERNS).to_string()) };
++    // debian-watch/10: fields after a URL with an inline pattern are shifted,
++    // so the general properties give such URLs no policy (pinned separately).
++    let policy = if pattern.is_some() && tc.draw(generators::booleans()) {
++        Some(pick(tc, POLICIES).to_string())
++    } else {
++        None
++    };
++    let script = if policy.is_some() && tc.draw(generators::booleans()) { Some(pick(tc, SCRIPTS).to_string()) } else { None };
++    WEntry {
++        options,
++        quoted: tc.draw(generators::booleans()),
++        quoted_spaces: tc.draw(generators::booleans()),
++        cont_after_opts: tc.draw(int!(0, 2)) == 0,
++        url,
++        pattern,
++        policy,
++        script,
++        sep: pick(tc, &[" ", "  ", " \t", "\t"]).to_string(),
++    }
++}
++
++#[derive(Clone, Debug)]
++struct WFile {
++    version: u32,
++    /// Lines (comments, blanks) before the version line.
++    leading: Vec<String>,
++    entries: Vec<WEntry>,
++    /// Lines before entry i / after the last.
++    extra: Vec<Vec<String>>,
++    trailing_newline: bool,
++}
++
++impl WFile {
++    fn text(&self) -> String {
++        let mut lines: Vec<String> = self.leading.clone();
++        lines.push(format!("version={}", self.version));
++        for (i, e) in self.entries.iter().enumerate() {
++            lines.extend(self.extra[i].iter().cloned());
++            lines.push(e.text());
++        }
++        lines.extend(self.extra[self.entries.len()].iter().cloned());
++        let mut s = lines.join("\n");
++        if self.trailing_newline {
++            s.push('\n');
++        }
++        s
++    }
++}
++
++#[hegel::composite]
++fn arb_wfile(tc: &hegel::TestCase) -> WFile {
++    let version = pick(tc, &[4, 4, 4, 3]);
++    let n = tc.draw(int!(0, 3)) as usize;
++    let mut entries = Vec::new();
++    for _ in 0..n {
++        entries.push(tc.draw(arb_wentry().print_as_debug()));
++    }
++    let mut extra = Vec::new();
++    for _ in 0..=n {
++        let k = tc.draw(int!(0, 2));
++        let mut e = Vec::new();
++        for _ in 0..k {
++            // debian-watch/11: a comment without a space (`#`, `#foo`) is
++            // read as an entry, so only spaced comments here (pinned).
++            e.push(pick(tc, &["", "# a comment", "# x", "# opts=bare https://x/ .*"]).to_string());
++        }
++        extra.push(e);
++    }
++    let mut leading = Vec::new();
++    if tc.draw(int!(0, 3)) == 0 {
++        leading.push("# Watch file".to_string());
++    }
++    // debian-watch/8: a version line at end of file must have a newline, so
++    // files without entries always get one here (pinned separately).
++    let trailing_newline = tc.draw(int!(0, 4)) != 0 || (entries.is_empty() && extra[0].is_empty());
++    WFile { version, leading, entries, extra, trailing_newline }
++}
++
++// ---------------------------------------------------------------------------
++// Helpers on the crate's side
++// ---------------------------------------------------------------------------
++
++fn entry_options(e: &Entry) -> Vec<String> {
++    match e.option_list() {
++        None => vec![],
++        Some(ol) => ol
++            .options()
++            .map(|o| match (o.key(), o.value()) {
++                (Some(k), Some(v)) => format!("{k}={v}"),
++                (Some(k), None) => k,
++                (None, v) => format!("?={v:?}"),
++            })
++            .collect(),
++    }
++}
++
++/// The entry as python-debian would report it.
++fn entry_as_py(e: &Entry) -> PyEntry {
++    let url = e.url();
++    let (url, pattern, version, script) = match py_split_url(&url) {
++        Some((base, pat)) => (base, Some(pat), e.version_policy_text(), e.script()),
++        None => (url, e.matching_pattern(), e.version_policy_text(), e.script()),
++    };
++    PyEntry { url, matching_pattern: pattern, version, script, options: entry_options(e) }
++}
++
++trait PolicyText {
++    fn version_policy_text(&self) -> Option<String>;
++}
++
++impl PolicyText for Entry {
++    fn version_policy_text(&self) -> Option<String> {
++        self.version_node().map(|n| n.policy())
++    }
++}
++
++fn wentry_as_py(e: &WEntry) -> PyEntry {
++    match py_split_url(&e.url) {
++        Some((base, pat)) => PyEntry {
++            url: base,
++            matching_pattern: Some(pat),
++            version: e.policy.clone(),
++            script: e.script.clone(),
++            options: e.option_texts(),
++        },
++        None => PyEntry {
++            url: e.url.clone(),
++            matching_pattern: e.pattern.clone(),
++            version: e.policy.clone(),
++            script: e.script.clone(),
++            options: e.option_texts(),
++        },
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Mangling rules against uscan
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn substitution_rules_mangle_like_uscan(tc: hegel::TestCase) {
++    let rule = tc.draw(arb_subst_rule(true).print_as_debug());
++    let input = tc.draw(arb_input());
++    let text = rule.text();
++    // Perl and the regex crate differ on an empty match right after a
++    // non-empty one (`s/a*/A/g`): a regex-dialect nuance, not a watch bug.
++    if rule.flags.contains('g') && rule.pattern.nullable {
++        return;
++    }
++    // uscan implements `g` as a loop of single substitutions on the
++    // modified string, so `s/^x//g` strips repeatedly: a uscan quirk.
++    if rule.flags.contains('g') && rule.pattern.text.starts_with('^') {
++        return;
++    }
++    let theirs = uscan_mangle(&text, &input);
++    let ours = apply_mangle(&text, &input);
++    match theirs {
++        Ok(t) => {
++            let o = ours.unwrap_or_else(|e| panic!("uscan mangles {text:?} on {input:?} to {t:?}, we fail: {e}"));
++            assert_eq!(o, t, "rule {text:?} on {input:?}");
++        }
++        Err(e) => assert!(ours.is_err(), "uscan refuses {text:?} ({e}), we produce {ours:?} on {input:?}"),
++    }
++    // The parsed expression reads back what we generated.
++    let expr = parse_mangle_expr(&text).unwrap();
++    assert_eq!(expr.pattern, rule.pattern.text);
++    assert_eq!(expr.replacement, rule.replacement);
++    assert_eq!(expr.flags.unwrap_or_default(), rule.flags);
++}
++
++#[hegel::test]
++fn translation_rules_mangle_like_uscan(tc: hegel::TestCase) {
++    let (from, from_len) = tc.draw(arb_tr_list());
++    // Same expanded length: the subset the crate supports.
++    let mut to = String::new();
++    for _ in 0..from_len {
++        to.push(pick(&tc, &['A', 'B', 'C', 'X', '9', '.', '_']));
++    }
++    let op = pick(&tc, &["tr", "y"]);
++    let delim = pick(&tc, &['/', '|', '#', '!']);
++    let text = format!("{op}{delim}{from}{delim}{to}{delim}");
++    let input = tc.draw(arb_input());
++    let theirs = uscan_mangle(&text, &input);
++    let ours = apply_mangle(&text, &input);
++    match theirs {
++        Ok(t) => assert_eq!(ours.as_ref().map_err(|e| e.to_string()), Ok(&t), "rule {text:?} on {input:?}"),
++        Err(e) => assert!(ours.is_err(), "uscan refuses {text:?} ({e}), we produce {ours:?}"),
++    }
++}
++
++#[hegel::test]
++fn unmatched_rules_leave_the_input_alone(tc: hegel::TestCase) {
++    let rule = tc.draw(arb_subst_rule(true).print_as_debug());
++    let input = tc.draw(arb_input());
++    let text = rule.text();
++    let re = regex::Regex::new(&rule.pattern.text).unwrap();
++    if re.is_match(&input) {
++        return;
++    }
++    assert_eq!(apply_mangle(&text, &input).unwrap(), input);
++}
++
++// ---------------------------------------------------------------------------
++// Substitutions
++// ---------------------------------------------------------------------------
++
++const VARS: &[&str] = &["@PACKAGE@", "@ANY_VERSION@", "@ARCHIVE_EXT@", "@SIGNATURE_EXT@", "@DEB_EXT@"];
++
++#[hegel::test]
++fn substitutions_expand_like_python_debian(tc: hegel::TestCase) {
++    let n = tc.draw(int!(0, 5)) as usize;
++    let mut text = String::new();
++    for _ in 0..n {
++        if tc.draw(generators::booleans()) {
++            text.push_str(pick(&tc, VARS));
++        } else {
++            text.push_str(pick(&tc, &["foo", "-", "/", "\\.tar\\.gz", "@", "x@y", "@PACKAGE"]));
++        }
++    }
++    let package = pick(&tc, &["foo", "my-pkg", "a@b"]);
++    let ours = subst(&text, || package.to_string(), || unreachable!("no @COMPONENT@"));
++    assert_eq!(ours, py_expand(&text, package), "for {text:?}");
++    // Idempotent on its own output when no variables are left.
++    if !ours.contains('@') {
++        assert_eq!(subst(&ours, || unreachable!(), || unreachable!()), ours);
++    }
++}
++
++/// A filename and the template it should (or should not) match.
++#[derive(Clone, Debug)]
++struct Sample {
++    template: String,
++    input: String,
++    /// The input has a `v`/`V` before the version (uscan's `[Vv]?`).
++    v_prefix: bool,
++    /// The input uses a zstd extension (uscan's `tar\.zstd?`).
++    zst: bool,
++}
++
++#[hegel::composite]
++fn arb_sample(tc: &hegel::TestCase) -> Sample {
++    let package = "foo";
++    let sep = pick(tc, &["-", "_", ""]);
++    let v = pick(tc, &["", "", "v", "V"]);
++    let version = pick(tc, &["1.2.3", "1.0", "2.0~rc1", "1.2.3+dfsg1", "0.9.4-beta", "10", "1.2.3:4"]);
++    let ext = pick(tc, &[".tar.gz", ".tar.xz", ".tar.bz2", ".zip", ".tgz", ".TAR.GZ", ".tar.zst", ".tar.zstd", ".tar", ".tar.gz.asc", ".zip.sig"]);
++    let template = pick(tc, &["@PACKAGE@-@ANY_VERSION@@ARCHIVE_EXT@", "@PACKAGE@@ANY_VERSION@@ARCHIVE_EXT@", "@PACKAGE@-@ANY_VERSION@@SIGNATURE_EXT@", ".*/@PACKAGE@-@ANY_VERSION@\\.tar\\.gz", "@ANY_VERSION@@DEB_EXT@"]);
++    let dir = pick(tc, &["", "dl/", "a/b/"]);
++    let input = format!("{dir}{package}{sep}{v}{version}{ext}");
++    Sample { template: template.to_string(), input, v_prefix: !v.is_empty(), zst: ext.contains("zst") }
++}
++
++fn our_match(template: &str, input: &str, package: &str) -> (bool, Option<String>) {
++    let re = format!("^{}$", subst(template, || package.to_string(), || String::new()));
++    let re = regex::Regex::new(&re).unwrap_or_else(|e| panic!("{re:?}: {e}"));
++    match re.captures(input) {
++        Some(c) => (true, c.get(1).map(|m| m.as_str().to_string())),
++        None => (false, None),
++    }
++}
++
++#[hegel::test]
++fn expanded_patterns_match_like_uscan(tc: hegel::TestCase) {
++    let s = tc.draw(arb_sample().print_as_debug());
++    if s.v_prefix || s.zst {
++        return;
++    }
++    let (m, cap, re) = uscan_match(&s.template, &s.input, "foo");
++    let (om, ocap) = our_match(&s.template, &s.input, "foo");
++    assert_eq!((om, ocap), (m, cap), "template {:?} on {:?} (uscan regex {re:?})", s.template, s.input);
++}
++
++// ---------------------------------------------------------------------------
++// The line-based watch file parser
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn watch_files_are_read_like_python_debian(tc: hegel::TestCase) {
++    let file = tc.draw(arb_wfile().print_as_debug());
++    let text = file.text();
++    let wf = WatchFile::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let py = py_watch(&text).unwrap_or_else(|e| panic!("python-debian failed on {text:?}: {e}")).unwrap();
++    assert_eq!(wf.version(), py.version);
++    assert_eq!(wf.version(), file.version);
++    let ours: Vec<PyEntry> = wf.entries().map(|e| entry_as_py(&e)).collect();
++    assert_eq!(ours, py.entries, "for {text:?}");
++    let model: Vec<PyEntry> = file.entries.iter().map(wentry_as_py).collect();
++    assert_eq!(py.entries, model, "python-debian vs model for {text:?}");
++}
++
++#[hegel::test]
++fn the_tree_is_lossless_and_the_parse_is_consistent(tc: hegel::TestCase) {
++    let file = tc.draw(arb_wfile().print_as_debug());
++    let text = file.text();
++    let wf = WatchFile::from_str(&text).unwrap();
++    assert_eq!(wf.to_string(), text);
++    let parsed = parse_watch_file(&text);
++    assert!(parsed.is_ok(), "{:?}", parsed.errors());
++    assert_eq!(parsed.tree().to_string(), text);
++    let relaxed = WatchFile::from_str_relaxed(&text);
++    assert_eq!(relaxed.to_string(), text);
++    assert_eq!(relaxed.entries().count(), wf.entries().count());
++    let via_reader = WatchFile::from_reader(text.as_bytes()).unwrap();
++    assert_eq!(via_reader.to_string(), text);
++    // Every entry knows its line.
++    let lines: Vec<&str> = text.split('\n').collect();
++    for (e, ge) in wf.entries().zip(&file.entries) {
++        let (line, col) = e.line_col();
++        let first = ge.text().split('\n').next().unwrap().to_string();
++        assert_eq!(lines[line].trim_end(), first.trim_end(), "line of {e:?}");
++        assert_eq!(col, 0);
++    }
++}
++
++#[hegel::test]
++fn typed_accessors_follow_the_options(tc: hegel::TestCase) {
++    let file = tc.draw(arb_wfile().print_as_debug());
++    let text = file.text();
++    let wf = WatchFile::from_str(&text).unwrap();
++    for (e, ge) in wf.entries().zip(&file.entries) {
++        let get = |k: &str| ge.get(k).flatten();
++        let has = |k: &str| ge.get(k).is_some();
++        assert_eq!(e.opts(), ge.options.iter().filter_map(|o| o.value.clone().map(|v| (o.key.clone(), v))).collect());
++        for o in &ge.options {
++            assert!(e.has_option(&o.key), "{}", o.key);
++            assert_eq!(e.get_option(&o.key), o.value, "{}", o.key);
++        }
++        assert!(!e.has_option("no-such-option"));
++        assert_eq!(e.repack(), has("repack"));
++        assert_eq!(e.bare(), has("bare"));
++        assert_eq!(e.decompress(), has("decompress"));
++        assert_eq!(e.component(), get("component"));
++        assert_eq!(e.repacksuffix(), get("repacksuffix"));
++        assert_eq!(e.unzipoptions(), get("unzipopt"));
++        assert_eq!(e.pgpsigurlmangle(), get("pgpsigurlmangle"));
++        assert_eq!(e.filenamemangle(), get("filenamemangle"));
++        assert_eq!(e.dirversionmangle(), get("dirversionmangle"));
++        assert_eq!(e.versionmangle(), get("versionmangle"));
++        assert_eq!(e.uversionmangle(), get("uversionmangle").or(get("versionmangle")));
++        assert_eq!(e.dversionmangle(), get("dversionmangle").or(get("versionmangle")));
++        assert_eq!(e.passive(), if has("passive") { Some(true) } else if has("active") { Some(false) } else { None });
++        assert_eq!(e.date(), get("date").unwrap_or_else(|| "%Y%m%d".to_string()));
++        assert_eq!(e.compression().unwrap(), get("compression").map(|v| Compression::from_str(&v).unwrap()));
++        assert_eq!(e.mode().unwrap(), get("mode").map(|v| Mode::from_str(&v).unwrap()).unwrap_or_default());
++        assert_eq!(e.pgpmode().unwrap(), get("pgpmode").map(|v| PgpMode::from_str(&v).unwrap()).unwrap_or_default());
++        assert_eq!(e.gitmode().unwrap(), get("gitmode").map(|v| GitMode::from_str(&v).unwrap()).unwrap_or_default());
++        assert_eq!(e.gitexport().unwrap(), get("gitexport").map(|v| GitExport::from_str(&v).unwrap()).unwrap_or_default());
++        assert_eq!(e.searchmode().unwrap(), get("searchmode").map(|v| SearchMode::from_str(&v).unwrap()).unwrap_or_default());
++        assert_eq!(e.ctype().unwrap(), get("ctype").map(|v| ComponentType::from_str(&v).unwrap()));
++        if let Some(p) = get("pretty") {
++            assert_eq!(e.pretty().unwrap().to_string(), p);
++        }
++        // Version policy.
++        let policy = ge.policy.clone();
++        assert_eq!(e.version().unwrap().map(|p| p.to_string()), policy, "policy for {text:?}");
++        // The mangling accessors delegate to apply_mangle.
++        for v in ["1.0+ds", "2.0-rc1", "v1.2"] {
++            let expect = |rule: Option<String>| rule.map(|r| apply_mangle(&r, v).map_err(|e| e.to_string())).unwrap_or(Ok(v.to_string()));
++            assert_eq!(e.apply_uversionmangle(v).map_err(|e| e.to_string()), expect(e.uversionmangle()));
++            assert_eq!(e.apply_dversionmangle(v).map_err(|e| e.to_string()), expect(e.dversionmangle()));
++            assert_eq!(e.apply_dirversionmangle(v).map_err(|e| e.to_string()), expect(e.dirversionmangle()));
++            assert_eq!(e.apply_filenamemangle(v).map_err(|e| e.to_string()), expect(e.filenamemangle()));
++        }
++        // format_url on plain URLs.
++        if !ge.url_has_pattern() && !ge.url.contains('?') {
++            let expect = subst(&ge.url, || "foo".to_string(), || String::new());
++            assert_eq!(e.format_url(|| "foo".to_string(), || String::new()).as_str(), url::Url::parse(&expect).unwrap().as_str());
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Building and editing
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn built_entries_are_read_back(tc: hegel::TestCase) {
++    let n = tc.draw(int!(0, 3)) as usize;
++    let mut wf = WatchFile::new(Some(4));
++    let mut model: Vec<WEntry> = Vec::new();
++    for _ in 0..n {
++        let mut ge = tc.draw(arb_wentry().print_as_debug());
++        // The builder's options come from a HashMap; with a flag option the
++        // text would depend on the iteration order (debian-watch/7).
++        ge.options = valued_only(&ge.options);
++        let mut b = EntryBuilder::new(ge.url.clone());
++        if let Some(p) = &ge.pattern {
++            b = b.matching_pattern(p.clone());
++        }
++        if let Some(p) = &ge.policy {
++            b = b.version_policy(p.clone());
++        }
++        if let Some(s) = &ge.script {
++            b = b.script(s.clone());
++        }
++        for o in &ge.options {
++            b = match &o.value {
++                Some(v) => b.opt(o.key.clone(), v.clone()),
++                None => b.flag(o.key.clone()),
++            };
++        }
++        let added = wf.add_entry(b.build());
++        assert_eq!(added.url(), ge.url);
++        model.push(ge);
++    }
++    assert_eq!(wf.version(), 4);
++    assert_eq!(wf.entries().count(), n);
++    let text = wf.to_string();
++    assert!(text.starts_with("version=4\n"), "{text:?}");
++    let again = WatchFile::from_str(&text).unwrap_or_else(|e| panic!("built text {text:?} does not parse: {e}"));
++    let py = py_watch(&text).unwrap_or_else(|e| panic!("python-debian failed on built {text:?}: {e}")).unwrap();
++    assert_eq!(again.entries().count(), n);
++    for ((e, a), ge) in wf.entries().zip(again.entries()).zip(&model) {
++        for x in [&e, &a] {
++            assert_eq!(x.url(), ge.url, "in {text:?}");
++            assert_eq!(x.matching_pattern(), ge.pattern, "in {text:?}");
++            assert_eq!(x.version_policy_text(), ge.policy, "in {text:?}");
++            assert_eq!(x.script(), ge.script, "in {text:?}");
++            // Options come from a HashMap: compare as sets.
++            let got: BTreeSet<String> = entry_options(x).into_iter().collect();
++            let want: BTreeSet<String> = ge.option_texts().into_iter().collect();
++            assert_eq!(got, want, "in {text:?}");
++        }
++    }
++    let py_model: Vec<PyEntry> = model.iter().map(wentry_as_py).collect();
++    let py_sorted: Vec<PyEntry> = py.entries.into_iter().map(|mut e| { e.options.sort(); e }).collect();
++    let model_sorted: Vec<PyEntry> = py_model.into_iter().map(|mut e| { e.options.sort(); e }).collect();
++    assert_eq!(py_sorted, model_sorted, "python-debian on built {text:?}");
++}
++
++#[derive(Clone, Debug)]
++enum Edit {
++    Url(String),
++    Pattern(String),
++    Policy(String),
++    Script(String),
++    SetOpt(String, String),
++    DelOpt(String),
++    Version(u32),
++}
++
++#[hegel::composite]
++fn arb_edit(tc: &hegel::TestCase) -> Edit {
++    match tc.draw(int!(0, 6)) {
++        0 => Edit::Url(pick(tc, &["https://new.example.org/", "ftp://a/b/", "https://github.com/@PACKAGE@/releases"]).to_string()),
++        1 => Edit::Pattern(pick(tc, PATTERNS).to_string()),
++        2 => Edit::Policy(pick(tc, POLICIES).to_string()),
++        3 => Edit::Script(pick(tc, SCRIPTS).to_string()),
++        4 => {
++            let (k, vals) = pick(tc, VALUE_KEYS);
++            Edit::SetOpt(k.to_string(), pick(tc, vals).to_string())
++        }
++        5 => Edit::DelOpt(pick(tc, &["compression", "mode", "bare", "repack", "component", "nosuch"]).to_string()),
++        _ => Edit::Version(pick(tc, &[3, 4, 5])),
++    }
++}
++
++#[hegel::test]
++fn edits_are_read_back(tc: hegel::TestCase) {
++    let mut ge = tc.draw(arb_wentry().print_as_debug());
++    if ge.url_has_pattern() {
++        return;
++    }
++    // Deleting options could leave a flag last (debian-watch/7).
++    ge.options = valued_only(&ge.options);
++    let mut version = 4;
++    let text = format!("version=4\n{}\n", ge.text());
++    let mut wf = WatchFile::from_str(&text).unwrap();
++    let n = tc.draw(int!(1, 4));
++    for _ in 0..n {
++        let edit = tc.draw(arb_edit().print_as_debug());
++        let mut e = wf.entries().next().unwrap();
++        match &edit {
++            Edit::Url(u) => {
++                e.set_url(u);
++                ge.url = u.clone();
++            }
++            Edit::Pattern(p) => {
++                // Documented: the setters only replace an existing field.
++                if ge.pattern.is_none() {
++                    continue;
++                }
++                e.set_matching_pattern(p);
++                ge.pattern = Some(p.clone());
++            }
++            Edit::Policy(p) => {
++                if ge.policy.is_none() {
++                    continue;
++                }
++                e.set_version_policy(p);
++                ge.policy = Some(p.clone());
++            }
++            Edit::Script(s) => {
++                if ge.script.is_none() {
++                    continue;
++                }
++                e.set_script(s);
++                ge.script = Some(s.clone());
++            }
++            Edit::SetOpt(k, v) => {
++                // debian-watch/13: set_opt appends after the closing quote
++                // of a quoted list, so only unquoted lists here (pinned).
++                if ge.quoted && !ge.options.is_empty() {
++                    continue;
++                }
++                e.set_opt(k, v);
++                match ge.options.iter_mut().find(|o| &o.key == k) {
++                    Some(o) => o.value = Some(v.clone()),
++                    None => ge.options.push(WOption { key: k.clone(), value: Some(v.clone()) }),
++                }
++            }
++            Edit::DelOpt(k) => {
++                e.del_opt_str(k);
++                ge.options.retain(|o| &o.key != k);
++            }
++            Edit::Version(v) => {
++                wf.set_version(*v);
++                version = *v;
++            }
++        }
++        let shown = wf.to_string();
++        let again = WatchFile::from_str(&shown).unwrap_or_else(|er| panic!("after {edit:?}: {shown:?} does not parse: {er}"));
++        assert_eq!(again.version(), version, "after {edit:?}: {shown:?}");
++        assert_eq!(wf.version(), version);
++        assert_eq!(again.entries().count(), 1, "after {edit:?}: {shown:?}");
++        let live = wf.entries().next().unwrap();
++        for (what, x) in [("live", &live), ("re-parsed", &again.entries().next().unwrap())] {
++            assert_eq!(x.url(), ge.url, "{what} url after {edit:?}: {shown:?}");
++            assert_eq!(x.matching_pattern(), ge.pattern, "{what} pattern after {edit:?}: {shown:?}");
++            assert_eq!(x.version_policy_text(), ge.policy, "{what} policy after {edit:?}: {shown:?}");
++            assert_eq!(x.script(), ge.script, "{what} script after {edit:?}: {shown:?}");
++            let got: BTreeSet<String> = entry_options(x).into_iter().collect();
++            let want: BTreeSet<String> = ge.option_texts().into_iter().collect();
++            assert_eq!(got, want, "{what} options after {edit:?}: {shown:?}");
++        }
++        let py = py_watch(&shown).unwrap_or_else(|er| panic!("python-debian fails after {edit:?} on {shown:?}: {er}")).unwrap();
++        assert_eq!(py.version, version);
++        let mut pe = py.entries;
++        assert_eq!(pe.len(), 1, "python-debian after {edit:?}: {shown:?}");
++        pe[0].options.sort();
++        let mut want = wentry_as_py(&ge);
++        want.options.sort();
++        assert_eq!(pe[0], want, "python-debian after {edit:?}: {shown:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Option value types
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn option_types_round_trip_through_display(tc: hegel::TestCase) {
++    macro_rules! rt {
++        ($t:ty, $vals:expr) => {{
++            let v = pick(&tc, $vals);
++            let parsed: $t = v.parse().unwrap_or_else(|e| panic!("{v:?}: {e}"));
++            let shown = parsed.to_string();
++            let again: $t = shown.parse().unwrap_or_else(|e| panic!("{shown:?} from {v:?}: {e}"));
++            assert_eq!(again, parsed, "{v:?} -> {shown:?}");
++        }};
++    }
++    rt!(Compression, &["xz", "gz", "gzip", "bzip2", "bz2", "lzma", "default"]);
++    rt!(Mode, &["git", "lwp", "svn"]);
++    rt!(PgpMode, &["auto", "default", "mangle", "next", "previous", "self", "gittag"]);
++    rt!(GitMode, &["shallow", "full"]);
++    rt!(GitExport, &["all", "default"]);
++    rt!(SearchMode, &["plain", "html"]);
++    rt!(ComponentType, &["perl", "nodejs"]);
++    rt!(VersionPolicy, &["debian", "same", "previous", "ignore", "group", "checksum", "version-1.2", "version-0.9~rc1"]);
++    for bad in ["", "GIT", "xz ", "version-", "version"] {
++        assert!(Mode::from_str(bad).is_err() || bad == "");
++        assert!(VersionPolicy::from_str(bad).is_err(), "{bad:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pinned bugs
++// ---------------------------------------------------------------------------
++
++/// debian-watch/1: uscan supports bracketing delimiters (`s{a}{b}`,
++/// `s(a)(b)`, `s[a][b]`, `s<a><b>`); the crate splits on the opening bracket.
++#[hegel::test]
++fn bracket_delimiters_are_supported(tc: hegel::TestCase) {
++    let (open, close) = pick(&tc, &[('{', '}'), ('(', ')'), ('[', ']'), ('<', '>')]);
++    let from = pick(&tc, &["1", "a", "\\+ds", "-rc"]);
++    let to = pick(&tc, &["X", "", "~rc"]);
++    let text = format!("s{open}{from}{close}{open}{to}{close}");
++    let input = tc.draw(arb_input());
++    let theirs = uscan_mangle(&text, &input).unwrap();
++    assert_eq!(apply_mangle(&text, &input).map_err(|e| e.to_string()), Ok(theirs), "rule {text:?} on {input:?}");
++}
++
++/// debian-watch/2: the `i` flag (and `x`) is ignored; flags uscan rejects are
++/// accepted.
++#[hegel::test]
++fn the_case_insensitive_flag_is_honoured(tc: hegel::TestCase) {
++    let from = pick(&tc, &["A", "FOO", "X"]);
++    let text = format!("s/{from}/y/i");
++    let input = pick(&tc, &["a", "foo", "x", "aA", "xfoo"]).to_string();
++    let theirs = uscan_mangle(&text, &input).unwrap();
++    assert_eq!(apply_mangle(&text, &input).map_err(|e| e.to_string()), Ok(theirs), "rule {text:?} on {input:?}");
++}
++
++/// debian-watch/3: uscan refuses flags outside `gix`.
++#[hegel::test]
++fn unknown_flags_are_refused(tc: hegel::TestCase) {
++    let flag = pick(&tc, &["z", "e", "s", "m", "q"]);
++    let text = format!("s/a/b/{flag}");
++    assert!(uscan_mangle(&text, "a").is_err());
++    assert!(apply_mangle(&text, "a").is_err(), "accepted {text:?}");
++}
++
++/// debian-watch/4: the replacement is not processed like Perl's: `\.` is
++/// `.`, `\1` is a group reference, `$&` is the whole match and an escaped
++/// delimiter loses its backslash.
++#[hegel::test]
++fn replacement_escapes_work_like_perl(tc: hegel::TestCase) {
++    let (text, input) = pick(
++        &tc,
++        &[
++            ("s/(\\d+)-(\\d+)/$1\\.$2/", "1-2"),
++            ("s/(\\d+)/\\1x/", "12"),
++            ("s/\\d+/<$&>/", "a12b"),
++            ("s/a\\/b/x\\/y/", "a/b"),
++            ("s|(\\d)|\\$1|", "7"),
++            ("s/(\\d)/$1\\.tar\\.gz/", "3"),
++        ],
++    );
++    let theirs = uscan_mangle(text, input).unwrap();
++    assert_eq!(apply_mangle(text, input).map_err(|e| e.to_string()), Ok(theirs), "rule {text:?} on {input:?}");
++}
++
++/// debian-watch/5: `tr` with a replacement shorter than the pattern (Perl
++/// repeats the last character; an empty replacement is the identity) is an
++/// error, and the `d`/`c`/`s` flags are ignored.
++#[hegel::test]
++fn translation_pads_and_flags_like_perl(tc: hegel::TestCase) {
++    let (text, input) = pick(
++        &tc,
++        &[
++            ("tr/a-c/x/", "abcd"),
++            ("tr/abc//", "abc"),
++            ("tr/a-c//d", "abcd"),
++            ("y/a-z/A-Z/", "hello"),
++            ("tr/a-c/x/d", "abcd"),
++            ("tr/a//s", "aaab"),
++            ("tr/a-c/x/c", "abcd"),
++        ],
++    );
++    let theirs = uscan_mangle(text, input).unwrap();
++    assert_eq!(apply_mangle(text, input).map_err(|e| e.to_string()), Ok(theirs), "rule {text:?} on {input:?}");
++}
++
++/// debian-watch/7: a flag option (`bare`, `repack`, …) that ends the option
++/// list is a parse error ("expected `=`"), quoted or not.
++#[hegel::test]
++fn a_flag_option_can_end_the_option_list(tc: hegel::TestCase) {
++    let opts = pick(&tc, &["opts=bare", "opts=\"bare\"", "opts=repack,bare", "opts=\"compression=xz,repack\"", "opts=bare \\\n  "]);
++    let rest = pick(&tc, &["https://h.example.org/releases/ .*/v?(\\d\\S+)\\.tar\\.gz", "https://h.example.org/releases/"]);
++    let sep = if opts.ends_with(' ') { "" } else { " " };
++    let text = format!("version=4\n{opts}{sep}{rest}\n");
++    let py = py_watch(&text).unwrap().unwrap();
++    assert_eq!(py.entries.len(), 1);
++    let wf = WatchFile::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let e = wf.entries().next().unwrap();
++    assert_eq!(entry_options(&e), py.entries[0].options, "{text:?}");
++    assert_eq!(e.url(), py.entries[0].url);
++}
++
++/// debian-watch/7 (second face): an entry built with only a flag option
++/// renders to text the parser rejects.
++#[hegel::test]
++fn a_built_entry_with_a_flag_option_is_read_back(tc: hegel::TestCase) {
++    let flag = pick(&tc, FLAG_KEYS);
++    let mut wf = WatchFile::new(Some(4));
++    wf.add_entry(EntryBuilder::new("https://h.example.org/releases/".to_string()).flag(flag.to_string()).build());
++    let text = wf.to_string();
++    let again = WatchFile::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let e = again.entries().next().unwrap();
++    assert!(e.has_option(flag), "{text:?}");
++}
++
++/// debian-watch/8: a version line at the end of the file (no trailing
++/// newline) is rejected with "expected newline".
++#[hegel::test]
++fn a_version_line_at_end_of_file_is_read(tc: hegel::TestCase) {
++    let text = pick(&tc, &["version=4", "# Watch file\nversion=4", "version=3"]);
++    let py = py_watch(text).unwrap().unwrap();
++    let wf = WatchFile::from_str(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(wf.version(), py.version);
++    assert_eq!(wf.entries().count(), 0);
++}
++
++/// debian-watch/9: the default `pretty` pattern is `0.0~git%cd.h%`, a typo
++/// of uscan's `0.0~git%cd.%h`.
++#[hegel::test]
++fn the_default_pretty_pattern_is_uscans(tc: hegel::TestCase) {
++    let text = pick(&tc, &["version=4\nopts=mode=git https://h.example.org/foo.git refs/tags/v([\\d.]+)\n", "version=4\nhttps://h.example.org/releases/ .*/v?(\\d\\S+)\\.tar\\.gz\n"]);
++    let wf = WatchFile::from_str(text).unwrap();
++    let e = wf.entries().next().unwrap();
++    assert_eq!(e.pretty().unwrap().to_string(), "0.0~git%cd.%h");
++    assert_eq!(debian_watch::Pretty::default().to_string(), "0.0~git%cd.%h");
++}
++
++/// debian-watch/10: when the URL's last component carries the pattern
++/// (uscan: "no separate filepattern field"), the following fields are the
++/// version policy and script; the crate reports the policy as the matching
++/// pattern and the script as the policy.
++#[hegel::test]
++fn fields_after_an_inline_pattern_url_are_the_policy_and_script(tc: hegel::TestCase) {
++    let url = pick(&tc, &["https://pypi.debian.net/foo/foo-(.+)\\.tar\\.gz", "https://example.org/dir/foo-(\\d[\\d.]*)\\.tar\\.gz"]);
++    let policy = pick(&tc, POLICIES);
++    let script = pick(&tc, &[None, Some("uupdate")]);
++    let mut line = format!("{url} {policy}");
++    if let Some(s) = script {
++        line.push(' ');
++        line.push_str(s);
++    }
++    let text = format!("version=4\n{line}\n");
++    let py = py_watch(&text).unwrap().unwrap();
++    assert_eq!(py.entries[0].version.as_deref(), Some(policy));
++    assert_eq!(py.entries[0].script.as_deref(), script);
++    let wf = WatchFile::from_str(&text).unwrap();
++    let e = wf.entries().next().unwrap();
++    assert_eq!(e.version().unwrap().map(|p| p.to_string()).as_deref(), Some(policy), "{text:?}");
++    assert_eq!(e.script().as_deref(), script, "{text:?}");
++}
++
++/// debian-watch/11: a comment line without a space after `#` (`#`, `#foo`)
++/// lexes as a value and is read as an entry with that URL.
++#[hegel::test]
++fn comments_without_a_space_are_comments(tc: hegel::TestCase) {
++    let comment = pick(&tc, &["#", "#foo", "#opts=bare", "#https://x/"]);
++    let entry = pick(&tc, &["", "https://h.example.org/releases/ .*/v?(\\d\\S+)\\.tar\\.gz\n"]);
++    let text = format!("version=4\n{comment}\n{entry}");
++    let py = py_watch(&text).unwrap().unwrap();
++    let wf = WatchFile::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(wf.entries().count(), py.entries.len(), "{text:?}");
++    let ours: Vec<PyEntry> = wf.entries().map(|e| entry_as_py(&e)).collect();
++    assert_eq!(ours, py.entries, "{text:?}");
++}
++
++/// debian-watch/12: an option value containing `=` (common in mangle
++/// rules) is truncated at that `=` by `get_option`/`opts`.
++#[hegel::test]
++fn option_values_containing_an_equals_sign_are_whole(tc: hegel::TestCase) {
++    let (key, value) = pick(&tc, &[("filenamemangle", "s/.*ref=(.*)/$1/"), ("downloadurlmangle", "s/tag=v/tag=/"), ("uversionmangle", "s/=//")]);
++    let quoted = tc.draw(generators::booleans());
++    let opts = if quoted { format!("opts=\"{key}={value}\"") } else { format!("opts={key}={value}") };
++    let text = format!("version=4\n{opts} https://h.example.org/releases/ .*/v?(\\d\\S+)\\.tar\\.gz\n");
++    let py = py_watch(&text).unwrap().unwrap();
++    assert_eq!(py.entries[0].options, vec![format!("{key}={value}")]);
++    let wf = WatchFile::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let e = wf.entries().next().unwrap();
++    assert_eq!(e.get_option(key).as_deref(), Some(value), "{text:?}");
++    assert_eq!(e.opts().get(key).map(|s| s.as_str()), Some(value), "{text:?}");
++    assert_eq!(entry_options(&e), py.entries[0].options, "{text:?}");
++}
++
++/// debian-watch/13: `set_opt` on a quoted option list appends the new
++/// option after the closing quote (`opts="a=1",b=2`), which does not parse.
++#[hegel::test]
++fn set_opt_on_a_quoted_option_list_stays_inside_the_quotes(tc: hegel::TestCase) {
++    let existing = pick(&tc, &["compression=xz", "repack,compression=xz", "mode=git, pgpmode=none"]);
++    let (k, vals) = pick(&tc, VALUE_KEYS);
++    let v = pick(&tc, vals);
++    let text = format!("version=4\nopts=\"{existing}\" https://h.example.org/releases/ .*/v?(\\d\\S+)\\.tar\\.gz\n");
++    let wf = WatchFile::from_str(&text).unwrap();
++    let mut e = wf.entries().next().unwrap();
++    e.set_opt(k, v);
++    let shown = wf.to_string();
++    let again = WatchFile::from_str(&shown).unwrap_or_else(|er| panic!("{shown:?} does not parse: {er}"));
++    let a = again.entries().next().unwrap();
++    assert_eq!(a.get_option(k).as_deref(), Some(v), "{shown:?}");
++    let py = py_watch(&shown).unwrap().unwrap();
++    assert!(py.entries[0].options.contains(&format!("{k}={v}")), "{shown:?}: {:?}", py.entries[0].options);
++}
++
++/// debian-watch/6: `@ANY_VERSION@` lacks uscan's `[Vv]?` and `@ARCHIVE_EXT@`
++/// lacks `tar\.zstd?`, so patterns using them miss files uscan matches.
++#[hegel::test]
++fn substitutions_match_what_uscan_matches(tc: hegel::TestCase) {
++    let mut s = tc.draw(arb_sample().print_as_debug());
++    if !s.v_prefix && !s.zst {
++        s.input = "foo-v1.2.3.tar.gz".to_string();
++        s.template = "@PACKAGE@-@ANY_VERSION@@ARCHIVE_EXT@".to_string();
++    }
++    let (m, cap, re) = uscan_match(&s.template, &s.input, "foo");
++    let (om, ocap) = our_match(&s.template, &s.input, "foo");
++    assert_eq!((om, ocap), (m, cap), "template {:?} on {:?} (uscan regex {re:?})", s.template, s.input);
++}
