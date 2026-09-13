@@ -1,0 +1,1596 @@
+diff --git a/debian-changelog/Cargo.toml b/debian-changelog/Cargo.toml
+index b720283..16c2d37 100644
+--- a/debian-changelog/Cargo.toml
++++ b/debian-changelog/Cargo.toml
+@@ -23,6 +23,8 @@ default = ["chrono"]
+ merge = ["dep:merge3"]
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++regex = "1"
+ flate2 = "1.1"
+ maplit = "1.0.2"
+ tempfile = "3.25"
+diff --git a/debian-changelog/tests/hegel.rs b/debian-changelog/tests/hegel.rs
+new file mode 100644
+index 0000000..39bce91
+--- /dev/null
++++ b/debian-changelog/tests/hegel.rs
+@@ -0,0 +1,1577 @@
++//! Hegel properties for `debian-changelog`.
++//!
++//! Oracles: `dpkg-parsechangelog` (dpkg's own `Dpkg::Changelog::Debian`, run per generated
++//! changelog with `--all --format rfc822`; its warnings and fatal errors say what is a
++//! changelog) and python-debian's `debian.changelog` (a line-for-line port of dpkg's regexes,
++//! driven as a persistent `/usr/bin/python3` child for the high-volume properties: the
++//! `Closes:` / `LP:` bug-list regexes and header/trailer field splitting). Alongside: the
++//! lossless round trip of the CST, the entry builder and setters read back by dpkg, offset
++//! lookups, `from_iter`/`pop_first`, `add_bullet` wrapping and the author-section helpers.
++#![allow(clippy::all, dead_code)]
++
++use debian_changelog::bugs::{bug_at_offset, bug_ref_spans, iter_bug_refs, Bug};
++use debian_changelog::changes::{find_closed_debian_bugs, find_closed_launchpad_bugs, find_extra_authors};
++use debian_changelog::{ChangeLog, Entry, Urgency};
++use hegel::generators;
++use hegel::generators::Generator;
++use rowan::ast::AstNode;
++use std::collections::{BTreeMap, BTreeSet};
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// --------------------------------------------------------------------------- python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys, re
++try:
++    import debian.changelog as C
++    have = True
++except Exception:
++    have = False
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def nums(rx, text):
++    out = []
++    for m in rx.finditer(text):
++        out.extend(int(d) for d in re.findall(r'\d+', m.group(0)))
++    return ','.join(str(x) for x in out)
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    if not have:
++        out = ['na']
++    elif cmd == 'B':
++        out = ['ok', nums(C.closes, args[0]), nums(C.closeslp, args[0])]
++    elif cmd == 'H':
++        m = C.topline.match(args[0])
++        if m is None:
++            out = ['err']
++        else:
++            out = ['ok', m.group(1), m.group(2), ' '.join(m.group(3).split())]
++    elif cmd == 'T':
++        m = C.endline.match(args[0])
++        if m is None:
++            out = ['err']
++        else:
++            out = ['ok', m.group(1), m.group(2), m.group(3), m.group(4).strip()]
++    else:
++        out = ['bad']
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let python = if std::path::Path::new("/usr/bin/python3").exists() { "/usr/bin/python3" } else { "python3" };
++        let mut child = Command::new(python)
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("python3 is needed for the python-debian oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?})");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    (status, it.map(unhex).collect())
++}
++
++fn parse_list(s: &str) -> Vec<u32> {
++    s.split(',').filter(|p| !p.is_empty()).map(|p| p.parse().unwrap()).collect()
++}
++
++/// dpkg's / python-debian's `Closes:` and `LP:` bug lists over a changes text.
++fn oracle_bugs(text: &str) -> Option<(Vec<u32>, Vec<u32>)> {
++    let (status, f) = ask("B", &[text]);
++    if status != "ok" {
++        return None;
++    }
++    Some((parse_list(&f[0]), parse_list(&f[1])))
++}
++
++// --------------------------------------------------------------------------- dpkg oracle
++
++#[derive(Debug, Default)]
++struct Dpkg {
++    entries: Vec<BTreeMap<String, String>>,
++    warnings: Vec<String>,
++    fatal: bool,
++}
++
++static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
++
++/// Run `dpkg-parsechangelog --all --format rfc822` on the text.
++fn dpkg(text: &str) -> Dpkg {
++    let n = TMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
++    let path = std::env::temp_dir().join(format!("hegel-debian-changelog-{}-{n}", std::process::id()));
++    std::fs::write(&path, text).unwrap();
++    let out = Command::new("dpkg-parsechangelog")
++        .arg("-l")
++        .arg(&path)
++        .args(["--all", "--format", "rfc822"])
++        .env("LC_ALL", "C.UTF-8")
++        .output()
++        .expect("dpkg-parsechangelog is needed as the oracle");
++    let _ = std::fs::remove_file(&path);
++    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
++    let mut r = Dpkg::default();
++    r.fatal = !out.status.success();
++    r.warnings = stderr
++        .lines()
++        .filter(|l| l.contains("warning:"))
++        .map(|l| l.split("warning:").nth(1).unwrap_or(l).trim().to_string())
++        .collect();
++    if r.fatal {
++        return r;
++    }
++    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
++    for stanza in stdout.split("\n\n") {
++        if stanza.trim().is_empty() {
++            continue;
++        }
++        let mut fields: BTreeMap<String, String> = BTreeMap::new();
++        let mut last: Option<String> = None;
++        for line in stanza.lines() {
++            if let Some(cont) = line.strip_prefix(' ') {
++                if let Some(k) = &last {
++                    let v = fields.get_mut(k).unwrap();
++                    v.push('\n');
++                    v.push_str(cont);
++                }
++            } else if let Some((k, v)) = line.split_once(':') {
++                fields.insert(k.to_string(), v.trim_start().to_string());
++                last = Some(k.to_string());
++            }
++        }
++        r.entries.push(fields);
++    }
++    r
++}
++
++/// The change lines dpkg keeps for an entry: the `Changes:` field without the header line and
++/// the ` .` separator, with the field's own one-space indent removed and `.` blank lines emptied.
++fn dpkg_change_lines(fields: &BTreeMap<String, String>) -> Vec<String> {
++    let changes = fields.get("Changes").cloned().unwrap_or_default();
++    let changes = changes.trim_start_matches('\n');
++    let mut lines: Vec<String> = changes.lines().skip(1).map(|l| if l == "." { String::new() } else { l.trim_end().to_string() }).collect();
++    if lines.first().map(|l| l.is_empty()) == Some(true) {
++        lines.remove(0);
++    }
++    lines
++}
++
++fn dpkg_list(fields: &BTreeMap<String, String>, key: &str) -> Vec<u32> {
++    let mut v: Vec<u32> = fields.get(key).map(|s| s.split_whitespace().map(|x| x.parse().unwrap()).collect()).unwrap_or_default();
++    v.sort();
++    v.dedup();
++    v
++}
++
++// --------------------------------------------------------------------------- generators
++
++const WORDS: &[&str] = &[
++    "Fix", "the", "build", "on", "arm64", "New", "upstream", "release", "Team", "upload", "Thanks", "to", "A.", "Hacker",
++    "Drop", "dependency", "python3-six", "Standards-Version", "4.7.0", "debhelper-compat", "13", "Closes", "closes:", "LP",
++    "Update", "d/copyright", "Bump", "(no", "changes)", "Vernooĳ", "Simó", "ü", "foo,", "bar.", "#", "Closes:", "->", "%s",
++];
++
++const NAMES: &[&str] = &["Jelmer", "Vernooĳ", "Jane", "Doe", "Adeodato", "Simó", "O'Brien", "Jean-Paul", "Dr.", "van", "der", "Berg", "李", "Guillem", "Jover"];
++
++const EMAILS: &[&str] = &["jelmer@debian.org", "jane@example.com", "bob@x.org", "team+pkg@tracker.debian.org", "a.b-c_d@sub.example.co.uk", "root@localhost"];
++
++const MONTHS: &[&str] = &["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
++const WEEKDAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
++
++const VERSIONS: &[&str] = &[
++    "1.0-1", "0.1", "2:3.4~rc1-2ubuntu1", "1.0+dfsg-1~bpo12+1", "1:1.0-1+deb12u1", "3.3.4-1", "0.0.1-0ubuntu1", "1.2.3+really1.2.2-1",
++    "20240101-1", "1.0-1+b1", "1.0-1+nmu1", "9", "1:0", "0.99.1~beta2+git20230101.abcdef-3",
++];
++
++const DISTS: &[&str] = &[
++    "unstable", "experimental", "UNRELEASED", "bookworm-backports", "stable-security", "UNRELEASED-1", "trixie", "noble", "focal-proposed",
++    "stable", "oldstable", "bookworm", "sid", "unstable-debug", "jammy",
++];
++
++fn pick<'a>(tc: &hegel::TestCase, items: &[&'a str]) -> &'a str {
++    items[tc.draw(int!(0usize, items.len() - 1))]
++}
++
++fn chars_from(tc: &hegel::TestCase, alphabet: &str, n: usize) -> String {
++    let a: Vec<char> = alphabet.chars().collect();
++    (0..n).map(|_| a[tc.draw(int!(0usize, a.len() - 1))]).collect()
++}
++
++#[hegel::composite]
++fn arb_package(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 9)) {
++        0 => pick(tc, &["g++", "libsigc++-2.0", "gtkmm3.0", "libxml++2.6", "dpkg", "breezy", "0ad", "a", "python3-defaults", "Foo"]).to_string(),
++        _ => {
++            let first = chars_from(tc, "abcdefgxyz", 1);
++            let rest = chars_from(tc, "abcdefghijklmnopqrstuvwxyz0123456789.+-", tc.draw(int!(0usize, 8)));
++            format!("{first}{rest}")
++        }
++    }
++}
++
++#[hegel::composite]
++fn arb_version(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 3)) {
++        0..=1 => pick(tc, VERSIONS).to_string(),
++        _ => {
++            let mut s = String::new();
++            if tc.draw(int!(0u8, 3)) == 0 {
++                s.push_str(&format!("{}:", tc.draw(int!(1u32, 9))));
++            }
++            s.push_str(&tc.draw(int!(0u32, 99)).to_string());
++            for _ in 0..tc.draw(int!(0usize, 3)) {
++                s.push('.');
++                s.push_str(&tc.draw(int!(0u32, 99)).to_string());
++            }
++            if tc.draw(int!(0u8, 3)) == 0 {
++                s.push_str(pick(tc, &["~rc1", "+dfsg", "+git20240101", "~beta", "a", "+really1.0"]));
++            }
++            if tc.draw(int!(0u8, 2)) != 0 {
++                s.push('-');
++                s.push_str(pick(tc, &["1", "0ubuntu1", "2+b1", "1~bpo12+1", "3+nmu1", "0", "1+deb12u2"]));
++            }
++            s
++        }
++    }
++}
++
++#[hegel::composite]
++fn arb_distributions(tc: &hegel::TestCase) -> Vec<String> {
++    let n = tc.draw(int!(1usize, 3));
++    (0..n)
++        .map(|_| match tc.draw(int!(0u8, 4)) {
++            0 => chars_from(tc, "abcdefghijklmnopqrstuvwxyz0123456789.+-", tc.draw(int!(1usize, 10))),
++            _ => pick(tc, DISTS).to_string(),
++        })
++        .collect()
++}
++
++/// A metadata key=value pair as written after the `;`.
++#[hegel::composite]
++fn arb_metadata_item(tc: &hegel::TestCase) -> (String, String) {
++    match tc.draw(int!(0u8, 9)) {
++        0..=5 => {
++            let mut u = pick(tc, &["low", "medium", "high", "emergency", "critical"]).to_string();
++            if tc.draw(int!(0u8, 5)) == 0 {
++                u = match tc.draw(int!(0u8, 2)) {
++                    0 => u.to_uppercase(),
++                    1 => {
++                        let mut c = u.chars();
++                        c.next().unwrap().to_uppercase().collect::<String>() + c.as_str()
++                    }
++                    _ => u,
++                };
++            }
++            ("urgency".to_string(), u)
++        }
++        6..=7 => ("binary-only".to_string(), "yes".to_string()),
++        _ => (
++            pick(tc, &["XS-Foo", "xbs-bar", "XC-Vcs-Git", "xs-a"]).to_string(),
++            chars_from(tc, "abcdefghijklmnopqrstuvwxyz0123456789.-", tc.draw(int!(1usize, 6))),
++        ),
++    }
++}
++
++#[hegel::composite]
++fn arb_bug_list(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(1usize, 3));
++    let mut s = String::new();
++    for i in 0..n {
++        if i > 0 {
++            s.push_str(pick(tc, &[", ", ",", " , ", ",  ", " ", ",, "]));
++        }
++        s.push_str(pick(tc, &["#", "#", "#", "", "# ", "bug#", "Bug #", "bug "]));
++        s.push_str(&tc.draw(int!(1u32, 9_999_999)).to_string());
++    }
++    s
++}
++
++/// One change line (what follows the two-space indent), possibly carrying bug references.
++#[hegel::composite]
++fn arb_detail(tc: &hegel::TestCase, bullet: bool) -> String {
++    let mut s = String::new();
++    if bullet {
++        s.push_str(pick(tc, &["* ", "* ", "* ", "+ ", "- ", "  + ", "*"]));
++    } else if tc.draw(int!(0u8, 2)) == 0 {
++        s.push_str("  ");
++    }
++    let n = tc.draw(int!(0usize, 6));
++    for i in 0..n {
++        if i > 0 {
++            s.push(' ');
++        }
++        s.push_str(pick(tc, WORDS));
++    }
++    match tc.draw(int!(0u8, 9)) {
++        0..=2 => {
++            let marker = pick(tc, &["Closes: ", "Closes:", "closes: ", "CLOSES: ", "(Closes: ", "Closes:  ", "LP: ", "lp: ", "LP:", "LP: #", "(LP: "]);
++            let list = tc.draw(arb_bug_list());
++            s.push_str(&format!(" {marker}{list}"));
++            if marker.starts_with('(') {
++                s.push(')');
++            }
++            if tc.draw(int!(0u8, 3)) == 0 {
++                s.push(',');
++            }
++        }
++        3 => s.push_str(pick(tc, &[" Closes: #", " Closes:", " LP:", " Fixes: #123", " closes bug 5", " Encloses: #7", " lp:#12", " lp: 34"])),
++        _ => {}
++    }
++    s
++}
++
++#[hegel::composite]
++fn arb_body(tc: &hegel::TestCase) -> Vec<String> {
++    let n = tc.draw(int!(0usize, 6));
++    let mut lines = Vec::new();
++    for i in 0..n {
++        match tc.draw(int!(0u8, 9)) {
++            0 if i > 0 => lines.push(String::new()),
++            1 => {
++                let name: Vec<&str> = (0..tc.draw(int!(1usize, 2))).map(|_| pick(tc, NAMES)).collect();
++                lines.push(format!("  [ {} ]", name.join(" ")));
++            }
++            2 if i > 0 => lines.push(format!("    {}", tc.draw(arb_detail(false)))),
++            _ => lines.push(format!("  {}", tc.draw(arb_detail(true)))),
++        }
++    }
++    lines
++}
++
++#[derive(Debug, Clone)]
++struct GenDate {
++    weekday: Option<String>,
++    day: u32,
++    month: usize,
++    year: i32,
++    hour: u32,
++    minute: u32,
++    second: u32,
++    tz_sign: char,
++    tz: u32,
++    pad_day: bool,
++}
++
++impl GenDate {
++    fn text(&self) -> String {
++        let day = if self.pad_day { format!("{:02}", self.day) } else { self.day.to_string() };
++        let mut s = String::new();
++        if let Some(w) = &self.weekday {
++            s.push_str(w);
++            s.push_str(", ");
++        }
++        s.push_str(&format!(
++            "{day} {} {} {:02}:{:02}:{:02} {}{:04}",
++            MONTHS[self.month], self.year, self.hour, self.minute, self.second, self.tz_sign, self.tz
++        ));
++        s
++    }
++}
++
++#[hegel::composite]
++fn arb_date(tc: &hegel::TestCase) -> String {
++    let year = tc.draw(int!(1998i32, 2030));
++    let month = tc.draw(int!(0usize, 11));
++    let day = tc.draw(int!(1u32, 28));
++    let dt = chrono::NaiveDate::from_ymd_opt(year, month as u32 + 1, day).unwrap();
++    let true_weekday = dt.format("%a").to_string();
++    let weekday = match tc.draw(int!(0u8, 9)) {
++        0 => None,
++        1 => Some(pick(tc, WEEKDAYS).to_string()),
++        _ => Some(true_weekday),
++    };
++    let d = GenDate {
++        weekday,
++        day,
++        month,
++        year,
++        hour: tc.draw(int!(0u32, 23)),
++        minute: tc.draw(int!(0u32, 59)),
++        second: tc.draw(int!(0u32, 59)),
++        tz_sign: if tc.draw(generators::booleans()) { '+' } else { '-' },
++        tz: *pick_owned(tc, &[0, 0, 100, 530, 1200, 45, 1400, 930]),
++        pad_day: tc.draw(int!(0u8, 4)) != 0,
++    };
++    d.text()
++}
++
++fn pick_owned<'a, T>(tc: &hegel::TestCase, items: &'a [T]) -> &'a T {
++    &items[tc.draw(int!(0usize, items.len() - 1))]
++}
++
++#[hegel::composite]
++fn arb_name(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(0usize, 3));
++    (0..n).map(|_| pick(tc, NAMES)).collect::<Vec<_>>().join(" ")
++}
++
++/// A generated entry: its text and the shape choices that matter for the properties.
++#[derive(Debug, Clone)]
++struct GenEntry {
++    text: String,
++    package: String,
++    version: String,
++    dists: Vec<String>,
++    metadata: Vec<(String, String)>,
++    urgency_comment: bool,
++    body: Vec<String>,
++    name: String,
++    email: String,
++    date: String,
++    malformed: Option<&'static str>,
++}
++
++#[hegel::composite]
++fn arb_entry(tc: &hegel::TestCase) -> GenEntry {
++    let package = tc.draw(arb_package());
++    let version = tc.draw(arb_version());
++    let dists = tc.draw(arb_distributions());
++    let nmeta = tc.draw(int!(0usize, 3));
++    let mut metadata: Vec<(String, String)> = Vec::new();
++    for _ in 0..nmeta {
++        let item = tc.draw(arb_metadata_item());
++        if !metadata.iter().any(|(k, _)| k.eq_ignore_ascii_case(&item.0)) {
++            metadata.push(item);
++        }
++    }
++    let urgency_comment = metadata.iter().any(|(k, _)| k == "urgency") && tc.draw(int!(0u8, 14)) == 0;
++    let body = tc.draw(arb_body());
++    let name = tc.draw(arb_name());
++    let email = pick(tc, EMAILS).to_string();
++    let date = tc.draw(arb_date());
++    let malformed = match tc.draw(int!(0u8, 24)) {
++        0 => Some("no-distribution"),
++        1 => Some("no-semicolon"),
++        2 => Some("no-version"),
++        3 => Some("one-space-before-date"),
++        4 => Some("no-footer"),
++        _ => None,
++    };
++
++    let mut text = String::new();
++    // header
++    text.push_str(&package);
++    if malformed != Some("no-version") {
++        text.push_str(&format!(" ({version})"));
++    }
++    if malformed != Some("no-distribution") {
++        for d in &dists {
++            text.push(' ');
++            text.push_str(d);
++        }
++    }
++    if malformed != Some("no-semicolon") {
++        text.push(';');
++        for (i, (k, v)) in metadata.iter().enumerate() {
++            if i > 0 {
++                text.push_str(pick(tc, &[", ", ",", " , "]));
++            } else {
++                text.push_str(pick(tc, &[" ", " ", ""]));
++            }
++            text.push_str(&format!("{k}={v}"));
++            if k == "urgency" && urgency_comment {
++                text.push_str(" (HIGH for security)");
++            }
++        }
++    }
++    text.push('\n');
++    // body
++    for _ in 0..tc.draw(int!(0usize, 2)) {
++        text.push('\n');
++    }
++    for l in &body {
++        text.push_str(l);
++        text.push('\n');
++    }
++    for _ in 0..tc.draw(int!(0usize, 2)) {
++        text.push('\n');
++    }
++    // footer
++    if malformed != Some("no-footer") {
++        text.push_str(" -- ");
++        text.push_str(&name);
++        text.push_str(&format!(" <{email}>"));
++        text.push_str(if malformed == Some("one-space-before-date") { " " } else { "  " });
++        text.push_str(&date);
++        if tc.draw(int!(0u8, 9)) == 0 {
++            text.push(' ');
++        }
++        text.push('\n');
++    }
++    GenEntry { text, package, version, dists, metadata, urgency_comment, body, name, email, date, malformed }
++}
++
++#[derive(Debug, Clone)]
++struct GenChangelog {
++    text: String,
++    entries: Vec<GenEntry>,
++}
++
++#[hegel::composite]
++fn arb_changelog(tc: &hegel::TestCase, with_comments: bool) -> GenChangelog {
++    let n = tc.draw(int!(1usize, 3));
++    let mut text = String::new();
++    let mut entries = Vec::new();
++    for i in 0..n {
++        if i > 0 {
++            for _ in 0..tc.draw(int!(0usize, 2)) {
++                text.push('\n');
++            }
++            if with_comments && tc.draw(int!(0u8, 5)) == 0 {
++                text.push_str(pick(tc, &["# a comment\n", "# Oh, and here is a comment\n\n"]));
++            }
++        }
++        let e = tc.draw(arb_entry().print_as_debug());
++        text.push_str(&e.text);
++        entries.push(e);
++    }
++    if with_comments && tc.draw(int!(0u8, 5)) == 0 {
++        text.push_str(pick(tc, &["\n# trailing comment\n", "# trailing comment"]));
++    }
++    if tc.draw(int!(0u8, 9)) == 0 {
++        text.push('\n');
++    }
++    GenChangelog { text, entries }
++}
++
++/// Entries whose header dpkg cannot read at all, which the crate reads anyway (bug 1).
++fn hits_lenient_header_bug(e: &GenEntry) -> bool {
++    matches!(e.malformed, Some("no-distribution") | Some("no-semicolon"))
++}
++
++fn is_clean_shape(e: &GenEntry) -> bool {
++    e.malformed.is_none() && !e.urgency_comment
++}
++
++fn crate_fields(entry: &Entry) -> BTreeMap<&'static str, String> {
++    let mut m = BTreeMap::new();
++    m.insert("Source", entry.package().unwrap_or_default());
++    m.insert("Version", entry.version().map(|v| v.to_string()).unwrap_or_default());
++    m.insert("Distribution", entry.distributions().unwrap_or_default().join(" "));
++    m.insert("Urgency", entry.urgency().map(|u| u.to_string()).unwrap_or_default());
++    m.insert(
++        "Maintainer",
++        match (entry.maintainer(), entry.email()) {
++            (None, None) => String::new(),
++            (name, email) => format!("{} <{}>", name.unwrap_or_default(), email.unwrap_or_default()),
++        },
++    );
++    m.insert("Date", entry.timestamp().unwrap_or_default().trim().to_string());
++    m
++}
++
++fn dpkg_field(fields: &BTreeMap<String, String>, key: &str) -> String {
++    fields.get(key).cloned().unwrap_or_default()
++}
++
++/// Compare one crate entry with dpkg's stanza for it.
++fn assert_entry_matches_dpkg(entry: &Entry, fields: &BTreeMap<String, String>, text: &str, skip: &[&str]) {
++    let cf = crate_fields(entry);
++    for key in ["Source", "Version", "Distribution", "Urgency", "Maintainer", "Date"] {
++        if skip.contains(&key) {
++            continue;
++        }
++        let mut want = dpkg_field(fields, key);
++        if key == "Urgency" && want == "unknown" {
++            want.clear(); // dpkg prints `unknown` for an absent urgency
++        }
++        assert_eq!(cf[key].trim(), want.trim(), "field {key} differs from dpkg for:\n{text}");
++    }
++    if !skip.contains(&"Timestamp") {
++        let dpkg_ts: Option<i64> = fields.get("Timestamp").map(|s| s.parse().unwrap());
++        let crate_ts = entry.datetime().map(|d| d.timestamp());
++        assert_eq!(crate_ts, dpkg_ts, "datetime() differs from dpkg's Timestamp for:\n{text}");
++    }
++    let mut lines: Vec<String> = entry.change_lines().map(|l| l.trim_end().to_string()).collect();
++    // a whitespace-only line is a blank line for dpkg; the crate keeps it as a change line
++    while lines.last().map(|l| l.is_empty()) == Some(true) {
++        lines.pop();
++    }
++    while lines.first().map(|l| l.is_empty()) == Some(true) {
++        lines.remove(0);
++    }
++    let expected: Vec<String> = dpkg_change_lines(fields)
++        .into_iter()
++        .map(|l| l.strip_prefix("  ").map(|s| s.to_string()).unwrap_or(l))
++        .collect();
++    if !skip.contains(&"Changes") {
++        assert_eq!(lines, expected, "change_lines() differ from dpkg's Changes for:\n{text}");
++    }
++    if !skip.contains(&"Closes") {
++        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
++        let mut closes: Vec<u32> = find_closed_debian_bugs(&refs).into_iter().collect();
++        closes.sort();
++        assert_eq!(closes, dpkg_list(fields, "Closes"), "find_closed_debian_bugs differs from dpkg's Closes for:\n{text}");
++        let mut lp: Vec<u32> = find_closed_launchpad_bugs(&refs).into_iter().collect();
++        lp.sort();
++        assert_eq!(lp, dpkg_list(fields, "Launchpad-Bugs-Fixed"), "find_closed_launchpad_bugs differs from dpkg's Launchpad-Bugs-Fixed for:\n{text}");
++    }
++}
++
++/// The bug-list shapes on which the crate's `Closes:`/`LP:` scanning is known to differ from dpkg.
++fn hits_closes_bug(lines: &[String]) -> bool {
++    let joined = lines.join("\n");
++    // bug 5: the marker is matched case-sensitively (`CLOSES:` is missed) and `bug` prefixes are not read
++    let odd_case = regex::Regex::new(r"(?i)closes:").unwrap().find_iter(&joined).any(|m| m.as_str() != "Closes:" && m.as_str() != "closes:");
++    let bug_prefix = regex::Regex::new(r"(?i)(closes|lp):[#\d\s,]*(bug|,\s*\d)").unwrap().is_match(&joined);
++    // bug 4: the list is read greedily: numbers separated by whitespace only, doubled commas,
++    // two spaces after `#`, and `lp:` without ` #`
++    let greedy = regex::Regex::new(r"(?i)(closes|lp):\s*[#\d\s,]*(\d\s+#?\d|,\s*,|#\s\s+\d|#\s*#|\d\s+,)").unwrap().is_match(&joined);
++    let lp_loose = regex::Regex::new(r"(?i)lp:").unwrap().find_iter(&joined).any(|m| !regex::Regex::new(r"^\s+#\d").unwrap().is_match(&joined[m.end()..]));
++    let lp_bare_item = regex::Regex::new(r"(?i)lp:[#\d\s,]*(,\s*\d|#\s+\d)").unwrap().is_match(&joined);
++    odd_case || bug_prefix || greedy || lp_loose || lp_bare_item
++}
++
++/// Package and distribution names with `+` (`g++`, `libsigc++-2.0`) are not read by the crate (bug 2).
++fn hits_package_chars_bug(package: &str) -> bool {
++    package.contains('+')
++}
++
++fn hits_plus_bug(e: &GenEntry) -> bool {
++    hits_package_chars_bug(&e.package) || e.dists.iter().any(|d| d.contains('+'))
++}
++
++/// Trailer dates dpkg reads but `datetime()` does not (bug 3): no weekday, a one-digit day, or
++/// trailing whitespace on the line.
++fn hits_datetime_bug(timestamp: &str) -> bool {
++    let t = timestamp.trim();
++    t != timestamp || !t.contains(", ") || regex::Regex::new(r"^(\w+,\s*)?\d\s").unwrap().is_match(t)
++}
++
++/// `prepend_change_line` inserts after the first blank line of the entry, which is only the
++/// right place when exactly one blank line separates the header from the changes (bug 9).
++fn hits_prepend_bug(entry_text: &str) -> bool {
++    let blanks = entry_text.lines().skip(1).take_while(|l| l.trim().is_empty()).count();
++    let has_body = entry_text.lines().skip(1).any(|l| l.starts_with("  ") && !l.trim().is_empty());
++    has_body && blanks != 1
++}
++
++fn is_footer_setter(s: &Setter) -> bool {
++    matches!(s, Setter::Maintainer(..) | Setter::Timestamp(..) | Setter::Datetime(..))
++}
++
++/// `bug_at_offset` attributes the cursor to the leading number of a comma-delimited fragment
++/// even when other text and another reference follow in the same fragment (bug 13).
++fn hits_offset_bug(line: &str) -> bool {
++    regex::Regex::new(r"(?i)(closes|lp):[^,]*[^#\d\s,:][^,]*\d").unwrap().is_match(line)
++}
++
++/// `Closes: # 123` (one space after the `#`) is read by dpkg and by `find_closed_debian_bugs`,
++/// but not by the `bugs` module (bug 8).
++fn hits_hash_space_bug(line: &str) -> bool {
++    regex::Regex::new(r"(?i)(closes|lp):[#\d\s,]*#\s+\d").unwrap().is_match(line)
++}
++
++/// dpkg's `closes:` regex has no word boundary, so `Encloses: #7` closes #7 for dpkg; the
++/// crate's `bugs` module deliberately requires one. Not counted as a divergence.
++fn marker_inside_a_word(text: &str) -> bool {
++    regex::Regex::new(r"(?i)[a-z0-9_-](closes|lp):").unwrap().is_match(text)
++}
++
++// --------------------------------------------------------------------------- properties: parsing
++
++/// Everything dpkg reads cleanly, the strict parser reads, with the same fields.
++#[hegel::test]
++fn changelogs_parse_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(true).print_as_debug());
++    let d = dpkg(&g.text);
++    let parsed = ChangeLog::from_str(&g.text);
++    let all_clean = g.entries.iter().all(is_clean_shape);
++    if d.fatal {
++        if g.entries.iter().any(hits_lenient_header_bug) {
++            return;
++        }
++        assert!(parsed.is_err(), "dpkg refuses ({:?}) but the strict parser accepts:\n{}", d.warnings, g.text);
++        return;
++    }
++    if g.entries.iter().any(hits_plus_bug) && parsed.is_err() {
++        return;
++    }
++    if d.warnings.is_empty() && all_clean {
++        assert!(parsed.is_ok(), "dpkg reads this cleanly but the strict parser says {:?}:\n{}", parsed.as_ref().err().map(|e| e.to_string()), g.text);
++    }
++    let Ok(cl) = parsed else { return };
++    assert_eq!(cl.to_string(), g.text, "the CST is not lossless");
++    if g.entries.iter().any(|e| e.malformed.is_some()) {
++        return; // bug 1, and dpkg's `unknown (unknown1) unknown` entries: the entries do not line up
++    }
++    let entries: Vec<Entry> = cl.iter().collect();
++    assert_eq!(entries.len(), d.entries.len(), "entry count differs from dpkg for:\n{}", g.text);
++    for (entry, fields) in entries.iter().zip(&d.entries) {
++        if dpkg_field(fields, "Source") == "unknown" || entry.is_old_style() {
++            continue; // dpkg could not read the header (it invents `unknown (unknown1) unknown`)
++        }
++        let lines: Vec<String> = entry.change_lines().collect();
++        let mut skip: Vec<&str> = vec![];
++        if hits_closes_bug(&lines) || marker_inside_a_word(&lines.join("\n")) {
++            skip.push("Closes");
++        }
++        if entry.timestamp().map(|t| hits_datetime_bug(&t)).unwrap_or(false) {
++            skip.push("Timestamp"); // bug 3
++        }
++        assert_entry_matches_dpkg(entry, fields, &g.text, &skip);
++    }
++}
++
++/// Pin for bug 2: `+` is a package-name character for dpkg (`g++`, `libsigc++-2.0`).
++#[hegel::test]
++fn package_names_with_plus_are_parsed(tc: hegel::TestCase) {
++    let package = pick(&tc, &["g++", "libsigc++-2.0", "libxml++2.6", "a+b", "c++-annotations", "gcc-snapshot+"]);
++    let text = format!("{package} (1.0-1) unstable; urgency=low\n\n  * x\n\n -- Jane Doe <jane@example.com>  Mon, 01 Jan 2024 10:00:00 +0000\n");
++    let d = dpkg(&text);
++    assert!(!d.fatal && d.warnings.is_empty(), "dpkg should read {package}: {:?}", d.warnings);
++    assert_eq!(d.entries[0]["Source"], package);
++    let cl = ChangeLog::from_str(&text).unwrap_or_else(|e| panic!("the strict parser refuses the package name {package}: {e}"));
++    assert_eq!(cl.iter().next().unwrap().package(), Some(package.to_string()));
++}
++
++/// Pin for bug 1: headers without distributions or without the `;` are not changelog headers
++/// for dpkg (fatal), but the strict parser accepts them.
++#[hegel::test]
++fn strict_parser_rejects_headers_dpkg_rejects(tc: hegel::TestCase) {
++    let mut e = tc.draw(arb_entry().print_as_debug());
++    if !matches!(e.malformed, Some("no-distribution") | Some("no-semicolon")) {
++        return;
++    }
++    e.malformed = e.malformed;
++    let d = dpkg(&e.text);
++    if !d.fatal {
++        return;
++    }
++    assert!(ChangeLog::from_str(&e.text).is_err(), "dpkg refuses this header but the strict parser accepts it:\n{}", e.text);
++}
++
++/// Pin for bug 3: dpkg reads a trailer date without the optional weekday, with a one-digit
++/// day, or with trailing whitespace on the line; `datetime()` does not.
++#[hegel::test]
++fn dates_dpkg_reads_are_read(tc: hegel::TestCase) {
++    let body = "  * x\n";
++    let mut date = tc.draw(arb_date());
++    if tc.draw(int!(0u8, 2)) == 0 {
++        date.push_str(pick(&tc, &[" ", "  ", "\t"]));
++    }
++    if !hits_datetime_bug(&date) {
++        return;
++    }
++    let text = format!("foo (1.0-1) unstable; urgency=low\n\n{body}\n -- Jane Doe <jane@example.com>  {date}\n");
++    let d = dpkg(&text);
++    assert!(!d.fatal && d.warnings.is_empty(), "dpkg should read {text:?} cleanly: {:?}", d.warnings);
++    let cl: ChangeLog = text.parse().unwrap();
++    let entry = cl.iter().next().unwrap();
++    let dpkg_ts: i64 = d.entries[0]["Timestamp"].parse().unwrap();
++    assert_eq!(entry.datetime().map(|d| d.timestamp()), Some(dpkg_ts), "datetime() of {:?}", entry.timestamp());
++}
++
++/// Pin for bugs 4 and 5: the `Closes:` scanner against dpkg's regex on real changelogs.
++#[hegel::test]
++fn closes_lists_agree_with_dpkg(tc: hegel::TestCase) {
++    let body = tc.draw(arb_body());
++    let text = format!(
++        "foo (1.0-1) unstable; urgency=low\n\n{}\n -- Jane Doe <jane@example.com>  Mon, 01 Jan 2024 10:00:00 +0000\n",
++        body.iter().map(|l| format!("{l}\n")).collect::<String>()
++    );
++    let d = dpkg(&text);
++    if d.fatal || d.entries.len() != 1 {
++        return;
++    }
++    let cl: ChangeLog = text.parse().unwrap();
++    let entry = cl.iter().next().unwrap();
++    let lines: Vec<String> = entry.change_lines().collect();
++    let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
++    let mut closes: Vec<u32> = find_closed_debian_bugs(&refs).into_iter().collect();
++    closes.sort();
++    assert_eq!(closes, dpkg_list(&d.entries[0], "Closes"), "find_closed_debian_bugs vs dpkg for:\n{text}");
++    let mut lp: Vec<u32> = find_closed_launchpad_bugs(&refs).into_iter().collect();
++    lp.sort();
++    assert_eq!(lp, dpkg_list(&d.entries[0], "Launchpad-Bugs-Fixed"), "find_closed_launchpad_bugs vs dpkg for:\n{text}");
++}
++
++/// The high-volume version of the bug-list comparison: python-debian's regexes (identical to
++/// dpkg's) on single lines, plus the consistency of the `bugs` module with itself.
++#[hegel::test]
++fn bug_references_agree_with_the_reference_regexes(tc: hegel::TestCase) {
++    let line = tc.draw(arb_detail(true));
++    let Some((deb, lp)) = oracle_bugs(&line) else { return };
++    if hits_closes_bug(&[line.clone()]) || marker_inside_a_word(&line) || hits_hash_space_bug(&line) || hits_offset_bug(&line) {
++        return;
++    }
++    let deb_set: BTreeSet<u32> = deb.iter().copied().collect();
++    let lp_set: BTreeSet<u32> = lp.iter().copied().collect();
++    let refs = iter_bug_refs(&line);
++    // every reference found sits on digits, and bug_at_offset agrees on each of its offsets
++    for r in &refs {
++        assert_eq!(&line[r.start..r.end], r.bug.id().to_string(), "BugRef range for {line:?}");
++        for off in r.start..=r.end {
++            assert_eq!(bug_at_offset(&line, 0, off), Some(r.bug), "bug_at_offset({off}) in {line:?}");
++        }
++        let spans = bug_ref_spans(&line, false);
++        assert!(spans.iter().any(|s| s.start <= r.start && r.end <= s.end), "no span covers {r:?} in {line:?}: {spans:?}");
++    }
++    let refs_deb: BTreeSet<u32> = refs.iter().filter_map(|r| match r.bug { Bug::Debian(n) => Some(n), _ => None }).collect();
++    let refs_lp: BTreeSet<u32> = refs.iter().filter_map(|r| match r.bug { Bug::Launchpad(n) => Some(n), _ => None }).collect();
++    assert_eq!(refs_deb, deb_set, "iter_bug_refs (Debian) vs dpkg's regex on {line:?}");
++    assert_eq!(refs_lp, lp_set, "iter_bug_refs (Launchpad) vs dpkg's regex on {line:?}");
++}
++
++/// Pin for bug 5: dpkg's `closes:` is case-insensitive and reads `bug#NNN`.
++#[hegel::test]
++fn closes_marker_is_case_insensitive_and_reads_bug_prefixes(tc: hegel::TestCase) {
++    let n = tc.draw(int!(1u32, 999_999));
++    let marker = pick(&tc, &["CLOSES: #", "Closes: bug#", "cLoses: #", "CLOSES:bug ", "Closes: bug "]);
++    let line = format!("* Fix. {marker}{n}");
++    let (deb, _) = oracle_bugs(&line).unwrap();
++    let got: BTreeSet<u32> = find_closed_debian_bugs(&[line.as_str()]).into_iter().collect();
++    assert_eq!(got, deb.into_iter().collect::<BTreeSet<u32>>(), "find_closed_debian_bugs({line:?})");
++    let refs: BTreeSet<u32> = iter_bug_refs(&line).iter().map(|r| r.bug.id()).collect();
++    assert_eq!(refs, got, "iter_bug_refs vs find_closed_debian_bugs on {line:?}");
++}
++
++/// Pin for bug 8: `Closes: # 123` is a bug reference for dpkg and for `find_closed_debian_bugs`;
++/// `iter_bug_refs` / `bug_at_offset` must see it too.
++#[hegel::test]
++fn a_space_after_the_hash_is_still_a_bug_reference(tc: hegel::TestCase) {
++    let n = tc.draw(int!(1u32, 999_999));
++    let marker = pick(&tc, &["Closes: # ", "closes: # ", "Closes:# ", "LP: # "]);
++    let line = format!("* Fix. {marker}{n}");
++    let (deb, lp) = oracle_bugs(&line).unwrap();
++    let want: BTreeSet<u32> = deb.into_iter().chain(lp).collect();
++    let refs: BTreeSet<u32> = iter_bug_refs(&line).iter().map(|r| r.bug.id()).collect();
++    assert_eq!(refs, want, "iter_bug_refs({line:?})");
++}
++
++/// Pin for bug 13: `bug_at_offset` returns the bug under the cursor, not the first number of
++/// the comma-delimited fragment the cursor is in.
++#[hegel::test]
++fn bug_at_offset_reports_the_bug_under_the_cursor(tc: hegel::TestCase) {
++    let a = tc.draw(int!(1u32, 999_999));
++    let b = tc.draw(int!(1u32, 999_999));
++    let (m1, m2) = match tc.draw(int!(0u8, 2)) {
++        0 => ("Closes: #", "LP: #"),
++        1 => ("LP: #", "Closes: #"),
++        _ => ("Closes: #", "Closes: #"),
++    };
++    let filler = pick(&tc, &[" and ", " fixed with ", "; see ", " (", " / "]);
++    let line = format!("* Fix. {m1}{a}{filler}{m2}{b}");
++    let refs = iter_bug_refs(&line);
++    assert_eq!(refs.len(), 2, "iter_bug_refs({line:?}) = {refs:?}");
++    let second = refs[1];
++    assert_eq!(second.bug.id(), b);
++    for off in second.start..=second.end {
++        assert_eq!(bug_at_offset(&line, 0, off), Some(second.bug), "bug_at_offset({off}) in {line:?}");
++    }
++}
++
++/// Header and trailer lines split like python-debian's (= dpkg's) regexes.
++#[hegel::test]
++fn header_and_trailer_lines_split_like_dpkg(tc: hegel::TestCase) {
++    let e = tc.draw(arb_entry().print_as_debug());
++    if e.malformed.is_some() || e.urgency_comment || hits_plus_bug(&e) {
++        return;
++    }
++    let header = e.text.lines().next().unwrap().to_string();
++    let (status, f) = ask("H", &[&header]);
++    if status == "na" {
++        return;
++    }
++    let cl = ChangeLog::parse_relaxed(&e.text);
++    let entry = cl.iter().next().unwrap();
++    if status == "ok" {
++        assert_eq!(entry.package(), Some(f[0].clone()), "package of {header:?}");
++        assert_eq!(entry.version().map(|v| v.to_string()), Some(f[1].clone()), "version of {header:?}");
++        assert_eq!(entry.distributions().map(|d| d.join(" ")), Some(f[2].clone()), "distributions of {header:?}");
++        for (k, v) in &e.metadata {
++            let got = entry.header().unwrap().metadata().find(|(kk, _)| kk == k).map(|(_, v)| v);
++            assert_eq!(got, Some(v.clone()), "metadata {k} of {header:?}");
++        }
++    }
++    let footer = e.text.lines().last().unwrap().to_string();
++    let (status, f) = ask("T", &[&footer]);
++    if status == "ok" {
++        assert_eq!(entry.maintainer().unwrap_or_default(), f[0], "maintainer of {footer:?}");
++        assert_eq!(entry.email(), Some(f[1].clone()), "email of {footer:?}");
++        assert_eq!(entry.timestamp().map(|t| t.trim().to_string()), Some(f[3].clone()), "timestamp of {footer:?}");
++    }
++}
++
++// --------------------------------------------------------------------------- properties: CST
++
++#[hegel::composite]
++fn arb_text(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 3)) {
++        0 => tc.draw(arb_changelog(true).print_as_debug()).text,
++        1 => {
++            let mut t = tc.draw(arb_changelog(true).print_as_debug()).text;
++            let junk = pick(tc, &["\n", " ", "  ", " -- ", "(", ")", ";", "=", "<", ">", "#", "\t", "\r\n", "x", "1.0", "ä", "\u{2028}", "*"]);
++            let at = tc.draw(int!(0usize, t.chars().count()));
++            let byte = t.char_indices().nth(at).map(|(i, _)| i).unwrap_or(t.len());
++            t.insert_str(byte, junk);
++            t
++        }
++        2 => {
++            let mut t = tc.draw(arb_changelog(true).print_as_debug()).text;
++            let n = t.chars().count();
++            if n > 0 {
++                let at = tc.draw(int!(0usize, n - 1));
++                let (i, c) = t.char_indices().nth(at).unwrap();
++                t.replace_range(i..i + c.len_utf8(), "");
++            }
++            t
++        }
++        _ => {
++            let n = tc.draw(int!(0usize, 12));
++            (0..n).map(|_| pick(tc, &["foo (1.0) unstable; urgency=low\n", "\n", "  * x\n", " -- A <a@b>  Mon, 01 Jan 2024 10:00:00 +0000\n", "1.9.16alpha10-1:\n", "Old Changelog:\n", "# c\n", " x\n", "\t\n", "foo\n", "(1.0)\n", "; urgency=low\n", " --\n", " -- \n", "  \n", "a=b\n"])).collect()
++        }
++    }
++}
++
++/// The CST is lossless for any text, strict or relaxed, and the accessors never panic.
++#[hegel::test]
++fn the_tree_is_lossless_for_any_text(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let parsed = ChangeLog::parse(&text);
++    assert_eq!(parsed.tree().to_string(), text, "Parse::tree() text");
++    let relaxed = ChangeLog::parse_relaxed(&text);
++    assert_eq!(relaxed.to_string(), text, "parse_relaxed text");
++    let n_lines = text.lines().count();
++    let mut concat = String::new();
++    for entry in relaxed.iter() {
++        let _ = (entry.package(), entry.try_version(), entry.distributions(), entry.try_urgency(), entry.maintainer(), entry.email(), entry.timestamp(), entry.datetime());
++        let _ = (entry.is_unreleased(), entry.is_team_upload(), entry.get_authors(), entry.iter_changes_by_author(), entry.is_old_style());
++        let lines: Vec<String> = entry.change_lines().collect();
++        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
++        let _ = (find_closed_debian_bugs(&refs), find_closed_launchpad_bugs(&refs), find_extra_authors(&refs));
++        assert!(entry.line() <= n_lines, "entry.line() {} beyond the {n_lines} lines", entry.line());
++        concat.push_str(&entry.to_string());
++    }
++    assert!(text.contains(&concat) || concat.is_empty() || relaxed.iter().count() > 1, "entry text is not a substring of the input");
++    if let Ok(cl) = ChangeLog::from_str(&text) {
++        assert_eq!(cl.to_string(), text, "strict parse text");
++        assert!(parsed.ok(), "from_str succeeded but Parse::ok() is false");
++    } else {
++        assert!(!parsed.ok(), "from_str failed but Parse::ok() is true");
++    }
++    // the entries in the full range are all the entries
++    let full = rowan::TextRange::new(0.into(), rowan::TextSize::of(text.as_str()));
++    assert_eq!(relaxed.entries_in_range(full).count(), relaxed.iter().count(), "entries_in_range(full)");
++}
++
++/// `entry_at_offset` finds the entry containing every offset in it.
++#[hegel::test]
++fn entry_at_offset_finds_the_entry(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(true).print_as_debug());
++    let Ok(cl) = ChangeLog::from_str(&g.text) else { return };
++    let entries: Vec<Entry> = cl.iter().collect();
++    for entry in &entries {
++        let range = entry.syntax().text_range();
++        let start: u32 = range.start().into();
++        let end: u32 = range.end().into();
++        if end <= start {
++            continue;
++        }
++        let off = tc.draw(int!(start, end - 1));
++        let found = cl.entry_at_offset(off.into()).unwrap_or_else(|| panic!("no entry at offset {off} (entry range {range:?}) in:\n{}", g.text));
++        assert_eq!(found.syntax().text_range(), range, "entry_at_offset({off}) in:\n{}", g.text);
++        let sub = rowan::TextRange::new(off.into(), (off + 1).into());
++        let in_range: Vec<Entry> = cl.entries_in_range(sub).collect();
++        assert_eq!(in_range.len(), 1, "entries_in_range({sub:?}) in:\n{}", g.text);
++        assert_eq!(in_range[0].syntax().text_range(), range);
++    }
++}
++
++/// `from_iter` keeps the entries' text; `pop_first` removes exactly the first entry.
++#[hegel::test]
++fn from_iter_and_pop_first_keep_entry_texts(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(false).print_as_debug());
++    let Ok(cl) = ChangeLog::from_str(&g.text) else { return };
++    let texts: Vec<String> = cl.iter().map(|e| e.to_string()).collect();
++    let rebuilt: ChangeLog = cl.iter().collect();
++    assert_eq!(rebuilt.to_string(), texts.concat(), "from_iter text");
++    let again: Vec<String> = rebuilt.iter().map(|e| e.to_string()).collect();
++    assert_eq!(again, texts, "from_iter entries");
++    // dpkg reads the rebuilt file with the same fields, when it read the original cleanly
++    let d0 = dpkg(&g.text);
++    if !d0.fatal && d0.warnings.is_empty() {
++        let d1 = dpkg(&rebuilt.to_string());
++        assert!(!d1.fatal, "dpkg refuses the from_iter text:\n{rebuilt}");
++        let keep = |m: &BTreeMap<String, String>| -> Vec<(String, String)> {
++            m.iter().filter(|(k, _)| k.as_str() != "Changes").map(|(k, v)| (k.clone(), v.clone())).collect()
++        };
++        assert_eq!(d1.entries.iter().map(keep).collect::<Vec<_>>(), d0.entries.iter().map(keep).collect::<Vec<_>>(), "dpkg fields after from_iter");
++    }
++    let mut cl = cl;
++    let n = texts.len();
++    let popped = cl.pop_first().unwrap();
++    assert_eq!(popped.to_string(), texts[0], "pop_first text");
++    let rest: Vec<String> = cl.iter().map(|e| e.to_string()).collect();
++    assert_eq!(rest, texts[1..].to_vec(), "entries after pop_first");
++    assert_eq!(cl.iter().count(), n - 1);
++    assert!(g.text.ends_with(&cl.to_string()) || cl.to_string().is_empty(), "text after pop_first is not a suffix of the input:\n{cl}");
++}
++
++// --------------------------------------------------------------------------- properties: building
++
++#[hegel::composite]
++fn arb_urgency(tc: &hegel::TestCase) -> Urgency {
++    tc.draw(generators::sampled_from(vec![Urgency::Low, Urgency::Medium, Urgency::High, Urgency::Emergency, Urgency::Critical]).print_as_debug())
++}
++
++/// Entries made with the builder are read back by dpkg and by the crate with the given fields.
++#[hegel::test]
++fn built_entries_are_read_back_by_dpkg(tc: hegel::TestCase) {
++    let package = tc.draw(arb_package());
++    let version = tc.draw(arb_version());
++    let dists = tc.draw(arb_distributions());
++    let urgency = if tc.draw(generators::booleans()) { Some(tc.draw(arb_urgency().print_as_debug())) } else { None };
++    let name = tc.draw(arb_name());
++    let email = pick(&tc, EMAILS).to_string();
++    let date = tc.draw(arb_date());
++    let n = tc.draw(int!(1usize, 4));
++    let lines: Vec<String> = (0..n).map(|_| tc.draw(arb_detail(true))).collect();
++    let Ok(version_parsed) = debversion::Version::from_str(&version) else { return };
++    if name.is_empty() || hits_package_chars_bug(&package) || dists.iter().any(|d| d.contains('+')) || urgency.is_none() {
++        return;
++    }
++    let mut cl = ChangeLog::new();
++    let mut b = cl.new_empty_entry().package(package.clone()).version(version_parsed.clone()).distributions(dists.clone()).maintainer((name.clone(), email.clone())).datetime(date.as_str());
++    if let Some(u) = &urgency {
++        b = b.urgency(u.clone());
++    }
++    for l in &lines {
++        b = b.change_line(l.clone());
++    }
++    b.verify().unwrap();
++    let entry = b.finish();
++    // the in-memory entry
++    assert_eq!(entry.package(), Some(package.clone()));
++    assert_eq!(entry.version(), Some(version_parsed.clone()));
++    assert_eq!(entry.distributions(), Some(dists.clone()));
++    assert_eq!(entry.urgency(), urgency.clone(), "urgency() of a built entry");
++    assert_eq!(entry.maintainer(), Some(name.clone()));
++    assert_eq!(entry.email(), Some(email.clone()));
++    assert_eq!(entry.timestamp(), Some(date.clone()));
++    assert_eq!(entry.change_lines().collect::<Vec<_>>(), lines);
++    // the text, re-read by the crate and by dpkg
++    let text = cl.to_string();
++    let reread: ChangeLog = text.parse().unwrap_or_else(|e| panic!("the builder wrote something the strict parser refuses ({e}):\n{text}"));
++    let re = reread.iter().next().unwrap();
++    assert_eq!(crate_fields(&re), crate_fields(&entry), "re-read fields differ from the built entry:\n{text}");
++    let d = dpkg(&text);
++    assert!(!d.fatal, "dpkg refuses the built entry ({:?}):\n{text}", d.warnings);
++    assert!(d.warnings.is_empty(), "dpkg warns about the built entry ({:?}):\n{text}", d.warnings);
++    assert_eq!(d.entries.len(), 1);
++    let mut skip = vec![];
++    if hits_datetime_bug(&date) {
++        skip.push("Timestamp");
++    }
++    let body: Vec<String> = re.change_lines().collect();
++    if hits_closes_bug(&body) || marker_inside_a_word(&body.join("\n")) {
++        skip.push("Closes");
++    }
++    assert_entry_matches_dpkg(&re, &d.entries[0], &text, &skip);
++}
++
++/// Pin for bug 6: an entry built without an urgency has no `;` in its header, which is not a
++/// changelog header for dpkg at all.
++#[hegel::test]
++fn built_entries_without_urgency_are_headers_for_dpkg(tc: hegel::TestCase) {
++    let package = tc.draw(arb_package());
++    if hits_package_chars_bug(&package) {
++        return;
++    }
++    let dists = tc.draw(arb_distributions());
++    let line = tc.draw(arb_detail(true));
++    let mut cl = ChangeLog::new();
++    cl.new_empty_entry().package(package).version("1.0-1".parse().unwrap()).distributions(dists).maintainer(("A B".into(), "a@b.c".into())).datetime("Mon, 01 Jan 2024 10:00:00 +0000").change_line(line).finish();
++    let text = cl.to_string();
++    let d = dpkg(&text);
++    assert!(!d.fatal, "dpkg refuses the built entry ({:?}):\n{text}", d.warnings);
++}
++
++/// A second entry via `new_entry()` goes on top, unreleased, with the incremented version.
++#[hegel::test]
++fn new_entry_goes_on_top_as_unreleased(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(false).print_as_debug());
++    if !g.entries.iter().all(is_clean_shape) || g.entries[0].name.is_empty() || g.entries.iter().any(hits_plus_bug) {
++        return;
++    }
++    let d0 = dpkg(&g.text);
++    if d0.fatal || !d0.warnings.is_empty() {
++        return;
++    }
++    let mut cl: ChangeLog = g.text.parse().unwrap();
++    let first = cl.iter().next().unwrap();
++    let Some(mut expected_version) = first.version() else { return };
++    if expected_version.debian_revision.as_deref().map(|r| r.len() > 6).unwrap_or(false) {
++        return; // debversion/3: increment_debian overflows i32
++    }
++    expected_version.increment_debian();
++    let line = tc.draw(arb_detail(true));
++    let entry = cl.new_entry().maintainer(("Someone Else".to_string(), "else@example.com".to_string())).datetime("Mon, 01 Jan 2024 10:00:00 +0000").change_line(line.clone()).finish();
++    assert_eq!(entry.version(), Some(expected_version.clone()));
++    assert_eq!(entry.is_unreleased(), Some(true));
++    assert_eq!(entry.distributions(), Some(vec!["UNRELEASED".to_string()]));
++    let text = cl.to_string();
++    let reread: ChangeLog = text.parse().unwrap_or_else(|e| panic!("new_entry wrote something the strict parser refuses ({e}):\n{text}"));
++    assert_eq!(reread.iter().count(), g.entries.len() + 1);
++    let top = reread.iter().next().unwrap();
++    assert_eq!(top.version(), Some(expected_version));
++    assert_eq!(top.package(), first.package());
++    assert_eq!(top.change_lines().collect::<Vec<_>>(), vec![line]);
++    let d = dpkg(&text);
++    assert!(!d.fatal && d.warnings.is_empty(), "dpkg is unhappy with the new entry ({:?}):\n{text}", d.warnings);
++    assert_eq!(d.entries.len(), g.entries.len() + 1);
++    assert_eq!(d.entries[0]["Distribution"], "UNRELEASED");
++    assert_eq!(&d.entries[1..], &d0.entries[..], "the older entries changed for dpkg");
++}
++
++#[derive(Debug, Clone)]
++enum Setter {
++    Package(String),
++    Version(String),
++    Distributions(Vec<String>),
++    Urgency(Urgency),
++    Metadata(String, String),
++    Maintainer(String, String),
++    Timestamp(String),
++    Datetime(i64, i32),
++    Append(String),
++    Prepend(String),
++    Bullet(String),
++}
++
++#[hegel::composite]
++fn arb_setter(tc: &hegel::TestCase) -> Setter {
++    match tc.draw(int!(0u8, 10)) {
++        0 => Setter::Package(tc.draw(arb_package())),
++        1 => Setter::Version(tc.draw(arb_version())),
++        2 => Setter::Distributions(tc.draw(arb_distributions())),
++        3 => Setter::Urgency(tc.draw(arb_urgency().print_as_debug())),
++        4 => {
++            let (k, v) = tc.draw(arb_metadata_item());
++            Setter::Metadata(k, v)
++        }
++        5 => Setter::Maintainer(tc.draw(arb_name()), pick(tc, EMAILS).to_string()),
++        6 => Setter::Timestamp(tc.draw(arb_date())),
++        7 => Setter::Datetime(tc.draw(int!(0i64, 2_000_000_000)), tc.draw(int!(-14i32, 14)) * 3600 + tc.draw(int!(0i32, 1)) * 1800),
++        8 => Setter::Append(tc.draw(arb_detail(true))),
++        9 => Setter::Prepend(tc.draw(arb_detail(true))),
++        _ => Setter::Bullet(tc.draw(arb_detail(false)).trim().to_string()),
++    }
++}
++
++/// Setters change the in-memory entry and the text alike, and dpkg reads the new values.
++#[hegel::test]
++fn setters_are_read_back_by_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(false).print_as_debug());
++    if !g.entries.iter().all(is_clean_shape) || g.entries[0].name.is_empty() || g.entries.iter().any(hits_plus_bug) {
++        return;
++    }
++    let d0 = dpkg(&g.text);
++    if d0.fatal || !d0.warnings.is_empty() {
++        return;
++    }
++    let cl: ChangeLog = g.text.parse().unwrap();
++    let mut entry = cl.iter().next().unwrap();
++    let n = tc.draw(int!(1usize, 3));
++    let setters: Vec<Setter> = (0..n).map(|_| tc.draw(arb_setter().print_as_debug())).collect();
++    let mut expected = crate_fields(&entry);
++    let mut expected_lines: Vec<String> = entry.change_lines().collect();
++    let mut expected_meta: Vec<(String, String)> = entry.header().unwrap().metadata().collect();
++    let set_meta = |k: &str, v: &str, expected_meta: &mut Vec<(String, String)>| {
++        if let Some(e) = expected_meta.iter_mut().find(|(kk, _)| kk == k) {
++            e.1 = v.to_string();
++        } else {
++            expected_meta.push((k.to_string(), v.to_string()));
++        }
++    };
++    for s in &setters {
++        match s {
++            Setter::Package(p) => {
++                if hits_package_chars_bug(p) {
++                    continue;
++                }
++                entry.set_package(p.clone());
++                expected.insert("Source", p.clone());
++            }
++            Setter::Version(v) => {
++                let Ok(v) = debversion::Version::from_str(v) else { continue };
++                entry.set_version(&v);
++                expected.insert("Version", v.to_string());
++            }
++            Setter::Distributions(ds) => {
++                if ds.iter().any(|d| d.contains('+')) {
++                    continue;
++                }
++                entry.set_distributions(ds.clone());
++                expected.insert("Distribution", ds.join(" "));
++            }
++            Setter::Urgency(u) => {
++                if !expected_meta.is_empty() && !expected_meta.iter().any(|(k, _)| k == "urgency") {
++                    continue; // bug 12
++                }
++                entry.set_urgency(u.clone());
++                expected.insert("Urgency", u.to_string());
++                set_meta("urgency", &u.to_string(), &mut expected_meta);
++            }
++            Setter::Metadata(k, v) => {
++                if k == "urgency" {
++                    continue;
++                }
++                if !expected_meta.is_empty() && !expected_meta.iter().any(|(kk, _)| kk == k) {
++                    continue; // bug 12
++                }
++                entry.set_metadata(k, v);
++                set_meta(k, v, &mut expected_meta);
++            }
++            Setter::Maintainer(name, email) => {
++                if name.is_empty() {
++                    continue;
++                }
++                entry.set_maintainer((name.clone(), email.clone()));
++                expected.insert("Maintainer", format!("{name} <{email}>"));
++            }
++            Setter::Timestamp(t) => {
++                entry.set_timestamp(t.clone());
++                expected.insert("Date", t.clone());
++            }
++            Setter::Datetime(secs, offset) => {
++                let tz = chrono::FixedOffset::east_opt(*offset).unwrap();
++                let dt = chrono::DateTime::from_timestamp(*secs, 0).unwrap().with_timezone(&tz);
++                entry.set_datetime(dt);
++                expected.insert("Date", dt.format("%a, %d %b %Y %H:%M:%S %z").to_string());
++            }
++            Setter::Append(l) => {
++                entry.append_change_line(l);
++                expected_lines.push(l.clone());
++            }
++            Setter::Prepend(l) => {
++                if hits_prepend_bug(&g.entries[0].text) {
++                    continue; // bug 9
++                }
++                entry.prepend_change_line(l);
++                expected_lines.insert(0, l.clone());
++            }
++            Setter::Bullet(t) => {
++                if t.is_empty() {
++                    continue;
++                }
++                entry.add_bullet(t);
++                let before = expected_lines.len();
++                let now: Vec<String> = entry.change_lines().collect();
++                expected_lines.extend(now[before.min(now.len())..].iter().cloned());
++            }
++        }
++    }
++    // the in-memory entry
++    if !setters.iter().any(is_footer_setter) {
++        let got = crate_fields(&entry);
++        assert_eq!(got, expected, "in-memory fields after {setters:?}:\n{cl}");
++    }
++    assert_eq!(entry.change_lines().collect::<Vec<_>>(), expected_lines, "in-memory change lines after {setters:?}:\n{cl}");
++    let got_meta: Vec<(String, String)> = entry.header().unwrap().metadata().collect();
++    assert_eq!(got_meta, expected_meta, "in-memory metadata after {setters:?}:\n{cl}");
++    // the text, re-read
++    let text = cl.to_string();
++    let reread: ChangeLog = text.parse().unwrap_or_else(|e| panic!("the setters {setters:?} wrote something the strict parser refuses ({e}):\n{text}"));
++    let re = reread.iter().next().unwrap();
++    assert_eq!(crate_fields(&re), expected, "re-read fields after {setters:?}:\n{text}");
++    assert_eq!(re.change_lines().collect::<Vec<_>>(), expected_lines, "re-read change lines after {setters:?}:\n{text}");
++    assert_eq!(re.header().unwrap().metadata().collect::<Vec<_>>(), expected_meta, "re-read metadata after {setters:?}:\n{text}");
++    // dpkg
++    let d = dpkg(&text);
++    assert!(!d.fatal, "dpkg refuses the text after {setters:?} ({:?}):\n{text}", d.warnings);
++    let mut skip = vec!["Closes"];
++    if re.timestamp().map(|t| hits_datetime_bug(&t)).unwrap_or(false) {
++        skip.push("Timestamp");
++    }
++    if expected_meta.len() > 1 && d.warnings.iter().any(|w| w.contains("unknown key-value")) {
++        skip.push("Urgency");
++    }
++    assert_entry_matches_dpkg(&re, &d.entries[0], &text, &skip);
++    for (k, v) in &expected_meta {
++        if k.eq_ignore_ascii_case("binary-only") {
++            assert_eq!(d.entries[0].get("Binary-Only"), Some(v), "dpkg's Binary-Only after {setters:?}:\n{text}");
++        }
++    }
++}
++
++/// `add_bullet` wraps to 78 columns, keeps every word, and keeps `Closes: #N` together.
++#[hegel::test]
++fn add_bullet_wraps_and_keeps_the_words(tc: hegel::TestCase) {
++    let n = tc.draw(int!(1usize, 40));
++    let words: Vec<String> = (0..n)
++        .map(|_| match tc.draw(int!(0u8, 9)) {
++            0 => format!("Closes: #{}", tc.draw(int!(1u32, 9_999_999))),
++            1 => chars_from(&tc, "abcdefghijklmnopqrstuvwxyz-", tc.draw(int!(1usize, 90))),
++            _ => pick(&tc, WORDS).to_string(),
++        })
++        .collect();
++    let text = words.join(" ");
++    let mut cl = ChangeLog::new();
++    let entry = cl.new_empty_entry().package("foo".into()).version("1.0-1".parse().unwrap()).distribution("unstable".into()).urgency(Urgency::Medium).maintainer(("A B".into(), "a@b.c".into())).datetime("Mon, 01 Jan 2024 10:00:00 +0000").change_line("* first".into()).finish();
++    entry.add_bullet(&text);
++    let lines: Vec<String> = entry.change_lines().collect();
++    assert_eq!(lines[0], "* first");
++    let new = &lines[1..];
++    assert!(!new.is_empty(), "add_bullet added nothing for {text:?}");
++    assert!(new[0].starts_with("* "), "first wrapped line {:?}", new[0]);
++    for l in &new[1..] {
++        assert!(l.starts_with("  ") && !l.starts_with("   "), "continuation line {l:?}");
++    }
++    let mut joined = String::new();
++    for (i, l) in new.iter().enumerate() {
++        let body = if i == 0 { &l[2..] } else { &l[2..] };
++        assert_eq!(body.trim(), body, "line {l:?} has surrounding whitespace");
++        if i > 0 {
++            joined.push(' ');
++        }
++        joined.push_str(body);
++    }
++    assert_eq!(joined.split_whitespace().collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>(), "words changed for {text:?}: {new:?}");
++    for pair in new.windows(2) {
++        assert!(!(pair[0].ends_with("Closes:") && pair[1][2..].starts_with('#')), "Closes: separated from its number: {pair:?}");
++    }
++    let t = cl.to_string();
++    let d = dpkg(&t);
++    assert!(!d.fatal && d.warnings.is_empty(), "dpkg after add_bullet: {:?}\n{t}", d.warnings);
++}
++
++/// Pin for bug 10: `add_bullet` documents wrapping to 78 columns; textwrap's optimal-fit
++/// algorithm is allowed to overflow the width a little when the alternative is very ragged.
++#[hegel::test]
++fn add_bullet_stays_within_78_columns(tc: hegel::TestCase) {
++    let n = tc.draw(int!(1usize, 12));
++    let words: Vec<String> = (0..n)
++        .map(|_| match tc.draw(int!(0u8, 3)) {
++            0 => format!("Closes: #{}", tc.draw(int!(1u32, 9_999_999))),
++            1 => chars_from(&tc, "abcdefghijklmnopqrstuvwxyz", tc.draw(int!(20usize, 70))),
++            _ => pick(&tc, WORDS).to_string(),
++        })
++        .collect();
++    let text = words.join(" ");
++    let mut cl = ChangeLog::new();
++    let entry = cl.new_empty_entry().package("foo".into()).version("1.0-1".parse().unwrap()).distribution("unstable".into()).urgency(Urgency::Medium).maintainer(("A B".into(), "a@b.c".into())).datetime("Mon, 01 Jan 2024 10:00:00 +0000").change_line("* first".into()).finish();
++    entry.add_bullet(&text);
++    for l in entry.change_lines().skip(1) {
++        let width = l.chars().count();
++        let longest_word = l[2..].split_whitespace().map(|w| w.chars().count()).max().unwrap_or(0);
++        assert!(width <= 78 || longest_word + 2 >= width, "line wider than 78 without an over-long word: {l:?} (from {text:?})");
++    }
++}
++
++/// Adding changes for another author opens a section for them, in both spellings of the API.
++#[hegel::test]
++fn changes_for_another_author_get_a_section(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(false).print_as_debug());
++    if !g.entries.iter().all(is_clean_shape) || g.entries[0].name.is_empty() || g.entries.iter().any(hits_plus_bug) {
++        return;
++    }
++    let cl_a: ChangeLog = match g.text.parse() {
++        Ok(cl) => cl,
++        Err(_) => return,
++    };
++    let cl_b: ChangeLog = g.text.parse().unwrap();
++    let entry_a = cl_a.iter().next().unwrap();
++    let entry_b = cl_b.iter().next().unwrap();
++    let maintainer = entry_a.maintainer().unwrap();
++    let author = if tc.draw(int!(0u8, 3)) == 0 { maintainer.clone() } else { tc.draw(arb_name()) };
++    if author.is_empty() {
++        return;
++    }
++    let line = format!("* {}", tc.draw(arb_detail(false)).trim());
++    let before: Vec<String> = entry_a.change_lines().collect();
++    if before.iter().any(|l| l.trim().is_empty()) || before.iter().any(|l| l.contains('[')) || before.iter().any(|l| !l.starts_with("* ")) {
++        return; // keep to the plain-bullet shape
++    }
++    if before.is_empty() && author != maintainer {
++        return; // bug 7
++    }
++    if hits_prepend_bug(&g.entries[0].text) && author != maintainer {
++        return; // bug 9
++    }
++    entry_a.try_add_changes_for_author(&author, vec![line.as_str()]).unwrap();
++    entry_b.try_add_change_for_author(&[line.as_str()], (author.clone(), "x@y.z".to_string())).unwrap();
++    let after_a: Vec<String> = entry_a.change_lines().collect();
++    let after_b: Vec<String> = entry_b.change_lines().collect();
++    assert_eq!(after_a, after_b, "try_add_changes_for_author vs try_add_change_for_author for author {author:?} on {before:?}");
++    assert!(after_a.contains(&line) || after_a.iter().any(|l| l.starts_with("* ") && line.starts_with(l.trim_end())), "the new line is missing: {after_a:?}");
++    let sections = entry_a.iter_changes_by_author();
++    let last = sections.last().unwrap();
++    if author != maintainer {
++        assert_eq!(last.0.as_deref(), Some(author.as_str()), "last section author in {after_a:?}");
++        assert!(entry_a.get_authors().contains(&author), "get_authors() lacks {author:?}: {after_a:?}");
++        if !before.is_empty() {
++            assert_eq!(sections[0].0.as_deref(), Some(maintainer.as_str()), "the maintainer's own section in {after_a:?}");
++        }
++    } else {
++        assert!(last.0.is_none() || last.0.as_deref() == Some(author.as_str()), "a section for the maintainer themself: {after_a:?}");
++    }
++    let text = cl_a.to_string();
++    let reread: ChangeLog = text.parse().unwrap_or_else(|e| panic!("author sections wrote something the strict parser refuses ({e}):\n{text}"));
++    assert_eq!(reread.iter().next().unwrap().change_lines().collect::<Vec<_>>(), after_a);
++    let d = dpkg(&text);
++    assert!(!d.fatal, "dpkg refuses the text after adding a section:\n{text}");
++}
++
++/// Pin for bug 7: adding a change for another author to an entry without changes must not open
++/// an empty section for the maintainer (the `changes::` function does not).
++#[hegel::test]
++fn adding_for_another_author_to_an_empty_entry_opens_one_section(tc: hegel::TestCase) {
++    let maintainer = tc.draw(arb_name());
++    let author = tc.draw(arb_name());
++    if maintainer.is_empty() || author.is_empty() || author == maintainer {
++        return;
++    }
++    let text = format!("foo (1.0-1) unstable; urgency=low\n\n -- {maintainer} <m@example.com>  Mon, 01 Jan 2024 10:00:00 +0000\n");
++    let cl: ChangeLog = text.parse().unwrap();
++    let entry = cl.iter().next().unwrap();
++    assert_eq!(entry.change_lines().count(), 0);
++    let line = format!("* {}", tc.draw(arb_detail(false)).trim());
++    entry.try_add_change_for_author(&[line.as_str()], (author.clone(), "a@example.com".into())).unwrap();
++    let mut model: Vec<String> = vec![];
++    debian_changelog::changes::try_add_change_for_author(&mut model, &author, vec![line.as_str()], Some((maintainer.clone(), "m@example.com".into()))).unwrap();
++    assert_eq!(entry.change_lines().collect::<Vec<_>>(), model, "Entry::try_add_change_for_author vs changes::try_add_change_for_author on an empty entry");
++}
++
++/// Pin for bug 9: `prepend_change_line` puts the line before the first change line, also when
++/// the header is directly followed by the changes (which dpkg allows).
++#[hegel::test]
++fn prepend_change_line_puts_the_line_first(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(false).print_as_debug());
++    let e = &g.entries[0];
++    if !is_clean_shape(e) || hits_plus_bug(e) || !hits_prepend_bug(&e.text) {
++        return;
++    }
++    let Ok(cl) = ChangeLog::from_str(&g.text) else { return };
++    let entry = cl.iter().next().unwrap();
++    let before: Vec<String> = entry.change_lines().collect();
++    let line = format!("* {}", tc.draw(arb_detail(false)).trim());
++    entry.prepend_change_line(&line);
++    let mut expected = vec![line];
++    expected.extend(before);
++    assert_eq!(entry.change_lines().collect::<Vec<_>>(), expected, "prepend_change_line on:\n{}", g.text);
++}
++
++/// Pin for bug 11: the footer setters are visible through the accessors without re-parsing.
++#[hegel::test]
++fn footer_setters_are_visible_in_memory(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changelog(false).print_as_debug());
++    let e = &g.entries[0];
++    if !is_clean_shape(e) || hits_plus_bug(e) || e.name.is_empty() {
++        return;
++    }
++    let Ok(cl) = ChangeLog::from_str(&g.text) else { return };
++    let mut entry = cl.iter().next().unwrap();
++    match tc.draw(int!(0u8, 1)) {
++        0 => {
++            let date = tc.draw(arb_date());
++            entry.set_timestamp(date.clone());
++            assert_eq!(cl.iter().next().unwrap().timestamp(), Some(date.clone()), "timestamp() through the changelog after set_timestamp");
++            assert_eq!(entry.timestamp(), Some(date), "timestamp() after set_timestamp");
++        }
++        _ => {
++            let name = tc.draw(arb_name());
++            if name.is_empty() {
++                return;
++            }
++            let email = pick(&tc, EMAILS).to_string();
++            entry.set_maintainer((name.clone(), email.clone()));
++            assert_eq!(entry.email(), Some(email), "email() after set_maintainer");
++            assert_eq!(entry.maintainer(), Some(name), "maintainer() after set_maintainer");
++        }
++    }
++}
++
++/// Pin for bug 12: `set_metadata` adding a second key writes `; a=b c=d`, which dpkg reads as one
++/// option `a` with the value `b c=d`.
++#[hegel::test]
++fn set_metadata_separates_options_with_a_comma(tc: hegel::TestCase) {
++    let (k1, v1) = tc.draw(arb_metadata_item());
++    let (k2, v2) = tc.draw(arb_metadata_item());
++    if k1.eq_ignore_ascii_case(&k2) || (k1 != "urgency" && k2 != "urgency") {
++        return;
++    }
++    let text = format!("foo (1.0-1) unstable; {k1}={v1}\n\n  * x\n\n -- Jane Doe <jane@example.com>  Mon, 01 Jan 2024 10:00:00 +0000\n");
++    let cl: ChangeLog = text.parse().unwrap();
++    let mut entry = cl.iter().next().unwrap();
++    entry.set_metadata(&k2, &v2);
++    let out = cl.to_string();
++    let d = dpkg(&out);
++    assert!(!d.fatal, "dpkg refuses:\n{out}");
++    let urgency = if k1 == "urgency" { &v1 } else { &v2 };
++    assert_eq!(d.entries[0].get("Urgency").map(|s| s.to_lowercase()), Some(urgency.to_lowercase()), "dpkg's urgency after set_metadata({k2}):\n{out}");
++}
++
++/// `Urgency` round-trips through `Display`/`FromStr` regardless of case.
++#[hegel::test]
++fn urgency_round_trips(tc: hegel::TestCase) {
++    let u = tc.draw(arb_urgency().print_as_debug());
++    let s = u.to_string();
++    let text = match tc.draw(int!(0u8, 2)) {
++        0 => s.to_uppercase(),
++        1 => s.clone(),
++        _ => {
++            let mut c = s.chars();
++            c.next().unwrap().to_uppercase().collect::<String>() + c.as_str()
++        }
++    };
++    assert_eq!(Urgency::from_str(&text).ok(), Some(u));
++}
++
