@@ -1,0 +1,676 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8a09bf8..954b0ba 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,8 @@ num-traits = { version = "0.2", optional = true }
+ serde = { version = "1.0", optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++jiff = "0.2"
+ serde_json = "1.0"
+ 
+ [features]
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..6c75cb1
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,657 @@
++//! Hegel property tests for `iso8601`: the date (calendar, ISO week, ordinal), time, datetime and
++//! duration parsers, their `Display` and serde round trips, the `From<Duration>` seconds model and
++//! the optional `chrono` conversions.
++//!
++//! Oracles: the text is *generated from* known components, so the parsed fields are known exactly;
++//! `jiff` (an independent ISO 8601 implementation) supplies the ISO week and ordinal numbers of a
++//! calendar date, the instant of a datetime with an offset, and a second reading of every
++//! duration; `chrono` (the crate's own optional dependency) is compared with `jiff` through the
++//! crate's `into_naive`/`into_fixed_offset` conversions.
++
++#![allow(clippy::too_many_arguments, clippy::type_complexity)]
++
++use std::str::FromStr;
++
++use chrono::{Datelike, Timelike};
++use hegel::generators;
++use iso8601::parsers;
++use iso8601::{Date, DateTime, Duration, Time};
++use jiff::civil;
++
++// ----------------------------------------------------------------------------------------------
++// generators
++
++macro_rules! pp {
++    ($($t:ty),*) => {$(
++        impl hegel::PrettyPrintable for $t {
++            fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++                hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++            }
++        }
++    )*};
++}
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++/// A valid proleptic-Gregorian date whose ISO week-year also has at most four digits.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct DateSpec {
++    y: i32,
++    m: u32,
++    d: u32,
++}
++
++impl DateSpec {
++    fn jiff(&self) -> civil::Date {
++        civil::Date::new(self.y as i16, self.m as i8, self.d as i8).unwrap()
++    }
++    fn ymd(&self) -> Date {
++        Date::YMD { year: self.y, month: self.m, day: self.d }
++    }
++    fn week(&self) -> Date {
++        let w = self.jiff().iso_week_date();
++        Date::Week { year: w.year() as i32, ww: w.week() as u32, d: w.weekday().to_monday_one_offset() as u32 }
++    }
++    fn ordinal(&self) -> Date {
++        Date::Ordinal { year: self.y, ddd: self.jiff().day_of_year() as u32 }
++    }
++}
++
++fn year_text(y: i32) -> String {
++    if y < 0 { format!("-{:04}", -y) } else { format!("{y:04}") }
++}
++
++/// The text of a date in one of the three forms, with each separator present or absent.
++fn date_text(date: Date, sep1: bool, sep2: bool) -> String {
++    let (s1, s2) = (if sep1 { "-" } else { "" }, if sep2 { "-" } else { "" });
++    match date {
++        Date::YMD { year, month, day } => format!("{}{s1}{month:02}{s2}{day:02}", year_text(year)),
++        Date::Week { year, ww, d } => format!("{}{s1}W{ww:02}{s2}{d}", year_text(year)),
++        Date::Ordinal { year, ddd } => format!("{}{s1}{ddd:03}", year_text(year)),
++    }
++}
++
++fn days_in_month(y: i32, m: u32) -> u32 {
++    match m {
++        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
++        4 | 6 | 9 | 11 => 30,
++        _ => if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 },
++    }
++}
++
++pp!(DateSpec, TimeSpec, Zone, DurSpec);
++
++#[hegel::composite]
++fn arb_date(tc: &hegel::TestCase) -> DateSpec {
++    let y = match tc.draw(int!(0u8, 2)) {
++        0 => tc.draw(int!(-9998i32, 9998)),
++        1 => tc.draw(int!(1890i32, 2110)),
++        _ => tc.draw(generators::sampled_from(vec![-9998, -1, 0, 1, 1582, 1600, 1900, 1970, 1999, 2000, 2004, 2020, 2021, 9998])),
++    };
++    let m = tc.draw(int!(1u32, 12));
++    let d = match tc.draw(int!(0u8, 1)) {
++        0 => tc.draw(int!(1u32, days_in_month(y, m))),
++        _ => tc.draw(generators::sampled_from(vec![1, 2, 28, days_in_month(y, m) - 1, days_in_month(y, m)])),
++    };
++    DateSpec { y, m, d }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Zone {
++    None,
++    Utc,
++    Offset { sign: i32, h: u32, m: Option<u32>, colon: bool },
++}
++
++impl Zone {
++    fn expected(&self) -> (i32, i32) {
++        match *self {
++            Zone::None | Zone::Utc => (0, 0),
++            Zone::Offset { sign, h, m, .. } => (sign * h as i32, sign * m.unwrap_or(0) as i32),
++        }
++    }
++    fn text(&self) -> String {
++        match *self {
++            Zone::None => String::new(),
++            Zone::Utc => "Z".to_string(),
++            Zone::Offset { sign, h, m, colon } => {
++                let s = if sign < 0 { '-' } else { '+' };
++                match m {
++                    None => format!("{s}{h:02}"),
++                    Some(m) => format!("{s}{h:02}{}{m:02}", if colon { ":" } else { "" }),
++                }
++            }
++        }
++    }
++    fn seconds(&self) -> i32 {
++        let (h, m) = self.expected();
++        h * 3600 + m * 60
++    }
++}
++
++/// A time: hour 0..=24, optional seconds (0..=60), an optional fraction of 1–9 digits (only
++/// with seconds), an optional zone; `colons` chooses the extended form.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct TimeSpec {
++    h: u32,
++    mi: u32,
++    s: Option<u32>,
++    frac: Option<String>,
++    comma: bool,
++    colons: bool,
++    zone: Zone,
++}
++
++/// The crate keeps the first three fraction digits (zero-padded) as milliseconds.
++fn millis(frac: &Option<String>) -> u32 {
++    match frac {
++        None => 0,
++        Some(f) => {
++            let mut t: String = f.chars().take(3).collect();
++            while t.len() < 3 {
++                t.push('0');
++            }
++            t.parse().unwrap()
++        }
++    }
++}
++
++impl TimeSpec {
++    fn expected(&self) -> Time {
++        let (tz_offset_hours, tz_offset_minutes) = self.zone.expected();
++        Time {
++            hour: self.h,
++            minute: self.mi,
++            second: self.s.unwrap_or(0),
++            millisecond: millis(&self.frac),
++            tz_offset_hours,
++            tz_offset_minutes,
++        }
++    }
++    fn text(&self) -> String {
++        let c = if self.colons { ":" } else { "" };
++        let mut t = format!("{:02}{c}{:02}", self.h, self.mi);
++        if let Some(s) = self.s {
++            t.push_str(&format!("{c}{s:02}"));
++            if let Some(f) = &self.frac {
++                t.push(if self.comma { ',' } else { '.' });
++                t.push_str(f);
++            }
++        }
++        t.push_str(&self.zone.text());
++        t
++    }
++    /// Representable by `chrono`/`jiff`: hour < 24, second < 60, offset hour < 24.
++    fn representable(&self) -> bool {
++        self.h < 24
++            && self.s.unwrap_or(0) < 60
++            && !matches!(self.zone, Zone::Offset { h, .. } if h > 23)
++    }
++}
++
++#[hegel::composite]
++fn arb_zone(tc: &hegel::TestCase) -> Zone {
++    match tc.draw(int!(0u8, 3)) {
++        0 => Zone::None,
++        1 => Zone::Utc,
++        _ => {
++            let sign = if tc.draw(generators::booleans()) { 1 } else { -1 };
++            let h = match tc.draw(int!(0u8, 2)) {
++                0 => tc.draw(int!(0u32, 24)),
++                _ => tc.draw(int!(0u32, 14)),
++            };
++            let m = if tc.draw(generators::booleans()) {
++                Some(match tc.draw(int!(0u8, 1)) {
++                    0 => tc.draw(int!(0u32, 59)),
++                    _ => tc.draw(generators::sampled_from(vec![0, 15, 30, 45])),
++                })
++            } else {
++                None
++            };
++            Zone::Offset { sign, h, m, colon: tc.draw(generators::booleans()) }
++        }
++    }
++}
++
++fn digits(tc: &hegel::TestCase, n: usize) -> String {
++    (0..n).map(|_| char::from(b'0' + tc.draw(int!(0u8, 9)))).collect()
++}
++
++#[hegel::composite]
++fn arb_time(tc: &hegel::TestCase) -> TimeSpec {
++    let h = match tc.draw(int!(0u8, 3)) {
++        0 => tc.draw(int!(0u32, 24)),
++        _ => tc.draw(int!(0u32, 23)),
++    };
++    let mi = tc.draw(int!(0u32, 59));
++    let s = if tc.draw(int!(0u8, 4)) == 0 {
++        None
++    } else {
++        Some(match tc.draw(int!(0u8, 5)) {
++            0 => 60,
++            _ => tc.draw(int!(0u32, 59)),
++        })
++    };
++    let frac = if s.is_some() && tc.draw(generators::booleans()) {
++        let n = tc.draw(int!(1usize, 9));
++        Some(digits(tc, n))
++    } else {
++        None
++    };
++    TimeSpec {
++        h,
++        mi,
++        s,
++        frac,
++        comma: tc.draw(generators::booleans()),
++        colons: tc.draw(generators::booleans()),
++        zone: tc.draw(arb_zone()),
++    }
++}
++
++/// A duration in the `P…Y…M…DT…H…M…S` form: every component optional, the seconds optionally
++/// fractional.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct DurSpec {
++    y: Option<u32>,
++    mo: Option<u32>,
++    d: Option<u32>,
++    t: bool,
++    h: Option<u32>,
++    mi: Option<u32>,
++    s: Option<u32>,
++    frac: Option<String>,
++    comma: bool,
++}
++
++impl DurSpec {
++    fn text(&self) -> String {
++        let mut t = String::from("P");
++        for (v, u) in [(self.y, 'Y'), (self.mo, 'M'), (self.d, 'D')] {
++            if let Some(v) = v {
++                t.push_str(&format!("{v}{u}"));
++            }
++        }
++        if self.t {
++            t.push('T');
++            for (v, u) in [(self.h, 'H'), (self.mi, 'M')] {
++                if let Some(v) = v {
++                    t.push_str(&format!("{v}{u}"));
++                }
++            }
++            if let Some(s) = self.s {
++                t.push_str(&format!("{s}"));
++                if let Some(f) = &self.frac {
++                    t.push(if self.comma { ',' } else { '.' });
++                    t.push_str(f);
++                }
++                t.push('S');
++            }
++        }
++        t
++    }
++    fn components(&self) -> [u32; 7] {
++        let z = |v: Option<u32>| v.unwrap_or(0);
++        [z(self.y), z(self.mo), z(self.d), z(self.h), z(self.mi), z(self.s), millis(&self.frac)]
++    }
++    fn expected(&self) -> Duration {
++        let [year, month, day, hour, minute, second, millisecond] = self.components();
++        Duration::YMDHMS { year, month, day, hour, minute, second, millisecond }
++    }
++    /// A `T` with no hour, minute or second after it.
++    fn empty_time(&self) -> bool {
++        self.t && self.h.is_none() && self.mi.is_none() && self.s.is_none()
++    }
++    fn has_a_component(&self) -> bool {
++        [self.y, self.mo, self.d, self.h, self.mi, self.s].iter().any(Option::is_some)
++    }
++    /// Within `jiff::Span`'s per-unit limits.
++    fn in_jiff_range(&self) -> bool {
++        let [y, mo, d, h, mi, s, _] = self.components();
++        y <= 19_998 && mo <= 239_976 && d <= 7_304_484 && h <= 175_307_616 && mi <= 10_518_456_960u64 as u32 && s <= 631_107_417_600u64 as u32
++    }
++}
++
++fn arb_component(tc: &hegel::TestCase) -> Option<u32> {
++    match tc.draw(int!(0u8, 5)) {
++        0 => None,
++        1 => Some(tc.draw(int!(0u32, u32::MAX))),
++        2 => Some(tc.draw(int!(0u32, 99_999))),
++        _ => Some(tc.draw(int!(0u32, 60))),
++    }
++}
++
++#[hegel::composite]
++fn arb_duration(tc: &hegel::TestCase) -> DurSpec {
++    let (y, mo, d) = (arb_component(tc), arb_component(tc), arb_component(tc));
++    let t = tc.draw(int!(0u8, 3)) != 0;
++    let (h, mi, s) = if t { (arb_component(tc), arb_component(tc), arb_component(tc)) } else { (None, None, None) };
++    let frac = if s.is_some() && tc.draw(generators::booleans()) {
++        let n = tc.draw(int!(1usize, 9));
++        Some(digits(tc, n))
++    } else {
++        None
++    };
++    DurSpec { y, mo, d, t, h, mi, s, frac, comma: tc.draw(generators::booleans()) }
++}
++
++fn suffixes() -> Vec<&'static str> {
++    vec!["", "T12:00", "Z", " ", "abc", "/P1D", "\n"]
++}
++
++// ----------------------------------------------------------------------------------------------
++// dates
++
++/// Every date form parses to its components in the extended, basic and mixed spellings (the
++/// low-level parser leaving the suffix untouched), prints back to a text that re-parses equal,
++/// and round-trips through serde as that text; the calendar and ordinal forms convert to the
++/// `chrono` day `jiff` says they are.
++#[hegel::test]
++fn dates_parse_in_every_form_and_print_back(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_date());
++    let form = tc.draw(int!(0u8, 2));
++    let expected = match form {
++        0 => spec.ymd(),
++        1 => spec.week(),
++        _ => spec.ordinal(),
++    };
++    let (sep1, sep2) = (tc.draw(generators::booleans()), tc.draw(generators::booleans()));
++    let text = date_text(expected, sep1, sep2);
++
++    assert_eq!(iso8601::date(&text), Ok(expected), "{text}");
++    assert_eq!(Date::from_str(&text), Ok(expected), "{text}");
++    for suffix in suffixes() {
++        let full = format!("{text}{suffix}");
++        let (rest, parsed) = parsers::parse_date(full.as_bytes()).unwrap_or_else(|e| panic!("{full}: {e}"));
++        assert_eq!((rest, parsed), (suffix.as_bytes(), expected), "{full}");
++    }
++
++    let shown = expected.to_string();
++    assert_eq!(shown, date_text(expected, true, true), "Display is the extended form");
++    assert_eq!(iso8601::date(&shown), Ok(expected), "Display round trip of {expected:?}");
++    let json = serde_json::to_string(&expected).unwrap();
++    assert_eq!(json, format!("\"{shown}\""));
++    assert_eq!(serde_json::from_str::<Date>(&json).unwrap(), expected);
++    assert_eq!(serde_json::from_str::<Date>(&format!("\"{text}\"")).unwrap(), expected);
++
++    // chrono conversions (the ISO-week form is pinned in `week_dates_convert_to_the_day_jiff_names`)
++    if form != 1 {
++        let naive = expected.into_naive().unwrap_or_else(|| panic!("{expected:?} has no chrono date"));
++        assert_eq!((naive.year(), naive.month(), naive.day()), (spec.y, spec.m, spec.d), "{expected:?}");
++        assert_eq!(chrono::NaiveDate::try_from(expected), Ok(naive));
++    }
++}
++
++/// `Date::Week { year, ww, d }` names ISO week `ww` of week-year `year`, day `d` with 1 = Monday
++/// and 7 = Sunday; `into_naive` must give the same calendar day as `jiff` for that week date.
++#[hegel::test]
++fn week_dates_convert_to_the_day_jiff_names(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_date());
++    let week = spec.week();
++    let naive = week.into_naive().unwrap_or_else(|| panic!("{week:?} ({spec:?}) has no chrono date"));
++    assert_eq!((naive.year(), naive.month(), naive.day()), (spec.y, spec.m, spec.d), "{week:?}");
++}
++
++/// A field outside its documented range makes the extended-form date unparsable (the parser is
++/// documented not to check calendar validity, so only the field ranges are tested here).
++#[hegel::test]
++fn out_of_range_date_fields_are_rejected(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_date());
++    let y = year_text(spec.y);
++    let bad = match tc.draw(int!(0u8, 7)) {
++        0 => format!("{y}-{:02}-{:02}", tc.draw(generators::sampled_from(vec![0, 13, 20, 99])), spec.d),
++        1 => format!("{y}-{:02}-{:02}", spec.m, tc.draw(generators::sampled_from(vec![0, 32, 40, 99]))),
++        2 => format!("{y}-W{:02}-{}", tc.draw(generators::sampled_from(vec![0, 54, 60, 99])), tc.draw(int!(1u32, 7))),
++        3 => format!("{y}-W{:02}-{}", tc.draw(int!(1u32, 53)), tc.draw(generators::sampled_from(vec![0, 8, 9]))),
++        4 => format!("{y}-{:03}", tc.draw(generators::sampled_from(vec![0, 367, 400, 999]))),
++        5 => format!("{}-{:02}-{:02}", tc.draw(int!(0u32, 999)), spec.m, spec.d),
++        6 => format!("{}{:02}-{}", y, spec.m, tc.draw(int!(1u32, 9))),
++        _ => format!("{}-{:02}-{:02}", tc.draw(int!(10000u32, 99999)), spec.m, spec.d),
++    };
++    assert!(iso8601::date(&bad).is_err(), "{bad} was accepted as {:?}", iso8601::date(&bad));
++    assert!(serde_json::from_str::<Date>(&format!("\"{bad}\"")).is_err(), "{bad}");
++}
++
++// ----------------------------------------------------------------------------------------------
++// times
++
++/// A time parses to its components in every spelling (fraction truncated to milliseconds, offset
++/// split into signed hours and minutes), prints back to a text that re-parses equal, round-trips
++/// through serde, and converts to the `chrono` time exactly when hour < 24 and second < 60.
++#[hegel::test]
++fn times_parse_in_every_form_and_print_back(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_time());
++    let text = spec.text();
++    let expected = spec.expected();
++
++    assert_eq!(iso8601::time(&text), Ok(expected), "{text}");
++    assert_eq!(Time::from_str(&text), Ok(expected), "{text}");
++    for suffix in suffixes() {
++        if spec.zone == Zone::None && suffix == "Z" {
++            continue; // the suffix would be read as the zone
++        }
++        let full = format!("{text}{suffix}");
++        let (rest, parsed) = parsers::parse_time(full.as_bytes()).unwrap_or_else(|e| panic!("{full}: {e}"));
++        assert_eq!((rest, parsed), (suffix.as_bytes(), expected), "{full}");
++    }
++
++    let shown = expected.to_string();
++    let (oh, om) = spec.zone.expected();
++    let sign = if oh < 0 || om < 0 { '-' } else { '+' };
++    assert_eq!(
++        shown,
++        format!("{:02}:{:02}:{:02}.{:03}{sign}{:02}:{:02}", expected.hour, expected.minute, expected.second, expected.millisecond, oh.abs(), om.abs()),
++        "{expected:?}"
++    );
++    assert_eq!(iso8601::time(&shown), Ok(expected), "Display round trip of {expected:?}");
++    let json = serde_json::to_string(&expected).unwrap();
++    assert_eq!(json, format!("\"{shown}\""));
++    assert_eq!(serde_json::from_str::<Time>(&json).unwrap(), expected);
++
++    let naive = chrono::NaiveTime::from_hms_milli_opt(expected.hour, expected.minute, expected.second, expected.millisecond);
++    assert_eq!(expected.into_naive(), naive, "{expected:?}");
++    assert_eq!(naive.is_some(), spec.h < 24 && spec.s.unwrap_or(0) < 60);
++    if let Some(n) = naive {
++        assert_eq!((n.hour(), n.minute(), n.second(), n.nanosecond()), (expected.hour, expected.minute, expected.second, expected.millisecond * 1_000_000));
++    }
++
++    let other = tc.draw(arb_zone()).expected();
++    let moved = expected.set_tz(other);
++    assert_eq!((moved.tz_offset_hours, moved.tz_offset_minutes), other);
++    assert_eq!(Time { tz_offset_hours: 0, tz_offset_minutes: 0, ..moved }, Time { tz_offset_hours: 0, tz_offset_minutes: 0, ..expected });
++}
++
++/// The low-level time parser stops exactly where the text stops being a time: an out-of-range
++/// hour or minute is a parse error, and out-of-range optional parts (seconds, offset minutes)
++/// are left unread as the remainder.
++#[hegel::test]
++fn out_of_range_time_fields_stop_the_parser(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_time());
++    let base = TimeSpec { s: None, frac: None, zone: Zone::None, colons: true, ..spec };
++    let text = base.text();
++    match tc.draw(int!(0u8, 3)) {
++        0 => {
++            let bad = format!("{:02}:{:02}", tc.draw(int!(25u32, 99)), spec.mi);
++            assert!(iso8601::time(&bad).is_err(), "{bad}");
++        }
++        1 => {
++            let bad = format!("{:02}:{:02}", spec.h, tc.draw(int!(60u32, 99)));
++            assert!(iso8601::time(&bad).is_err(), "{bad}");
++        }
++        2 => {
++            let rest = format!(":{:02}", tc.draw(int!(61u32, 99)));
++            let full = format!("{text}{rest}");
++            let (left, parsed) = parsers::parse_time(full.as_bytes()).unwrap();
++            assert_eq!((left, parsed), (rest.as_bytes(), base.expected()), "{full}");
++        }
++        _ => {
++            let rest = format!("+{:02}:{:02}", tc.draw(int!(25u32, 99)), spec.mi);
++            let full = format!("{text}{rest}");
++            let (left, parsed) = parsers::parse_time(full.as_bytes()).unwrap();
++            assert_eq!((left, parsed), (rest.as_bytes(), base.expected()), "{full}");
++        }
++    }
++}
++
++// ----------------------------------------------------------------------------------------------
++// datetimes
++
++/// A datetime is its date and its time; through `chrono` it is the instant `jiff` computes for
++/// the same civil datetime and offset, and where the text is also RFC 3339 `jiff` parses it to
++/// the same instant.
++#[hegel::test]
++fn datetimes_are_the_instant_jiff_computes(tc: hegel::TestCase) {
++    let dspec = tc.draw(arb_date());
++    let tspec = tc.draw(arb_time());
++    let date = match tc.draw(int!(0u8, 2)) {
++        0 => dspec.ymd(),
++        1 => dspec.week(),
++        _ => dspec.ordinal(),
++    };
++    let (sep1, sep2) = (tc.draw(generators::booleans()), tc.draw(generators::booleans()));
++    let text = format!("{}T{}", date_text(date, sep1, sep2), tspec.text());
++    let expected = DateTime { date, time: tspec.expected() };
++
++    assert_eq!(iso8601::datetime(&text), Ok(expected), "{text}");
++    assert_eq!(DateTime::from_str(&text), Ok(expected), "{text}");
++    let shown = expected.to_string();
++    assert_eq!(shown, format!("{}T{}", expected.date, expected.time));
++    assert_eq!(iso8601::datetime(&shown), Ok(expected), "Display round trip of {expected:?}");
++    let json = serde_json::to_string(&expected).unwrap();
++    assert_eq!(json, format!("\"{shown}\""));
++    assert_eq!(serde_json::from_str::<DateTime>(&json).unwrap(), expected);
++
++    // the week form's chrono conversion is pinned separately
++    if matches!(date, Date::Week { .. }) {
++        return;
++    }
++    let fixed = expected.into_fixed_offset();
++    assert_eq!(fixed.is_some(), tspec.representable(), "{expected:?}");
++    let Some(fixed) = fixed else { return };
++    let ms = tspec.expected().millisecond;
++    let civil = dspec.jiff().at(tspec.h as i8, tspec.mi as i8, tspec.s.unwrap_or(0) as i8, (ms * 1_000_000) as i32);
++    let zoned = civil.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(tspec.zone.seconds()).unwrap())).unwrap();
++    assert_eq!(fixed.timestamp_millis(), zoned.timestamp().as_millisecond(), "{text}");
++    assert_eq!(fixed.offset().local_minus_utc(), tspec.zone.seconds());
++    assert_eq!(expected.into_naive(), Some(fixed.naive_local()));
++    let naive = fixed.naive_local();
++    assert_eq!((naive.year(), naive.month(), naive.day()), (dspec.y, dspec.m, dspec.d));
++    assert_eq!((naive.hour(), naive.minute(), naive.second(), naive.nanosecond()), (tspec.h, tspec.mi, tspec.s.unwrap_or(0), ms * 1_000_000));
++
++    // RFC 3339 texts: calendar form, extended, with seconds, an offset with a colon or `Z`
++    let rfc3339 = matches!(date, Date::YMD { .. })
++        && (0..=9999).contains(&dspec.y)
++        && sep1
++        && sep2
++        && tspec.colons
++        && tspec.s.is_some()
++        && tspec.frac.as_ref().is_none_or(|f| f.len() <= 3) // jiff keeps the sub-millisecond digits and truncates toward zero
++        && !tspec.comma
++        && matches!(tspec.zone, Zone::Utc | Zone::Offset { m: Some(_), colon: true, .. });
++    if rfc3339 {
++        let jts: jiff::Timestamp = text.parse().unwrap_or_else(|e| panic!("jiff rejects {text}: {e}"));
++        assert_eq!(fixed.timestamp_millis(), jts.as_millisecond(), "{text}");
++    }
++}
++
++// ----------------------------------------------------------------------------------------------
++// durations
++
++/// A `P…Y…M…DT…H…M…S` duration parses to its components (seconds fraction truncated to
++/// milliseconds), agrees with `jiff::Span` component for component, converts to
++/// `core::time::Duration` by the documented 365-day year / 30-day month model, prints back to a
++/// text that re-parses equal and round-trips through serde; a `P` with no component is rejected.
++#[hegel::test]
++fn durations_parse_like_jiff_and_print_back(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_duration());
++    let text = spec.text();
++    let parsed = iso8601::duration(&text);
++    if !spec.has_a_component() && !spec.t {
++        assert!(parsed.is_err(), "{text} parsed as {parsed:?}, but a duration needs at least one component");
++        return;
++    }
++    if spec.empty_time() {
++        return; // `P…T` with nothing after the `T`: pinned in `a_bare_time_designator_is_rejected`
++    }
++    let expected = spec.expected();
++    assert_eq!(parsed, Ok(expected), "{text}");
++    assert_eq!(Duration::from_str(&text), Ok(expected), "{text}");
++    for suffix in suffixes() {
++        if !spec.t && suffix.starts_with('T') {
++            continue; // a bare `T` is read as an empty time part (see the notes on `PT`)
++        }
++        let full = format!("{text}{suffix}");
++        let (rest, p) = parsers::parse_duration(full.as_bytes()).unwrap_or_else(|e| panic!("{full}: {e}"));
++        assert_eq!((rest, p), (suffix.as_bytes(), expected), "{full}");
++    }
++
++    let [y, mo, d, h, mi, s, ms] = spec.components();
++    assert_eq!(expected.is_zero(), [y, mo, d, h, mi, s, ms] == [0; 7]);
++    let std: std::time::Duration = expected.into();
++    let secs = u64::from(y) * 365 * 86_400 + u64::from(mo) * 30 * 86_400 + u64::from(d) * 86_400 + u64::from(h) * 3600 + u64::from(mi) * 60 + u64::from(s);
++    assert_eq!(std, std::time::Duration::new(secs, ms * 1_000_000), "{text}");
++
++    let shown = expected.to_string();
++    assert_eq!(iso8601::duration(&shown), Ok(expected), "Display round trip of {expected:?} = {shown}");
++    let json = serde_json::to_string(&expected).unwrap();
++    assert_eq!(json, format!("\"{shown}\""));
++    assert_eq!(serde_json::from_str::<Duration>(&json).unwrap(), expected);
++    assert_eq!(serde_json::from_str::<Duration>(&format!("\"{text}\"")).unwrap(), expected);
++
++    if spec.in_jiff_range() && !spec.comma {
++        let span: jiff::Span = text.parse().unwrap_or_else(|e| panic!("jiff rejects {text}: {e}"));
++        assert_eq!(span.get_years() as u32, y, "{text}");
++        assert_eq!(span.get_months() as u32, mo, "{text}");
++        assert_eq!(span.get_days() as u32, d, "{text}");
++        assert_eq!(span.get_hours() as u32, h, "{text}");
++        assert_eq!(span.get_minutes() as u32, mi, "{text}");
++        assert_eq!(span.get_seconds() as u64 * 1000 + span.get_milliseconds() as u64, u64::from(s) * 1000 + u64::from(ms), "{text}");
++    }
++}
++
++/// The grammar the crate quotes (RFC 3339 appendix A) makes `dur-time = "T" (dur-hour /
++/// dur-minute / dur-second)`: a `T` must be followed by at least one time unit, so `PT`, `P1YT`,
++/// `P2M3DT` are not durations (`jiff` rejects them too).
++#[hegel::test]
++fn a_bare_time_designator_is_rejected(tc: hegel::TestCase) {
++    let spec = DurSpec { t: true, h: None, mi: None, s: None, frac: None, ..tc.draw(arb_duration()) };
++    let text = spec.text();
++    assert!(text.ends_with('T'));
++    assert!(jiff::Span::from_str(&text).is_err(), "jiff accepts {text}");
++    let parsed = iso8601::duration(&text);
++    assert!(parsed.is_err(), "{text} parsed as {parsed:?}");
++}
++
++/// Week durations and the `P<datetime>` spelling: `P…W` is `Weeks(n)` (7-day weeks in the seconds
++/// model), and `P<date>T<time>` in the calendar form is the `YMDHMS` duration with those fields.
++#[hegel::test]
++fn week_and_datetime_form_durations(tc: hegel::TestCase) {
++    let w = match tc.draw(int!(0u8, 2)) {
++        0 => tc.draw(int!(0u32, u32::MAX)),
++        _ => tc.draw(int!(0u32, 60)),
++    };
++    let text = format!("P{w}W");
++    assert_eq!(iso8601::duration(&text), Ok(Duration::Weeks(w)), "{text}");
++    assert_eq!(Duration::Weeks(w).to_string(), text);
++    assert_eq!(Duration::Weeks(w).is_zero(), w == 0);
++    let std: std::time::Duration = Duration::Weeks(w).into();
++    assert_eq!(std, std::time::Duration::from_secs(u64::from(w) * 7 * 86_400));
++    assert_eq!(serde_json::from_str::<Duration>(&format!("\"{text}\"")).unwrap(), Duration::Weeks(w));
++
++    let y = tc.draw(int!(0u32, 9999));
++    let mo = tc.draw(int!(1u32, 12));
++    let d = tc.draw(int!(1u32, 31));
++    let tspec = TimeSpec { zone: Zone::None, ..tc.draw(arb_time()) };
++    let (sep1, sep2) = (tc.draw(generators::booleans()), tc.draw(generators::booleans()));
++    let (s1, s2) = (if sep1 { "-" } else { "" }, if sep2 { "-" } else { "" });
++    let text = format!("P{y:04}{s1}{mo:02}{s2}{d:02}T{}", tspec.text());
++    let t = tspec.expected();
++    let expected = Duration::YMDHMS { year: y, month: mo, day: d, hour: t.hour, minute: t.minute, second: t.second, millisecond: t.millisecond };
++    assert_eq!(iso8601::duration(&text), Ok(expected), "{text}");
++    let shown = expected.to_string();
++    assert_eq!(iso8601::duration(&shown), Ok(expected), "Display round trip of {expected:?} = {shown}");
++}
