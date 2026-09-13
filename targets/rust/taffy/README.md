@@ -33,3 +33,4 @@
 - 2026-07-15: predecessor base commit `bb351fcc056c` (Prepare for v0.12.2 release (#979)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/taffy.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped bb351fcc056c → 887a847484ab (2026-09-13, "round_layout: round positions in cumulative coordinates to avoid 1px gaps (#1189)"; 0.14.0); 2 bug(s) still reproduce. 6368 tests pass.

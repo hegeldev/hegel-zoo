@@ -25,3 +25,4 @@
 - 2026-07-23: predecessor base commit `15e0c6e6f1ab` (Fix typo).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/tera.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 15e0c6e6f1ab → 6ead3c0ffa1e (2026-09-11, "Fix some Value::deserialize issues"; 2.4.0); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 136 tests pass.
