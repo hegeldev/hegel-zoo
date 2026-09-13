@@ -33,3 +33,4 @@
 - 2025-12-16: predecessor base commit `9f39918876eb` (tests: fix clippy warnings).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/yaml-rust2.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 9f39918876eb → e12069447073 (2026-09-10, "yaml-rust2 v0.13.0"; 0.13.0); 3 bug(s) still reproduce; 1 ignored reproducer(s) not run. 184 tests pass. yaml-rust2/1 (the YamlDecoder hang on short UTF-16 input, an ignored reproducer the bump does not run) was checked by hand and is fixed: v0.11.1 (issue #78) makes decode_loop reserve at least 4 bytes per iteration; the reproducer now asserts the decoded document.
