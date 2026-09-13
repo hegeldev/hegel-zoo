@@ -41,3 +41,4 @@
 - 2026-06-30: predecessor base commit `3320ecca21dc` (fix: Cholesky::new returns None non-positive-definite complex matri...).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/nalgebra.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: `[run] command` gained `--features proptest-support,arbitrary`: `tests/linalg/qr.rs` and `cholesky.rs` are `#![cfg(feature = "proptest-support")]`, so the QR/Cholesky properties and the QR known-failure pin had never compiled in the zoo (found by the judge's NOTRUN check in a re-run; the target had never been bumped because upstream has not moved since the base). With the features on, 1058 tests pass, the two QR properties and the Cholesky property among them, and the pin fails deterministically → recorded as nalgebra/3.
