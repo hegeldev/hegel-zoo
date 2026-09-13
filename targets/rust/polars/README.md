@@ -25,3 +25,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/polars.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 1f6362635a59 → ccff55e4f507 (2026-09-12, "perf: Improve cache-removal and join-order cost estimates (#29263)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-13: base bumped ccff55e4f507 → a8811c306720 (2026-09-13, "perf: Use stats to decide cross join buffering side (#29270)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
