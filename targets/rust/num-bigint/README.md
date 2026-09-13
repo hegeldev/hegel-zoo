@@ -49,3 +49,4 @@
 - 2026-07-07: predecessor base commit `9ec740f8c162` (Merge pull request #351 from cuviper/rename-head).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/num-bigint.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 9ec740f8c162 → 41f0b035d129 (2026-08-21, "Merge pull request #355 from samuelcolvin/push-headroom"; 0.5.1); 1 bug(s) still reproduce. 183 tests pass.
