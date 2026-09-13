@@ -34,3 +34,4 @@
 - 2026-07-23: predecessor base commit `303b80f44685` (fix(validate): reject unsupported critical extensions per RFC 5280).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/x509-parser.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 303b80f44685 → 68c5c55e6298 (2026-08-06, "Update README.md"; 0.19.0-beta.1); 0 bug(s) still reproduce; add/add conflicts in tests/readcert.rs resolved by keeping both sides. 94 tests pass.
