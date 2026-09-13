@@ -37,3 +37,4 @@
   property `hegel_cursor_next_boundary_chunked_agrees_with_iterator`, which passed at the default case
   count under 0.44.1 (the bug needs the chunk split between the two RIs); the zoo added the deterministic
   pin `known_failure_gb12_chunk_split_double_counts_regional_indicators` from the report's counterexample.
+- 2026-09-13: base bumped 66a032fd8d66 → 048d51fe1d9b (2026-09-02, "Apply GB5 before GB9b in GraphemeCursor::provide_context (#180)"; 1.13.3); 0 bug(s) still reproduce; fixed upstream: unicode-segmentation/1. 59 tests pass. PR #180 changed provide_context so an RI already counted by the forward pass is not re-counted by the backward scan; its regression test `test_grapheme_cursor_ris_count_across_chunks` is exactly the zoo's counterexample.
