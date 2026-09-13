@@ -1,0 +1,1035 @@
+diff --git a/debversion/Cargo.toml b/debversion/Cargo.toml
+index 7e8b931..f9e31cd 100644
+--- a/debversion/Cargo.toml
++++ b/debversion/Cargo.toml
+@@ -36,11 +36,5 @@ features = ["postgres"]
+ version = "^1"
+ optional = true
+ 
+-[dev-dependencies.sqlx]
+-version = ">=0.8.2,<0.10"
+-default-features = false
+-features = ["runtime-async-std", "tls-rustls"]
+-
+-[dev-dependencies.pyo3]
+-workspace = true
+-features = ["auto-initialize"]
++[dev-dependencies]
++hegeltest = "0.44.1"
+diff --git a/debversion/tests/hegel.rs b/debversion/tests/hegel.rs
+new file mode 100644
+index 0000000..38771fb
+--- /dev/null
++++ b/debversion/tests/hegel.rs
+@@ -0,0 +1,1011 @@
++//! Hegel properties for `debversion`.
++//!
++//! Oracles: `dpkg` itself (`--validate-version` for what is a version, `--compare-versions` as
++//! the fallback comparator), `apt_pkg.version_compare` from python3-apt (libapt's comparator, the
++//! same algorithm as dpkg, driven as a persistent `/usr/bin/python3` child) and python-debian's
++//! `Version` for the epoch/upstream/revision split. `git check-ref-format` judges the DEP-14
++//! tag mangling. Alongside: `Ord`/`Eq`/`Hash` laws, `canonicalize`, the increment helpers, the
++//! binNMU/NMU suffix helpers and the VCS snapshot suffixes of `debversion::upstream`.
++#![allow(clippy::all, dead_code)]
++
++use debversion::upstream::{add_dfsg_suffix, get_revision, strip_dfsg_suffix, upstream_version_add_revision, Direction, VcsSnapshot};
++use debversion::vcs::mangle_version_for_git;
++use debversion::vendor::{initial_debian_revision, Vendor};
++use debversion::{AsVersion, Version};
++use hegel::generators;
++use hegel::generators::Generator;
++use std::cmp::Ordering;
++use std::hash::{DefaultHasher, Hash, Hasher};
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// --------------------------------------------------------------------------- oracles
++
++const ORACLE_SCRIPT: &str = r#"
++import sys
++try:
++    import apt_pkg
++    apt_pkg.init()
++    have_apt = True
++except Exception:
++    have_apt = False
++try:
++    from debian.debian_support import Version as DV
++    have_deb = True
++except Exception:
++    have_deb = False
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    if cmd == 'C':
++        if not have_apt:
++            out = ['na']
++        else:
++            r = apt_pkg.version_compare(args[0], args[1])
++            out = ['ok', '-1' if r < 0 else ('1' if r > 0 else '0')]
++    elif cmd == 'P':
++        if not have_deb:
++            out = ['na']
++        else:
++            try:
++                v = DV(args[0])
++                out = ['ok', v.epoch or '', v.upstream_version or '', v.debian_revision or '']
++            except Exception:
++                out = ['err']
++    else:
++        out = ['bad']
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let python = if std::path::Path::new("/usr/bin/python3").exists() { "/usr/bin/python3" } else { "python3" };
++        let mut child = Command::new(python)
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("python3 is needed for the apt_pkg / python-debian oracles");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++/// Ask the oracle; returns the status (`ok`, `err`, `na`) and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?})");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    (status, it.map(unhex).collect())
++}
++
++fn dpkg_compare(a: &str, b: &str, op: &str) -> bool {
++    Command::new("dpkg").args(["--compare-versions", a, op, b]).stderr(Stdio::null()).status().expect("dpkg").success()
++}
++
++/// The reference comparison: libapt's `version_compare`, or `dpkg --compare-versions`.
++fn oracle_cmp(a: &str, b: &str) -> Ordering {
++    let (status, f) = ask("C", &[a, b]);
++    if status == "ok" {
++        return match f[0].as_str() {
++            "-1" => Ordering::Less,
++            "0" => Ordering::Equal,
++            _ => Ordering::Greater,
++        };
++    }
++    if dpkg_compare(a, b, "lt") {
++        Ordering::Less
++    } else if dpkg_compare(a, b, "gt") {
++        Ordering::Greater
++    } else {
++        Ordering::Equal
++    }
++}
++
++/// `dpkg --validate-version`: 0 clean, 1 a warning (a policy "should", e.g. "version number
++/// does not start with digit", or an `_`), 2 an error; `None` when dpkg cannot be asked (a
++/// text starting with `-` is taken as an option).
++fn dpkg_check(text: &str) -> Option<u8> {
++    if text.starts_with('-') {
++        return None;
++    }
++    let out = Command::new("dpkg").args(["--validate-version", text]).stderr(Stdio::piped()).stdout(Stdio::null()).output().expect("dpkg");
++    let err = String::from_utf8_lossy(&out.stderr);
++    Some(if err.contains("error:") { 2 } else if err.contains("warning:") { 1 } else { 0 })
++}
++
++/// `Some(false)` when dpkg reports an error.
++fn dpkg_valid(text: &str) -> Option<bool> {
++    dpkg_check(text).map(|level| level < 2)
++}
++
++/// python-debian's split, `None` if it rejects the text, `Err` when python-debian is missing.
++fn python_debian_parse(text: &str) -> Result<Option<(String, String, String)>, ()> {
++    let (status, f) = ask("P", &[text]);
++    match status.as_str() {
++        "ok" => Ok(Some((f[0].clone(), f[1].clone(), f[2].clone()))),
++        "err" => Ok(None),
++        _ => Err(()),
++    }
++}
++
++fn git_ref_ok(tag: &str) -> bool {
++    Command::new("git").args(["check-ref-format", &format!("refs/tags/{tag}")]).stderr(Stdio::null()).status().expect("git").success()
++}
++
++// --------------------------------------------------------------------------- generators
++
++const LETTERS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
++
++#[hegel::composite]
++fn arb_digits(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 9)) {
++        0 => "0".to_string(),
++        1 => format!("0{}", tc.draw(int!(0u32, 99))),
++        2 => "00".to_string(),
++        3 => "2147483647".to_string(),
++        4 => "2147483648".to_string(),
++        5 => "18446744073709551616".to_string(),
++        6 => "123456789012345678901234567890".to_string(),
++        _ => tc.draw(int!(0u32, 30)).to_string(),
++    }
++}
++
++#[hegel::composite]
++fn arb_word(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 9)) {
++        0 => "rc".to_string(),
++        1 => "ubuntu".to_string(),
++        2 => "dfsg".to_string(),
++        3 => "really".to_string(),
++        4 => "b".to_string(),
++        5 => "nmu".to_string(),
++        6 => "beta".to_string(),
++        7 => "bpo".to_string(),
++        _ => {
++            let n = tc.draw(int!(1usize, 3));
++            (0..n).map(|_| LETTERS.as_bytes()[tc.draw(int!(0usize, LETTERS.len() - 1))] as char).collect()
++        }
++    }
++}
++
++/// An upstream version: policy says it should start with a digit and contain `A-Za-z0-9.+~`,
++/// with `-` allowed when there is a revision and `:` when there is an epoch.
++#[hegel::composite]
++fn arb_upstream(tc: &hegel::TestCase, allow_hyphen: bool, allow_colon: bool) -> String {
++    let mut s = tc.draw(arb_digits());
++    let n = tc.draw(int!(0usize, 5));
++    for _ in 0..n {
++        match tc.draw(int!(0u8, 11)) {
++            0..=3 => {
++                s.push('.');
++                s.push_str(&tc.draw(arb_digits()));
++            }
++            4 => s.push('~'),
++            5 => s.push('+'),
++            6 => s.push_str(&tc.draw(arb_word())),
++            7 => s.push_str(&tc.draw(arb_digits())),
++            8 => s.push('.'),
++            9 if allow_hyphen => s.push('-'),
++            10 if allow_colon => s.push(':'),
++            _ => {
++                s.push_str(tc.draw(generators::sampled_from(vec!["~rc", "+dfsg", "+really", "~bpo12", "+git", ".0", "..", "..."])));
++                s.push_str(&tc.draw(arb_digits()));
++            }
++        }
++    }
++    s
++}
++
++#[hegel::composite]
++fn arb_revision(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 7)) {
++        0 => tc.draw(arb_digits()),
++        1 => format!("0ubuntu{}", tc.draw(arb_digits())),
++        2 => format!("{}+b{}", tc.draw(arb_digits()), tc.draw(arb_digits())),
++        3 => format!("{}+nmu{}", tc.draw(arb_digits()), tc.draw(arb_digits())),
++        4 => format!("{}~bpo12+{}", tc.draw(arb_digits()), tc.draw(arb_digits())),
++        5 => format!("{}.{}", tc.draw(arb_digits()), tc.draw(arb_digits())),
++        6 => format!("{}{}", tc.draw(arb_word()), tc.draw(arb_digits())),
++        _ => {
++            let mut s = tc.draw(arb_digits());
++            for _ in 0..tc.draw(int!(0usize, 3)) {
++                s.push_str(tc.draw(generators::sampled_from(vec!["+", "~", ".", "a", "b", "0", "1"])));
++            }
++            s
++        }
++    }
++}
++
++#[hegel::composite]
++fn arb_epoch(tc: &hegel::TestCase) -> Option<String> {
++    match tc.draw(int!(0u8, 9)) {
++        0 => Some("0".to_string()),
++        1 => Some("1".to_string()),
++        2 => Some(tc.draw(int!(0u32, 20)).to_string()),
++        3 => Some("2147483647".to_string()),
++        4 => Some("2147483648".to_string()),
++        5 => Some("4294967295".to_string()),
++        6 => Some("4294967296".to_string()),
++        _ => None,
++    }
++}
++
++/// A well-formed version text (epoch, upstream, revision), with occasional junk.
++#[hegel::composite]
++fn arb_version_text(tc: &hegel::TestCase) -> String {
++    let epoch = tc.draw(arb_epoch());
++    let revision = if tc.draw(int!(0u8, 2)) == 0 { None } else { Some(tc.draw(arb_revision())) };
++    let upstream = tc.draw(arb_upstream(revision.is_some() && tc.draw(int!(0u8, 3)) == 0, epoch.is_some() && tc.draw(int!(0u8, 3)) == 0));
++    let mut s = String::new();
++    if let Some(e) = &epoch {
++        s.push_str(e);
++        s.push(':');
++    }
++    s.push_str(&upstream);
++    if let Some(r) = &revision {
++        s.push('-');
++        s.push_str(r);
++    }
++    if tc.draw(int!(0u8, 7)) == 0 {
++        let junk = tc.draw(generators::sampled_from(vec![" ", "_", ":", "-", "a", ".", "1.0:2", "1:", "-1", "", "~", "ä"]));
++        let at = tc.draw(int!(0usize, s.len()));
++        let at = (at..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap();
++        s.insert_str(at, junk);
++    }
++    s
++}
++
++/// A text the crate parses and dpkg accepts (no `-` start, so dpkg can be asked).
++#[hegel::composite]
++fn arb_valid_version_text(tc: &hegel::TestCase) -> String {
++    for _ in 0..8 {
++        let t = tc.draw(arb_version_text());
++        if !t.starts_with('-') && !hits_lenient_parser_bug(&t) && Version::from_str(&t).is_ok() {
++            return t;
++        }
++    }
++    "1.0-1".to_string()
++}
++
++/// A version near `base`: digits padded or bumped, suffixes appended, the revision or epoch
++/// changed — the pairs where the comparison algorithm has to work.
++#[hegel::composite]
++fn arb_variant(tc: &hegel::TestCase, base: &Version) -> String {
++    let mut upstream = base.upstream_version.clone();
++    let mut revision = base.debian_revision.clone();
++    let mut epoch = base.epoch;
++    match tc.draw(int!(0u8, 12)) {
++        0 => upstream.push('0'),
++        1 => upstream.push('.'),
++        2 => upstream.push('~'),
++        3 => upstream.push_str(tc.draw(generators::sampled_from(vec!["+", "a", "~rc1", "+b1", ".0", "0", "Z", "+dfsg1"]))),
++        4 => {
++            // pad a digit run with leading zeros
++            if let Some(i) = upstream.bytes().position(|b| b.is_ascii_digit()) {
++                upstream.insert_str(i, "00");
++            }
++        }
++        5 => {
++            // bump the last digit run
++            if let Some(i) = upstream.bytes().rposition(|b| b.is_ascii_digit()) {
++                let d = upstream.as_bytes()[i];
++                let bumped = if d == b'9' { "10".to_string() } else { ((d - b'0' + 1) as u32).to_string() };
++                upstream.replace_range(i..i + 1, &bumped);
++            }
++        }
++        6 => revision = None,
++        7 => revision = Some(tc.draw(generators::sampled_from(vec!["0", "00", "1", "0ubuntu1", "1~bpo12+1", "1+b1", "1.", "1.0"])).to_string()),
++        8 => revision = revision.map(|r| format!("{r}0")).or(Some("0".to_string())),
++        9 => epoch = Some(epoch.unwrap_or(0)),
++        10 => epoch = Some(epoch.unwrap_or(0) + 1),
++        11 => upstream = upstream.replace('~', "+"),
++        _ => {}
++    }
++    let mut s = String::new();
++    if let Some(e) = epoch {
++        s.push_str(&format!("{e}:"));
++    }
++    s.push_str(&upstream);
++    if let Some(r) = revision {
++        s.push('-');
++        s.push_str(&r);
++    }
++    s
++}
++
++fn hash_of<T: Hash>(t: &T) -> u64 {
++    let mut h = DefaultHasher::new();
++    t.hash(&mut h);
++    h.finish()
++}
++
++// --------------------------------------------------------------------------- a model of dpkg's verrevcmp, used only to locate bug 1
++
++/// dpkg's `verrevcmp` on one part, returning the order and whether the comparison met a digit
++/// run that is empty on one side and all zeros on the other (dpkg: equal; the crate: less).
++fn verrevcmp(a: &str, b: &str) -> (Ordering, bool) {
++    fn order(c: u8) -> i32 {
++        match c {
++            b'~' => -1,
++            b'0'..=b'9' => 0,
++            c if c.is_ascii_alphabetic() => c as i32,
++            c => c as i32 + 256,
++        }
++    }
++    let (a, b) = (a.as_bytes(), b.as_bytes());
++    let (mut i, mut j) = (0, 0);
++    let mut empty_vs_zeros = false;
++    while i < a.len() || j < b.len() {
++        while (i < a.len() && !a[i].is_ascii_digit()) || (j < b.len() && !b[j].is_ascii_digit()) {
++            let ac = if i < a.len() { order(a[i]) } else { 0 };
++            let bc = if j < b.len() { order(b[j]) } else { 0 };
++            if ac != bc {
++                return (ac.cmp(&bc), empty_vs_zeros);
++            }
++            i += 1;
++            j += 1;
++        }
++        let (ra, rb) = (i, j);
++        while i < a.len() && a[i] == b'0' {
++            i += 1;
++        }
++        while j < b.len() && b[j] == b'0' {
++            j += 1;
++        }
++        let a_has = i < a.len() && a[i].is_ascii_digit();
++        let b_has = j < b.len() && b[j].is_ascii_digit();
++        if !a_has && !b_has && ((ra == i) != (rb == j)) {
++            empty_vs_zeros = true;
++        }
++        let mut first_diff = Ordering::Equal;
++        while i < a.len() && j < b.len() && a[i].is_ascii_digit() && b[j].is_ascii_digit() {
++            if first_diff == Ordering::Equal {
++                first_diff = a[i].cmp(&b[j]);
++            }
++            i += 1;
++            j += 1;
++        }
++        if i < a.len() && a[i].is_ascii_digit() {
++            return (Ordering::Greater, empty_vs_zeros);
++        }
++        if j < b.len() && b[j].is_ascii_digit() {
++            return (Ordering::Less, empty_vs_zeros);
++        }
++        if first_diff != Ordering::Equal {
++            return (first_diff, empty_vs_zeros);
++        }
++    }
++    (Ordering::Equal, empty_vs_zeros)
++}
++
++/// debversion/1: an empty digit run against a run of zeros (`1.` vs `1.0`, `1.0a` vs `1.0a0`).
++fn hits_empty_vs_zeros_bug(a: &Version, b: &Version) -> bool {
++    if a.epoch.unwrap_or(0) != b.epoch.unwrap_or(0) {
++        return false;
++    }
++    let (up, hit_up) = verrevcmp(&a.upstream_version, &b.upstream_version);
++    if up != Ordering::Equal || hit_up {
++        return hit_up;
++    }
++    verrevcmp(a.debian_revision.as_deref().unwrap_or("0"), b.debian_revision.as_deref().unwrap_or("0")).1
++}
++
++/// debversion/2: texts the strict parser accepts although dpkg refuses them — a colon without
++/// a numeric epoch, an empty revision (`1.0-`), an empty upstream (`1:-1`), an epoch beyond
++/// `INT_MAX`.
++fn hits_lenient_parser_bug(text: &str) -> bool {
++    let (epoch, rest) = match text.split_once(':') {
++        Some((e, r)) if !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit()) => (Some(e), r),
++        Some(_) => return true,
++        None => (None, text),
++    };
++    if let Some(e) = epoch {
++        if e.parse::<u64>().map_or(true, |n| n > i32::MAX as u64) {
++            return true;
++        }
++    }
++    rest.ends_with('-') || rest.starts_with('-') || rest.is_empty() || rest.rsplit_once('-').map_or(false, |(_, r)| r.contains(':'))
++}
++
++fn parts(v: &Version) -> (String, String, String) {
++    (v.epoch.map(|e| e.to_string()).unwrap_or_default(), v.upstream_version.clone(), v.debian_revision.clone().unwrap_or_default())
++}
++
++// --------------------------------------------------------------------------- parsing
++
++#[hegel::test]
++fn parsing_agrees_with_dpkg_and_python_debian(tc: hegel::TestCase) {
++    let text = tc.draw(arb_version_text());
++    let ours = Version::from_str(&text);
++    // the split: epoch before the first colon, revision after the last hyphen, verbatim Display
++    if let Ok(v) = &ours {
++        // Display is verbatim (the epoch is a number: `01:` prints as `1:`)
++        let epoch_text = text.split_once(':').filter(|(e, _)| e.bytes().all(|b| b.is_ascii_digit())).map(|(e, _)| e);
++        if epoch_text.map_or(true, |e| !e.starts_with('0') || e == "0") {
++            assert_eq!(v.to_string(), text, "Display is verbatim");
++        }
++        assert_eq!(Version::from_str(&v.to_string()).map(|w| parts(&w)), Ok(parts(v)), "Display round trip of {text:?}");
++        if let Some(e) = v.epoch {
++            assert!(text.starts_with(&format!("{e}:")) || text.starts_with(&format!("{:0>width$}:", e, width = text.find(':').unwrap())), "{text}");
++        } else {
++            assert!(!text.starts_with(|c: char| c.is_ascii_digit()) || !text[..text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len())].ends_with(':'), "{text}");
++        }
++        match &v.debian_revision {
++            Some(r) => {
++                assert!(!r.is_empty() && !r.contains('-'));
++                assert_eq!(text.rsplit_once('-').unwrap().1, r, "{text}");
++            }
++            None => assert!(v.is_native()),
++        }
++        assert!(!v.upstream_version.is_empty());
++        assert!(v.upstream_version.bytes().all(|b| b.is_ascii_alphanumeric() || b".+:~-".contains(&b)), "{text}");
++        assert_eq!(Version::parse_lenient(&text).unwrap().to_string(), v.to_string());
++        assert_eq!(text.as_str().into_version().unwrap(), *v);
++        assert_eq!(text.clone().into_version().unwrap(), *v);
++        if let Ok(Some((e, u, r))) = python_debian_parse(&text) {
++            // python-debian keeps the epoch as text (`01`), the crate as a number
++            assert_eq!((v.epoch, v.upstream_version.clone(), v.debian_revision.clone().unwrap_or_default()), (if e.is_empty() { None } else { Some(e.parse::<u32>().unwrap()) }, u, r), "python-debian split of {text:?}");
++        }
++    } else {
++        assert!(ours.as_ref().unwrap_err().to_string().starts_with("Invalid version string: ") || ours.as_ref().unwrap_err().to_string().starts_with("Error parsing epoch: "), "{text:?}");
++        assert!(text.contains('_') || Version::parse_lenient(&text).is_err(), "lenient parse of {text:?}");
++    }
++    // validity against dpkg, policy's "should start with a digit" being a warning there; dpkg
++    // trims surrounding whitespace, which is not a version's business
++    if hits_lenient_parser_bug(&text) || text.contains(char::is_whitespace) {
++        return;
++    }
++    if let Some(level) = dpkg_check(&text) {
++        // the strict parser may refuse what dpkg only warns about, never what dpkg accepts
++        // cleanly, and must refuse what dpkg refuses
++        match (&ours, level) {
++            (Ok(_), 2) => panic!("{text:?}: debversion accepts, dpkg refuses"),
++            (Err(e), 0) => panic!("{text:?}: debversion refuses ({e}), dpkg accepts"),
++            _ => {}
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- ordering
++
++#[hegel::test]
++fn ordering_agrees_with_dpkg(tc: hegel::TestCase) {
++    let a = tc.draw(arb_valid_version_text());
++    let va = Version::from_str(&a).unwrap();
++    let b = if tc.draw(generators::booleans()) { tc.draw(arb_variant(&va)) } else { tc.draw(arb_valid_version_text()) };
++    let Ok(vb) = Version::from_str(&b) else {
++        return;
++    };
++    if b.starts_with('-') || hits_lenient_parser_bug(&b) || va.epoch.map_or(false, |e| e > i32::MAX as u32) || vb.epoch.map_or(false, |e| e > i32::MAX as u32) {
++        return;
++    }
++    let want = oracle_cmp(&a, &b);
++    if hits_empty_vs_zeros_bug(&va, &vb) {
++        return; // debversion/1
++    }
++    assert_eq!(va.cmp(&vb), want, "{a:?} vs {b:?}");
++    assert_eq!(vb.cmp(&va), want.reverse());
++    assert_eq!(va == vb, want == Ordering::Equal);
++    assert_eq!(va.partial_cmp(&vb), Some(want));
++    // a third version for transitivity
++    let c = tc.draw(arb_variant(&vb));
++    if let Ok(vc) = Version::from_str(&c) {
++        if !hits_lenient_parser_bug(&c) && !c.starts_with('-') && !hits_empty_vs_zeros_bug(&va, &vc) && !hits_empty_vs_zeros_bug(&vb, &vc) {
++            let (ab, bc, ac) = (va.cmp(&vb), vb.cmp(&vc), va.cmp(&vc));
++            if ab != Ordering::Greater && bc != Ordering::Greater {
++                assert_ne!(ac, Ordering::Greater, "{a} <= {b} <= {c}");
++            }
++            if ab == Ordering::Equal && bc == Ordering::Equal {
++                assert_eq!(ac, Ordering::Equal);
++            }
++        }
++    }
++}
++
++/// `Eq` is by comparison (`1.0 == 1.0-0 == 0:1.0`); `Hash` must follow.
++#[hegel::test]
++fn equal_versions_hash_equally(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let mut twins = vec![
++        Version { epoch: Some(v.epoch.unwrap_or(0)), ..v.clone() },
++        Version { debian_revision: Some(v.debian_revision.clone().unwrap_or("0".to_string())), ..v.clone() },
++        Version { upstream_version: format!("0{}", v.upstream_version), ..v.clone() },
++    ];
++    if v.debian_revision.is_none() || v.debian_revision.as_deref() == Some("0") {
++        twins.push(Version { debian_revision: Some("00".to_string()), ..v.clone() });
++    }
++    for t in twins {
++        if t.upstream_version.starts_with("00") && !v.upstream_version.starts_with(|c: char| c.is_ascii_digit()) {
++            continue;
++        }
++        assert_eq!(t, v, "{t} vs {v}");
++        assert_eq!(hash_of(&t), hash_of(&v), "{t} == {v} but the hashes differ");
++    }
++}
++
++// --------------------------------------------------------------------------- canonicalize, increments
++
++#[hegel::test]
++fn canonicalize_keeps_the_version_and_is_idempotent(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let c = v.canonicalize();
++    if !hits_empty_vs_zeros_bug(&v, &c) {
++        assert_eq!(c, v, "{c} vs {v}");
++    }
++    let zero_revision = v.debian_revision.as_deref().map_or(false, |r| r.bytes().all(|b| b == b'0'));
++    if (v.epoch == Some(0) && v.upstream_version.contains(':')) || (zero_revision && v.upstream_version.contains('-')) {
++        return; // debversion/9
++    }
++    if !hits_empty_vs_zeros_bug(&v, &c) {
++        assert_eq!(oracle_cmp(&c.to_string(), &text), Ordering::Equal, "{c} vs {text}");
++    }
++    assert_eq!(c.canonicalize(), c);
++    assert_eq!(c.canonicalize().to_string(), c.to_string(), "canonicalize is idempotent on {text}");
++    assert_ne!(c.epoch, Some(0));
++    assert!(c.debian_revision.as_deref().map_or(true, |r| !r.bytes().all(|b| b == b'0')), "{c}");
++    for part in [Some(c.upstream_version.as_str()), c.debian_revision.as_deref()].into_iter().flatten() {
++        let b = part.as_bytes();
++        assert!(!(b.len() >= 2 && b[0] == b'0' && b[1].is_ascii_digit()), "{c}: leading zero in {part}");
++    }
++    assert_eq!(Version::from_str(&c.to_string()).unwrap(), c);
++    assert_eq!(c.is_native(), v.is_native() || v.debian_revision.as_deref().map_or(false, |r| r.bytes().all(|b| b == b'0')));
++}
++
++fn trailing_number(s: &str) -> Option<(&str, &str)> {
++    let i = s.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i + 1);
++    if i < s.len() {
++        Some((&s[..i], &s[i..]))
++    } else {
++        None
++    }
++}
++
++#[hegel::test]
++fn increment_debian_gives_the_next_revision(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let part = v.debian_revision.clone().unwrap_or_else(|| v.upstream_version.clone());
++    let Some((prefix, digits)) = trailing_number(&part) else {
++        return; // nothing to increment
++    };
++    let Ok(n) = digits.parse::<u64>() else {
++        return; // debversion/3
++    };
++    if n >= i32::MAX as u64 {
++        return; // debversion/3
++    }
++    let mut w = v.clone();
++    w.increment_debian();
++    let expected = format!("{prefix}{}", n + 1);
++    if v.debian_revision.is_some() {
++        assert_eq!(w.debian_revision.as_deref(), Some(expected.as_str()), "{text}");
++        assert_eq!(w.upstream_version, v.upstream_version);
++    } else {
++        assert_eq!(w.upstream_version, expected, "{text}");
++        assert!(w.is_native());
++    }
++    assert_eq!(w.epoch, v.epoch);
++    assert!(w > v, "{w} > {v}");
++    assert_eq!(oracle_cmp(&w.to_string(), &text), Ordering::Greater);
++}
++
++/// debversion/3: `increment_debian` parses the trailing number as `i32` and unwraps.
++#[hegel::test]
++fn increment_debian_handles_large_trailing_numbers(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let big = tc.draw(generators::sampled_from(vec!["2147483647", "2147483648", "4294967296", "18446744073709551616"]));
++    let mut w = Version { debian_revision: Some(format!("{big}")), ..v.clone() };
++    let before = w.to_string();
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        w.increment_debian();
++        w
++    }));
++    let w = result.unwrap_or_else(|_| panic!("increment_debian on {before} panicked"));
++    assert!(w > Version::from_str(&before).unwrap(), "{w} after {before}");
++    assert_eq!(oracle_cmp(&w.to_string(), &before), Ordering::Greater);
++}
++
++// --------------------------------------------------------------------------- binNMU / NMU helpers
++
++#[hegel::test]
++fn bin_nmu_suffixes_round_trip(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let part = v.debian_revision.clone().unwrap_or_else(|| v.upstream_version.clone());
++    if part.contains("+b") || part.contains("+nmu") {
++        return; // debversion/4, /5
++    }
++    assert!(!v.is_bin_nmu() && v.bin_nmu_count().is_none(), "{text}");
++    assert!(!v.is_nmu() && v.nmu_count().is_none(), "{text}");
++    let w = v.clone().increment_bin_nmu();
++    assert_eq!(w.to_string(), format!("{v}+b1"));
++    assert!(w.is_bin_nmu() && w.bin_nmu_count() == Some(1), "{w}");
++    assert!(!w.is_nmu(), "{w}");
++    assert!(w > v);
++    assert_eq!(oracle_cmp(&w.to_string(), &text), Ordering::Greater);
++    let k = tc.draw(int!(1u32, 4));
++    let mut x = w.clone();
++    for _ in 0..k {
++        let y = x.clone().increment_bin_nmu();
++        assert!(y > x);
++        x = y;
++    }
++    assert_eq!(x.bin_nmu_count(), Some(1 + k as i32), "{x}");
++    assert_eq!(x.to_string(), format!("{v}+b{}", 1 + k));
++    assert_eq!(x.epoch, v.epoch);
++    assert_eq!(x.is_native(), v.is_native());
++}
++
++/// debversion/4: the binNMU suffix is the *last* `+bN`; `split_once("+b")` finds the first `+b`
++/// (`1.0+beta1+b1` is a binNMU, and `increment_bin_nmu` produced it).
++#[hegel::test]
++fn bin_nmu_count_reads_the_last_suffix(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let infix = tc.draw(generators::sampled_from(vec!["+beta1", "+build2", "+b", "+bzr123", "+b1a"]));
++    let n = tc.draw(int!(1i32, 5));
++    let part = format!("{}{infix}", v.debian_revision.clone().unwrap_or_else(|| v.upstream_version.clone()));
++    if part.contains("+nmu") {
++        return;
++    }
++    let with = if v.debian_revision.is_some() { Version { debian_revision: Some(part.clone()), ..v.clone() } } else { Version { upstream_version: part.clone(), ..v.clone() } };
++    let w = with.clone().increment_bin_nmu();
++    assert_eq!(w.to_string(), format!("{with}+b1"), "increment appends the suffix");
++    assert_eq!(w.bin_nmu_count(), Some(1), "{w} is the binNMU increment_bin_nmu just made");
++    let mut y = w;
++    for _ in 1..n {
++        y = y.increment_bin_nmu();
++    }
++    assert_eq!(y.to_string(), format!("{with}+b{n}"), "{n} increments");
++    assert_eq!(y.bin_nmu_count(), Some(n), "{y}");
++}
++
++/// debversion/5: a binNMU of a sourceful NMU (`1.0-1+nmu1+b1`) is still an NMU.
++#[hegel::test]
++fn nmu_count_survives_a_bin_nmu(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let part = v.debian_revision.clone().unwrap_or_else(|| v.upstream_version.clone());
++    if part.contains("+b") || part.contains("+nmu") {
++        return;
++    }
++    let n = tc.draw(int!(1i32, 3));
++    let nmu = if v.debian_revision.is_some() { Version { debian_revision: Some(format!("{part}+nmu{n}")), ..v.clone() } } else { Version { upstream_version: format!("{part}+nmu{n}"), ..v.clone() } };
++    assert_eq!(nmu.nmu_count(), Some(n), "{nmu}");
++    assert!(nmu.is_nmu());
++    let bin = nmu.clone().increment_bin_nmu();
++    assert_eq!(bin.to_string(), format!("{nmu}+b1"));
++    assert_eq!(bin.bin_nmu_count(), Some(1), "{bin}");
++    assert_eq!(bin.nmu_count(), Some(n), "{bin} is still NMU {n}");
++    assert!(bin.is_nmu(), "{bin}");
++}
++
++// --------------------------------------------------------------------------- DEP-14 git tags
++
++#[hegel::test]
++fn mangled_versions_are_valid_git_tags(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    if !text.starts_with(|c: char| c.is_ascii_digit()) {
++        return; // not a policy version; DEP-14 does not say
++    }
++    let tag = mangle_version_for_git(&v);
++    let text = v.to_string();
++    assert!(!tag.contains('~') && !tag.contains(':'), "{tag}");
++    assert_eq!(tag.matches('%').count(), text.matches(':').count());
++    assert_eq!(tag.matches('_').count(), text.matches('~').count());
++    // DEP-14 mangling is reversible on the simple substitutions
++    let back = tag.replace('_', "~").replace('%', ":");
++    if !text.contains("..") && !text.ends_with('.') && !text.ends_with(".lock") {
++        assert_eq!(back, text);
++    }
++    if text.contains("...") {
++        return; // debversion/6
++    }
++    assert!(git_ref_ok(&tag), "{text} -> {tag} is not a valid git tag name");
++}
++
++/// debversion/6: a run of three or more dots is mangled to `.#..` — still a `..`, which git
++/// refuses in a ref name.
++#[hegel::test]
++fn dot_runs_are_mangled_to_valid_git_tags(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    if !text.starts_with(|c: char| c.is_ascii_digit()) {
++        return;
++    }
++    let dots = ".".repeat(tc.draw(int!(3usize, 6)));
++    let w = Version { upstream_version: format!("{}{dots}{}", v.upstream_version, tc.draw(int!(0u8, 9))), ..v };
++    assert!(Version::from_str(&w.to_string()).is_ok());
++    let tag = mangle_version_for_git(&w);
++    assert!(git_ref_ok(&tag), "{w} -> {tag} is not a valid git tag name");
++}
++
++// --------------------------------------------------------------------------- upstream helpers
++
++#[hegel::composite]
++fn arb_base_upstream(tc: &hegel::TestCase) -> String {
++    let mut s = tc.draw(int!(0u32, 20)).to_string();
++    for _ in 0..tc.draw(int!(0usize, 3)) {
++        s.push('.');
++        s.push_str(&tc.draw(int!(0u32, 20)).to_string());
++    }
++    match tc.draw(int!(0u8, 4)) {
++        0 => s.push_str("~rc1"),
++        1 => s.push_str("+really1.0"),
++        2 => s.push_str("~beta2"),
++        _ => {}
++    }
++    s
++}
++
++#[hegel::composite]
++fn arb_snapshot(tc: &hegel::TestCase) -> VcsSnapshot {
++    match tc.draw(int!(0u8, 2)) {
++        0 => {
++            let date = if tc.draw(int!(0u8, 3)) == 0 { None } else { chrono::NaiveDate::from_ymd_opt(tc.draw(int!(2000i32, 2030)), tc.draw(int!(1u32, 12)), tc.draw(int!(1u32, 28))) };
++            let sha = if tc.draw(int!(0u8, 3)) == 0 {
++                None
++            } else {
++                let n = tc.draw(int!(7usize, 12));
++                Some((0..n).map(|_| b"0123456789abcdef"[tc.draw(int!(0usize, 15))] as char).collect())
++            };
++            let snapshot = if tc.draw(generators::booleans()) { None } else { Some(tc.draw(int!(1usize, 9))) };
++            VcsSnapshot::Git { date, sha, snapshot }
++        }
++        1 => VcsSnapshot::Bzr { revno: if tc.draw(int!(0u8, 3)) == 0 { format!("{}.{}.{}", tc.draw(int!(1u32, 9)), tc.draw(int!(1u32, 9)), tc.draw(int!(1u32, 9))) } else { tc.draw(int!(1u32, 9999)).to_string() } },
++        _ => VcsSnapshot::Svn { revno: tc.draw(int!(1usize, 99999)) },
++    }
++}
++
++/// The suffix `upstream_version_add_revision` writes (the crate's `to_suffix` is private).
++fn suffix_of(s: &VcsSnapshot) -> String {
++    match s {
++        VcsSnapshot::Git { date, sha, snapshot } => {
++            let gitid = sha.as_deref().map(|s| &s[..s.len().min(7)]);
++            match (gitid, snapshot, date) {
++                (Some(id), Some(n), Some(d)) => format!("git{}.{n}.{id}", d.format("%Y%m%d")),
++                (Some(id), None, Some(d)) => format!("git{}.{id}", d.format("%Y%m%d")),
++                (Some(id), _, None) => format!("git{id}"),
++                (None, _, Some(d)) => format!("git{}", d.format("%Y%m%d")),
++                (None, _, None) => "git".to_string(),
++            }
++        }
++        VcsSnapshot::Bzr { revno } => format!("bzr{revno}"),
++        VcsSnapshot::Svn { revno } => format!("svn{revno}"),
++    }
++}
++
++/// What `get_revision` should read back: the sha cut to 7 characters.
++fn normalized(s: &VcsSnapshot) -> VcsSnapshot {
++    match s {
++        VcsSnapshot::Git { date, sha, snapshot } => VcsSnapshot::Git { date: *date, sha: sha.as_deref().map(|s| s[..s.len().min(7)].to_string()), snapshot: *snapshot },
++        other => other.clone(),
++    }
++}
++
++/// debversion/7: `get_revision` only reads back `git<date>.<sha>`, `git<date>.<n>.<sha>`,
++/// `bzr<digits>` and `svn<digits>` — not the date-only, sha-only or bare `git` suffixes that
++/// `upstream_version_add_revision` writes, nor a dotted bzr revno.
++fn hits_unreadable_suffix_bug(s: &VcsSnapshot) -> bool {
++    match s {
++        VcsSnapshot::Git { date, sha, .. } => date.is_none() || sha.is_none(),
++        VcsSnapshot::Bzr { revno } => !revno.bytes().all(|b| b.is_ascii_digit()),
++        VcsSnapshot::Svn { .. } => false,
++    }
++}
++
++#[hegel::test]
++fn vcs_snapshot_suffixes_are_written_and_read_consistently(tc: hegel::TestCase) {
++    let base = tc.draw(arb_base_upstream());
++    let snap = tc.draw(arb_snapshot().print_as_debug());
++    let dir = if tc.draw(generators::booleans()) { Direction::After } else { Direction::Before };
++    assert_eq!(get_revision(&base), (base.as_str(), None), "a plain version has no snapshot");
++    let written = upstream_version_add_revision(&base, snap.clone(), Some(dir.clone()));
++    assert_eq!(written, format!("{base}{}{}", dir.as_str(), suffix_of(&snap)));
++    assert!(Version::from_str(&written).is_ok(), "{written}");
++    assert!(Version::from_str(&written).unwrap() > Version::from_str(&base).unwrap() || dir == Direction::Before);
++    assert!(Version::from_str(&written).unwrap() < Version::from_str(&base).unwrap() || dir == Direction::After);
++    if hits_unreadable_suffix_bug(&snap) {
++        return; // debversion/7
++    }
++    let (read_base, read) = get_revision(&written);
++    assert_eq!(read_base, base, "{written}");
++    assert_eq!(read, Some((dir.clone(), normalized(&snap))), "{written}");
++    // updating replaces the suffix instead of stacking a second one
++    let snap2 = tc.draw(arb_snapshot().print_as_debug());
++    let updated = upstream_version_add_revision(&written, snap2.clone(), None);
++    assert!(updated.starts_with(&format!("{base}{}", dir.as_str())), "{written} -> {updated}");
++    let rest = &updated[base.len() + 1..];
++    assert_eq!(rest.matches("git").count() + rest.matches("bzr").count() + rest.matches("svn").count(), 1, "{written} -> {updated}");
++    // an explicit direction wins, a default keeps the current one
++    let redirected = upstream_version_add_revision(&written, snap2, Some(Direction::After));
++    assert!(redirected.starts_with(&format!("{base}+")), "{redirected}");
++}
++
++/// debversion/7 pinned: every suffix `upstream_version_add_revision` writes is read back by
++/// `get_revision`, so a second update replaces it rather than appending another.
++#[hegel::test]
++fn every_written_snapshot_suffix_is_read_back(tc: hegel::TestCase) {
++    let base = tc.draw(arb_base_upstream());
++    let snap = tc.draw(arb_snapshot().print_as_debug());
++    if matches!(snap, VcsSnapshot::Git { sha: None, date: None, .. }) {
++        return; // a bare `git` carries no information to read back
++    }
++    let written = upstream_version_add_revision(&base, snap.clone(), None);
++    let (read_base, read) = get_revision(&written);
++    assert_eq!((read_base, read), (base.as_str(), Some((Direction::After, normalized(&snap)))), "{written}");
++    let again = upstream_version_add_revision(&written, snap.clone(), None);
++    assert_eq!(again.matches("git").count() + again.matches("bzr").count() + again.matches("svn").count(), 1, "{written} -> {again}");
++}
++
++/// debversion/8: `get_revision` unwraps the svn revision number into a `usize`.
++#[hegel::test]
++fn svn_revisions_beyond_usize_do_not_panic(tc: hegel::TestCase) {
++    let base = tc.draw(arb_base_upstream());
++    let digits = tc.draw(generators::sampled_from(vec!["18446744073709551616", "99999999999999999999999", "184467440737095516150"]));
++    let text = format!("{base}+svn{digits}");
++    assert!(Version::from_str(&text).is_ok());
++    let result = std::panic::catch_unwind(|| get_revision(&text).0.to_string());
++    let read_base = result.unwrap_or_else(|_| panic!("get_revision({text}) panicked"));
++    assert!(read_base == base || read_base == text, "{text} -> {read_base}");
++}
++
++#[hegel::test]
++fn dfsg_suffixes_round_trip(tc: hegel::TestCase) {
++    let base = tc.draw(arb_base_upstream());
++    let old = tc.draw(generators::sampled_from(vec![None, Some("1.0+dfsg1"), Some("1.0+dfsg"), Some("1.0+ds1"), Some("1.0~ds3"), Some("1.0+ds"), Some("1.0"), Some("1.0+dfsg12")]));
++    assert_eq!(strip_dfsg_suffix(&base), None, "{base}");
++    let with = add_dfsg_suffix(&base, old);
++    assert_eq!(strip_dfsg_suffix(&with), Some(base.as_str()), "{with}");
++    let style = old.and_then(|o| o.find(['+', '~']).map(|i| &o[i..])).filter(|s| s.starts_with("+dfsg") || s.starts_with("+ds") || s.starts_with("~ds") || s.starts_with("~dfsg"));
++    match style {
++        None => assert!(with.ends_with("+ds"), "{with}"),
++        Some(s) => {
++            let kind: String = s.chars().take_while(|c| !c.is_ascii_digit()).collect();
++            let numbered = s.len() > kind.len();
++            assert_eq!(with, format!("{base}{kind}{}", if numbered { "1" } else { "" }), "style {s}");
++        }
++    }
++    assert!(Version::from_str(&with).is_ok());
++    assert!(Version::from_str(&with).unwrap() > Version::from_str(&base).unwrap() || with.contains('~'));
++}
++
++#[hegel::test]
++fn vendors_round_trip(tc: hegel::TestCase) {
++    let vendor = tc.draw(generators::sampled_from(vec![Vendor::Debian, Vendor::Ubuntu, Vendor::Kali]).print_as_debug());
++    let shown = vendor.to_string();
++    assert_eq!(Vendor::from_str(&shown), Ok(vendor));
++    assert_eq!(Vendor::from_str(&shown.to_lowercase()), Ok(vendor));
++    assert_eq!(Vendor::from_str(&shown.to_uppercase()), Ok(vendor));
++    let junk = tc.draw(arb_word());
++    if Vendor::from_str(&junk).is_ok() {
++        assert!(junk.eq_ignore_ascii_case("debian") || junk.eq_ignore_ascii_case("ubuntu") || junk.eq_ignore_ascii_case("kali"));
++    } else {
++        assert_eq!(Vendor::from_str(&junk).unwrap_err().to_string(), format!("Unknown vendor: {junk}"));
++    }
++    let rev = initial_debian_revision(vendor);
++    let base = tc.draw(arb_base_upstream());
++    let v = Version::from_str(&format!("{base}-{rev}")).unwrap();
++    assert_eq!(v.debian_revision.as_deref(), Some(rev));
++    assert!(v > Version::from_str(&base).unwrap());
++    let mut w = v.clone();
++    w.increment_debian();
++    assert!(w > v);
++    assert_eq!(Direction::from("~"), Direction::Before);
++    assert_eq!(Direction::from("+"), Direction::After);
++    assert_eq!(<&str>::from(Direction::Before), "~");
++}
++
++/// debversion/1 pinned: dpkg skips leading zeros before comparing digit runs, so a missing run
++/// equals a run of zeros — `1.` == `1.0`, `1.0a` == `1.0a0`, `1.0-1` == `1.0-1.00`.
++#[hegel::test]
++fn empty_digit_runs_compare_equal_to_zeros(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let zeros = "0".repeat(tc.draw(int!(1usize, 3)));
++    let (short, long) = match tc.draw(int!(0u8, 2)) {
++        0 => (format!("{}.", v.upstream_version), format!("{}.{zeros}", v.upstream_version)),
++        1 => (format!("{}a", v.upstream_version), format!("{}a{zeros}", v.upstream_version)),
++        _ => (format!("{}~", v.upstream_version), format!("{}~{zeros}", v.upstream_version)),
++    };
++    let (a, b) = (Version { upstream_version: short, ..v.clone() }, Version { upstream_version: long, ..v.clone() });
++    assert_eq!(oracle_cmp(&a.to_string(), &b.to_string()), Ordering::Equal, "dpkg on {a} vs {b}");
++    assert_eq!(a.cmp(&b), Ordering::Equal, "{a} vs {b}");
++    assert_eq!(a, b);
++}
++
++/// debversion/2 pinned: the strict parser (`FromStr`, "enforces strict Debian Policy
++/// compliance") accepts texts dpkg refuses: a colon without a numeric epoch, an empty
++/// revision, an empty upstream version, an epoch beyond `INT_MAX`.
++#[hegel::test]
++fn strict_parser_rejects_what_dpkg_rejects(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let bad = match tc.draw(int!(0u8, 4)) {
++        0 => format!("{}:{}", v.upstream_version, tc.draw(int!(0u8, 9))),
++        1 => format!("{text}-"),
++        2 => format!("{}:-{}", v.epoch.unwrap_or(1), v.upstream_version),
++        3 => format!("{text}-:{}", tc.draw(int!(0u8, 9))),
++        _ => format!("{}:{}", tc.draw(generators::sampled_from(vec!["2147483648", "4294967295"])), v.upstream_version.split(':').next_back().unwrap()),
++    };
++    let Some(false) = dpkg_valid(&bad) else {
++        return; // dpkg accepts (e.g. the upstream part already carried an epoch's colon)
++    };
++    assert!(Version::from_str(&bad).is_err(), "{bad:?} parses as {:?}", Version::from_str(&bad).map(|v| (v.epoch, v.upstream_version, v.debian_revision)));
++}
++
++/// debversion/9: `canonicalize` drops an explicit `0:` epoch and a `-0` revision even when the
++/// upstream part contains a colon or a hyphen and so needs them: `0:1.0:2` -> `1.0:2` (dpkg:
++/// "epoch in version is not number"), `1.0--0` -> `1.0-` ("revision number is empty"),
++/// `1.0-1-0` -> `1.0-1`, a different version.
++#[hegel::test]
++fn canonicalize_keeps_the_separators_the_upstream_needs(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let plain = v.upstream_version.split([':', '-']).next().unwrap().to_string();
++    let w = match tc.draw(int!(0u8, 2)) {
++        0 => Version { epoch: Some(0), upstream_version: format!("{plain}:{}", tc.draw(int!(0u8, 9))), debian_revision: v.debian_revision.clone() },
++        1 => Version { epoch: v.epoch, upstream_version: format!("{plain}-"), debian_revision: Some("0".repeat(tc.draw(int!(1usize, 2)))) },
++        _ => Version { epoch: v.epoch, upstream_version: format!("{plain}-{}", tc.draw(int!(0u8, 9))), debian_revision: Some("0".to_string()) },
++    };
++    let shown = w.to_string();
++    assert_eq!(dpkg_valid(&shown), Some(true), "{shown}");
++    let c = w.canonicalize();
++    assert_eq!(dpkg_valid(&c.to_string()), Some(true), "{shown} canonicalized to {c}, which dpkg refuses");
++    assert_eq!(oracle_cmp(&c.to_string(), &shown), Ordering::Equal, "{c} vs {shown}");
++    assert_eq!(Version::from_str(&c.to_string()).map(|x| parts(&x)), Ok(parts(&c)), "{c} does not read back");
++}
