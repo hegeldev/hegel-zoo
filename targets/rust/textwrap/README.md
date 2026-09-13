@@ -50,3 +50,4 @@
   line with trailing whitespace the docs say is discarded, and re-wrapping differs. Pinned as an
   intermittent expected failure.
 - 2026-09-13: base bumped 7debe996ca88 → 85da244320f3 (2026-09-13, "Merge pull request #632 from xtqqczze/lint-fuzz"; 0.16.3); 2 bug(s) still reproduce. 233 tests pass.
+- 2026-09-13: base bumped 85da244320f3 → 932bd45e244d (2026-09-13, "Merge pull request #634 from mgeisler/update_dprint_plugins"; 0.16.3); 2 bug(s) still reproduce. 233 tests pass.
