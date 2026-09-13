@@ -40,3 +40,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped f296bc36b18d → f532eadfc228 (2026-09-13, "cli: diff: add utility command for comparing materialized files"; 0.45.1); 0 bug(s) still reproduce; fixed upstream: jj/1. 1957 tests pass. jj/1 is fixed (issue #9868, someone reported the same lone-CR loss): the generated round-trip property covers lone CRs again. Upstream split `dag_walk`, `diff` and `merge` into the new `jj-core` crate; the patch's properties for them moved along and `[run] command` now tests `-p jj-core` too.
 - 2026-09-13: base bumped f532eadfc228 → bd3d537a6308 (2026-09-13, "windows: don't attach an invisible console to subprocesses"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
+- 2026-09-13: base bumped bd3d537a6308 → 8504a124e3ca (2026-09-13, "docs: restore backend::Commit hyperlink"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
