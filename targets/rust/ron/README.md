@@ -40,3 +40,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1. Eight upstream
   `from_str(&to_string(&std::T::MIN/MAX)...)` calls in `tests/min_max.rs` got an explicit `from_str::<T>`: with
   hegeltest's `serde_json` in scope the deserialized type is ambiguous (E0283).
+- 2026-09-13: base bumped 31529b8b8d8c → 7cf000afe4de (2026-09-09, "Fix Miri aliasing UB in test_deeply_nested_struct (#620)"; 0.12.2); 1 bug(s) still reproduce. 470 tests pass. The patch's hunk for `tests/307_stack_overflow.rs` used to be a binary hunk (the upstream file carried a raw NUL byte in a fuzz string, which git cannot merge); upstream replaced the NUL with `\0`, the zoo's module was re-applied onto the text file, and the hunk is now a plain text diff.
