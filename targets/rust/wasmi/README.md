@@ -34,3 +34,4 @@
 - 2026-07-22: predecessor base commit `bd3732cea636` (Move `ArenaKey` and impls into its own submodule (#1989)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/wasmi.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped bd3732cea636 → 2970aa871cc1 (2026-09-01, "Fix release date (#2033)"; 2.0.0); 0 bug(s) still reproduce. 130 tests pass.
