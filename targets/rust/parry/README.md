@@ -39,3 +39,8 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/parry.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 8436f7c21875 → 3609fcc6bffe (2026-09-03, "compound pseudo normals (2d and 3d) (#442)"; 0.30.2); 0 bug(s) still reproduce; fixed upstream: parry/1. 641 tests pass. The 0.30.1 fix to closest_points_cuboid_cuboid makes cuboid-cuboid distances exact and symmetric; the property that found parry/1 no longer excludes cuboid pairs.
+- 2026-09-13: a 10× budget run (`--test-cases 1000`) failed `prop_triangle_projection_is_idempotent`:
+  new bug **parry/2** — in 2D, `Triangle::project_local_point(pt, false)` for a point inside a
+  sliver triangle chooses the closest edge from `|ap|² − |proj|²` per edge, which cancels
+  catastrophically in f32, so a point lying on edge *ca* is re-projected onto edge *bc* 2.2e−3
+  away. Pinned as an intermittent expected failure.
