@@ -35,3 +35,4 @@
 - 2026-07-23: predecessor base commit `1c8295c992c5` (feat: Support Union type in approx_distinct (#23714)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/datafusion.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 1c8295c992c5 → a407990b4443 (2026-09-12, "fix: out-of-bounds read in ArrowBytesMap on a short/long hash collision (#25218)"; 55.0.0); 1 bug(s) still reproduce; add/add conflicts in datafusion/common/src/scalar/mod.rs, datafusion/common/src/stats.rs resolved by keeping both sides. 623 tests pass.
