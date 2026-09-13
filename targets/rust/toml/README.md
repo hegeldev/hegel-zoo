@@ -18,3 +18,4 @@
 - 2026-07-16: predecessor base commit `a0c14f4b6a46` (chore(deps): Update Prek to v0.4.10 (#1190)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/toml.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped a0c14f4b6a46 → 8e1d5a85c361 (2026-09-10, "chore: Release"; 1.1.6+spec-1.1.0); 1 bug(s) still reproduce; 2 ignored reproducer(s) not run. 1366 tests pass. The run command must name the crate as `toml@<version>` because the workspace also carries toml 0.5.11 (a compatibility test fixture), so each bump has to move that pin (1.1.3 → 1.1.6).
