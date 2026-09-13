@@ -1,0 +1,1150 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f1dee73..dff3d3c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,4 +24,6 @@ unscanny = { version = "0.1.0" }
+ version-ranges = { version = "0.1.1", optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
+ indoc = { version = "2.0.5" }
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..7aef1a1
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,1133 @@
++//! Hegel properties for `pep440_rs`.
++//!
++//! Oracle: Python's `packaging` (the PEP 440 reference implementation, `packaging.version` and
++//! `packaging.specifiers`), driven as one persistent `python3` child process: version parsing
++//! and normalisation, ordering, and specifier containment with `prereleases=True` (the crate
++//! implements the operator semantics and leaves the pre-release policy to the caller).
++//! Alongside: the crate's own invariants (Display round trips, `Ord`/`Eq`/`Hash`, the builders)
++//! and, with the `version-ranges` feature, agreement between `VersionSpecifier::contains` and
++//! the `Ranges<Version>` conversion.
++#![allow(clippy::all, dead_code)]
++
++use hegel::generators;
++use pep440_rs::{
++    LocalSegment, Operator, Prerelease, PrereleaseKind, Version, VersionPattern, VersionSpecifier, VersionSpecifiers, MIN_VERSION,
++};
++use std::cmp::Ordering;
++use std::hash::{DefaultHasher, Hash, Hasher};
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys
++from packaging.version import Version, InvalidVersion
++from packaging.specifiers import Specifier, SpecifierSet, InvalidSpecifier
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def flag(b):
++    return 'true' if b else 'false'
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'V':
++            v = Version(args[0])
++            pre = '' if v.pre is None else f'{v.pre[0]}{v.pre[1]}'
++            out = ['ok', str(v), str(v.epoch), '.'.join(map(str, v.release)), pre,
++                   '' if v.post is None else str(v.post), '' if v.dev is None else str(v.dev), v.local or '']
++        elif cmd == 'C':
++            a, b = Version(args[0]), Version(args[1])
++            out = ['ok', '-1' if a < b else ('1' if a > b else '0')]
++        elif cmd == 'S':
++            s = Specifier(args[0])
++            out = ['ok'] + [flag(s.contains(Version(a), prereleases=True)) for a in args[1:]]
++        elif cmd == 'SS':
++            s = SpecifierSet(args[0])
++            out = ['ok'] + [flag(s.contains(Version(a), prereleases=True)) for a in args[1:]]
++        else:
++            out = ['bad', cmd]
++    except (InvalidVersion, InvalidSpecifier):
++        out = ['err']
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let mut child = Command::new("python3")
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("python3 with the `packaging` module is needed as the PEP 440 oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++/// Ask the oracle; returns the status and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?}); is `packaging` installed for python3?");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(status == "ok" || status == "err", "oracle said {reply:?} to {line:?}");
++    (status, it.map(unhex).collect())
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct PyVersion {
++    normalized: String,
++    epoch: u64,
++    release: Vec<u64>,
++    pre: String,
++    post: Option<u64>,
++    dev: Option<u64>,
++    local: String,
++}
++
++fn py_version(text: &str) -> Option<PyVersion> {
++    let (status, f) = ask("V", &[text]);
++    if status == "err" {
++        return None;
++    }
++    let opt = |s: &str| if s.is_empty() { None } else { Some(s.parse::<u64>().unwrap()) };
++    Some(PyVersion {
++        normalized: f[0].clone(),
++        epoch: f[1].parse().unwrap(),
++        release: f[2].split('.').map(|n| n.parse().unwrap()).collect(),
++        pre: f[3].clone(),
++        post: opt(&f[4]),
++        dev: opt(&f[5]),
++        local: f[6].clone(),
++    })
++}
++
++fn py_cmp(a: &str, b: &str) -> Ordering {
++    let (status, f) = ask("C", &[a, b]);
++    assert_eq!(status, "ok", "{a} vs {b}");
++    match f[0].as_str() {
++        "-1" => Ordering::Less,
++        "0" => Ordering::Equal,
++        _ => Ordering::Greater,
++    }
++}
++
++/// `None` when the specifier is invalid for `packaging`; otherwise containment per candidate.
++fn py_contains(set: bool, spec: &str, candidates: &[String]) -> Option<Vec<bool>> {
++    let mut args: Vec<&str> = vec![spec];
++    args.extend(candidates.iter().map(String::as_str));
++    let (status, f) = ask(if set { "SS" } else { "S" }, &args);
++    if status == "err" {
++        return None;
++    }
++    Some(f.iter().map(|s| s == "true").collect())
++}
++
++// --------------------------------------------------------------------------- generators
++
++const WS: [&str; 6] = [" ", "  ", "\t", "\n", "\r", "\x0C"];
++const PRE_SPELLINGS: [&str; 14] = ["a", "b", "c", "rc", "alpha", "beta", "pre", "preview", "A", "B", "RC", "Alpha", "BETA", "Pre"];
++const POST_SPELLINGS: [&str; 6] = ["post", "rev", "r", "POST", "Rev", "R"];
++const DEV_SPELLINGS: [&str; 3] = ["dev", "DEV", "Dev"];
++const LOCAL_WORDS: [&str; 10] = ["local", "ubuntu", "abc", "ABC", "g1a2b3", "deadbeef", "x", "Z9", "cu118", "aBc"];
++const JUNK: [&str; 12] = ["x", "..", ".", "+", "-", "!", "*", "ä", "🙈", " 1", "1.0", "a1"];
++
++#[hegel::composite]
++fn arb_number(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 11)) {
++        0 => "0".to_string(),
++        1 => "00".to_string(),
++        2 => format!("0{}", tc.draw(int!(0u32, 99))),
++        3 => "65535".to_string(),
++        4 => "65536".to_string(),
++        5 => "255".to_string(),
++        6 => "256".to_string(),
++        7 => u64::MAX.to_string(),
++        8 => "18446744073709551616".to_string(), // u64::MAX + 1
++        9 => "2097152".to_string(),               // 2^21, beyond the small suffix field
++        _ => tc.draw(int!(0u32, 30)).to_string(),
++    }
++}
++
++#[hegel::composite]
++fn arb_sep(tc: &hegel::TestCase) -> String {
++    tc.draw(generators::sampled_from(vec!["", ".", "-", "_"])).to_string()
++}
++
++/// Any spelling PEP 440's normalisation accepts, with a small dose of junk.
++#[hegel::composite]
++fn arb_version_text(tc: &hegel::TestCase) -> String {
++    let mut s = String::new();
++    if tc.draw(int!(0u8, 5)) == 0 {
++        s.push_str(WS[tc.draw(int!(0usize, WS.len() - 1))]);
++    }
++    if tc.draw(int!(0u8, 4)) == 0 {
++        s.push(if tc.draw(generators::booleans()) { 'v' } else { 'V' });
++    }
++    if tc.draw(int!(0u8, 5)) == 0 {
++        s.push_str(&tc.draw(arb_number()));
++        s.push('!');
++    }
++    let k = tc.draw(int!(1usize, 5));
++    for i in 0..k {
++        if i > 0 {
++            s.push('.');
++        }
++        s.push_str(&tc.draw(arb_number()));
++    }
++    if tc.draw(int!(0u8, 2)) == 0 {
++        s.push_str(&tc.draw(arb_sep()));
++        s.push_str(PRE_SPELLINGS[tc.draw(int!(0usize, PRE_SPELLINGS.len() - 1))]);
++        s.push_str(&tc.draw(arb_sep()));
++        if tc.draw(int!(0u8, 3)) != 0 {
++            s.push_str(&tc.draw(arb_number()));
++        }
++    }
++    if tc.draw(int!(0u8, 2)) == 0 {
++        if tc.draw(int!(0u8, 3)) == 0 {
++            s.push('-');
++            s.push_str(&tc.draw(arb_number()));
++        } else {
++            s.push_str(&tc.draw(arb_sep()));
++            s.push_str(POST_SPELLINGS[tc.draw(int!(0usize, POST_SPELLINGS.len() - 1))]);
++            s.push_str(&tc.draw(arb_sep()));
++            if tc.draw(int!(0u8, 3)) != 0 {
++                s.push_str(&tc.draw(arb_number()));
++            }
++        }
++    }
++    if tc.draw(int!(0u8, 2)) == 0 {
++        s.push_str(&tc.draw(arb_sep()));
++        s.push_str(DEV_SPELLINGS[tc.draw(int!(0usize, DEV_SPELLINGS.len() - 1))]);
++        s.push_str(&tc.draw(arb_sep()));
++        if tc.draw(int!(0u8, 3)) != 0 {
++            s.push_str(&tc.draw(arb_number()));
++        }
++    }
++    if tc.draw(int!(0u8, 3)) == 0 {
++        s.push('+');
++        let k = tc.draw(int!(1usize, 3));
++        for i in 0..k {
++            if i > 0 {
++                s.push_str(tc.draw(generators::sampled_from(vec![".", "-", "_"])));
++            }
++            if tc.draw(generators::booleans()) {
++                s.push_str(LOCAL_WORDS[tc.draw(int!(0usize, LOCAL_WORDS.len() - 1))]);
++            } else {
++                s.push_str(&tc.draw(arb_number()));
++            }
++        }
++    }
++    if tc.draw(int!(0u8, 5)) == 0 {
++        s.push_str(WS[tc.draw(int!(0usize, WS.len() - 1))]);
++    }
++    if tc.draw(int!(0u8, 7)) == 0 {
++        // junk somewhere
++        let junk = JUNK[tc.draw(int!(0usize, JUNK.len() - 1))];
++        let at = tc.draw(int!(0usize, s.len()));
++        let at = (at..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap();
++        s.insert_str(at, junk);
++    }
++    s
++}
++
++/// True when a number before any local part does not fit a `u64` — the crate's documented
++/// limit (`packaging` uses Python integers), so such texts are checked separately.
++fn beyond_u64(text: &str) -> bool {
++    let public = text.split('+').next().unwrap();
++    let mut run = String::new();
++    for c in public.chars().chain(std::iter::once(' ')) {
++        if c.is_ascii_digit() {
++            run.push(c);
++        } else {
++            if !run.is_empty() && run.parse::<u64>().is_err() {
++                return true;
++            }
++            run.clear();
++        }
++    }
++    false
++}
++
++/// A text that both implementations parse (no junk, no oversize numbers).
++#[hegel::composite]
++fn arb_valid_version_text(tc: &hegel::TestCase) -> String {
++    for _ in 0..6 {
++        let t = tc.draw(arb_version_text());
++        if !beyond_u64(&t) && Version::from_str(&t).is_ok() {
++            return t;
++        }
++    }
++    "1.0".to_string()
++}
++
++/// A version near `base`: same release with the suffixes changed, a neighbouring number, an
++/// extra segment, another epoch, a local part.
++#[hegel::composite]
++fn arb_related(tc: &hegel::TestCase, base: &Version) -> String {
++    let mut release: Vec<u64> = base.release().to_vec();
++    match tc.draw(int!(0u8, 6)) {
++        0 => {
++            let i = tc.draw(int!(0usize, release.len() - 1));
++            release[i] = release[i].saturating_add(1);
++        }
++        1 => {
++            let i = tc.draw(int!(0usize, release.len() - 1));
++            release[i] = release[i].saturating_sub(1);
++        }
++        2 => release.push(tc.draw(int!(0u64, 2))),
++        3 => {
++            if release.len() > 1 {
++                release.pop();
++            }
++        }
++        _ => {}
++    }
++    let mut s = String::new();
++    let epoch = if tc.draw(int!(0u8, 5)) == 0 { tc.draw(int!(0u64, 2)) } else { base.epoch() };
++    if epoch != 0 {
++        s.push_str(&format!("{epoch}!"));
++    }
++    s.push_str(&release.iter().map(u64::to_string).collect::<Vec<_>>().join("."));
++    let keep = tc.draw(generators::booleans());
++    if keep {
++        if let Some(p) = base.pre() {
++            s.push_str(&format!("{p}"));
++        }
++        if let Some(p) = base.post() {
++            s.push_str(&format!(".post{p}"));
++        }
++        if let Some(d) = base.dev() {
++            s.push_str(&format!(".dev{d}"));
++        }
++    } else {
++        if tc.draw(int!(0u8, 2)) == 0 {
++            s.push_str(tc.draw(generators::sampled_from(vec!["a0", "a1", "b2", "rc1", "rc0", "a3"])));
++        }
++        if tc.draw(int!(0u8, 2)) == 0 {
++            s.push_str(tc.draw(generators::sampled_from(vec![".post0", ".post1", ".post2"])));
++        }
++        if tc.draw(int!(0u8, 2)) == 0 {
++            s.push_str(tc.draw(generators::sampled_from(vec![".dev0", ".dev1", ".dev5"])));
++        }
++    }
++    if tc.draw(int!(0u8, 3)) == 0 {
++        s.push_str(tc.draw(generators::sampled_from(vec!["+local", "+1", "+local.1", "+abc.def", "+0", "+z"])));
++    }
++    s
++}
++
++fn hash_of<T: Hash>(t: &T) -> u64 {
++    let mut h = DefaultHasher::new();
++    t.hash(&mut h);
++    h.finish()
++}
++
++/// Releases compare with zero padding.
++fn same_release(a: &Version, b: &Version) -> bool {
++    let n = a.release().len().max(b.release().len());
++    (0..n).all(|i| a.release().get(i).copied().unwrap_or(0) == b.release().get(i).copied().unwrap_or(0))
++}
++
++/// PEP 440 (and `packaging` 26): `<V` admits every version below `V` except the pre-releases
++/// of `V` itself when `V` is not one — those at or above `V.dev0`.
++fn should_be_less_than(spec_version: &Version, candidate: &Version) -> bool {
++    candidate < spec_version && !(!spec_version.any_prerelease() && candidate.any_prerelease() && *candidate >= spec_version.clone().with_dev(Some(0)))
++}
++
++/// PEP 440 (and `packaging` 26): `>V` admits every version above `V` except the post-releases
++/// of `V` itself when `V` is not one — same epoch, release and pre-release, `V` without dev.
++fn should_be_greater_than(spec_version: &Version, candidate: &Version) -> bool {
++    let post_of_v = !spec_version.is_post() && !spec_version.is_dev() && candidate.is_post() && candidate.epoch() == spec_version.epoch() && same_release(spec_version, candidate) && candidate.pre() == spec_version.pre();
++    candidate > spec_version && !post_of_v
++}
++
++/// pep440_rs/1: `<V` rejects every pre-release of the same release below `V` — `1.0a1` for
++/// `<1.0a2`, `1.0.dev1` for `<1.0.dev2`, `1.0a1` for `<1.0.post1`, `1.0a1` for `<1!1.0` —
++/// although only the pre-releases of `V` itself are to be excluded.
++fn hits_less_than_prerelease_bug(spec: &VersionSpecifier, candidate: &Version) -> bool {
++    let v = spec.version();
++    *spec.operator() == Operator::LessThan && candidate.any_prerelease() && same_release(v, candidate) && should_be_less_than(v, candidate)
++}
++
++/// pep440_rs/2, /3 and /10: the `Ranges` conversion of `<X.postN`, of `>X.postN` (its lower
++/// bound skips `X.postN+1.devM`), and of specifiers whose numbers are `u64::MAX` where the
++/// conversion adds one.
++fn hits_range_bug(spec: &VersionSpecifier) -> bool {
++    let v = spec.version();
++    let release = v.release();
++    match spec.operator() {
++        Operator::LessThan => v.is_post() && !v.any_prerelease(),
++        Operator::GreaterThan => v.dev() == Some(u64::MAX) || (v.dev().is_none() && v.is_post()),
++        Operator::EqualStar | Operator::NotEqualStar => release.last() == Some(&u64::MAX),
++        Operator::TildeEqual => release.len() >= 2 && release[release.len() - 2] == u64::MAX,
++        _ => false,
++    }
++}
++
++/// pep440_rs/6: `>V` rejects every post-release of the same release above `V` — `1.0.post1`
++/// and `1.0a2.post1` for `>1.0a1`, `1.0.post1.dev0` for `>1.0.dev1` — although only the
++/// post-releases of `V` itself are to be excluded.
++fn hits_greater_than_prerelease_bug(spec: &VersionSpecifier, candidate: &Version) -> bool {
++    let v = spec.version();
++    *spec.operator() == Operator::GreaterThan && candidate.is_post() && !v.is_post() && candidate.epoch() == v.epoch() && same_release(v, candidate) && should_be_greater_than(v, candidate)
++}
++
++/// pep440_rs/7: `0.devN` sorts below `MIN_VERSION` (`0a0.dev0`).
++fn below_min_version(v: &Version) -> bool {
++    v.epoch() == 0 && v.release().iter().all(|&n| n == 0) && v.is_dev() && !v.is_pre() && !v.is_post()
++}
++
++/// pep440_rs/8: `==X.Y.*` compares only as many release parts as the candidate has, so a
++/// shorter candidate is not zero-padded (`==1.2.*` matches `1`).
++fn hits_star_padding_bug(spec: &VersionSpecifier, candidate: &Version) -> bool {
++    let v = spec.version();
++    spec.operator().is_star()
++        && v.epoch() == candidate.epoch()
++        && candidate.release().len() < v.release().len()
++        && v.release()[..candidate.release().len()] == *candidate.release()
++        && v.release()[candidate.release().len()..].iter().any(|&n| n != 0)
++}
++
++/// pep440_rs/9: a dev number of `u64::MAX` on a pre- or post-release is the sort key's "no
++/// dev" sentinel, so `1.0.post2.dev18446744073709551615 == 1.0.post2`.
++fn has_max_dev(v: &Version) -> bool {
++    v.dev() == Some(u64::MAX) && (v.is_pre() || v.is_post())
++}
++
++/// pep440_rs/4: blank items in a comma list.
++fn has_blank_item(text: &str) -> bool {
++    !text.is_empty() && text.split(',').any(|i| i.trim().is_empty())
++}
++
++/// pep440_rs/5: an all-digit local segment beyond u64 becomes a string segment.
++fn has_oversize_local(text: &str) -> bool {
++    match text.split_once('+') {
++        Some((_, local)) => local.trim().split(['.', '-', '_']).any(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) && seg.parse::<u64>().is_err()),
++        None => false,
++    }
++}
++
++fn parts(v: &Version) -> (u64, Vec<u64>, String, Option<u64>, Option<u64>, String) {
++    (
++        v.epoch(),
++        v.release().to_vec(),
++        v.pre().map(|p| p.to_string()).unwrap_or_default(),
++        v.post(),
++        v.dev(),
++        v.local().iter().map(ToString::to_string).collect::<Vec<_>>().join("."),
++    )
++}
++
++// --------------------------------------------------------------------------- parsing
++
++#[hegel::test]
++fn versions_parse_and_normalize_like_packaging(tc: hegel::TestCase) {
++    let text = tc.draw(arb_version_text());
++    let ours = Version::from_str(&text);
++    if beyond_u64(&text) {
++        // the crate's documented limit: numbers must fit a u64
++        if ask("V", &[&text]).0 == "ok" {
++            let err = ours.expect_err("a number beyond u64 must be an error");
++            assert!(err.to_string().contains("exceeds"), "{text:?}: {err}");
++        }
++        return;
++    }
++    let theirs = py_version(&text);
++    match (&ours, &theirs) {
++        (Ok(v), Some(py)) => {
++            assert_eq!(v.to_string(), py.normalized, "normalized form of {text:?}");
++            assert_eq!(parts(v), (py.epoch, py.release.clone(), py.pre.clone(), py.post, py.dev, py.local.clone()), "parts of {text:?}");
++            assert_eq!(v.is_local(), !py.local.is_empty());
++            assert_eq!(v.is_pre(), !py.pre.is_empty());
++            assert_eq!(v.is_post(), py.post.is_some());
++            assert_eq!(v.is_dev(), py.dev.is_some());
++            assert_eq!(v.any_prerelease(), v.is_pre() || v.is_dev());
++            assert_eq!(v.is_stable(), !v.any_prerelease());
++            // the normalized form parses back to the same version, and is a fixed point
++            let again = Version::from_str(&py.normalized).unwrap();
++            assert_eq!(again, *v);
++            assert_eq!(again.to_string(), py.normalized);
++            assert_eq!(hash_of(&again), hash_of(v));
++            // the pattern parser agrees on verbatim texts
++            let pat = VersionPattern::from_str(&text).unwrap();
++            assert!(!pat.is_wildcard());
++            assert_eq!(pat.version(), v);
++            // the local segments are numbers when they are digits
++            for seg in v.local() {
++                match seg {
++                    LocalSegment::Number(n) => assert!(n.to_string().len() <= 20),
++                    LocalSegment::String(s) => {
++                        assert!(s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{s}");
++                        assert!(s.parse::<u64>().is_err(), "{s} is a number");
++                    }
++                }
++            }
++            if !below_min_version(v) {
++                assert!(*MIN_VERSION <= *v, "{text:?} below MIN_VERSION");
++            }
++        }
++        (Err(_), None) => {
++            // the error message names the problem
++            assert!(!ours.as_ref().unwrap_err().to_string().is_empty());
++            assert!(VersionPattern::from_str(&text).is_err() || text.trim().ends_with(".*"));
++        }
++        (Ok(v), None) => panic!("{text:?}: pep440_rs accepts ({v}), packaging rejects"),
++        (Err(e), Some(py)) => panic!("{text:?}: pep440_rs rejects ({e}), packaging accepts ({})", py.normalized),
++    }
++}
++
++#[hegel::test]
++fn wildcard_patterns_parse_like_packaging_specifiers(tc: hegel::TestCase) {
++    // a pattern is a version with a trailing `.*`; packaging has no such type, so `==<pattern>`
++    // as a specifier is the reference
++    let mut text = tc.draw(arb_version_text());
++    if tc.draw(generators::booleans()) {
++        text = text.trim().to_string();
++        text.push_str(".*");
++    }
++    if beyond_u64(&text) {
++        return;
++    }
++    let ours = VersionPattern::from_str(&text);
++    let theirs = py_contains(false, &format!("=={text}"), &[]);
++    match (&ours, &theirs) {
++        (Ok(pat), Some(_)) => {
++            assert_eq!(pat.is_wildcard(), text.trim().ends_with(".*"), "{text:?}");
++            if pat.is_wildcard() {
++                let spec = VersionSpecifier::from_str(&format!("=={text}")).unwrap();
++                assert_eq!(*spec.operator(), Operator::EqualStar);
++                assert_eq!(spec.version(), pat.version());
++                assert!(Version::from_str(&text).unwrap_err().to_string().contains("wildcard"));
++            }
++        }
++        (Err(_), None) => {}
++        (Ok(pat), None) => panic!("{text:?}: pep440_rs accepts ({pat:?}), packaging rejects =={text}"),
++        (Err(e), Some(_)) => panic!("{text:?}: pep440_rs rejects ({e}), packaging accepts =={text}"),
++    }
++}
++
++// --------------------------------------------------------------------------- ordering
++
++#[hegel::test]
++fn versions_order_like_packaging(tc: hegel::TestCase) {
++    let a = tc.draw(arb_valid_version_text());
++    let va = Version::from_str(&a).unwrap();
++    let b = if tc.draw(generators::booleans()) { tc.draw(arb_related(&va)) } else { tc.draw(arb_valid_version_text()) };
++    let vb = Version::from_str(&b).unwrap_or_else(|e| panic!("{b:?}: {e}"));
++    if has_oversize_local(&a) || has_oversize_local(&b) {
++        return; // pep440_rs/5
++    }
++    if has_max_dev(&va) || has_max_dev(&vb) {
++        return; // pep440_rs/9
++    }
++    let want = py_cmp(&a, &b);
++    assert_eq!(va.cmp(&vb), want, "{a:?} vs {b:?} ({va} vs {vb})");
++    assert_eq!(vb.cmp(&va), want.reverse());
++    assert_eq!(va == vb, want == Ordering::Equal);
++    if va == vb {
++        assert_eq!(hash_of(&va), hash_of(&vb), "{a:?} vs {b:?}");
++    }
++    // the release compares with zero padding: trailing zeros never matter
++    let padded = Version::new(va.release().iter().copied().chain([0])).with_epoch(va.epoch());
++    let plain = va.only_release().with_epoch(va.epoch());
++    assert_eq!(padded, plain, "{padded} vs {plain}");
++    assert_eq!(hash_of(&padded), hash_of(&plain));
++    assert_eq!(padded.cmp(&va), plain.cmp(&va));
++    let _ = vb.cmp(&*MIN_VERSION);
++}
++
++#[hegel::test]
++fn versions_built_from_parts_equal_parsed_ones(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let built = Version::new(v.release().iter().copied())
++        .with_epoch(v.epoch())
++        .with_pre(v.pre())
++        .with_post(v.post())
++        .with_dev(v.dev())
++        .with_local(v.local().to_vec());
++    assert_eq!(built, v);
++    assert_eq!(built.to_string(), v.to_string());
++    assert_eq!(parts(&built), parts(&v));
++    // and in another order of setters
++    let built2 = Version::new([0u64]).with_local(v.local().to_vec()).with_dev(v.dev()).with_post(v.post()).with_pre(v.pre()).with_epoch(v.epoch()).with_release(v.release().iter().copied());
++    assert_eq!(built2.to_string(), v.to_string());
++    // stripping
++    let stripped = v.clone().without_local();
++    assert!(!stripped.is_local());
++    assert_eq!(stripped.to_string(), v.to_string().split('+').next().unwrap());
++    let only = v.only_release();
++    assert_eq!(only.release(), v.release());
++    assert!(only.is_stable() && !only.is_post() && !only.is_local() && only.epoch() == 0);
++    // the pre-release kinds order a < b < rc
++    let (pa, pb, prc) = (
++        Version::new([1u64]).with_pre(Some(Prerelease { kind: PrereleaseKind::Alpha, number: 9 })),
++        Version::new([1u64]).with_pre(Some(Prerelease { kind: PrereleaseKind::Beta, number: 0 })),
++        Version::new([1u64]).with_pre(Some(Prerelease { kind: PrereleaseKind::Rc, number: 0 })),
++    );
++    assert!(pa < pb && pb < prc && prc < Version::new([1u64]));
++    assert_eq!(pa.to_string(), "1a9");
++    // a small and a full representation of the same version agree
++    let base = v.clone().without_local();
++    let big = base.clone().with_local(vec![LocalSegment::Number(1)]).without_local();
++    assert_eq!(big, base);
++    assert_eq!(big.cmp(&base), Ordering::Equal);
++    assert_eq!(hash_of(&big), hash_of(&base));
++    let other = Version::from_str(&tc.draw(arb_valid_version_text())).unwrap();
++    assert_eq!(big.cmp(&other), base.cmp(&other));
++    assert_eq!(other.cmp(&big), other.cmp(&base));
++}
++
++// --------------------------------------------------------------------------- specifiers
++
++const OPS: [&str; 7] = ["==", "!=", "<=", ">=", "<", ">", "~="];
++
++#[hegel::composite]
++fn arb_specifier_text(tc: &hegel::TestCase) -> String {
++    let op = OPS[tc.draw(int!(0usize, OPS.len() - 1))];
++    let mut s = String::new();
++    if tc.draw(int!(0u8, 5)) == 0 {
++        s.push(' ');
++    }
++    s.push_str(op);
++    if tc.draw(int!(0u8, 3)) == 0 {
++        s.push_str(WS[tc.draw(int!(0usize, WS.len() - 1))]);
++    }
++    let version = if tc.draw(int!(0u8, 4)) == 0 { tc.draw(arb_version_text()) } else { tc.draw(arb_valid_version_text()) };
++    s.push_str(version.trim());
++    if tc.draw(int!(0u8, 4)) == 0 {
++        s.push_str(".*");
++    }
++    if tc.draw(int!(0u8, 5)) == 0 {
++        s.push_str(WS[tc.draw(int!(0usize, WS.len() - 1))]);
++    }
++    s
++}
++
++fn candidates(tc: &hegel::TestCase, around: &Version, n: usize) -> Vec<String> {
++    let mut out = Vec::new();
++    for _ in 0..n {
++        let t = if tc.draw(int!(0u8, 3)) == 0 { tc.draw(arb_valid_version_text()) } else { tc.draw(arb_related(around)) };
++        if let Ok(v) = Version::from_str(&t) {
++            out.push(v.to_string());
++        }
++    }
++    out
++}
++
++#[hegel::test]
++fn specifiers_parse_and_contain_like_packaging(tc: hegel::TestCase) {
++    let spec = tc.draw(arb_specifier_text());
++    if beyond_u64(&spec) {
++        return;
++    }
++    let ours = VersionSpecifier::from_str(&spec);
++    let theirs = py_contains(false, &spec, &[]);
++    let parsed = match (&ours, &theirs) {
++        (Ok(s), Some(_)) => s.clone(),
++        (Err(_), None) => {
++            assert!(!ours.as_ref().unwrap_err().to_string().is_empty());
++            return;
++        }
++        (Ok(s), None) => panic!("{spec:?}: pep440_rs accepts ({s}), packaging rejects"),
++        (Err(e), Some(_)) => panic!("{spec:?}: pep440_rs rejects ({e}), packaging accepts"),
++    };
++    // Display round trip
++    let shown = parsed.to_string();
++    assert_eq!(VersionSpecifier::from_str(&shown).unwrap(), parsed, "{spec:?} -> {shown:?}");
++    assert_eq!(py_contains(false, &shown, &[]).is_some(), true, "{shown:?} not accepted by packaging");
++    // containment, with the pre-release policy left to the caller (prereleases=True)
++    let cands = candidates(&tc, parsed.version(), 6);
++    if cands.is_empty() || has_max_dev(parsed.version()) {
++        return;
++    }
++    let want = py_contains(false, &spec, &cands).unwrap();
++    for (c, w) in cands.iter().zip(want) {
++        let v = Version::from_str(c).unwrap();
++        if has_max_dev(&v) || hits_less_than_prerelease_bug(&parsed, &v) || hits_greater_than_prerelease_bug(&parsed, &v) || hits_star_padding_bug(&parsed, &v) {
++            continue;
++        }
++        assert_eq!(parsed.contains(&v), w, "{spec:?} contains {c:?}");
++    }
++}
++
++#[hegel::test]
++fn specifier_sets_parse_and_contain_like_packaging(tc: hegel::TestCase) {
++    let k = tc.draw(int!(0usize, 4));
++    let mut items: Vec<String> = (0..k).map(|_| tc.draw(arb_specifier_text())).collect();
++    if tc.draw(int!(0u8, 5)) == 0 {
++        items.push(tc.draw(generators::sampled_from(vec!["", " ", "1.0", "=="])).to_string());
++    }
++    let text = items.join(",");
++    if text.split(',').any(beyond_u64) || has_blank_item(&text) {
++        return; // pep440_rs/4 for the blanks
++    }
++    let ours = VersionSpecifiers::from_str(&text);
++    let theirs = py_contains(true, &text, &[]);
++    let parsed = match (&ours, &theirs) {
++        (Ok(s), Some(_)) => s.clone(),
++        (Err(e), None) => {
++            assert!(e.to_string().starts_with("Failed to parse version:"), "{e}");
++            assert_eq!(e.line(), &text);
++            return;
++        }
++        (Ok(s), None) => panic!("{text:?}: pep440_rs accepts ({s}), packaging rejects"),
++        (Err(e), Some(_)) => panic!("{text:?}: pep440_rs rejects ({e}), packaging accepts"),
++    };
++    assert_eq!(parsed.len(), items.iter().filter(|i| !i.trim().is_empty()).count(), "{text:?}");
++    assert_eq!(parsed.is_empty(), parsed.len() == 0);
++    // sorted by version, Display / serde round trips
++    for w in parsed.windows(2) {
++        assert!(w[0].version() <= w[1].version(), "{text:?} -> {parsed}");
++    }
++    let shown = parsed.to_string();
++    assert_eq!(VersionSpecifiers::from_str(&shown).unwrap(), parsed, "{text:?} -> {shown:?}");
++    let json = serde_json::to_string(&parsed).unwrap();
++    let back: VersionSpecifiers = serde_json::from_str(&json).unwrap();
++    assert_eq!(back, parsed);
++    assert_eq!(json, serde_json::to_string(&parsed.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")).unwrap());
++    // containment is the conjunction, and agrees with packaging
++    let around = parsed.first().map(|s| s.version().clone()).unwrap_or_else(|| Version::new([1u64]));
++    let cands = candidates(&tc, &around, 5);
++    if cands.is_empty() {
++        return;
++    }
++    let want = py_contains(true, &text, &cands).unwrap();
++    for (c, w) in cands.iter().zip(want) {
++        let v = Version::from_str(c).unwrap();
++        assert_eq!(parsed.contains(&v), parsed.iter().all(|s| s.contains(&v)));
++        if has_max_dev(&v) || parsed.iter().any(|s| has_max_dev(s.version()) || hits_less_than_prerelease_bug(s, &v) || hits_greater_than_prerelease_bug(s, &v) || hits_star_padding_bug(s, &v)) {
++            continue;
++        }
++        assert_eq!(parsed.contains(&v), w, "{text:?} contains {c:?}");
++    }
++}
++
++#[hegel::test]
++fn specifier_builders_validate_like_the_parser(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    if has_max_dev(&v) {
++        return; // pep440_rs/9
++    }
++    let ops = [Operator::Equal, Operator::NotEqual, Operator::LessThan, Operator::LessThanEqual, Operator::GreaterThan, Operator::GreaterThanEqual, Operator::TildeEqual, Operator::ExactEqual];
++    let cands = candidates(&tc, &v, 3);
++    for op in ops {
++        let built = VersionSpecifier::from_version(op, v.clone());
++        let parsed = VersionSpecifier::from_str(&format!("{op}{v}"));
++        match (&built, &parsed) {
++            (Ok(b), Ok(p)) => {
++                assert_eq!(b, p);
++                assert_eq!(b.operator(), &op);
++                assert_eq!(b.version(), &v);
++                assert_eq!(b.clone().into_parts(), (op, v.clone()));
++                assert_eq!(b.any_prerelease(), v.any_prerelease());
++                assert_eq!(b.has_lower_bound(), !matches!(op, Operator::LessThan | Operator::LessThanEqual | Operator::NotEqual));
++                assert!(b.contains(&v) || op == Operator::LessThan || op == Operator::GreaterThan || op == Operator::NotEqual, "{op}{v} does not contain {v}");
++                if op == Operator::ExactEqual {
++                    assert!(b.contains(&v));
++                    for c in &cands {
++                        let cv = Version::from_str(c).unwrap();
++                        if has_max_dev(&cv) {
++                            continue;
++                        }
++                        assert_eq!(b.contains(&cv), cv.to_string() == v.to_string(), "{b} on {c}");
++                    }
++                }
++            }
++            (Err(b), Err(p)) => assert_eq!(b.to_string(), p.to_string(), "{op}{v}"),
++            (b, p) => panic!("{op}{v}: from_version {b:?}, from_str {p:?}"),
++        }
++        // the documented constraints
++        let local_ok = matches!(op, Operator::Equal | Operator::NotEqual | Operator::ExactEqual);
++        if v.is_local() {
++            assert_eq!(built.is_ok(), local_ok, "{op}{v}");
++            if !local_ok {
++                assert!(built.as_ref().unwrap_err().to_string().contains("incompatible with versions containing non-empty local segments"));
++            }
++        } else if op == Operator::TildeEqual {
++            assert_eq!(built.is_ok(), v.release().len() >= 2, "{op}{v}");
++            if v.release().len() < 2 {
++                assert!(built.as_ref().unwrap_err().to_string().contains("requires at least two segments"));
++            }
++        } else {
++            assert!(built.is_ok(), "{op}{v}: {built:?}");
++        }
++        // stars
++        let star = VersionSpecifier::from_pattern(op, VersionPattern::wildcard(v.clone()));
++        let starop = match op {
++            Operator::Equal => Some(Operator::EqualStar),
++            Operator::NotEqual => Some(Operator::NotEqualStar),
++            _ => None,
++        };
++        match starop {
++            Some(starop) => {
++                if !v.is_local() {
++                    let s = star.unwrap();
++                    assert_eq!(*s.operator(), starop);
++                    assert!(starop.is_star());
++                    assert_eq!(s.to_string(), format!("{op}{v}.*"));
++                }
++            }
++            None => assert!(star.unwrap_err().to_string().contains("cannot be used with a wildcard"), "{op}"),
++        }
++        // negation
++        match op.negate() {
++            None => assert_eq!(op, Operator::TildeEqual),
++            Some(neg) => {
++                let n = VersionSpecifier::from_version(neg, v.clone());
++                if let (Ok(b), Ok(n)) = (&built, &n) {
++                    for c in &cands {
++                        let cv = Version::from_str(c).unwrap();
++                        // pre- and post-release exclusions make `<`/`>` and their negations
++                        // agree only across releases
++                        if op == Operator::ExactEqual || v.is_local() || cv.is_local() || same_release(&v, &cv) || has_max_dev(&cv) {
++                            continue;
++                        }
++                        assert_ne!(b.contains(&cv), n.contains(&cv), "{b} / {n} on {c}");
++                    }
++                }
++            }
++        }
++    }
++    assert_eq!(Operator::from_str("==="), Ok(Operator::ExactEqual));
++    assert!(Operator::from_str("=").unwrap_err().to_string().contains("no such comparison operator"));
++    assert!(Operator::from_str("~==").is_err());
++    for op in ops {
++        assert_eq!(Operator::from_str(&op.to_string()), Ok(op));
++    }
++}
++
++#[cfg(feature = "version-ranges")]
++#[hegel::test]
++fn ranges_agree_with_contains(tc: hegel::TestCase) {
++    use version_ranges::Ranges;
++    let spec = tc.draw(arb_specifier_text());
++    let Ok(parsed) = VersionSpecifier::from_str(&spec) else {
++        return;
++    };
++    if *parsed.operator() == Operator::ExactEqual || parsed.version().is_local() || hits_range_bug(&parsed) || has_max_dev(parsed.version()) {
++        return;
++    }
++    let range = Ranges::<Version>::from(parsed.clone());
++    for c in candidates(&tc, parsed.version(), 6) {
++        let v = Version::from_str(&c).unwrap();
++        if v.is_local() || has_max_dev(&v) || hits_less_than_prerelease_bug(&parsed, &v) || hits_greater_than_prerelease_bug(&parsed, &v) || hits_star_padding_bug(&parsed, &v) {
++            // local versions sit above their public version in the total order, which a range
++            // over that order cannot fold back onto it (uv handles them before resolution)
++            continue;
++        }
++        assert_eq!(range.contains(&v), parsed.contains(&v), "{spec:?} as a range, on {c}: {range}");
++    }
++    // a set is the intersection
++    let k = tc.draw(int!(0usize, 3));
++    let specs: Vec<VersionSpecifier> = (0..k).filter_map(|_| VersionSpecifier::from_str(&tc.draw(arb_specifier_text())).ok()).filter(|s| *s.operator() != Operator::ExactEqual && !s.version().is_local() && !hits_range_bug(s) && !has_max_dev(s.version())).collect();
++    let set: VersionSpecifiers = specs.iter().cloned().collect();
++    let range = Ranges::<Version>::from(set.clone());
++    for c in candidates(&tc, parsed.version(), 4) {
++        let v = Version::from_str(&c).unwrap();
++        if v.is_local() || has_max_dev(&v) || specs.iter().any(|s| hits_less_than_prerelease_bug(s, &v) || hits_greater_than_prerelease_bug(s, &v) || hits_star_padding_bug(s, &v)) {
++            continue;
++        }
++        assert_eq!(range.contains(&v), set.contains(&v), "{set} as a range, on {c}");
++    }
++}
++
++#[cfg(feature = "version-ranges")]
++#[hegel::test]
++fn release_only_ranges_agree_with_contains_on_release_only_versions(tc: hegel::TestCase) {
++    use pep440_rs::{release_specifier_to_range, release_specifiers_to_ranges};
++    let spec = tc.draw(arb_specifier_text());
++    let Ok(parsed) = VersionSpecifier::from_str(&spec) else {
++        return;
++    };
++    // release-only semantics strip the specifier's version too; the documented contract is
++    // for specifiers and candidates made of release segments only
++    if !parsed.version().is_stable() || parsed.version().is_post() || parsed.version().is_local() || parsed.version().epoch() != 0 || hits_range_bug(&parsed) {
++        return;
++    }
++    let range = release_specifier_to_range(parsed.clone());
++    let set_range = release_specifiers_to_ranges(VersionSpecifiers::from(parsed.clone()));
++    assert_eq!(range, set_range);
++    for c in candidates(&tc, parsed.version(), 6) {
++        let v = Version::from_str(&c).unwrap().only_release();
++        if hits_star_padding_bug(&parsed, &v) {
++            continue;
++        }
++        assert_eq!(range.contains(&v), parsed.contains(&v), "{spec:?} as a release-only range, on {v}: {range}");
++    }
++}
++
++// --------------------------------------------------------------------------- pinned bugs
++
++/// pep440_rs/1: PEP 440, "the exclusive ordered comparison <V MUST NOT allow a pre-release of
++/// the specified version unless the specified version is itself a pre-release" — so `<1.0a2`
++/// admits `1.0a1`, `<1.0.dev2` admits `1.0.dev1`, `<1.0.post1` admits `1.0a1` and `1.0.dev0`,
++/// `<1!1.0` admits `1.0a1`; only `<1.0` excludes `1.0a1`, `1.0.dev0`, `1.0.post0.dev0`.
++#[hegel::test]
++fn less_than_admits_the_prereleases_of_other_versions(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap().without_local();
++    let spec = VersionSpecifier::less_than_version(v.clone());
++    let plain = v.clone().with_pre(None).with_dev(None).with_post(None);
++    let n = tc.draw(int!(0u64, 2));
++    let mut cands = vec![
++        plain.clone().with_dev(Some(n)),
++        plain.clone().with_pre(Some(Prerelease { kind: PrereleaseKind::Alpha, number: n })),
++        plain.clone().with_pre(Some(Prerelease { kind: PrereleaseKind::Rc, number: n })).with_dev(Some(0)),
++        plain.clone().with_post(Some(n)).with_dev(Some(0)),
++        v.clone().with_dev(Some(n)),
++        plain.clone().with_epoch(v.epoch().saturating_sub(1)).with_pre(Some(Prerelease { kind: PrereleaseKind::Beta, number: n })),
++    ];
++    if let Some(p) = v.pre() {
++        cands.push(v.clone().with_pre(Some(Prerelease { kind: p.kind, number: p.number.saturating_sub(1) })));
++    }
++    if let Some(d) = v.dev() {
++        cands.push(v.clone().with_dev(Some(d.saturating_sub(1))));
++    }
++    for c in cands {
++        let want = should_be_less_than(&v, &c);
++        let py = py_contains(false, &spec.to_string(), &[c.to_string()]).unwrap()[0];
++        assert_eq!(py, want, "packaging on {spec} / {c}");
++        assert_eq!(spec.contains(&c), want, "{spec} contains {c}");
++    }
++}
++
++/// pep440_rs/2: the range of `<X.postN` must keep `X` and the lower post-releases of `X`, as
++/// `VersionSpecifier::contains` does.
++#[cfg(feature = "version-ranges")]
++#[hegel::test]
++fn less_than_a_post_release_range_keeps_the_release(tc: hegel::TestCase) {
++    use version_ranges::Ranges;
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap().without_local().with_pre(None).with_dev(None).with_post(Some(tc.draw(int!(0u64, 3))));
++    let spec = VersionSpecifier::less_than_version(v.clone());
++    let range = Ranges::<Version>::from(spec.clone());
++    let cands = [v.clone().with_post(None), v.clone().with_post(v.post().map(|p| p.saturating_sub(1))), v.clone().with_post(None).with_pre(Some(Prerelease { kind: PrereleaseKind::Rc, number: 1 })), v.clone().with_post(None).with_dev(Some(0)), v.clone()];
++    for c in cands {
++        assert_eq!(range.contains(&c), spec.contains(&c), "{spec} as the range {range}, on {c}");
++    }
++}
++
++/// pep440_rs/3: numbers up to `u64::MAX` parse, so the range conversion must not overflow when
++/// it adds one (`>X.postMAX`, `>X.devMAX`, `==X.MAX.*`, `~=X.MAX.Y`).
++#[cfg(feature = "version-ranges")]
++#[hegel::test]
++fn ranges_do_not_overflow_on_maximal_numbers(tc: hegel::TestCase) {
++    use version_ranges::Ranges;
++    let base = Version::from_str(&tc.draw(arb_valid_version_text())).unwrap().only_release();
++    let (spec, inside, outside) = match tc.draw(int!(0u8, 3)) {
++        0 => {
++            let v = base.clone().with_post(Some(u64::MAX));
++            (VersionSpecifier::greater_than_version(v.clone()), v.clone().with_epoch(v.epoch() + 1), v.with_post(Some(1)))
++        }
++        1 => {
++            let v = base.clone().with_dev(Some(u64::MAX));
++            (VersionSpecifier::greater_than_version(v.clone()), v.clone().with_dev(None), v.with_dev(Some(1)))
++        }
++        2 => {
++            let v = base.clone().with_release(base.release().iter().copied().chain([u64::MAX]));
++            let outside = base.clone().with_release(base.release().iter().copied().chain([1]));
++            (VersionSpecifier::equals_star_version(v.clone()), v, outside)
++        }
++        _ => {
++            let v = base.clone().with_release(base.release().iter().copied().chain([u64::MAX, 0]));
++            let outside = base.clone().with_release(base.release().iter().copied().chain([0, 0]));
++            (VersionSpecifier::from_version(Operator::TildeEqual, v.clone()).unwrap(), v, outside)
++        }
++    };
++    let range = std::panic::catch_unwind(|| Ranges::<Version>::from(spec.clone())).unwrap_or_else(|_| panic!("Ranges::from({spec}) panicked"));
++    assert!(spec.contains(&inside) && range.contains(&inside), "{spec} as {range} must contain {inside}");
++    assert!(!spec.contains(&outside) && !range.contains(&outside), "{spec} as {range} must not contain {outside}");
++    // the release-only conversion adds one to release numbers the same way
++    let release_only = std::panic::catch_unwind(|| pep440_rs::release_specifier_to_range(spec.clone())).unwrap_or_else(|_| panic!("release_specifier_to_range({spec}) panicked"));
++    if spec.version().is_stable() && !spec.version().is_post() {
++        assert!(!release_only.contains(&outside.only_release()), "{spec} as the release-only range {release_only} must not contain {outside}");
++    }
++}
++
++/// pep440_rs/4: `packaging` skips blank items in a comma list (`">=1.0,"`, `" "`); the crate
++/// only special-cases the empty string.
++#[hegel::test]
++fn blank_items_in_specifier_sets_are_skipped_like_packaging(tc: hegel::TestCase) {
++    let k = tc.draw(int!(0usize, 3));
++    let mut items: Vec<String> = Vec::new();
++    for _ in 0..k {
++        let s = tc.draw(arb_valid_version_text());
++        items.push(format!("{}{}", OPS[tc.draw(int!(0usize, 5))], s.trim()));
++    }
++    let blank = tc.draw(generators::sampled_from(vec!["", " ", "\t"])).to_string();
++    items.insert(tc.draw(int!(0usize, items.len())), blank);
++    let text = items.join(",");
++    if VersionSpecifiers::from_str(&items.iter().filter(|i| !i.trim().is_empty()).cloned().collect::<Vec<_>>().join(",")).is_err() {
++        return;
++    }
++    assert!(py_contains(true, &text, &[]).is_some(), "packaging rejects {text:?}");
++    let parsed = VersionSpecifiers::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(parsed.len(), items.len() - 1);
++}
++
++/// pep440_rs/5: an all-digit local segment is a number, however large (`packaging` uses
++/// Python integers); the crate keeps segments beyond `u64` as strings, which sort below every
++/// number.
++#[hegel::test]
++fn oversize_local_numbers_order_as_numbers(tc: hegel::TestCase) {
++    let base = Version::from_str(&tc.draw(arb_valid_version_text())).unwrap().without_local();
++    let big = format!("{base}+{}", tc.draw(generators::sampled_from(vec!["18446744073709551616", "99999999999999999999", "184467440737095516150"])));
++    let small = format!("{base}+{}", tc.draw(int!(0u64, 5)));
++    let (vb, vs) = (Version::from_str(&big).unwrap(), Version::from_str(&small).unwrap());
++    assert_eq!(py_cmp(&big, &small), Ordering::Greater);
++    assert_eq!(vb.cmp(&vs), Ordering::Greater, "{big} vs {small}: {:?}", vb.local());
++}
++
++/// pep440_rs/6: PEP 440, ">V MUST NOT allow a post-release of the given version unless V is
++/// itself a post release" — `1.0.post1` and `1.0a2.post1` are not post-releases of `1.0a1`, so
++/// `>1.0a1` admits them, and `>1.0.dev1` admits `1.0.post1.dev0` (`packaging` agrees, and so
++/// does the crate's range conversion); only `1.0a1.postN` is excluded by `>1.0a1`.
++#[hegel::test]
++fn greater_than_admits_the_post_releases_of_other_versions(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap().without_local().with_post(None);
++    let spec = VersionSpecifier::greater_than_version(v.clone());
++    let plain = v.clone().with_pre(None).with_dev(None);
++    let n = tc.draw(int!(0u64, 2));
++    let mut cands = vec![
++        v.clone().with_post(Some(n)),
++        v.clone().with_post(Some(n)).with_dev(Some(0)),
++        plain.clone().with_post(Some(n)),
++        plain.clone().with_post(Some(n)).with_dev(Some(0)),
++        plain.clone().with_pre(Some(Prerelease { kind: PrereleaseKind::Rc, number: n })).with_post(Some(n)),
++    ];
++    if let Some(p) = v.pre() {
++        cands.push(v.clone().with_pre(Some(Prerelease { kind: p.kind, number: p.number + 1 })).with_post(Some(n)));
++    }
++    for c in cands {
++        let want = should_be_greater_than(&v, &c);
++        let py = py_contains(false, &spec.to_string(), &[c.to_string()]).unwrap()[0];
++        assert_eq!(py, want, "packaging on {spec} / {c}");
++        assert_eq!(spec.contains(&c), want, "{spec} contains {c}");
++        #[cfg(feature = "version-ranges")]
++        if want {
++            assert!(version_ranges::Ranges::<Version>::from(spec.clone()).contains(&c), "{spec} as a range, on {c}");
++        }
++    }
++}
++
++/// pep440_rs/7: `MIN_VERSION` is documented as the smallest version, but `0.dev0` sorts below
++/// `0a0.dev0` (a dev release of a final version precedes its pre-releases).
++#[hegel::test]
++fn min_version_is_below_every_version(tc: hegel::TestCase) {
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap();
++    let candidates = [v.clone(), v.only_release().with_dev(Some(0)), Version::new([0u64]).with_dev(Some(tc.draw(int!(0u64, 3))))];
++    for c in candidates {
++        assert!(*MIN_VERSION <= c, "{c} < MIN_VERSION {}", *MIN_VERSION);
++    }
++}
++
++/// pep440_rs/8: PEP 440 prefix matching pads the candidate's release with zeros to the length
++/// of the prefix, so `==1.2.*` does not match `1` (`packaging` agrees; the crate's range
++/// conversion agrees).
++#[hegel::test]
++fn star_prefix_matching_pads_the_candidate(tc: hegel::TestCase) {
++    let base = Version::from_str(&tc.draw(arb_valid_version_text())).unwrap();
++    let mut release = base.release().to_vec();
++    release.truncate(tc.draw(int!(1usize, release.len())));
++    release.push(tc.draw(int!(1u64, 3)));
++    if tc.draw(generators::booleans()) {
++        release.push(0);
++    }
++    let pattern = Version::new(release.iter().copied()).with_epoch(base.epoch());
++    let candidate = Version::new(base.release().iter().copied().take(release.len() - 1 - usize::from(*release.last().unwrap() == 0))).with_epoch(base.epoch());
++    for op in ["==", "!="] {
++        let spec = VersionSpecifier::from_str(&format!("{op}{pattern}.*")).unwrap();
++        let py = py_contains(false, &spec.to_string(), &[candidate.to_string()]).unwrap()[0];
++        assert_eq!(py, op == "!=", "packaging on {spec} / {candidate}");
++        assert_eq!(spec.contains(&candidate), py, "{spec} contains {candidate}");
++        #[cfg(feature = "version-ranges")]
++        assert_eq!(version_ranges::Ranges::<Version>::from(spec.clone()).contains(&candidate), py, "{spec} as a range, on {candidate}");
++    }
++}
++
++/// pep440_rs/9: `X.dev18446744073709551615` is a dev release below `X`, not `X` itself; the sort
++/// key uses `u64::MAX` as the "no dev" sentinel, so on a pre- or post-release the two compare
++/// equal (while hashing differently).
++#[hegel::test]
++fn a_maximal_dev_number_is_a_dev_release(tc: hegel::TestCase) {
++    let base = Version::from_str(&tc.draw(arb_valid_version_text())).unwrap().without_local().with_dev(None);
++    let base = if base.is_pre() || base.is_post() { base } else { base.with_post(Some(tc.draw(int!(0u64, 2)))) };
++    let dev = base.clone().with_dev(Some(u64::MAX));
++    assert_eq!(py_cmp(&dev.to_string(), &base.to_string()), Ordering::Less);
++    assert!(dev.is_dev() && !base.is_dev());
++    assert_eq!(dev.cmp(&base), Ordering::Less, "{dev} vs {base}");
++    assert_ne!(dev, base);
++    if dev == base {
++        assert_eq!(hash_of(&dev), hash_of(&base), "Eq without Hash");
++    }
++}
++
++/// pep440_rs/10: `>X.postN` admits `X.postN+1.devM` (`contains` does, and so does `packaging`),
++/// but the range conversion starts at `X.postN+1` and skips those dev releases.
++#[cfg(feature = "version-ranges")]
++#[hegel::test]
++fn greater_than_a_post_release_range_keeps_the_next_dev_releases(tc: hegel::TestCase) {
++    use version_ranges::Ranges;
++    let text = tc.draw(arb_valid_version_text());
++    let v = Version::from_str(&text).unwrap().without_local().with_dev(None).with_post(Some(tc.draw(int!(0u64, 3))));
++    let spec = VersionSpecifier::greater_than_version(v.clone());
++    let range = Ranges::<Version>::from(spec.clone());
++    let c = v.clone().with_post(v.post().map(|p| p + 1)).with_dev(Some(tc.draw(int!(0u64, 3))));
++    let py = py_contains(false, &spec.to_string(), &[c.to_string()]).unwrap()[0];
++    assert!(py && spec.contains(&c), "{spec} contains {c}");
++    assert!(range.contains(&c), "{spec} as the range {range}, on {c}");
++}
