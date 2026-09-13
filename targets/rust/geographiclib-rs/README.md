@@ -28,3 +28,9 @@
 - 2026-02-17: predecessor base commit `c5e906d94a46` (return result rather than panic).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/geographiclib-rs.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: a 10× budget run (`--test-cases 1000`) failed `test_hegel_polygon_reversal_negates_signed_area`
+  with the vertices (0,0), (90,0), (−90,1): consecutive antipodal vertices (here the two poles)
+  have no unique geodesic between them, so forward and reversed polygons took different
+  meridians and their areas differed by exactly a 1° lune (1.4e12 m²). Not a library bug — the
+  polygon is ill-defined — so the property now `assume`s every edge (cyclically) is shorter than
+  20 000 km, i.e. no (near-)antipodal consecutive vertices; 82 tests pass at 10×.
