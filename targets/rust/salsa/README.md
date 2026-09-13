@@ -35,3 +35,4 @@
 - 2026-07-22: predecessor base commit `dcbcc7082c3b` (chore: release v0.28.1 (#1248)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/salsa.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped dcbcc7082c3b → e021c01d4939 (2026-09-07, "chore: Update taiki-e/install-action action to v2.87.2 (#1309)"; 0.28.2); 1 bug(s) still reproduce; add/add conflicts in Cargo.toml resolved by keeping both sides. 223 tests pass.
