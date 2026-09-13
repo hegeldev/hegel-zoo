@@ -1,0 +1,962 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c3bbc65..ed63b6f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,7 @@ data-encoding = "2"
+ serde_cbor = "0.11"
+ ciborium = "0.2"
+ criterion = "0.8"
++hegeltest = "0.44.1"
+ 
+ [package.metadata.docs.rs]
+ all-features = true
+diff --git a/tests/decode.rs b/tests/decode.rs
+index 8e5b4a7..be0415e 100644
+--- a/tests/decode.rs
++++ b/tests/decode.rs
+@@ -456,3 +456,383 @@ fn test_mock_chunk_string() {
+ 
+     assert_eq!(s, "123456");
+ }
++
++// ===========================================================================
++// Property-based tests (hegel)
++// ===========================================================================
++mod hegel_props {
++    use cbor4ii::core::{ Value, RawValue };
++    use cbor4ii::core::enc::Encode;
++    use cbor4ii::core::dec::{ self, Decode };
++    use cbor4ii::core::types;
++    use cbor4ii::core::utils::{ BufWriter, SliceReader };
++    use hegel::generators::{ self, Generator };
++
++    type DecodeResult<T> = Result<T, dec::Error<std::convert::Infallible>>;
++
++    fn enc<T: Encode>(value: &T) -> Vec<u8> {
++        let mut writer = BufWriter::new(Vec::new());
++        value.encode(&mut writer).unwrap();
++        writer.into_inner()
++    }
++
++    fn dec<'a, T: Decode<'a>>(buf: &'a [u8]) -> DecodeResult<T> {
++        let mut reader = SliceReader::new(buf);
++        T::decode(&mut reader)
++    }
++
++    /// u64 with the CBOR length-encoding boundaries (23/24, u8/u16/u32/u64 edges) boosted.
++    fn arb_u64(tc: &hegel::TestCase) -> u64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<u64>(),
++            generators::sampled_from(vec![
++                0u64, 1, 23, 24, 25, 255, 256, 65535, 65536,
++                u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX - 1, u64::MAX,
++            ]),
++        ))
++    }
++
++    /// An integer in CBOR's native (major type 0/1) range: [-2^64, 2^64 - 1].
++    fn arb_native_int(tc: &hegel::TestCase) -> i128 {
++        let mag = i128::from(arb_u64(tc));
++        if tc.draw(generators::booleans()) {
++            mag
++        } else {
++            -1 - mag
++        }
++    }
++
++    /// Any f64 bit pattern (including inf, subnormals and arbitrary NaN payloads).
++    fn arb_f64(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>(),
++            generators::integers::<u64>().map(f64::from_bits),
++        ))
++    }
++
++    /// Structural equality on `Value` that compares floats bit-exactly,
++    /// so NaN payloads round-tripping is asserted rather than rejected.
++    fn value_eq(a: &Value, b: &Value) -> bool {
++        match (a, b) {
++            (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
++            (Value::Array(x), Value::Array(y)) =>
++                x.len() == y.len() && x.iter().zip(y.iter()).all(|(u, v)| value_eq(u, v)),
++            (Value::Map(x), Value::Map(y)) =>
++                x.len() == y.len() && x.iter().zip(y.iter()).all(
++                    |((ka, va), (kb, vb))| value_eq(ka, kb) && value_eq(va, vb)),
++            (Value::Tag(ta, va), Value::Tag(tb, vb)) => ta == tb && value_eq(va, vb),
++            _ => a == b
++        }
++    }
++
++    /// Arbitrary `Value` tree.
++    ///
++    /// Integers are restricted to CBOR's native range because the *core* codec
++    /// (by design, see `test_value_i128`) decodes bignum-encoded `Value::Integer`s
++    /// back as `Value::Tag(2/3, Bytes)` rather than folding them into `Integer`.
++    fn arb_value(depth: u32) -> generators::BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let max_choice = if depth == 0 { 5u8 } else { 8u8 };
++            match tc.draw(generators::integers::<u8>().max_value(max_choice)) {
++                0 => Value::Null,
++                1 => Value::Bool(tc.draw(generators::booleans())),
++                2 => Value::Integer(arb_native_int(&tc)),
++                3 => Value::Float(arb_f64(&tc)),
++                4 => Value::Bytes(tc.draw(generators::binary().max_size(64))),
++                5 => Value::Text(tc.draw(generators::text().max_size(64))),
++                6 => Value::Array(tc.draw(generators::vecs(arb_value(depth - 1)).max_size(4))),
++                7 => Value::Map(tc.draw(generators::vecs(generators::tuples!(
++                        arb_value(depth - 1),
++                        arb_value(depth - 1),
++                    )).max_size(4))),
++                _ => Value::Tag(
++                    tc.draw(generators::integers::<u64>()),
++                    Box::new(tc.draw(arb_value(depth - 1)))
++                ),
++            }
++        })
++        .boxed()
++    }
++
++    /// Round-trip: decode(encode(v)) == v (bit-exact for floats), and re-encoding
++    /// the decoded value is a byte-for-byte fixpoint.
++    #[hegel::test]
++    fn prop_core_value_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw(arb_value(3));
++
++        let buf = enc(&value);
++        let decoded: Value = dec(&buf).unwrap_or_else(|err| {
++            panic!("decode failed: {:?} value: {:?} buf: {:?}", err, value, buf)
++        });
++        assert!(value_eq(&value, &decoded),
++            "value: {:?} decoded: {:?} buf: {:?}", value, decoded, buf);
++
++        let buf2 = enc(&decoded);
++        assert_eq!(buf, buf2, "re-encode is not a fixpoint: {:?}", value);
++    }
++
++    /// `RawValue` and `IgnoredAny` consume exactly one item, and `RawValue`
++    /// captures exactly the encoded bytes of that item.
++    #[hegel::test]
++    fn prop_raw_value_and_ignored_any_consume_exactly_one_item(tc: hegel::TestCase) {
++        let value = tc.draw(arb_value(3));
++        let sentinel = arb_u64(&tc);
++
++        let item = enc(&value);
++        let mut buf = item.clone();
++        buf.extend_from_slice(&enc(&sentinel));
++
++        // RawValue: exact byte identity + reader left at the next item
++        let mut reader = SliceReader::new(&buf);
++        let raw = RawValue::decode(&mut reader).unwrap();
++        assert_eq!(raw.as_bytes(), item.as_slice(), "value: {:?}", value);
++        assert_eq!(u64::decode(&mut reader).unwrap(), sentinel);
++
++        // IgnoredAny: skips exactly one item
++        let mut reader = SliceReader::new(&buf);
++        let _ignore = dec::IgnoredAny::decode(&mut reader).unwrap();
++        assert_eq!(u64::decode(&mut reader).unwrap(), sentinel);
++    }
++
++    /// Decoding arbitrary untrusted bytes as any type returns Ok/Err but never
++    /// panics, aborts, over-allocates or hangs. (Supplements fuzz_targets/decode.rs.)
++    #[hegel::test]
++    fn prop_core_decode_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++        let data: Vec<u8> = tc.draw(generators::binary().max_size(512));
++        let data = data.as_slice();
++
++        drop(dec::<Value>(data));
++        drop(dec::<RawValue>(data));
++        drop(dec::<dec::IgnoredAny>(data));
++        drop(dec::<u8>(data));
++        drop(dec::<u16>(data));
++        drop(dec::<u32>(data));
++        drop(dec::<u64>(data));
++        drop(dec::<u128>(data));
++        drop(dec::<i8>(data));
++        drop(dec::<i16>(data));
++        drop(dec::<i32>(data));
++        drop(dec::<i64>(data));
++        drop(dec::<i128>(data));
++        drop(dec::<bool>(data));
++        drop(dec::<f32>(data));
++        drop(dec::<f64>(data));
++        drop(dec::<types::F16>(data));
++        drop(dec::<types::Simple>(data));
++        drop(dec::<String>(data));
++        drop(dec::<&str>(data));
++        drop(dec::<types::Bytes<Vec<u8>>>(data));
++        drop(dec::<types::Bytes<&[u8]>>(data));
++        drop(dec::<Vec<Value>>(data));
++        drop(dec::<types::Map<Vec<(Value, Value)>>>(data));
++        drop(dec::<types::Tag<Value>>(data));
++        drop(dec::<Option<Value>>(data));
++        drop(dec::<types::Maybe<Option<Value>>>(data));
++    }
++
++    /// A definite-length header claiming a huge length (or an unterminated
++    /// indefinite-length item) must fail with a normal error -- quickly and
++    /// without pre-allocating the claimed length.
++    #[hegel::test]
++    fn prop_crafted_length_prefix_rejected_without_oom(tc: hegel::TestCase) {
++        // major types with a payload/element length: bytes, string, array, map
++        let major: u8 = tc.draw(generators::sampled_from(vec![2u8, 3, 4, 5]));
++        let indefinite = tc.draw(generators::booleans());
++
++        // garbage tail; 0xff-free so an indefinite item can never see its
++        // "break" marker and terminate successfully
++        let garbage: Vec<u8> = tc.draw(
++            generators::vecs(generators::integers::<u8>().max_value(0xfe)).max_size(16));
++
++        let mut data = Vec::new();
++        if indefinite {
++            data.push((major << 5) | 0x1f);
++        } else {
++            // claimed length always exceeds the available payload
++            let len: u64 = tc.draw(hegel::one_of!(
++                generators::integers::<u64>().min_value(17),
++                generators::sampled_from(vec![
++                    65536u64, u32::MAX as u64, u32::MAX as u64 + 1,
++                    1 << 48, u64::MAX - 1, u64::MAX,
++                ]),
++            ));
++            match tc.draw(generators::sampled_from(vec![1u8, 2, 4, 8])) {
++                1 if len <= u8::MAX as u64 => {
++                    data.push((major << 5) | 0x18);
++                    data.push(len as u8);
++                },
++                2 if len <= u16::MAX as u64 => {
++                    data.push((major << 5) | 0x19);
++                    data.extend_from_slice(&(len as u16).to_be_bytes());
++                },
++                4 if len <= u32::MAX as u64 => {
++                    data.push((major << 5) | 0x1a);
++                    data.extend_from_slice(&(len as u32).to_be_bytes());
++                },
++                _ => {
++                    data.push((major << 5) | 0x1b);
++                    data.extend_from_slice(&len.to_be_bytes());
++                }
++            }
++        }
++        data.extend_from_slice(&garbage);
++
++        let ret: DecodeResult<Value> = dec(&data);
++        assert!(ret.is_err(), "data: {:?} ret: {:?}", data, ret);
++        let ret: DecodeResult<dec::IgnoredAny> = dec(&data);
++        assert!(ret.is_err(), "data: {:?}", data);
++    }
++
++    /// Deeply nested input must either decode or fail with a depth error --
++    /// never overflow the stack. SliceReader's documented recursion limit is 256.
++    #[hegel::test]
++    fn prop_deeply_nested_input_no_stack_overflow(tc: hegel::TestCase) {
++        let depth: usize = tc.draw(hegel::one_of!(
++            generators::integers::<usize>().min_value(1).max_value(20_000),
++            generators::sampled_from(vec![100usize, 127, 128, 129, 255, 256, 257, 512, 20_000]),
++        ));
++        let kind: u8 = tc.draw(generators::integers::<u8>().max_value(3));
++
++        let mut data = Vec::new();
++        match kind {
++            0 => { // definite arrays: [[[...0...]]]
++                data.resize(depth, 0x81);
++                data.push(0x00);
++            },
++            1 => { // indefinite arrays: [_ [_ ... ]]
++                data.resize(depth, 0x9f);
++                data.resize(depth * 2, 0xff);
++            },
++            2 => { // maps: {0: {0: ...0...}}
++                for _ in 0..depth {
++                    data.push(0xa1);
++                    data.push(0x00);
++                }
++                data.push(0x00);
++            },
++            _ => { // tags: 1(1(...0...))
++                data.resize(depth, 0xc1);
++                data.push(0x00);
++            }
++        }
++
++        let value: DecodeResult<Value> = dec(&data);
++        let ignored: DecodeResult<dec::IgnoredAny> = dec(&data);
++        let raw: DecodeResult<RawValue> = dec(&data);
++
++        if depth > 256 {
++            // must be rejected by the depth limit, not crash the process
++            assert!(value.is_err(), "depth {} kind {}", depth, kind);
++            assert!(ignored.is_err(), "depth {} kind {}", depth, kind);
++            assert!(raw.is_err(), "depth {} kind {}", depth, kind);
++        }
++        if depth <= 100 {
++            // well-formed and comfortably inside the limit
++            assert!(value.is_ok(), "depth {} kind {}: {:?}", depth, kind, value);
++            assert!(ignored.is_ok(), "depth {} kind {}", depth, kind);
++            assert!(raw.is_ok(), "depth {} kind {}", depth, kind);
++        }
++    }
++
++    /// Corrupting a valid encoding (bit flip, truncation, insertion) never panics.
++    #[hegel::test]
++    fn prop_corrupted_encoding_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw(arb_value(3));
++        let mut buf = enc(&value);
++
++        let pos = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => { // overwrite one byte
++                buf[pos] = tc.draw(generators::integers::<u8>());
++            },
++            1 => { // truncate
++                buf.truncate(pos);
++            },
++            _ => { // insert a byte
++                let byte = tc.draw(generators::integers::<u8>());
++                buf.insert(pos, byte);
++            }
++        }
++
++        drop(dec::<Value>(&buf));
++        drop(dec::<dec::IgnoredAny>(&buf));
++        drop(dec::<RawValue>(&buf));
++    }
++
++    /// Decoding a text string validates UTF-8: a definite-length string item
++    /// decodes to exactly its payload iff the payload is valid UTF-8, and is
++    /// rejected otherwise.
++    #[hegel::test]
++    fn prop_string_decode_validates_utf8(tc: hegel::TestCase) {
++        let payload: Vec<u8> = tc.draw(generators::binary().max_size(128));
++        let buf = enc(&types::UncheckedStr(payload.as_slice()));
++
++        let ret: DecodeResult<String> = dec(&buf);
++        match core::str::from_utf8(&payload) {
++            Ok(s) => assert_eq!(ret.unwrap(), s),
++            Err(_) => assert!(
++                matches!(ret, Err(cbor4ii::core::error::DecodeError::RequireUtf8 { .. })),
++                "payload: {:?} ret: {:?}", payload, ret
++            )
++        }
++    }
++
++    /// Spec (RFC 8949 4.2.1-style shortest form): the encoder emits the smallest
++    /// possible integer header, for both unsigned and negative integers.
++    #[hegel::test]
++    fn prop_int_header_shortest_form(tc: hegel::TestCase) {
++        let n = arb_u64(&tc);
++        let expected = match n {
++            0..=23 => 1,
++            24..=0xff => 2,
++            0x100..=0xffff => 3,
++            0x1_0000..=0xffff_ffff => 5,
++            _ => 9
++        };
++
++        let buf = enc(&n);
++        assert_eq!(buf.len(), expected, "n: {}", n);
++        assert_eq!(buf[0] >> 5, 0, "n: {}", n); // major type 0
++
++        // the corresponding negative integer -1 - n uses the same header size
++        let m: i128 = -1 - i128::from(n);
++        let buf = enc(&m);
++        assert_eq!(buf.len(), expected, "m: {}", m);
++        assert_eq!(buf[0] >> 5, 1, "m: {}", m); // major type 1
++    }
++
++    /// Narrowing decodes agree with `try_from`: bytes encoded from a wide
++    /// integer decode as a narrower type exactly when the value fits.
++    #[hegel::test]
++    fn prop_narrowing_decode_matches_try_from(tc: hegel::TestCase) {
++        use std::convert::TryFrom;
++
++        let n = arb_u64(&tc);
++        let buf = enc(&n);
++        assert_eq!(dec::<u8>(&buf).ok(), u8::try_from(n).ok(), "n: {}", n);
++        assert_eq!(dec::<u16>(&buf).ok(), u16::try_from(n).ok(), "n: {}", n);
++        assert_eq!(dec::<u32>(&buf).ok(), u32::try_from(n).ok(), "n: {}", n);
++        assert_eq!(dec::<u64>(&buf).ok(), Some(n));
++        assert_eq!(dec::<i64>(&buf).ok(), i64::try_from(n).ok(), "n: {}", n);
++        assert_eq!(dec::<u128>(&buf).ok(), Some(u128::from(n)));
++        assert_eq!(dec::<i128>(&buf).ok(), Some(i128::from(n)));
++
++        let i: i64 = tc.draw(hegel::one_of!(
++            generators::integers::<i64>(),
++            generators::sampled_from(vec![
++                i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX,
++                i64::from(i8::MIN), i64::from(i8::MIN) - 1,
++                i64::from(i8::MAX), i64::from(i8::MAX) + 1,
++                i64::from(i16::MIN) - 1, i64::from(i16::MAX) + 1,
++                i64::from(i32::MIN) - 1, i64::from(i32::MAX) + 1,
++            ]),
++        ));
++        let buf = enc(&i);
++        assert_eq!(dec::<i8>(&buf).ok(), i8::try_from(i).ok(), "i: {}", i);
++        assert_eq!(dec::<i16>(&buf).ok(), i16::try_from(i).ok(), "i: {}", i);
++        assert_eq!(dec::<i32>(&buf).ok(), i32::try_from(i).ok(), "i: {}", i);
++        assert_eq!(dec::<i64>(&buf).ok(), Some(i));
++        assert_eq!(dec::<i128>(&buf).ok(), Some(i128::from(i)));
++        assert_eq!(dec::<u64>(&buf).ok(), u64::try_from(i).ok(), "i: {}", i);
++    }
++}
+diff --git a/tests/serde.rs b/tests/serde.rs
+index fe6aee5..570097f 100644
+--- a/tests/serde.rs
++++ b/tests/serde.rs
+@@ -535,3 +535,391 @@ fn test_regression_f16() {
+         _ => panic!()
+     }
+ }
++
++// ===========================================================================
++// Property-based tests (hegel)
++// ===========================================================================
++mod hegel_props {
++    use std::collections::BTreeMap;
++    use serde::{ Serialize, Deserialize };
++    use cbor4ii::core::Value;
++    use cbor4ii::serde::{ to_vec, from_slice, from_reader };
++    use hegel::generators::{ self, Generator };
++
++    /// f32 wrapper comparing bit patterns, so NaN payload round-tripping is
++    /// asserted rather than being unequal to itself.
++    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
++    struct BitsF32(f32);
++
++    impl PartialEq for BitsF32 {
++        fn eq(&self, other: &Self) -> bool {
++            self.0.to_bits() == other.0.to_bits()
++        }
++    }
++
++    /// f64 wrapper comparing bit patterns.
++    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
++    struct BitsF64(f64);
++
++    impl PartialEq for BitsF64 {
++        fn eq(&self, other: &Self) -> bool {
++            self.0.to_bits() == other.0.to_bits()
++        }
++    }
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq)]
++    enum ModelEnum {
++        Unit,
++        NewType(i64),
++        Tuple(String, bool),
++        Struct { x: BitsF32, y: Vec<u8> },
++    }
++
++    /// A model exercising every serde data-model shape the crate supports:
++    /// all integer widths, floats, bool, char, unicode strings, byte strings,
++    /// options, sequences, maps, tuples, enums and nested structs.
++    #[derive(Serialize, Deserialize, Debug, PartialEq)]
++    struct Model {
++        u8v: u8, u16v: u16, u32v: u32, u64v: u64, u128v: u128,
++        i8v: i8, i16v: i16, i32v: i32, i64v: i64, i128v: i128,
++        f32v: BitsF32,
++        f64v: BitsF64,
++        boolean: bool,
++        ch: char,
++        text: String,
++        #[serde(with = "serde_bytes")]
++        bytes: Vec<u8>,
++        opt: Option<i64>,
++        list: Vec<i32>,
++        map: BTreeMap<String, i64>,
++        tup: (bool, u8, String),
++        en: ModelEnum,
++        nested: Option<Box<Model>>,
++    }
++
++    fn arb_u64(tc: &hegel::TestCase) -> u64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<u64>(),
++            generators::sampled_from(vec![
++                0u64, 1, 23, 24, 25, 255, 256, 65535, 65536,
++                u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX - 1, u64::MAX,
++            ]),
++        ))
++    }
++
++    fn arb_i64(tc: &hegel::TestCase) -> i64 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i64>(),
++            generators::sampled_from(vec![
++                i64::MIN, i64::MIN + 1, -1, 0, 1, 23, 24, i64::MAX - 1, i64::MAX,
++            ]),
++        ))
++    }
++
++    fn arb_u128(tc: &hegel::TestCase) -> u128 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<u128>(),
++            generators::sampled_from(vec![
++                0u128, u64::MAX as u128 - 1, u64::MAX as u128, u64::MAX as u128 + 1,
++                u128::MAX - 1, u128::MAX,
++            ]),
++        ))
++    }
++
++    fn arb_i128(tc: &hegel::TestCase) -> i128 {
++        tc.draw(hegel::one_of!(
++            generators::integers::<i128>(),
++            generators::sampled_from(vec![
++                i128::MIN, i128::MIN + 1, -(u64::MAX as i128) - 2, -(u64::MAX as i128) - 1,
++                -(u64::MAX as i128), i64::MIN as i128 - 1, i64::MIN as i128, -1, 0,
++                i64::MAX as i128, u64::MAX as i128, u64::MAX as i128 + 1,
++                i128::MAX - 1, i128::MAX,
++            ]),
++        ))
++    }
++
++    fn arb_f32(tc: &hegel::TestCase) -> f32 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f32>(),
++            generators::integers::<u32>().map(f32::from_bits),
++        ))
++    }
++
++    fn arb_f64(tc: &hegel::TestCase) -> f64 {
++        tc.draw(hegel::one_of!(
++            generators::floats::<f64>(),
++            generators::integers::<u64>().map(f64::from_bits),
++        ))
++    }
++
++    fn arb_char(tc: &hegel::TestCase) -> char {
++        let n = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(0x7F),
++            generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++            generators::integers::<u32>().min_value(0x1_0000).max_value(0x10_FFFF),
++        ));
++        char::from_u32(n).unwrap_or('\u{FFFD}')
++    }
++
++    fn arb_enum(tc: &hegel::TestCase) -> ModelEnum {
++        match tc.draw(generators::integers::<u8>().max_value(3)) {
++            0 => ModelEnum::Unit,
++            1 => ModelEnum::NewType(arb_i64(tc)),
++            2 => ModelEnum::Tuple(tc.draw(generators::text().max_size(16)),
++                                  tc.draw(generators::booleans())),
++            _ => ModelEnum::Struct {
++                x: BitsF32(arb_f32(tc)),
++                y: tc.draw(generators::binary().max_size(16)),
++            },
++        }
++    }
++
++    fn arb_model(depth: u32) -> generators::BoxedGenerator<'static, Model> {
++        hegel::compose!(|tc| {
++            Model {
++                u8v: tc.draw(generators::integers::<u8>()),
++                u16v: tc.draw(generators::integers::<u16>()),
++                u32v: tc.draw(generators::integers::<u32>()),
++                u64v: arb_u64(&tc),
++                u128v: arb_u128(&tc),
++                i8v: tc.draw(generators::integers::<i8>()),
++                i16v: tc.draw(generators::integers::<i16>()),
++                i32v: tc.draw(generators::integers::<i32>()),
++                i64v: arb_i64(&tc),
++                i128v: arb_i128(&tc),
++                f32v: BitsF32(arb_f32(&tc)),
++                f64v: BitsF64(arb_f64(&tc)),
++                boolean: tc.draw(generators::booleans()),
++                ch: arb_char(&tc),
++                text: tc.draw(generators::text().max_size(32)),
++                bytes: tc.draw(generators::binary().max_size(32)),
++                opt: tc.draw(generators::optional(generators::integers::<i64>())),
++                list: tc.draw(generators::vecs(generators::integers::<i32>()).max_size(8)),
++                map: tc.draw(generators::hashmaps(
++                        generators::text().max_size(8),
++                        generators::integers::<i64>(),
++                    ).max_size(4))
++                    .into_iter().collect(),
++                tup: (
++                    tc.draw(generators::booleans()),
++                    tc.draw(generators::integers::<u8>()),
++                    tc.draw(generators::text().max_size(8)),
++                ),
++                en: arb_enum(&tc),
++                nested: if depth > 0 && tc.draw(generators::booleans()) {
++                    Some(Box::new(tc.draw(arb_model(depth - 1))))
++                } else {
++                    None
++                },
++            }
++        })
++        .boxed()
++    }
++
++    /// Bit-exact structural equality on `Value` (floats compared by bits).
++    fn value_eq(a: &Value, b: &Value) -> bool {
++        match (a, b) {
++            (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
++            (Value::Array(x), Value::Array(y)) =>
++                x.len() == y.len() && x.iter().zip(y.iter()).all(|(u, v)| value_eq(u, v)),
++            (Value::Map(x), Value::Map(y)) =>
++                x.len() == y.len() && x.iter().zip(y.iter()).all(
++                    |((ka, va), (kb, vb))| value_eq(ka, kb) && value_eq(va, vb)),
++            (Value::Tag(ta, va), Value::Tag(tb, vb)) => ta == tb && value_eq(va, vb),
++            _ => a == b
++        }
++    }
++
++    /// Integers a serde-mod `Value` round-trip supports.
++    ///
++    /// KNOWN BUG EXCLUSION: the range [-2^64, i64::MIN - 1] is excluded here;
++    /// it is pinned by `prop_serde_value_roundtrip_big_negative_int_known_bug`
++    /// below. Everything else (full u64, i64, and bignum tails) is covered.
++    fn arb_serde_int(tc: &hegel::TestCase) -> i128 {
++        tc.draw(hegel::one_of!(
++            // native unsigned range [0, 2^64 - 1]
++            generators::integers::<u64>().map(i128::from),
++            // negative range representable as i64
++            generators::integers::<i64>().max_value(-1).map(i128::from),
++            // positive bignum (tag 2)
++            generators::integers::<i128>().min_value(i128::from(u64::MAX) + 1),
++            // negative bignum (tag 3), starts below -2^64
++            generators::integers::<i128>().max_value(-i128::from(u64::MAX) - 2),
++            generators::sampled_from(vec![
++                0i128, -1, 1, 23, 24, i64::MIN as i128, u64::MAX as i128,
++                u64::MAX as i128 + 1, -(u64::MAX as i128) - 2, i128::MIN, i128::MAX,
++            ]),
++        ))
++    }
++
++    /// Arbitrary `Value` tree for the serde mod (no `Tag`: serializing Tag via
++    /// serde is documented as unsupported).
++    fn arb_serde_value(depth: u32) -> generators::BoxedGenerator<'static, Value> {
++        hegel::compose!(|tc| {
++            let max_choice = if depth == 0 { 5u8 } else { 7u8 };
++            match tc.draw(generators::integers::<u8>().max_value(max_choice)) {
++                0 => Value::Null,
++                1 => Value::Bool(tc.draw(generators::booleans())),
++                2 => Value::Integer(arb_serde_int(&tc)),
++                3 => Value::Float(arb_f64(&tc)),
++                4 => Value::Bytes(tc.draw(generators::binary().max_size(64))),
++                5 => Value::Text(tc.draw(generators::text().max_size(64))),
++                6 => Value::Array(tc.draw(generators::vecs(arb_serde_value(depth - 1)).max_size(4))),
++                _ => Value::Map(tc.draw(generators::vecs(generators::tuples!(
++                        arb_serde_value(depth - 1),
++                        arb_serde_value(depth - 1),
++                    )).max_size(4))),
++            }
++        })
++        .boxed()
++    }
++
++    /// The crown: from_slice(to_vec(v)) == v over a rich serde model, through
++    /// both the zero-copy slice reader and the buffered io reader.
++    #[hegel::test]
++    fn prop_serde_roundtrip_rich_model(tc: hegel::TestCase) {
++        let model = tc.draw(arb_model(2));
++
++        let buf = to_vec(Vec::new(), &model).unwrap();
++        let decoded: Model = from_slice(&buf).unwrap_or_else(|err| {
++            panic!("from_slice failed: {:?} model: {:?} buf: {:?}", err, model, buf)
++        });
++        assert_eq!(decoded, model, "buf: {:?}", buf);
++
++        let decoded: Model = from_reader(buf.as_slice()).unwrap_or_else(|err| {
++            panic!("from_reader failed: {:?} model: {:?} buf: {:?}", err, model, buf)
++        });
++        assert_eq!(decoded, model, "buf: {:?}", buf);
++    }
++
++    /// Encoding is deterministic, and decode-then-encode is a byte fixpoint.
++    #[hegel::test]
++    fn prop_serde_encoding_deterministic_and_fixpoint(tc: hegel::TestCase) {
++        let model = tc.draw(arb_model(2));
++
++        let buf1 = to_vec(Vec::new(), &model).unwrap();
++        let buf2 = to_vec(Vec::new(), &model).unwrap();
++        assert_eq!(buf1, buf2, "encoding is not deterministic: {:?}", model);
++
++        let decoded: Model = from_slice(&buf1).unwrap();
++        let buf3 = to_vec(Vec::new(), &decoded).unwrap();
++        assert_eq!(buf1, buf3, "re-encode is not a fixpoint: {:?}", model);
++    }
++
++    /// Round-trip of dynamic `Value` trees through the serde mod, including
++    /// bignum (tag 2/3) integers beyond the u64 range.
++    #[hegel::test]
++    fn prop_serde_value_roundtrip(tc: hegel::TestCase) {
++        let value = tc.draw(arb_serde_value(3));
++
++        let buf = to_vec(Vec::new(), &value).unwrap();
++        let decoded: Value = from_slice(&buf).unwrap_or_else(|err| {
++            panic!("from_slice failed: {:?} value: {:?} buf: {:?}", err, value, buf)
++        });
++        assert!(value_eq(&value, &decoded),
++            "value: {:?} decoded: {:?} buf: {:?}", value, decoded, buf);
++    }
++
++    /// KNOWN FAILURE (real bug): CBOR negative integers in [-2^64, i64::MIN - 1]
++    /// -- valid RFC 8949 major type 1, and exactly what `to_vec` itself emits for
++    /// `Value::Integer` in that range -- fail to decode as `Value` with
++    /// `CastOverflow { name: "-i64" }`. `deserialize_any` routes all of major
++    /// type 1 to `deserialize_i64` (src/serde/de.rs) with no i128 fallback, so
++    /// the serde-mod Value round-trip is broken for these values. serde_cbor
++    /// decodes the same bytes successfully (`Integer(-9223372036854775809)`).
++    /// Minimal reproducer: to_vec(Value::Integer(i64::MIN as i128 - 1)).
++    #[hegel::test]
++    fn prop_serde_value_roundtrip_big_negative_int_known_bug(tc: hegel::TestCase) {
++        // deterministic: every value in this range fails
++        let n: i128 = tc.draw(generators::integers::<i128>()
++            .min_value(-i128::from(u64::MAX) - 1)
++            .max_value(i128::from(i64::MIN) - 1));
++        let value = Value::Integer(n);
++
++        let buf = to_vec(Vec::new(), &value).unwrap();
++        let decoded: Value = from_slice(&buf).unwrap_or_else(|err| {
++            panic!("from_slice failed: {:?} value: {:?} buf: {:?}", err, value, buf)
++        });
++        assert!(value_eq(&value, &decoded), "value: {:?} decoded: {:?}", value, decoded);
++    }
++
++    /// Decoding arbitrary untrusted bytes never panics, over-allocates or hangs.
++    /// (Supplements fuzz_targets/de.rs.)
++    #[hegel::test]
++    fn prop_from_slice_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++        let data: Vec<u8> = tc.draw(generators::binary().max_size(512));
++
++        drop(from_slice::<Value>(&data));
++        drop(from_slice::<Model>(&data));
++        drop(from_slice::<ModelEnum>(&data));
++        drop(from_reader::<Value, _>(data.as_slice()));
++        drop(from_reader::<Model, _>(data.as_slice()));
++    }
++
++    /// Bytes valid for one type decoded as any other type never panic.
++    #[hegel::test]
++    fn prop_from_slice_cross_type_never_panics(tc: hegel::TestCase) {
++        let value = tc.draw(arb_serde_value(2));
++        let buf = to_vec(Vec::new(), &value).unwrap();
++        let buf = buf.as_slice();
++
++        drop(from_slice::<()>(buf));
++        drop(from_slice::<bool>(buf));
++        drop(from_slice::<u8>(buf));
++        drop(from_slice::<u64>(buf));
++        drop(from_slice::<u128>(buf));
++        drop(from_slice::<i8>(buf));
++        drop(from_slice::<i64>(buf));
++        drop(from_slice::<i128>(buf));
++        drop(from_slice::<f32>(buf));
++        drop(from_slice::<f64>(buf));
++        drop(from_slice::<char>(buf));
++        drop(from_slice::<String>(buf));
++        drop(from_slice::<&str>(buf));
++        drop(from_slice::<serde_bytes::ByteBuf>(buf));
++        drop(from_slice::<Option<i64>>(buf));
++        drop(from_slice::<Vec<String>>(buf));
++        drop(from_slice::<BTreeMap<String, u64>>(buf));
++        drop(from_slice::<(f32, f64)>(buf));
++        drop(from_slice::<Model>(buf));
++        drop(from_slice::<ModelEnum>(buf));
++    }
++
++    /// Deeply nested input through the serde deserializer is depth-limited:
++    /// graceful error, never a stack overflow.
++    #[hegel::test]
++    fn prop_serde_deeply_nested_no_stack_overflow(tc: hegel::TestCase) {
++        let depth: usize = tc.draw(hegel::one_of!(
++            generators::integers::<usize>().min_value(1).max_value(20_000),
++            generators::sampled_from(vec![100usize, 127, 128, 129, 255, 256, 257, 512, 20_000]),
++        ));
++        let kind: u8 = tc.draw(generators::integers::<u8>().max_value(2));
++
++        let mut data = Vec::new();
++        match kind {
++            0 => { // definite arrays
++                data.resize(depth, 0x81);
++                data.push(0x00);
++            },
++            1 => { // indefinite arrays
++                data.resize(depth, 0x9f);
++                data.resize(depth * 2, 0xff);
++            },
++            _ => { // maps: {0: {0: ...}}
++                for _ in 0..depth {
++                    data.push(0xa1);
++                    data.push(0x00);
++                }
++                data.push(0x00);
++            }
++        }
++
++        let ret = from_slice::<Value>(&data);
++        if depth > 256 {
++            assert!(ret.is_err(), "depth {} kind {}", depth, kind);
++        }
++        if depth <= 100 {
++            assert!(ret.is_ok(), "depth {} kind {}: {:?}", depth, kind, ret);
++        }
++    }
++}
+diff --git a/tests/serde_cbor.rs b/tests/serde_cbor.rs
+index a16d567..eecd35f 100644
+--- a/tests/serde_cbor.rs
++++ b/tests/serde_cbor.rs
+@@ -230,3 +230,161 @@ fn serde() {
+ 
+     assert_eq!(value, data_de_value);
+ }
++
++// ===========================================================================
++// Property-based tests (hegel): differential against serde_cbor
++// ===========================================================================
++//
++// README: "This library is intended to be compatible with serde_cbor" --
++// serde_cbor is the compatibility oracle, in both directions, over data
++// shapes the README does not call out as intentionally different (the unit
++// type and packed mode are excluded).
++mod hegel_props {
++    use std::collections::BTreeMap;
++    use serde::{ Serialize, Deserialize };
++    use cbor4ii::serde::to_vec;
++    use hegel::generators;
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    enum CompatEnum {
++        Unit,
++        NewType(i64),
++        Tuple(String, bool),
++        Struct { x: i32, y: String },
++    }
++
++    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
++    struct Compat {
++        u: u64,
++        i: i64,
++        b: bool,
++        ch: char,
++        s: String,
++        #[serde(with = "serde_bytes")]
++        bytes: Vec<u8>,
++        // NaN is excluded because the test's oracle (derived PartialEq) cannot
++        // compare it, not because of any library contract.
++        f: f64,
++        list: Vec<i32>,
++        map: BTreeMap<String, u32>,
++        opt: Option<String>,
++        en: CompatEnum,
++        tup: (u8, String),
++    }
++
++    fn arb_char(tc: &hegel::TestCase) -> char {
++        let n = tc.draw(hegel::one_of!(
++            generators::integers::<u32>().max_value(0x7F),
++            generators::integers::<u32>().min_value(0x80).max_value(0xFFFF),
++            generators::integers::<u32>().min_value(0x1_0000).max_value(0x10_FFFF),
++        ));
++        char::from_u32(n).unwrap_or('\u{FFFD}')
++    }
++
++    /// True iff serde_cbor would encode this f64 in a narrower width (f16/f32).
++    fn narrowable(f: f64) -> bool {
++        (f as f32) as f64 == f
++    }
++
++    /// An f64 that serde_cbor will encode with the full F64 marker.
++    ///
++    /// KNOWN BUG EXCLUSION: serde_cbor encodes floats in the shortest lossless
++    /// width, and cbor4ii's typed `deserialize_f64` rejects F16/F32-encoded
++    /// floats; see `prop_cbor4ii_decodes_serde_cbor_float_known_bug` below.
++    fn arb_wide_f64(tc: &hegel::TestCase) -> f64 {
++        let f = tc.draw(generators::floats::<f64>().allow_nan(false));
++        let f = if narrowable(f) {
++            if f == 0.0 || !f.is_finite() {
++                1.0e-300 // below the f32 range: never narrowable
++            } else {
++                // perturb the low mantissa bits out of f32 precision
++                f * (1.0 + f64::EPSILON)
++            }
++        } else {
++            f
++        };
++        // the transform above must have produced a non-narrowable float,
++        // otherwise this test silently loses its float coverage
++        assert!(!narrowable(f), "de-narrowing failed for {:?}", f);
++        f
++    }
++
++    #[hegel::composite]
++    fn arb_compat(tc: &hegel::TestCase) -> Compat {
++        Compat {
++            u: tc.draw(generators::integers::<u64>()),
++            i: tc.draw(generators::integers::<i64>()),
++            b: tc.draw(generators::booleans()),
++            ch: arb_char(&tc),
++            s: tc.draw(generators::text().max_size(32)),
++            bytes: tc.draw(generators::binary().max_size(32)),
++            f: arb_wide_f64(&tc),
++            list: tc.draw(generators::vecs(generators::integers::<i32>()).max_size(8)),
++            map: tc.draw(generators::hashmaps(
++                    generators::text().max_size(8),
++                    generators::integers::<u32>(),
++                ).max_size(4))
++                .into_iter().collect(),
++            opt: tc.draw(generators::optional(generators::text().max_size(8))),
++            en: match tc.draw(generators::integers::<u8>().max_value(3)) {
++                0 => CompatEnum::Unit,
++                1 => CompatEnum::NewType(tc.draw(generators::integers::<i64>())),
++                2 => CompatEnum::Tuple(tc.draw(generators::text().max_size(8)),
++                                       tc.draw(generators::booleans())),
++                _ => CompatEnum::Struct {
++                    x: tc.draw(generators::integers::<i32>()),
++                    y: tc.draw(generators::text().max_size(8)),
++                },
++            },
++            tup: (
++                tc.draw(generators::integers::<u8>()),
++                tc.draw(generators::text().max_size(8)),
++            ),
++        }
++    }
++
++    /// serde_cbor decodes what cbor4ii encodes.
++    #[hegel::test]
++    fn prop_serde_cbor_decodes_cbor4ii_encoding(tc: hegel::TestCase) {
++        let value = tc.draw(arb_compat());
++
++        let buf = to_vec(Vec::new(), &value).unwrap();
++        let back: Compat = serde_cbor::from_slice(&buf).unwrap_or_else(|err| {
++            panic!("serde_cbor failed: {:?} value: {:?} buf: {:?}", err, value, buf)
++        });
++        assert_eq!(back, value, "buf: {:?}", buf);
++    }
++
++    /// KNOWN FAILURE (compatibility bug): serde_cbor encodes every f64 in the
++    /// shortest lossless float width (0.0 -> 0xf9 0x00 0x00, an f16), which RFC
++    /// 8949 treats as an equivalent representation. cbor4ii's typed
++    /// `deserialize_f64` (src/serde/de.rs -> f64::decode in src/core/dec.rs)
++    /// accepts only the F64 (0xfb) marker, so cbor4ii fails to decode most
++    /// serde_cbor-encoded floats with `Mismatch { name: "f64", found: 249 }`,
++    /// despite the README's serde_cbor-compatibility claim (float width is not
++    /// one of the documented intentional differences). Minimal reproducer:
++    /// `cbor4ii::serde::from_slice::<f64>(&serde_cbor::to_vec(&0.0f64)?)`.
++    #[hegel::test]
++    fn prop_cbor4ii_decodes_serde_cbor_float_known_bug(tc: hegel::TestCase) {
++        // deterministic: every f32-representable float is narrowed by serde_cbor
++        let value = f64::from(tc.draw(generators::floats::<f32>().allow_nan(false)));
++
++        let buf = serde_cbor::to_vec(&value).unwrap();
++        let back: f64 = cbor4ii::serde::from_slice(&buf).unwrap_or_else(|err| {
++            panic!("cbor4ii failed: {:?} value: {:?} buf: {:?}", err, value, buf)
++        });
++        assert_eq!(back, value, "buf: {:?}", buf);
++    }
++
++    /// cbor4ii decodes what serde_cbor encodes.
++    #[hegel::test]
++    fn prop_cbor4ii_decodes_serde_cbor_encoding(tc: hegel::TestCase) {
++        let value = tc.draw(arb_compat());
++
++        let buf = serde_cbor::to_vec(&value).unwrap();
++        let back: Compat = cbor4ii::serde::from_slice(&buf).unwrap_or_else(|err| {
++            panic!("cbor4ii failed: {:?} value: {:?} buf: {:?}", err, value, buf)
++        });
++        assert_eq!(back, value, "buf: {:?}", buf);
++    }
++}

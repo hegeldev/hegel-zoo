@@ -1,0 +1,37 @@
+# hifitime
+
+[nyx-space/hifitime](https://github.com/nyx-space/hifitime).
+
+## What is tested
+
+**`tests/duration.rs`**
+- `prop_duration_total_nanoseconds_roundtrip`: from_total_nanoseconds is the inverse of total_nanoseconds for in-range values and saturates to MIN/MAX outside the range (per its rustdoc).
+- `prop_duration_add_matches_i128_oracle`: Duration addition agrees with saturating i128 addition of the total nanoseconds (evidence: Add docs + "Duration::MIN - 1 ns == MIN" bound tests).
+- `prop_duration_sub_matches_i128_oracle`: Duration subtraction agrees with saturating i128 subtraction. KNOWN FAILURE: when `a.centuries - b.centuries` overflows an i16 on the *positive* side (a large positive minus a large negative duration), `Sub for Duration` (src/duration/ops.rs) treats the `checked_sub` overflow as an underflow and saturates to `Duration::MIN` instead of `Duration::MAX`. Minimal counterexample (pinned by the `just` branch below so the failure reproduces on every run): `Duration::ZERO - Duration::MIN == Duration::MIN` but must be `Duration::MAX`.
+- `prop_duration_sub_matches_i128_oracle_no_century_overflow`: Sibling of prop_duration_sub_matches_i128_oracle (KNOWN FAILURE): the same oracle restricted to pairs whose century difference fits in an i16, i.e. excluding the known wrong-saturation bug, so the rest of the subtraction logic keeps being exercised.
+- `prop_duration_neg_matches_i128_oracle`: Negation matches i128 negation (the range is symmetric: -MIN == MAX), and is therefore an involution.
+- `prop_duration_ordering_matches_total_nanoseconds`: The derived lexicographic Ord on (centuries, nanoseconds) must order durations by their actual value (evidence: representation convention documented on the Duration struct).
+- `prop_duration_display_fromstr_roundtrip`: Display -> FromStr round-trips exactly. Evidence: the serde Serialize/Deserialize impls for Duration serialize via to_string and deserialize via from_str, so this round-trip must be lossless. KNOWN FAILURE: `Duration::decompose()` computes each component with f64 unit conversions (`to_unit(...).floor()`). For large durations the f64 rounds up across a component boundary, so `Display` prints a value that differs from the stored duration and the serde round-trip corrupts the value. Minimal counterexample (pinned by the `just` branch below so the failure reproduces on every run): `Duration::from_total_nanoseconds(NANOSECONDS_PER_CENTURY as i128 - 1)` (one nanosecond less than a century) displays as "36525 days 59 min 59 s 999 ms 999 μs 999 ns" — 36525 days is already the *full* century, its `decompose()` is (0, 36525, 0, 59, 59, 999, 999, 999) (note the missing 23 h), and parsing the display back yields a value ~1 h larger than the original. The failure region starts as low as ~105 days: e.g. 250 days - 1 ns displays as "250 days 59 min 59 s 999 ms 999 μs 999 ns" and round-trips off by 1 h.
+- `prop_duration_display_fromstr_roundtrip_subday`: Sibling of prop_duration_display_fromstr_roundtrip (KNOWN FAILURE): restricted to sub-day durations, where the largest component value is 23 hours and the f64 conversions in decompose() are exact (the 1 ns resolution is orders of magnitude above the f64 ulp of every component), so the round-trip must hold.
+- `prop_duration_from_str_never_panics`: Duration::from_str must never panic, whatever the input.
+
+**`tests/epoch.rs`**
+- `prop_epoch_timescale_roundtrip_non_utc`: Converting an epoch to another time scale and back returns the original epoch: exactly for the fixed-offset scales (TAI, TT, GNSS), within the documented tolerances for the scales that apply a relativistic rate (TCG/TL/TCL, ~1 ns per sofa_val_tcg and tcl_tl_round_trip) or an iterated correction (ET/TDB/TCB). UTC is excluded here: it is covered by the two UTC-specific properties below because of the leap-second boundary behavior.
+- `prop_epoch_utc_roundtrip`: Round-trip through UTC from a fixed-offset scale, boosted near leap second boundaries. KNOWN FAILURE (suspected bug): TAI->UTC->TAI is off by 1 s for every TAI epoch within [L, L + delta_at_new) of each IERS leap boundary L — a window 10..37 s wide, much wider than the genuinely ambiguous 23:59:60 leap second itself. Cause: the leap second table timestamps (src/epoch/leap_seconds.rs) are "UTC seconds counted as TAI" (2_272_060_800 is 26_297 days, i.e. the UTC calendar count of 1972-01-01), and `to_time_scale` keys the UTC->TAI lookup with that same convention ("Assume this is TAI"), but keys the TAI->UTC lookup with the *true* TAI value — the two directions disagree wherever the lookups straddle a boundary. Pinned counterexample (`just` branch below): TAI 2_272_060_800 s (1972-01-01T00:00:00 TAI) -> UTC 1971-12-31T23:59:50 -> TAI 1971-12-31T23:59:50 (10 s error, the full first IERS delta_at).
+- `prop_epoch_utc_roundtrip_away_from_leap_boundaries`: Sibling of prop_epoch_utc_roundtrip (KNOWN FAILURE): UTC round-trips, in both directions, restricted to epochs more than 60 s away from every IERS leap second boundary, i.e. excluding the known buggy windows, so the conversion logic everywhere else keeps being tested exactly.
+- `prop_epoch_gregorian_roundtrip`: Gregorian round-trip: to_gregorian in the epoch's own time scale followed by maybe_from_gregorian must return the exact same epoch (both directions are pure integer calendar math). Evidence: extreme_gregorian_print_roundtrip does this for hand-picked extreme dates in TAI and UTC.
+- `prop_epoch_from_str_never_panics`: Epoch::from_str / from_gregorian_str must never panic, whatever the input (they return Result). KNOWN FAILURE (real panic bug): `Epoch::from_str` sniffs the format with byte-index slicing (`&s[..2] == "JD"`, `&s[..3] == "MJD"`, ... in src/epoch/mod.rs). The length guard only checks `s.len() < 7` in *bytes*, so any string of >= 7 bytes whose byte 2 or 3 falls inside a multi-byte character makes the slice panic ("byte index 2 is not a char boundary"). Pinned counterexample (`just` branch below): `"ࠀ𐀀"` (U+0800 U+10000, 7 bytes).
+- `prop_epoch_from_str_never_panics_ascii`: Sibling of prop_epoch_from_str_never_panics (KNOWN FAILURE): robustness restricted to ASCII-only inputs, where the byte-slicing panic cannot trigger, so the rest of the parser keeps being fuzzed.
+- `prop_epoch_display_fromstr_roundtrip`: Display -> from_str round-trips exactly for representable dates in the ISO year range. Evidence: the serde impls for Epoch serialize via to_string and deserialize via from_str; tcl_tl_round_trip and test_timescale_recip assert the same for specific epochs.
+- `prop_epoch_time_of_week_roundtrip`: to_time_of_week / from_time_of_week round-trip for non-negative epoch durations (the week counter is unsigned).
+
+## Oracles
+
+## Not tested
+
+## History
+
+- 2026-07-21: predecessor base commit `b2ccd8f1163f` (Merge pull request #493 from nyx-space/derive-partial-eq-duration-1...).
+- 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/hifitime.patch`).
+- 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: `prop_epoch_utc_roundtrip_away_from_leap_boundaries`'s leap-boundary exclusion filter computed `(ns - l).abs()` in i64, which overflows for `ns` near `i64::MIN` (Hegel found `ns - l == i64::MIN` exactly); now uses `abs_diff`.

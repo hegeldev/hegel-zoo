@@ -102,7 +102,17 @@ class Target:
 
     @property
     def expected_failures(self) -> dict[str, str]:
-        return dict(self.meta.get("expected_failures", {}))
+        """test name -> bug id. Values in target.toml are either "bug/id" or
+        { bug = "bug/id", intermittent = true } for tests that reach the bug only on some runs."""
+        out = {}
+        for name, v in self.meta.get("expected_failures", {}).items():
+            out[name] = v["bug"] if isinstance(v, dict) else v
+        return out
+
+    @property
+    def intermittent(self) -> set[str]:
+        return {n for n, v in self.meta.get("expected_failures", {}).items()
+                if isinstance(v, dict) and v.get("intermittent")}
 
 
 def load_pins() -> dict:
@@ -178,15 +188,17 @@ class Backend:
 class Rust(Backend):
     lang = "rust"
     # +hegeltest = "0.44.1"   |   +hegeltest = { version = "0.44.1", features = [...] }
-    dep_re = re.compile(r'^\+\s*hegeltest\s*=\s*(?:"(?P<v>[^"]+)"|\{[^}\n]*version\s*=\s*"(?P<v2>[^"]+)")',
+    # also the table form:  +[dev-dependencies.hegeltest]\n+version = "0.44.1"
+    dep_re = re.compile(r'^\+\s*hegeltest\s*=\s*(?:"(?P<v>[^"]+)"|\{[^}\n]*version\s*=\s*"(?P<v2>[^"]+)")'
+                        r'|^\+\[dev-dependencies\.hegeltest\]\n(?:\+(?!\[)[^\n]*\n)*?\+version\s*=\s*"(?P<v3>[^"]+)"',
                         re.M)
 
     def patch_versions(self, patch_text: str) -> set[str]:
-        return {m.group("v") or m.group("v2") for m in self.dep_re.finditer(patch_text)}
+        return {m.group("v") or m.group("v2") or m.group("v3") for m in self.dep_re.finditer(patch_text)}
 
     def rewrite_version(self, patch_text: str, new: str) -> str:
         def sub(m: re.Match) -> str:
-            old = m.group("v") or m.group("v2")
+            old = m.group("v") or m.group("v2") or m.group("v3")
             return m.group(0).replace(f'"{old}"', f'"{new}"', 1)
         return self.dep_re.sub(sub, patch_text)
 
@@ -199,7 +211,9 @@ class Rust(Backend):
     def default_env(self, t: Target) -> dict:
         # Cargo is happy to build a crate whose rust-version is older than hegeltest's MSRV;
         # tell it not to fail resolution on that (predecessor patches were made this way).
-        return {"CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS": "allow", "CARGO_TERM_COLOR": "never"}
+        return {"CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS": "allow", "CARGO_TERM_COLOR": "never",
+                # keep Hegel's failure database out of the upstream checkout (and of hegel.patch)
+                "HEGEL_DATABASE": str(WORK / t.lang / f"{t.name}.hegel")}
 
     # "test a::b ... ok" | "test a::b - should panic ... ok" | "test src/x.rs - f (line 3) ... ok"
     _line = re.compile(r"^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$", re.M)
@@ -215,7 +229,7 @@ class Rust(Backend):
         return res
 
     def patch_excludes(self) -> list[str]:
-        return [":(exclude)Cargo.lock", ":(exclude)**/Cargo.lock"]
+        return [":(exclude,glob)**/Cargo.lock"]
 
 
 BACKENDS: dict[str, Backend] = {b.lang: b for b in (Rust(),)}
@@ -245,10 +259,18 @@ def fetch(t: Target) -> None:
     have = git(t, "cat-file", "-e", f"{base}^{{commit}}", check=False, capture=True).returncode == 0
     if not have:
         log(f"{t.id}: fetching {base[:12]} from {upstream}")
-        r = git(t, "fetch", "-q", "--depth", "1", "origin", base, check=False)
-        if r.returncode != 0:  # server refuses fetch-by-sha; take the whole history
-            log(f"{t.id}: shallow fetch refused, fetching full history")
+        r = None
+        if len(base) == 40:
+            r = git(t, "fetch", "-q", "--depth", "1", "origin", base, check=False)
+        if r is None or r.returncode != 0:  # abbreviated sha, or server refuses fetch-by-sha
+            log(f"{t.id}: fetching full history")
             git(t, "fetch", "-q", "origin")
+    if len(base) < 40:  # imported targets carry the predecessor's 12-hex sha: resolve and record it
+        full = git(t, "rev-parse", "--verify", f"{base}^{{commit}}", capture=True).stdout.strip()
+        tt = t.dir / "target.toml"
+        tt.write_text(tt.read_text().replace(f'commit = "{base}"', f'commit = "{full}"', 1))
+        t.meta["base"]["commit"] = base = full
+        log(f"{t.id}: resolved base commit to {full}")
     git(t, "checkout", "-q", "--detach", base)
 
 
@@ -274,9 +296,10 @@ def apply(t: Target) -> None:
 def save(t: Target) -> None:
     if not (t.work / ".git").is_dir():
         die(f"{t.id}: nothing in {t.work}; run `zoo apply` and edit there first")
+    excludes = [":(exclude,glob)**/.hegel/**", *backend(t).patch_excludes()]
     git(t, "add", "-N", "--all")  # make new files show up in diff
-    excludes = backend(t).patch_excludes()
-    r = git(t, "diff", "--binary", "--", ".", *excludes, capture=True)
+    # diff against the base commit, not the index: `apply --3way` leaves the patch staged
+    r = git(t, "diff", "--binary", "HEAD", "--", ".", *excludes, capture=True)
     text = r.stdout
     if not text.strip():
         die(f"{t.id}: working tree in {t.work} has no changes against base")
@@ -294,20 +317,39 @@ class Verdict:
     unexpected_passed: list[str]   # listed as expected failures but passed: bug fixed?
     missing: list[str]             # expected failures that did not run at all
     ignored: list[str]
+    intermittent_passed: list[str] = field(default_factory=list)  # intermittent ones that passed this run
+    upstream_failed: list[str] = field(default_factory=list)      # upstream's own tests failing: reported, not judged
 
     @property
     def ok(self) -> bool:
         return not (self.unexpected_failed or self.unexpected_passed or self.missing)
 
 
+_ADDED_TEST = re.compile(r"^\+\s*#\[(?:hegel::)?test\b[^\n]*\n(?:\+\s*#\[[^\n]*\n)*\+\s*(?:pub(?:\([^)]*\))? )?(?:async )?fn (\w+)", re.M)
+
+
+def patch_tests(t: Target) -> set[str]:
+    """Names of the test functions hegel.patch adds. Only these are judged: upstream's own
+    suite can fail for reasons that are not ours (patches exclude lockfiles, so dependencies
+    float; toolchain drift), and that is reported, not counted against the target."""
+    return set(_ADDED_TEST.findall(t.patch.read_text())) if t.patch.is_file() else set()
+
+
 def judge(t: Target, results: dict[str, str]) -> Verdict:
     exp = t.expected_failures
+    inter = t.intermittent
+    ours = patch_tests(t)
     v = Verdict([], [], [], [], [], [])
     for name, r in results.items():
+        base = name.rsplit("::", 1)[-1]
         if r == "ignored":
             v.ignored.append(name)
+        elif r == "FAILED" and ours and base not in ours and name not in exp:
+            v.upstream_failed.append(name)
         elif r == "FAILED":
             (v.expected_failed if name in exp else v.unexpected_failed).append(name)
+        elif name in inter:
+            v.intermittent_passed.append(name)
         elif name in exp:
             v.unexpected_passed.append(name)
         else:
@@ -347,6 +389,10 @@ def test(t: Target, test_cases: int | None, no_apply: bool) -> bool:
         print(f"    FAIL  {n}")
     for n in v.unexpected_passed:
         print(f"    PASS? {n}  (listed as expected failure for {t.expected_failures[n]} — fixed upstream?)")
+    for n in v.intermittent_passed:
+        print(f"    pass  {n}  (intermittent expected failure for {t.expected_failures[n]}; passed this run)")
+    for n in v.upstream_failed:
+        print(f"    UPSTREAM {n}  (upstream's own test failed; not judged)")
     for n in v.missing:
         print(f"    MISSING {n}  (expected failure not found in results)")
     if not v.ok:
@@ -374,7 +420,7 @@ def check(t: Target, pins: dict, do_apply: bool) -> list[str]:
         errs.append("hegel.patch missing or empty")
         return errs
     text = t.patch.read_text()
-    if "HEGEL_REPORT.md" in text:
+    if re.search(r"^diff --git a/\S*HEGEL_REPORT\.md ", text, re.M):
         errs.append("hegel.patch adds HEGEL_REPORT.md (strip it)")
     b = BACKENDS.get(t.lang)
     pin = pins.get(t.lang, {}).get("version", "")
@@ -516,6 +562,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("targets", nargs="+")
     p.add_argument("--test-cases", type=int, help="override HEGEL_TEST_CASES")
     p.add_argument("--no-apply", action="store_true", help="run against work/ as it is (while porting)")
+    p.add_argument("--clean", action="store_true", help="delete the checkout under work/ after the run (disk)")
     sub.add_parser("save").add_argument("target")
     p = sub.add_parser("check")
     p.add_argument("targets", nargs="*")
@@ -542,6 +589,8 @@ def main(argv: list[str]) -> int:
         ok = True
         for t in resolve(a.targets):
             ok &= test(t, a.test_cases, a.no_apply)
+            if a.clean:
+                shutil.rmtree(t.work, ignore_errors=True)
         return 0 if ok else 1
     elif a.cmd == "save":
         save(resolve([a.target])[0])

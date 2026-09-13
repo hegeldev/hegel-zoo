@@ -123,13 +123,21 @@ result = "reproduces"                    # reproduces | fixed | not-run
 ```
 
 Tests that expose a still-open bug stay in the patch, unmodified, and are listed in
-`target.toml [expected_failures]`. The runner treats their failure as expected and their
+`target.toml [expected_failures]`. A test that reaches a known bug only on some runs (a
+model-based test whose random walk sometimes hits the buggy sequence, say) is listed as
+`"name" = { bug = "id", intermittent = true }`: its failure is expected and its passing is
+not taken as a sign the bug is fixed. The runner treats their failure as expected and their
 *passing* as a signal ("bug roaring/1 no longer reproduces at 0.12.0 — fixed?") that the record
 needs updating. This keeps the patch clean enough to send upstream and keeps CI green without
 `#[ignore]` littering. Process-aborting bugs (crash/hang/OOM) are the exception: per the skill,
 those keep a skipped minimal reproducer in the patch, since an abort takes the whole suite down.
 
 `TROPHIES.md` at the root is generated from all `bugs.toml` files by `zoo report`.
+
+Only the tests the patch adds are judged. Upstream's own suite runs alongside (the patch sits
+in its test files) and can fail for reasons that are not the zoo's: patches exclude lockfiles,
+so dependencies float, and toolchains drift. Such failures are reported as `UPSTREAM` and do not
+make the run BAD; a failing test that *is* ours is either an expected failure or a problem.
 
 ## The runner: `tools/zoo`
 

@@ -1,0 +1,701 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7d60497..b4721b6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -18,6 +18,7 @@ std = []
+ 
+ [dev-dependencies]
+ criterion = { version = "0.3.5", features = ["html_reports"] }
++hegeltest = "0.44.1"
+ rand = "0.8.5"
+ 
+ [lib]
+diff --git a/src/lib.rs b/src/lib.rs
+index 98b37c7..495a47c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2780,4 +2780,684 @@ mod tests {
+ 
+         assert_eq!(result, Err(crate::Error::Token));
+     }
++
++    /// Property-based tests (hegel).
++    ///
++    /// These supplement the fuzz targets in `fuzz/fuzz_targets/`, which already
++    /// cover "no panic on raw arbitrary bytes" for `Request::parse`,
++    /// `Response::parse`, `parse_headers` and `parse_chunk_size`. The
++    /// properties here additionally exercise:
++    /// - HTTP-shaped inputs (valid messages with drawn corruptions), which land
++    ///   far deeper in the parser than raw fuzz bytes;
++    /// - grammar invariants on any `Complete` parse (returned slices point into
++    ///   the input, token bytes are within the RFC-allowed sets);
++    /// - incremental (per-prefix) vs whole-buffer parsing agreement;
++    /// - exact round-trips for well-formed drawn messages;
++    /// - rejection of forbidden bytes injected into valid messages.
++    mod hegel_props {
++        use crate::{Error, Header, Request, Response, Status, EMPTY_HEADER};
++        use hegel::generators::{self, Generator};
++
++        const MAX_HEADERS: usize = 16;
++
++        // ---------- generators ----------
++
++        fn byte_set(pred: impl Fn(u8) -> bool) -> Vec<u8> {
++            (0u16..=255).map(|b| b as u8).filter(|&b| pred(b)).collect()
++        }
++
++        fn draw_from_set(tc: &hegel::TestCase, set: Vec<u8>, min: usize, max: usize) -> Vec<u8> {
++            tc.draw(
++                generators::vecs(generators::sampled_from(set))
++                    .min_size(min)
++                    .max_size(max),
++            )
++        }
++
++        /// URI chars accepted by `URI_MAP` that also survive the UTF-8 check in
++        /// `parse_uri`: visible ASCII except space, plus any non-ASCII scalar
++        /// (whose UTF-8 encoding only uses bytes >= 0x80, all in `URI_MAP`).
++        fn draw_path(tc: &hegel::TestCase) -> String {
++            let chars: Vec<char> = tc.draw(
++                generators::vecs(
++                    hegel::one_of!(
++                        generators::integers::<u32>().min_value(0x21).max_value(0x7E),
++                        generators::integers::<u32>().min_value(0x80).max_value(0x10FFFF),
++                    )
++                    .map(|n| char::from_u32(n).unwrap_or('\u{FFFD}')),
++                )
++                .min_size(1)
++                .max_size(24),
++            );
++            chars.into_iter().collect()
++        }
++
++        fn draw_headers(
++            tc: &hegel::TestCase,
++            min: usize,
++            max: usize,
++        ) -> Vec<(Vec<u8>, Vec<u8>)> {
++            let n = tc.draw(
++                generators::integers::<usize>()
++                    .min_value(min)
++                    .max_value(max),
++            );
++            let mut headers = Vec::with_capacity(n);
++            for _ in 0..n {
++                let name = draw_from_set(tc, byte_set(crate::is_header_name_token), 1, 12);
++                let value = draw_from_set(tc, byte_set(crate::is_header_value_token), 0, 24);
++                headers.push((name, value));
++            }
++            headers
++        }
++
++        struct ReqParts {
++            leading_empty_lines: usize,
++            method: Vec<u8>,
++            path: String,
++            version: u8,
++            headers: Vec<(Vec<u8>, Vec<u8>)>,
++            crlf: bool,
++        }
++
++        fn draw_req_parts(tc: &hegel::TestCase, min_headers: usize) -> ReqParts {
++            ReqParts {
++                leading_empty_lines: tc.draw(generators::integers::<usize>().max_value(2)),
++                method: draw_from_set(tc, byte_set(crate::is_method_token), 1, 10),
++                path: draw_path(tc),
++                version: tc.draw(generators::integers::<u8>().max_value(1)),
++                headers: draw_headers(tc, min_headers, 8),
++                crlf: tc.draw(generators::booleans()),
++            }
++        }
++
++        struct RespParts {
++            leading_empty_lines: usize,
++            version: u8,
++            code: u16,
++            /// `None` means the status line ends right after the code.
++            /// The reason bytes are drawn from the RFC 7230 reason-phrase set
++            /// (HTAB / SP / VCHAR / obs-text).
++            reason: Option<Vec<u8>>,
++            headers: Vec<(Vec<u8>, Vec<u8>)>,
++            crlf: bool,
++        }
++
++        fn draw_resp_parts(tc: &hegel::TestCase) -> RespParts {
++            let reason = if tc.draw(generators::booleans()) {
++                Some(draw_from_set(
++                    tc,
++                    byte_set(|b| b == b'\t' || b == b' ' || (0x21..=0x7E).contains(&b) || b >= 0x80),
++                    0,
++                    24,
++                ))
++            } else {
++                None
++            };
++            RespParts {
++                leading_empty_lines: tc.draw(generators::integers::<usize>().max_value(2)),
++                version: tc.draw(generators::integers::<u8>().max_value(1)),
++                code: tc.draw(generators::integers::<u16>().max_value(999)),
++                reason,
++                headers: draw_headers(tc, 0, 8),
++                crlf: tc.draw(generators::booleans()),
++            }
++        }
++
++        fn push_headers(out: &mut Vec<u8>, headers: &[(Vec<u8>, Vec<u8>)], nl: &[u8]) {
++            for (name, value) in headers {
++                out.extend_from_slice(name);
++                out.push(b':');
++                out.extend_from_slice(value);
++                out.extend_from_slice(nl);
++            }
++            out.extend_from_slice(nl);
++        }
++
++        impl ReqParts {
++            fn to_bytes(&self) -> Vec<u8> {
++                let nl: &[u8] = if self.crlf { b"\r\n" } else { b"\n" };
++                let mut out = Vec::new();
++                for _ in 0..self.leading_empty_lines {
++                    out.extend_from_slice(nl);
++                }
++                out.extend_from_slice(&self.method);
++                out.push(b' ');
++                out.extend_from_slice(self.path.as_bytes());
++                out.extend_from_slice(b" HTTP/1.");
++                out.push(b'0' + self.version);
++                out.extend_from_slice(nl);
++                push_headers(&mut out, &self.headers, nl);
++                out
++            }
++        }
++
++        impl RespParts {
++            fn to_bytes(&self) -> Vec<u8> {
++                let nl: &[u8] = if self.crlf { b"\r\n" } else { b"\n" };
++                let mut out = Vec::new();
++                for _ in 0..self.leading_empty_lines {
++                    out.extend_from_slice(nl);
++                }
++                out.extend_from_slice(b"HTTP/1.");
++                out.push(b'0' + self.version);
++                out.push(b' ');
++                out.extend_from_slice(format!("{:03}", self.code).as_bytes());
++                if let Some(reason) = &self.reason {
++                    out.push(b' ');
++                    out.extend_from_slice(reason);
++                }
++                out.extend_from_slice(nl);
++                push_headers(&mut out, &self.headers, nl);
++                out
++            }
++
++            /// What `Response::parse` documents it will report as the reason:
++            /// the drawn phrase, or "" when it was absent or contained obs-text.
++            fn expected_reason(&self) -> &str {
++                match &self.reason {
++                    None => "",
++                    Some(bytes) if bytes.iter().any(|&b| b >= 0x80) => "",
++                    Some(bytes) => core::str::from_utf8(bytes).unwrap(),
++                }
++            }
++        }
++
++        /// Apply 0..=4 drawn corruptions (replace / insert / delete / truncate).
++        fn corrupt_bytes(tc: &hegel::TestCase, buf: &mut Vec<u8>) {
++            let n_ops = tc.draw(generators::integers::<usize>().max_value(4));
++            for _ in 0..n_ops {
++                let op = tc.draw(generators::integers::<u8>().max_value(3));
++                match op {
++                    0 if !buf.is_empty() => {
++                        let i = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                        buf[i] = tc.draw(generators::integers::<u8>());
++                    }
++                    1 => {
++                        let i = tc.draw(generators::integers::<usize>().max_value(buf.len()));
++                        buf.insert(i, tc.draw(generators::integers::<u8>()));
++                    }
++                    2 if !buf.is_empty() => {
++                        let i = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                        buf.remove(i);
++                    }
++                    3 => {
++                        let i = tc.draw(generators::integers::<usize>().max_value(buf.len()));
++                        buf.truncate(i);
++                    }
++                    _ => {}
++                }
++            }
++        }
++
++        // ---------- invariant checkers ----------
++
++        /// Assert `part` is a subslice of `buf` (empty slices are exempt: the
++        /// parser legitimately returns static "" for e.g. obs-text reasons).
++        fn assert_within(buf: &[u8], part: &[u8], what: &str) {
++            if part.is_empty() {
++                return;
++            }
++            let b = buf.as_ptr() as usize;
++            let p = part.as_ptr() as usize;
++            assert!(
++                p >= b && p + part.len() <= b + buf.len(),
++                "{what} is not a subslice of the input"
++            );
++        }
++
++        fn check_parsed_headers(buf: &[u8], headers: &[Header<'_>]) {
++            for h in headers {
++                assert!(!h.name.is_empty(), "complete parse produced empty header name");
++                assert!(
++                    h.name.bytes().all(crate::is_header_name_token),
++                    "header name {:?} contains non-token byte",
++                    h.name
++                );
++                assert!(
++                    h.value.iter().all(|&b| crate::is_header_value_token(b)),
++                    "header value {:?} contains forbidden byte",
++                    h.value
++                );
++                assert_within(buf, h.name.as_bytes(), "header name");
++                assert_within(buf, h.value, "header value");
++            }
++        }
++
++        /// Parse `buf` as a request; on `Complete`, check the self-evident
++        /// invariants the parser promises. Never panics on any input.
++        fn check_request_invariants(buf: &[u8], slots: usize) -> bool {
++            let mut headers = vec![EMPTY_HEADER; slots];
++            let mut req = Request::new(&mut headers);
++            match req.parse(buf) {
++                Ok(Status::Complete(n)) => {
++                    assert!(n <= buf.len(), "Complete({n}) exceeds input length {}", buf.len());
++                    let method = req.method.expect("complete request must have a method");
++                    let path = req.path.expect("complete request must have a path");
++                    let version = req.version.expect("complete request must have a version");
++                    assert!(version <= 1, "version {version} is not 0 or 1");
++                    assert!(!method.is_empty(), "complete parse produced empty method");
++                    assert!(
++                        method.bytes().all(crate::is_method_token),
++                        "method {method:?} contains non-token byte"
++                    );
++                    assert!(!path.is_empty(), "complete parse produced empty path");
++                    assert!(
++                        path.bytes().all(crate::is_uri_token),
++                        "path {path:?} contains non-URI byte"
++                    );
++                    assert_within(buf, method.as_bytes(), "method");
++                    assert_within(buf, path.as_bytes(), "path");
++                    assert!(req.headers.len() <= slots, "more headers than provided slots");
++                    check_parsed_headers(buf, req.headers);
++                    true
++                }
++                Ok(Status::Partial) | Err(_) => false,
++            }
++        }
++
++        /// Same as `check_request_invariants`, for responses.
++        fn check_response_invariants(buf: &[u8], slots: usize) -> bool {
++            let mut headers = vec![EMPTY_HEADER; slots];
++            let mut resp = Response::new(&mut headers);
++            match resp.parse(buf) {
++                Ok(Status::Complete(n)) => {
++                    assert!(n <= buf.len(), "Complete({n}) exceeds input length {}", buf.len());
++                    let version = resp.version.expect("complete response must have a version");
++                    let code = resp.code.expect("complete response must have a code");
++                    let reason = resp.reason.expect("complete response must have a reason");
++                    assert!(version <= 1, "version {version} is not 0 or 1");
++                    assert!(code <= 999, "code {code} is not three digits");
++                    assert!(
++                        reason
++                            .bytes()
++                            .all(|b| b == b'\t' || b == b' ' || (0x21..=0x7E).contains(&b)),
++                        "reason {reason:?} contains bytes outside HTAB/SP/VCHAR"
++                    );
++                    assert_within(buf, reason.as_bytes(), "reason");
++                    assert!(resp.headers.len() <= slots, "more headers than provided slots");
++                    check_parsed_headers(buf, resp.headers);
++                    true
++                }
++                Ok(Status::Partial) | Err(_) => false,
++            }
++        }
++
++        // ---------- properties ----------
++
++        /// `Request::parse` returns Ok/Partial/Err — never panics — on
++        /// arbitrary bytes, and any `Complete(n)` satisfies the parser's
++        /// self-evident invariants (n <= len, slices in range, tokens valid).
++        #[hegel::test]
++        fn request_parse_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++            let n = tc.draw(generators::integers::<usize>().max_value(300));
++            let buf: Vec<u8> = tc.draw(generators::binary().min_size(n));
++            let slots = tc.draw(generators::integers::<usize>().max_value(4));
++            check_request_invariants(&buf, slots);
++        }
++
++        /// As above, for `Response::parse`.
++        #[hegel::test]
++        fn response_parse_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++            let n = tc.draw(generators::integers::<usize>().max_value(300));
++            let buf: Vec<u8> = tc.draw(generators::binary().min_size(n));
++            let slots = tc.draw(generators::integers::<usize>().max_value(4));
++            check_response_invariants(&buf, slots);
++        }
++
++        /// HTTP-shaped bytes (a valid drawn message with 0..=4 drawn
++        /// corruptions) never panic either parser, and any `Complete` result
++        /// still satisfies all grammar/offset invariants. This reaches much
++        /// deeper parser states than raw arbitrary bytes.
++        #[hegel::test]
++        fn http_shaped_bytes_never_panic_and_invariants_hold(tc: hegel::TestCase) {
++            let mut buf = if tc.draw(generators::booleans()) {
++                draw_req_parts(&tc, 0).to_bytes()
++            } else {
++                draw_resp_parts(&tc).to_bytes()
++            };
++            corrupt_bytes(&tc, &mut buf);
++            // Parse the (possibly corrupted) bytes as both message kinds.
++            check_request_invariants(&buf, 8);
++            check_response_invariants(&buf, 8);
++        }
++
++        /// `parse_headers` never panics, and a `Complete((pos, headers))`
++        /// result has pos <= len and in-range, token-valid headers.
++        #[hegel::test]
++        fn parse_headers_never_panics_and_offsets_valid(tc: hegel::TestCase) {
++            let buf: Vec<u8> = if tc.draw(generators::booleans()) {
++                // Header-block shaped, possibly corrupted.
++                let headers = draw_headers(&tc, 0, 8);
++                let nl: &[u8] = if tc.draw(generators::booleans()) { b"\r\n" } else { b"\n" };
++                let mut out = Vec::new();
++                push_headers(&mut out, &headers, nl);
++                corrupt_bytes(&tc, &mut out);
++                out
++            } else {
++                let n = tc.draw(generators::integers::<usize>().max_value(300));
++                tc.draw(generators::binary().min_size(n))
++            };
++            let mut dst = [EMPTY_HEADER; 8];
++            match crate::parse_headers(&buf, &mut dst) {
++                Ok(Status::Complete((pos, parsed))) => {
++                    assert!(pos <= buf.len(), "Complete pos {pos} exceeds input length");
++                    assert!(parsed.len() <= 8, "more headers than provided slots");
++                    check_parsed_headers(&buf, parsed);
++                }
++                Ok(Status::Partial) | Err(_) => {}
++            }
++        }
++
++        /// A well-formed request built from drawn tokens parses back to exactly
++        /// those tokens (header values modulo the documented OWS trim).
++        #[hegel::test]
++        fn request_roundtrip(tc: hegel::TestCase) {
++            let parts = draw_req_parts(&tc, 0);
++            let buf = parts.to_bytes();
++            let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++            let mut req = Request::new(&mut headers);
++            assert_eq!(req.parse(&buf), Ok(Status::Complete(buf.len())));
++            assert_eq!(req.method.unwrap().as_bytes(), &parts.method[..]);
++            assert_eq!(req.path.unwrap(), parts.path);
++            assert_eq!(req.version.unwrap(), parts.version);
++            assert_eq!(req.headers.len(), parts.headers.len());
++            for (parsed, (name, value)) in req.headers.iter().zip(&parts.headers) {
++                assert_eq!(parsed.name.as_bytes(), &name[..]);
++                assert_eq!(parsed.value, trim_ows(value));
++            }
++        }
++
++        /// Leading/trailing SP and HTAB, which the parser documents trimming
++        /// from header values.
++        fn trim_ows(v: &[u8]) -> &[u8] {
++            match v.iter().position(|&b| b != b' ' && b != b'\t') {
++                None => &[],
++                Some(start) => {
++                    let end = v.iter().rposition(|&b| b != b' ' && b != b'\t').unwrap() + 1;
++                    &v[start..end]
++                }
++            }
++        }
++
++        /// A well-formed response built from drawn tokens parses back to
++        /// exactly those tokens (reason becomes "" if absent or obs-text).
++        #[hegel::test]
++        fn response_roundtrip(tc: hegel::TestCase) {
++            let parts = draw_resp_parts(&tc);
++            let buf = parts.to_bytes();
++            let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++            let mut resp = Response::new(&mut headers);
++            assert_eq!(resp.parse(&buf), Ok(Status::Complete(buf.len())));
++            assert_eq!(resp.version.unwrap(), parts.version);
++            assert_eq!(resp.code.unwrap(), parts.code);
++            assert_eq!(resp.reason.unwrap(), parts.expected_reason());
++            assert_eq!(resp.headers.len(), parts.headers.len());
++            for (parsed, (name, value)) in resp.headers.iter().zip(&parts.headers) {
++                assert_eq!(parsed.name.as_bytes(), &name[..]);
++                assert_eq!(parsed.value, trim_ows(value));
++            }
++        }
++
++        /// Incremental vs whole: every strict prefix of a valid request parses
++        /// as `Ok(Partial)` (never `Err`, never an early `Complete`), and any
++        /// request-line fields already parsed agree with the whole-buffer
++        /// parse. This is the streaming contract from the README.
++        #[hegel::test]
++        fn request_every_prefix_is_partial_and_agrees(tc: hegel::TestCase) {
++            let parts = draw_req_parts(&tc, 0);
++            let buf = parts.to_bytes();
++            let mut whole_headers = [EMPTY_HEADER; MAX_HEADERS];
++            let mut whole = Request::new(&mut whole_headers);
++            assert_eq!(whole.parse(&buf), Ok(Status::Complete(buf.len())));
++            for i in 0..buf.len() {
++                let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++                let mut req = Request::new(&mut headers);
++                match req.parse(&buf[..i]) {
++                    Ok(Status::Partial) => {
++                        if let Some(m) = req.method {
++                            assert_eq!(Some(m), whole.method, "prefix {i}: method differs");
++                        }
++                        if let Some(p) = req.path {
++                            assert_eq!(Some(p), whole.path, "prefix {i}: path differs");
++                        }
++                        if let Some(v) = req.version {
++                            assert_eq!(Some(v), whole.version, "prefix {i}: version differs");
++                        }
++                    }
++                    other => panic!(
++                        "prefix of length {i} of a valid request returned {other:?} instead of Partial"
++                    ),
++                }
++            }
++        }
++
++        /// As above, for responses.
++        #[hegel::test]
++        fn response_every_prefix_is_partial_and_agrees(tc: hegel::TestCase) {
++            let parts = draw_resp_parts(&tc);
++            let buf = parts.to_bytes();
++            let mut whole_headers = [EMPTY_HEADER; MAX_HEADERS];
++            let mut whole = Response::new(&mut whole_headers);
++            assert_eq!(whole.parse(&buf), Ok(Status::Complete(buf.len())));
++            for i in 0..buf.len() {
++                let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++                let mut resp = Response::new(&mut headers);
++                match resp.parse(&buf[..i]) {
++                    Ok(Status::Partial) => {
++                        if let Some(v) = resp.version {
++                            assert_eq!(Some(v), whole.version, "prefix {i}: version differs");
++                        }
++                        if let Some(c) = resp.code {
++                            assert_eq!(Some(c), whole.code, "prefix {i}: code differs");
++                        }
++                        if let Some(r) = resp.reason {
++                            assert_eq!(Some(r), whole.reason, "prefix {i}: reason differs");
++                        }
++                    }
++                    other => panic!(
++                        "prefix of length {i} of a valid response returned {other:?} instead of Partial"
++                    ),
++                }
++            }
++        }
++
++        /// Completeness monotonicity: once a buffer parses as `Complete(n)`,
++        /// appending arbitrary bytes must yield the identical `Complete(n)`
++        /// and identical parsed fields (the parser never reads past the head).
++        #[hegel::test]
++        fn complete_result_unchanged_by_trailing_bytes(tc: hegel::TestCase) {
++            let junk: Vec<u8> = tc.draw(generators::binary().max_size(64));
++
++            let req_parts = draw_req_parts(&tc, 0);
++            let buf = req_parts.to_bytes();
++            let mut ext = buf.clone();
++            ext.extend_from_slice(&junk);
++            let mut h1 = [EMPTY_HEADER; MAX_HEADERS];
++            let mut r1 = Request::new(&mut h1);
++            let s1 = r1.parse(&buf);
++            let mut h2 = [EMPTY_HEADER; MAX_HEADERS];
++            let mut r2 = Request::new(&mut h2);
++            let s2 = r2.parse(&ext);
++            assert_eq!(s1, Ok(Status::Complete(buf.len())));
++            assert_eq!(s2, s1, "trailing bytes changed the parse result");
++            assert_eq!(r1.method, r2.method);
++            assert_eq!(r1.path, r2.path);
++            assert_eq!(r1.version, r2.version);
++            assert_eq!(r1.headers, r2.headers);
++
++            let resp_parts = draw_resp_parts(&tc);
++            let buf = resp_parts.to_bytes();
++            let mut ext = buf.clone();
++            ext.extend_from_slice(&junk);
++            let mut h1 = [EMPTY_HEADER; MAX_HEADERS];
++            let mut p1 = Response::new(&mut h1);
++            let s1 = p1.parse(&buf);
++            let mut h2 = [EMPTY_HEADER; MAX_HEADERS];
++            let mut p2 = Response::new(&mut h2);
++            let s2 = p2.parse(&ext);
++            assert_eq!(s1, Ok(Status::Complete(buf.len())));
++            assert_eq!(s2, s1, "trailing bytes changed the parse result");
++            assert_eq!(p1.version, p2.version);
++            assert_eq!(p1.code, p2.code);
++            assert_eq!(p1.reason, p2.reason);
++            assert_eq!(p1.headers, p2.headers);
++        }
++
++        /// Header capacity is honored: a message with k headers parses
++        /// completely with exactly k headers given >= k slots, and returns
++        /// `Err(TooManyHeaders)` given fewer.
++        #[hegel::test]
++        fn header_capacity_honored(tc: hegel::TestCase) {
++            let parts = draw_req_parts(&tc, 0);
++            let k = parts.headers.len();
++            let buf = parts.to_bytes();
++            let slots = tc.draw(generators::integers::<usize>().max_value(k + 3));
++            let mut headers = vec![EMPTY_HEADER; slots];
++            let mut req = Request::new(&mut headers);
++            let result = req.parse(&buf);
++            if slots >= k {
++                assert_eq!(result, Ok(Status::Complete(buf.len())));
++                assert_eq!(req.headers.len(), k);
++            } else {
++                assert_eq!(result, Err(Error::TooManyHeaders));
++            }
++        }
++
++        /// Validation: a NUL byte replacing any single byte of a valid message
++        /// makes the parse fail. NUL is forbidden in every position of an
++        /// HTTP/1.x message head.
++        #[hegel::test]
++        fn nul_byte_is_always_rejected(tc: hegel::TestCase) {
++            let as_request = tc.draw(generators::booleans());
++            let result = if as_request {
++                let mut buf = draw_req_parts(&tc, 0).to_bytes();
++                let i = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                buf[i] = 0;
++                let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++                Request::new(&mut headers).parse(&buf)
++            } else {
++                let mut buf = draw_resp_parts(&tc).to_bytes();
++                let i = tc.draw(generators::integers::<usize>().max_value(buf.len() - 1));
++                buf[i] = 0;
++                let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++                Response::new(&mut headers).parse(&buf)
++            };
++            assert!(result.is_err(), "NUL-corrupted message accepted: {result:?}");
++        }
++
++        /// Validation at the token-set boundary: inserting any byte that is
++        /// outside the allowed set for a header name or header value (and is
++        /// not a structural byte `:`/CR/LF, which would merely re-delimit the
++        /// message) makes the parse fail. The classic parser bug is accepting
++        /// a forbidden byte.
++        #[hegel::test]
++        fn forbidden_header_byte_is_rejected(tc: hegel::TestCase) {
++            let mut parts = draw_req_parts(&tc, 1);
++            let hi = tc.draw(generators::integers::<usize>().max_value(parts.headers.len() - 1));
++            if tc.draw(generators::booleans()) {
++                // Corrupt the header name.
++                let bad = tc.draw(generators::sampled_from(byte_set(|b| {
++                    !crate::is_header_name_token(b) && b != b':' && b != b'\r' && b != b'\n'
++                })));
++                let name = &mut parts.headers[hi].0;
++                let pos = tc.draw(generators::integers::<usize>().max_value(name.len()));
++                name.insert(pos, bad);
++            } else {
++                // Corrupt the header value.
++                let bad = tc.draw(generators::sampled_from(byte_set(|b| {
++                    !crate::is_header_value_token(b) && b != b'\r' && b != b'\n'
++                })));
++                let value = &mut parts.headers[hi].1;
++                let pos = tc.draw(generators::integers::<usize>().max_value(value.len()));
++                value.insert(pos, bad);
++            }
++            let buf = parts.to_bytes();
++            let mut headers = [EMPTY_HEADER; MAX_HEADERS];
++            let mut req = Request::new(&mut headers);
++            let result = req.parse(&buf);
++            assert!(result.is_err(), "forbidden header byte accepted: {result:?}");
++        }
++
++        /// An input consisting only of empty lines (the parser skips leading
++        /// empty lines) never completes: both parsers report `Partial`.
++        #[hegel::test]
++        fn only_empty_lines_is_partial(tc: hegel::TestCase) {
++            let n = tc.draw(generators::integers::<usize>().max_value(64));
++            let nl: &[u8] = if tc.draw(generators::booleans()) { b"\r\n" } else { b"\n" };
++            let mut buf = Vec::new();
++            for _ in 0..n {
++                buf.extend_from_slice(nl);
++            }
++            if tc.draw(generators::booleans()) {
++                buf.push(b'\r'); // dangling CR: still needs more input
++            }
++            let mut h1 = [EMPTY_HEADER; 4];
++            assert_eq!(Request::new(&mut h1).parse(&buf), Ok(Status::Partial));
++            let mut h2 = [EMPTY_HEADER; 4];
++            assert_eq!(Response::new(&mut h2).parse(&buf), Ok(Status::Partial));
++        }
++
++        /// Round-trip for `parse_chunk_size`: any u64 rendered as hex (either
++        /// case, with leading zeros up to the 16-digit limit), optionally
++        /// followed by LWS and a chunk extension, then CRLF, parses back to
++        /// exactly that size with the position just past the CRLF —
++        /// independent of trailing bytes.
++        #[hegel::test]
++        fn chunk_size_roundtrip(tc: hegel::TestCase) {
++            let size = tc.draw(generators::integers::<u64>());
++            let digits = if tc.draw(generators::booleans()) {
++                format!("{size:X}")
++            } else {
++                format!("{size:x}")
++            };
++            let zeros = tc.draw(generators::integers::<usize>().max_value(16 - digits.len()));
++
++            let mut buf = Vec::new();
++            buf.extend_from_slice("0".repeat(zeros).as_bytes());
++            buf.extend_from_slice(digits.as_bytes());
++            // "Linear white space" is allowed after the chunk size.
++            buf.extend_from_slice(&draw_from_set(&tc, vec![b' ', b'\t'], 0, 3));
++            if tc.draw(generators::booleans()) {
++                // Chunk extension: any octets are accepted (and ignored) until
++                // CR, per the comment in `parse_chunk_size`.
++                buf.push(b';');
++                buf.extend_from_slice(&draw_from_set(
++                    &tc,
++                    byte_set(|b| b != b'\r'),
++                    0,
++                    16,
++                ));
++            }
++            buf.extend_from_slice(b"\r\n");
++            let expected_pos = buf.len();
++            // Trailing bytes (the chunk payload) must not affect the result.
++            buf.extend_from_slice(&tc.draw(generators::binary().max_size(16)));
++
++            assert_eq!(
++                crate::parse_chunk_size(&buf),
++                Ok(Status::Complete((expected_pos, size)))
++            );
++        }
++
++        /// `parse_chunk_size` never panics on arbitrary bytes, and a
++        /// `Complete((pos, _))` result has pos <= len.
++        #[hegel::test]
++        fn chunk_size_never_panics_on_arbitrary_bytes(tc: hegel::TestCase) {
++            let buf: Vec<u8> = if tc.draw(generators::booleans()) {
++                // Chunk-ish bytes, so the Complete branch below is reachable.
++                let mut b = draw_from_set(&tc, b"0123456789abcdefABCDEF\r\n; \tx".to_vec(), 0, 32);
++                if tc.draw(generators::booleans()) {
++                    b.extend_from_slice(b"\r\n");
++                }
++                b
++            } else {
++                let n = tc.draw(generators::integers::<usize>().max_value(200));
++                tc.draw(generators::binary().min_size(n))
++            };
++            if let Ok(Status::Complete((pos, _size))) = crate::parse_chunk_size(&buf) {
++                assert!(pos <= buf.len(), "Complete pos {pos} exceeds input length");
++            }
++        }
++    }
+ }

@@ -1,0 +1,507 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7a89200..8e30143 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,6 +25,7 @@ glob = "0.3"
+ criterion = "0.7.0"
+ png = "0.18.0"
+ rayon = "1.10.0" # for parallel reencoding example
++hegeltest = "0.44.1"
+ 
+ [features]
+ default = ["raii_no_panic", "std", "color_quant"]
+diff --git a/tests/decode.rs b/tests/decode.rs
+index 57aa66a..354dc79 100644
+--- a/tests/decode.rs
++++ b/tests/decode.rs
+@@ -399,3 +399,239 @@ fn empty_comment_extension_real_world_gif() {
+     assert_eq!(frame.width, 128);
+     assert_eq!(frame.height, 128);
+ }
++
++/// Property-based tests (hegel). Decode-robustness / memory-limit family.
++///
++/// The encode->decode round trip and structural invariants live in
++/// `tests/roundtrip.rs`.
++#[cfg(test)]
++mod hegel_props {
++    use gif::{ColorOutput, DecodeOptions, Encoder, Frame, MemoryLimit};
++    use hegel::generators;
++    use std::borrow::Cow;
++
++    // Cap on how many frames we pull from an arbitrary input, and on the memory
++    // limit we hand the decoder. GIF logical-screen and image-descriptor
++    // dimensions are attacker-controlled and LZW can expand hugely, so we always
++    // run the fallible/robustness properties under a bounded memory limit and a
++    // frame cap: a crafted input must surface an `Err`, never panic, OOM, or hang.
++    const FRAME_CAP: usize = 4096;
++    const MEM_LIMIT: u64 = 16 * 1024 * 1024;
++
++    fn small_limit() -> MemoryLimit {
++        MemoryLimit::Bytes(MEM_LIMIT.try_into().unwrap())
++    }
++
++    /// Decoding arbitrary bytes (optionally with a valid GIF magic prefix so the
++    /// fuzzer reaches deeper block-parsing paths) must never panic. It returns
++    /// `Ok` or `Err`; under a bounded memory limit it must not OOM, and being
++    /// finite input it must terminate. We vary the decoder configuration to
++    /// cover paths the crate's single fuzz target (default options only) misses:
++    /// RGBA output, frame-consistency checks, unknown-block tolerance, and the
++    /// LZW end-code requirement.
++    ///
++    /// `skip_frame_decoding` is deliberately NOT exercised here: it reserves
++    /// `width*height/4` bytes ignoring the memory limit (see
++    /// `skip_frame_decoding_ignores_memory_limit_KNOWN_FAILURE`), which would
++    /// let a crafted dimension reserve gigabytes and is pinned separately.
++    #[hegel::test]
++    fn arbitrary_bytes_decode_never_panics(tc: hegel::TestCase) {
++        let mut data = tc.draw(generators::binary().max_size(4096));
++        // Sometimes prepend a valid header so garbage is parsed as GIF body.
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => {
++                let mut prefixed = b"GIF89a".to_vec();
++                prefixed.append(&mut data);
++                data = prefixed;
++            }
++            1 => {
++                let mut prefixed = b"GIF87a".to_vec();
++                prefixed.append(&mut data);
++                data = prefixed;
++            }
++            _ => {}
++        }
++
++        let mut opts = DecodeOptions::new();
++        opts.set_memory_limit(small_limit());
++        opts.set_color_output(if tc.draw(generators::booleans()) {
++            ColorOutput::RGBA
++        } else {
++            ColorOutput::Indexed
++        });
++        opts.check_frame_consistency(tc.draw(generators::booleans()));
++        opts.allow_unknown_blocks(tc.draw(generators::booleans()));
++        opts.check_lzw_end_code(tc.draw(generators::booleans()));
++
++        if let Ok(mut decoder) = opts.read_info(&data[..]) {
++            let mut frames = 0;
++            loop {
++                match decoder.read_next_frame() {
++                    Ok(Some(_)) => {
++                        frames += 1;
++                        assert!(
++                            frames < FRAME_CAP,
++                            "finite input produced an unbounded number of frames"
++                        );
++                    }
++                    Ok(None) => break,
++                    Err(_) => break,
++                }
++            }
++        }
++    }
++
++    /// Build a valid single-frame GIF, then corrupt it (flip a byte or truncate)
++    /// and confirm decoding degrades gracefully — an `Ok` or `Err`, never a
++    /// panic. Oracle-independent robustness.
++    #[hegel::test]
++    fn valid_then_corrupt_never_panics(tc: hegel::TestCase) {
++        let width = tc.draw(generators::integers::<u16>().min_value(1).max_value(32));
++        let height = tc.draw(generators::integers::<u16>().min_value(1).max_value(32));
++        let count = usize::from(width) * usize::from(height);
++        let pixels = tc.draw(
++            generators::vecs(generators::integers::<u8>())
++                .min_size(count)
++                .max_size(count),
++        );
++        let palette = tc.draw(
++            generators::vecs(generators::integers::<u8>())
++                .min_size(3)
++                .max_size(256 * 3),
++        );
++
++        let mut data = Vec::new();
++        {
++            let mut encoder = Encoder::new(&mut data, width, height, &palette).unwrap();
++            let frame = Frame::from_indexed_pixels(width, height, pixels, None);
++            encoder.write_frame(&frame).unwrap();
++        }
++        assert!(!data.is_empty());
++
++        // Corrupt: either truncate at a drawn length, or overwrite a byte.
++        if tc.draw(generators::booleans()) {
++            let keep = tc.draw(generators::integers::<usize>().max_value(data.len()));
++            data.truncate(keep);
++        } else {
++            let idx = tc.draw(generators::integers::<usize>().max_value(data.len() - 1));
++            let byte = tc.draw(generators::integers::<u8>());
++            data[idx] = byte;
++        }
++
++        let mut opts = DecodeOptions::new();
++        opts.set_memory_limit(small_limit());
++        if let Ok(mut decoder) = opts.read_info(&data[..]) {
++            let mut frames = 0;
++            loop {
++                match decoder.read_next_frame() {
++                    Ok(Some(_)) => {
++                        frames += 1;
++                        assert!(frames < FRAME_CAP, "unbounded frames from corrupted input");
++                    }
++                    Ok(None) | Err(_) => break,
++                }
++            }
++        }
++    }
++
++    /// Craft a tiny file that declares a huge frame but carries only a few bytes
++    /// of LZW data, then decode it through the normal (pixel) path with a memory
++    /// limit far below width*height. The decoder must reject it with an error
++    /// rather than allocating the full frame — i.e. `set_memory_limit` is honored
++    /// on the pixel path.
++    #[hegel::test]
++    fn memory_limit_enforced_on_pixel_path(tc: hegel::TestCase) {
++        // Draw dimensions whose product exceeds the limit, so the frame cannot
++        // fit and must be rejected.
++        let width = tc.draw(generators::integers::<u16>().min_value(2000).max_value(0xFFFF));
++        let height = tc.draw(generators::integers::<u16>().min_value(2000).max_value(0xFFFF));
++        let limit: u64 = tc.draw(generators::integers::<u64>().min_value(1).max_value(1024));
++        assert!(u64::from(width) * u64::from(height) > limit);
++
++        // Small real LZW payload so the file itself is tiny.
++        let mut lzw = Frame::from_indexed_pixels(2, 2, vec![0u8; 4], None);
++        lzw.make_lzw_pre_encoded();
++
++        let mut data = Vec::new();
++        {
++            let mut encoder = Encoder::new(&mut data, width, height, &[1, 2, 3]).unwrap();
++            let frame = Frame {
++                width,
++                height,
++                buffer: lzw.buffer.clone(),
++                ..Frame::default()
++            };
++            encoder.write_lzw_pre_encoded_frame(&frame).unwrap();
++        }
++
++        let mut opts = DecodeOptions::new();
++        opts.set_memory_limit(MemoryLimit::Bytes(limit.try_into().unwrap()));
++        let mut decoder = opts.read_info(&data[..]).expect("decoder init");
++        let result = decoder.read_next_frame();
++        assert!(
++            result.is_err(),
++            "an oversized frame must be rejected under the memory limit, got {:?}",
++            result.map(|f| f.map(|f| (f.width, f.height, f.buffer.len())))
++        );
++    }
++
++    /// KNOWN FAILURE — pins a real memory-limit bypass.
++    ///
++    /// With `skip_frame_decoding` enabled, `Decoder::read_next_frame`
++    /// (src/reader/mod.rs, the `FrameDataType::Lzw` branch) pre-reserves
++    /// `width * height / 4` bytes for the output buffer using the raw,
++    /// attacker-controlled frame dimensions and WITHOUT consulting the
++    /// configured `MemoryLimit`. A ~45-byte crafted GIF that declares a
++    /// 65535x65535 frame therefore makes the decoder reserve ~1 GiB even though
++    /// a 1 KiB memory limit was explicitly set. This is a decompression-bomb /
++    /// memory-limit-bypass vector.
++    ///
++    /// The reservation is a `try_reserve` (virtual, not committed), so it does
++    /// not abort the process — this fails as a normal assertion, deterministically.
++    /// It stays failing until the crate clamps the skip-path reservation to the
++    /// memory limit. Remove the `should_panic`/pin once fixed.
++    #[hegel::test(test_cases = 1)]
++    #[allow(non_snake_case)]
++    fn skip_frame_decoding_ignores_memory_limit_KNOWN_FAILURE(tc: hegel::TestCase) {
++        let _ = tc.draw(generators::booleans());
++        let width: u16 = 0xFFFF;
++        let height: u16 = 0xFFFF;
++        let limit: u64 = 1024;
++
++        let mut lzw = Frame::from_indexed_pixels(2, 2, vec![0u8; 4], None);
++        lzw.make_lzw_pre_encoded();
++
++        let mut data = Vec::new();
++        {
++            let mut encoder = Encoder::new(&mut data, width, height, &[1, 2, 3]).unwrap();
++            let frame = Frame {
++                width,
++                height,
++                buffer: lzw.buffer.clone(),
++                ..Frame::default()
++            };
++            encoder.write_lzw_pre_encoded_frame(&frame).unwrap();
++        }
++        assert!(data.len() < 100, "crafted file is tiny: {} bytes", data.len());
++
++        let mut opts = DecodeOptions::new();
++        opts.skip_frame_decoding(true);
++        opts.set_memory_limit(MemoryLimit::Bytes(limit.try_into().unwrap()));
++        let mut decoder = opts.read_info(&data[..]).expect("decoder init");
++        let frame = decoder
++            .read_next_frame()
++            .expect("skip-path decode")
++            .expect("one frame");
++        let capacity = match &frame.buffer {
++            Cow::Owned(v) => v.capacity(),
++            Cow::Borrowed(_) => 0,
++        };
++        // The output buffer capacity should stay within a small factor of the
++        // configured limit. It does not: it is ~width*height/4.
++        assert!(
++            (capacity as u64) <= limit.saturating_mul(64),
++            "skip-path reserved {capacity} bytes for a {}-byte file despite a {limit}-byte memory limit",
++            data.len()
++        );
++    }
++}
+diff --git a/tests/roundtrip.rs b/tests/roundtrip.rs
+index dd2a97e..9cce2ff 100644
+--- a/tests/roundtrip.rs
++++ b/tests/roundtrip.rs
+@@ -228,3 +228,246 @@ fn palette_fail() {
+         ))
+     ));
+ }
++
++/// Property-based tests (hegel). Roundtrip / dimension-consistency family.
++///
++/// These exercise the encode->decode round trip and structural invariants of
++/// decoded frames. The decode-robustness / memory-limit family lives in
++/// `tests/decode.rs`.
++#[cfg(test)]
++mod hegel_props {
++    use gif::{
++        AnyExtension, ColorOutput, DecodeOptions, Decoder, DisposalMethod, Encoder, Extension,
++        Frame, Repeat,
++    };
++    use hegel::generators;
++    use hegel::Generator;
++    use std::borrow::Cow;
++
++    /// A drawn paletted image: canvas dims, a palette (2..=256 colours) and
++    /// exactly width*height index bytes. Indices are full-range `u8` on purpose
++    /// — the indexed decode path returns raw LZW output verbatim, so the round
++    /// trip must hold regardless of whether an index is within the palette.
++    struct DrawnImage {
++        width: u16,
++        height: u16,
++        palette: Vec<u8>,
++        pixels: Vec<u8>,
++    }
++
++    fn draw_image(tc: &hegel::TestCase, max_side: u16) -> DrawnImage {
++        let width = tc.draw(generators::integers::<u16>().min_value(1).max_value(max_side));
++        let height = tc.draw(generators::integers::<u16>().min_value(1).max_value(max_side));
++        let num_colors = tc.draw(generators::integers::<usize>().min_value(1).max_value(256));
++        let palette = tc.draw(
++            generators::vecs(generators::integers::<u8>())
++                .min_size(num_colors * 3)
++                .max_size(num_colors * 3),
++        );
++        let count = usize::from(width) * usize::from(height);
++        let pixels = tc.draw(
++            generators::vecs(generators::integers::<u8>())
++                .min_size(count)
++                .max_size(count),
++        );
++        DrawnImage {
++            width,
++            height,
++            palette,
++            pixels,
++        }
++    }
++
++    /// Encode a drawn frame with a global palette, decode it back in Indexed
++    /// mode, and assert the index buffer and dimensions recover exactly. LZW is
++    /// lossless, so this is an oracle-independent round trip.
++    #[hegel::test]
++    fn encode_decode_indexed_roundtrip(tc: hegel::TestCase) {
++        let img = draw_image(&tc, 64);
++        let mut buf = Vec::new();
++        {
++            let mut encoder =
++                Encoder::new(&mut buf, img.width, img.height, &img.palette).unwrap();
++            let frame = Frame::from_indexed_pixels(img.width, img.height, img.pixels.clone(), None);
++            encoder.write_frame(&frame).unwrap();
++        }
++
++        let mut decoder = Decoder::new(&buf[..]).expect("decoder init");
++        let frame = decoder
++            .read_next_frame()
++            .expect("decode frame")
++            .expect("one frame");
++        assert_eq!(frame.width, img.width);
++        assert_eq!(frame.height, img.height);
++        assert_eq!(&*frame.buffer, &img.pixels[..], "indices must round-trip");
++        assert!(decoder.read_next_frame().unwrap().is_none(), "exactly one frame");
++    }
++
++    /// A decoded frame's buffer length must equal width*height (Indexed) or
++    /// width*height*4 (RGBA). This holds for any encodable image and needs no
++    /// external oracle.
++    #[hegel::test]
++    fn decoded_buffer_length_matches_dimensions(tc: hegel::TestCase) {
++        let img = draw_image(&tc, 64);
++        let rgba = tc.draw(generators::booleans());
++        let mut buf = Vec::new();
++        {
++            let mut encoder =
++                Encoder::new(&mut buf, img.width, img.height, &img.palette).unwrap();
++            let frame = Frame::from_indexed_pixels(img.width, img.height, img.pixels.clone(), None);
++            encoder.write_frame(&frame).unwrap();
++        }
++
++        let mut opts = DecodeOptions::new();
++        opts.set_color_output(if rgba {
++            ColorOutput::RGBA
++        } else {
++            ColorOutput::Indexed
++        });
++        let mut decoder = opts.read_info(&buf[..]).expect("decoder init");
++        let (fw, fh, blen) = {
++            let frame = decoder
++                .read_next_frame()
++                .expect("decode frame")
++                .expect("one frame");
++            (frame.width, frame.height, frame.buffer.len())
++        };
++        let expected = usize::from(fw) * usize::from(fh) * if rgba { 4 } else { 1 };
++        assert_eq!(blen, expected);
++        // buffer_size() must agree with line_length()*height (both oracle-free).
++        assert_eq!(decoder.buffer_size(), decoder.line_length() * usize::from(fh));
++    }
++
++    /// Compressing a frame with `make_lzw_pre_encoded` and writing it via
++    /// `write_lzw_pre_encoded_frame` must round-trip back to the original
++    /// indices when decoded normally. Exercises the parallel-compression LZW
++    /// path (crate `lzw_encode` -> weezl decode).
++    #[hegel::test]
++    fn lzw_pre_encoded_roundtrip(tc: hegel::TestCase) {
++        let img = draw_image(&tc, 64);
++        let mut frame = Frame::from_indexed_pixels(img.width, img.height, img.pixels.clone(), None);
++        frame.make_lzw_pre_encoded();
++
++        let mut buf = Vec::new();
++        {
++            let mut encoder =
++                Encoder::new(&mut buf, img.width, img.height, &img.palette).unwrap();
++            encoder.write_lzw_pre_encoded_frame(&frame).unwrap();
++        }
++
++        let mut decoder = Decoder::new(&buf[..]).expect("decoder init");
++        let decoded = decoder
++            .read_next_frame()
++            .expect("decode frame")
++            .expect("one frame");
++        assert_eq!(decoded.width, img.width);
++        assert_eq!(decoded.height, img.height);
++        assert_eq!(&*decoded.buffer, &img.pixels[..]);
++    }
++
++    /// A drawn frame with graphic-control metadata (delay/dispose/transparent),
++    /// used to check that the control-extension fields round-trip.
++    struct DrawnFrame {
++        width: u16,
++        height: u16,
++        pixels: Vec<u8>,
++        delay: u16,
++        dispose: DisposalMethod,
++        transparent: Option<u8>,
++        needs_user_input: bool,
++    }
++
++    fn draw_frame(tc: &hegel::TestCase, width: u16, height: u16) -> DrawnFrame {
++        let count = usize::from(width) * usize::from(height);
++        let pixels = tc.draw(
++            generators::vecs(generators::integers::<u8>())
++                .min_size(count)
++                .max_size(count),
++        );
++        let delay = tc.draw(generators::integers::<u16>());
++        let dispose = tc.draw((generators::sampled_from(vec![
++            DisposalMethod::Any,
++            DisposalMethod::Keep,
++            DisposalMethod::Background,
++            DisposalMethod::Previous,
++        ])).print_as_debug());
++        let transparent = tc.draw(generators::optional(generators::integers::<u8>()));
++        let needs_user_input = tc.draw(generators::booleans());
++        DrawnFrame {
++            width,
++            height,
++            pixels,
++            delay,
++            dispose,
++            transparent,
++            needs_user_input,
++        }
++    }
++
++    /// Encode a multi-frame animation with a NETSCAPE repeat extension and a
++    /// comment extension, then decode it. Frame count, per-frame control
++    /// metadata, buffers and the repeat count must all round-trip, and the
++    /// extension blocks must be handled without panicking.
++    #[hegel::test]
++    fn multi_frame_with_extensions_roundtrip(tc: hegel::TestCase) {
++        let width = tc.draw(generators::integers::<u16>().min_value(1).max_value(24));
++        let height = tc.draw(generators::integers::<u16>().min_value(1).max_value(24));
++        let num_colors = tc.draw(generators::integers::<usize>().min_value(1).max_value(256));
++        let palette = tc.draw(
++            generators::vecs(generators::integers::<u8>())
++                .min_size(num_colors * 3)
++                .max_size(num_colors * 3),
++        );
++        let num_frames = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++        let repeat = if tc.draw(generators::booleans()) {
++            Repeat::Infinite
++        } else {
++            // Finite(0) is not written by the encoder, so it can't round-trip;
++            // draw a non-zero finite count.
++            Repeat::Finite(tc.draw(generators::integers::<u16>().min_value(1)))
++        };
++
++        let frames: Vec<DrawnFrame> = (0..num_frames)
++            .map(|_| draw_frame(&tc, width, height))
++            .collect();
++
++        let mut buf = Vec::new();
++        {
++            let mut encoder = Encoder::new(&mut buf, width, height, &palette).unwrap();
++            encoder.set_repeat(repeat).unwrap();
++            encoder
++                .write_raw_extension(AnyExtension(Extension::Comment as u8), &[b"hegel"])
++                .unwrap();
++            for df in &frames {
++                let frame = Frame {
++                    width: df.width,
++                    height: df.height,
++                    buffer: Cow::Owned(df.pixels.clone()),
++                    delay: df.delay,
++                    dispose: df.dispose,
++                    transparent: df.transparent,
++                    needs_user_input: df.needs_user_input,
++                    ..Frame::default()
++                };
++                encoder.write_frame(&frame).unwrap();
++            }
++        }
++
++        let mut decoder = Decoder::new(&buf[..]).expect("decoder init");
++        assert_eq!(decoder.repeat(), repeat);
++        let mut decoded = Vec::new();
++        while let Some(f) = decoder.read_next_frame().expect("decode frame") {
++            decoded.push(f.clone());
++        }
++        assert_eq!(decoded.len(), frames.len(), "frame count must round-trip");
++        for (dec, df) in decoded.iter().zip(&frames) {
++            assert_eq!(dec.width, df.width);
++            assert_eq!(dec.height, df.height);
++            assert_eq!(dec.delay, df.delay);
++            assert_eq!(dec.dispose, df.dispose);
++            assert_eq!(dec.transparent, df.transparent);
++            assert_eq!(dec.needs_user_input, df.needs_user_input);
++            assert_eq!(&*dec.buffer, &df.pixels[..]);
++        }
++    }
++}

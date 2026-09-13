@@ -1,0 +1,1222 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index be611f5..c64d8e1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -60,6 +60,7 @@ optional = true
+ [dev-dependencies]
+ criterion = "0.8"
+ anyhow = "1.0"
++hegeltest = "0.44.1"
+ 
+ [dev-dependencies.nalgebra]
+ version = "0.35"
+diff --git a/src/distribution/internal.rs b/src/distribution/internal.rs
+index 9b146c3..5ffc4c7 100644
+--- a/src/distribution/internal.rs
++++ b/src/distribution/internal.rs
+@@ -433,6 +433,1205 @@ pub(super) mod density_util {
+     }
+ }
+ 
++/// Property-based tests (hegel) for contracts shared by the univariate
++/// distributions: cdf/inverse_cdf round-trips, cdf shape, pdf positivity,
++/// sf/cdf complementarity, moment formulas, pmf/cdf consistency, and
++/// constructor domain checking. These live here, next to `density_util`,
++/// because they are cross-distribution checks rather than tests of any one
++/// distribution's numerics.
++#[cfg(test)]
++mod hegel_properties {
++    use crate::distribution::{
++        Beta, Binomial, ChiSquared, Continuous, ContinuousCDF, Discrete, DiscreteCDF, Exp, Gamma,
++        Normal, Poisson, StudentsT, Uniform,
++    };
++    use crate::statistics::Distribution;
++    use hegel::generators;
++
++    /// Object-safe bundle of everything the generic continuous properties need.
++    trait ContDist: ContinuousCDF<f64, f64> + Continuous<f64, f64> {}
++    impl<D: ContinuousCDF<f64, f64> + Continuous<f64, f64>> ContDist for D {}
++
++    trait DiscDist: DiscreteCDF<u64, f64> + Discrete<u64, f64> {}
++    impl<D: DiscreteCDF<u64, f64> + Discrete<u64, f64>> DiscDist for D {}
++
++    /// How a distribution computes its inverse cdf; used to pick tolerances
++    /// that follow from each implementation's own convergence criteria.
++    enum Kind {
++        /// Normal, Uniform: closed-form inverse with relative-accuracy
++        /// semantics throughout.
++        ClosedForm,
++        /// Exp: closed-form inverse (`ln_1p`), but `cdf` is computed as the
++        /// documented `1 - e^(-λx)`, which has absolute (one-ulp-of-1.0)
++        /// accuracy only in the lower tail.
++        Exp,
++        /// Gamma and ChiSquared: safeguarded Newton whose stop criterion is
++        /// `prec::convergence`, i.e. DEFAULT_EPS = 1e-9 *absolute* in x.
++        /// `shape`/`rate` are kept for the overflow exclusions.
++        GammaFamily { shape: f64, rate: f64 },
++        /// Beta: AS 64/109 `inv_beta_reg` Newton iteration. Shapes kept for
++        /// the boundary-pole pdf exclusion.
++        Beta { a: f64, b: f64 },
++        /// StudentsT: delegates to `inv_beta_reg` on y = ν/(ν+k²).
++        StudentsT { loc: f64, scale: f64, nu: f64 },
++    }
++
++    struct DrawnCont {
++        name: String,
++        kind: Kind,
++        dist: Box<dyn ContDist>,
++        /// Magnitude of the location-type parameter, when the inverse-cdf
++        /// formula runs through intermediates of that magnitude: quantiles
++        /// much smaller than it carry an absolute error of ~ε·scale_hint
++        /// from catastrophic cancellation (e.g. Uniform's
++        /// `(max-min)·p + min`, Normal's `μ - σ√2·erfc_inv(2p)`).
++        scale_hint: f64,
++    }
++
++    impl DrawnCont {
++        /// Relative q-space round-trip tolerance.
++        ///
++        /// Closed-form inverses: the crate's target relative accuracy is
++        /// DEFAULT_RELATIVE_ACC = 1e-14; the round-trip amplifies it by the
++        /// tail conditioning factor |x·pdf/q| (≈ z² ≤ ~1500 for the normal at
++        /// p = 1e-300; observed round-trip error ≤ 7.1e-11). 1e-9 gives that
++        /// bound ~15x headroom.
++        ///
++        /// Iterative inverses (Newton with the convergence criteria noted on
++        /// `Kind`): outside the excluded known-bug zones the worst observed
++        /// legitimate error was ~6.6e-8 (Beta(1e5,2) upper tail); 1e-6 gives
++        /// that ~15x headroom.
++        fn rel_c(&self) -> f64 {
++            match self.kind {
++                Kind::ClosedForm | Kind::Exp => 1e-9,
++                Kind::GammaFamily { .. } | Kind::Beta { .. } | Kind::StudentsT { .. } => 1e-6,
++            }
++        }
++
++        /// Absolute q-space floor, dependent on which side p lies:
++        /// - Exp's cdf uses the documented formula `1 - e^(-λx)`, which can
++        ///   only resolve the *lower* tail to about half an ulp of 1.0
++        ///   (1.1e-16); 1e-15 ≈ 5 ulps (the crate's DEFAULT_ULPS).
++        /// - Gamma/ChiSquared's inverse_cdf runs Newton against `cdf` (not
++        ///   `sf`, unlike the trait default), so in the *upper* tail the
++        ///   quantile is only determined to the cdf's absolute resolution
++        ///   near 1 (observed 2.5 ulps; 2e-15 ≈ 9 ulps).
++        fn abs_q(&self, p: f64) -> f64 {
++            match self.kind {
++                Kind::Exp if p <= 0.5 => 1e-15,
++                Kind::GammaFamily { .. } if p > 0.5 => 2e-15,
++                _ => 0.0,
++            }
++        }
++
++        /// Absolute error in the inverse's own iteration variable, allowed by
++        /// each implementation's stop criterion:
++        /// - gamma family: `prec::convergence` accepts a step of
++        ///   DEFAULT_EPS = 1e-9 absolute in x (2x headroom);
++        /// - Beta/StudentsT: `inv_beta_reg`'s converged residual in its
++        ///   Newton variable (the quantile's small side) was measured at
++        ///   1.4e-11–3e-11 outside the excluded zones; 1e-9 is ~50x margin.
++        ///   (Its *stop criterion* would permit up to ~1e-7, but observed
++        ///   convergence is far better; if a case ever exceeds 1e-9 it
++        ///   should be investigated, not tolerated.)
++        fn icdf_atol(&self) -> f64 {
++            match self.kind {
++                Kind::GammaFamily { .. } => 2e-9,
++                Kind::Beta { .. } | Kind::StudentsT { .. } => 1e-9,
++                _ => 0.0,
++            }
++        }
++
++        /// Inputs excluded from the round-trip properties because they fall in
++        /// zones where `inverse_cdf` is known-broken. Each zone is pinned by a
++        /// canonical `known_failure_*` test below; per the testing guidelines
++        /// the sibling properties skip the pinned zone so they keep checking
++        /// everything else.
++        ///
++        /// - Gamma family: the 1e-9 *absolute* Newton stop makes any quantile
++        ///   below ~1e-9 come back as garbage
++        ///   (`known_failure_gamma_inverse_cdf_small_quantile`). We skip
++        ///   x < 1e-6 (1000x the floor).
++        /// - Beta/StudentsT: `inv_beta_reg` stops when its scaled residual
++        ///   squared drops below `acu`, which ranges from 1e-30 (`FPU`) up to
++        ///   ~1e-14 depending on shape and target — an *absolute* budget of
++        ///   up to ~1e-7 in the Newton variable (the small side of the
++        ///   quantile). Below small side ~1e-4 relative accuracy in the
++        ///   variable is therefore no longer even ~1e-3 by construction, and
++        ///   in practice it can be arbitrarily wrong: observed 2.2e-5
++        ///   relative q error at small side 2.4e-6 (Beta(1, 8.3e5)), a stall
++        ///   at 3.6e-12 whose cdf is 0.23 instead of 0.5 (Beta(1, 0.01)),
++        ///   and total garbage below 1e-15
++        ///   (`known_failure_beta_inverse_cdf_stalls_far_from_quantile`,
++        ///   `known_failure_beta_try_inverse_cdf_panics_for_tiny_p`,
++        ///   `known_failure_beta_inverse_cdf_hangs_for_extreme_p`).
++        ///   We skip small side < 1e-4.
++        fn known_bug_zone(&self, x: f64) -> bool {
++            match self.kind {
++                Kind::GammaFamily { .. } => x < 1e-6,
++                Kind::Beta { .. } => x.min(1.0 - x) < 1e-4,
++                Kind::StudentsT { loc, scale, nu } => {
++                    // StudentsT inverts through y = ν/(ν+k²); inv_beta_reg's
++                    // Newton variable is min(y, 1-y), so the same ~1e-4
++                    // relative-accuracy floor applies on *both* sides: y → 0
++                    // in the far tails, and 1-y = k²/(ν+k²) → 0 near the
++                    // location (observed: t₁ quantile at 1e-6 from the
++                    // center comes back with 4.4e-5 relative error). The
++                    // near-center side also subsumes the cdf's h-rounding
++                    // collapse pinned by
++                    // known_failure_students_t_cdf_collapses_for_huge_freedom.
++                    let k = (x - loc) / scale;
++                    let y = nu / (nu + k * k);
++                    let one_minus_y = (k * k) / (nu + k * k);
++                    !(y >= 1e-4) || !(one_minus_y >= 1e-4)
++                }
++                _ => false,
++            }
++        }
++
++        /// True when calling cdf/sf at this x is known to panic or return
++        /// NaN for the gamma family: the implementations pass x·rate to
++        /// `gamma_lr`/`gamma_ur` without guarding against the product
++        /// underflowing to 0 or overflowing to ∞ while x itself is a
++        /// positive finite in-support value. Pinned by
++        /// `known_failure_gamma_cdf_panics_when_x_times_rate_underflows` and
++        /// `known_failure_gamma_pdf_nan_when_x_times_rate_overflows`.
++        fn cdf_arg_is_known_broken(&self, x: f64) -> bool {
++            match self.kind {
++                Kind::GammaFamily { rate, .. } => {
++                    x > 0.0 && x.is_finite() && (x * rate == 0.0 || (x * rate).is_infinite())
++                }
++                _ => false,
++            }
++        }
++
++        /// True when calling inverse_cdf at this p is known to panic or hang:
++        /// `inv_beta_reg` (Beta and StudentsT) panics with `XOutOfRange` once
++        /// the tail probability is deep enough that its Newton iterate
++        /// escapes [0, 1] (observed at min(p, 1-p) ≤ ~1e-162 even for
++        /// Beta(1, 1); pinned by
++        /// known_failure_beta_try_inverse_cdf_panics_for_tiny_p), and *hangs
++        /// forever* for large first shape with small tail probability
++        /// (observed for every probed q ≤ 1e-40 with shapes (1e3..1e6, 2),
++        /// while q = 1e-35 terminates; pinned, #[ignore]d, by
++        /// known_failure_beta_inverse_cdf_hangs_for_extreme_p). The
++        /// thresholds are shape-dependent, so 1e-30 is used with margin.
++        fn icdf_arg_is_known_broken(&self, p: f64) -> bool {
++            match self.kind {
++                Kind::Beta { .. } | Kind::StudentsT { .. } => p.min(1.0 - p) < 1e-30,
++                // Gamma::inverse_cdf's Newton descends the power-law lower
++                // tail by a factor (1 - 1/shape) per step, i.e. it needs
++                // ≈ |ln p| iterations, but caps at MAX_ITERATIONS = 100 and
++                // silently returns wherever it stopped (pinned by
++                // known_failure_gamma_inverse_cdf_exhausts_iterations).
++                // 1e-35 keeps the needed iterations ≤ ~81.
++                Kind::GammaFamily { .. } => p < 1e-35,
++                _ => false,
++            }
++        }
++
++        /// Absolute tolerance for cdf(x) + sf(x) − 1: both terms lie in
++        /// [0, 1]. For the closed-form/erfc-based distributions each term is
++        /// good to ~1e-14 relative (crate target), so 1e-13 is a 5x margin.
++        /// The incomplete-gamma/beta functions lose accuracy roughly like
++        /// ε·shape (measured against the exact 1-(1-x)^b form: relative
++        /// error 1.5e-8 at shape 1e8, 2.8e-5 at 1e10, 2e-3 at 1e12 — about
++        /// 3e-15·shape), and Beta's cdf and sf are computed independently,
++        /// so those kinds get 1e-11 + 1e-13·shape (≥ 15x margin over the
++        /// measurements). StudentsT computes cdf and sf from the same `ib`
++        /// value, so its sum is structurally exact and keeps 1e-11.
++        fn sum_tol(&self) -> f64 {
++            match self.kind {
++                Kind::ClosedForm | Kind::Exp => 1e-13,
++                Kind::GammaFamily { shape, .. } => 1e-11 + 1e-13 * shape,
++                // Base 1e-10: independently computed cdf/sf pairs disagree
++                // by up to ~1.1e-11 even at O(1) shapes when x is extreme
++                // (observed at Beta(0.1, 1), x = 1e-7); 10x margin.
++                Kind::Beta { a, b } => 1e-10 + 1e-13 * a.max(b),
++                Kind::StudentsT { .. } => 1e-11,
++            }
++        }
++
++        /// True when calling pdf at this x is known to return NaN:
++        /// - Gamma: the same unguarded x·rate product as the cdf, on overflow
++        ///   (pinned by known_failure_gamma_pdf_nan_when_x_times_rate_overflows);
++        /// - Beta: at a boundary pole (x = 0 with a < 1, or x = 1 with b < 1)
++        ///   the direct-formula branch evaluates Γ(a+b)/(Γ(a)Γ(b)) · ∞, which
++        ///   is 0 · ∞ = NaN whenever Γ(a)Γ(b) overflows (pinned by
++        ///   known_failure_beta_pdf_nan_at_boundary_pole).
++        fn pdf_arg_is_known_broken(&self, x: f64) -> bool {
++            match self.kind {
++                Kind::GammaFamily { shape, rate } => {
++                    // For shape ≤ 160 Gamma::pdf multiplies
++                    // rate^shape · x^(shape-1) · e^(-rate·x) directly; any
++                    // ∞ · 0 combination among the factors yields NaN (pinned
++                    // by known_failure_gamma_pdf_nan_when_rate_pow_shape_overflows
++                    // and known_failure_gamma_pdf_nan_when_x_times_rate_overflows).
++                    // Mirror the factor product to detect exactly those inputs.
++                    x.is_finite()
++                        && x >= 0.0
++                        && shape <= 160.0
++                        && (rate.powf(shape) * x.powf(shape - 1.0) * (-rate * x).exp()).is_nan()
++                }
++                Kind::Beta { a, b } => {
++                    (x == 0.0 || x == 1.0)
++                        && crate::function::gamma::ln_gamma(a) + crate::function::gamma::ln_gamma(b)
++                            > 708.0
++                }
++                _ => false,
++            }
++        }
++    }
++
++    /// Log-uniform positive magnitude 10^u, u ∈ [lo, hi].
++    fn pow10(tc: &hegel::TestCase, lo: f64, hi: f64) -> f64 {
++        let u = tc.draw(generators::floats::<f64>().min_value(lo).max_value(hi));
++        10f64.powf(u)
++    }
++
++    fn signed_mag(tc: &hegel::TestCase, lo: f64, hi: f64) -> f64 {
++        let m = pow10(tc, lo, hi);
++        if tc.draw(generators::booleans()) { m } else { -m }
++    }
++
++    /// A location-type parameter: exactly zero sometimes, otherwise a signed
++    /// log-uniform magnitude.
++    fn loc_value(tc: &hegel::TestCase, lo: f64, hi: f64) -> f64 {
++        if tc.draw(generators::integers::<u8>().max_value(7)) == 0 {
++            0.0
++        } else {
++            signed_mag(tc, lo, hi)
++        }
++    }
++
++    /// Any real input for cdf-shape properties: zero, ±∞, or a signed
++    /// magnitude across the full finite range.
++    fn draw_real_extended(tc: &hegel::TestCase) -> f64 {
++        match tc.draw(generators::integers::<u8>().max_value(9)) {
++            0 => 0.0,
++            1 => f64::NEG_INFINITY,
++            2 => f64::INFINITY,
++            _ => signed_mag(tc, -300.0, 300.0),
++        }
++    }
++
++    /// A probability in (0, 1): uniform bulk, or boosted deep into either
++    /// tail. The near-1 branch uses 1 - 2^-k, which is exactly representable,
++    /// so `1 - p` in the tests is exact (Sterbenz).
++    fn draw_p(tc: &hegel::TestCase) -> f64 {
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => tc.draw(
++                generators::floats::<f64>()
++                    .min_value_exclusive(0.0)
++                    .max_value_exclusive(1.0),
++            ),
++            1 => 10f64.powi(-tc.draw(generators::integers::<i32>().min_value(1).max_value(300))),
++            _ => 1.0 - 2f64.powi(-tc.draw(generators::integers::<i32>().min_value(1).max_value(52))),
++        }
++    }
++
++    /// Draw one of the seven univariate continuous distributions with valid
++    /// parameters whose magnitudes are log-uniform in [10^lo, 10^hi].
++    fn draw_continuous(tc: &hegel::TestCase, lo: f64, hi: f64) -> DrawnCont {
++        match tc.draw(generators::integers::<u8>().max_value(6)) {
++            0 => {
++                let m = loc_value(tc, lo, hi);
++                let s = pow10(tc, lo, hi);
++                DrawnCont {
++                    name: format!("Normal(mean={m:e}, std_dev={s:e})"),
++                    kind: Kind::ClosedForm,
++                    dist: Box::new(Normal::new(m, s).unwrap()),
++                    scale_hint: m.abs(),
++                }
++            }
++            1 => {
++                // Shape capped to [1e-12, 1e10]: below ~1e-14 `gamma_lr`
++                // returns cdf values > 1 by a few 1e-15 (pinned by
++                // known_failure_gamma_cdf_exceeds_one_for_tiny_shape;
++                // ChiSquared(1e-14), i.e. shape 5e-15, still exceeds 1); near
++                // x·rate ≈ shape its iteration count grows like √shape, from
++                // ~25ms at 1e12 up to a multi-minute effective hang (pinned,
++                // #[ignore]d, by known_failure_gamma_cdf_hangs_for_huge_shape)
++                // — the cap protects the suite's runtime and greenness, not
++                // the library's contract.
++                let shape = pow10(tc, lo.max(-12.0), hi.min(10.0));
++                let rate = pow10(tc, lo, hi);
++                DrawnCont {
++                    name: format!("Gamma(shape={shape:e}, rate={rate:e})"),
++                    kind: Kind::GammaFamily { shape, rate },
++                    dist: Box::new(Gamma::new(shape, rate).unwrap()),
++                    scale_hint: 0.0,
++                }
++            }
++            2 => {
++                // Shapes capped to [1e-12, 1e12]: for tiny shapes beta_reg
++                // exceeds 1 by ~1e-15 (pinned by
++                // known_failure_beta_cdf_exceeds_one_for_tiny_shape); it
++                // escapes [0, 1] entirely for shapes ≥ ~1e15 (cdf of 2.7,
++                // -5e256, 1+2.8e-8 — pinned by
++                // known_failure_beta_cdf_negative_for_huge_shape) and
++                // returns NaN for shapes ≥ ~1e200 (pinned by
++                // known_failure_beta_cdf_nan_for_huge_shape).
++                let a = pow10(tc, lo.max(-12.0), hi.min(12.0));
++                let b = pow10(tc, lo.max(-12.0), hi.min(12.0));
++                DrawnCont {
++                    name: format!("Beta(a={a:e}, b={b:e})"),
++                    kind: Kind::Beta { a, b },
++                    dist: Box::new(Beta::new(a, b).unwrap()),
++                    scale_hint: 0.0,
++                }
++            }
++            3 => {
++                let rate = pow10(tc, lo, hi);
++                DrawnCont {
++                    name: format!("Exp(rate={rate:e})"),
++                    kind: Kind::Exp,
++                    dist: Box::new(Exp::new(rate).unwrap()),
++                    scale_hint: 0.0,
++                }
++            }
++            4 => {
++                // Same caps as Gamma: ChiSquared(k) is Gamma(k/2, 1/2).
++                let k = pow10(tc, lo.max(-12.0), hi.min(10.0));
++                DrawnCont {
++                    name: format!("ChiSquared(freedom={k:e})"),
++                    kind: Kind::GammaFamily {
++                        shape: k / 2.0,
++                        rate: 0.5,
++                    },
++                    dist: Box::new(ChiSquared::new(k).unwrap()),
++                    scale_hint: 0.0,
++                }
++            }
++            5 => {
++                // Freedom capped to ≤ 1e12: the cdf routes through
++                // beta_reg(ν/2, 0.5, ·), which escapes [0, 1] for shapes
++                // ≥ ~1e15 (see known_failure_beta_cdf_negative_for_huge_shape),
++                // collapses in value for ν ≥ ~1e15 (pinned by
++                // known_failure_students_t_cdf_collapses_for_huge_freedom)
++                // and returns NaN for ν ≥ ~1e200 (pinned by
++                // known_failure_students_t_cdf_nan_for_huge_freedom).
++                let loc = loc_value(tc, lo, hi);
++                let scale = pow10(tc, lo, hi);
++                // Floored at 1e-12: for tiny freedom the beta_reg overshoot
++                // breaks monotonicity outright (pinned by
++                // known_failure_students_t_cdf_nonmonotone_for_tiny_freedom).
++                let nu = pow10(tc, lo.max(-12.0), hi.min(12.0));
++                DrawnCont {
++                    name: format!("StudentsT(loc={loc:e}, scale={scale:e}, freedom={nu:e})"),
++                    kind: Kind::StudentsT { loc, scale, nu },
++                    dist: Box::new(StudentsT::new(loc, scale, nu).unwrap()),
++                    scale_hint: loc.abs(),
++                }
++            }
++            _ => {
++                let a = loc_value(tc, lo, hi);
++                // Draw the width so that a + width > a is representable
++                // (width exponent within ~14 decimal digits of |a|); this
++                // avoids rejecting most draws, it does not narrow the domain.
++                let wlo = if a == 0.0 {
++                    lo
++                } else {
++                    lo.max(a.abs().log10() - 14.0).min(hi)
++                };
++                let w = pow10(tc, wlo, hi);
++                let b = a + w;
++                tc.assume(b > a && b.is_finite());
++                DrawnCont {
++                    name: format!("Uniform(min={a:e}, max={b:e})"),
++                    kind: Kind::ClosedForm,
++                    dist: Box::new(Uniform::new(a, b).unwrap()),
++                    scale_hint: a.abs().max(b.abs()),
++                }
++            }
++        }
++    }
++
++    /// PROPERTY 1 (crown round-trip, q side): for p in (0,1),
++    /// cdf(inverse_cdf(p)) recovers p — checked against the tail mass
++    /// q = min(p, 1-p) via whichever of cdf/sf is well conditioned on that
++    /// side, so the deep tails are actually probed.
++    ///
++    /// Tolerance: rel_c()·q for the implementation's relative error under
++    /// tail conditioning (see rel_c), plus pdf(x)·4ε|x| for the quantile's
++    /// own representation limit (the true quantile can be off by half an ulp
++    /// of x, which forward-maps through the density; e.g. Normal(1e5, 1e-6)
++    /// deep tails are representation- not implementation-limited), plus
++    /// abs_q() for Exp's absolute-accuracy cdf formula, plus a MIN_POSITIVE
++    /// floor so subnormal tolerances don't underflow to zero.
++    #[hegel::test]
++    fn prop_cdf_of_inverse_cdf_recovers_p(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -6.0, 6.0);
++        let p = draw_p(&tc);
++        if d.icdf_arg_is_known_broken(p) {
++            return; // pinned by known_failure_* tests below
++        }
++        let x = d.dist.inverse_cdf(p);
++        tc.assume(x.is_finite());
++        if d.known_bug_zone(x) || d.pdf_arg_is_known_broken(x) {
++            return; // pinned by known_failure_* tests below
++        }
++        let q_expected = if p <= 0.5 { p } else { 1.0 - p }; // exact: Sterbenz
++        let q_actual = if p <= 0.5 { d.dist.cdf(x) } else { d.dist.sf(x) };
++        let pdf = d.dist.pdf(x);
++        // icdf_atol maps the gamma family's 1e-9-absolute Newton stop into
++        // q-space through the density (e.g. Gamma(1, 3.7e3): a 1e-9 error in
++        // a 3e-3 quantile is 2.3e-6 relative in the tail mass).
++        let tol = d.rel_c() * q_expected
++            + (4.0 * f64::EPSILON * (x.abs() + d.scale_hint) + d.icdf_atol()) * pdf
++            + d.abs_q(p)
++            + f64::MIN_POSITIVE;
++        assert!(
++            (q_actual - q_expected).abs() <= tol,
++            "{}: inverse_cdf({p:e}) = {x:e}, round-trip gave {q_actual:e}, expected {q_expected:e} (tol {tol:e})",
++            d.name
++        );
++    }
++
++    /// PROPERTY 2 (crown round-trip, x side): inverse_cdf(cdf(x)) recovers x
++    /// wherever cdf(x) is not saturated to 0 or 1.
++    ///
++    /// Tolerance in x-space: rel_c()·|x| for the inverse's relative error,
++    /// plus the cdf's own error (1e-13 relative to the tail mass — 10x the
++    /// crate's 1e-14 target — plus Exp's absolute floor) back-mapped through
++    /// the density, plus the gamma family's documented 1e-9-absolute Newton
++    /// stop, plus a MIN_POSITIVE underflow floor.
++    #[hegel::test]
++    fn prop_inverse_cdf_of_cdf_recovers_x(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -6.0, 6.0);
++        // Either a quantile of a drawn probability (guaranteed interesting)
++        // or a raw magnitude clamped into the support.
++        let x = if tc.draw(generators::booleans()) {
++            let t = draw_p(&tc);
++            if d.icdf_arg_is_known_broken(t) {
++                return; // pinned by known_failure_* tests below
++            }
++            d.dist.inverse_cdf(t)
++        } else {
++            signed_mag(&tc, -8.0, 8.0).clamp(d.dist.min(), d.dist.max())
++        };
++        tc.assume(x.is_finite());
++        if d.known_bug_zone(x) {
++            return; // pinned by known_failure_* tests below
++        }
++        let p = d.dist.cdf(x);
++        if !(p > 0.0 && p < 1.0) {
++            return; // saturated: x not recoverable from p by construction
++        }
++        if d.icdf_arg_is_known_broken(p) {
++            return; // pinned by known_failure_* tests below
++        }
++        let pdf = d.dist.pdf(x);
++        tc.assume(pdf > 0.0 && pdf.is_finite());
++        let x2 = d.dist.inverse_cdf(p);
++        let q = p.min(1.0 - p);
++        // For p in the upper half, p = cdf(x) is quantized to the float grid
++        // near 1.0 (spacing ε/2), so no inverse can recover x better than
++        // ~ε/pdf: that quantization term applies to every distribution here.
++        let upper_quant = if p > 0.5 { 4.0 * f64::EPSILON } else { 0.0 };
++        // The relative term scales with |x| + q/pdf: q/pdf is the local
++        // length scale of the distribution, which is the scale the quantile
++        // is actually computed at — for location-scale families x = μ + σz
++        // suffers cancellation, so |x| alone understates the error scale
++        // (observed: Normal(-1, 1) quantile at -0.01 carries a 5.7e-11
++        // absolute error from erf_inv's ~1e-10 relative accuracy).
++        let tol = d.rel_c() * (x.abs() + q / pdf)
++            + 4.0 * f64::EPSILON * d.scale_hint
++            + (1e-13 * q + upper_quant + d.abs_q(p)) / pdf
++            + d.icdf_atol()
++            + f64::MIN_POSITIVE;
++        assert!(
++            (x2 - x).abs() <= tol,
++            "{}: cdf({x:e}) = {p:e}, inverse_cdf back = {x2:e} (tol {tol:e})",
++            d.name
++        );
++    }
++
++    /// PROPERTY 3: cdf is non-decreasing and stays within [0, 1] for *all*
++    /// real inputs (inside or outside the support) and all valid parameters,
++    /// including extreme magnitudes. Exact assertions — order and bounds are
++    /// not subject to rounding. A NaN cdf value also fails these asserts.
++    #[hegel::test]
++    fn prop_cdf_monotone_nondecreasing_and_bounded(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -300.0, 300.0);
++        let x1 = draw_real_extended(&tc);
++        let x2 = draw_real_extended(&tc);
++        if d.cdf_arg_is_known_broken(x1) || d.cdf_arg_is_known_broken(x2) {
++            return; // pinned by known_failure_* tests below
++        }
++        let (lo, hi) = if x1 <= x2 { (x1, x2) } else { (x2, x1) };
++        let c_lo = d.dist.cdf(lo);
++        let c_hi = d.dist.cdf(hi);
++        assert!(c_lo >= 0.0, "{}: cdf({lo:e}) = {c_lo:e} < 0", d.name);
++        assert!(c_hi <= 1.0, "{}: cdf({hi:e}) = {c_hi:e} > 1", d.name);
++        assert!(
++            c_lo <= c_hi,
++            "{}: cdf not monotone: cdf({lo:e}) = {c_lo:e} > cdf({hi:e}) = {c_hi:e}",
++            d.name
++        );
++    }
++
++    /// PROPERTY 4: cdf/sf limits are exact at the support boundaries:
++    /// cdf(-∞) = 0, cdf(∞) = 1 (and the sf mirror images), and for finite
++    /// support endpoints cdf(min) = 0 and cdf(max) = 1 — continuous
++    /// distributions place no atom at their endpoints. These are exact branch
++    /// behaviors of the implementations, so no tolerance applies.
++    #[hegel::test]
++    fn prop_cdf_limits_at_support_bounds(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -300.0, 300.0);
++        assert_eq!(d.dist.cdf(f64::NEG_INFINITY), 0.0, "{}: cdf(-inf)", d.name);
++        assert_eq!(d.dist.cdf(f64::INFINITY), 1.0, "{}: cdf(inf)", d.name);
++        assert_eq!(d.dist.sf(f64::NEG_INFINITY), 1.0, "{}: sf(-inf)", d.name);
++        assert_eq!(d.dist.sf(f64::INFINITY), 0.0, "{}: sf(inf)", d.name);
++        let lo = d.dist.min();
++        let hi = d.dist.max();
++        if lo.is_finite() {
++            assert_eq!(d.dist.cdf(lo), 0.0, "{}: cdf(min = {lo:e})", d.name);
++            assert_eq!(d.dist.sf(lo), 1.0, "{}: sf(min = {lo:e})", d.name);
++        }
++        if hi.is_finite() {
++            assert_eq!(d.dist.cdf(hi), 1.0, "{}: cdf(max = {hi:e})", d.name);
++            assert_eq!(d.dist.sf(hi), 0.0, "{}: sf(max = {hi:e})", d.name);
++        }
++    }
++
++    /// PROPERTY 5: pdf is non-negative (and never NaN) everywhere on the
++    /// support, for all valid parameters including extreme magnitudes.
++    /// +∞ is allowed (density poles, e.g. Beta with shape < 1 at 0).
++    #[hegel::test]
++    fn prop_pdf_nonnegative_on_support(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -300.0, 300.0);
++        let x = draw_real_extended(&tc).clamp(d.dist.min(), d.dist.max());
++        if d.pdf_arg_is_known_broken(x) {
++            return; // pinned by known_failure_* tests below
++        }
++        let pdf = d.dist.pdf(x);
++        assert!(pdf >= 0.0, "{}: pdf({x:e}) = {pdf:e}", d.name);
++    }
++
++    /// PROPERTY 6: sf(x) + cdf(x) = 1. The trait default computes sf as
++    /// 1 - cdf, but Normal, Gamma, Exp, StudentsT and Uniform override sf
++    /// with independent formulas, so this checks real consistency.
++    ///
++    /// Tolerance: both terms lie in [0, 1] and each is computed to ~1e-14
++    /// relative accuracy (crate target), so the sum is exact to ~2e-14
++    /// absolute; 1e-13 gives 5x headroom.
++    #[hegel::test]
++    fn prop_sf_plus_cdf_is_one(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -6.0, 6.0);
++        let x = draw_real_extended(&tc);
++        if d.cdf_arg_is_known_broken(x) {
++            return; // pinned by known_failure_* tests below
++        }
++        // Beta's independently-computed cdf and sf drift apart for extreme
++        // in-support arguments (observed: 1 + 3.6e-10 at Beta(0.1, 1),
++        // x = 1e-9 — far beyond the crate's 1e-14 relative target; recorded
++        // as an accuracy observation in HEGEL_REPORT.md). Restrict this
++        // property to min(x, 1-x) >= 1e-6 for Beta.
++        if let Kind::Beta { .. } = d.kind {
++            if x > 0.0 && x < 1.0 && x.min(1.0 - x) < 1e-6 {
++                return;
++            }
++        }
++        let sum = d.dist.cdf(x) + d.dist.sf(x);
++        let tol = d.sum_tol();
++        assert!(
++            (sum - 1.0).abs() <= tol,
++            "{}: cdf({x:e}) + sf({x:e}) = {sum:e} (tol {tol:e})",
++            d.name
++        );
++    }
++
++    /// Compares a moment against its closed-form value. Tolerance: the
++    /// formulas are a handful of flops (each contributing half an ulp), so
++    /// agreement to ~5e-15 relative is expected; 1e-12 gives headroom for
++    /// deliberately different operation orderings between test and
++    /// implementation. `scale` guards the case expected == 0.
++    fn assert_close(actual: f64, expected: f64, scale: f64, ctx: &str) {
++        let tol = 1e-12 * expected.abs().max(scale) + f64::MIN_POSITIVE;
++        assert!(
++            (actual - expected).abs() <= tol,
++            "{ctx}: got {actual:e}, expected {expected:e} (tol {tol:e})"
++        );
++    }
++
++    /// PROPERTY 7: mean() and variance() match the documented closed-form
++    /// formulas for the drawn parameters (formulas written in an equivalent
++    /// but differently-ordered form where possible). Also pins the
++    /// None-returning moment cases (StudentsT with small freedom).
++    #[hegel::test]
++    fn prop_mean_and_variance_match_closed_form(tc: hegel::TestCase) {
++        let (lo, hi) = (-6.0, 6.0);
++        match tc.draw(generators::integers::<u8>().max_value(8)) {
++            0 => {
++                let m = loc_value(&tc, lo, hi);
++                let s = pow10(&tc, lo, hi);
++                let d = Normal::new(m, s).unwrap();
++                let ctx = format!("Normal({m:e},{s:e})");
++                assert_close(d.mean().unwrap(), m, m.abs(), &ctx);
++                assert_close(d.variance().unwrap(), s * s, s * s, &ctx);
++            }
++            1 => {
++                let k = pow10(&tc, lo, hi);
++                let r = pow10(&tc, lo, hi);
++                let d = Gamma::new(k, r).unwrap();
++                let ctx = format!("Gamma({k:e},{r:e})");
++                assert_close(d.mean().unwrap(), k / r, k / r, &ctx);
++                assert_close(d.variance().unwrap(), (k / r) / r, (k / r) / r, &ctx);
++            }
++            2 => {
++                let a = pow10(&tc, lo, hi);
++                let b = pow10(&tc, lo, hi);
++                let d = Beta::new(a, b).unwrap();
++                let ctx = format!("Beta({a:e},{b:e})");
++                let mean = a / (a + b);
++                let var = (a / (a + b)) * (b / (a + b)) / (a + b + 1.0);
++                assert_close(d.mean().unwrap(), mean, mean, &ctx);
++                assert_close(d.variance().unwrap(), var, var, &ctx);
++            }
++            3 => {
++                let r = pow10(&tc, lo, hi);
++                let d = Exp::new(r).unwrap();
++                let ctx = format!("Exp({r:e})");
++                assert_close(d.mean().unwrap(), 1.0 / r, 1.0 / r, &ctx);
++                assert_close(d.variance().unwrap(), (1.0 / r) * (1.0 / r), 1.0 / r / r, &ctx);
++            }
++            4 => {
++                let k = pow10(&tc, lo, hi);
++                let d = ChiSquared::new(k).unwrap();
++                let ctx = format!("ChiSquared({k:e})");
++                assert_close(d.mean().unwrap(), k, k, &ctx);
++                assert_close(d.variance().unwrap(), 2.0 * k, k, &ctx);
++            }
++            5 => {
++                let loc = loc_value(&tc, lo, hi);
++                let scale = pow10(&tc, lo, hi);
++                let nu = pow10(&tc, lo, hi);
++                let d = StudentsT::new(loc, scale, nu).unwrap();
++                let ctx = format!("StudentsT({loc:e},{scale:e},{nu:e})");
++                if nu > 1.0 {
++                    assert_close(d.mean().unwrap(), loc, loc.abs().max(1e-300), &ctx);
++                } else {
++                    assert!(d.mean().is_none(), "{ctx}: mean should be None for freedom <= 1");
++                }
++                if nu > 2.0 {
++                    let var = nu / (nu - 2.0) * (scale * scale);
++                    assert_close(d.variance().unwrap(), var, var, &ctx);
++                } else {
++                    assert!(
++                        d.variance().is_none(),
++                        "{ctx}: variance should be None for freedom <= 2"
++                    );
++                }
++            }
++            6 => {
++                let a = loc_value(&tc, lo, hi);
++                let wlo = if a == 0.0 {
++                    lo
++                } else {
++                    lo.max(a.abs().log10() - 14.0).min(hi)
++                };
++                let w = pow10(&tc, wlo, hi);
++                let b = a + w;
++                tc.assume(b > a && b.is_finite());
++                let d = Uniform::new(a, b).unwrap();
++                let ctx = format!("Uniform({a:e},{b:e})");
++                let scale = a.abs().max(b.abs());
++                assert_close(d.mean().unwrap(), (a + b) / 2.0, scale, &ctx);
++                let var = ((b - a) / 2.0) * ((b - a) / 2.0) / 3.0;
++                assert_close(d.variance().unwrap(), var, var, &ctx);
++            }
++            7 => {
++                let p = tc.draw(generators::floats::<f64>().min_value(0.0).max_value(1.0));
++                let n = tc.draw(generators::integers::<u64>().max_value(1_000_000_000));
++                let d = Binomial::new(p, n).unwrap();
++                let ctx = format!("Binomial({p:e},{n})");
++                let nf = n as f64;
++                assert_close(d.mean().unwrap(), nf * p, nf, &ctx);
++                assert_close(d.variance().unwrap(), nf * p * (1.0 - p), nf, &ctx);
++            }
++            _ => {
++                let l = pow10(&tc, lo, hi);
++                let d = Poisson::new(l).unwrap();
++                let ctx = format!("Poisson({l:e})");
++                assert_close(d.mean().unwrap(), l, l, &ctx);
++                assert_close(d.variance().unwrap(), l, l, &ctx);
++            }
++        }
++    }
++
++    /// PROPERTY 8: pdf is the derivative of cdf (central finite difference).
++    ///
++    /// The step is h = 1e-4·q/pdf(x) (q = tail mass at x): large enough that
++    /// the cdf difference 2h·pdf ≈ 2e-4·q clears the cdf's ~1e-14·q error by
++    /// ten orders, small enough that the truncation term (h·d(ln pdf)/dx)² is
++    /// ≲1e-6 for the drawn parameter range. Parameter magnitudes are kept in
++    /// [1e-1, 1e2] to protect the finite-difference *oracle* from roundoff
++    /// blowup at power-law density poles — this bounds the test's arithmetic,
++    /// not the library's contract (extreme parameters are covered by the
++    /// exact-shape properties above). Tolerance 1e-3 relative: ~100x the
++    /// worst expected truncation + roundoff.
++    #[hegel::test]
++    fn prop_pdf_is_derivative_of_cdf(tc: hegel::TestCase) {
++        let d = draw_continuous(&tc, -1.0, 2.0);
++        let t = tc.draw(generators::floats::<f64>().min_value(0.02).max_value(0.98));
++        let x = d.dist.inverse_cdf(t);
++        tc.assume(x.is_finite());
++        if d.known_bug_zone(x) {
++            return; // pinned by known_failure_* tests below
++        }
++        let p = d.dist.cdf(x);
++        tc.assume(p > 0.001 && p < 0.999);
++        let pdf = d.dist.pdf(x);
++        tc.assume(pdf.is_finite() && pdf > 0.0);
++        let q = p.min(1.0 - p);
++        let h = 1e-4 * q / pdf;
++        tc.assume(h > 0.0 && x - h > d.dist.min() && x + h < d.dist.max());
++        tc.assume(x + h != x && x - h != x);
++        let fd = if p <= 0.5 {
++            (d.dist.cdf(x + h) - d.dist.cdf(x - h)) / (2.0 * h)
++        } else {
++            (d.dist.sf(x - h) - d.dist.sf(x + h)) / (2.0 * h)
++        };
++        assert!(
++            (fd - pdf).abs() <= 1e-3 * pdf + f64::MIN_POSITIVE,
++            "{}: at x = {x:e} (p = {p:e}), finite difference {fd:e} vs pdf {pdf:e}",
++            d.name
++        );
++    }
++
++    /// PROPERTY 9: for the discrete distributions, each pmf value is a
++    /// probability, the running pmf sum reproduces the cdf at every point of
++    /// the (truncated) support, and the total mass reaches 1.
++    ///
++    /// Tolerances: 1e-10 absolute for sum-vs-cdf, matching the crate's own
++    /// `density_util::check_sum_pmf_is_cdf` precedent (a few hundred additions
++    /// of values ≤ 1 accumulate ≲1e-13; the cdf itself targets ~1e-14).
++    /// Binomial sums its whole support; Poisson is truncated at
++    /// λ + 20√λ + 30, beyond which the omitted tail is < 1e-40, so the total
++    /// must be within 1e-9 of 1. The size bounds (n ≤ 300, λ ≤ 100) protect
++    /// the test's runtime, not any library contract.
++    #[hegel::test]
++    fn prop_discrete_pmf_sums_to_cdf(tc: hegel::TestCase) {
++        let (name, k_max, dist): (String, u64, Box<dyn DiscDist>) =
++            if tc.draw(generators::booleans()) {
++                let p = tc.draw(generators::floats::<f64>().min_value(0.0).max_value(1.0));
++                let n = tc.draw(generators::integers::<u64>().max_value(300));
++                (
++                    format!("Binomial({p:e},{n})"),
++                    n,
++                    Box::new(Binomial::new(p, n).unwrap()),
++                )
++            } else {
++                let l = pow10(&tc, -6.0, 2.0);
++                let k_max = (l + 20.0 * l.sqrt() + 30.0).ceil() as u64;
++                (
++                    format!("Poisson({l:e})"),
++                    k_max,
++                    Box::new(Poisson::new(l).unwrap()),
++                )
++            };
++        let mut sum = 0.0;
++        for k in 0..=k_max {
++            let pmf = dist.pmf(k);
++            assert!((0.0..=1.0).contains(&pmf), "{name}: pmf({k}) = {pmf:e}");
++            sum += pmf;
++            let cdf = dist.cdf(k);
++            assert!(
++                (sum - cdf).abs() <= 1e-10,
++                "{name}: sum of pmf(0..={k}) = {sum:e} but cdf({k}) = {cdf:e}"
++            );
++        }
++        assert!(
++            (sum - 1.0).abs() <= 1e-9,
++            "{name}: total pmf mass over support = {sum:e}"
++        );
++    }
++
++    /// PROPERTY 10: checked constructors reject out-of-domain parameters with
++    /// Err (not panic, not silent acceptance), across every documented
++    /// violation class for each distribution.
++    #[hegel::test]
++    fn prop_checked_constructors_reject_invalid_parameters(tc: hegel::TestCase) {
++        // An invalid value for a parameter documented as "must be positive
++        // and not NaN": NaN, zero, or negative.
++        fn invalid_pos(tc: &hegel::TestCase) -> f64 {
++            match tc.draw(generators::integers::<u8>().max_value(2)) {
++                0 => f64::NAN,
++                1 => 0.0,
++                _ => -pow10(tc, -300.0, 300.0),
++            }
++        }
++
++        match tc.draw(generators::integers::<u8>().max_value(8)) {
++            0 => {
++                let (m, s) = if tc.draw(generators::booleans()) {
++                    (f64::NAN, pow10(&tc, -300.0, 300.0))
++                } else {
++                    (loc_value(&tc, -300.0, 300.0), invalid_pos(&tc))
++                };
++                assert!(Normal::new(m, s).is_err(), "Normal::new({m:e}, {s:e})");
++            }
++            1 => {
++                let (k, r) = if tc.draw(generators::booleans()) {
++                    (invalid_pos(&tc), pow10(&tc, -300.0, 300.0))
++                } else {
++                    (pow10(&tc, -300.0, 300.0), invalid_pos(&tc))
++                };
++                assert!(Gamma::new(k, r).is_err(), "Gamma::new({k:e}, {r:e})");
++            }
++            2 => {
++                // Beta additionally rejects infinite shapes.
++                let bad = match tc.draw(generators::integers::<u8>().max_value(3)) {
++                    0 => f64::NAN,
++                    1 => 0.0,
++                    2 => -pow10(&tc, -300.0, 300.0),
++                    _ => f64::INFINITY,
++                };
++                let good = pow10(&tc, -300.0, 300.0);
++                let (a, b) = if tc.draw(generators::booleans()) {
++                    (bad, good)
++                } else {
++                    (good, bad)
++                };
++                assert!(Beta::new(a, b).is_err(), "Beta::new({a:e}, {b:e})");
++            }
++            3 => {
++                let r = invalid_pos(&tc);
++                assert!(Exp::new(r).is_err(), "Exp::new({r:e})");
++            }
++            4 => {
++                let k = invalid_pos(&tc);
++                assert!(ChiSquared::new(k).is_err(), "ChiSquared::new({k:e})");
++            }
++            5 => {
++                let good_loc = loc_value(&tc, -300.0, 300.0);
++                let good_pos = pow10(&tc, -300.0, 300.0);
++                let (loc, scale, nu) = match tc.draw(generators::integers::<u8>().max_value(2)) {
++                    0 => (f64::NAN, good_pos, pow10(&tc, -300.0, 300.0)),
++                    1 => (good_loc, invalid_pos(&tc), pow10(&tc, -300.0, 300.0)),
++                    _ => (good_loc, good_pos, invalid_pos(&tc)),
++                };
++                assert!(
++                    StudentsT::new(loc, scale, nu).is_err(),
++                    "StudentsT::new({loc:e}, {scale:e}, {nu:e})"
++                );
++            }
++            6 => {
++                let a = loc_value(&tc, -300.0, 300.0);
++                let (min, max) = match tc.draw(generators::integers::<u8>().max_value(5)) {
++                    0 => (f64::NAN, a),
++                    1 => (a, f64::NAN),
++                    2 => (f64::NEG_INFINITY, a),
++                    3 => (a, f64::INFINITY),
++                    4 => (a, a),                              // empty interval
++                    _ => (a, a - pow10(&tc, -300.0, 300.0)), // reversed
++                };
++                tc.assume(!(min < max)); // reversed branch can round to a - w == a
++                assert!(
++                    Uniform::new(min, max).is_err(),
++                    "Uniform::new({min:e}, {max:e})"
++                );
++            }
++            7 => {
++                let p = match tc.draw(generators::integers::<u8>().max_value(2)) {
++                    0 => f64::NAN,
++                    1 => -pow10(&tc, -300.0, 300.0),
++                    _ => 1.0 + pow10(&tc, -15.0, 300.0),
++                };
++                let n = tc.draw(generators::integers::<u64>());
++                assert!(Binomial::new(p, n).is_err(), "Binomial::new({p:e}, {n})");
++            }
++            _ => {
++                let l = invalid_pos(&tc);
++                assert!(Poisson::new(l).is_err(), "Poisson::new({l:e})");
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // KNOWN FAILURES — real bugs found by the round-trip properties above.
++    // These pin the bugs deterministically and are expected to FAIL until
++    // the bugs are fixed. Do not "fix" the tests. See HEGEL_REPORT.md.
++    // ------------------------------------------------------------------
++
++    /// KNOWN FAILURE (real bug): `Gamma::inverse_cdf` (and `ChiSquared` /
++    /// `Erlang`, which delegate to it) is catastrophically wrong whenever the
++    /// true quantile is smaller than ~1e-9. The safeguarded Newton loop in
++    /// `Gamma::inverse_cdf` stops via `prec::convergence`, which accepts a
++    /// step below `DEFAULT_EPS = 1e-9` *absolute*; when the search bisects
++    /// down toward a tiny quantile the steps shrink below 1e-9 long before
++    /// reaching it. Here the true median of Gamma(1e-3, 1) is ~1e-301, but
++    /// inverse_cdf(0.5) returns ~9.3e-10, whose cdf is ~0.98.
++    #[test]
++    fn known_failure_gamma_inverse_cdf_small_quantile() {
++        let d = Gamma::new(1e-3, 1.0).unwrap();
++        let x = d.inverse_cdf(0.5);
++        let back = d.cdf(x);
++        assert!(
++            (back - 0.5).abs() <= 1e-3,
++            "Gamma(1e-3, 1).inverse_cdf(0.5) = {x:e}, but cdf({x:e}) = {back:e}, expected 0.5"
++        );
++    }
++
++    /// KNOWN FAILURE (real bug): `Gamma::inverse_cdf` (and delegating
++    /// distributions) silently returns a wildly wrong quantile when the
++    /// Newton search runs out of iterations. In the power-law lower tail the
++    /// safeguarded Newton step multiplies x by (1 - 1/shape) per iteration,
++    /// so reaching a tail probability p takes ≈ |ln p| iterations regardless
++    /// of shape — but MAX_ITERATIONS is 100 and exhaustion is not reported.
++    /// Here the true quantile of ChiSquared(100) at p = 1e-262 is ~2e-4
++    /// (perfectly representable), but the value returned has cdf ≈ 1e-124 —
++    /// 138 orders of magnitude off. Distinct from the absolute-stop bug
++    /// pinned above (that one stops too early near zero; this one runs out
++    /// of budget far from zero).
++    #[test]
++    fn known_failure_gamma_inverse_cdf_exhausts_iterations() {
++        let d = ChiSquared::new(100.0).unwrap();
++        let x = d.inverse_cdf(1e-262);
++        let back = d.cdf(x);
++        assert!(
++            back <= 1e-250,
++            "ChiSquared(100).inverse_cdf(1e-262) = {x:e}, but cdf({x:e}) = {back:e}"
++        );
++    }
++
++    /// KNOWN FAILURE (real bug): `Beta::try_inverse_cdf` is documented to
++    /// return an error instead of panicking for out-of-range `x`, and its
++    /// input here is squarely inside [0, 1] — yet it panics with
++    /// `XOutOfRange` from the `beta_reg` unwrap in `function/beta.rs`,
++    /// because `inv_beta_reg`'s Newton iterate escapes [0, 1] for tail
++    /// probabilities this small. `StudentsT::inverse_cdf` panics on the same
++    /// path (e.g. StudentsT(0, 1, 5).inverse_cdf(1e-300)).
++    #[test]
++    fn known_failure_beta_try_inverse_cdf_panics_for_tiny_p() {
++        let d = Beta::new(2.0, 3.0).unwrap();
++        let r = d.try_inverse_cdf(1e-300); // panics: XOutOfRange
++        assert!(r.is_ok(), "expected Ok(quantile), got {r:?}");
++    }
++
++    /// KNOWN FAILURE (real bug): `Beta::inverse_cdf` silently returns a value
++    /// orders of magnitude away from the true quantile once the quantile's
++    /// small side drops below `inv_beta_reg`'s accuracy floor (AS 109's
++    /// `FPU = 1e-30` bound is on the *squared* Newton step, i.e. ~1e-15 in
++    /// x). The true quantile of Beta(2, 3) at p = 1e-40 is ~4e-21, but
++    /// inverse_cdf returns ~7.3e-16 — a point whose cdf is ~3.2e-30, ten
++    /// orders of magnitude off in probability.
++    #[test]
++    fn known_failure_beta_inverse_cdf_stalls_far_from_quantile() {
++        let d = Beta::new(2.0, 3.0).unwrap();
++        let x = d.inverse_cdf(1e-40);
++        let back = d.cdf(x);
++        assert!(
++            back <= 1e-38,
++            "Beta(2, 3).inverse_cdf(1e-40) = {x:e}, but cdf({x:e}) = {back:e} (100x tolerance)"
++        );
++    }
++
++    /// KNOWN FAILURE (real bug, process-hanging): `Beta::inverse_cdf` never
++    /// returns for large first shape + deep lower-tail p — `inv_beta_reg`'s
++    /// outer Newton loop spins forever (observed: steady 100% CPU, no
++    /// progress, for at least minutes; probed hanging for every p ≤ 1e-40
++    /// with shapes (1e5, 2)). Kept `#[ignore]`d because a hang would take
++    /// down the whole test suite; remove the ignore once fixed upstream.
++    #[test]
++    #[ignore = "KNOWN BUG: hangs forever in inv_beta_reg; see HEGEL_REPORT.md"]
++    fn known_failure_beta_inverse_cdf_hangs_for_extreme_p() {
++        let d = Beta::new(1e5, 2.0).unwrap();
++        let x = d.inverse_cdf(1e-100); // never returns
++        assert!(x.is_finite());
++    }
++
++    /// KNOWN FAILURE (real bug): `Beta::cdf`/`sf` return NaN for every x in
++    /// (0, 1) once either shape reaches ~1e200 (1e150 still works), violating
++    /// cdf ∈ [0, 1]. The constructor accepts any positive finite shape.
++    /// Found by prop_cdf_monotone_nondecreasing_and_bounded; the broad
++    /// generator caps Beta shapes at 1e150 and references this pin.
++    #[test]
++    fn known_failure_beta_cdf_nan_for_huge_shape() {
++        let d = Beta::new(1e200, 3.0).unwrap();
++        let c = d.cdf(0.5);
++        assert!(!c.is_nan(), "Beta(1e200, 3).cdf(0.5) = {c}");
++    }
++
++    /// KNOWN FAILURE (real bug): `Beta::cdf` escapes [0, 1] catastrophically
++    /// for large shapes: Beta(1, 1e18).cdf(1e-17) = -4.99e256 (the true value
++    /// is ~0.99995), Beta(1, 1e15).cdf(1e-15) = 2.73, and
++    /// Beta(0.5, 1e18).cdf(1e-17) = 1 + 2.8e-8. Accuracy already degrades
++    /// like ~3e-15·shape from shape ~1e8 (0.2% relative error at 1e12) before
++    /// breaking down completely around 1e15. Found by
++    /// prop_cdf_monotone_nondecreasing_and_bounded; the broad generator caps
++    /// Beta shapes (and StudentsT freedom, which routes through the same
++    /// beta_reg geometry) at 1e12 and references this pin.
++    #[test]
++    fn known_failure_beta_cdf_negative_for_huge_shape() {
++        let d = Beta::new(1.0, 1e18).unwrap();
++        let c = d.cdf(1e-17);
++        assert!(
++            (0.0..=1.0).contains(&c),
++            "Beta(1, 1e18).cdf(1e-17) = {c:e}, expected ~0.99995"
++        );
++    }
++
++    /// KNOWN FAILURE (real bug): `Gamma::cdf` exceeds 1 for tiny shapes —
++    /// `gamma_lr` comes back above 1 and no clamp is applied. E.g.
++    /// Gamma(1e-30, 1).cdf(1) = 1.0000000000000024 (already visible at
++    /// shape = 1e-30 for x near the mass; also 1.0000000000000238 at
++    /// shape = 1e-300). Violates cdf ∈ [0, 1]. Found by
++    /// prop_cdf_monotone_nondecreasing_and_bounded; the broad generator
++    /// floors gamma-family shapes at 1e-14 and references this pin.
++    #[test]
++    fn known_failure_gamma_cdf_exceeds_one_for_tiny_shape() {
++        let d = Gamma::new(1e-30, 1.0).unwrap();
++        let c = d.cdf(1.0);
++        assert!(c <= 1.0, "Gamma(1e-30, 1).cdf(1) = {c:.17e} > 1");
++    }
++
++    /// KNOWN FAILURE (real bug): `Gamma::cdf` and `Gamma::sf` panic
++    /// (`XInvalid` unwrap in function/gamma.rs) when `x * rate` underflows to
++    /// 0 — the implementation checks `x <= 0` but then hands the underflowed
++    /// product to `gamma_lr`, which rejects 0. The same unguarded product
++    /// also panics when it *overflows* to ∞ (Gamma(2, 1e300).cdf(1e300)).
++    /// x = 1e-300 is a positive, in-support argument, so this violates the
++    /// cdf's domain contract. Found by prop_cdf_monotone_nondecreasing_and_bounded.
++    #[test]
++    fn known_failure_gamma_cdf_panics_when_x_times_rate_underflows() {
++        let d = Gamma::new(2.0, 1e-300).unwrap();
++        let c = d.cdf(1e-300); // panics: XInvalid
++        assert!((0.0..=1.0).contains(&c));
++    }
++
++    /// KNOWN FAILURE (real bug): `Beta::pdf` returns NaN at a boundary pole
++    /// when `Γ(a)Γ(b)` overflows: the direct-formula branch computes
++    /// `Γ(a+b)/(Γ(a)Γ(b)) * x^(a-1) * (1-x)^(b-1)`, and the prefactor
++    /// underflows to 0 while `0^(a-1)` is ∞, giving 0 · ∞ = NaN. For
++    /// non-overflowing shapes the same input returns ∞ (e.g.
++    /// Beta(0.5, 0.5).pdf(0) = ∞), so NaN here is an inconsistency, not a
++    /// policy. Found by prop_pdf_nonnegative_on_support.
++    #[test]
++    fn known_failure_beta_pdf_nan_at_boundary_pole() {
++        let d = Beta::new(1e-9, 1e-300).unwrap();
++        let p = d.pdf(0.0);
++        assert!(p >= 0.0, "Beta(1e-9, 1e-300).pdf(0) = {p}");
++    }
++
++    /// KNOWN FAILURE (real bug): `Gamma::pdf` returns NaN when `x * rate`
++    /// overflows to ∞ for finite in-support x (the true density is 0 there).
++    /// Found by prop_pdf_nonnegative_on_support.
++    #[test]
++    fn known_failure_gamma_pdf_nan_when_x_times_rate_overflows() {
++        let d = Gamma::new(2.0, 1e300).unwrap();
++        let p = d.pdf(1e300);
++        assert!(p >= 0.0, "Gamma(2, 1e300).pdf(1e300) = {p}");
++    }
++
++    /// KNOWN FAILURE (real bug): `Gamma::pdf`'s direct-formula branch
++    /// computes `rate^shape * x^(shape-1) * e^(-rate·x) / Γ(shape)`; when
++    /// `rate^shape` overflows to ∞ and `x^(shape-1)` underflows to 0 the
++    /// product is ∞ · 0 = NaN. Gamma(10, 1e31).pdf(0) should be 0. (Nearby,
++    /// e.g. pdf(1e-35), the same overflow yields a spurious ∞ instead of the
++    /// true tiny density. The symmetric combination also occurs:
++    /// ChiSquared(10).pdf(1e78) = NaN via x^(shape-1) = ∞ times
++    /// e^(-rate·x) = 0.) Found by prop_pdf_nonnegative_on_support.
++    #[test]
++    fn known_failure_gamma_pdf_nan_when_rate_pow_shape_overflows() {
++        let d = Gamma::new(10.0, 1e31).unwrap();
++        let p = d.pdf(0.0);
++        assert!(p >= 0.0, "Gamma(10, 1e31).pdf(0) = {p}");
++    }
++
++    /// KNOWN FAILURE (real bug): `Gamma::pdf` is NaN in the *bulk* of the
++    /// distribution for ordinary parameters: with shape ≤ 160 the direct
++    /// formula `rate^shape * x^(shape-1) * e^(-rate·x) / Γ(shape)` is used,
++    /// and for Gamma(80, 1e-5) at x near the mean (8e6), `rate^shape`
++    /// underflows to 0 while `x^(shape-1)` overflows to ∞, giving NaN where
++    /// the true density is a perfectly representable ~5e-8. (In nearby
++    /// regions where only one factor degenerates, the pdf comes back as a
++    /// spurious 0 or ∞.) Found by prop_cdf_of_inverse_cdf_recovers_p, whose
++    /// tolerance became NaN through this pdf.
++    #[test]
++    fn known_failure_gamma_pdf_nan_for_moderate_parameters() {
++        let d = Gamma::new(80.0, 1e-5).unwrap();
++        let x = 8e6; // the mean: shape/rate
++        let p = d.pdf(x);
++        assert!(p >= 0.0, "Gamma(80, 1e-5).pdf(8e6) = {p}");
++    }
++
++    /// KNOWN FAILURE (real bug): `Beta::cdf` exceeds 1 for tiny shapes —
++    /// the beta_reg analog of
++    /// known_failure_gamma_cdf_exceeds_one_for_tiny_shape:
++    /// Beta(1e-17, 1).cdf(0.01) = 1.000000000000001. Violates cdf ∈ [0, 1].
++    /// Found by prop_cdf_monotone_nondecreasing_and_bounded; the broad
++    /// generator floors Beta shapes at 1e-12 and references this pin.
++    #[test]
++    fn known_failure_beta_cdf_exceeds_one_for_tiny_shape() {
++        let d = Beta::new(1e-17, 1.0).unwrap();
++        let c = d.cdf(0.01);
++        assert!(c <= 1.0, "Beta(1e-17, 1).cdf(0.01) = {c:.17e} > 1");
++    }
++
++    /// KNOWN FAILURE (real bug, effective hang): `Gamma::cdf` iteration count
++    /// grows like √shape when x·rate ≈ shape (0.3ms at shape 1e8, 25ms at
++    /// 1e12, 235ms at 1e14, minutes-to-forever at 1e16 and beyond).
++    /// `#[ignore]`d because Gamma(1e300, 1e300).cdf(1) does not return in any
++    /// practical time and would wedge the suite.
++    #[test]
++    #[ignore = "KNOWN BUG: gamma_lr effectively hangs for huge shape; see HEGEL_REPORT.md"]
++    fn known_failure_gamma_cdf_hangs_for_huge_shape() {
++        let d = Gamma::new(1e300, 1e300).unwrap();
++        let c = d.cdf(1.0); // does not return
++        assert!((0.0..=1.0).contains(&c));
++    }
++
++    /// KNOWN FAILURE (real bug): `StudentsT::cdf` is non-monotone for tiny
++    /// freedom: the beta_reg tiny-shape overshoot (see
++    /// known_failure_beta_cdf_exceeds_one_for_tiny_shape) makes
++    /// StudentsT(0, 1, 1e-16).cdf(-1) = 0.5000000000000009, which is greater
++    /// than cdf(0) = 0.5 — the cdf decreases between -1 and 0. Found by
++    /// prop_cdf_monotone_nondecreasing_and_bounded; the broad generator
++    /// floors freedom at 1e-12 and references this pin.
++    #[test]
++    fn known_failure_students_t_cdf_nonmonotone_for_tiny_freedom() {
++        let d = StudentsT::new(0.0, 1.0, 1e-16).unwrap();
++        let (lo, hi) = (d.cdf(-1.0), d.cdf(0.0));
++        assert!(
++            lo <= hi,
++            "StudentsT(0, 1, 1e-16): cdf(-1) = {lo:.17e} > cdf(0) = {hi:.17e}"
++        );
++    }
++
++    /// KNOWN FAILURE (real bug): `StudentsT::cdf` returns NaN for huge
++    /// freedom and large |x| (ν ≥ ~1e200; ν = 1e150 still returns 0).
++    /// The constructor accepts any positive freedom, and only ν = ∞ is
++    /// special-cased to the normal limit. Found by
++    /// prop_cdf_monotone_nondecreasing_and_bounded; the broad generator caps
++    /// ν at 1e150 and references this pin.
++    #[test]
++    fn known_failure_students_t_cdf_nan_for_huge_freedom() {
++        let d = StudentsT::new(0.0, 1.0, 1e200).unwrap();
++        let c = d.cdf(-1e300);
++        assert!(!c.is_nan(), "StudentsT(0, 1, 1e200).cdf(-1e300) = {c}");
++    }
++
++    /// KNOWN FAILURE (real bug): `StudentsT::cdf` parametrizes through
++    /// h = ν/(ν + k²), which loses all information once k²/ν < ε. For large
++    /// finite freedom the cdf should be within ~1/ν of the normal limit
++    /// Φ(-2) ≈ 0.02275; instead it collapses (ν = 1e16 gives 0.0, ν = 1e17
++    /// gives 0.5, and already ν = 1e15 gives 0.069 — off by 3x). Found by
++    /// the round-trip properties; the pointwise center-collapse exclusion in
++    /// known_bug_zone references this pin.
++    #[test]
++    fn known_failure_students_t_cdf_collapses_for_huge_freedom() {
++        let d = StudentsT::new(0.0, 1.0, 1e16).unwrap();
++        let c = d.cdf(-2.0);
++        let normal_limit = 0.022750131948179212;
++        assert!(
++            (c - normal_limit).abs() <= 1e-2,
++            "StudentsT(0, 1, 1e16).cdf(-2) = {c}, normal limit is {normal_limit}"
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod test {
+ 

@@ -1,0 +1,448 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 41abbaa..2e53285 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -52,3 +52,6 @@ lto = true
+ 
+ [profile.release.package.jotdown_wasm]
+ opt-level = 's'
++
++[dev-dependencies]
++hegeltest = "0.44.1"
+diff --git a/tests/properties.rs b/tests/properties.rs
+new file mode 100644
+index 0000000..589c5cf
+--- /dev/null
++++ b/tests/properties.rs
+@@ -0,0 +1,431 @@
++//! Property-based tests for the jotdown Djot parser, written with hegel
++//! (crate `hegeltest`, imported as `hegel`).
++//!
++//! These focus on oracle-independent structural invariants of the parser and
++//! renderer: no-panic robustness, Start/End event balance, source-span
++//! validity, render determinism, and text preservation. They supplement the
++//! crate's existing AFL fuzz targets (see `tests/afl/src/lib.rs`), whose
++//! `parse`/`html` sanity checks encode the same span/balance invariants for
++//! fuzzer-found inputs; here we drive them from generated Djot-shaped input.
++//!
++//! KNOWN BUG: the block parser recurses once per nested block container, so
++//! deeply nested blockquotes / divs / lists overflow the stack and abort the
++//! process on ~1 KB of untrusted input. See `deep_nesting_stack_overflow`
++//! (ignored) and HEGEL_REPORT.md. The live no-panic properties cap nesting
++//! depth well below the overflow threshold so the suite stays green.
++
++use hegel::generators::{self, Generator};
++use jotdown::{Container, Event, Parser, Render};
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++/// A grab-bag of Djot inline/block fragments. Assembling documents from these
++/// exercises the real syntactic constructs (headings, lists, emphasis, links,
++/// code, tables, divs, spans, footnotes, attributes) rather than only the
++/// arbitrary-text path.
++const FRAGMENTS: &[&str] = &[
++    // headings
++    "# heading\n",
++    "## sub *heading*\n",
++    "###### deep\n",
++    // paragraphs / inline
++    "plain text\n",
++    "some _emphasis_ and *strong*\n",
++    "a `code span` here\n",
++    "super^script^ and sub~script~\n",
++    "a \\* escaped and \\{ brace\n",
++    "smart -- dash --- and ... dots\n",
++    "\"double\" and 'single' quotes\n",
++    // links / spans / images
++    "[link text](https://example.com)\n",
++    "[ref link][ref]\n",
++    "![image](img.png)\n",
++    "a [span]{.cls #id} here\n",
++    "<https://autolink.example>\n",
++    "[^fn] footnote ref\n",
++    "[^fn]: the footnote text\n",
++    "[ref]: https://example.com/ref\n",
++    // attributes
++    "{#id .class key=val}\n",
++    "para with attrs\n{.trailing}\n",
++    // lists
++    "- item one\n",
++    "- item two\n",
++    "1. ordered\n",
++    "2) ordered paren\n",
++    "- [x] task done\n",
++    "- [ ] task todo\n",
++    ": term\n\n  definition\n",
++    // code blocks
++    "```rust\nfn x() {}\n```\n",
++    "~~~\nverbatim\n~~~\n",
++    // blockquote / div / thematic break
++    "> quoted line\n",
++    "::: warning\ncontent\n:::\n",
++    "----\n",
++    // tables
++    "| a | b |\n|---|---|\n| 1 | 2 |\n",
++    "| l | c | r |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n",
++    // raw / math / symbols
++    "`raw`{=html}\n",
++    "$`x^2`\n",
++    "$$`block math`\n",
++    "a :smile: symbol\n",
++    // blank lines and whitespace
++    "\n",
++    "   \n",
++    "\t\n",
++];
++
++/// Draw a Djot-shaped document by concatenating random fragments.
++fn draw_djot_document(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(30));
++    let mut doc = String::new();
++    for _ in 0..n {
++        let frag = tc.draw(generators::sampled_from(FRAGMENTS.to_vec()));
++        doc.push_str(frag);
++    }
++    doc
++}
++
++/// Block-container wrappers that trigger recursion in the block parser.
++/// (prefix per line, or a fenced open/close pair)
++#[derive(Clone, Copy, Debug, hegel::PrettyPrintable)]
++enum Nest {
++    Blockquote, // "> "
++    Div,        // "::: x" ... ":::"
++    List,       // indent + "- "
++    Emphasis,   // "_" ... "_"
++    Span,       // "[" ... "]"
++}
++
++/// Maximum nesting depth exercised by the *live* no-panic tests. Chosen well
++/// below the empirically-measured stack-overflow threshold (blockquote ~450,
++/// div ~470 on a 2 MiB thread stack) so these tests never abort the process.
++/// The actual overflow is pinned by the ignored `deep_nesting_stack_overflow`
++/// reproducer.
++const SAFE_NEST_DEPTH: usize = 120;
++
++/// Build input nested to `depth` in a single construct kind, wrapping `inner`.
++fn nested_input(kind: Nest, depth: usize, inner: &str) -> String {
++    match kind {
++        Nest::Blockquote => {
++            let mut s = "> ".repeat(depth);
++            s.push_str(inner);
++            s.push('\n');
++            s
++        }
++        Nest::Div => {
++            let mut s = String::new();
++            for i in 0..depth {
++                s.push_str(&format!("::: d{i}\n"));
++            }
++            s.push_str(inner);
++            s.push('\n');
++            for _ in 0..depth {
++                s.push_str(":::\n");
++            }
++            s
++        }
++        Nest::List => {
++            let mut s = String::new();
++            for i in 0..depth {
++                s.push_str(&" ".repeat(i * 2));
++                s.push_str("- ");
++                if i + 1 == depth {
++                    s.push_str(inner);
++                }
++                s.push('\n');
++            }
++            s
++        }
++        Nest::Emphasis => format!("{}{inner}{}", "_".repeat(depth), "_".repeat(depth)),
++        Nest::Span => format!("{}{inner}{}", "[".repeat(depth), "]".repeat(depth)),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Property 1: parse never panics on arbitrary text
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn parse_never_panics_arbitrary_text(tc: hegel::TestCase) {
++    let s = tc.draw(generators::text());
++    // Fully consume both iterator forms.
++    let _ = Parser::new(&s).count();
++    let _ = Parser::new(&s).into_offset_iter().count();
++}
++
++// ---------------------------------------------------------------------------
++// Property 2: parse never panics on Djot-shaped input
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn parse_never_panics_djot_shaped(tc: hegel::TestCase) {
++    let doc = draw_djot_document(&tc);
++    tc.note(&format!("doc = {doc:?}"));
++    let _ = Parser::new(&doc).collect::<Vec<_>>();
++    let _ = Parser::new(&doc).into_offset_iter().count();
++}
++
++// ---------------------------------------------------------------------------
++// Property 3: deep nesting up to a safe depth does not abort or hang
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn deep_nesting_bounded_no_abort(tc: hegel::TestCase) {
++    let kind = tc.draw(generators::sampled_from(vec![
++        Nest::Blockquote,
++        Nest::Div,
++        Nest::List,
++        Nest::Emphasis,
++        Nest::Span,
++    ]));
++    let depth = tc.draw(
++        generators::integers::<usize>()
++            .min_value(0)
++            .max_value(SAFE_NEST_DEPTH),
++    );
++    // Bias the engine toward deeper nesting (still capped at SAFE_NEST_DEPTH).
++    tc.target(depth as f64);
++    let src = nested_input(kind, depth, "x");
++
++    // Cap the number of emitted events. A single-construct nesting of depth d
++    // should yield O(d) events; a superlinear blowup (or runaway emission)
++    // would trip this cap and convert an OOM/hang into a falsifiable failure.
++    let cap = 100 * (depth + 1) + 1000;
++    let mut count = 0usize;
++    for _ in Parser::new(&src) {
++        count += 1;
++        assert!(count <= cap, "event count {count} exceeded cap {cap} at depth {depth} kind {kind:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Property 4: Start/End event balance (well-nested, LIFO, matching kinds)
++// ---------------------------------------------------------------------------
++
++fn assert_event_balance(src: &str) {
++    let mut open: Vec<Container> = Vec::new();
++    for event in Parser::new(src) {
++        match event {
++            Event::Start(c, _) => open.push(c),
++            Event::End(c) => {
++                let opened = open.pop().expect("End event with no matching Start");
++                assert_eq!(opened, c, "End does not match most-recent Start (LIFO violation)");
++            }
++            _ => {}
++        }
++    }
++    assert!(open.is_empty(), "unclosed containers remain: {open:?}");
++}
++
++#[hegel::test]
++fn event_balance_arbitrary_text(tc: hegel::TestCase) {
++    let s = tc.draw(generators::text());
++    assert_event_balance(&s);
++}
++
++#[hegel::test]
++fn event_balance_djot_shaped(tc: hegel::TestCase) {
++    let doc = draw_djot_document(&tc);
++    tc.note(&format!("doc = {doc:?}"));
++    assert_event_balance(&doc);
++}
++
++// ---------------------------------------------------------------------------
++// Property 5: source spans are within the input and well-ordered
++// ---------------------------------------------------------------------------
++
++fn assert_spans_valid(src: &str) {
++    // Attributes live outside events, so their whitespace can appear between /
++    // after spans; mirror the AFL target's whitelisting of `{...}` inputs.
++    let whitelist_whitespace = src.contains('{') && src.contains('}');
++    let mut last: (Option<Event>, std::ops::Range<usize>) = (None, 0..0);
++    for (event, range) in Parser::new(src).into_offset_iter() {
++        // range lies within the input and does not split a char boundary
++        assert!(range.start <= range.end, "inverted range {range:?}");
++        assert!(range.end <= src.len(), "range {range:?} past end {}", src.len());
++        let _ = &src[range.clone()]; // panics if not on char boundaries
++
++        // ordering: non-overlapping and in order, with the caption exception
++        // the parser documents (caption event precedes table rows, but its
++        // source is after them).
++        let ordered = last.1.end <= range.start
++            || matches!(
++                last.0,
++                Some(Event::Start(Container::Caption, ..)) | Some(Event::End(Container::Caption))
++            ) && range.end <= last.1.start;
++        assert!(
++            ordered,
++            "span out of order: prev {:?} end {} then {range:?}",
++            last.0, last.1.end
++        );
++        last = (Some(event), range);
++    }
++    // Only whitespace (or attribute braces) may follow the last event.
++    assert!(
++        whitelist_whitespace || src[last.1.end..].chars().all(char::is_whitespace),
++        "non-whitespace after final event: {:?}",
++        &src[last.1.end..]
++    );
++}
++
++#[hegel::test]
++fn spans_valid_arbitrary_text(tc: hegel::TestCase) {
++    let s = tc.draw(generators::text());
++    assert_spans_valid(&s);
++}
++
++#[hegel::test]
++fn spans_valid_djot_shaped(tc: hegel::TestCase) {
++    let doc = draw_djot_document(&tc);
++    tc.note(&format!("doc = {doc:?}"));
++    assert_spans_valid(&doc);
++}
++
++// ---------------------------------------------------------------------------
++// Property 6: HTML rendering never panics and is deterministic
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn html_render_never_panics_and_deterministic(tc: hegel::TestCase) {
++    let doc = draw_djot_document(&tc);
++    tc.note(&format!("doc = {doc:?}"));
++
++    let mut out1 = String::new();
++    jotdown::html::Renderer::default()
++        .push_events(Parser::new(&doc), &mut out1)
++        .unwrap();
++    let mut out2 = String::new();
++    jotdown::html::Renderer::default()
++        .push_events(Parser::new(&doc), &mut out2)
++        .unwrap();
++    assert_eq!(out1, out2, "HTML rendering is not deterministic");
++}
++
++// ---------------------------------------------------------------------------
++// Property 7: the two HTML rendering APIs agree
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn render_apis_agree(tc: hegel::TestCase) {
++    let doc = draw_djot_document(&tc);
++    tc.note(&format!("doc = {doc:?}"));
++
++    let via_helper = jotdown::html::render_to_string(Parser::new(&doc));
++    let mut via_push = String::new();
++    jotdown::html::Renderer::default()
++        .push_events(Parser::new(&doc), &mut via_push)
++        .unwrap();
++    assert_eq!(
++        via_helper, via_push,
++        "render_to_string disagrees with Renderer::push_events"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// Property 8: concatenated Str content is an in-order subsequence of source
++// ---------------------------------------------------------------------------
++
++/// True if every char of `needle` appears in `hay` in order (a subsequence).
++fn is_char_subsequence(needle: &str, hay: &str) -> bool {
++    let mut chars = hay.chars();
++    needle.chars().all(|c| chars.any(|h| h == c))
++}
++
++fn assert_str_subsequence(src: &str) {
++    // Escapes only *remove* the backslash (the escaped char is literal in the
++    // source); entities pass through verbatim; smart punctuation is emitted as
++    // dedicated non-Str events. So every char of every Str event is present,
++    // in order, in the source.
++    let mut collected = String::new();
++    for event in Parser::new(src) {
++        if let Event::Str(s) = event {
++            collected.push_str(&s);
++        }
++    }
++    assert!(
++        is_char_subsequence(&collected, src),
++        "Str content {collected:?} is not a subsequence of source {src:?}"
++    );
++}
++
++#[hegel::test]
++fn str_content_is_subsequence_arbitrary(tc: hegel::TestCase) {
++    let s = tc.draw(generators::text());
++    assert_str_subsequence(&s);
++}
++
++#[hegel::test]
++fn str_content_is_subsequence_djot(tc: hegel::TestCase) {
++    let doc = draw_djot_document(&tc);
++    tc.note(&format!("doc = {doc:?}"));
++    assert_str_subsequence(&doc);
++}
++
++// ---------------------------------------------------------------------------
++// Property 9: attribute parsing is robust
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn attributes_parse_never_panics_arbitrary(tc: hegel::TestCase) {
++    let s = tc.draw(generators::text());
++    // Attributes::try_from should return Err on malformed input, never panic.
++    let _ = jotdown::Attributes::try_from(s.as_str());
++}
++
++/// Draw an attribute-block-shaped string: `{ ... }` with plausible contents.
++fn draw_attr_block(tc: &hegel::TestCase) -> String {
++    let parts: &[&str] = &[
++        ".class", "#id", "key=val", "key=\"quoted val\"", "key='single'",
++        "%comment%", ".a .b", "#x #y", "k1=v1 k2=v2", "", " ", "\n",
++        "key=", "=val", "..", "##", "{nested}", "\"unterminated",
++    ];
++    let n = tc.draw(generators::integers::<usize>().min_value(0).max_value(6));
++    let mut inner = String::new();
++    for i in 0..n {
++        if i > 0 {
++            inner.push(' ');
++        }
++        inner.push_str(tc.draw(generators::sampled_from(parts.to_vec())));
++    }
++    format!("{{{inner}}}")
++}
++
++#[hegel::test]
++fn attributes_parse_never_panics_shaped(tc: hegel::TestCase) {
++    let block = draw_attr_block(&tc);
++    tc.note(&format!("block = {block:?}"));
++    // Standalone attribute parse.
++    let _ = jotdown::Attributes::try_from(block.as_str());
++    // And inline in a document (span/paragraph attributes go through the full
++    // parser + attribute machinery).
++    let doc = format!("text [span]{block} more\n{block}\npara\n");
++    let _ = Parser::new(&doc).collect::<Vec<_>>();
++}
++
++// ---------------------------------------------------------------------------
++// KNOWN BUG (process-aborting): stack overflow on deep block nesting.
++//
++// The block parser recurses once per nested block container. Nesting
++// blockquotes / divs / lists a few hundred levels deep overflows the stack and
++// *aborts the process* (SIGABRT) — it is not a catchable panic, so a live
++// failing test would take the whole suite down with it. Kept ignored.
++//
++// Measured on a 2 MiB thread stack (cargo's default for spawned test threads):
++//   - `> ` blockquote nesting aborts between depth 400 and 500
++//   - `::: ` div nesting aborts between depth 460 and 480
++// Input is tiny and fully attacker-controlled (~1-2 KB), making this an
++// untrusted-input denial-of-service. There is no depth limit in the parser.
++// ---------------------------------------------------------------------------
++
++#[test]
++#[ignore = "KNOWN BUG: stack overflow (SIGABRT) on deep block nesting; aborts the process"]
++fn deep_nesting_stack_overflow() {
++    // Depth 1000 is comfortably past both measured thresholds.
++    let src = "> ".repeat(1000) + "x";
++    let _ = Parser::new(&src).count();
++}

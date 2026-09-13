@@ -1,0 +1,565 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 0cc105a..f6ec4f0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46,6 +46,7 @@ incremental = false
+ # alloc-no-stdlib 3.x live behind its "unsafe" feature (always present on 2.x).
+ # Enable it for tests only; the library itself uses no calloc path.
+ "alloc-no-stdlib" = { version = ">=2.0.4, <3", features = ["unsafe"] }
++hegeltest = "0.44.1"
+ 
+ [features]
+ default = ["std"]
+diff --git a/src/enc/test.rs b/src/enc/test.rs
+index 1870932..e92d35d 100644
+--- a/src/enc/test.rs
++++ b/src/enc/test.rs
+@@ -603,6 +603,535 @@ fn test_compress_into_short_buffer() {
+ 
+     println!("{output_buffer:?}");
+ }
++// ---------------------------------------------------------------------------
++// Property-based tests (hegel)
++//
++// These generate encoder configurations (quality 0-11, lgwin 10-24, lgblock,
++// mode, magic number, ...) and structured payloads (byte runs, repeated
++// chunks, text, arbitrary bytes) and check round-trip and robustness
++// properties across the one-shot, streaming Read/Write adapter, custom
++// dictionary and concatenation APIs.
++// ---------------------------------------------------------------------------
++#[cfg(feature = "std")]
++mod hegel_props {
++    use core::cmp::min;
++    use std::io::{Cursor, Read, Write};
++    use std::string::{String, ToString};
++    use std::vec::Vec;
++
++    use hegel::generators;
++
++    use hegel::Generator;
++
++    use super::super::backward_references::{BrotliEncoderMode, BrotliEncoderParams};
++    use crate::concat::{BroCatli, BroCatliResult};
++    use crate::enc::interface;
++    use crate::enc::reader::StandardAlloc;
++    use crate::enc::BrotliCompress;
++    use crate::{
++        BrotliCompressCustomIoCustomDict, BrotliDecompress, CompressorReader, CompressorWriter,
++        Decompressor, DecompressorWriter, IoReaderWrapper, IoWriterWrapper,
++    };
++
++    /// Compact, Debug-printable encoder configuration so hegel
++    /// counterexamples stay readable. Converted to BrotliEncoderParams
++    /// before use.
++    #[derive(Debug, Clone, hegel::PrettyPrintable)]
++    struct EncCfg {
++        quality: i32,
++        q9_5: bool,
++        lgwin: i32,
++        lgblock: i32,
++        mode: u8,
++        magic_number: bool,
++        use_size_hint: bool,
++        disable_literal_context_modeling: bool,
++    }
++
++    impl EncCfg {
++        fn to_params(&self, input_len: usize) -> BrotliEncoderParams {
++            let mut p = BrotliEncoderParams::default();
++            p.quality = self.quality;
++            p.q9_5 = self.q9_5;
++            p.lgwin = self.lgwin;
++            p.lgblock = self.lgblock;
++            p.mode = match self.mode {
++                0 => BrotliEncoderMode::BROTLI_MODE_GENERIC,
++                1 => BrotliEncoderMode::BROTLI_MODE_TEXT,
++                _ => BrotliEncoderMode::BROTLI_MODE_FONT,
++            };
++            p.magic_number = self.magic_number;
++            if self.use_size_hint {
++                p.size_hint = input_len;
++            }
++            p.disable_literal_context_modeling = self.disable_literal_context_modeling as i32;
++            p
++        }
++    }
++
++    /// Arbitrary valid encoder configuration, per the documented parameter
++    /// ranges (quality 0-11, lgwin 10-24, lgblock 0=auto or 16-24).
++    #[hegel::composite]
++    fn enc_cfgs(tc: &hegel::TestCase) -> EncCfg {
++        let quality = tc.draw(generators::integers::<i32>().min_value(0).max_value(11));
++        let q9_5 = quality >= 10 && tc.draw(generators::booleans());
++        let lgwin = tc.draw(generators::integers::<i32>().min_value(10).max_value(24));
++        let lgblock = if tc.draw(generators::booleans()) {
++            0 // auto
++        } else {
++            tc.draw(generators::integers::<i32>().min_value(16).max_value(24))
++        };
++        EncCfg {
++            quality,
++            q9_5,
++            lgwin,
++            lgblock,
++            mode: tc.draw(generators::integers::<u8>().max_value(2)),
++            magic_number: tc.draw(generators::booleans()),
++            use_size_hint: tc.draw(generators::booleans()),
++            disable_literal_context_modeling: tc.draw(generators::booleans()),
++        }
++    }
++
++    /// Structured payloads: mixes of single-byte runs, repeated chunks
++    /// (LZ back-reference food), unicode-ish text and arbitrary bytes.
++    /// Sizes are bounded (~12KiB max) to keep quality-11 compression fast
++    /// in the test - this protects the test's time budget, not the
++    /// library's contract.
++    #[hegel::composite]
++    fn payloads(tc: &hegel::TestCase) -> Vec<u8> {
++        let n_pieces = tc.draw(generators::integers::<usize>().max_value(6));
++        let mut out = Vec::new();
++        for _ in 0..n_pieces {
++            match tc.draw(generators::integers::<u8>().max_value(3)) {
++                0 => {
++                    // run of a single byte
++                    let b = tc.draw(generators::integers::<u8>());
++                    let len = tc.draw(generators::integers::<usize>().max_value(2048));
++                    out.resize(out.len() + len, b);
++                }
++                1 => {
++                    // repeated chunk
++                    let chunk: Vec<u8> = tc.draw(generators::binary().min_size(1).max_size(32));
++                    let reps = tc.draw(generators::integers::<usize>().max_value(128));
++                    for _ in 0..reps {
++                        out.extend_from_slice(&chunk);
++                    }
++                }
++                2 => {
++                    // text
++                    let s: String = tc.draw(generators::text().max_size(512));
++                    out.extend_from_slice(s.as_bytes());
++                }
++                _ => {
++                    // arbitrary bytes (incompressible-ish)
++                    let b: Vec<u8> = tc.draw(generators::binary().max_size(512));
++                    out.extend_from_slice(&b);
++                }
++            }
++        }
++        out
++    }
++
++    fn compress_oneshot(input: &[u8], params: &BrotliEncoderParams) -> Vec<u8> {
++        let mut out = Vec::new();
++        BrotliCompress(&mut Cursor::new(input), &mut out, params).expect("compression failed");
++        out
++    }
++
++    fn decompress_oneshot(compressed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
++        let mut out = Vec::new();
++        BrotliDecompress(&mut Cursor::new(compressed), &mut out).map(|_| out)
++    }
++
++    /// A schedule of chunk sizes for feeding streaming APIs. Drawn up front
++    /// (bounded) and cycled, so shrinking stays effective.
++    fn draw_chunk_schedule(tc: &hegel::TestCase, max_chunk: usize) -> Vec<usize> {
++        tc.draw(
++            generators::vecs(
++                generators::integers::<usize>()
++                    .min_value(1)
++                    .max_value(max_chunk),
++            )
++            .min_size(1)
++            .max_size(8),
++        )
++    }
++
++    // Property: one-shot compress -> decompress is the identity for every
++    // valid encoder configuration.
++    #[hegel::test]
++    fn test_hegel_oneshot_roundtrip(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let compressed = compress_oneshot(&input, &cfg.to_params(input.len()));
++        let roundtrip = decompress_oneshot(&compressed).expect("decompression failed");
++        assert_eq!(roundtrip, input);
++    }
++
++    // Property: CompressorWriter with arbitrary internal buffer size,
++    // write-chunking and intermediate flushes still produces a valid stream
++    // that decodes to the input.
++    #[hegel::test]
++    fn test_hegel_compressor_writer_streaming_roundtrip(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let buffer_size = tc.draw(generators::integers::<usize>().min_value(1).max_value(8192));
++        let chunks = draw_chunk_schedule(&tc, 1024);
++        let flushes: Vec<bool> = tc.draw(
++            generators::vecs(generators::booleans())
++                .min_size(1)
++                .max_size(8),
++        );
++        let params = cfg.to_params(input.len());
++
++        let mut writer = CompressorWriter::with_params(Vec::<u8>::new(), buffer_size, &params);
++        let mut offset = 0usize;
++        let mut step = 0usize;
++        while offset < input.len() {
++            let n = min(chunks[step % chunks.len()], input.len() - offset);
++            writer.write_all(&input[offset..offset + n]).unwrap();
++            if flushes[step % flushes.len()] {
++                writer.flush().unwrap();
++            }
++            offset += n;
++            step += 1;
++        }
++        let compressed = writer.into_inner();
++        let roundtrip = decompress_oneshot(&compressed).expect("decompression failed");
++        assert_eq!(roundtrip, input);
++    }
++
++    // Property: CompressorReader (Read adapter) with arbitrary internal
++    // buffer size and read granularity produces a valid stream that decodes
++    // to the input.
++    #[hegel::test]
++    fn test_hegel_compressor_reader_streaming_roundtrip(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let buffer_size = tc.draw(generators::integers::<usize>().min_value(1).max_value(8192));
++        let chunks = draw_chunk_schedule(&tc, 1024);
++        let params = cfg.to_params(input.len());
++
++        let mut reader = CompressorReader::with_params(Cursor::new(input.clone()), buffer_size, &params);
++        let mut compressed = Vec::new();
++        let mut step = 0usize;
++        loop {
++            let want = chunks[step % chunks.len()];
++            let start = compressed.len();
++            compressed.resize(start + want, 0);
++            let got = reader.read(&mut compressed[start..]).unwrap();
++            compressed.truncate(start + got);
++            if got == 0 {
++                break;
++            }
++            step += 1;
++        }
++        let roundtrip = decompress_oneshot(&compressed).expect("decompression failed");
++        assert_eq!(roundtrip, input);
++    }
++
++    // Property: the Decompressor Read adapter, driven with arbitrary
++    // internal buffer size and read granularity, agrees with the one-shot
++    // decompressor.
++    #[hegel::test]
++    fn test_hegel_decompressor_reader_matches_oneshot(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let buffer_size = tc.draw(generators::integers::<usize>().min_value(1).max_value(8192));
++        let chunks = draw_chunk_schedule(&tc, 1024);
++        let compressed = compress_oneshot(&input, &cfg.to_params(input.len()));
++
++        let oneshot = decompress_oneshot(&compressed).expect("decompression failed");
++
++        let mut reader = Decompressor::new(Cursor::new(compressed), buffer_size);
++        let mut streamed = Vec::new();
++        let mut step = 0usize;
++        loop {
++            let want = chunks[step % chunks.len()];
++            let start = streamed.len();
++            streamed.resize(start + want, 0);
++            let got = reader.read(&mut streamed[start..]).unwrap();
++            streamed.truncate(start + got);
++            if got == 0 {
++                break;
++            }
++            step += 1;
++        }
++        assert_eq!(streamed, oneshot);
++        assert_eq!(streamed, input);
++    }
++
++    // Property: DecompressorWriter fed a valid stream in arbitrary write
++    // chunks reconstructs the input.
++    #[hegel::test]
++    fn test_hegel_decompressor_writer_streaming_roundtrip(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let buffer_size = tc.draw(generators::integers::<usize>().min_value(1).max_value(8192));
++        let chunks = draw_chunk_schedule(&tc, 1024);
++        let compressed = compress_oneshot(&input, &cfg.to_params(input.len()));
++
++        let mut writer = DecompressorWriter::new(Vec::<u8>::new(), buffer_size);
++        let mut offset = 0usize;
++        let mut step = 0usize;
++        while offset < compressed.len() {
++            let n = min(chunks[step % chunks.len()], compressed.len() - offset);
++            writer.write_all(&compressed[offset..offset + n]).unwrap();
++            offset += n;
++            step += 1;
++        }
++        let roundtrip = writer
++            .into_inner()
++            .expect("valid stream should close cleanly");
++        assert_eq!(roundtrip, input);
++    }
++
++    // Property: decompressing arbitrary bytes returns an error or data but
++    // never panics, both through the one-shot API and the Read adapter.
++    #[hegel::test]
++    fn test_hegel_decompress_arbitrary_bytes_never_panics(tc: hegel::TestCase) {
++        let garbage: Vec<u8> = tc.draw(generators::binary().max_size(2048));
++        drop(decompress_oneshot(&garbage));
++
++        let mut reader = Decompressor::new(Cursor::new(garbage), 4096);
++        let mut sink = Vec::new();
++        drop(reader.read_to_end(&mut sink));
++    }
++
++    // Property: a strict prefix of a valid stream never decompresses
++    // successfully (the terminating ISLAST metablock cannot be complete),
++    // and never panics.
++    #[hegel::test]
++    fn test_hegel_truncated_stream_errors(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let compressed = compress_oneshot(&input, &cfg.to_params(input.len()));
++        assert!(!compressed.is_empty());
++        let cut = tc.draw(
++            generators::integers::<usize>()
++                .min_value(0)
++                .max_value(compressed.len() - 1),
++        );
++        let result = decompress_oneshot(&compressed[..cut]);
++        assert!(
++            result.is_err(),
++            "truncated stream (cut at {} of {}) decompressed successfully",
++            cut,
++            compressed.len()
++        );
++    }
++
++    // Property: decompressing a valid stream with a single flipped bit may
++    // succeed or fail (brotli has no integrity check) but must never panic.
++    #[hegel::test]
++    fn test_hegel_bitflip_never_panics(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let input: Vec<u8> = tc.draw(payloads());
++        let mut compressed = compress_oneshot(&input, &cfg.to_params(input.len()));
++        assert!(!compressed.is_empty());
++        let byte = tc.draw(
++            generators::integers::<usize>()
++                .min_value(0)
++                .max_value(compressed.len() - 1),
++        );
++        let bit = tc.draw(generators::integers::<u8>().max_value(7));
++        compressed[byte] ^= 1 << bit;
++        drop(decompress_oneshot(&compressed));
++    }
++
++    /// Payload that shares material with the dictionary, so dictionary
++    /// back-references actually get exercised.
++    #[hegel::composite]
++    fn dict_payloads(tc: &hegel::TestCase, dict: Vec<u8>) -> Vec<u8> {
++        let n_pieces = tc.draw(generators::integers::<usize>().max_value(6));
++        let mut out = Vec::new();
++        for _ in 0..n_pieces {
++            if !dict.is_empty() && tc.draw(generators::booleans()) {
++                // slice of the dictionary
++                let start = tc.draw(
++                    generators::integers::<usize>()
++                        .min_value(0)
++                        .max_value(dict.len() - 1),
++                );
++                let len = tc.draw(
++                    generators::integers::<usize>()
++                        .min_value(1)
++                        .max_value(dict.len() - start),
++                );
++                out.extend_from_slice(&dict[start..start + len]);
++            } else {
++                let b: Vec<u8> = tc.draw(generators::binary().max_size(256));
++                out.extend_from_slice(&b);
++            }
++        }
++        out
++    }
++
++    // Property: compressing with a custom dictionary and decompressing with
++    // the same dictionary is the identity.
++    #[hegel::test]
++    fn test_hegel_custom_dictionary_roundtrip(tc: hegel::TestCase) {
++        let cfg = tc.draw((enc_cfgs()).print_as_debug());
++        let dict: Vec<u8> = tc.draw(generators::binary().max_size(1024));
++        let input: Vec<u8> = tc.draw(dict_payloads(dict.clone()));
++        let params = cfg.to_params(input.len());
++
++        let mut compressed = Vec::new();
++        {
++            let mut input_buffer = [0u8; 4096];
++            let mut output_buffer = [0u8; 4096];
++            let mut nop_callback =
++                |_data: &mut interface::PredictionModeContextMap<interface::InputReferenceMut>,
++                 _cmds: &mut [interface::StaticCommand],
++                 _mb: interface::InputPair,
++                 _mfv: &mut StandardAlloc| ();
++            BrotliCompressCustomIoCustomDict(
++                &mut IoReaderWrapper(&mut Cursor::new(&input)),
++                &mut IoWriterWrapper(&mut compressed),
++                &mut input_buffer[..],
++                &mut output_buffer[..],
++                &params,
++                StandardAlloc::default(),
++                &mut nop_callback,
++                &dict,
++                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected EOF"),
++            )
++            .expect("compression with custom dictionary failed");
++        }
++
++        let mut roundtrip = Vec::new();
++        {
++            let mut input_buffer = [0u8; 4096];
++            let mut output_buffer = [0u8; 4096];
++            brotli_decompressor::BrotliDecompressCustomDict(
++                &mut Cursor::new(&compressed),
++                &mut roundtrip,
++                &mut input_buffer[..],
++                &mut output_buffer[..],
++                dict.clone(),
++            )
++            .expect("decompression with custom dictionary failed");
++        }
++        assert_eq!(roundtrip, input);
++    }
++
++    fn brocatli_concat_impl(mut cat: BroCatli, streams: &[Vec<u8>], out_buf_size: usize) -> Vec<u8> {
++        let mut result = Vec::new();
++        let mut obuf = vec![0u8; out_buf_size];
++        for s in streams.iter() {
++            cat.new_brotli_file();
++            let mut ioffset = 0usize;
++            loop {
++                let mut ooffset = 0usize;
++                match cat.stream(&s[..], &mut ioffset, &mut obuf[..], &mut ooffset) {
++                    BroCatliResult::NeedsMoreOutput => {
++                        result.extend_from_slice(&obuf[..ooffset]);
++                    }
++                    BroCatliResult::NeedsMoreInput => {
++                        result.extend_from_slice(&obuf[..ooffset]);
++                        break;
++                    }
++                    other => panic!("unexpected BroCatli stream result: {:?}", other),
++                }
++            }
++        }
++        loop {
++            let mut ooffset = 0usize;
++            match cat.finish(&mut obuf[..], &mut ooffset) {
++                BroCatliResult::NeedsMoreOutput => {
++                    result.extend_from_slice(&obuf[..ooffset]);
++                }
++                BroCatliResult::Success => {
++                    result.extend_from_slice(&obuf[..ooffset]);
++                    break;
++                }
++                other => panic!("unexpected BroCatli finish result: {:?}", other),
++            }
++        }
++        result
++    }
++
++    fn brocatli_concat(streams: &[Vec<u8>], out_buf_size: usize) -> Vec<u8> {
++        brocatli_concat_impl(BroCatli::new(), streams, out_buf_size)
++    }
++
++    // KNOWN FAILURE: BroCatli emits a non-decodable stream (while reporting
++    // Success) when an *empty* catable brotli stream is appended after a
++    // stream whose final bytes have a particular bit alignment. Minimal
++    // reproduction found by hegel: the quality-1 encoding of the 22 bytes
++    // b"000100...0" (ends 0xA1 0x01) followed by the empty catable stream
++    // [0xA1, 0x01]. BroCatli's output replaces the trailing [0xA1, 0x01]
++    // with [0x21, 0x80, 0x80], which fails to decompress (UnexpectedEof).
++    // Other first-stream qualities (0, 2, 5) and non-empty second streams
++    // concatenate fine, so this is a bit-surgery edge case in
++    // src/concat/mod.rs. This test is expected to FAIL until the bug is
++    // fixed; test_hegel_brocatli_concat_roundtrip excludes empty payloads
++    // so it can keep covering everything else.
++    #[test]
++    fn test_brocatli_empty_stream_after_q1_stream_known_failure() {
++        let mut input = vec![b'0'; 22];
++        input[3] = b'1';
++        let compress_catable = |q: i32, inp: &[u8]| {
++            let mut params = BrotliEncoderParams::default();
++            params.quality = q;
++            params.lgwin = 10;
++            params.catable = true;
++            params.use_dictionary = false;
++            params.appendable = false;
++            compress_oneshot(inp, &params)
++        };
++        let streams = [compress_catable(1, &input), compress_catable(5, &[])];
++        // both inputs are individually valid catable streams:
++        assert_eq!(decompress_oneshot(&streams[0]).unwrap(), input);
++        assert_eq!(decompress_oneshot(&streams[1]).unwrap(), Vec::<u8>::new());
++        let concatenated = brocatli_concat(&streams, 4096);
++        let roundtrip = decompress_oneshot(&concatenated)
++            .expect("BroCatli produced a stream that fails to decompress");
++        assert_eq!(roundtrip, input);
++    }
++
++    // Property: streams compressed as catable can be concatenated with
++    // BroCatli and the result decompresses to the concatenation of the
++    // payloads.
++    //
++    // The BroCatli window size is pinned to the maximum (24) because the
++    // encoder silently raises the effective window to >= 18 for qualities
++    // 0 and 1, so with an inferred window a later stream can legitimately
++    // fail with WindowSizeLargerThanPreviousFile even when every stream was
++    // requested with the same lgwin.
++    //
++    // Empty payloads are excluded: appending an empty catable stream can
++    // produce a non-decodable result - a real bug pinned by
++    // test_brocatli_empty_stream_after_q1_stream_known_failure above.
++    #[hegel::test]
++    fn test_hegel_brocatli_concat_roundtrip(tc: hegel::TestCase) {
++        let n_streams = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++        let out_buf_size = tc.draw(generators::integers::<usize>().min_value(1).max_value(4096));
++        let mut expected = Vec::new();
++        let mut streams = Vec::new();
++        for _ in 0..n_streams {
++            let cfg = tc.draw(enc_cfgs());
++            let mut input: Vec<u8> = tc.draw(payloads());
++            if input.is_empty() {
++                // exclude the known-buggy empty-stream shape (see above)
++                input.push(tc.draw(generators::integers::<u8>()));
++            }
++            let mut params = cfg.to_params(input.len());
++            params.catable = true;
++            params.use_dictionary = false;
++            params.appendable = false;
++            params.magic_number = false;
++            streams.push(compress_oneshot(&input, &params));
++            expected.extend_from_slice(&input);
++        }
++        let concatenated =
++            brocatli_concat_impl(BroCatli::new_with_window_size(24), &streams, out_buf_size);
++        let roundtrip = decompress_oneshot(&concatenated).expect("decompression failed");
++        assert_eq!(roundtrip, expected);
++    }
++}
++
+ /*
+ 
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index ed0cae3..12e4721 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,6 +19,8 @@ extern crate alloc_no_stdlib as alloc;
+ #[cfg(feature = "std")]
+ extern crate alloc_stdlib;
+ extern crate brotli_decompressor;
++#[cfg(test)]
++extern crate hegel;
+ 
+ pub mod concat;
+ pub mod enc;

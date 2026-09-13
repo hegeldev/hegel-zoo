@@ -1,0 +1,550 @@
+diff --git a/chalk-ir/Cargo.toml b/chalk-ir/Cargo.toml
+index 018047ea..980c3aac 100644
+--- a/chalk-ir/Cargo.toml
++++ b/chalk-ir/Cargo.toml
+@@ -12,3 +12,7 @@ edition = "2018"
+ [dependencies]
+ bitflags = "2.4.1"
+ chalk-derive = { version = "0.105.0-dev.0", path = "../chalk-derive" }
++
++[dev-dependencies]
++chalk-integration = { path = "../chalk-integration" }
++hegeltest = "0.44.1"
+diff --git a/chalk-ir/tests/hegel_properties.rs b/chalk-ir/tests/hegel_properties.rs
+new file mode 100644
+index 00000000..bec7ad94
+--- /dev/null
++++ b/chalk-ir/tests/hegel_properties.rs
+@@ -0,0 +1,532 @@
++//! Property-based tests (using hegel) for chalk-ir's core term algebra:
++//! folding, de Bruijn index shifting, and substitution.
++//!
++//! These tests use the `ChalkIr` interner from `chalk-integration` (the same
++//! interner the rest of the workspace tests with) and generate random IR
++//! terms -- types, lifetimes and consts, including terms with binders
++//! (`TyKind::Function`) and free bound variables.
++
++use chalk_integration::interner::{ChalkFnAbi, ChalkIr, RawId};
++use chalk_ir::cast::Cast;
++use chalk_ir::could_match::CouldMatch;
++use chalk_ir::fold::shift::Shift;
++use chalk_ir::fold::{FallibleTypeFolder, Subst, TypeFoldable};
++use chalk_ir::*;
++
++use hegel::generators::{self, Generator};
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++/// Configuration for term generation.
++#[derive(Copy, Clone, Debug)]
++struct TermCfg {
++    /// When true, the only bound variables generated are `TyKind::BoundVar`s
++    /// that refer to the *top-level* binder of the term (i.e. the binder a
++    /// substitution would eliminate), with `index < n_params`. No bound
++    /// lifetimes or bound consts are generated. This is the input domain of
++    /// `SubstFolder` (`Substitution::apply`), which asserts that every free
++    /// variable lives at the innermost binder.
++    ///
++    /// With `n_params == 0` this generates fully closed terms (no free bound
++    /// variables at all).
++    innermost_ty_only: bool,
++    n_params: usize,
++}
++
++const ANY: TermCfg = TermCfg {
++    innermost_ty_only: false,
++    n_params: 0,
++};
++
++/// Fully closed terms: no free bound variables anywhere.
++const CLOSED: TermCfg = TermCfg {
++    innermost_ty_only: true,
++    n_params: 0,
++};
++
++fn scalars() -> Vec<Scalar> {
++    vec![
++        Scalar::Bool,
++        Scalar::Char,
++        Scalar::Int(IntTy::I32),
++        Scalar::Uint(UintTy::U8),
++        Scalar::Float(FloatTy::F64),
++    ]
++}
++
++fn arb_ty(
++    cfg: TermCfg,
++    budget: u32,
++    nesting: u32,
++) -> generators::BoxedGenerator<'static, Ty<ChalkIr>> {
++    hegel::compose!(|tc| {
++        let max_choice = if budget == 0 { 7u8 } else { 14u8 };
++        let choice = tc.draw(generators::integers::<u8>().max_value(max_choice));
++        match choice {
++            0 => TyKind::Scalar(tc.draw((generators::sampled_from(scalars())).print_as_debug())).intern(ChalkIr),
++            1 => TyKind::Str.intern(ChalkIr),
++            2 => TyKind::Never.intern(ChalkIr),
++            3 => TyKind::Error.intern(ChalkIr),
++            4 => {
++                // Bound variable.
++                if cfg.innermost_ty_only {
++                    if cfg.n_params == 0 {
++                        // Closed-term mode: no bound vars at all.
++                        TyKind::Scalar(Scalar::Bool).intern(ChalkIr)
++                    } else {
++                        let index = tc.draw(
++                            generators::integers::<usize>().max_value(cfg.n_params - 1),
++                        );
++                        TyKind::BoundVar(BoundVar::new(DebruijnIndex::new(nesting), index))
++                            .intern(ChalkIr)
++                    }
++                } else {
++                    // NOTE: depth kept modest here; huge depths overflow in
++                    // `DebruijnIndex::shifted_in_from`, which is pinned by the
++                    // KNOWN FAILURE test `debruijn_shift_overflows_at_boundary`.
++                    let debruijn = tc.draw(generators::integers::<u32>().max_value(4));
++                    let index = tc.draw(generators::integers::<usize>().max_value(4));
++                    TyKind::BoundVar(BoundVar::new(DebruijnIndex::new(debruijn), index))
++                        .intern(ChalkIr)
++                }
++            }
++            5 => {
++                let var = InferenceVar::from(tc.draw(generators::integers::<u32>().max_value(5)));
++                let kind = tc.draw((generators::sampled_from(vec![
++                    TyVariableKind::General,
++                    TyVariableKind::Integer,
++                    TyVariableKind::Float,
++                ])).print_as_debug());
++                TyKind::InferenceVar(var, kind).intern(ChalkIr)
++            }
++            6 => TyKind::Placeholder(tc.draw((arb_placeholder()).print_as_debug())).intern(ChalkIr),
++            7 => TyKind::Foreign(ForeignDefId(RawId {
++                index: tc.draw(generators::integers::<u32>().max_value(3)),
++            }))
++            .intern(ChalkIr),
++            8 => TyKind::Slice(tc.draw((arb_ty(cfg, budget - 1, nesting)).print_as_debug())).intern(ChalkIr),
++            9 => TyKind::Raw(
++                tc.draw((arb_mutability()).print_as_debug()),
++                tc.draw((arb_ty(cfg, budget - 1, nesting)).print_as_debug()),
++            )
++            .intern(ChalkIr),
++            10 => TyKind::Ref(
++                tc.draw((arb_mutability()).print_as_debug()),
++                tc.draw((arb_lifetime(cfg, nesting)).print_as_debug()),
++                tc.draw((arb_ty(cfg, budget - 1, nesting)).print_as_debug()),
++            )
++            .intern(ChalkIr),
++            11 => TyKind::Array(
++                tc.draw((arb_ty(cfg, budget - 1, nesting)).print_as_debug()),
++                tc.draw((arb_const(cfg, nesting)).print_as_debug()),
++            )
++            .intern(ChalkIr),
++            12 => {
++                let arity = tc.draw(generators::integers::<usize>().max_value(3));
++                let tys: Vec<Ty<ChalkIr>> = (0..arity)
++                    .map(|_| tc.draw((arb_ty(cfg, budget - 1, nesting)).print_as_debug()))
++                    .collect();
++                TyKind::Tuple(arity, Substitution::from_iter(ChalkIr, tys)).intern(ChalkIr)
++            }
++            13 => {
++                let adt_id = AdtId(RawId {
++                    index: tc.draw(generators::integers::<u32>().max_value(2)),
++                });
++                let arity = tc.draw(generators::integers::<usize>().max_value(3));
++                let args: Vec<GenericArg<ChalkIr>> = (0..arity)
++                    .map(|_| tc.draw((arb_generic_arg(cfg, budget - 1, nesting)).print_as_debug()))
++                    .collect();
++                TyKind::Adt(adt_id, Substitution::from_iter(ChalkIr, args)).intern(ChalkIr)
++            }
++            _ => {
++                // Function pointer: introduces one level of binders.
++                let num_binders = tc.draw(generators::integers::<usize>().max_value(2));
++                let arity = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++                let args: Vec<Ty<ChalkIr>> = (0..arity)
++                    .map(|_| tc.draw((arb_ty(cfg, budget - 1, nesting + 1)).print_as_debug()))
++                    .collect();
++                TyKind::Function(FnPointer {
++                    num_binders,
++                    sig: FnSig {
++                        abi: ChalkFnAbi::Rust,
++                        safety: Safety::Safe,
++                        variadic: false,
++                    },
++                    substitution: FnSubst(Substitution::from_iter(ChalkIr, args)),
++                })
++                .intern(ChalkIr)
++            }
++        }
++    })
++    .boxed()
++}
++
++fn arb_placeholder() -> generators::BoxedGenerator<'static, PlaceholderIndex> {
++    hegel::compose!(|tc| {
++        PlaceholderIndex {
++            ui: UniverseIndex {
++                counter: tc.draw(generators::integers::<usize>().max_value(3)),
++            },
++            idx: tc.draw(generators::integers::<usize>().max_value(3)),
++        }
++    })
++    .boxed()
++}
++
++fn arb_mutability() -> generators::BoxedGenerator<'static, Mutability> {
++    generators::sampled_from(vec![Mutability::Not, Mutability::Mut]).boxed()
++}
++
++fn arb_lifetime(
++    cfg: TermCfg,
++    _nesting: u32,
++) -> generators::BoxedGenerator<'static, Lifetime<ChalkIr>> {
++    hegel::compose!(|tc| {
++        let choice = tc.draw(generators::integers::<u8>().max_value(4));
++        match choice {
++            0 => LifetimeData::<ChalkIr>::Static.intern(ChalkIr),
++            1 => LifetimeData::<ChalkIr>::Erased.intern(ChalkIr),
++            2 => LifetimeData::<ChalkIr>::InferenceVar(InferenceVar::from(
++                tc.draw(generators::integers::<u32>().max_value(5)),
++            ))
++            .intern(ChalkIr),
++            3 => LifetimeData::<ChalkIr>::Placeholder(tc.draw((arb_placeholder()).print_as_debug())).intern(ChalkIr),
++            _ => {
++                if cfg.innermost_ty_only {
++                    // No bound lifetimes in innermost-ty-only mode.
++                    LifetimeData::<ChalkIr>::Static.intern(ChalkIr)
++                } else {
++                    let debruijn = tc.draw(generators::integers::<u32>().max_value(4));
++                    let index = tc.draw(generators::integers::<usize>().max_value(4));
++                    LifetimeData::<ChalkIr>::BoundVar(BoundVar::new(
++                        DebruijnIndex::new(debruijn),
++                        index,
++                    ))
++                    .intern(ChalkIr)
++                }
++            }
++        }
++    })
++    .boxed()
++}
++
++fn arb_const(cfg: TermCfg, nesting: u32) -> generators::BoxedGenerator<'static, Const<ChalkIr>> {
++    hegel::compose!(|tc| {
++        // The const's type is kept shallow (budget 0) to bound recursion, and
++        // *closed* (no bound variables): chalk-ir treats "const types don't
++        // have free variables" as an invariant (see the comments in
++        // `Shifter::fold_free_var_const`, chalk-ir/src/fold/shift.rs).
++        // Generating a bound variable inside a const's type exposes a
++        // fold/visit asymmetry -- `Const::try_super_fold_with` folds the
++        // `ty` field but `Const::super_visit_with` never visits it -- which
++        // makes `needs_shift` disagree with the shift folder on such
++        // (invalid) terms.
++        let ty = tc.draw((arb_ty(CLOSED, 0, nesting)).print_as_debug());
++        let choice = tc.draw(generators::integers::<u8>().max_value(3));
++        let value = match choice {
++            0 => ConstValue::Concrete(ConcreteConst {
++                interned: tc.draw(generators::integers::<u32>()),
++            }),
++            1 => ConstValue::InferenceVar(InferenceVar::from(
++                tc.draw(generators::integers::<u32>().max_value(5)),
++            )),
++            2 => ConstValue::Placeholder(tc.draw((arb_placeholder()).print_as_debug())),
++            _ => {
++                if cfg.innermost_ty_only {
++                    ConstValue::Concrete(ConcreteConst { interned: 0 })
++                } else {
++                    let debruijn = tc.draw(generators::integers::<u32>().max_value(4));
++                    let index = tc.draw(generators::integers::<usize>().max_value(4));
++                    ConstValue::BoundVar(BoundVar::new(DebruijnIndex::new(debruijn), index))
++                }
++            }
++        };
++        ConstData { ty, value }.intern(ChalkIr)
++    })
++    .boxed()
++}
++
++fn arb_generic_arg(
++    cfg: TermCfg,
++    budget: u32,
++    nesting: u32,
++) -> generators::BoxedGenerator<'static, GenericArg<ChalkIr>> {
++    hegel::compose!(|tc| {
++        let choice = tc.draw(generators::integers::<u8>().max_value(2));
++        match choice {
++            0 => GenericArgData::Ty(tc.draw((arb_ty(cfg, budget, nesting)).print_as_debug())).intern(ChalkIr),
++            1 => GenericArgData::Lifetime(tc.draw((arb_lifetime(cfg, nesting)).print_as_debug())).intern(ChalkIr),
++            _ => GenericArgData::Const(tc.draw((arb_const(cfg, nesting)).print_as_debug())).intern(ChalkIr),
++        }
++    })
++    .boxed()
++}
++
++/// Draws a type with the standard recursion budget.
++fn draw_ty(tc: &hegel::TestCase, cfg: TermCfg) -> Ty<ChalkIr> {
++    let budget = tc.draw(generators::integers::<u32>().max_value(4));
++    tc.draw((arb_ty(cfg, budget, 0)).print_as_debug())
++}
++
++// ---------------------------------------------------------------------------
++// Identity fold
++// ---------------------------------------------------------------------------
++
++/// A folder that overrides nothing: every default callback should
++/// reconstruct the term exactly.
++struct IdentityFolder;
++
++impl FallibleTypeFolder<ChalkIr> for IdentityFolder {
++    type Error = std::convert::Infallible;
++
++    fn as_dyn(&mut self) -> &mut dyn FallibleTypeFolder<ChalkIr, Error = Self::Error> {
++        self
++    }
++
++    fn interner(&self) -> ChalkIr {
++        ChalkIr
++    }
++}
++
++/// Folding a term with a do-nothing folder is the identity. The default
++/// `try_super_fold_with` impls destructure and re-intern every `TyKind`
++/// variant, so any variant whose fields are dropped, reordered, or
++/// re-adjusted incorrectly would fail this.
++#[hegel::test]
++fn identity_fold_is_identity(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    let folded = ty
++        .clone()
++        .try_fold_with(&mut IdentityFolder, DebruijnIndex::INNERMOST)
++        .unwrap();
++    assert_eq!(folded, ty);
++}
++
++// ---------------------------------------------------------------------------
++// Shifting
++// ---------------------------------------------------------------------------
++
++/// `shifted_in_from(n)` followed by `shifted_out_to(n)` is the identity on
++/// whole terms (documented inverse relationship in `fold/shift.rs`).
++#[hegel::test]
++fn shift_in_then_out_is_identity(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    let n = tc.draw(generators::integers::<u32>().max_value(3));
++    let binder = DebruijnIndex::new(n);
++    let shifted = ty.clone().shifted_in_from(ChalkIr, binder);
++    let back = shifted
++        .shifted_out_to(ChalkIr, binder)
++        .expect("shifting out exactly what was shifted in cannot fail");
++    assert_eq!(back, ty);
++}
++
++/// If `shifted_out` succeeds, `shifted_in` restores the original term:
++/// success means no variable was bound by the eliminated level, so the
++/// downshift is invertible.
++#[hegel::test]
++fn shift_out_then_in_is_identity(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    if let Ok(out) = ty.clone().shifted_out(ChalkIr) {
++        assert_eq!(out.shifted_in(ChalkIr), ty);
++    }
++}
++
++/// `needs_shift` (implemented via the *visitor* free-variable search) agrees
++/// exactly with whether shifting (implemented via the *folder*) actually
++/// changes the term. This cross-checks the visit and fold implementations
++/// of "free variable" against each other.
++#[hegel::test]
++fn needs_shift_iff_shift_changes_term(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    let changed = ty.clone().shifted_in(ChalkIr) != ty;
++    assert_eq!(ty.needs_shift(ChalkIr), changed);
++}
++
++// ---------------------------------------------------------------------------
++// DebruijnIndex / BoundVar algebra (pure, no interner)
++// ---------------------------------------------------------------------------
++
++/// `BoundVar::shifted_in_from(o)` then `shifted_out_to(o)` round-trips.
++/// Depths are capped at 2^16 here because the unchecked arithmetic in
++/// `DebruijnIndex::shifted_in_from` overflows near `u32::MAX`; that bug is
++/// pinned by the KNOWN FAILURE test `debruijn_shift_overflows_at_boundary`.
++#[hegel::test]
++fn bound_var_shift_roundtrip(tc: hegel::TestCase) {
++    let depth = tc.draw(generators::integers::<u32>().max_value(1 << 16));
++    let index = tc.draw(generators::integers::<usize>());
++    let outer = tc.draw(generators::integers::<u32>().max_value(1 << 16));
++    let bv = BoundVar::new(DebruijnIndex::new(depth), index);
++    let outer = DebruijnIndex::new(outer);
++    let roundtripped = bv.shifted_in_from(outer).shifted_out_to(outer);
++    assert_eq!(roundtripped, Some(bv));
++}
++
++/// `shifted_out_to` returns `None` exactly when the index is bound within
++/// the outer binder (documented in `DebruijnIndex::shifted_out_to`).
++#[hegel::test]
++fn shifted_out_none_iff_within(tc: hegel::TestCase) {
++    let d = DebruijnIndex::new(tc.draw(generators::integers::<u32>()));
++    let o = DebruijnIndex::new(tc.draw(generators::integers::<u32>()));
++    assert_eq!(d.shifted_out_to(o).is_none(), d.within(o));
++}
++
++/// KNOWN FAILURE: `DebruijnIndex::shifted_in_from` computes
++/// `self.depth() + outer_binder.depth()` with unchecked arithmetic
++/// (chalk-ir/src/lib.rs). For depths whose sum exceeds `u32::MAX` this
++/// panics with "attempt to add with overflow" in debug builds and silently
++/// wraps (corrupting the index) in release builds. Neither `DebruijnIndex::new`
++/// nor `shifted_in_from` documents any bound on the depth.
++///
++/// The generator draws both depths from [2^31, u32::MAX], so every case
++/// overflows and the failure is deterministic.
++#[hegel::test]
++fn debruijn_shift_overflows_at_boundary(tc: hegel::TestCase) {
++    let d = DebruijnIndex::new(tc.draw(generators::integers::<u32>().min_value(1 << 31)));
++    let o = DebruijnIndex::new(tc.draw(generators::integers::<u32>().min_value(1 << 31)));
++    let shifted = d.shifted_in_from(o); // panics (debug) / wraps (release)
++    assert_eq!(shifted.shifted_out_to(o), Some(d));
++}
++
++// ---------------------------------------------------------------------------
++// Substitution
++// ---------------------------------------------------------------------------
++
++/// Draws a substitution of `n` fully closed types (as `GenericArg`s).
++fn draw_closed_ty_params(tc: &hegel::TestCase, n: usize) -> Vec<GenericArg<ChalkIr>> {
++    let closed = TermCfg {
++        innermost_ty_only: true,
++        n_params: 0,
++    };
++    (0..n)
++        .map(|_| {
++            let ty = tc.draw((arb_ty(closed, 2, 0)).print_as_debug());
++            ty.cast::<GenericArg<ChalkIr>>(ChalkIr)
++        })
++        .collect()
++}
++
++/// chalk-ir contains two independent substitution folders: `Subst`
++/// (chalk-ir/src/fold/subst.rs, used by `Binders::substitute`) and
++/// `SubstFolder` (chalk-ir/src/lib.rs, used by `Substitution::apply`).
++/// On terms in both domains -- all free variables refer to the innermost
++/// binder -- they must agree.
++#[hegel::test]
++fn subst_and_substitution_apply_agree(tc: hegel::TestCase) {
++    let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++    let params = draw_closed_ty_params(&tc, n);
++    let cfg = TermCfg {
++        innermost_ty_only: true,
++        n_params: n,
++    };
++    let budget = tc.draw(generators::integers::<u32>().max_value(4));
++    let term = tc.draw((arb_ty(cfg, budget, 0)).print_as_debug());
++
++    let via_subst = Subst::apply(ChalkIr, &params, term.clone());
++    let via_substitution = Substitution::from_iter(ChalkIr, params).apply(term, ChalkIr);
++    assert_eq!(via_subst, via_substitution);
++}
++
++/// Substituting into a term that was just shifted *in* is a no-op: the
++/// shift guarantees no variable refers to the innermost binder, so the
++/// substitution merely undoes the shift (this is the binder-elimination
++/// semantics documented on `Subst`). The parameter list is irrelevant --
++/// even an empty one works.
++#[hegel::test]
++fn subst_after_shift_in_is_identity(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    let shifted = ty.clone().shifted_in(ChalkIr);
++    let no_params: &[GenericArg<ChalkIr>] = &[];
++    assert_eq!(Subst::apply(ChalkIr, no_params, shifted), ty);
++}
++
++/// `Binders::identity_substitution` produces a substitution that
++/// `Substitution::is_identity_subst` recognizes as the identity.
++#[hegel::test]
++fn identity_substitution_is_recognized(tc: hegel::TestCase) {
++    let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(4));
++    let kinds = VariableKinds::from_iter(
++        ChalkIr,
++        (0..n).map(|_| VariableKind::Ty(TyVariableKind::General)),
++    );
++    let ty = TyKind::<ChalkIr>::Str.intern(ChalkIr);
++    let binders = Binders::new(kinds, ty);
++    let subst = binders.identity_substitution(ChalkIr);
++    assert!(subst.is_identity_subst(ChalkIr));
++}
++
++/// Substituting the identity substitution into a binder's value leaves the
++/// value unchanged.
++#[hegel::test]
++fn substitute_identity_is_noop(tc: hegel::TestCase) {
++    let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(3));
++    let cfg = TermCfg {
++        innermost_ty_only: true,
++        n_params: n,
++    };
++    let budget = tc.draw(generators::integers::<u32>().max_value(4));
++    let value = tc.draw((arb_ty(cfg, budget, 0)).print_as_debug());
++    let kinds = VariableKinds::from_iter(
++        ChalkIr,
++        (0..n).map(|_| VariableKind::Ty(TyVariableKind::General)),
++    );
++    let binders = Binders::new(kinds, value.clone());
++    let subst = binders.identity_substitution(ChalkIr);
++    assert_eq!(binders.substitute(ChalkIr, &subst), value);
++}
++
++/// KNOWN FAILURE: the documentation on `Subst::parameters`
++/// (chalk-ir/src/fold/subst.rs) promises that a free variable with index
++/// `i >= parameters.len()` "will be left untouched", but
++/// `fold_free_var_ty` indexes `self.parameters[index]` unconditionally and
++/// panics with an index-out-of-bounds error instead.
++///
++/// Every generated case uses an empty parameter list and a free variable,
++/// so the failure is deterministic.
++#[hegel::test]
++fn subst_leaves_out_of_range_vars_untouched(tc: hegel::TestCase) {
++    let index = tc.draw(generators::integers::<usize>().max_value(10));
++    let ty = TyKind::<ChalkIr>::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, index))
++        .intern(ChalkIr);
++    let no_params: &[GenericArg<ChalkIr>] = &[];
++    // Per the documentation, an out-of-range variable is left untouched.
++    let result = Subst::apply(ChalkIr, no_params, ty.clone());
++    assert_eq!(result, ty);
++}
++
++// ---------------------------------------------------------------------------
++// could_match / cast
++// ---------------------------------------------------------------------------
++
++#[derive(Debug)]
++struct InvariantDb;
++
++impl UnificationDatabase<ChalkIr> for InvariantDb {
++    fn fn_def_variance(&self, _fn_def_id: FnDefId<ChalkIr>) -> Variances<ChalkIr> {
++        Variances::from_iter(ChalkIr, std::iter::repeat(Variance::Invariant).take(8))
++    }
++
++    fn adt_variance(&self, _adt_id: AdtId<ChalkIr>) -> Variances<ChalkIr> {
++        Variances::from_iter(ChalkIr, std::iter::repeat(Variance::Invariant).take(8))
++    }
++}
++
++/// `could_match` is documented as "a fast check to see whether two things
++/// could ever possibly match"; it over-approximates unifiability, so it must
++/// at minimum be reflexive. A missing or wrong arm in its big `TyKind`
++/// match would break this.
++#[hegel::test]
++fn could_match_is_reflexive(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    assert!(ty.could_match(ChalkIr, &InvariantDb, &ty));
++}
++
++/// Casting a `Ty` to a `GenericArg` and projecting it back yields the
++/// original type (and the kind accessors agree that it is a type).
++#[hegel::test]
++fn cast_ty_to_generic_arg_roundtrips(tc: hegel::TestCase) {
++    let ty = draw_ty(&tc, ANY);
++    let arg: GenericArg<ChalkIr> = ty.clone().cast(ChalkIr);
++    assert_eq!(arg.ty(ChalkIr), Some(&ty));
++}
