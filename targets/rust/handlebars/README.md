@@ -34,3 +34,4 @@
 - 2026-07-16: predecessor base commit `2802ada08ad8` (chore(deps-dev): bump websocket-driver in /playground/www (#772)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/handlebars.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 2802ada08ad8 → 567b48015464 (2026-09-12, "Add the Auric SPA MVC framework to the related projects section (#787)"; 6.4.4); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 241 tests pass.
