@@ -38,3 +38,4 @@
 - 2026-07-10: predecessor base commit `cd1e5ac838ad` (chore(deps): Update Rust Stable to v1.97 (#625)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/liquid.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped cd1e5ac838ad → 4d57f1941b6b (2026-09-01, "Merge pull request #630 from cobalt-org/renovate/crate-ci-typos-1.x"; 0.26.11); 3 bug(s) still reproduce; 1 ignored reproducer(s) not run. 569 tests pass.
