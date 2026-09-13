@@ -31,3 +31,4 @@
 - 2026-07-22: predecessor base commit `dd23c83b49ff` (Preserve `FrozenHeapName` across paging).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/starlark.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped dd23c83b49ff → d596084ab5f6 (2026-09-12, "Bump either 1.17.0 -> 1.18.0"; 0.14.2); 0 bug(s) still reproduce; fixed upstream: starlark/1, starlark/2, starlark/3; 2 ignored reproducer(s) not run. 985 tests pass.
