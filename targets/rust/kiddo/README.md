@@ -27,3 +27,4 @@
 - 2026-07-22: predecessor base commit `39cbbaf99876` (ci: cap benchmark trees at 2^25).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/kiddo.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 39cbbaf99876 → 408e63820bea (2026-09-06, "chore: update version references"; 6.3.0); 1 bug(s) still reproduce; fixed upstream: kiddo/2. 515 tests pass. kiddo/2 was fixed upstream ("Preserve mutable leaf split associations" in the CHANGELOG; `split_leaf` reworked with the v6 leaf strategies).

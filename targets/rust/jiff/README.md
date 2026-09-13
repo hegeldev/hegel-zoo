@@ -67,3 +67,4 @@ reports them as UPSTREAM.
 - 2026-07-19: predecessor base commit `7311a6ac67cf` (0.2.34).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/jiff.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1 (composites by reference; `.print_as_debug()` on draws of jiff types with `use hegel::Generator` in each test module).
+- 2026-09-13: base bumped 7311a6ac67cf → 7bd0c36306bc (2026-09-12, "doc: fix include paths, redux"; 0.2.34); 1 bug(s) still reproduce. 2153 tests pass.
