@@ -31,3 +31,4 @@
 - 2026-05-15: predecessor base commit `9aa1ac21a7da` (Merge pull request #469 from Ogeon/phf_0.13).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/palette.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 9aa1ac21a7da → 71011dee471c (2026-09-05, "Merge pull request #483 from Ogeon/fix_issue_482"; 0.7.7); 0 bug(s) still reproduce; fixed upstream: palette/1, palette/2. 1294 tests pass. Both bugs were fixed upstream: palette/1 by issue #473's fix in `angle.rs` (subnormal / 360.0 results normalise to 0.0) and palette/2 by PR #483 for issue #482 (HSL saturation divisor guarded against zero); the upstream regression tests use the zoo's counterexample values, and the two known-failure properties now pass.
