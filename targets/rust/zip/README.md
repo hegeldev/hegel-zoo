@@ -29,3 +29,4 @@
 - 2026-07-23: predecessor base commit `1058f8062102` (ci(deps): bump step-security/harden-runner from 2.19.4 to 2.20.0 (#...).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/zip.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 1058f8062102 → 6fff6209289b (2026-09-11, "feat: add comment and test for ZipStreamReader and symlinks (#985)"; 9.0.0-pre3); 0 bug(s) still reproduce; add/add conflicts in tests/end_to_end.rs resolved by keeping both sides. 272 tests pass.
