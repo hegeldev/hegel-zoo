@@ -46,3 +46,4 @@
 - 2026-07-16: predecessor base commit `7fc21fe52d39` (chore: release v1.8.0 (#375)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/borsh.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 7fc21fe52d39 → c9a2ed489276 (2026-09-10, "test: make isize/usize snapshots pointer-width independent (#382)"; 1.8.1); 0 bug(s) still reproduce; add/add conflicts in borsh/tests/roundtrip/test_primitives.rs resolved by keeping both sides. 199 tests pass.

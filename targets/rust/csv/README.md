@@ -41,3 +41,4 @@
 - 2025-10-17: predecessor base commit `4a3997e91d66` (1.4.0).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/csv.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 4a3997e91d66 → 05612e87e6e9 (2026-08-04, "tests: fix binary discovery"; 1.4.0); 4 bug(s) still reproduce. 443 tests pass.

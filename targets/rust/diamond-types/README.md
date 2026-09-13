@@ -30,3 +30,4 @@
 - 2026-05-29: predecessor base commit `ad48b9cced1d` (More cleanups).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/diamond-types.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped ad48b9cced1d → 89ae3a0ab8d9 (2026-09-02, "Added span helpers for i32, fixes tests"; 2.0.0); 2 bug(s) still reproduce; add/add conflicts in src/list/encoding/tests.rs resolved by keeping both sides. 157 tests pass.
