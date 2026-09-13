@@ -1,0 +1,860 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 03e8dbe..3c7fa43 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -48,6 +48,8 @@ arbitrary = { version = "1.4.1", features = ["derive"], optional = true }
+ crunchy = "0.2.2"
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++num-traits = "0.2"
+ criterion = "0.5"
+ quickcheck = "1.0"
+ quickcheck_macros = "1.0"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..33f65ec
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,841 @@
++//! Property tests for `half`'s `f16` and `bf16`.
++//!
++//! The crate documents its conversions as "rounded to the nearest representable value" (IEEE
++//! 754 round-to-nearest-even) and implements arithmetic, `mul_add` and friends by computing in
++//! `f32` and converting back. The oracle here is exact: every finite `f16`/`bf16`/`f32`/`f64` is
++//! an integer times a power of two, so sums, products, quotients and fused multiply-adds are
++//! evaluated exactly as `num / den · 2^exp` in `i128` and rounded to the target format once, by
++//! hand. Classification, sign handling, ordering and formatting are checked against the bit
++//! patterns directly.
++
++use half::slice::HalfFloatSliceExt;
++use half::{bf16, f16};
++use hegel::generators;
++use hegel::Generator as _;
++use num_traits::Float;
++use std::num::FpCategory;
++
++// ---------------------------------------------------------------------------
++// Exact oracle: round num/den · 2^exp2 (num, den > 0) to a binary format
++// ---------------------------------------------------------------------------
++
++/// A binary floating-point format: `prec` significand bits including the hidden bit, normal
++/// exponents `emin..=emax`, biased exponent field `exp + bias`.
++#[derive(Debug, Clone, Copy)]
++struct Format {
++    prec: u32,
++    emin: i32,
++    emax: i32,
++    bias: i32,
++}
++
++const F16: Format = Format { prec: 11, emin: -14, emax: 15, bias: 15 };
++const BF16: Format = Format { prec: 8, emin: -126, emax: 127, bias: 127 };
++
++fn bit_len(x: i128) -> i32 {
++    debug_assert!(x > 0);
++    128 - x.leading_zeros() as i32
++}
++
++/// The magnitude bits (no sign) of the value `num / den · 2^exp2`, `num, den > 0`, rounded to
++/// nearest, ties to even, in `fmt`; infinity when it overflows. Exact integer arithmetic.
++fn round_magnitude(num: i128, den: i128, exp2: i32, fmt: Format) -> u16 {
++    assert!(num > 0 && den > 0);
++    // floor(log2(num/den)):
++    let mut l = bit_len(num) - bit_len(den);
++    let smaller = if l >= 0 { num < (den << l) } else { (num << -l) < den };
++    if smaller {
++        l -= 1;
++    }
++    let e = l + exp2; // value in [2^e, 2^(e+1))
++    let stored = (fmt.prec - 1) as i32;
++    let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++    if e > fmt.emax {
++        return inf;
++    }
++    // Unit of the last place: normals have prec significant bits, subnormals share emin's ulp.
++    let u = if e < fmt.emin { fmt.emin - stored } else { e - stored };
++    if e < u - 1 {
++        return 0; // below half the smallest subnormal: rounds to zero (and keeps shifts small)
++    }
++    // s = round(value / 2^u) with ties to even.
++    let shift = exp2 - u;
++    let (n, d) = if shift >= 0 { (num << shift, den) } else { (num, den << -shift) };
++    let mut s = n / d;
++    let rem = n % d;
++    if 2 * rem > d || (2 * rem == d && s % 2 == 1) {
++        s += 1;
++    }
++    let hidden = 1i128 << stored;
++    if e < fmt.emin {
++        // Subnormal (or rounded up into the smallest normal, whose encoding is the same).
++        debug_assert!(s <= hidden);
++        return s as u16;
++    }
++    let mut e = e;
++    if s == 2 * hidden {
++        s = hidden;
++        e += 1;
++    }
++    if e > fmt.emax {
++        return inf;
++    }
++    (((e + fmt.bias) as u16) << stored) | (s - hidden) as u16
++}
++
++/// Decompose a finite, nonzero float into `(negative, mantissa, exp2)` with value
++/// `mantissa · 2^exp2`.
++fn decompose_f64(x: f64) -> (bool, i128, i32) {
++    assert!(x.is_finite() && x != 0.0);
++    let bits = x.to_bits();
++    let neg = bits >> 63 == 1;
++    let exp = ((bits >> 52) & 0x7FF) as i32;
++    let frac = (bits & ((1u64 << 52) - 1)) as i128;
++    if exp == 0 {
++        (neg, frac, -1074)
++    } else {
++        (neg, frac | (1 << 52), exp - 1075)
++    }
++}
++
++/// Decompose finite, nonzero `bits` of a 16-bit format into `(negative, mantissa, exp2)`.
++fn decompose_bits(bits: u16, fmt: Format) -> (bool, i128, i32) {
++    let stored = (fmt.prec - 1) as u32;
++    let neg = bits >> 15 == 1;
++    let exp = ((bits >> stored) & ((1 << (15 - stored)) - 1)) as i32;
++    let frac = (bits & ((1 << stored) - 1)) as i128;
++    assert!(exp != (1 << (15 - stored)) - 1 && bits & 0x7FFF != 0, "finite nonzero only: {bits:#06x}");
++    if exp == 0 {
++        (neg, frac, fmt.emin - stored as i32)
++    } else {
++        (neg, frac | (1 << stored), exp - fmt.bias - stored as i32)
++    }
++}
++
++fn sign_bit(neg: bool) -> u16 {
++    if neg { 0x8000 } else { 0 }
++}
++
++/// Correctly rounded conversion of an `f64` to `fmt` bits. NaN payloads are not modelled: a
++/// NaN input yields `None`.
++fn expected_from_f64(x: f64, fmt: Format) -> Option<u16> {
++    let stored = (fmt.prec - 1) as u16;
++    let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++    if x.is_nan() {
++        return None;
++    }
++    let neg = x.is_sign_negative();
++    if x.is_infinite() {
++        return Some(sign_bit(neg) | inf);
++    }
++    if x == 0.0 {
++        return Some(sign_bit(neg));
++    }
++    let (neg, m, e) = decompose_f64(x);
++    Some(sign_bit(neg) | round_magnitude(m, 1, e, fmt))
++}
++
++fn expected_from_f32(x: f32, fmt: Format) -> Option<u16> {
++    expected_from_f64(x as f64, fmt) // f32 → f64 is exact
++}
++
++/// The exact value of finite `bits` as an `f64` (exact for both formats).
++fn exact_value(bits: u16, fmt: Format) -> f64 {
++    let stored = (fmt.prec - 1) as u32;
++    let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++    if bits & 0x7FFF == 0 {
++        return if bits >> 15 == 1 { -0.0 } else { 0.0 };
++    }
++    if bits & 0x7FFF == inf {
++        return if bits >> 15 == 1 { f64::NEG_INFINITY } else { f64::INFINITY };
++    }
++    let (neg, m, e) = decompose_bits(bits, fmt);
++    let v = (m as f64) * 2f64.powi(e);
++    if neg { -v } else { v }
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++/// Any 16-bit pattern: all f16/bf16 values including both zeros, infinities, NaNs.
++fn bits16() -> impl hegel::PrintableGenerator<u16> {
++    generators::integers::<u16>()
++}
++
++/// A finite 16-bit pattern in `fmt`.
++#[hegel::composite]
++fn finite_bits(tc: &hegel::TestCase, fmt: Format) -> u16 {
++    let stored = (fmt.prec - 1) as u16;
++    let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++    let b = tc.draw(bits16());
++    tc.assume(b & 0x7FFF < inf);
++    b
++}
++
++impl hegel::PrettyPrintable for Format {
++    fn pretty_print(&self, printer: &mut hegel::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(if self.prec == 11 { "F16" } else { "BF16" }, printer);
++    }
++}
++
++/// An `f64` that is hard to round: exactly between two adjacent finite `fmt` values, or a few
++/// `f64` ulps to either side of that midpoint (where a conversion that goes through `f32`, or
++/// truncates low mantissa bits first, rounds the wrong way), or an arbitrary `f64`.
++#[hegel::composite]
++fn hard_f64(tc: &hegel::TestCase, fmt: Format) -> f64 {
++    let kind = tc.draw(generators::integers::<u8>().max_value(3));
++    if kind == 0 {
++        return tc.draw(generators::floats::<f64>());
++    }
++    let stored = (fmt.prec - 1) as u16;
++    let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++    let lo = tc.draw(finite_bits(fmt));
++    tc.assume((lo & 0x7FFF) + 1 < inf); // has a finite successor of the same sign
++    let a = exact_value(lo, fmt);
++    let hi = (lo & 0x8000) | ((lo & 0x7FFF) + 1);
++    let b = exact_value(hi, fmt);
++    let mid = (a + b) / 2.0; // exact: one more bit than the format has
++    match kind {
++        1 => mid,
++        _ => {
++            let ulps = tc.draw(generators::integers::<i32>().min_value(-3).max_value(3));
++            let mut x = mid;
++            for _ in 0..ulps.abs() {
++                x = if (ulps > 0) == (mid > 0.0) { next_up(x) } else { next_down(x) };
++            }
++            x
++        }
++    }
++}
++
++fn next_up(x: f64) -> f64 {
++    if x == 0.0 {
++        return f64::from_bits(1);
++    }
++    let b = x.to_bits();
++    f64::from_bits(if x > 0.0 { b + 1 } else { b - 1 })
++}
++
++fn next_down(x: f64) -> f64 {
++    -next_up(-x)
++}
++
++/// An `f32` that is hard to round to `fmt`: a midpoint (or near one) between adjacent values,
++/// or any `f32`.
++#[hegel::composite]
++fn hard_f32(tc: &hegel::TestCase, fmt: Format) -> f32 {
++    let x = tc.draw(hard_f64(fmt));
++    // Midpoints and their neighbours in f32 (any f16/bf16 midpoint is exact in f32; a
++    // neighbour of it in f64 becomes the midpoint itself or a f32 neighbour).
++    let y = x as f32;
++    if !y.is_finite() || y == 0.0 {
++        return tc.draw(generators::floats::<f32>());
++    }
++    let ulps = tc.draw(generators::integers::<i32>().min_value(-1).max_value(1));
++    match ulps {
++        0 => y,
++        1 => f32::from_bits(if y > 0.0 { y.to_bits() + 1 } else { y.to_bits() - 1 }),
++        _ => f32::from_bits(if y > 0.0 { y.to_bits() - 1 } else { y.to_bits() + 1 }),
++    }
++}
++
++fn check_conversion(name: &str, input: impl std::fmt::Debug, got: u16, want: Option<u16>, fmt: Format) {
++    let stored = (fmt.prec - 1) as u16;
++    let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++    match want {
++        None => assert!(got & 0x7FFF > inf, "{name}({input:?}) = {got:#06x} is not NaN"),
++        Some(w) => assert_eq!(
++            got, w,
++            "{name}({input:?}) = {got:#06x} ({}) but correctly rounded is {w:#06x} ({})",
++            exact_value(got, fmt), exact_value(w, fmt)
++        ),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Conversions
++// ---------------------------------------------------------------------------
++
++/// `f16::from_f32` (and the software `from_f32_const`) round to nearest, ties to even, as
++/// documented ("rounded to the nearest representable value"), including into subnormals and
++/// to infinity on overflow; NaN stays NaN.
++#[hegel::test]
++fn f16_from_f32_is_correctly_rounded(tc: hegel::TestCase) {
++    let x = tc.draw(hard_f32(F16));
++    let want = expected_from_f32(x, F16);
++    check_conversion("f16::from_f32", x, f16::from_f32(x).to_bits(), want, F16);
++    check_conversion("f16::from_f32_const", x, f16::from_f32_const(x).to_bits(), want, F16);
++}
++
++/// `bf16::from_f32` (and `from_f32_const`) round to nearest even.
++#[hegel::test]
++fn bf16_from_f32_is_correctly_rounded(tc: hegel::TestCase) {
++    let x = tc.draw(hard_f32(BF16));
++    let want = expected_from_f32(x, BF16);
++    check_conversion("bf16::from_f32", x, bf16::from_f32(x).to_bits(), want, BF16);
++    check_conversion("bf16::from_f32_const", x, bf16::from_f32_const(x).to_bits(), want, BF16);
++}
++
++/// `f16::from_f64` rounds the `f64` to the nearest `f16` directly — the docs promise the
++/// nearest representable value, which rounding through `f32` first does not give near the
++/// midpoints (a value just above an `f16` midpoint that `f32` rounds *onto* the midpoint is then
++/// rounded to even, i.e. the wrong way).
++#[hegel::test]
++fn f16_from_f64_is_correctly_rounded(tc: hegel::TestCase) {
++    let x = tc.draw(hard_f64(F16));
++    check_conversion("f16::from_f64", x, f16::from_f64(x).to_bits(), expected_from_f64(x, F16), F16);
++}
++
++/// Same for the software (`const`) path, which must not truncate mantissa bits before deciding
++/// how to round.
++#[hegel::test]
++fn f16_from_f64_const_is_correctly_rounded(tc: hegel::TestCase) {
++    let x = tc.draw(hard_f64(F16));
++    check_conversion("f16::from_f64_const", x, f16::from_f64_const(x).to_bits(), expected_from_f64(x, F16), F16);
++}
++
++/// `bf16::from_f64` / `from_f64_const` round to nearest even directly from the `f64`.
++#[hegel::test]
++fn bf16_from_f64_is_correctly_rounded(tc: hegel::TestCase) {
++    let x = tc.draw(hard_f64(BF16));
++    let want = expected_from_f64(x, BF16);
++    check_conversion("bf16::from_f64", x, bf16::from_f64(x).to_bits(), want, BF16);
++    check_conversion("bf16::from_f64_const", x, bf16::from_f64_const(x).to_bits(), want, BF16);
++}
++
++/// Widening is exact: `to_f32`/`to_f64` (and the `const` variants) give the exact value of the
++/// bit pattern, so every finite `f16`/`bf16` round-trips through `f32` and `f64`; infinities and
++/// NaNs keep their kind and sign.
++#[hegel::test]
++fn widening_is_exact_and_round_trips(tc: hegel::TestCase) {
++    let b = tc.draw(bits16());
++    let h = f16::from_bits(b);
++    let g = bf16::from_bits(b);
++    if h.is_nan() {
++        assert!(h.to_f32().is_nan() && h.to_f64().is_nan() && h.to_f32_const().is_nan() && h.to_f64_const().is_nan());
++        assert_eq!(h.to_f32().is_sign_negative(), h.is_sign_negative(), "f16 NaN sign through to_f32");
++        assert!(f16::from_f32(h.to_f32()).is_nan() && f16::from_f64(h.to_f64()).is_nan());
++    } else {
++        let v = exact_value(b, F16);
++        assert_eq!(h.to_f64().to_bits(), v.to_bits(), "f16::to_f64({b:#06x})");
++        assert_eq!(h.to_f64_const().to_bits(), v.to_bits(), "f16::to_f64_const({b:#06x})");
++        assert_eq!(h.to_f32().to_bits(), (v as f32).to_bits(), "f16::to_f32({b:#06x})");
++        assert_eq!(h.to_f32_const().to_bits(), (v as f32).to_bits(), "f16::to_f32_const({b:#06x})");
++        assert_eq!(f16::from_f32(h.to_f32()).to_bits(), b, "f16 round trip through f32");
++        assert_eq!(f16::from_f64(h.to_f64()).to_bits(), b, "f16 round trip through f64");
++        assert_eq!(f16::from_f64_const(h.to_f64()).to_bits(), b, "f16 const round trip through f64");
++    }
++    if g.is_nan() {
++        assert!(g.to_f32().is_nan() && g.to_f64().is_nan() && g.to_f32_const().is_nan() && g.to_f64_const().is_nan());
++        assert!(bf16::from_f32(g.to_f32()).is_nan() && bf16::from_f64(g.to_f64()).is_nan());
++    } else {
++        let v = exact_value(b, BF16);
++        assert_eq!(g.to_f64().to_bits(), v.to_bits(), "bf16::to_f64({b:#06x})");
++        assert_eq!(g.to_f64_const().to_bits(), v.to_bits(), "bf16::to_f64_const({b:#06x})");
++        assert_eq!(g.to_f32().to_bits(), (v as f32).to_bits(), "bf16::to_f32({b:#06x})");
++        assert_eq!(g.to_f32_const().to_bits(), (v as f32).to_bits(), "bf16::to_f32_const({b:#06x})");
++        assert_eq!(bf16::from_f32(g.to_f32()).to_bits(), b, "bf16 round trip through f32");
++        assert_eq!(bf16::from_f64(g.to_f64()).to_bits(), b, "bf16 round trip through f64");
++    }
++}
++
++/// The slice conversions (vectorised in chunks, with a scalar tail) agree bit for bit with the
++/// element-wise conversions, for every length up to a few chunks, and `to_f32_vec`/`to_f64_vec`
++/// agree with `to_f32`/`to_f64`.
++#[hegel::test]
++fn slice_conversions_match_elementwise(tc: hegel::TestCase) {
++    let xs: Vec<f64> = tc.draw(generators::vecs(hard_f64(F16)).max_size(20));
++    let ys: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
++    let n = xs.len();
++
++    let mut from64 = vec![f16::ZERO; n];
++    from64.convert_from_f64_slice(&xs);
++    for i in 0..n {
++        let want = f16::from_f64(xs[i]);
++        assert!(
++            from64[i].to_bits() == want.to_bits() || (from64[i].is_nan() && want.is_nan()),
++            "convert_from_f64_slice[{i}] of {n}: {:#06x} vs from_f64 {:#06x} for {:?}",
++            from64[i].to_bits(), want.to_bits(), xs[i]
++        );
++    }
++    let mut from32 = vec![f16::ZERO; n];
++    from32.convert_from_f32_slice(&ys);
++    for i in 0..n {
++        let want = f16::from_f32(ys[i]);
++        assert!(
++            from32[i].to_bits() == want.to_bits() || (from32[i].is_nan() && want.is_nan()),
++            "convert_from_f32_slice[{i}] of {n}: {:#06x} vs from_f32 {:#06x} for {:?}",
++            from32[i].to_bits(), want.to_bits(), ys[i]
++        );
++    }
++
++    let hs: Vec<f16> = tc.draw(generators::vecs(bits16()).max_size(20)).into_iter().map(f16::from_bits).collect();
++    let mut to32 = vec![0f32; hs.len()];
++    hs.convert_to_f32_slice(&mut to32);
++    let mut to64 = vec![0f64; hs.len()];
++    hs.convert_to_f64_slice(&mut to64);
++    let vec32 = hs.to_f32_vec();
++    let vec64 = hs.to_f64_vec();
++    for i in 0..hs.len() {
++        let (w32, w64) = (hs[i].to_f32(), hs[i].to_f64());
++        let same32 = |x: f32| x.to_bits() == w32.to_bits() || (x.is_nan() && w32.is_nan());
++        let same64 = |x: f64| x.to_bits() == w64.to_bits() || (x.is_nan() && w64.is_nan());
++        assert!(same32(to32[i]), "convert_to_f32_slice[{i}]: {:?} vs {w32:?}", to32[i]);
++        assert!(same64(to64[i]), "convert_to_f64_slice[{i}]: {:?} vs {w64:?}", to64[i]);
++        assert!(same32(vec32[i]), "to_f32_vec[{i}]: {:?} vs {w32:?}", vec32[i]);
++        assert!(same64(vec64[i]), "to_f64_vec[{i}]: {:?} vs {w64:?}", vec64[i]);
++    }
++
++    let mut gs = vec![bf16::ZERO; n];
++    gs.convert_from_f64_slice(&xs);
++    for i in 0..n {
++        let want = bf16::from_f64(xs[i]);
++        assert!(
++            gs[i].to_bits() == want.to_bits() || (gs[i].is_nan() && want.is_nan()),
++            "bf16 convert_from_f64_slice[{i}] of {n}: {:#06x} vs from_f64 {:#06x} for {:?}",
++            gs[i].to_bits(), want.to_bits(), xs[i]
++        );
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Arithmetic
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, Copy, PartialEq)]
++enum Op {
++    Add,
++    Sub,
++    Mul,
++    Div,
++}
++
++/// The correctly rounded result of `a op b` for finite operands (`b != 0` for `Div`), as bits
++/// of `fmt`, following IEEE 754 for the sign of an exact zero.
++fn expected_arith(a: u16, b: u16, op: Op, fmt: Format) -> u16 {
++    let dec = |x: u16| -> (bool, i128, i32) {
++        if x & 0x7FFF == 0 { (x >> 15 == 1, 0, 0) } else { decompose_bits(x, fmt) }
++    };
++    let (na, ma, ea) = dec(a);
++    let (nb, mb, eb) = dec(b);
++    let sa = if na { -1i128 } else { 1 };
++    let sb = if nb { -1i128 } else { 1 };
++    match op {
++        Op::Add | Op::Sub => {
++            let sb = if op == Op::Sub { -sb } else { sb };
++            let nb_eff = sb < 0;
++            if ma == 0 && mb == 0 {
++                // IEEE 754: an exact zero sum is -0 only when both addends are -0.
++                return sign_bit(na && nb_eff);
++            }
++            if ma == 0 {
++                return sign_bit(nb_eff) | (b & 0x7FFF);
++            }
++            if mb == 0 {
++                return a;
++            }
++            let (ma, ea, mb, eb) = sticky_align(ma, ea, mb, eb);
++            let e = ea.min(eb);
++            let v = sa * (ma << (ea - e)) + sb * (mb << (eb - e));
++            if v == 0 {
++                return 0; // x + (-x) is +0 in round-to-nearest
++            }
++            sign_bit(v < 0) | round_magnitude(v.abs(), 1, e, fmt)
++        }
++        Op::Mul => {
++            let neg = na != nb;
++            if ma == 0 || mb == 0 {
++                return sign_bit(neg);
++            }
++            sign_bit(neg) | round_magnitude(ma * mb, 1, ea + eb, fmt)
++        }
++        Op::Div => {
++            let neg = na != nb;
++            assert!(mb != 0);
++            if ma == 0 {
++                return sign_bit(neg);
++            }
++            sign_bit(neg) | round_magnitude(ma, mb, ea - eb, fmt)
++        }
++    }
++}
++
++/// Bring two nonzero terms `ma·2^ea`, `mb·2^eb` to exponents at most 100 apart: a term more
++/// than 2^100 times smaller than the other cannot change how their sum rounds beyond being a
++/// nonzero "sticky" remainder, so it is replaced by `1·2^(e_big − 100)` of the same sign. Keeps
++/// the `i128` shifts in range for `bf16`'s exponent span.
++fn sticky_align(ma: i128, ea: i32, mb: i128, eb: i32) -> (i128, i32, i128, i32) {
++    debug_assert!(ma != 0 && mb != 0);
++    let (ta, tb) = (ea + bit_len(ma), eb + bit_len(mb)); // magnitudes in [2^(t-1), 2^t)
++    if ta - tb > 100 {
++        (ma, ea, 1, ea - 100)
++    } else if tb - ta > 100 {
++        (1, eb - 100, mb, eb)
++    } else {
++        (ma, ea, mb, eb)
++    }
++}
++
++fn arith_case(tc: &hegel::TestCase, fmt: Format) -> (u16, u16, Op) {
++    let a = tc.draw(finite_bits(fmt));
++    let b = tc.draw(finite_bits(fmt));
++    let op = tc.draw(generators::sampled_from(vec![Op::Add, Op::Sub, Op::Mul, Op::Div]).print_as_debug());
++    tc.assume(op != Op::Div || b & 0x7FFF != 0);
++    (a, b, op)
++}
++
++/// `+ - * /` on `f16` are correctly rounded (a single rounding of the exact result; computing in
++/// `f32` and rounding once more is fine here because `f32` carries more than 2·11+2 bits).
++#[hegel::test]
++fn f16_arithmetic_is_correctly_rounded(tc: hegel::TestCase) {
++    let (a, b, op) = arith_case(&tc, F16);
++    let (x, y) = (f16::from_bits(a), f16::from_bits(b));
++    let got = match op {
++        Op::Add => x + y,
++        Op::Sub => x - y,
++        Op::Mul => x * y,
++        Op::Div => x / y,
++    };
++    let want = expected_arith(a, b, op, F16);
++    assert_eq!(
++        got.to_bits(), want,
++        "{x} ({a:#06x}) {op:?} {y} ({b:#06x}) = {got} ({:#06x}); exact rounding gives {} ({want:#06x})",
++        got.to_bits(), f16::from_bits(want)
++    );
++}
++
++/// `+ - * /` on `bf16` are correctly rounded.
++#[hegel::test]
++fn bf16_arithmetic_is_correctly_rounded(tc: hegel::TestCase) {
++    let (a, b, op) = arith_case(&tc, BF16);
++    let (x, y) = (bf16::from_bits(a), bf16::from_bits(b));
++    let got = match op {
++        Op::Add => x + y,
++        Op::Sub => x - y,
++        Op::Mul => x * y,
++        Op::Div => x / y,
++    };
++    let want = expected_arith(a, b, op, BF16);
++    assert_eq!(
++        got.to_bits(), want,
++        "{x} ({a:#06x}) {op:?} {y} ({b:#06x}) = {got} ({:#06x}); exact rounding gives {} ({want:#06x})",
++        got.to_bits(), bf16::from_bits(want)
++    );
++}
++
++/// The correctly rounded `a·b + c` for finite operands.
++fn expected_mul_add(a: u16, b: u16, c: u16, fmt: Format) -> u16 {
++    let dec = |x: u16| -> (bool, i128, i32) {
++        if x & 0x7FFF == 0 { (x >> 15 == 1, 0, 0) } else { decompose_bits(x, fmt) }
++    };
++    let (na, ma, ea) = dec(a);
++    let (nb, mb, eb) = dec(b);
++    let (nc, mc, ec) = dec(c);
++    let np = na != nb;
++    let sp = if np { -1i128 } else { 1 };
++    let sc = if nc { -1i128 } else { 1 };
++    let (mp, ep) = (ma * mb, ea + eb);
++    if mp == 0 && mc == 0 {
++        // IEEE 754: an exact zero is -0 only when the product and c are both -0.
++        return sign_bit(np && nc);
++    }
++    if mp == 0 {
++        return c;
++    }
++    if mc == 0 {
++        return sign_bit(np) | round_magnitude(mp, 1, ep, fmt);
++    }
++    let (mp, ep, mc, ec) = sticky_align(mp, ep, mc, ec);
++    let e = ep.min(ec);
++    let v = sp * (mp << (ep - e)) + sc * (mc << (ec - e));
++    if v == 0 {
++        return 0; // exact cancellation is +0 in round-to-nearest
++    }
++    sign_bit(v < 0) | round_magnitude(v.abs(), 1, e, fmt)
++}
++
++/// `num_traits::Float::mul_add` is documented as a *fused* multiply-add: "Computes
++/// `(self * a) + b` with only one rounding error". So the result must be the exact `a·b + c`
++/// rounded once to `f16`.
++#[hegel::test]
++fn f16_mul_add_is_fused(tc: hegel::TestCase) {
++    let a = tc.draw(finite_bits(F16));
++    let b = tc.draw(finite_bits(F16));
++    let c = tc.draw(finite_bits(F16));
++    let (x, y, z) = (f16::from_bits(a), f16::from_bits(b), f16::from_bits(c));
++    let got = Float::mul_add(x, y, z);
++    let want = expected_mul_add(a, b, c, F16);
++    assert_eq!(
++        got.to_bits(), want,
++        "({x}).mul_add({y}, {z}) = {got} ({:#06x}); exactly rounded: {} ({want:#06x})",
++        got.to_bits(), f16::from_bits(want)
++    );
++}
++
++/// Same for `bf16`.
++#[hegel::test]
++fn bf16_mul_add_is_fused(tc: hegel::TestCase) {
++    let a = tc.draw(finite_bits(BF16));
++    let b = tc.draw(finite_bits(BF16));
++    let c = tc.draw(finite_bits(BF16));
++    let (x, y, z) = (bf16::from_bits(a), bf16::from_bits(b), bf16::from_bits(c));
++    let got = Float::mul_add(x, y, z);
++    let want = expected_mul_add(a, b, c, BF16);
++    assert_eq!(
++        got.to_bits(), want,
++        "({x}).mul_add({y}, {z}) = {got} ({:#06x}); exactly rounded: {} ({want:#06x})",
++        got.to_bits(), bf16::from_bits(want)
++    );
++}
++
++// ---------------------------------------------------------------------------
++// Classification, sign, ordering, formatting
++// ---------------------------------------------------------------------------
++
++fn expected_category(bits: u16, fmt: Format) -> FpCategory {
++    let stored = (fmt.prec - 1) as u16;
++    let exp_mask = 0x7FFF & !((1 << stored) - 1);
++    let frac = bits & ((1 << stored) - 1);
++    match (bits & exp_mask, frac) {
++        (0, 0) => FpCategory::Zero,
++        (0, _) => FpCategory::Subnormal,
++        (e, 0) if e == exp_mask => FpCategory::Infinite,
++        (e, _) if e == exp_mask => FpCategory::Nan,
++        _ => FpCategory::Normal,
++    }
++}
++
++/// `classify`, `is_nan`, `is_infinite`, `is_finite`, `is_normal`, the sign predicates,
++/// `signum` and `copysign` follow the bit pattern (a subnormal `f16` is *subnormal*, even
++/// though it widens to a normal `f32`).
++#[hegel::test]
++fn classification_follows_the_bits(tc: hegel::TestCase) {
++    let b = tc.draw(bits16());
++    let neg = b >> 15 == 1;
++
++    let h = f16::from_bits(b);
++    let cat = expected_category(b, F16);
++    assert_eq!(h.classify(), cat, "f16::classify({b:#06x})");
++    assert_eq!(h.is_nan(), cat == FpCategory::Nan);
++    assert_eq!(h.is_infinite(), cat == FpCategory::Infinite);
++    assert_eq!(h.is_finite(), !matches!(cat, FpCategory::Nan | FpCategory::Infinite));
++    assert_eq!(h.is_normal(), cat == FpCategory::Normal, "f16::is_normal({b:#06x})");
++    assert_eq!(h.is_sign_negative(), neg);
++    assert_eq!(h.is_sign_positive(), !neg);
++    if cat == FpCategory::Nan {
++        assert!(h.signum().is_nan());
++    } else {
++        assert_eq!(h.signum().to_bits(), if neg { f16::NEG_ONE.to_bits() } else { f16::ONE.to_bits() }, "f16::signum({b:#06x})");
++    }
++    let s = tc.draw(bits16());
++    let cs = h.copysign(f16::from_bits(s));
++    assert_eq!(cs.to_bits(), (b & 0x7FFF) | (s & 0x8000), "f16::copysign");
++    assert_eq!((-h).to_bits(), b ^ 0x8000, "f16 negation flips only the sign");
++
++    let g = bf16::from_bits(b);
++    let cat = expected_category(b, BF16);
++    assert_eq!(g.classify(), cat, "bf16::classify({b:#06x})");
++    assert_eq!(g.is_nan(), cat == FpCategory::Nan);
++    assert_eq!(g.is_infinite(), cat == FpCategory::Infinite);
++    assert_eq!(g.is_finite(), !matches!(cat, FpCategory::Nan | FpCategory::Infinite));
++    assert_eq!(g.is_normal(), cat == FpCategory::Normal, "bf16::is_normal({b:#06x})");
++    assert_eq!(g.is_sign_negative(), neg);
++    if cat == FpCategory::Nan {
++        assert!(g.signum().is_nan());
++    } else {
++        assert_eq!(g.signum().to_bits(), if neg { bf16::NEG_ONE.to_bits() } else { bf16::ONE.to_bits() }, "bf16::signum({b:#06x})");
++    }
++    assert_eq!(g.copysign(bf16::from_bits(s)).to_bits(), (b & 0x7FFF) | (s & 0x8000), "bf16::copysign");
++}
++
++/// IEEE 754 totalOrder as an integer key on the bits.
++fn total_order_key(bits: u16) -> i32 {
++    let m = (bits & 0x7FFF) as i32;
++    if bits >> 15 == 1 { -m } else { m }
++}
++
++/// `total_cmp` is IEEE 754's totalOrder (−NaN < −∞ < … < −0 < +0 < … < +∞ < +NaN, NaNs by
++/// payload); `PartialOrd`/`PartialEq` agree with the exact values (NaN unordered, `-0 == +0`);
++/// `max`/`min`/`clamp` follow their documentation (NaN arguments are ignored).
++#[hegel::test]
++fn ordering_matches_values_and_total_order(tc: hegel::TestCase) {
++    let a = tc.draw(bits16());
++    let b = tc.draw(bits16());
++    let (x, y) = (f16::from_bits(a), f16::from_bits(b));
++    assert_eq!(x.total_cmp(&y), total_order_key(a).cmp(&total_order_key(b)), "f16::total_cmp({a:#06x}, {b:#06x})");
++    let (va, vb) = (x.to_f64(), y.to_f64());
++    assert_eq!(x.partial_cmp(&y), va.partial_cmp(&vb), "f16 partial_cmp({a:#06x}, {b:#06x})");
++    assert_eq!(x == y, va == vb, "f16 == ({a:#06x}, {b:#06x})");
++    match (x.is_nan(), y.is_nan()) {
++        (true, true) => assert!(x.max(y).is_nan() && x.min(y).is_nan()),
++        (true, false) => {
++            assert_eq!(x.max(y).to_bits(), b, "max(NaN, y) = y");
++            assert_eq!(x.min(y).to_bits(), b, "min(NaN, y) = y");
++        }
++        (false, true) => {
++            assert_eq!(x.max(y).to_bits(), a, "max(x, NaN) = x");
++            assert_eq!(x.min(y).to_bits(), a, "min(x, NaN) = x");
++        }
++        (false, false) => {
++            assert_eq!(x.max(y).to_f64(), va.max(vb), "f16::max");
++            assert_eq!(x.min(y).to_f64(), va.min(vb), "f16::min");
++            let (lo, hi) = if va <= vb { (x, y) } else { (y, x) };
++            let c = tc.draw(finite_bits(F16));
++            let z = f16::from_bits(c);
++            let clamped = z.clamp(lo, hi);
++            assert_eq!(clamped.to_f64(), z.to_f64().clamp(lo.to_f64(), hi.to_f64()), "f16::clamp");
++        }
++    }
++
++    let (x, y) = (bf16::from_bits(a), bf16::from_bits(b));
++    assert_eq!(x.total_cmp(&y), total_order_key(a).cmp(&total_order_key(b)), "bf16::total_cmp({a:#06x}, {b:#06x})");
++    assert_eq!(x.partial_cmp(&y), x.to_f64().partial_cmp(&y.to_f64()), "bf16 partial_cmp({a:#06x}, {b:#06x})");
++}
++
++/// `Display`, `Debug`, `LowerExp` and `UpperExp` print a decimal that parses back (via
++/// `FromStr`) to the same value, for every finite value and both infinities.
++#[hegel::test]
++fn formatting_round_trips_through_from_str(tc: hegel::TestCase) {
++    let b = tc.draw(bits16());
++    let h = f16::from_bits(b);
++    let g = bf16::from_bits(b);
++    let cmp16 = |name: &str, s: String| {
++        let back: f16 = s.parse().unwrap_or_else(|e| panic!("f16 {name} {s:?} of {b:#06x} does not parse: {e}"));
++        if h.is_nan() {
++            assert!(back.is_nan(), "f16 {name} {s:?} of NaN parses to {back}");
++        } else {
++            assert_eq!(back.to_bits(), b, "f16 {name} {s:?} of {b:#06x} parses back to {:#06x}", back.to_bits());
++        }
++    };
++    cmp16("Display", format!("{h}"));
++    cmp16("Debug", format!("{h:?}"));
++    cmp16("LowerExp", format!("{h:e}"));
++    cmp16("UpperExp", format!("{h:E}"));
++    let cmpb = |name: &str, s: String| {
++        let back: bf16 = s.parse().unwrap_or_else(|e| panic!("bf16 {name} {s:?} of {b:#06x} does not parse: {e}"));
++        if g.is_nan() {
++            assert!(back.is_nan(), "bf16 {name} {s:?} of NaN parses to {back}");
++        } else {
++            assert_eq!(back.to_bits(), b, "bf16 {name} {s:?} of {b:#06x} parses back to {:#06x}", back.to_bits());
++        }
++    };
++    cmpb("Display", format!("{g}"));
++    cmpb("Debug", format!("{g:?}"));
++    cmpb("LowerExp", format!("{g:e}"));
++    cmpb("UpperExp", format!("{g:E}"));
++}
++
++/// `FromStr` rounds a decimal to the nearest `f16`/`bf16`. Two kinds of input: a short random
++/// decimal, whose nearest value the oracle gets by parsing it as `f64` (exact enough: a decimal
++/// of ≤ 12 significant digits is never within an `f64` rounding error of an 11-bit midpoint
++/// without being that midpoint) and rounding once; and a *crafted* decimal — the exact decimal
++/// expansion of a midpoint between two adjacent values (a tie, rounds to even), that expansion
++/// with a `1` appended (just above: rounds up), or the 30-digit expansion of the `f64` just
++/// below it (rounds down) — whose answer is known by construction. Parsing via `f32` first
++/// loses the side information for the crafted inputs.
++#[hegel::test]
++fn from_str_rounds_to_nearest(tc: hegel::TestCase) {
++    let fmt = tc.draw(generators::sampled_from(vec![F16, BF16]));
++    let crafted = tc.draw(generators::booleans());
++    let (s, want): (String, u16) = if crafted {
++        let stored = (fmt.prec - 1) as u16;
++        let inf = ((fmt.emax + fmt.bias + 1) as u16) << stored;
++        let lo = tc.draw(finite_bits(fmt));
++        tc.assume((lo & 0x7FFF) + 1 < inf);
++        let hi = (lo & 0x8000) | ((lo & 0x7FFF) + 1);
++        let mid = (exact_value(lo, fmt) + exact_value(hi, fmt)) / 2.0;
++        // `{:.30}` prints an f64 exactly when it has at most 30 fraction bits… a midpoint of a
++        // normal or subnormal 16-bit value has at most 25 (f16) / 134 (bf16) fraction bits, so
++        // use the number of digits the exact expansion needs, capped for bf16 (any decimal
++        // rounded *towards zero* stays on the same side).
++        let exact = |x: f64| -> String {
++            let neg = x < 0.0;
++            let (_, m, e) = decompose_f64(x);
++            // x = m · 2^e; with e < 0 the exact decimal is m·5^(-e) / 10^(-e).
++            let (int, frac) = if e >= 0 {
++                ((m << e).to_string(), String::new())
++            } else {
++                let digits = (-e) as usize;
++                let mut n = m as u128 * 5u128.pow(digits as u32); // may overflow for tiny bf16
++                let mut f = String::new();
++                for _ in 0..digits {
++                    f.insert(0, char::from(b'0' + (n % 10) as u8));
++                    n /= 10;
++                }
++                (n.to_string(), f)
++            };
++            let mut s = String::new();
++            if neg {
++                s.push('-');
++            }
++            s.push_str(&int);
++            if !frac.is_empty() {
++                s.push('.');
++                s.push_str(&frac);
++            }
++            s
++        };
++        // u128 holds m·5^d only for d ≤ ~27 with m up to 2^53; restrict crafted inputs to that.
++        let (_, _, e) = decompose_f64(mid);
++        tc.assume(e >= -27);
++        let even = if lo & 1 == 0 { lo } else { hi };
++        match tc.draw(generators::integers::<u8>().max_value(2)) {
++            0 => (exact(mid), even),
++            1 => {
++                let mut s = exact(mid);
++                if !s.contains('.') {
++                    s.push_str(".0");
++                }
++                s.push('1'); // just above the midpoint in magnitude
++                (s, if mid > 0.0 { hi } else { hi })
++            }
++            _ => {
++                let mut s = exact(mid);
++                if !s.contains('.') {
++                    s.push_str(".0");
++                }
++                // Just below the midpoint in magnitude: shave the last digit down by one after
++                // appending a 9: "…d" → "…(d-1)9…"; simpler: append nothing and replace the
++                // last digit d>0 by d-1 followed by "9".
++                let last = s.pop().unwrap();
++                let d = last.to_digit(10).unwrap();
++                if d == 0 {
++                    // ends in 0 (e.g. "2.0"): take one off the next digit is awkward; use the
++                    // tie instead, which also has a known answer.
++                    s.push(last);
++                    (s, even)
++                } else {
++                    s.push(char::from(b'0' + (d - 1) as u8));
++                    s.push('9');
++                    (s, lo)
++                }
++            }
++        }
++    } else {
++        let neg = tc.draw(generators::booleans());
++        let int: u32 = tc.draw(generators::integers::<u32>().max_value(99_999));
++        let frac: Option<u32> = tc.draw(generators::optional(generators::integers::<u32>().max_value(999_999)));
++        let exp: Option<i32> = tc.draw(generators::optional(generators::integers::<i32>().min_value(-9).max_value(6)));
++        let mut s = String::new();
++        if neg {
++            s.push('-');
++        }
++        s.push_str(&int.to_string());
++        if let Some(f) = frac {
++            s.push_str(&format!(".{f:06}"));
++        }
++        if let Some(e) = exp {
++            s.push_str(&format!("e{e}"));
++        }
++        let x: f64 = s.parse().unwrap();
++        (s.clone(), expected_from_f64(x, fmt).unwrap())
++    };
++    if fmt.prec == 11 {
++        let got: f16 = s.parse().unwrap_or_else(|e| panic!("f16::from_str({s:?}): {e}"));
++        assert_eq!(got.to_bits(), want, "f16::from_str({s:?}) = {got} ({:#06x}) but the nearest f16 is {} ({want:#06x})", got.to_bits(), f16::from_bits(want));
++    } else {
++        let got: bf16 = s.parse().unwrap_or_else(|e| panic!("bf16::from_str({s:?}): {e}"));
++        assert_eq!(got.to_bits(), want, "bf16::from_str({s:?}) = {got} ({:#06x}) but the nearest bf16 is {} ({want:#06x})", got.to_bits(), bf16::from_bits(want));
++    }
++}
