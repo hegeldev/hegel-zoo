@@ -27,3 +27,4 @@
 - 2025-11-22: predecessor base commit `6e75b3c539ef` (chore: Deduplicate vhea parsing (#204)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/ttf-parser.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 6e75b3c539ef → 0c7291223fe9 (2026-08-06, "chore: Temporarily remove publish workflow"; 0.25.1); 3 bug(s) still reproduce; 3 ignored reproducer(s) not run; add/add conflicts in Cargo.toml resolved by keeping both sides. 283 tests pass.
