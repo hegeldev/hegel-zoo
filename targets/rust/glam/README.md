@@ -43,3 +43,4 @@
 - 2026-07-23: predecessor base commit `6feed7d50ee7` (Consolodate some common test code into macros where possible (#756)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/glam.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 6feed7d50ee7 → 2391a343f22b (2026-09-12, "chore: Undo most of PR #836. (#837)"; 0.33.7); 1 bug(s) still reproduce. 3459 tests pass.

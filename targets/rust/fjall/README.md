@@ -39,3 +39,4 @@
 - 2026-07-18: predecessor base commit `6debe706dbc5` (3.1.8).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/fjall.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 6debe706dbc5 → 3adaa50261c9 (2026-08-30, "3.1.10"; 3.1.10); 1 bug(s) still reproduce. 215 tests pass.

@@ -44,3 +44,4 @@ versions. `tools/zoo` reports those as UPSTREAM and does not judge them.
 - 2026-07-22: predecessor base commit `6b2127d9ad99` (Use total_cmp in sweep line interval ordering (#1554)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/geo.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 6b2127d9ad99 → 4b31f1409a56 (2026-09-01, "Fix unsound prefix pruning in the separable distance fast path (#1603)"; 0.33.1); 3 bug(s) still reproduce; add/add conflicts in geo/src/algorithm/convex_hull/test.rs resolved by keeping both sides. 1438 tests pass.

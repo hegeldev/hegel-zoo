@@ -26,3 +26,4 @@
 - 2026-07-18: predecessor base commit `e4a73e22ee00` (bump microlp add mip gap and initial solution (#129)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/good_lp.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped e4a73e22ee00 → 83d030b103d5 (2026-08-31, "docs: clarify determinism guarantees (#137)"; 1.15.3); 1 bug(s) still reproduce. 94 tests pass.
