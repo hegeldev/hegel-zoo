@@ -52,3 +52,4 @@
 - 2026-09-13: base bumped 7debe996ca88 → 85da244320f3 (2026-09-13, "Merge pull request #632 from xtqqczze/lint-fuzz"; 0.16.3); 2 bug(s) still reproduce. 233 tests pass.
 - 2026-09-13: base bumped 85da244320f3 → 932bd45e244d (2026-09-13, "Merge pull request #634 from mgeisler/update_dprint_plugins"; 0.16.3); 2 bug(s) still reproduce. 233 tests pass.
 - 2026-09-13: base bumped 932bd45e244d → 5246c6367058 (2026-09-13, "Merge pull request #638 from mgeisler/release-0.16.4"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
+- 2026-09-13: base bumped 5246c6367058 → 6df2560c0d87 (2026-09-13, "Merge pull request #641 from mgeisler/update-agent-guidelines-tooling"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
