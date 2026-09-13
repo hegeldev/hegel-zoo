@@ -31,3 +31,4 @@
 - 2026-07-05: predecessor base commit `eeb4a9acfd1a` (update contribution rules).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/i_overlay.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped eeb4a9acfd1a → 1e33a352ee3d (2026-09-06, "int range"; 8.1.1); 3 bug(s) still reproduce; fixed upstream: i_overlay/2. 699 tests pass. i_overlay/2 (Frag solver region disagreement) no longer reproduces after upstream's fragment-solver rework; /1 and /3 still do. New zoo finding i_overlay/4: `simplify` with `FillRule::Negative` returns a clockwise outer contour (documented as counterclockwise) — found by `hegel_simplify_is_idempotent` on this bump, pinned by `hegel_pin_simplify_negative_returns_clockwise_outer`.
