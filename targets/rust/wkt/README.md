@@ -29,3 +29,4 @@
 - 2026-01-01: predecessor base commit `85088d9279e5` (Fix doc build (#151)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/wkt.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 85088d9279e5 → be86fc449d17 (2026-09-09, "Bound GeometryCollection nesting depth to prevent stack overflow"; 0.14.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 143 tests pass. wkt/2 (the nested GEOMETRYCOLLECTION stack overflow, an ignored reproducer the bump does not run) was checked by hand and is fixed by this very commit: parsing is bounded at MAX_DEPTH = 128 and returns an error past it.
