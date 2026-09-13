@@ -26,3 +26,4 @@
 - 2026-07-14: predecessor base commit `c8cece05a69a` (Add approx integer parsing error-path test coverage (#466)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/simd-json.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped c8cece05a69a → 61d649d13fae (2026-08-23, "chore: Release simd-json version 0.18.1"; 0.18.1); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 500 tests pass. Upstream adopted simdjson's `DEFAULT_MAX_DEPTH` (1024) in 0.18.1, so `hegel_prop_tape_handles_deep_nesting` now asserts parses below the limit, `DepthLimitExceeded` above it and no crash either way.
