@@ -1,0 +1,1895 @@
+diff --git a/debian-control/Cargo.toml b/debian-control/Cargo.toml
+index 53ad717..1c41cad 100644
+--- a/debian-control/Cargo.toml
++++ b/debian-control/Cargo.toml
+@@ -40,6 +40,7 @@ required-features = ["lossless"]
+ 
+ [dev-dependencies]
+ serde_json = "1.0.148"
++hegeltest = "0.44.1"
+ 
+ [badges]
+ maintenance = { status = "actively-maintained" }
+diff --git a/debian-control/tests/hegel.rs b/debian-control/tests/hegel.rs
+new file mode 100644
+index 0000000..93e9ba9
+--- /dev/null
++++ b/debian-control/tests/hegel.rs
+@@ -0,0 +1,1877 @@
++//! Hegel properties for `debian-control`'s relationship-field parsers (`Depends:` and friends).
++//!
++//! Oracles: dpkg's own `Dpkg::Deps` (Perl, driven as a persistent child: `deps_parse`, the
++//! canonical `output`, `implies` and `get_evaluation` against `Dpkg::Deps::KnownFacts`) and
++//! python-debian's `PkgRelation` (the regexes dak and most Debian tooling use). Alongside:
++//! the lossless round trip of the CST, the lossy parser against the lossless one, every setter
++//! read back through a re-parse, through the accessors on the edited tree and by dpkg, the
++//! `ensure_*` helpers, `wrap_and_sort`, `Ord`/`Eq` consistency and substvars.
++#![allow(clippy::all, dead_code)]
++
++use debian_control::lossless::relations::{Entry, Relation, Relations, DefaultSortingOrder, WrapAndSortOrder};
++use debian_control::lossy::{Relation as LossyRelation, Relations as LossyRelations};
++use debian_control::relations::{BuildProfile, SyntaxKind, VersionConstraint};
++use debversion::Version;
++use hegel::generators;
++use hegel::generators::Generator;
++use serde_json::Value;
++use std::collections::{BTreeMap, BTreeSet};
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// --------------------------------------------------------------------------- oracles
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use Dpkg::Deps; use Dpkg::Deps::KnownFacts; use Dpkg::Arch qw(get_host_arch);
++use JSON::PP;
++$| = 1;
++my $json = JSON::PP->new->canonical;
++sub hx { return pack('H*', shift) }
++sub fields {
++    my $d = shift;
++    return { package => $d->{package}, archqual => $d->{archqual}, relation => $d->{relation},
++             version => (defined $d->{version} ? "$d->{version}" : undef),
++             arches => $d->{arches}, restrictions => $d->{restrictions} };
++}
++sub structure {
++    my $d = shift;
++    my @entries;
++    for my $e ($d->get_deps()) {
++        if ($e->isa('Dpkg::Deps::Simple')) { push @entries, [fields($e)]; }
++        else { push @entries, [ map { fields($_) } $e->get_deps() ]; }
++    }
++    return \@entries;
++}
++sub parse1 {
++    my $text = shift;
++    my $d;
++    my $ok = eval { $d = deps_parse($text, build_dep => 1); 1 };
++    return undef unless $ok && defined $d;
++    return $d;
++}
++sub single { my $d = shift; my @m = $d->get_deps(); return @m == 1 ? $m[0] : $d; }
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, @args) = split / /, $line;
++    my $reply;
++    if ($cmd eq 'P') {
++        my $d = parse1(hx($args[0]));
++        $reply = defined $d ? { ok => JSON::PP::true, output => $d->output, entries => structure($d) }
++                            : { ok => JSON::PP::false };
++    } elsif ($cmd eq 'I') {
++        my $a = parse1(hx($args[0])); my $b = parse1(hx($args[1]));
++        if (!defined $a || !defined $b) { $reply = { ok => JSON::PP::false }; }
++        else {
++            my $r = single($a)->implies(single($b));
++            $reply = { ok => JSON::PP::true, implies => (defined $r ? ($r ? 'y' : 'n') : 'u') };
++        }
++    } elsif ($cmd eq 'E') {
++        my $d = parse1(hx($args[0]));
++        my $facts = Dpkg::Deps::KnownFacts->new();
++        my $arch = get_host_arch();
++        for my $f (split /;/, hx($args[1] // '')) {
++            next unless length $f;
++            my ($p, $v) = split /=/, $f, 2;
++            $facts->add_installed_package($p, $v, $arch, 'allowed');
++        }
++        if (!defined $d) { $reply = { ok => JSON::PP::false }; }
++        else {
++            my $r = $d->get_evaluation($facts);
++            $reply = { ok => JSON::PP::true, satisfied => (defined $r ? ($r ? 'y' : 'n') : 'u') };
++        }
++    } else { $reply = { error => "unknown $cmd" }; }
++    print $json->encode($reply), "\n";
++}
++"#;
++
++const PYTHON_SCRIPT: &str = r#"
++import sys, json
++try:
++    from debian.deb822 import PkgRelation
++    have = True
++except Exception:
++    have = False
++def hx(s):
++    return bytes.fromhex(s).decode('utf-8')
++for line in sys.stdin:
++    cmd, *args = line.rstrip('\n').split(' ')
++    if not have:
++        print(json.dumps({'na': True}), flush=True)
++        continue
++    if cmd == 'R':
++        rels = PkgRelation.parse_relations(hx(args[0]))
++        out = []
++        for e in rels:
++            ents = []
++            for r in e:
++                ents.append({
++                    'name': r['name'], 'archqual': r['archqual'],
++                    'version': list(r['version']) if r['version'] else None,
++                    'arch': [[a.enabled, a.arch] for a in r['arch']] if r['arch'] is not None else None,
++                    'restrictions': [[[t.enabled, t.profile] for t in g] for g in r['restrictions']] if r['restrictions'] is not None else None,
++                })
++            out.append(ents)
++        print(json.dumps({'entries': out, 'str': PkgRelation.str(rels)}), flush=True)
++    else:
++        print(json.dumps({'error': cmd}), flush=True)
++"#;
++
++struct Child2 {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static PERL: OnceLock<Mutex<Child2>> = OnceLock::new();
++static PYTHON: OnceLock<Mutex<Child2>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn spawn(program: &str, args: &[&str]) -> Mutex<Child2> {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("{program} is needed for the oracle: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Mutex::new(Child2 { child, stdin, stdout })
++}
++
++fn ask(which: &'static Mutex<Child2>, cmd: &str, args: &[&str]) -> Value {
++    let mut o = which.lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the oracle exited ({status:?}) on {line:?}");
++    }
++    serde_json::from_str(reply.trim_end_matches(['\n', '\r'])).unwrap_or_else(|e| panic!("bad oracle reply {reply:?}: {e}"))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    PERL.get_or_init(|| spawn("perl", &["-e", PERL_SCRIPT]))
++}
++
++fn python() -> &'static Mutex<Child2> {
++    PYTHON.get_or_init(|| {
++        let python = if std::path::Path::new("/usr/bin/python3").exists() { "/usr/bin/python3" } else { "python3" };
++        spawn(python, &["-u", "-c", PYTHON_SCRIPT])
++    })
++}
++
++/// One simple dependency as dpkg reads it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct Simple {
++    package: String,
++    archqual: Option<String>,
++    version: Option<(String, String)>,
++    arches: Option<Vec<String>>,
++    restrictions: Option<Vec<Vec<String>>>,
++}
++
++#[derive(Debug, Clone)]
++struct Dpkg {
++    output: String,
++    entries: Vec<Vec<Simple>>,
++}
++
++fn jstr(v: &Value) -> Option<String> {
++    v.as_str().map(|s| s.to_string())
++}
++
++/// `Dpkg::Deps::deps_parse($text, build_dep => 1)`; `None` when dpkg cannot parse the text.
++fn dpkg(text: &str) -> Option<Dpkg> {
++    let v = ask(perl(), "P", &[text]);
++    if v["ok"] != Value::Bool(true) {
++        return None;
++    }
++    let entries = v["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|e| {
++            e.as_array()
++                .unwrap()
++                .iter()
++                .map(|s| Simple {
++                    package: jstr(&s["package"]).unwrap(),
++                    archqual: jstr(&s["archqual"]),
++                    version: match (jstr(&s["relation"]), jstr(&s["version"])) {
++                        (Some(r), Some(ver)) => Some((r, ver)),
++                        _ => None,
++                    },
++                    arches: s["arches"].as_array().map(|a| a.iter().map(|x| jstr(x).unwrap()).collect()),
++                    restrictions: s["restrictions"]
++                        .as_array()
++                        .map(|g| g.iter().map(|l| l.as_array().unwrap().iter().map(|x| jstr(x).unwrap()).collect()).collect()),
++                })
++                .collect()
++        })
++        .collect();
++    Some(Dpkg { output: jstr(&v["output"]).unwrap(), entries })
++}
++
++/// `$outer->implies($inner)` in dpkg: `Some(true)`, `Some(false)` or `None` (undecidable).
++fn dpkg_implies(outer: &str, inner: &str) -> Option<Option<bool>> {
++    let v = ask(perl(), "I", &[outer, inner]);
++    if v["ok"] != Value::Bool(true) {
++        return None;
++    }
++    Some(match v["implies"].as_str().unwrap() {
++        "y" => Some(true),
++        "n" => Some(false),
++        _ => None,
++    })
++}
++
++/// `$deps->get_evaluation($facts)` with the given installed packages (host arch, Multi-Arch: allowed).
++fn dpkg_satisfied(text: &str, facts: &BTreeMap<String, String>) -> Option<Option<bool>> {
++    let f: Vec<String> = facts.iter().map(|(k, v)| format!("{k}={v}")).collect();
++    let v = ask(perl(), "E", &[text, &f.join(";")]);
++    if v["ok"] != Value::Bool(true) {
++        return None;
++    }
++    Some(match v["satisfied"].as_str().unwrap() {
++        "y" => Some(true),
++        "n" => Some(false),
++        _ => None,
++    })
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PyRel {
++    name: String,
++    archqual: Option<String>,
++    version: Option<(String, String)>,
++    arch: Option<Vec<(bool, String)>>,
++    restrictions: Option<Vec<Vec<(bool, String)>>>,
++}
++
++/// python-debian's `PkgRelation.parse_relations` and `PkgRelation.str`; `None` without python-debian.
++fn pydebian(text: &str) -> Option<(Vec<Vec<PyRel>>, String)> {
++    let v = ask(python(), "R", &[text]);
++    if v.get("na").is_some() {
++        return None;
++    }
++    let entries = v["entries"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|e| {
++            e.as_array()
++                .unwrap()
++                .iter()
++                .map(|r| PyRel {
++                    name: jstr(&r["name"]).unwrap(),
++                    archqual: jstr(&r["archqual"]),
++                    version: r["version"].as_array().map(|a| (jstr(&a[0]).unwrap(), jstr(&a[1]).unwrap())),
++                    arch: r["arch"].as_array().map(|a| a.iter().map(|x| (x[0].as_bool().unwrap(), jstr(&x[1]).unwrap())).collect()),
++                    restrictions: r["restrictions"].as_array().map(|g| {
++                        g.iter()
++                            .map(|l| l.as_array().unwrap().iter().map(|x| (x[0].as_bool().unwrap(), jstr(&x[1]).unwrap())).collect())
++                            .collect()
++                    }),
++                })
++                .collect()
++        })
++        .collect();
++    Some((entries, jstr(&v["str"]).unwrap()))
++}
++
++// --------------------------------------------------------------------------- generators
++
++fn pick<'a, T: Clone + Send + Sync + std::fmt::Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn chars_from(tc: &hegel::TestCase, alphabet: &str, n: usize) -> String {
++    let chars: Vec<char> = alphabet.chars().collect();
++    (0..n).map(|_| pick(tc, &chars)).collect()
++}
++
++const NAMES: &[&str] = &[
++    "libc6", "python3", "debhelper", "debhelper-compat", "dh-python", "g++", "libstdc++6", "perl", "cdbs",
++    "python3-dulwich", "libgtk-3-0", "gcc-13-base", "zlib1g", "libssl3t64", "rustc", "cargo", "dpkg-dev",
++    "pkg-config", "samba", "libx11-6", "a", "b", "c", "0ad", "x.y", "foo+bar",
++];
++
++/// A package name: `[a-z0-9][a-z0-9+.-]*` (Policy), occasionally with upper case (dpkg accepts it).
++#[hegel::composite]
++fn arb_name(tc: &hegel::TestCase) -> String {
++    match tc.draw(int!(0u8, 5)) {
++        0..=2 => pick(tc, NAMES).to_string(),
++        3 => {
++            let first = chars_from(tc, "abcdefghijklmnopqrstuvwxyz0123456789", 1);
++            let rest = chars_from(tc, "abcdefghijklmnopqrstuvwxyz0123456789+.-", tc.draw(int!(1usize, 8)));
++            first + &rest
++        }
++        4 => chars_from(tc, "abcdefghijklmnopqrstuvwxyz0123456789", 1),
++        _ => {
++            let first = chars_from(tc, "ABCDEFabcdef0123456789", 1);
++            let rest = chars_from(tc, "abcdefXYZ0123456789+.-", tc.draw(int!(0usize, 6)));
++            first + &rest
++        }
++    }
++}
++
++/// A Debian version that `debversion` parses: `[epoch:]upstream[-revision]`.
++#[hegel::composite]
++fn arb_version(tc: &hegel::TestCase) -> String {
++    let mut s = String::new();
++    if tc.draw(int!(0u8, 4)) == 0 {
++        s.push_str(&tc.draw(int!(0u32, 99)).to_string());
++        s.push(':');
++    }
++    let has_revision = tc.draw(int!(0u8, 2)) != 0;
++    s.push_str(&tc.draw(int!(0u32, 999)).to_string());
++    let upstream_alpha = if has_revision { "0123456789abcdefghijklmnopqrstuvwxyz.+~-" } else { "0123456789abcdefghijklmnopqrstuvwxyz.+~" };
++    s.push_str(&chars_from(tc, upstream_alpha, tc.draw(int!(0usize, 8))));
++    if has_revision {
++        s.push('-');
++        s.push_str(&tc.draw(int!(0u32, 99)).to_string());
++        s.push_str(&chars_from(tc, "0123456789abcdefghijklmnopqrstuvwxyz.+~", tc.draw(int!(0usize, 4))));
++    }
++    s
++}
++
++const OPS: &[&str] = &["<<", "<=", "=", ">=", ">>"];
++const ARCHQUALS: &[&str] = &["any", "native", "amd64", "i386", "arm64", "all"];
++const ARCHES: &[&str] = &[
++    "amd64", "i386", "arm64", "armhf", "armel", "ppc64el", "s390x", "riscv64", "mips64el", "linux-any",
++    "any-amd64", "kfreebsd-amd64", "hurd-i386", "any-i386", "x32", "powerpc", "hppa", "sparc64",
++];
++const PROFILES: &[&str] = &["nocheck", "nodoc", "cross", "stage1", "stage2", "noinsttest", "noudeb", "pkg.foo.bar", "nobiarch", "nogolang"];
++
++/// Whitespace where dpkg allows `\s*` (it collapses newlines to a space before parsing).
++fn ws0(tc: &hegel::TestCase) -> &'static str {
++    pick(tc, &["", " ", " ", " ", "  ", "\t", "\n ", "\n\t"])
++}
++
++/// Whitespace where dpkg needs `\s+`.
++fn ws1(tc: &hegel::TestCase) -> &'static str {
++    pick(tc, &[" ", " ", " ", "  ", "\t", "\n "])
++}
++
++/// The generated shape of one simple dependency.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct GenRelation {
++    text: String,
++    name: String,
++    archqual: Option<String>,
++    /// Operator as written (may be the deprecated `<` / `>`) and the version.
++    version: Option<(String, String)>,
++    arches: Option<Vec<String>>,
++    profiles: Option<Vec<Vec<String>>>,
++    /// Kinds of whitespace / shapes dpkg accepts that some parsers of the crate do not.
++    newline: bool,
++    deprecated_op: bool,
++    ws_before_rparen: bool,
++    ws_before_rangle: bool,
++    ws_after_langle: bool,
++}
++
++impl GenRelation {
++    fn normalized_op(&self) -> Option<String> {
++        self.version.as_ref().map(|(op, _)| match op.as_str() {
++            ">" => ">=".to_string(),
++            "<" => "<=".to_string(),
++            o => o.to_string(),
++        })
++    }
++
++    fn negated_arches(&self) -> bool {
++        self.arches.as_ref().is_some_and(|a| a.iter().any(|x| x.starts_with('!')))
++    }
++
++    fn multi_profile_group(&self) -> bool {
++        self.profiles.as_ref().is_some_and(|g| g.iter().any(|l| l.len() > 1))
++    }
++
++    fn profile_groups(&self) -> usize {
++        self.profiles.as_ref().map_or(0, |g| g.len())
++    }
++
++    /// The shape dpkg prints back (`output`) for this relation.
++    fn dpkg_shape(&self) -> String {
++        let mut s = self.name.clone();
++        if let Some(q) = &self.archqual {
++            s.push(':');
++            s.push_str(q);
++        }
++        if let Some((_, ver)) = &self.version {
++            s.push_str(&format!(" ({} {})", self.normalized_op().unwrap(), ver));
++        }
++        if let Some(a) = &self.arches {
++            s.push_str(&format!(" [{}]", a.join(" ")));
++        }
++        if let Some(groups) = &self.profiles {
++            for g in groups {
++                s.push_str(&format!(" <{}>", g.join(" ")));
++            }
++        }
++        s
++    }
++}
++
++#[hegel::composite]
++fn arb_relation(tc: &hegel::TestCase, allow_deprecated: bool) -> GenRelation {
++    let name = tc.draw(arb_name());
++    let archqual = if tc.draw(int!(0u8, 5)) == 0 { Some(pick(tc, ARCHQUALS).to_string()) } else { None };
++    let mut deprecated_op = false;
++    let version = if tc.draw(int!(0u8, 2)) != 0 {
++        let op = if allow_deprecated && tc.draw(int!(0u8, 9)) == 0 {
++            deprecated_op = true;
++            pick(tc, &["<", ">"])
++        } else {
++            pick(tc, OPS)
++        };
++        Some((op.to_string(), tc.draw(arb_version())))
++    } else {
++        None
++    };
++    let arches = if tc.draw(int!(0u8, 4)) == 0 {
++        let n = tc.draw(int!(1usize, 3));
++        let neg = tc.draw(int!(0u8, 2)) == 0;
++        let mut set = BTreeSet::new();
++        for _ in 0..n {
++            set.insert(pick(tc, ARCHES).to_string());
++        }
++        Some(set.into_iter().map(|a| if neg { format!("!{a}") } else { a }).collect::<Vec<_>>())
++    } else {
++        None
++    };
++    let profiles = if tc.draw(int!(0u8, 4)) == 0 {
++        let groups = tc.draw(int!(1usize, 2));
++        Some(
++            (0..groups)
++                .map(|_| {
++                    let n = tc.draw(int!(1usize, 3));
++                    let mut set = BTreeSet::new();
++                    for _ in 0..n {
++                        set.insert(pick(tc, PROFILES).to_string());
++                    }
++                    set.into_iter().map(|p| if tc.draw(int!(0u8, 1)) == 0 { format!("!{p}") } else { p }).collect::<Vec<_>>()
++                })
++                .collect::<Vec<_>>(),
++        )
++    } else {
++        None
++    };
++
++    let mut text = name.clone();
++    let mut ws_before_rparen = false;
++    let mut ws_before_rangle = false;
++    let mut ws_after_langle = false;
++    if let Some(q) = &archqual {
++        text.push(':');
++        text.push_str(q);
++    }
++    if let Some((op, ver)) = &version {
++        text.push_str(ws0(tc));
++        text.push('(');
++        text.push_str(ws0(tc));
++        text.push_str(op);
++        text.push_str(ws0(tc));
++        text.push_str(ver);
++        let w = ws0(tc);
++        ws_before_rparen |= !w.is_empty();
++        text.push_str(w);
++        text.push(')');
++    }
++    if let Some(a) = &arches {
++        text.push_str(ws0(tc));
++        text.push('[');
++        text.push_str(ws0(tc));
++        for (i, x) in a.iter().enumerate() {
++            if i > 0 {
++                text.push_str(ws1(tc));
++            }
++            text.push_str(x);
++        }
++        text.push_str(ws0(tc));
++        text.push(']');
++    }
++    if let Some(groups) = &profiles {
++        for g in groups {
++            text.push_str(if text.ends_with('>') { ws1(tc) } else { ws0(tc) });
++            text.push('<');
++            let w = ws0(tc);
++            ws_after_langle |= !w.is_empty();
++            text.push_str(w);
++            for (i, x) in g.iter().enumerate() {
++                if i > 0 {
++                    text.push_str(ws1(tc));
++                }
++                text.push_str(x);
++            }
++            let w = ws0(tc);
++            ws_before_rangle |= !w.is_empty();
++            text.push_str(w);
++            text.push('>');
++        }
++    }
++    let newline = text.contains('\n');
++    GenRelation { text, name, archqual, version, arches, profiles, newline, deprecated_op, ws_before_rparen, ws_before_rangle, ws_after_langle }
++}
++
++#[derive(Debug, Clone)]
++struct GenRelations {
++    text: String,
++    entries: Vec<Vec<GenRelation>>,
++}
++
++impl GenRelations {
++    fn relations(&self) -> impl Iterator<Item = &GenRelation> {
++        self.entries.iter().flatten()
++    }
++    fn any(&self, f: impl Fn(&GenRelation) -> bool) -> bool {
++        self.relations().any(f)
++    }
++    fn newline(&self) -> bool {
++        self.text.contains('\n')
++    }
++}
++
++/// A whole relationship field: 0–4 entries of 1–3 alternatives, dpkg's whitespace freedoms,
++/// optionally a trailing comma or an empty entry (`a,,b`, which dpkg skips).
++#[hegel::composite]
++fn arb_relations(tc: &hegel::TestCase, allow_deprecated: bool) -> GenRelations {
++    let n = tc.draw(int!(0usize, 4));
++    let mut entries = Vec::new();
++    let mut text = String::new();
++    if tc.draw(int!(0u8, 4)) == 0 {
++        text.push_str(ws1(tc));
++    }
++    for i in 0..n {
++        if i > 0 {
++            text.push_str(ws0(tc));
++            text.push(',');
++            if tc.draw(int!(0u8, 9)) == 0 {
++                text.push_str(ws0(tc));
++                text.push(',');
++            }
++            text.push_str(ws0(tc));
++        }
++        let m = tc.draw(int!(1usize, 3));
++        let mut alts = Vec::new();
++        for j in 0..m {
++            if j > 0 {
++                text.push_str(ws0(tc));
++                text.push('|');
++                text.push_str(ws0(tc));
++            }
++            let r = tc.draw(arb_relation(allow_deprecated).print_as_debug());
++            text.push_str(&r.text);
++            alts.push(r);
++        }
++        entries.push(alts);
++    }
++    if n > 0 && tc.draw(int!(0u8, 9)) == 0 {
++        text.push_str(ws0(tc));
++        text.push(',');
++    }
++    if tc.draw(int!(0u8, 4)) == 0 {
++        text.push_str(ws1(tc));
++    }
++    GenRelations { text, entries }
++}
++
++/// Arbitrary text for the lossless round trip: mutated relations or junk.
++#[hegel::composite]
++fn arb_text(tc: &hegel::TestCase) -> String {
++    let base = tc.draw(arb_relations(true).print_as_debug()).text;
++    match tc.draw(int!(0u8, 3)) {
++        0 => base,
++        1 => {
++            let mut chars: Vec<char> = base.chars().collect();
++            let n = tc.draw(int!(1usize, 3));
++            for _ in 0..n {
++                let c = pick(tc, &['(', ')', '[', ']', '<', '>', '=', '!', ',', '|', ':', '$', '{', '}', '#', ' ', '\n', 'a', '1', '~', '@', '\u{e9}']);
++                if chars.is_empty() || tc.draw(int!(0u8, 1)) == 0 {
++                    let at = tc.draw(int!(0usize, chars.len()));
++                    chars.insert(at, c);
++                } else {
++                    let at = tc.draw(int!(0usize, chars.len() - 1));
++                    chars[at] = c;
++                }
++            }
++            chars.into_iter().collect()
++        }
++        2 => chars_from(tc, "ab1 ,|()[]<>=!:${}#\n\t~.+-", tc.draw(int!(0usize, 20))),
++        _ => format!("{} ${{misc:Depends}}{}", base, pick(tc, &["", ", ${shlibs:Depends}", ",${python3:Depends}"])),
++    }
++}
++
++// --------------------------------------------------------------------------- helpers
++
++fn vc(op: &str) -> VersionConstraint {
++    op.parse().unwrap()
++}
++
++fn profile_strings(p: &[BuildProfile]) -> Vec<String> {
++    p.iter().map(|x| x.to_string()).collect()
++}
++
++/// The crate's view of one lossless relation, in dpkg's terms.
++fn simple_of(r: &Relation) -> Simple {
++    Simple {
++        package: r.try_name().unwrap_or_default(),
++        archqual: r.archqual(),
++        version: r.version().map(|(c, v)| (c.to_string(), v.to_string())),
++        arches: r.architectures().map(|a| a.collect()),
++        restrictions: {
++            let p: Vec<Vec<String>> = r.profiles().map(|g| profile_strings(&g)).collect();
++            if p.is_empty() { None } else { Some(p) }
++        },
++    }
++}
++
++fn lossy_simple_of(r: &LossyRelation) -> Simple {
++    Simple {
++        package: r.name.clone(),
++        archqual: r.archqual.clone(),
++        version: r.version.as_ref().map(|(c, v)| (c.to_string(), v.to_string())),
++        arches: r.architectures.clone(),
++        restrictions: if r.profiles.is_empty() { None } else { Some(r.profiles.iter().map(|g| profile_strings(g)).collect()) },
++    }
++}
++
++fn structure(rels: &Relations) -> Vec<Vec<Simple>> {
++    rels.entries().map(|e| e.relations().map(|r| simple_of(&r)).collect()).collect()
++}
++
++fn lossy_structure(rels: &LossyRelations) -> Vec<Vec<Simple>> {
++    rels.iter().map(|e| e.iter().map(|r| lossy_simple_of(r)).collect()).collect()
++}
++
++/// dpkg's structure with the empty entries the generator wrote (`a,,b`) — dpkg drops them.
++fn gen_structure(g: &GenRelations) -> Vec<Vec<Simple>> {
++    g.entries
++        .iter()
++        .map(|e| {
++            e.iter()
++                .map(|r| Simple {
++                    package: r.name.clone(),
++                    archqual: r.archqual.clone(),
++                    version: r.version.as_ref().map(|(_, v)| (r.normalized_op().unwrap(), v.clone())),
++                    arches: r.arches.clone(),
++                    restrictions: r.profiles.clone(),
++                })
++                .collect()
++        })
++        .collect()
++}
++
++fn canonical(rels: &Relations) -> String {
++    rels.entries()
++        .map(|e| e.relations().map(|r| r.wrap_and_sort().to_string()).collect::<Vec<_>>().join(" | "))
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
++/// Bug debian-control/1: `architectures()` drops the `!` of negated architectures.
++fn hits_negated_arch_bug(g: &GenRelations) -> bool {
++    g.any(|r| r.negated_arches())
++}
++
++/// Bug debian-control/2: the lossy parser's `<...>` loop mishandles whitespace: `<a b>` is split
++/// or rejected, `< a>` opens an empty group, `<a >` is rejected.
++fn hits_lossy_profile_bug(g: &GenRelations) -> bool {
++    g.any(|r| r.multi_profile_group() || r.ws_before_rangle || r.ws_after_langle)
++}
++
++/// Bug debian-control/10: `Relation::cmp` looks at the name and version only.
++fn hits_ord_bug(a: &GenRelation, b: &GenRelation) -> bool {
++    let key = |r: &GenRelation| (r.name.clone(), r.version.clone());
++    let quals = |r: &GenRelation| (r.archqual.clone(), r.arches.clone().map(|a| a.into_iter().collect::<BTreeSet<_>>()), r.profiles.clone());
++    key(a) == key(b) && quals(a) != quals(b)
++}
++
++/// Bug debian-control/17: `set_architectures` / `add_profile` on a relation without such a
++/// list build an immutable node; the next edit inside the entry panics in rowan.
++fn hits_immutable_node_bug(r: &Relation, edit: &Edit) -> bool {
++    (matches!(edit, Edit::SetArchitectures(_)) && r.architectures().is_none())
++        || (matches!(edit, Edit::AddProfile(_)) && r.profiles().count() == 0)
++}
++
++/// Bug debian-control/14: the strict parser rejects whitespace before `)`.
++fn hits_rparen_bug(g: &GenRelations) -> bool {
++    g.any(|r| r.ws_before_rparen)
++}
++
++/// Bug debian-control/3: the lossy parser does not skip newlines inside a relation.
++fn hits_lossy_newline_bug(g: &GenRelations) -> bool {
++    g.any(|r| r.newline)
++}
++
++/// Bug debian-control/12: `version()` unwraps the constraint parse, so any operator text other
++/// than the five spellings (the deprecated `<`/`>`, `=>`, an empty one in `a(a)`) panics.
++fn hits_version_panic_bug(r: &Relation) -> bool {
++    r.syntax()
++        .children()
++        .find(|n| n.kind() == SyntaxKind::VERSION)
++        .and_then(|v| v.children().find(|c| c.kind() == SyntaxKind::CONSTRAINT))
++        .is_some_and(|c| !OPS.contains(&c.to_string().as_str()))
++}
++
++fn lookup(facts: &BTreeMap<String, String>) -> impl Fn(&str) -> Option<Version> + Copy + '_ {
++    move |name: &str| facts.get(name).map(|v| v.parse().unwrap())
++}
++
++// --------------------------------------------------------------------------- parsing
++
++/// Everything dpkg parses, the strict lossless parser parses with the same fields, and the
++/// canonical rendering of each relation is dpkg's.
++#[hegel::test]
++fn relations_parse_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    let Some(d) = dpkg(&g.text) else {
++        panic!("dpkg does not parse the generated text {:?}", g.text);
++    };
++    assert_eq!(d.entries, gen_structure(&g), "the generator's own view of {:?}", g.text);
++    if hits_rparen_bug(&g) {
++        return;
++    }
++    let rels = Relations::from_str(&g.text).unwrap_or_else(|e| panic!("strict parse of {:?} failed: {e}", g.text));
++    if hits_negated_arch_bug(&g) {
++        return;
++    }
++    assert_eq!(structure(&rels), d.entries, "fields of {:?}", g.text);
++    assert_eq!(canonical(&rels), d.output, "canonical rendering of {:?}", g.text);
++    assert_eq!(rels.len(), d.entries.len());
++    for (e, de) in rels.entries().zip(&d.entries) {
++        assert_eq!(e.len(), de.len());
++        assert!(!e.is_empty());
++    }
++}
++
++/// The lossy parser agrees with dpkg and prints dpkg's canonical form.
++#[hegel::test]
++fn lossy_relations_parse_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    let d = dpkg(&g.text).unwrap();
++    if hits_negated_arch_bug(&g) || hits_lossy_profile_bug(&g) || hits_lossy_newline_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let rels = LossyRelations::from_str(&g.text).unwrap_or_else(|e| panic!("lossy parse of {:?} failed: {e}", g.text));
++    assert_eq!(lossy_structure(&rels), d.entries, "lossy fields of {:?}", g.text);
++    assert_eq!(rels.to_string(), d.output, "lossy rendering of {:?}", g.text);
++    let again = LossyRelations::from_str(&rels.to_string()).unwrap();
++    assert_eq!(again, rels, "lossy Display round trip of {:?}", g.text);
++    let d2 = dpkg(&rels.to_string()).unwrap();
++    assert_eq!(d2.entries, d.entries, "dpkg reads the lossy rendering of {:?} differently", g.text);
++}
++
++/// python-debian splits the same text into the same names, qualifiers, versions, architecture
++/// and profile flags.
++#[hegel::test]
++fn relations_split_like_python_debian(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if g.newline() || hits_rparen_bug(&g) {
++        // python-debian's `<.+>` does not span lines (it never sees dpkg's line folding).
++        return;
++    }
++    let Some((py, _)) = pydebian(&g.text) else { return };
++    let rels = Relations::from_str(&g.text).unwrap();
++    let mine: Vec<Vec<PyRel>> = rels
++        .entries()
++        .filter(|e| !e.is_empty())
++        .map(|e| {
++            e.relations()
++                .map(|r| PyRel {
++                    name: r.try_name().unwrap(),
++                    archqual: r.archqual(),
++                    version: r.version().map(|(c, v)| (c.to_string(), v.to_string())),
++                    arch: r.architectures().map(|a| a.map(|x| (true, x)).collect()),
++                    restrictions: {
++                        let p: Vec<Vec<(bool, String)>> = r
++                            .profiles()
++                            .map(|g| {
++                                g.iter()
++                                    .map(|b| match b {
++                                        BuildProfile::Enabled(n) => (true, n.to_lowercase()),
++                                        BuildProfile::Disabled(n) => (false, n.to_lowercase()),
++                                    })
++                                    .collect()
++                            })
++                            .collect();
++                        if p.is_empty() { None } else { Some(p) }
++                    },
++                })
++                .collect()
++        })
++        .collect();
++    // python-debian keeps `a,,b` as an unparsable empty relation; drop those.
++    let py: Vec<Vec<PyRel>> = py.into_iter().filter(|e| !(e.len() == 1 && e[0].name.is_empty())).collect();
++    if hits_negated_arch_bug(&g) {
++        return;
++    }
++    assert_eq!(mine, py, "python-debian's split of {:?}", g.text);
++}
++
++/// Negated architectures are read with their `!` (bug debian-control/1).
++#[hegel::test]
++fn negated_architectures_keep_their_negation(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if !hits_negated_arch_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = Relations::from_str(&g.text).unwrap();
++    assert_eq!(structure(&rels), d.entries, "fields of {:?}", g.text);
++    assert_eq!(canonical(&rels), d.output, "canonical rendering of {:?}", g.text);
++}
++
++/// Whitespace before the closing parenthesis, `pkg (>= 1 )`, parses in both parsers as it does
++/// for dpkg and python-debian (bug debian-control/14).
++#[hegel::test]
++fn whitespace_before_the_closing_parenthesis_is_accepted(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if !hits_rparen_bug(&g) || hits_negated_arch_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = Relations::from_str(&g.text).unwrap_or_else(|e| panic!("strict parse of {:?} failed: {e}", g.text));
++    assert_eq!(structure(&rels), d.entries, "fields of {:?}", g.text);
++    if hits_lossy_profile_bug(&g) || hits_lossy_newline_bug(&g) {
++        return;
++    }
++    let lossy = LossyRelations::from_str(&g.text).unwrap_or_else(|e| panic!("lossy parse of {:?} failed: {e}", g.text));
++    assert_eq!(lossy_structure(&lossy), d.entries, "lossy fields of {:?}", g.text);
++}
++
++/// Negated architectures parse in the lossy parser (bug debian-control/1).
++#[hegel::test]
++fn lossy_parser_reads_negated_architectures(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if !hits_negated_arch_bug(&g) || hits_lossy_profile_bug(&g) || hits_lossy_newline_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = LossyRelations::from_str(&g.text).unwrap_or_else(|e| panic!("lossy parse of {:?} failed: {e}", g.text));
++    assert_eq!(lossy_structure(&rels), d.entries, "lossy fields of {:?}", g.text);
++}
++
++/// `<a b>` is one restriction list for the lossy parser too (bug debian-control/2).
++#[hegel::test]
++fn lossy_parser_keeps_profile_groups_together(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if !hits_lossy_profile_bug(&g) || hits_negated_arch_bug(&g) || hits_lossy_newline_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = LossyRelations::from_str(&g.text).unwrap_or_else(|e| panic!("lossy parse of {:?} failed: {e}", g.text));
++    assert_eq!(lossy_structure(&rels), d.entries, "lossy fields of {:?}", g.text);
++    assert_eq!(rels.to_string(), d.output, "lossy rendering of {:?}", g.text);
++}
++
++/// Newlines inside a relation are whitespace for the lossy parser as for dpkg (bug debian-control/3).
++#[hegel::test]
++fn lossy_parser_treats_newlines_as_whitespace(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if !hits_lossy_newline_bug(&g) || hits_negated_arch_bug(&g) || hits_lossy_profile_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = LossyRelations::from_str(&g.text).unwrap_or_else(|e| panic!("lossy parse of {:?} failed: {e}", g.text));
++    assert_eq!(lossy_structure(&rels), d.entries, "lossy fields of {:?}", g.text);
++}
++
++/// The deprecated `<` and `>` operators dpkg reads as `<=` / `>=` (with a warning) are read
++/// the same way, not rejected or panicked on.
++#[hegel::test]
++fn deprecated_operators_are_read_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(true).print_as_debug());
++    if !g.any(|r| r.deprecated_op) || hits_negated_arch_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = Relations::from_str(&g.text).unwrap_or_else(|e| panic!("strict parse of {:?} failed: {e}", g.text));
++    assert_eq!(structure(&rels), d.entries, "fields of {:?}", g.text);
++}
++
++/// The lossy parser reads the deprecated `<` / `>` as dpkg does (bug debian-control/13).
++#[hegel::test]
++fn lossy_parser_reads_deprecated_operators_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(true).print_as_debug());
++    if !g.any(|r| r.deprecated_op) || hits_negated_arch_bug(&g) || hits_lossy_profile_bug(&g) || hits_lossy_newline_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let d = dpkg(&g.text).unwrap();
++    let rels = LossyRelations::from_str(&g.text).unwrap_or_else(|e| panic!("lossy parse of {:?} failed: {e}", g.text));
++    assert_eq!(lossy_structure(&rels), d.entries, "lossy fields of {:?}", g.text);
++}
++
++/// Operator spellings outside the five (`=>`, `<>`, `>>>`, `==`, `=<`; dpkg reads some as an
++/// operator followed by a strange version) are rejected by the strict parser, or at least do
++/// not make `version()` panic (bug debian-control/12).
++#[hegel::test]
++fn bad_operators_do_not_panic(tc: hegel::TestCase) {
++    let name = tc.draw(arb_name());
++    let op = pick(&tc, &["=>", "<>", ">>>", "==", "=<", "><", "<<<", "<=>", "=="]);
++    let ver = tc.draw(arb_version());
++    let text = format!("{name}{}({}{op}{}{ver})", ws0(&tc), ws0(&tc), ws0(&tc));
++    match Relations::from_str(&text) {
++        Err(_) => {}
++        Ok(rels) => {
++            let r = rels.entries().next().unwrap().relations().next().unwrap();
++            let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.version()));
++            assert!(v.is_ok(), "strict parse accepted {text:?} and version() panicked");
++        }
++    }
++    assert!(LossyRelations::from_str(&text).is_err(), "lossy parse accepted {text:?}");
++}
++
++// --------------------------------------------------------------------------- the CST
++
++/// Any text prints back verbatim from the relaxed parse; when the relaxed parse reports no
++/// errors the accessors work, and the strict parse agrees with the relaxed one on errors.
++#[hegel::test]
++fn the_tree_is_lossless_for_any_text(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let (rels, errors) = Relations::parse_relaxed(&text, true);
++    assert_eq!(rels.to_string(), text, "relaxed parse is not lossless");
++    let (rels2, errors2) = Relations::parse_relaxed(&text, false);
++    assert_eq!(rels2.to_string(), text);
++    let strict = Relations::from_str(&text);
++    assert_eq!(strict.is_ok(), errors2.is_empty(), "strict/relaxed disagree on {text:?}: {errors2:?}");
++    if let Ok(s) = &strict {
++        assert_eq!(s.to_string(), text);
++    }
++    if errors.is_empty() {
++        for e in rels.entries() {
++            for r in e.relations() {
++                let _ = r.try_name();
++                let _ = r.archqual();
++                let _ = r.architectures().map(|a| a.count());
++                let _ = r.profiles().count();
++                if hits_version_panic_bug(&r) {
++                    continue;
++                }
++                let _ = r.version();
++                let _ = r.wrap_and_sort();
++            }
++            let _ = e.len();
++        }
++        let _ = rels.substvars().count();
++        let _ = rels.is_sorted(&DefaultSortingOrder);
++        let _ = rels.is_sorted(&WrapAndSortOrder);
++    }
++}
++
++/// `Entry`/`Relation` `FromStr` are the single-entry / single-relation views of `Relations`.
++#[hegel::test]
++fn entry_and_relation_from_str_are_views(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if hits_rparen_bug(&g) {
++        return;
++    }
++    let rels = Relations::from_str(&g.text).unwrap();
++    for (e, ge) in rels.entries().zip(&g.entries) {
++        let text = e.to_string();
++        let parsed = Entry::from_str(&text).unwrap_or_else(|err| panic!("entry {text:?}: {err}"));
++        assert_eq!(parsed, e);
++        assert_eq!(parsed.len(), ge.len());
++        for (r, gr) in e.relations().zip(ge) {
++            let parsed = Relation::from_str(&r.to_string()).unwrap_or_else(|err| panic!("relation {:?}: {err}", r.to_string()));
++            assert_eq!(parsed, r);
++            assert_eq!(parsed.try_name().as_deref(), Some(gr.name.as_str()));
++        }
++        if ge.len() > 1 {
++            assert!(Relation::from_str(&text).is_err());
++        }
++    }
++    if g.entries.len() > 1 {
++        assert!(Entry::from_str(&g.text).is_err());
++    }
++}
++
++// --------------------------------------------------------------------------- implication
++
++#[hegel::composite]
++fn arb_same_package_pair(tc: &hegel::TestCase) -> (GenRelation, GenRelation) {
++    let mut a = tc.draw(arb_relation(false).print_as_debug());
++    let mut b = tc.draw(arb_relation(false).print_as_debug());
++    b.name = a.name.clone();
++    // Often share the version so the boundary cases (equal versions) are reached.
++    if tc.draw(int!(0u8, 1)) == 0 {
++        if let (Some((_, va)), Some((ob, _))) = (&a.version, &b.version) {
++            b.version = Some((ob.clone(), va.clone()));
++        }
++    }
++    // Sometimes share the qualifiers so that dpkg gets past its superset checks.
++    if tc.draw(int!(0u8, 1)) == 0 {
++        b.archqual = a.archqual.clone();
++        b.arches = a.arches.clone();
++        b.profiles = a.profiles.clone();
++    }
++    for r in [&mut a, &mut b] {
++        r.text = r.dpkg_shape();
++        r.newline = false;
++    }
++    (a, b)
++}
++
++fn plain(r: &GenRelation) -> bool {
++    r.archqual.is_none() && r.arches.is_none() && r.profiles.is_none()
++}
++
++/// `Relation::is_implied_by` claims exactly the implications dpkg's `implies` proves, for
++/// relations without qualifiers (versions only).
++#[hegel::test]
++fn version_implication_agrees_with_dpkg(tc: hegel::TestCase) {
++    let (mut inner, mut outer) = tc.draw(arb_same_package_pair().print_as_debug());
++    for r in [&mut inner, &mut outer] {
++        r.archqual = None;
++        r.arches = None;
++        r.profiles = None;
++        r.text = r.dpkg_shape();
++    }
++    if hits_strict_implication_bug(&inner, &outer) {
++        return;
++    }
++    let d = dpkg_implies(&outer.text, &inner.text).unwrap();
++    let i = Relation::from_str(&inner.text).unwrap();
++    let o = Relation::from_str(&outer.text).unwrap();
++    assert_eq!(i.is_implied_by(&o), d == Some(true), "{:?} implied by {:?}: dpkg says {d:?}", inner.text, outer.text);
++    // A relation implies itself.
++    assert!(i.is_implied_by(&i));
++}
++
++/// Bug debian-control/15: `pkg (>> V)` is not seen to imply `pkg (>= V)`.
++fn hits_strict_implication_bug(inner: &GenRelation, outer: &GenRelation) -> bool {
++    inner.name == outer.name
++        && matches!((&inner.version, &outer.version), (Some((i, vi)), Some((o, vo)))
++            if i == ">=" && o == ">>" && vi.parse::<Version>().unwrap() == vo.parse::<Version>().unwrap())
++}
++
++/// `pkg (>> V)` implies `pkg (>= V)`, as `pkg (<< V)` implies `pkg (<= V)` (bug debian-control/15).
++#[hegel::test]
++fn strictly_greater_implies_at_least(tc: hegel::TestCase) {
++    let name = tc.draw(arb_name());
++    let v = tc.draw(arb_version());
++    let inner_text = format!("{name} (>= {v})");
++    let outer_text = format!("{name} (>> {v})");
++    assert_eq!(dpkg_implies(&outer_text, &inner_text).unwrap(), Some(true));
++    let i = Relation::from_str(&inner_text).unwrap();
++    let o = Relation::from_str(&outer_text).unwrap();
++    assert!(i.is_implied_by(&o), "{inner_text:?} not implied by {outer_text:?}");
++    // The mirror image, which the crate gets right.
++    let i2 = Relation::from_str(&format!("{name} (<= {v})")).unwrap();
++    let o2 = Relation::from_str(&format!("{name} (<< {v})")).unwrap();
++    assert!(i2.is_implied_by(&o2));
++}
++
++/// With architecture qualifiers, architecture lists and build profiles, an implication the
++/// crate claims must be one dpkg proves (bug debian-control/4: qualifiers are ignored).
++#[hegel::test]
++fn qualified_implication_agrees_with_dpkg(tc: hegel::TestCase) {
++    let (inner, outer) = tc.draw(arb_same_package_pair().print_as_debug());
++    if plain(&inner) && plain(&outer) {
++        return;
++    }
++    if inner.negated_arches() || outer.negated_arches() {
++        return;
++    }
++    let d = dpkg_implies(&outer.text, &inner.text).unwrap();
++    let i = Relation::from_str(&inner.text).unwrap();
++    let o = Relation::from_str(&outer.text).unwrap();
++    assert_eq!(i.is_implied_by(&o), d == Some(true), "{:?} implied by {:?}: dpkg says {d:?}", inner.text, outer.text);
++}
++
++/// An alternative group is implied by another only as dpkg proves it: `a` is not implied by
++/// `a | b` (bug debian-control/5).
++#[hegel::test]
++fn entry_implication_agrees_with_dpkg(tc: hegel::TestCase) {
++    let n = tc.draw(int!(2usize, 3));
++    let names: Vec<String> = (0..n).map(|i| format!("{}{i}", tc.draw(arb_name()))).collect();
++    let make = |k: usize| -> (String, Vec<GenRelation>) {
++        let mut rels = Vec::new();
++        for i in 0..k {
++            let mut r = tc.draw(arb_relation(false).print_as_debug());
++            r.name = names[i].clone();
++            r.archqual = None;
++            r.arches = None;
++            r.profiles = None;
++            r.text = r.dpkg_shape();
++            rels.push(r);
++        }
++        (rels.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" | "), rels)
++    };
++    let (inner_text, inner_rels) = make(tc.draw(int!(1usize, names.len())));
++    let (outer_text, outer_rels) = make(tc.draw(int!(1usize, names.len())));
++    if inner_rels.iter().any(|i| outer_rels.iter().any(|o| hits_strict_implication_bug(i, o))) {
++        return;
++    }
++    let d = dpkg_implies(&outer_text, &inner_text).unwrap();
++    let i = Entry::from_str(&inner_text).unwrap();
++    let o = Entry::from_str(&outer_text).unwrap();
++    let claimed = i.is_implied_by(&o);
++    if claimed && d != Some(true) && o.len() > 1 {
++        // Bug debian-control/5: any-to-any instead of dpkg's every-outer-member rule.
++        return;
++    }
++    assert_eq!(claimed, d == Some(true), "{inner_text:?} implied by {outer_text:?}: dpkg says {d:?}");
++}
++
++/// `a (>= 1)` is not implied by `a (>= 2) | b` — installing `b` satisfies the outer entry
++/// without `a` (bug debian-control/5, the crate's own doc example claims the opposite).
++#[hegel::test]
++fn a_single_relation_is_not_implied_by_an_alternative_group(tc: hegel::TestCase) {
++    let a = tc.draw(arb_name());
++    let mut b = tc.draw(arb_name());
++    if b == a {
++        b.push('0');
++    }
++    let inner_text = a.clone();
++    let outer_text = format!("{a} | {b}");
++    let d = dpkg_implies(&outer_text, &inner_text).unwrap();
++    assert_ne!(d, Some(true));
++    let i = Entry::from_str(&inner_text).unwrap();
++    let o = Entry::from_str(&outer_text).unwrap();
++    assert!(!i.is_implied_by(&o), "{inner_text:?} claimed implied by {outer_text:?}");
++    // And therefore ensure_relation must add it.
++    let mut rels = Relations::from_str(&outer_text).unwrap();
++    assert!(rels.ensure_relation(Entry::from_str(&inner_text).unwrap()), "ensure_relation({inner_text:?}) on {outer_text:?} did nothing");
++    assert!(rels.get_relation(&a).is_ok() || rels.iter_relations_for(&a).count() == 2, "{}", rels);
++}
++
++// --------------------------------------------------------------------------- satisfaction
++
++const FACT_NAMES: &[&str] = &["libc6", "python3", "debhelper", "perl", "zlib1g", "rustc", "cargo", "samba"];
++
++#[hegel::composite]
++fn arb_facts(tc: &hegel::TestCase) -> BTreeMap<String, String> {
++    let mut m = BTreeMap::new();
++    for n in FACT_NAMES {
++        if tc.draw(int!(0u8, 1)) == 0 {
++            m.insert(n.to_string(), tc.draw(arb_version()));
++        }
++    }
++    m
++}
++
++/// `satisfied_by` (lossless and lossy) agrees with dpkg's evaluation against installed packages.
++#[hegel::test]
++fn satisfied_by_agrees_with_dpkg(tc: hegel::TestCase) {
++    let facts = tc.draw(arb_facts().print_as_debug());
++    let mut g = tc.draw(arb_relations(false).print_as_debug());
++    // Use the fact names, qualifiers dpkg resolves on this host, and dpkg's shape.
++    let mut text = Vec::new();
++    for e in &mut g.entries {
++        for r in e.iter_mut() {
++            r.name = pick(&tc, FACT_NAMES).to_string();
++            if r.archqual.as_deref().is_some_and(|q| !["any", "native"].contains(&q)) {
++                r.archqual = None;
++            }
++            r.arches = None;
++            r.text = r.dpkg_shape();
++        }
++        text.push(e.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" | "));
++    }
++    let text = text.join(", ");
++    let Some(d) = dpkg_satisfied(&text, &facts) else { panic!("dpkg does not parse {text:?}") };
++    let rels = Relations::from_str(&text).unwrap();
++    let crate_says = rels.satisfied_by(lookup(&facts));
++    assert_eq!(Some(crate_says), d, "{text:?} with {facts:?}: dpkg says {d:?}");
++    let lossy = LossyRelations::from_str(&text).unwrap();
++    assert_eq!(lossy.satisfied_by(lookup(&facts)), crate_says, "lossy satisfied_by of {text:?}");
++    for e in rels.entries() {
++        let any = e.relations().any(|r| Relations::from_str(&r.to_string()).unwrap().satisfied_by(lookup(&facts)));
++        assert_eq!(any, e.satisfied_by(lookup(&facts)));
++    }
++}
++
++// --------------------------------------------------------------------------- editing
++
++#[derive(Debug, Clone)]
++enum Edit {
++    SetVersion(Option<(String, String)>),
++    DropConstraint,
++    SetArchqual(String),
++    SetArchitectures(Vec<String>),
++    AddProfile(Vec<String>),
++    PushAlternative(GenRelation),
++    RemoveRelation,
++    RemoveEntry,
++    PushEntry(GenRelation),
++    InsertEntry(GenRelation),
++    DropDependency(String),
++    AddDependency(GenRelation),
++    EnsureMinimum(String, String),
++    EnsureExact(String, String),
++    EnsureSome(String),
++    Filter(String),
++}
++
++#[hegel::composite]
++fn arb_edit(tc: &hegel::TestCase, names: Vec<String>) -> Edit {
++    let name = |tc: &hegel::TestCase| -> String {
++        if !names.is_empty() && tc.draw(int!(0u8, 1)) == 0 { pick(tc, &names) } else { tc.draw(arb_name()) }
++    };
++    let plain_rel = |tc: &hegel::TestCase| -> GenRelation {
++        let mut r = tc.draw(arb_relation(false).print_as_debug());
++        if tc.draw(int!(0u8, 1)) == 0 {
++            r.name = name(tc);
++        }
++        // Bugs debian-control/1 and /17 have their own pins.
++        r.arches = r.arches.map(|a| a.into_iter().map(|x| x.trim_start_matches('!').to_string()).collect());
++        r.profiles = r.profiles.map(|g| g.into_iter().take(1).collect());
++        r.text = r.dpkg_shape();
++        r
++    };
++    match tc.draw(int!(0u8, 15)) {
++        0 => Edit::SetVersion(if tc.draw(int!(0u8, 4)) == 0 { None } else { Some((pick(tc, OPS).to_string(), tc.draw(arb_version()))) }),
++        1 => Edit::DropConstraint,
++        2 => Edit::SetArchqual(pick(tc, ARCHQUALS).to_string()),
++        3 => {
++            let n = tc.draw(int!(1usize, 3));
++            let mut set = BTreeSet::new();
++            for _ in 0..n {
++                set.insert(pick(tc, ARCHES).to_string());
++            }
++            Edit::SetArchitectures(set.into_iter().collect())
++        }
++        4 => {
++            let n = tc.draw(int!(1usize, 2));
++            let mut set = BTreeSet::new();
++            for _ in 0..n {
++                set.insert(pick(tc, PROFILES).to_string());
++            }
++            Edit::AddProfile(set.into_iter().map(|p| if tc.draw(int!(0u8, 1)) == 0 { format!("!{p}") } else { p }).collect())
++        }
++        5 => Edit::PushAlternative(plain_rel(tc)),
++        6 => Edit::RemoveRelation,
++        7 => Edit::RemoveEntry,
++        8 => Edit::PushEntry(plain_rel(tc)),
++        9 => Edit::InsertEntry(plain_rel(tc)),
++        10 => Edit::DropDependency(name(tc)),
++        11 => Edit::AddDependency(plain_rel(tc)),
++        12 => Edit::EnsureMinimum(name(tc), tc.draw(arb_version())),
++        13 => Edit::EnsureExact(name(tc), tc.draw(arb_version())),
++        14 => Edit::EnsureSome(name(tc)),
++        _ => Edit::Filter(name(tc)),
++    }
++}
++
++fn gen_to_relation(r: &GenRelation) -> Relation {
++    let mut b = Relation::build(&r.name);
++    if let Some((op, v)) = &r.version {
++        b = b.version_constraint(vc(op), v.parse().unwrap());
++    }
++    if let Some(q) = &r.archqual {
++        b = b.archqual(q);
++    }
++    if let Some(a) = &r.arches {
++        b = b.architectures(a.clone());
++    }
++    if let Some(groups) = &r.profiles {
++        b = b.profiles(groups.iter().map(|g| g.iter().map(|p| p.parse().unwrap()).collect()).collect());
++    }
++    b.build()
++}
++
++/// Whether the entry at `idx` has a first relation named `name` alone (the `ensure_*` fast path).
++fn names_of(e: &Entry) -> Vec<String> {
++    e.relations().filter_map(|r| r.try_name()).collect()
++}
++
++/// The generic expectations after any edit: the text re-parses strictly to the same structure the
++/// accessors on the edited tree show, and dpkg reads that structure too.
++fn check_consistent(rels: &Relations, what: &str, before: &str) {
++    let text = rels.to_string();
++    let reparsed = Relations::from_str(&text).unwrap_or_else(|e| panic!("after {what} on {before:?} the text {text:?} does not parse: {e}"));
++    assert_eq!(structure(&reparsed), structure(rels), "after {what} on {before:?}: tree {text:?} differs from its re-parse");
++    let d = dpkg(&text).unwrap_or_else(|| panic!("after {what} on {before:?} dpkg does not parse {text:?}"));
++    assert_eq!(d.entries, structure(rels), "after {what} on {before:?}: dpkg reads {text:?} differently");
++}
++
++/// Bug debian-control/6: `set_version` on a relation with an architecture qualifier writes
++/// `pkg (>= 1):any`.
++fn hits_set_version_archqual_bug(r: &Relation, edit: &Edit) -> bool {
++    matches!(edit, Edit::SetVersion(Some(_))) && r.archqual().is_some() && r.version().is_none()
++}
++
++/// Bug debian-control/8: `add_profile` replaces the existing restriction lists.
++fn hits_add_profile_bug(r: &Relation, edit: &Edit) -> bool {
++    matches!(edit, Edit::AddProfile(_)) && r.profiles().count() > 0
++}
++
++/// Bug debian-control/9: `ensure_minimum_version` / `ensure_exact_version` replace the relation
++/// wholesale, dropping its qualifier, architectures and profiles.
++fn hits_ensure_drops_qualifiers_bug(rels: &Relations, edit: &Edit) -> bool {
++    let name = match edit {
++        Edit::EnsureMinimum(n, _) | Edit::EnsureExact(n, _) => n,
++        _ => return false,
++    };
++    rels.entries().any(|e| {
++        let names = names_of(&e);
++        names.len() == 1 && &names[0] == name && {
++            let r = e.relations().next().unwrap();
++            r.archqual().is_some() || r.architectures().is_some() || r.profiles().count() > 0
++        }
++    })
++}
++
++/// 1–3 random edits on a parsed field; after each, the tree, its re-parse and dpkg agree and
++/// the edit's own promise holds.
++#[hegel::test]
++fn edits_are_read_back(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if hits_negated_arch_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let mut rels = Relations::from_str(&g.text).unwrap();
++    let n = tc.draw(int!(1usize, 3));
++    for _ in 0..n {
++        let names: Vec<String> = rels.entries().flat_map(|e| names_of(&e)).collect();
++        let edit = tc.draw(arb_edit(names.clone()).print_as_debug());
++        let before = rels.to_string();
++        let what = format!("{edit:?}");
++        let count = rels.len();
++        let complex = |name: &str| rels.entries().any(|e| { let ns = names_of(&e); ns.len() > 1 && ns.contains(&name.to_string()) });
++        let target = if count > 0 { Some(tc.draw(int!(0usize, count - 1))) } else { None };
++        match &edit {
++            Edit::SetVersion(_) | Edit::DropConstraint if target.is_some() => {
++                let mut entry = rels.get_entry(target.unwrap()).unwrap();
++                let k = tc.draw(int!(0usize, entry.len() - 1));
++                let mut r = entry.get_relation(k).unwrap();
++                if hits_set_version_archqual_bug(&r, &edit) {
++                    return;
++                }
++                let expected = match &edit {
++                    Edit::SetVersion(Some((op, ver))) => {
++                        r.set_version(Some((vc(op), ver.parse().unwrap())));
++                        Some((vc(op), ver.parse::<Version>().unwrap()))
++                    }
++                    Edit::SetVersion(None) => {
++                        r.set_version(None);
++                        None
++                    }
++                    _ => {
++                        let had = r.version().is_some();
++                        assert_eq!(r.drop_constraint(), had);
++                        None
++                    }
++                };
++                assert_eq!(r.version(), expected, "version() on the edited relation");
++                // The edited relation is the k-th of the entry, in memory.
++                let again = Relations::from_str(&rels.to_string()).unwrap();
++                let rr = again.get_entry(target.unwrap()).unwrap().get_relation(k).unwrap();
++                assert_eq!(rr.version(), expected, "version() after re-parse");
++                let _ = &mut entry;
++            }
++            Edit::SetArchqual(q) if target.is_some() => {
++                let entry = rels.get_entry(target.unwrap()).unwrap();
++                let k = tc.draw(int!(0usize, entry.len() - 1));
++                let mut r = entry.get_relation(k).unwrap();
++                r.set_archqual(q);
++                assert_eq!(r.archqual().as_deref(), Some(q.as_str()));
++                let again = Relations::from_str(&rels.to_string()).unwrap();
++                assert_eq!(again.get_entry(target.unwrap()).unwrap().get_relation(k).unwrap().archqual().as_deref(), Some(q.as_str()));
++            }
++            Edit::SetArchitectures(a) if target.is_some() => {
++                let entry = rels.get_entry(target.unwrap()).unwrap();
++                let k = tc.draw(int!(0usize, entry.len() - 1));
++                let mut r = entry.get_relation(k).unwrap();
++                if hits_immutable_node_bug(&r, &edit) {
++                    return;
++                }
++                r.set_architectures(a.iter().map(|s| s.as_str()));
++                assert_eq!(r.architectures().map(|x| x.collect::<Vec<_>>()), Some(a.clone()));
++                let again = Relations::from_str(&rels.to_string()).unwrap();
++                assert_eq!(again.get_entry(target.unwrap()).unwrap().get_relation(k).unwrap().architectures().map(|x| x.collect::<Vec<_>>()), Some(a.clone()));
++            }
++            Edit::AddProfile(p) if target.is_some() => {
++                let entry = rels.get_entry(target.unwrap()).unwrap();
++                let k = tc.draw(int!(0usize, entry.len() - 1));
++                let mut r = entry.get_relation(k).unwrap();
++                if hits_add_profile_bug(&r, &edit) || hits_immutable_node_bug(&r, &edit) {
++                    return;
++                }
++                let before_groups: Vec<Vec<String>> = r.profiles().map(|g| profile_strings(&g)).collect();
++                let group: Vec<BuildProfile> = p.iter().map(|s| s.parse().unwrap()).collect();
++                r.add_profile(&group);
++                let mut expected = before_groups;
++                expected.push(p.clone());
++                assert_eq!(r.profiles().map(|g| profile_strings(&g)).collect::<Vec<_>>(), expected, "profiles() after add_profile");
++            }
++            Edit::PushAlternative(gr) if target.is_some() => {
++                // Bug debian-control/18.
++                return;
++                #[allow(unreachable_code)]
++                let mut entry = rels.get_entry(target.unwrap()).unwrap();
++                let len = entry.len();
++                entry.push(gen_to_relation(gr));
++                assert_eq!(entry.len(), len + 1);
++                assert_eq!(entry.relations().last().unwrap().try_name().as_deref(), Some(gr.name.as_str()));
++                let again = Relations::from_str(&rels.to_string()).unwrap();
++                assert_eq!(again.get_entry(target.unwrap()).unwrap().len(), len + 1, "{}", rels);
++            }
++            Edit::RemoveRelation if target.is_some() => {
++                let entry = rels.get_entry(target.unwrap()).unwrap();
++                let len = entry.len();
++                if len == 1 {
++                    // Bug debian-control/11.
++                    return;
++                }
++                let k = tc.draw(int!(0usize, len - 1));
++                let expected: Vec<Simple> = entry.relations().enumerate().filter(|(i, _)| *i != k).map(|(_, r)| simple_of(&r)).collect();
++                entry.remove_relation(k);
++                let again = Relations::from_str(&rels.to_string()).unwrap();
++                if len == 1 {
++                    assert_eq!(again.len(), count - 1, "removing the only relation removes the entry: {}", rels);
++                } else {
++                    let e2 = again.get_entry(target.unwrap()).unwrap();
++                    assert_eq!(e2.relations().map(|r| simple_of(&r)).collect::<Vec<_>>(), expected, "{}", rels);
++                }
++            }
++            Edit::RemoveEntry if target.is_some() => {
++                let expected: Vec<Vec<Simple>> = structure(&rels).into_iter().enumerate().filter(|(i, _)| *i != target.unwrap()).map(|(_, e)| e).collect();
++                rels.remove_entry(target.unwrap());
++                assert_eq!(structure(&rels), expected);
++            }
++            Edit::PushEntry(gr) => {
++                let mut expected = structure(&rels);
++                expected.push(vec![simple_of(&gen_to_relation(gr))]);
++                rels.push(Entry::from(gen_to_relation(gr)));
++                assert_eq!(structure(&rels), expected, "{}", rels);
++            }
++            Edit::InsertEntry(gr) => {
++                let at = tc.draw(int!(0usize, count));
++                let mut expected = structure(&rels);
++                expected.insert(at, vec![simple_of(&gen_to_relation(gr))]);
++                rels.insert(at, Entry::from(gen_to_relation(gr)));
++                assert_eq!(structure(&rels), expected, "{}", rels);
++            }
++            Edit::DropDependency(name) => {
++                let expected: Vec<Vec<Simple>> = structure(&rels).into_iter().filter(|e| !(e.len() == 1 && &e[0].package == name)).collect();
++                let found = rels.drop_dependency(name);
++                assert_eq!(found, expected.len() != count);
++                assert_eq!(structure(&rels), expected);
++                assert!(rels.get_relation(name).is_err());
++            }
++            Edit::AddDependency(gr) => {
++                let expected_set: Vec<Simple> = structure(&rels).into_iter().flatten().chain(std::iter::once(simple_of(&gen_to_relation(gr)))).collect();
++                let sorted_before = rels.is_sorted(&WrapAndSortOrder);
++                let default_sorted_before = rels.is_sorted(&DefaultSortingOrder);
++                rels.add_dependency(Entry::from(gen_to_relation(gr)), None);
++                let mut got: Vec<Simple> = structure(&rels).into_iter().flatten().collect();
++                let mut want = expected_set;
++                got.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
++                want.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
++                assert_eq!(got, want);
++                assert!(rels.has_relation(&gr.name));
++                if count >= 2 && sorted_before {
++                    assert!(rels.is_sorted(&WrapAndSortOrder), "add_dependency broke the wrap-and-sort order: {}", rels);
++                } else if count >= 2 && default_sorted_before {
++                    assert!(rels.is_sorted(&DefaultSortingOrder), "add_dependency broke the default order: {}", rels);
++                }
++            }
++            Edit::EnsureMinimum(name, ver) => {
++                if complex(name) || hits_ensure_drops_qualifiers_bug(&rels, &edit) {
++                    return;
++                }
++                let v: Version = ver.parse().unwrap();
++                let previous = rels.get_relation(name).ok().map(|(_, e)| e.relations().next().unwrap().version());
++                rels.ensure_minimum_version(name, &v);
++                let (_, e) = rels.get_relation(name).unwrap_or_else(|err| panic!("{err}: {}", rels));
++                let r = e.relations().next().unwrap();
++                let got = r.version().unwrap();
++                match previous {
++                    Some(Some((VersionConstraint::GreaterThanEqual, old))) if old >= v => assert_eq!(got, (VersionConstraint::GreaterThanEqual, old)),
++                    Some(Some((VersionConstraint::GreaterThan, old))) if old >= v => assert_eq!(got, (VersionConstraint::GreaterThan, old)),
++                    Some(Some((c @ (VersionConstraint::Equal | VersionConstraint::LessThan | VersionConstraint::LessThanEqual), old))) => {
++                        assert_eq!(got, (c, old))
++                    }
++                    _ => assert_eq!(got, (VersionConstraint::GreaterThanEqual, v.clone()), "{}", rels),
++                }
++            }
++            Edit::EnsureExact(name, ver) => {
++                if complex(name) || hits_ensure_drops_qualifiers_bug(&rels, &edit) {
++                    return;
++                }
++                let v: Version = ver.parse().unwrap();
++                rels.ensure_exact_version(name, &v);
++                let (_, e) = rels.get_relation(name).unwrap_or_else(|err| panic!("{err}: {}", rels));
++                assert_eq!(e.relations().next().unwrap().version(), Some((VersionConstraint::Equal, v)), "{}", rels);
++            }
++            Edit::EnsureSome(name) => {
++                if complex(name) {
++                    return;
++                }
++                let before_s = structure(&rels);
++                rels.ensure_some_version(name);
++                if before_s.iter().any(|e| e.len() == 1 && &e[0].package == name) {
++                    assert_eq!(structure(&rels), before_s);
++                } else {
++                    assert_eq!(rels.len(), count + 1);
++                    assert!(rels.get_relation(name).is_ok(), "{}", rels);
++                }
++            }
++            Edit::Filter(name) => {
++                let expected: Vec<Vec<Simple>> = structure(&rels).into_iter().filter(|e| e.iter().any(|r| &r.package == name)).collect();
++                rels.filter_entries(|e| e.relations().any(|r| r.try_name().as_deref() == Some(name)));
++                assert_eq!(structure(&rels), expected);
++            }
++            _ => continue,
++        }
++        check_consistent(&rels, &what, &before);
++    }
++}
++
++/// `set_version` on `pkg:any` writes `pkg:any (>= 1)`, not `pkg (>= 1):any` (bug debian-control/6).
++#[hegel::test]
++fn set_version_keeps_the_qualifier_in_front(tc: hegel::TestCase) {
++    let name = tc.draw(arb_name());
++    let q = pick(&tc, ARCHQUALS);
++    let op = pick(&tc, OPS);
++    let ver: Version = tc.draw(arb_version()).parse().unwrap();
++    let text = format!("{name}:{q}");
++    let mut rels = Relations::from_str(&text).unwrap();
++    let mut r = rels.get_entry(0).unwrap().get_relation(0).unwrap();
++    r.set_version(Some((vc(op), ver.clone())));
++    let out = rels.to_string();
++    assert_eq!(out, format!("{name}:{q} ({op} {ver})"));
++    let d = dpkg(&out).unwrap_or_else(|| panic!("dpkg does not parse {out:?}"));
++    assert_eq!(d.entries[0][0].archqual.as_deref(), Some(q));
++    // The builder takes the same path.
++    let built = Relation::build(&name).archqual(q).version_constraint(vc(op), ver.clone()).build();
++    assert!(dpkg(&built.to_string()).is_some(), "dpkg does not parse the built {:?}", built.to_string());
++}
++
++/// `Entry::from(vec![a, b])` builds a real pipe: removing an alternative afterwards leaves a
++/// clean entry (bug debian-control/7).
++#[hegel::test]
++fn built_entries_have_real_pipes(tc: hegel::TestCase) {
++    let n = tc.draw(int!(2usize, 3));
++    let rels: Vec<GenRelation> = (0..n).map(|_| { let mut r = tc.draw(arb_relation(false).print_as_debug()); r.text = r.dpkg_shape(); r }).collect();
++    let entry = Entry::from(rels.iter().map(gen_to_relation).collect::<Vec<_>>());
++    let text = entry.to_string();
++    assert_eq!(text, rels.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" | "));
++    let k = tc.draw(int!(0usize, n - 1));
++    entry.remove_relation(k);
++    let expected: Vec<String> = rels.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, r)| r.text.clone()).collect();
++    assert_eq!(entry.to_string(), expected.join(" | "), "after removing alternative {k} of {text:?}");
++    let mut e2 = Entry::from(rels.iter().map(gen_to_relation).collect::<Vec<_>>());
++    e2.push(Relation::simple("zzz"));
++    assert_eq!(e2.to_string(), format!("{text} | zzz"));
++}
++
++/// `add_profile` adds a restriction list instead of replacing the existing ones (bug debian-control/8).
++#[hegel::test]
++fn add_profile_adds(tc: hegel::TestCase) {
++    let mut r = tc.draw(arb_relation(false).print_as_debug());
++    r.arches = None;
++    if r.profiles.is_none() {
++        r.profiles = Some(vec![vec![format!("!{}", pick(&tc, PROFILES))]]);
++    }
++    r.text = r.dpkg_shape();
++    let mut rel = Relation::from_str(&r.text).unwrap();
++    let new = vec![BuildProfile::Enabled(pick(&tc, PROFILES).to_string())];
++    rel.add_profile(&new);
++    let mut expected = r.profiles.clone().unwrap();
++    expected.push(profile_strings(&new));
++    assert_eq!(rel.profiles().map(|g| profile_strings(&g)).collect::<Vec<_>>(), expected, "{}", rel);
++}
++
++/// `ensure_minimum_version` / `ensure_exact_version` keep the relation's qualifier,
++/// architectures and profiles (bug debian-control/9).
++#[hegel::test]
++fn ensure_version_keeps_qualifiers(tc: hegel::TestCase) {
++    let mut r = tc.draw(arb_relation(false).print_as_debug());
++    if r.archqual.is_none() && r.arches.is_none() && r.profiles.is_none() {
++        r.archqual = Some("any".into());
++    }
++    if r.negated_arches() {
++        r.arches = None;
++        if r.archqual.is_none() && r.profiles.is_none() {
++            r.archqual = Some("native".into());
++        }
++    }
++    r.text = r.dpkg_shape();
++    let v: Version = tc.draw(arb_version()).parse().unwrap();
++    let exact = tc.draw(int!(0u8, 1)) == 0;
++    let mut rels = Relations::from_str(&r.text).unwrap();
++    if exact {
++        rels.ensure_exact_version(&r.name, &v);
++    } else {
++        rels.ensure_minimum_version(&r.name, &v);
++    }
++    let out = rels.to_string();
++    let d = dpkg(&out).unwrap();
++    let s = &d.entries[0][0];
++    assert_eq!(s.archqual, r.archqual, "qualifier after ensure on {:?}: {out:?}", r.text);
++    assert_eq!(s.arches, r.arches, "architectures after ensure on {:?}: {out:?}", r.text);
++    assert_eq!(s.restrictions, r.profiles, "profiles after ensure on {:?}: {out:?}", r.text);
++}
++
++/// `wrap_and_sort` keeps the relations (as a multiset), leaves them sorted and dpkg reads
++/// the result as it read the input (modulo order).
++#[hegel::test]
++fn wrap_and_sort_keeps_the_relations(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if hits_negated_arch_bug(&g) || hits_rparen_bug(&g) || g.any(|r| r.archqual.is_some()) {
++        return;
++    }
++    let rels = Relations::from_str(&g.text).unwrap();
++    let before: Vec<Vec<Simple>> = structure(&rels).into_iter().filter(|e| !e.is_empty()).collect();
++    let sorted = rels.wrap_and_sort();
++    let out = sorted.to_string();
++    let d = dpkg(&out).unwrap_or_else(|| panic!("dpkg does not parse the sorted {out:?}"));
++    let mut a: Vec<Vec<Simple>> = d.entries.into_iter().map(|mut e| { e.sort_by_key(|s| format!("{s:?}")); e }).collect();
++    let mut b: Vec<Vec<Simple>> = before.into_iter().map(|mut e| { e.sort_by_key(|s| format!("{s:?}")); e }).collect();
++    a.sort_by_key(|e| format!("{e:?}"));
++    b.sort_by_key(|e| format!("{e:?}"));
++    assert_eq!(a, b, "wrap_and_sort changed the relations of {:?}: {out:?}", g.text);
++    assert!(sorted.is_sorted(&DefaultSortingOrder), "not sorted: {out:?}");
++    assert_eq!(out, canonical(&sorted), "wrap_and_sort output is not canonical");
++    assert_eq!(sorted.wrap_and_sort().to_string(), out, "wrap_and_sort is not idempotent");
++}
++
++/// `Ord` for `Relation` and `Entry` is a total order consistent with `Eq` (bug debian-control/10:
++/// `cmp` ignores the qualifiers `eq` compares).
++#[hegel::test]
++fn relation_ordering_is_consistent_with_equality(tc: hegel::TestCase) {
++    let make = || { let mut r = tc.draw(arb_relation(false).print_as_debug()); r.text = r.dpkg_shape(); r };
++    let (ga, gb, gc) = (make(), make(), make());
++    if hits_ord_bug(&ga, &gb) || hits_ord_bug(&gb, &gc) || hits_ord_bug(&ga, &gc) {
++        return;
++    }
++    let (ta, tb, tcx) = (ga.text, gb.text, gc.text);
++    let (a, b, c) = (Relation::from_str(&ta).unwrap(), Relation::from_str(&tb).unwrap(), Relation::from_str(&tcx).unwrap());
++    assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
++    assert_eq!(a.cmp(&b), b.cmp(&a).reverse(), "{a} vs {b}");
++    if a <= b && b <= c {
++        assert!(a <= c, "transitivity: {a} {b} {c}");
++    }
++    assert_eq!(a.cmp(&b) == std::cmp::Ordering::Equal, a == b, "cmp/eq disagree on {a} vs {b}");
++    let ea = Entry::from_str(&format!("{ta} | {tb}")).unwrap();
++    let eb = Entry::from_str(&format!("{tb} | {ta}")).unwrap();
++    assert_eq!(ea.cmp(&eb) == std::cmp::Ordering::Equal, ea == eb, "entries {ea} vs {eb}");
++}
++
++/// Substvars are preserved, listed, ensured once and dropped cleanly.
++#[hegel::test]
++fn substvars_round_trip(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if hits_negated_arch_bug(&g) || hits_rparen_bug(&g) {
++        return;
++    }
++    let var = pick(&tc, &["${misc:Depends}", "${shlibs:Depends}", "${python3:Depends}", "${perl:Depends}"]);
++    let mut rels = Relations::from_str(&g.text).unwrap();
++    assert!(Relations::from_str(&format!("{}, {var}", g.text)).is_err(), "the strict parser accepted a substvar");
++    let n = rels.len();
++    rels.ensure_substvar(var).unwrap();
++    assert_eq!(rels.substvars().collect::<Vec<_>>(), vec![var.to_string()]);
++    let text = rels.to_string();
++    let (again, errors) = Relations::parse_relaxed(&text, true);
++    assert!(errors.is_empty(), "{text:?}: {errors:?}");
++    assert_eq!(again.substvars().collect::<Vec<_>>(), vec![var.to_string()]);
++    assert_eq!(again.len(), n);
++    rels.ensure_substvar(var).unwrap();
++    assert_eq!(rels.to_string(), text, "ensure_substvar is not idempotent");
++    rels.drop_substvar(var);
++    assert_eq!(rels.substvars().count(), 0);
++    assert_eq!(structure(&rels).into_iter().filter(|e| !e.is_empty()).collect::<Vec<_>>(), structure(&Relations::from_str(&g.text).unwrap()).into_iter().filter(|e| !e.is_empty()).collect::<Vec<_>>());
++    if n > 0 {
++        assert!(dpkg(&rels.to_string()).is_some(), "after drop_substvar dpkg does not parse {:?}", rels.to_string());
++    }
++}
++
++/// `Relation::build` / `Relation::new` / the lossy `Relation` builder print what dpkg reads.
++#[hegel::test]
++fn built_relations_are_read_back_by_dpkg(tc: hegel::TestCase) {
++    let mut r = tc.draw(arb_relation(false).print_as_debug());
++    if r.multi_profile_group() || r.profile_groups() > 1 {
++        // Bugs debian-control/2 and /8 cover these shapes.
++        r.profiles = r.profiles.map(|g| vec![vec![g[0][0].clone()]]);
++    }
++    r.text = r.dpkg_shape();
++    let built = gen_to_relation(&r);
++    assert_eq!(built.to_string(), r.text, "lossless builder");
++    let d = dpkg(&built.to_string()).unwrap_or_else(|| panic!("dpkg does not parse the built {:?}", built.to_string()));
++    assert_eq!(d.entries, vec![vec![simple_of(&built)]]);
++    let mut lb = LossyRelation::build(&r.name);
++    if let Some((op, v)) = &r.version {
++        lb = lb.version(vc(op), v);
++    }
++    if let Some(q) = &r.archqual {
++        lb = lb.archqual(q);
++    }
++    if let Some(a) = &r.arches {
++        lb = lb.architectures(a.iter().map(|s| s.as_str()).collect());
++    }
++    if let Some(groups) = &r.profiles {
++        for g in groups {
++            lb = lb.profile(g.iter().map(|p| p.parse().unwrap()).collect());
++        }
++    }
++    let lossy = lb.build();
++    assert_eq!(lossy.to_string(), r.text, "lossy builder");
++    let converted: Relation = lossy.clone().into();
++    assert_eq!(converted.to_string(), r.text, "lossy -> lossless");
++    let back: LossyRelation = built.into();
++    assert_eq!(back, lossy, "lossless -> lossy");
++}
++
++/// Removing the last alternative of an entry removes the entry: `len()` and `entries()` agree
++/// with the text (bug debian-control/11).
++#[hegel::test]
++fn removing_the_last_alternative_removes_the_entry(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if hits_negated_arch_bug(&g) || hits_rparen_bug(&g) || g.entries.is_empty() {
++        return;
++    }
++    let rels = Relations::from_str(&g.text).unwrap();
++    let count = rels.len();
++    let idx = tc.draw(int!(0usize, count - 1));
++    let entry = rels.get_entry(idx).unwrap();
++    let len = entry.len();
++    for _ in 0..len {
++        entry.remove_relation(0);
++    }
++    let text = rels.to_string();
++    let again = Relations::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(rels.len(), again.len(), "len() of the edited tree vs its text {text:?}");
++    assert_eq!(rels.len(), count - 1, "{text:?}");
++    assert_eq!(rels.is_empty(), count == 1);
++}
++
++/// `wrap_and_sort` keeps the architecture qualifier visible: `archqual()` on the result, equality
++/// and a second `wrap_and_sort` (bug debian-control/16).
++#[hegel::test]
++fn wrap_and_sort_keeps_the_qualifier(tc: hegel::TestCase) {
++    let mut r = tc.draw(arb_relation(false).print_as_debug());
++    if r.archqual.is_none() {
++        r.archqual = Some(pick(&tc, ARCHQUALS).to_string());
++    }
++    if r.negated_arches() {
++        r.arches = None;
++    }
++    r.text = r.dpkg_shape();
++    let rel = Relation::from_str(&r.text).unwrap();
++    let sorted = rel.wrap_and_sort();
++    assert_eq!(sorted.to_string(), r.text);
++    assert_eq!(sorted.archqual(), r.archqual, "archqual() after wrap_and_sort of {:?}", r.text);
++    assert_eq!(sorted, rel);
++    assert_eq!(sorted.wrap_and_sort().to_string(), r.text, "second wrap_and_sort of {:?}", r.text);
++    let rels = Relations::from_str(&r.text).unwrap().wrap_and_sort();
++    assert_eq!(rels.wrap_and_sort().to_string(), r.text);
++}
++
++/// `Ord` and `Eq` of `Relation` agree on relations that differ only in their qualifiers
++/// (bug debian-control/10).
++#[hegel::test]
++fn ordering_sees_the_qualifiers_equality_sees(tc: hegel::TestCase) {
++    let mut a = tc.draw(arb_relation(false).print_as_debug());
++    let mut b = a.clone();
++    match tc.draw(int!(0u8, 2)) {
++        0 => {
++            a.arches = Some(vec!["amd64".into()]);
++            b.arches = Some(vec![pick(&tc, &["i386", "arm64"]).to_string()]);
++        }
++        1 => {
++            a.archqual = Some("any".into());
++            b.archqual = Some(pick(&tc, &["native", "amd64"]).to_string());
++        }
++        _ => {
++            a.profiles = Some(vec![vec!["!nocheck".into()]]);
++            b.profiles = Some(vec![vec![pick(&tc, &["nocheck", "!cross"]).to_string()]]);
++        }
++    }
++    for r in [&mut a, &mut b] {
++        r.text = r.dpkg_shape();
++    }
++    let ra = Relation::from_str(&a.text).unwrap();
++    let rb = Relation::from_str(&b.text).unwrap();
++    assert_ne!(ra, rb);
++    assert_ne!(ra.cmp(&rb), std::cmp::Ordering::Equal, "{:?} and {:?} compare Equal but are not equal", a.text, b.text);
++}
++
++/// `set_architectures` and `add_profile` on a relation that has none yet work inside an entry
++/// and allow further edits (bug debian-control/17: an immutable node is spliced in).
++#[hegel::test]
++fn set_architectures_and_add_profile_work_inside_an_entry(tc: hegel::TestCase) {
++    let mut r = tc.draw(arb_relation(false).print_as_debug());
++    r.arches = None;
++    r.profiles = None;
++    r.text = r.dpkg_shape();
++    let other = format!("{}0", tc.draw(arb_name()));
++    let text = if tc.draw(int!(0u8, 1)) == 0 { r.text.clone() } else { format!("{}, {other}", r.text) };
++    let rels = Relations::from_str(&text).unwrap();
++    let mut rel = rels.get_entry(0).unwrap().get_relation(0).unwrap();
++    let arch = pick(&tc, ARCHES).to_string();
++    let profile = pick(&tc, PROFILES).to_string();
++    if tc.draw(int!(0u8, 1)) == 0 {
++        rel.set_architectures(std::iter::once(arch.as_str()));
++        assert_eq!(rel.architectures().map(|a| a.collect::<Vec<_>>()), Some(vec![arch.clone()]));
++        rel.add_profile(&[BuildProfile::Disabled(profile.clone())]);
++    } else {
++        rel.add_profile(&[BuildProfile::Disabled(profile.clone())]);
++        assert_eq!(rel.profiles().map(|g| profile_strings(&g)).collect::<Vec<_>>(), vec![vec![format!("!{profile}")]]);
++        rel.set_architectures(std::iter::once(arch.as_str()));
++    }
++    rel.set_archqual("any");
++    let out = rels.to_string();
++    let d = dpkg(&out).unwrap_or_else(|| panic!("dpkg does not parse {out:?}"));
++    assert_eq!(d.entries[0][0].arches, Some(vec![arch]));
++    assert_eq!(d.entries[0][0].restrictions, Some(vec![vec![format!("!{profile}")]]));
++    assert_eq!(d.entries[0][0].archqual.as_deref(), Some("any"));
++    // A relation built from scratch takes the same path, and so does the builder with two
++    // restriction lists.
++    let mut fresh = Relation::simple(&r.name);
++    fresh.set_architectures(std::iter::once("amd64"));
++    fresh.set_archqual("native");
++    assert_eq!(fresh.to_string(), format!("{}:native [amd64]", r.name));
++    let built = Relation::build(&r.name).profiles(vec![vec![BuildProfile::Disabled("nocheck".into())], vec![BuildProfile::Enabled("cross".into())]]).build();
++    assert_eq!(built.to_string(), format!("{} <!nocheck> <cross>", r.name));
++}
++
++
++/// `Entry::push` on an entry inside a field adds one alternative to that entry and nothing else
++/// (bug debian-control/18: the whole field is nested into the entry and its text duplicated).
++#[hegel::test]
++fn entry_push_inside_a_field_keeps_the_field(tc: hegel::TestCase) {
++    let g = tc.draw(arb_relations(false).print_as_debug());
++    if hits_negated_arch_bug(&g) || hits_rparen_bug(&g) || g.entries.is_empty() {
++        return;
++    }
++    let rels = Relations::from_str(&g.text).unwrap();
++    let idx = tc.draw(int!(0usize, g.entries.len() - 1));
++    let mut r = tc.draw(arb_relation(false).print_as_debug());
++    r.arches = r.arches.map(|a| a.into_iter().map(|x| x.trim_start_matches('!').to_string()).collect());
++    r.profiles = r.profiles.map(|g| g.into_iter().take(1).collect());
++    r.text = r.dpkg_shape();
++    let mut expected = structure(&rels);
++    expected[idx].push(simple_of(&gen_to_relation(&r)));
++    let mut entry = rels.get_entry(idx).unwrap();
++    let len = entry.len();
++    entry.push(gen_to_relation(&r));
++    assert_eq!(entry.len(), len + 1, "entry.len() after push: {}", rels);
++    assert_eq!(rels.len(), g.entries.len(), "field length after push: {}", rels);
++    assert_eq!(structure(&rels), expected, "{}", rels);
++    let d = dpkg(&rels.to_string()).unwrap_or_else(|| panic!("dpkg does not parse {:?}", rels.to_string()));
++    assert_eq!(d.entries, expected, "dpkg reads {:?}", rels.to_string());
++}
