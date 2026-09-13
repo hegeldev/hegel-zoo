@@ -44,3 +44,4 @@
   sliver triangle chooses the closest edge from `|ap|² − |proj|²` per edge, which cancels
   catastrophically in f32, so a point lying on edge *ca* is re-projected onto edge *bc* 2.2e−3
   away. Pinned as an intermittent expected failure.
+- 2026-09-13: base bumped 3609fcc6bffe → 3dbc3d0da390 (2026-09-13, "feat: add an analytic ray-capsule intersection test (#446)"; 0.30.2); 1 bug(s) still reproduce. 645 tests pass.
