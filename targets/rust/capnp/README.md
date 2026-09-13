@@ -30,3 +30,4 @@
 - 2026-07-23: predecessor base commit `d1616946b6a5` (prepare for capnp-rpc-v0.26.2 release).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/capnp.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped d1616946b6a5 → 81bc1b815d0f (2026-09-08, "prepare for capnp-v0.27.2 release"; 0.27.2); 0 bug(s) still reproduce. 95 tests pass.

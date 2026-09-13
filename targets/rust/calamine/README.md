@@ -31,3 +31,4 @@
 - 2026-07-16: predecessor base commit `c53aff3d81a7` (support OOXML format (#681)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/calamine.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped c53aff3d81a7 → 0af05f4f6030 (2026-09-02, "deps: update quick-xml to 0.42.0 (#711)"; 0.36.1); 2 bug(s) still reproduce; fixed upstream: calamine/1. 281 tests pass. calamine/1: `push_column` was rewritten on top of a new `column_name_digits` (0 → "A", 26 → "AA"), with a unit test `test_push_column`; the property now passes.
