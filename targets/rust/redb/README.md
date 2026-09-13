@@ -27,3 +27,4 @@
 - 2026-07-17: predecessor base commit `fe0141159c73` (Sandbox just bench target).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/redb.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped fe0141159c73 → 8f08680d3d40 (2026-09-12, "Update changelog"; 4.2.0); 0 bug(s) still reproduce. 450 tests pass. The patch's `use redb::backends::InMemoryBackend;` was dropped because upstream's test file now imports it at the top.
