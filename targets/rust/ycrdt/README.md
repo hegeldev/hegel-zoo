@@ -45,3 +45,4 @@
 - 2026-07-13: predecessor base commit `67b0513fe6cf` (Merge pull request #638 from Horusiath/release-v0.27.3).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/ycrdt.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 67b0513fe6cf → 37dfed7eaeed (2026-09-09, "Merge pull request #644 from weironz/harden-untrusted-decode"; 0.27.4); 0 bug(s) still reproduce. 399 tests pass.
