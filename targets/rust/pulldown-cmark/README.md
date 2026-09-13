@@ -33,3 +33,4 @@
 - 2026-07-08: predecessor base commit `68afb08c9014` (Merge pull request #1111 from teddytennant/fix-wikilink-overflow).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/pulldown-cmark.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 68afb08c9014 → c51a2a4cd8ed (2026-09-11, "Merge pull request #1146 from mishan/container-fence-backslash"; 0.13.1); 0 bug(s) still reproduce; fixed upstream: pulldown-cmark/1. 1379 tests pass. pulldown-cmark/1 was fixed upstream (parse.rs restricts task list markers to paragraphs and list items), and the pin now passes.
