@@ -45,3 +45,4 @@
 - 2026-09-13: base bumped 3a3d15906f3a → bcf56b29eb32 (2026-09-13, "docs: serde: clarify compatibility guarantees"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 606 tests pass.
 - 2026-09-13: base bumped bcf56b29eb32 → 899eed622bfe (2026-09-13, "fix: engine: apply smaller-log election backoff only while still behind"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 608 tests pass.
 - 2026-09-13: base bumped 899eed622bfe → 13b84490ea05 (2026-09-13, "fix: replication: refresh clock on partial success"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
+- 2026-09-13: base bumped 13b84490ea05 → 15699abf73ca (2026-09-13, "test: openraft: extend watch progress send interval"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
