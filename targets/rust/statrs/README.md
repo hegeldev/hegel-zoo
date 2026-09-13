@@ -25,3 +25,4 @@
 - 2026-07-20: predecessor base commit `102945824c83` (chore: update MSRV lockfile).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/statrs.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1 (`floats().exclude_min(true)` → `min_value_exclusive`).
+- 2026-09-13: base bumped 102945824c83 → 52248ee4f94e (2026-09-07, "fix: return None from Empirical::variance for a single sample"; 0.19.1); 8 bug(s) still reproduce; fixed upstream: statrs/1. 1036 tests pass. statrs/1 was fixed upstream (Gamma::pdf via ln_pdf with a frexp-based product; upstream's regression test is the zoo's case), and statrs/3 and statrs/9 are partially fixed (two of three pins each now pass and were dropped). The bump's runs also reached statrs/7's unwrap through Gamma::inverse_cdf from the two generic cdf/inverse_cdf round-trip properties, now listed as intermittent expected failures for statrs/7.
