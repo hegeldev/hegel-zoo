@@ -30,3 +30,4 @@
 - 2026-07-21: predecessor base commit `bef86dd6826e` (Snowflake: parse CREATE WAREHOUSE (#2388)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/sqlparser.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped bef86dd6826e → b5950628a53d (2026-09-10, "Add NOTICE file (#2496)"; 0.63.0); 1 bug(s) still reproduce. 1528 tests pass.
