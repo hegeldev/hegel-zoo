@@ -1,0 +1,1204 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 49604ae..7bb2e52 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -58,6 +58,8 @@ windows-link = { version = "0.2", optional = true }
+ iana-time-zone = { version = "0.1.45", optional = true, features = ["fallback"] }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++jiff = "0.2"
+ serde_json = { version = "1" }
+ serde_derive = { version = "1", default-features = false }
+ similar-asserts = { version = "2.0.0" }
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..233e965
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,1185 @@
++//! Hegel property tests for `chrono`: the proleptic Gregorian calendar, ISO weeks, timestamps,
++//! `strftime` formatting/parsing, RFC 3339/2822, rounding and `TimeDelta`.
++//!
++//! Oracles: a small calendar model (Howard Hinnant's `days_from_civil`/`civil_from_days`, the ISO
++//! week rules, i128 nanosecond arithmetic) for chrono's whole ±262 143-year range, and the `jiff`
++//! crate — an independent date-time library with its own `strftime`, RFC 2822/3339 codecs and
++//! calendar arithmetic — for years −9999..=9999.
++
++use chrono::{
++    DateTime, Datelike, Days, DurationRound, FixedOffset, Months, NaiveDate, NaiveDateTime,
++    NaiveTime, RoundingError, SubsecRound, TimeDelta, TimeZone, Timelike, Utc, Weekday,
++};
++use hegel::generators;
++use jiff::civil;
++
++// ----------------------------------------------------------------------------------------------
++// the calendar model
++
++/// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm).
++fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
++    let y = if m <= 2 { y - 1 } else { y };
++    let era = y.div_euclid(400);
++    let yoe = y - era * 400;
++    let mp = (m + 9) % 12;
++    let doy = (153 * mp + 2) / 5 + d - 1;
++    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++    era * 146_097 + doe - 719_468
++}
++
++/// The inverse of `days_from_civil`.
++fn civil_from_days(z: i64) -> (i64, i64, i64) {
++    let z = z + 719_468;
++    let era = z.div_euclid(146_097);
++    let doe = z - era * 146_097;
++    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
++    let y = yoe + era * 400;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let d = doy - (153 * mp + 2) / 5 + 1;
++    let m = if mp < 10 { mp + 3 } else { mp - 9 };
++    (if m <= 2 { y + 1 } else { y }, m, d)
++}
++
++fn is_leap(y: i64) -> bool {
++    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
++}
++
++fn days_in_month(y: i64, m: i64) -> i64 {
++    match m {
++        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
++        4 | 6 | 9 | 11 => 30,
++        2 if is_leap(y) => 29,
++        2 => 28,
++        _ => unreachable!(),
++    }
++}
++
++/// ISO weekday, Monday = 1 … Sunday = 7, of a day count since 1970-01-01 (a Thursday).
++fn iso_weekday(days: i64) -> i64 {
++    (days + 3).rem_euclid(7) + 1
++}
++
++fn ordinal(y: i64, m: i64, d: i64) -> i64 {
++    days_from_civil(y, m, d) - days_from_civil(y, 1, 1) + 1
++}
++
++/// Number of ISO weeks in a year: 53 when the year starts on a Thursday, or on a Wednesday and is
++/// leap; 52 otherwise.
++fn iso_weeks_in_year(y: i64) -> i64 {
++    let jan1 = iso_weekday(days_from_civil(y, 1, 1));
++    if jan1 == 4 || (jan1 == 3 && is_leap(y)) { 53 } else { 52 }
++}
++
++/// ISO week-based year and week number.
++fn iso_week(y: i64, m: i64, d: i64) -> (i64, i64) {
++    let wd = iso_weekday(days_from_civil(y, m, d));
++    let week = (ordinal(y, m, d) - wd + 10) / 7;
++    if week < 1 {
++        (y - 1, iso_weeks_in_year(y - 1))
++    } else if week > iso_weeks_in_year(y) {
++        (y + 1, 1)
++    } else {
++        (y, week)
++    }
++}
++
++/// chrono's `%U` (weeks starting Sunday) and `%W` (weeks starting Monday): the number of the
++/// first day of the week on or before the date, counting from the first such day of the year.
++fn week_number(y: i64, m: i64, d: i64, week_starts_sunday: bool) -> i64 {
++    let days = days_from_civil(y, m, d);
++    let wd = iso_weekday(days); // Mon = 1 … Sun = 7
++    let offset = if week_starts_sunday { wd % 7 } else { wd - 1 }; // days since week start
++    (ordinal(y, m, d) - 1 - offset + 7) / 7
++}
++
++// ----------------------------------------------------------------------------------------------
++// generators
++
++macro_rules! printable {
++    ($($t:ident($inner:ty)),*) => {$(
++        #[derive(Clone, Copy, PartialEq, Eq)]
++        struct $t($inner);
++        impl std::fmt::Debug for $t {
++            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                write!(f, "{:?}", self.0)
++            }
++        }
++        impl hegel::PrettyPrintable for $t {
++            fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++                hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++            }
++        }
++    )*};
++}
++
++printable!(D(NaiveDate), T(NaiveTime), Dt(NaiveDateTime), Off(FixedOffset), Delta(TimeDelta));
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++/// A date anywhere in chrono's range, biased to the recent centuries and to year/month edges.
++#[hegel::composite]
++fn arb_date(tc: &hegel::TestCase) -> D {
++    let d = match tc.draw(int!(0u8, 4)) {
++        0 => {
++            let lo = NaiveDate::MIN.num_days_from_ce();
++            let hi = NaiveDate::MAX.num_days_from_ce();
++            NaiveDate::from_num_days_from_ce_opt(tc.draw(int!(lo, hi))).unwrap()
++        }
++        1 => {
++            let y = tc.draw(int!(-9999i32, 9999));
++            let m = tc.draw(int!(1u32, 12));
++            let d = tc.draw(int!(1u32, days_in_month(y as i64, m as i64) as u32));
++            NaiveDate::from_ymd_opt(y, m, d).unwrap()
++        }
++        2 => {
++            let y = tc.draw(int!(1890i32, 2110));
++            let m = tc.draw(int!(1u32, 12));
++            let d = tc.draw(int!(1u32, days_in_month(y as i64, m as i64) as u32));
++            NaiveDate::from_ymd_opt(y, m, d).unwrap()
++        }
++        3 => {
++            // the first or last days of a year
++            let y = tc.draw(int!(-9999i32, 9999));
++            let o = tc.draw(int!(1u32, 4));
++            let n = if is_leap(y as i64) { 366 } else { 365 };
++            let o = if tc.draw(generators::booleans()) { o } else { n + 1 - o };
++            NaiveDate::from_yo_opt(y, o).unwrap()
++        }
++        _ => tc.draw(generators::sampled_from(vec![
++            D(NaiveDate::MIN),
++            D(NaiveDate::MAX),
++            D(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
++            D(NaiveDate::from_ymd_opt(0, 1, 1).unwrap()),
++            D(NaiveDate::from_ymd_opt(0, 12, 31).unwrap()),
++            D(NaiveDate::from_ymd_opt(1, 1, 1).unwrap()),
++            D(NaiveDate::from_ymd_opt(-1, 12, 31).unwrap()),
++            D(NaiveDate::from_ymd_opt(2000, 2, 29).unwrap()),
++            D(NaiveDate::from_ymd_opt(1900, 2, 28).unwrap()),
++            D(NaiveDate::from_ymd_opt(9999, 12, 31).unwrap()),
++            D(NaiveDate::from_ymd_opt(10000, 1, 1).unwrap()),
++            D(NaiveDate::from_ymd_opt(-10000, 1, 1).unwrap()),
++        ])).0,
++    };
++    D(d)
++}
++
++/// A date in jiff's range, −9999..=9999.
++#[hegel::composite]
++fn arb_jiff_date(tc: &hegel::TestCase) -> D {
++    let y = match tc.draw(int!(0u8, 2)) {
++        0 => tc.draw(int!(-9999i32, 9999)),
++        1 => tc.draw(int!(1890i32, 2110)),
++        _ => tc.draw(int!(1i32, 9999)),
++    };
++    let m = tc.draw(int!(1u32, 12));
++    let d = tc.draw(int!(1u32, days_in_month(y as i64, m as i64) as u32));
++    D(NaiveDate::from_ymd_opt(y, m, d).unwrap())
++}
++
++/// A time of day; sometimes a leap second (`nanosecond ≥ 1e9` after second 59) when allowed.
++#[hegel::composite]
++fn arb_time_maybe_leap(tc: &hegel::TestCase, leap: bool) -> T {
++    let h = tc.draw(int!(0u32, 23));
++    let m = tc.draw(int!(0u32, 59));
++    let (s, n) = if leap && tc.draw(generators::weighted_booleans(0.15)) {
++        (59, tc.draw(int!(1_000_000_000u32, 1_999_999_999)))
++    } else {
++        let s = tc.draw(int!(0u32, 59));
++        let n = match tc.draw(int!(0u8, 3)) {
++            0 => 0,
++            1 => tc.draw(int!(0u32, 999)) * 1_000_000,
++            2 => tc.draw(int!(0u32, 999_999)) * 1_000,
++            _ => tc.draw(int!(0u32, 999_999_999)),
++        };
++        (s, n)
++    };
++    T(NaiveTime::from_hms_nano_opt(h, m, s, n).unwrap())
++}
++
++fn arb_time() -> impl hegel::PrintableGenerator<T> {
++    arb_time_maybe_leap(false)
++}
++
++#[hegel::composite]
++fn arb_jiff_datetime(tc: &hegel::TestCase) -> Dt {
++    let D(d) = tc.draw(arb_jiff_date());
++    let T(t) = tc.draw(arb_time());
++    Dt(d.and_time(t))
++}
++
++/// A fixed offset; whole hours, half hours, or any number of seconds below a day.
++#[hegel::composite]
++fn arb_offset(tc: &hegel::TestCase) -> Off {
++    let secs = match tc.draw(int!(0u8, 3)) {
++        0 => 0,
++        1 => tc.draw(int!(-14i32, 14)) * 3600,
++        2 => tc.draw(int!(-27i32, 27)) * 1800,
++        _ => tc.draw(int!(-86399i32, 86399)),
++    };
++    Off(FixedOffset::east_opt(secs).unwrap())
++}
++
++#[hegel::composite]
++fn arb_delta(tc: &hegel::TestCase) -> Delta {
++    let d = match tc.draw(int!(0u8, 4)) {
++        0 => TimeDelta::nanoseconds(tc.draw(int!(-1_000_000_000_000i64, 1_000_000_000_000))),
++        1 => TimeDelta::try_seconds(tc.draw(int!(-100_000_000i64, 100_000_000))).unwrap(),
++        2 => TimeDelta::try_milliseconds(tc.draw(int!(-i64::MAX, i64::MAX))).unwrap(),
++        3 => TimeDelta::new(tc.draw(int!(-10_000_000i64, 10_000_000)), tc.draw(int!(0u32, 999_999_999))).unwrap(),
++        _ => tc.draw(generators::sampled_from(vec![
++            Delta(TimeDelta::zero()),
++            Delta(TimeDelta::MIN),
++            Delta(TimeDelta::MAX),
++            Delta(TimeDelta::nanoseconds(1)),
++            Delta(TimeDelta::nanoseconds(-1)),
++            Delta(TimeDelta::try_days(1).unwrap()),
++            Delta(TimeDelta::try_days(-1).unwrap()),
++            Delta(TimeDelta::nanoseconds(i64::MAX)),
++            Delta(TimeDelta::nanoseconds(i64::MIN)),
++        ])).0,
++    };
++    Delta(d)
++}
++
++fn jiff_date(d: NaiveDate) -> civil::Date {
++    civil::Date::new(d.year() as i16, d.month() as i8, d.day() as i8).unwrap()
++}
++
++fn jiff_datetime(dt: NaiveDateTime) -> civil::DateTime {
++    jiff_date(dt.date()).at(dt.hour() as i8, dt.minute() as i8, dt.second() as i8, dt.nanosecond() as i32)
++}
++
++fn jiff_weekday(w: Weekday) -> civil::Weekday {
++    civil::Weekday::from_monday_one_offset(w.number_from_monday() as i8).unwrap()
++}
++
++fn nanos_of(dt: NaiveDateTime) -> i128 {
++    let days = days_from_civil(dt.year() as i64, dt.month() as i64, dt.day() as i64) as i128;
++    let secs = days * 86_400 + dt.num_seconds_from_midnight() as i128;
++    secs * 1_000_000_000 + dt.nanosecond() as i128
++}
++
++/// jiff's `Timestamp` range is narrower than its civil range (−9999-01-02T01:59:59Z ..=
++/// 9999-12-30T22:00:00Z): whether the instant of `dt` at `off` fits it.
++fn jiff_instant_ok(dt: NaiveDateTime, off: FixedOffset) -> bool {
++    let secs = (nanos_of(dt) - off.local_minus_utc() as i128 * 1_000_000_000).div_euclid(1_000_000_000);
++    (-377_705_023_201..=253_402_207_200).contains(&secs)
++}
++
++/// A jiff timestamp as nanoseconds since the epoch (its second/fraction split truncates toward zero).
++fn jiff_nanos(ts: jiff::Timestamp) -> i128 {
++    ts.as_second() as i128 * 1_000_000_000 + ts.subsec_nanosecond() as i128
++}
++
++fn delta_nanos(d: TimeDelta) -> i128 {
++    d.num_seconds() as i128 * 1_000_000_000 + d.subsec_nanos() as i128
++}
++
++// ----------------------------------------------------------------------------------------------
++// dates
++
++#[hegel::test]
++fn dates_match_the_calendar_model(tc: hegel::TestCase) {
++    let D(d) = tc.draw(arb_date());
++    let (y, m, day) = (d.year() as i64, d.month() as i64, d.day() as i64);
++    let days = days_from_civil(y, m, day);
++    // the day count, both ways
++    assert_eq!(d.num_days_from_ce() as i64, days + 719_163, "{d:?}");
++    assert_eq!(NaiveDate::from_num_days_from_ce_opt(d.num_days_from_ce()), Some(d));
++    assert_eq!(civil_from_days(days), (y, m, day));
++    // components
++    assert_eq!(d.ordinal() as i64, ordinal(y, m, day), "{d:?}");
++    assert_eq!(d.ordinal0() + 1, d.ordinal());
++    assert_eq!(d.month0() + 1, d.month());
++    assert_eq!(d.day0() + 1, d.day());
++    assert_eq!(d.leap_year(), is_leap(y), "{d:?}");
++    assert_eq!(d.weekday().number_from_monday() as i64, iso_weekday(days), "{d:?}");
++    assert_eq!(d.weekday().num_days_from_monday() + 1, d.weekday().number_from_monday());
++    assert_eq!(d.weekday().number_from_sunday() as i64, iso_weekday(days) % 7 + 1, "{d:?}");
++    assert_eq!(d.quarter(), (d.month() - 1) / 3 + 1);
++    let (iy, iw) = iso_week(y, m, day);
++    assert_eq!((d.iso_week().year() as i64, d.iso_week().week() as i64), (iy, iw), "{d:?}");
++    assert_eq!(d.iso_week().week0() + 1, d.iso_week().week());
++    // constructors agree
++    assert_eq!(NaiveDate::from_ymd_opt(d.year(), d.month(), d.day()), Some(d));
++    assert_eq!(NaiveDate::from_yo_opt(d.year(), d.ordinal()), Some(d));
++    assert_eq!(NaiveDate::from_isoywd_opt(d.iso_week().year(), d.iso_week().week(), d.weekday()), Some(d), "{d:?}");
++    assert_eq!(NaiveDate::from_ymd_opt(d.year(), d.month(), days_in_month(y, m) as u32 + 1), None, "{d:?}");
++    assert_eq!(NaiveDate::from_yo_opt(d.year(), if is_leap(y) { 367 } else { 366 }), None);
++    assert_eq!(NaiveDate::from_yo_opt(d.year(), 0), None);
++    assert_eq!(NaiveDate::from_ymd_opt(d.year(), 13, 1), None);
++    assert_eq!(NaiveDate::from_ymd_opt(d.year(), d.month(), 0), None);
++    // the nth weekday of the month
++    let nth = (d.day() - 1) / 7 + 1;
++    assert_eq!(NaiveDate::from_weekday_of_month_opt(d.year(), d.month(), d.weekday(), nth as u8), Some(d), "{d:?}");
++    let last_such = day + 7 * ((days_in_month(y, m) - day) / 7);
++    assert_eq!(
++        NaiveDate::from_weekday_of_month_opt(d.year(), d.month(), d.weekday(), nth as u8 + ((last_such - day) / 7) as u8 + 1),
++        None,
++        "{d:?}: no weekday of the month after the last"
++    );
++    // neighbours
++    assert_eq!(d.succ_opt().map(|n| n.num_days_from_ce()), if d == NaiveDate::MAX { None } else { Some(d.num_days_from_ce() + 1) });
++    assert_eq!(d.pred_opt().map(|n| n.num_days_from_ce()), if d == NaiveDate::MIN { None } else { Some(d.num_days_from_ce() - 1) });
++    // setters: `with_*` behaves like the constructor with one component replaced
++    for ny in [d.year() - 1, d.year() + 1, 2000, 1900, 2024] {
++        assert_eq!(d.with_year(ny), NaiveDate::from_ymd_opt(ny, d.month(), d.day()), "{d:?} with_year {ny}");
++    }
++    for nm in 1..=12u32 {
++        assert_eq!(d.with_month(nm), NaiveDate::from_ymd_opt(d.year(), nm, d.day()), "{d:?} with_month {nm}");
++    }
++    for nd in [1u32, 28, 29, 30, 31, 32] {
++        assert_eq!(d.with_day(nd), NaiveDate::from_ymd_opt(d.year(), d.month(), nd), "{d:?} with_day {nd}");
++    }
++    for no in [1u32, 59, 60, 365, 366, 367] {
++        assert_eq!(d.with_ordinal(no), NaiveDate::from_yo_opt(d.year(), no), "{d:?} with_ordinal {no}");
++    }
++    assert_eq!(d.with_month0(d.month0()), Some(d));
++    assert_eq!(d.with_day0(d.day0()), Some(d));
++    assert_eq!(d.with_ordinal0(d.ordinal0()), Some(d));
++    // formatting: the ISO date, sign-prefixed outside 0..=9999, round-trips through `FromStr`
++    let text = d.to_string();
++    assert_eq!(text.parse::<NaiveDate>(), Ok(d), "{text}");
++    assert_eq!(format!("{d:?}"), text);
++    let expected = if (0..=9999).contains(&d.year()) {
++        format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day())
++    } else {
++        format!("{:+05}-{:02}-{:02}", d.year(), d.month(), d.day())
++    };
++    assert_eq!(text, expected);
++    assert_eq!(d.format("%Y-%m-%d").to_string(), expected);
++    assert_eq!(d.format("%F").to_string(), expected);
++    assert_eq!(NaiveDate::parse_from_str(&text, "%Y-%m-%d"), Ok(d));
++    // week numbers
++    assert_eq!(d.format("%U").to_string(), format!("{:02}", week_number(y, m, day, true)), "{d:?}");
++    assert_eq!(d.format("%W").to_string(), format!("{:02}", week_number(y, m, day, false)), "{d:?}");
++    assert_eq!(d.format("%j").to_string(), format!("{:03}", d.ordinal()));
++    assert_eq!(d.format("%u %w").to_string(), format!("{} {}", d.weekday().number_from_monday(), d.weekday().num_days_from_sunday()));
++    assert_eq!(d.format("%V").to_string(), format!("{iw:02}"));
++    if (0..=9999).contains(&iy) {
++        assert_eq!(d.format("%G").to_string(), format!("{iy:04}"));
++        assert_eq!(NaiveDate::parse_from_str(&d.format("%G-W%V-%u").to_string(), "%G-W%V-%u"), Ok(d), "{d:?}");
++    }
++    if (0..=9999).contains(&d.year()) {
++        assert_eq!(d.format("%C%y").to_string(), format!("{:04}", d.year()));
++        assert_eq!(NaiveDate::parse_from_str(&d.format("%Y-%j").to_string(), "%Y-%j"), Ok(d));
++        assert_eq!(NaiveDate::parse_from_str(&d.format("%A, %B %e, %Y").to_string(), "%A, %B %e, %Y"), Ok(d), "{d:?}");
++        assert_eq!(NaiveDate::parse_from_str(&d.format("%a %b %d %Y").to_string(), "%a %b %d %Y"), Ok(d), "{d:?}");
++        assert_eq!(NaiveDate::parse_from_str(&d.format("%v").to_string(), "%v"), Ok(d), "{d:?}");
++        assert_eq!(NaiveDate::parse_from_str(&d.format("%Y%m%d").to_string(), "%Y%m%d"), Ok(d), "{d:?}");
++        // a wrong weekday is rejected
++        let other = d.succ_opt().unwrap_or(d.pred_opt().unwrap());
++        let wrong = format!("{} {}", other.format("%a"), d.format("%F"));
++        assert!(NaiveDate::parse_from_str(&wrong, "%a %F").is_err(), "{wrong}");
++    }
++}
++
++/// `iter_days`/`iter_weeks` "step across all representable dates" starting from `self`: from
++/// `k` days before `NaiveDate::MAX` that is `k + 1` days and `k / 7 + 1` weeks. The day iterator
++/// stops before `MAX`, the week iterator before the last representable week. KNOWN FAILURE
++/// chrono/4.
++#[hegel::test]
++fn iterators_start_from_the_date_itself(tc: hegel::TestCase) {
++    let D(d) = tc.draw(arb_date());
++    let k = tc.draw(int!(0u64, 60));
++    assert_eq!(d.iter_days().next(), Some(d), "{d:?}");
++    assert_eq!(d.iter_weeks().next(), Some(d), "{d:?}");
++    let near = NaiveDate::MAX.checked_sub_days(Days::new(k)).unwrap();
++    assert_eq!(near.iter_days().count() as u64, k + 1, "{near:?}: days up to MAX");
++    assert_eq!(near.iter_weeks().count() as u64, k / 7 + 1, "{near:?}: weeks up to MAX");
++    assert_eq!(near.iter_weeks().last(), near.checked_add_days(Days::new(k / 7 * 7)), "{near:?}: the last week");
++}
++
++#[hegel::test]
++fn date_arithmetic_matches_the_model(tc: hegel::TestCase) {
++    let D(d) = tc.draw(arb_date());
++    let D(e) = tc.draw(arb_date());
++    let n = match tc.draw(int!(0u8, 2)) {
++        0 => tc.draw(int!(0u64, 100)),
++        1 => tc.draw(int!(0u64, 200_000_000)),
++        _ => tc.draw(generators::integers::<u64>()),
++    };
++    let months = tc.draw(int!(0u32, 4_000_000));
++    let days = days_from_civil(d.year() as i64, d.month() as i64, d.day() as i64);
++    let lo = NaiveDate::MIN.num_days_from_ce() as i64 - 719_163;
++    let hi = NaiveDate::MAX.num_days_from_ce() as i64 - 719_163;
++    // days
++    let expect = |target: i128| -> Option<NaiveDate> {
++        if target < lo as i128 || target > hi as i128 {
++            None
++        } else {
++            let (y, m, dd) = civil_from_days(target as i64);
++            Some(NaiveDate::from_ymd_opt(y as i32, m as u32, dd as u32).unwrap())
++        }
++    };
++    assert_eq!(d.checked_add_days(Days::new(n)), expect(days as i128 + n as i128), "{d:?} + {n} days");
++    assert_eq!(d.checked_sub_days(Days::new(n)), expect(days as i128 - n as i128), "{d:?} - {n} days");
++    if let Ok(signed) = i64::try_from(n) {
++        assert_eq!(d.checked_add_signed(TimeDelta::try_days(signed).unwrap_or(TimeDelta::MAX)), if TimeDelta::try_days(signed).is_some() { expect(days as i128 + n as i128) } else { None });
++        assert_eq!(d.checked_sub_signed(TimeDelta::try_days(signed).unwrap_or(TimeDelta::MAX)), if TimeDelta::try_days(signed).is_some() { expect(days as i128 - n as i128) } else { None });
++    }
++    // differences
++    let edays = days_from_civil(e.year() as i64, e.month() as i64, e.day() as i64);
++    assert_eq!(d.signed_duration_since(e), TimeDelta::try_days(days - edays).unwrap(), "{d:?} - {e:?}");
++    assert_eq!(d - e, TimeDelta::try_days(days - edays).unwrap());
++    assert_eq!(e + (d - e), d);
++    assert_eq!(d.cmp(&e), days.cmp(&edays));
++    // months: the month index moves, the day is clamped to the target month
++    let expect_months = |delta: i64| -> Option<NaiveDate> {
++        let index = d.year() as i64 * 12 + (d.month() as i64 - 1) + delta;
++        let (y, m) = (index.div_euclid(12), index.rem_euclid(12) + 1);
++        if y < NaiveDate::MIN.year() as i64 || y > NaiveDate::MAX.year() as i64 {
++            return None;
++        }
++        let dd = (d.day() as i64).min(days_in_month(y, m));
++        NaiveDate::from_ymd_opt(y as i32, m as u32, dd as u32)
++    };
++    assert_eq!(d.checked_add_months(Months::new(months)), expect_months(months as i64), "{d:?} + {months} months");
++    assert_eq!(d.checked_sub_months(Months::new(months)), expect_months(-(months as i64)), "{d:?} - {months} months");
++    // iterators (near MAX: `iterators_start_from_the_date_itself`)
++    let step = (n % 5) as usize;
++    if (hi - days) as usize >= 7 * step {
++        let by_days: Vec<NaiveDate> = d.iter_days().take(step).collect();
++        assert_eq!(by_days, (0..step as i128).filter_map(|i| expect(days as i128 + i)).collect::<Vec<_>>(), "{d:?} days");
++        let by_weeks: Vec<NaiveDate> = d.iter_weeks().take(step).collect();
++        assert_eq!(by_weeks, (0..step as i128).filter_map(|i| expect(days as i128 + 7 * i)).collect::<Vec<_>>(), "{d:?} weeks");
++        let back: Vec<NaiveDate> = d.iter_days().take(step).rev().collect();
++        assert_eq!(back, by_days.iter().rev().copied().collect::<Vec<_>>(), "{d:?} reversed");
++    }
++    // the day count checks the same range
++    assert_eq!(NaiveDate::from_num_days_from_ce_opt(NaiveDate::MAX.num_days_from_ce()).is_some(), true);
++    assert_eq!(NaiveDate::from_num_days_from_ce_opt(NaiveDate::MAX.num_days_from_ce().checked_add(1).unwrap()), None);
++    assert_eq!(NaiveDate::from_num_days_from_ce_opt(NaiveDate::MIN.num_days_from_ce() - 1), None);
++}
++
++#[hegel::test]
++fn dates_agree_with_jiff(tc: hegel::TestCase) {
++    let D(d) = tc.draw(arb_jiff_date());
++    let D(e) = tc.draw(arb_jiff_date());
++    let n = tc.draw(int!(-4_000_000i64, 4_000_000));
++    let months = tc.draw(int!(-120_000i32, 120_000));
++    let j = jiff_date(d);
++    assert_eq!(d.weekday().number_from_monday() as i8, j.weekday().to_monday_one_offset(), "{d:?}");
++    assert_eq!(d.ordinal() as i16, j.day_of_year(), "{d:?}");
++    assert_eq!(d.leap_year(), j.in_leap_year());
++    let iso = j.iso_week_date();
++    assert_eq!((d.iso_week().year() as i16, d.iso_week().week() as i8), (iso.year(), iso.week()), "{d:?}");
++    assert_eq!(jiff_weekday(d.weekday()), iso.weekday());
++    assert_eq!(
++        d.with_day(1).map(jiff_date),
++        Some(j.first_of_month()),
++    );
++    assert_eq!(
++        d.checked_add_months(Months::new(1)).and_then(|x| x.with_day(1)).and_then(|x| x.pred_opt()).map(jiff_date),
++        Some(j.last_of_month()),
++        "{d:?}: last of month"
++    );
++    let in_jiff = |x: &NaiveDate| (-9999..=9999).contains(&x.year());
++    assert_eq!(d.succ_opt().filter(in_jiff).map(jiff_date), j.tomorrow().ok(), "{d:?}");
++    assert_eq!(d.pred_opt().filter(in_jiff).map(jiff_date), j.yesterday().ok(), "{d:?}");
++    // day arithmetic, within jiff's range
++    let plus = d.checked_add_signed(TimeDelta::try_days(n).unwrap()).filter(|x| (-9999..=9999).contains(&x.year()));
++    assert_eq!(plus.map(jiff_date), j.checked_add(jiff::Span::new().try_days(n).unwrap()).ok(), "{d:?} + {n} days");
++    // month arithmetic: both clamp the day to the target month
++    let plus = if months >= 0 { d.checked_add_months(Months::new(months as u32)) } else { d.checked_sub_months(Months::new(months.unsigned_abs())) };
++    let plus = plus.filter(|x| (-9999..=9999).contains(&x.year()));
++    assert_eq!(plus.map(jiff_date), j.checked_add(jiff::Span::new().try_months(months).unwrap()).ok(), "{d:?} + {months} months");
++    // differences in days
++    let je = jiff_date(e);
++    assert_eq!(d.signed_duration_since(e).num_days(), i64::from(j.since(je).unwrap().get_days()), "{d:?} - {e:?}");
++    // the nth weekday of the month
++    let nth = ((d.day() - 1) / 7 + 1) as i8;
++    assert_eq!(j.nth_weekday_of_month(nth, jiff_weekday(d.weekday())).unwrap(), j);
++    for k in 1..=5u8 {
++        let c = NaiveDate::from_weekday_of_month_opt(d.year(), d.month(), d.weekday(), k);
++        let jj = j.nth_weekday_of_month(k as i8, jiff_weekday(d.weekday())).ok();
++        assert_eq!(c.map(jiff_date), jj, "{d:?}: weekday {k}");
++    }
++    // ISO week date round trip in jiff's terms
++    let from_iso = civil::Date::from_iso_week_date(civil::ISOWeekDate::new(d.iso_week().year() as i16, d.iso_week().week() as i8, jiff_weekday(d.weekday())).unwrap());
++    assert_eq!(from_iso, j);
++}
++
++// ----------------------------------------------------------------------------------------------
++// times
++
++#[hegel::test]
++fn times_match_the_model(tc: hegel::TestCase) {
++    let T(t) = tc.draw(arb_time_maybe_leap(true));
++    let T(u) = tc.draw(arb_time_maybe_leap(true));
++    let (h, m, s, n) = (t.hour(), t.minute(), t.second(), t.nanosecond());
++    assert_eq!(t.num_seconds_from_midnight(), h * 3600 + m * 60 + s);
++    assert_eq!(NaiveTime::from_num_seconds_from_midnight_opt(t.num_seconds_from_midnight(), n), Some(t));
++    assert_eq!(NaiveTime::from_hms_nano_opt(h, m, s, n), Some(t));
++    assert_eq!(NaiveTime::from_hms_micro_opt(h, m, s, n / 1000).map(|x| x.nanosecond()), Some(n / 1000 * 1000));
++    assert_eq!(NaiveTime::from_hms_milli_opt(h, m, s, n / 1_000_000).map(|x| x.nanosecond()), Some(n / 1_000_000 * 1_000_000));
++    assert_eq!(NaiveTime::from_hms_opt(h, m, s), Some(t.with_nanosecond(0).unwrap()));
++    // the validity rules
++    assert_eq!(NaiveTime::from_hms_nano_opt(24, m, s, n), None);
++    assert_eq!(NaiveTime::from_hms_nano_opt(h, 60, s, n), None);
++    assert_eq!(NaiveTime::from_hms_nano_opt(h, m, 60, n), None);
++    assert_eq!(NaiveTime::from_hms_nano_opt(h, m, s, 2_000_000_000), None);
++    assert_eq!(NaiveTime::from_hms_nano_opt(h, m, s, 1_000_000_000).is_some(), s == 59, "leap only after :59");
++    // (`with_nanosecond` documents that a leap second "can theoretically follow any whole second")
++    assert!(t.with_nanosecond(1_500_000_000).is_some());
++    assert_eq!(t.with_nanosecond(2_000_000_000), None);
++    assert_eq!(t.with_second(60), None);
++    assert_eq!(t.with_minute(60), None);
++    assert_eq!(t.with_hour(24), None);
++    // the nominal position in the day, in nanoseconds; a leap second is `:59` plus a second
++    let pos = |x: NaiveTime| x.num_seconds_from_midnight() as i64 * 1_000_000_000 + x.nanosecond() as i64;
++    let is_leap = |x: NaiveTime| x.nanosecond() >= 1_000_000_000;
++    assert_eq!(t.cmp(&u), (t.num_seconds_from_midnight(), t.nanosecond()).cmp(&(u.num_seconds_from_midnight(), u.nanosecond())), "{t:?} vs {u:?}");
++    // differences assume the leap second seen is the only one in the day: everything after it is
++    // a second later than its nominal position (two leap seconds are outside the contract)
++    if !(is_leap(t) && is_leap(u)) {
++        let since = t.signed_duration_since(u);
++        let mut expected = (pos(t) - pos(u)) as i128;
++        if is_leap(t) && u.num_seconds_from_midnight() > t.num_seconds_from_midnight() {
++            expected -= 1_000_000_000;
++        }
++        if is_leap(u) && t.num_seconds_from_midnight() > u.num_seconds_from_midnight() {
++            expected += 1_000_000_000;
++        }
++        assert_eq!(delta_nanos(since), expected, "{t:?} - {u:?}");
++        assert_eq!(t - u, since);
++        assert_eq!(delta_nanos(u.signed_duration_since(t)), -expected, "{u:?} - {t:?}");
++    }
++    let Delta(delta) = tc.draw(arb_delta());
++    let (sum, wrapped_secs) = t.overflowing_add_signed(delta);
++    // without leap seconds the sum is the plain wrap-around; with one, the leap nanos count
++    if n < 1_000_000_000 {
++        let total = pos(t) as i128 + delta_nanos(delta);
++        let day = 86_400i128 * 1_000_000_000;
++        let expect = total.rem_euclid(day);
++        assert_eq!(pos(sum) as i128, expect, "{t:?} + {delta:?}");
++        assert_eq!(wrapped_secs, total.div_euclid(day) as i64 * 86_400, "{t:?} + {delta:?}: seconds in the days wrapped");
++        assert_eq!(t.overflowing_sub_signed(delta).1, -(pos(t) as i128 - delta_nanos(delta)).div_euclid(day) as i64 * 86_400, "{t:?} - {delta:?}");
++        assert_eq!(t + delta, sum);
++        assert_eq!(sum - delta, t, "{t:?} + {delta:?} - {delta:?}");
++    }
++    // formatting: `:60` for a leap second, and every precision reads back
++    let text = t.format("%H:%M:%S%.f").to_string();
++    let expected_secs = if n >= 1_000_000_000 { 60 } else { s };
++    let frac = n % 1_000_000_000;
++    let expected_frac = if frac == 0 {
++        String::new()
++    } else if frac % 1_000_000 == 0 {
++        format!(".{:03}", frac / 1_000_000)
++    } else if frac % 1_000 == 0 {
++        format!(".{:06}", frac / 1_000)
++    } else {
++        format!(".{frac:09}")
++    };
++    assert_eq!(text, format!("{h:02}:{m:02}:{expected_secs:02}{expected_frac}"), "{t:?}");
++    assert_eq!(NaiveTime::parse_from_str(&text, "%H:%M:%S%.f"), Ok(t), "{text}");
++    assert_eq!(t.to_string(), text);
++    assert_eq!(text.parse::<NaiveTime>(), Ok(t));
++    assert_eq!(t.format("%T").to_string(), format!("{h:02}:{m:02}:{expected_secs:02}"));
++    assert_eq!(t.format("%.3f").to_string(), format!(".{:03}", frac / 1_000_000));
++    assert_eq!(t.format("%.6f").to_string(), format!(".{:06}", frac / 1_000));
++    assert_eq!(t.format("%.9f").to_string(), format!(".{frac:09}"));
++    assert_eq!(t.format("%3f%6f%9f").to_string(), format!("{:03}{:06}{:09}", frac / 1_000_000, frac / 1_000, frac));
++    assert_eq!(NaiveTime::parse_from_str(&t.format("%H:%M:%S%.9f").to_string(), "%H:%M:%S%.9f"), Ok(t));
++    assert_eq!(NaiveTime::parse_from_str(&t.format("%T.%9f").to_string(), "%T.%f"), Ok(t), "{t:?}");
++    let trunc_ms = t.with_nanosecond(n / 1_000_000 * 1_000_000).unwrap();
++    assert_eq!(NaiveTime::parse_from_str(&t.format("%T%.3f").to_string(), "%T%.3f"), Ok(trunc_ms), "{t:?}");
++    // 12-hour clock
++    let text12 = t.format("%I:%M:%S %p").to_string();
++    let hour12 = if h % 12 == 0 { 12 } else { h % 12 };
++    assert_eq!(text12, format!("{hour12:02}:{m:02}:{expected_secs:02} {}", if h < 12 { "AM" } else { "PM" }));
++    assert_eq!(NaiveTime::parse_from_str(&text12, "%I:%M:%S %p"), Ok(t.with_nanosecond(n / 1_000_000_000 * 1_000_000_000).unwrap()), "{text12}");
++    assert_eq!(t.hour12(), (h >= 12, hour12));
++    assert_eq!(t.format("%l:%M %P").to_string(), format!("{hour12:>2}:{m:02} {}", if h < 12 { "am" } else { "pm" }));
++    assert_eq!(t.format("%k").to_string(), format!("{h:>2}"));
++    assert_eq!(t.format("%-H %-M %-S").to_string(), format!("{h} {m} {expected_secs}"));
++    assert_eq!(NaiveTime::parse_from_str(&t.format("%R").to_string(), "%R"), Ok(NaiveTime::from_hms_opt(h, m, 0).unwrap()));
++}
++
++/// `%f` is documented as "the number of nanoseconds since the last whole second", not padded:
++/// "7μs is formatted as `7000` with `%f`", the table shows `26490000`. KNOWN FAILURE chrono/3.
++#[hegel::test]
++fn nanosecond_count_is_printed_as_documented(tc: hegel::TestCase) {
++    let T(t) = tc.draw(arb_time());
++    let frac = t.nanosecond() % 1_000_000_000;
++    assert_eq!(t.format("%f").to_string(), format!("{frac}"), "{t:?}");
++}
++
++// ----------------------------------------------------------------------------------------------
++// date-times, timestamps, offsets
++
++#[hegel::test]
++fn timestamps_agree_with_jiff_and_the_model(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    if !jiff_instant_ok(dt, FixedOffset::east_opt(0).unwrap()) {
++        return;
++    }
++    let nanos = nanos_of(dt);
++    let secs = nanos.div_euclid(1_000_000_000) as i64;
++    let sub = nanos.rem_euclid(1_000_000_000) as u32;
++    // UTC timestamps
++    let utc = dt.and_utc();
++    assert_eq!(utc.timestamp(), secs, "{dt:?}");
++    assert_eq!(utc.timestamp_subsec_nanos(), sub);
++    assert_eq!(utc.timestamp_millis() as i128, nanos.div_euclid(1_000_000));
++    assert_eq!(utc.timestamp_micros() as i128, nanos.div_euclid(1_000));
++    assert_eq!(utc.timestamp_nanos_opt().map(i128::from), i64::try_from(nanos).ok().map(i128::from), "{dt:?}");
++    assert_eq!(DateTime::<Utc>::from_timestamp(secs, sub), Some(utc));
++    assert_eq!(DateTime::<Utc>::from_timestamp_millis(utc.timestamp_millis()), Some(utc.with_nanosecond(sub / 1_000_000 * 1_000_000).unwrap()));
++    assert_eq!(DateTime::<Utc>::from_timestamp_micros(utc.timestamp_micros()), Some(utc.with_nanosecond(sub / 1_000 * 1_000).unwrap()));
++    if let Some(ns) = utc.timestamp_nanos_opt() {
++        assert_eq!(DateTime::<Utc>::from_timestamp_nanos(ns), utc);
++    }
++    assert_eq!(DateTime::<Utc>::from_timestamp(secs, 1_000_000_000).is_some(), dt.second() == 59, "leap nanos in from_timestamp");
++    assert_eq!(DateTime::<Utc>::from_timestamp(secs, 2_000_000_000), None);
++    // jiff: the same instant has the same civil fields
++    let ts = jiff::Timestamp::new(secs, sub as i32).unwrap();
++    let jdt = ts.to_zoned(jiff::tz::TimeZone::UTC).datetime();
++    assert_eq!(jdt, jiff_datetime(dt), "{dt:?}");
++    assert_eq!(jiff_datetime(dt).to_zoned(jiff::tz::TimeZone::UTC).unwrap().timestamp(), ts);
++    // in a fixed offset: local = utc + offset
++    let local = utc.with_timezone(&off);
++    assert_eq!(local.timestamp(), secs, "the instant is the same");
++    assert_eq!(local, utc);
++    assert_eq!(local.naive_utc(), dt);
++    assert_eq!(nanos_of(local.naive_local()) - nanos, off.local_minus_utc() as i128 * 1_000_000_000, "{dt:?} in {off:?}");
++    assert_eq!(local.offset().local_minus_utc(), off.local_minus_utc());
++    assert_eq!(local.to_utc(), utc);
++    assert_eq!(local.fixed_offset(), local);
++    let jz = ts.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(off.local_minus_utc()).unwrap()));
++    assert_eq!(jz.datetime(), jiff_datetime(local.naive_local()), "{dt:?} in {off:?}");
++    // building from the local side
++    let back = off.from_local_datetime(&local.naive_local()).single().expect("fixed offsets are unambiguous");
++    assert_eq!(back, local);
++    assert_eq!(local.naive_local().and_local_timezone(off).unwrap(), local);
++    assert_eq!(off.from_utc_datetime(&dt), local);
++    // offsets
++    assert_eq!(FixedOffset::east_opt(off.local_minus_utc()), Some(off));
++    assert_eq!(FixedOffset::west_opt(-off.local_minus_utc()), Some(off));
++    assert_eq!(FixedOffset::east_opt(86_400), None);
++    assert_eq!(FixedOffset::east_opt(-86_400), None);
++    assert_eq!(off.utc_minus_local(), -off.local_minus_utc());
++    let o = off.local_minus_utc();
++    let sign = if o < 0 { '-' } else { '+' };
++    let (oh, om, os) = (o.abs() / 3600, o.abs() % 3600 / 60, o.abs() % 60);
++    let shown = if os == 0 { format!("{sign}{oh:02}:{om:02}") } else { format!("{sign}{oh:02}:{om:02}:{os:02}") };
++    assert_eq!(off.to_string(), shown, "Display of an offset");
++    assert_eq!(format!("{off:?}"), shown);
++    // `%z`/`%:z` round the seconds to the nearest minute (never to 24:00), `%:::z` truncates to
++    // hours, `%::z` prints the seconds
++    let rounded = ((o.abs() + 30) / 60).min(24 * 60 - 1);
++    let (rh, rm) = (rounded / 60, rounded % 60);
++    assert_eq!(local.format("%z").to_string(), format!("{sign}{rh:02}{rm:02}"), "{off:?}");
++    assert_eq!(local.format("%:z").to_string(), format!("{sign}{rh:02}:{rm:02}"), "{off:?}");
++    assert_eq!(local.format("%::z").to_string(), format!("{sign}{oh:02}:{om:02}:{os:02}"), "{off:?}");
++    assert_eq!(local.format("%:::z").to_string(), format!("{sign}{oh:02}"), "{off:?}");
++    assert_eq!(local.format("%s").to_string(), secs.to_string());
++    // Display / Debug / FromStr of a DateTime<FixedOffset> and <Utc>
++    let text = local.to_string();
++    assert_eq!(text, format!("{} {}", local.naive_local(), off), "Display is the local time and the offset");
++    if off.local_minus_utc() % 60 == 0 {
++        // (an offset with seconds prints as `+hh:mm:ss`, which the RFC 3339-like `FromStr` does not read)
++        assert_eq!(text.parse::<DateTime<FixedOffset>>(), Ok(local), "{text}");
++        assert_eq!(format!("{local:?}").parse::<DateTime<FixedOffset>>(), Ok(local), "{local:?}");
++    }
++    assert_eq!(utc.to_string().parse::<DateTime<Utc>>(), Ok(utc));
++    assert_eq!(format!("{utc:?}").parse::<DateTime<Utc>>(), Ok(utc));
++    assert_eq!(format!("{dt:?}").parse::<NaiveDateTime>(), Ok(dt));
++    // (`Display` of a NaiveDateTime uses a space, `FromStr` is documented as the `Debug` format
++    // with the `T`; the two are not a round trip)
++    assert_eq!(NaiveDateTime::parse_from_str(&dt.to_string(), "%Y-%m-%d %H:%M:%S%.f"), Ok(dt));
++    // ordering across offsets follows the instant
++    let Off(off2) = tc.draw(arb_offset());
++    let other = utc.with_timezone(&off2);
++    assert_eq!(local.cmp(&other), std::cmp::Ordering::Equal);
++    let later = utc + TimeDelta::nanoseconds(1);
++    assert!(later.with_timezone(&off2) > local);
++}
++
++#[hegel::test]
++fn datetime_arithmetic_matches_the_model(tc: hegel::TestCase) {
++    let D(d) = tc.draw(arb_date());
++    let T(t) = tc.draw(arb_time());
++    let dt = d.and_time(t);
++    let Delta(delta) = tc.draw(arb_delta());
++    let Dt(other) = tc.draw(arb_jiff_datetime());
++    let nanos = nanos_of(dt);
++    let lo = nanos_of(NaiveDateTime::MIN);
++    let hi = nanos_of(NaiveDateTime::MAX);
++    let expect = |target: i128| -> Option<NaiveDateTime> {
++        if target < lo || target > hi {
++            return None;
++        }
++        let days = target.div_euclid(86_400 * 1_000_000_000);
++        let rest = target.rem_euclid(86_400 * 1_000_000_000);
++        let (y, m, dd) = civil_from_days(days as i64);
++        let date = NaiveDate::from_ymd_opt(y as i32, m as u32, dd as u32)?;
++        Some(date.and_time(NaiveTime::from_num_seconds_from_midnight_opt((rest / 1_000_000_000) as u32, (rest % 1_000_000_000) as u32).unwrap()))
++    };
++    let sum = dt.checked_add_signed(delta);
++    assert_eq!(sum, expect(nanos + delta_nanos(delta)), "{dt:?} + {delta:?}");
++    assert_eq!(dt.checked_sub_signed(delta), expect(nanos - delta_nanos(delta)), "{dt:?} - {delta:?}");
++    if let Some(sum) = sum {
++        assert_eq!(dt + delta, sum);
++        assert_eq!(sum - delta, dt);
++        assert_eq!(sum.signed_duration_since(dt), delta);
++        assert_eq!(sum - dt, delta);
++        assert_eq!(dt.and_utc() + delta, sum.and_utc());
++        assert_eq!((sum.and_utc() - dt.and_utc()), delta);
++    }
++    assert_eq!(delta_nanos(dt.signed_duration_since(other)), nanos - nanos_of(other), "{dt:?} - {other:?}");
++    assert_eq!(dt.cmp(&other), nanos.cmp(&nanos_of(other)));
++    // whole days and months go through the date
++    let n = tc.draw(int!(0u64, 1_000_000_000));
++    assert_eq!(dt.checked_add_days(Days::new(n)), d.checked_add_days(Days::new(n)).map(|x| x.and_time(t)));
++    assert_eq!(dt.checked_sub_days(Days::new(n)), d.checked_sub_days(Days::new(n)).map(|x| x.and_time(t)));
++    let months = tc.draw(int!(0u32, 10_000_000));
++    assert_eq!(dt.checked_add_months(Months::new(months)), d.checked_add_months(Months::new(months)).map(|x| x.and_time(t)));
++    assert_eq!(dt.checked_sub_months(Months::new(months)), d.checked_sub_months(Months::new(months)).map(|x| x.and_time(t)));
++    // std::time::Duration too
++    let std_dur = std::time::Duration::new(n, (n % 1_000_000_000) as u32);
++    let via_std = dt.checked_add_signed(TimeDelta::from_std(std_dur).unwrap_or(TimeDelta::MAX)).filter(|_| TimeDelta::from_std(std_dur).is_ok());
++    assert_eq!(dt.and_utc().checked_add_signed(TimeDelta::from_std(std_dur).unwrap_or(TimeDelta::MAX)).filter(|_| TimeDelta::from_std(std_dur).is_ok()).map(|x| x.naive_utc()), via_std);
++    assert_eq!(dt.date(), d);
++    assert_eq!(dt.time(), t);
++    assert_eq!(NaiveDateTime::new(d, t), dt);
++    assert_eq!(d.and_hms_nano_opt(t.hour(), t.minute(), t.second(), t.nanosecond()), Some(dt));
++}
++
++// ----------------------------------------------------------------------------------------------
++// strftime, differential against jiff and round trips
++
++/// Specifiers whose formatting both libraries define the same way (no locale, no `%.f` family,
++/// no `%Z`/`%+`/`%v`; `%C` is zero-padded to two digits by chrono and not padded by jiff; `%:::z`
++/// drops the minutes in chrono and prints them when non-zero in jiff; `%s` of a time before the epoch
++/// with a fraction is the floor in chrono and truncated toward zero in jiff).
++const SHARED_SPECIFIERS: &[&str] = &[
++    "%Y", "%y", "%m", "%b", "%B", "%h", "%d", "%e", "%a", "%A", "%w", "%u", "%U", "%W", "%G", "%g",
++    "%V", "%j", "%D", "%F", "%H", "%k", "%I", "%l", "%P", "%p", "%M", "%S", "%R", "%T", "%z", "%:z", "%::z",
++    "%q", "%t", "%n", "%%", "%-d", "%_d", "%0e", "%-m", "%_m", "%-j", "%_j", "%-H", "%_H",
++    "%_I", "%-S", "%-y", "%-e", "%0k", "%0l", "%_j",
++];
++
++#[hegel::composite]
++fn arb_format(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(1u8, 8));
++    let mut f = String::new();
++    for i in 0..n {
++        if i > 0 {
++            f.push_str(tc.draw(generators::sampled_from(vec![" ", "-", ":", "/", "T", ", ", "|", "", "  ", "x"])));
++        }
++        f.push_str(tc.draw(generators::sampled_from(SHARED_SPECIFIERS.to_vec())));
++    }
++    f
++}
++
++#[hegel::test]
++fn strftime_agrees_with_jiff(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    if dt.year() < 1 {
++        // both libraries print years below 1 differently (`-0001` vs `-000001`); keep to CE years
++        return;
++    }
++    // chrono's `%z` family drops the seconds of an offset, jiff prints them: whole minutes only
++    let off = FixedOffset::east_opt(off.local_minus_utc() / 60 * 60).unwrap();
++    if !jiff_instant_ok(dt, off) {
++        return;
++    }
++    let local = dt.and_local_timezone(off).unwrap();
++    let jz = jiff_datetime(dt).to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(off.local_minus_utc()).unwrap())).unwrap();
++    for spec in SHARED_SPECIFIERS {
++        let c = local.format(spec).to_string();
++        let j = jiff::fmt::strtime::format(spec, &jz).unwrap_or_else(|e| panic!("jiff can't format {spec}: {e}"));
++        assert_eq!(c, j, "{spec} of {local:?}");
++    }
++    let fmt = tc.draw(arb_format());
++    let c = local.format(&fmt).to_string();
++    let j = jiff::fmt::strtime::format(&fmt, &jz).unwrap();
++    assert_eq!(c, j, "{fmt:?} of {local:?}");
++    // the naive value formats the same for everything but the offset specifiers
++    if !fmt.contains('z') {
++        assert_eq!(dt.format(&fmt).to_string(), c);
++        assert_eq!(jiff::fmt::strtime::format(&fmt, jiff_datetime(dt)).unwrap(), c);
++    }
++}
++
++/// Formats that pin down a whole `NaiveDateTime` (to the second), and their round trip in both
++/// libraries from chrono's text.
++const COMPLETE_FORMATS: &[&str] = &[
++    "%Y-%m-%d %H:%M:%S",
++    "%Y-%m-%dT%H:%M:%S",
++    "%F %T",
++    "%Y-%j %T",
++    "%G-W%V-%u %T",
++    "%Y %m %d %I:%M:%S %p",
++    "%Y %m %d %I:%M:%S %P",
++    "%a, %d %b %Y %T",
++    "%A %B %e %Y %k:%M:%S",
++    "%d/%m/%Y %H:%M:%S",
++    "%Y%m%d%H%M%S",
++    "%e %h %Y %l:%M:%S %p",
++    "%Y-%m-%d %H:%M:%S %j %u",
++    "%s",
++];
++
++#[hegel::test]
++fn strftime_round_trips(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    if dt.year() < 1 {
++        return;
++    }
++    let whole = dt.with_nanosecond(0).unwrap();
++    let fmt = tc.draw(generators::sampled_from(COMPLETE_FORMATS.to_vec()));
++    if fmt == "%s" && whole.and_utc().timestamp() < 0 {
++        return; // KNOWN FAILURE chrono/2, `negative_unix_timestamps_parse`
++    }
++    let text = whole.format(fmt).to_string();
++    assert_eq!(NaiveDateTime::parse_from_str(&text, fmt), Ok(whole), "{fmt:?} → {text:?}");
++    let parsed = jiff::fmt::strtime::parse(fmt, &text).unwrap_or_else(|e| panic!("jiff can't parse {text:?} with {fmt:?}: {e}"));
++    let jdt = if fmt == "%s" { parsed.to_timestamp().unwrap().to_zoned(jiff::tz::TimeZone::UTC).datetime() } else { parsed.to_datetime().unwrap() };
++    assert_eq!(jdt, jiff_datetime(whole), "{fmt:?} → {text:?} in jiff");
++    // with fractions
++    let text = dt.format("%Y-%m-%d %H:%M:%S%.f").to_string();
++    assert_eq!(NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f"), Ok(dt), "{text}");
++    assert_eq!(jiff::fmt::strtime::parse("%Y-%m-%d %H:%M:%S%.f", &text).unwrap().to_datetime().unwrap(), jiff_datetime(dt), "{text} in jiff");
++    let text = dt.format("%Y-%m-%d %H:%M:%S.%f").to_string();
++    assert_eq!(NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S.%f"), Ok(dt), "{text}");
++    // with an offset
++    let local = dt.and_local_timezone(off).unwrap();
++    for fmt in ["%Y-%m-%d %H:%M:%S%.f %z", "%Y-%m-%d %H:%M:%S%.f %:z", "%s%.f %z", "%+"] {
++        if fmt.contains("%s") && local.timestamp() < 0 {
++            continue; // KNOWN FAILURE chrono/2
++        }
++        let text = local.format(fmt).to_string();
++        let back = DateTime::<FixedOffset>::parse_from_str(&text, fmt);
++        if off.local_minus_utc() % 60 == 0 {
++            assert_eq!(back, Ok(local), "{fmt:?} → {text:?}");
++            assert_eq!(back.unwrap().offset(), local.offset(), "{fmt:?} → {text:?}: offset");
++        } else {
++            // `%z`/`%:z` round the offset to the nearest minute: the instant shifts by the difference
++            let back = back.unwrap();
++            let o = off.local_minus_utc();
++            let rounded = ((o.abs() + 30) / 60).min(24 * 60 - 1) * 60 * o.signum();
++            if fmt.contains("%s") {
++                assert_eq!(back.timestamp(), local.timestamp(), "{fmt:?} → {text:?}: instant");
++            } else {
++                assert_eq!(back.naive_local(), local.naive_local(), "{fmt:?} → {text:?}: local time");
++            }
++            assert_eq!(back.offset().local_minus_utc(), rounded, "{fmt:?} → {text:?}: offset");
++        }
++    }
++    // the `Z` and `UTC` spellings and case-insensitivity of `%+`
++    let utc = dt.and_utc();
++    for s in [format!("{}Z", dt.format("%Y-%m-%dT%H:%M:%S%.f")), format!("{}z", dt.format("%Y-%m-%dt%H:%M:%S%.f")), format!("{}UTC", dt.format("%Y-%m-%dT%H:%M:%S%.f")), format!("{}+00:00", dt.format("%Y-%m-%dT%H:%M:%S%.f"))] {
++        assert_eq!(DateTime::<FixedOffset>::parse_from_str(&s, "%+").map(|x| x.to_utc()), Ok(utc), "{s}");
++    }
++    // parse_and_remainder
++    let text = format!("{} trailing", whole.format("%F %T"));
++    assert_eq!(NaiveDateTime::parse_and_remainder(&text, "%F %T"), Ok((whole, " trailing")));
++    assert!(NaiveDateTime::parse_from_str(&text, "%F %T").is_err(), "trailing input is an error");
++}
++
++/// `%s` "is not padded and can be negative" — and it formats so — but no negative timestamp parses
++/// back (`ParseError(Invalid)`), whatever the surrounding format. KNOWN FAILURE chrono/2.
++#[hegel::test]
++fn negative_unix_timestamps_parse(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    let whole = dt.with_nanosecond(0).unwrap();
++    let text = whole.format("%s").to_string();
++    assert_eq!(text, whole.and_utc().timestamp().to_string());
++    assert_eq!(NaiveDateTime::parse_from_str(&text, "%s"), Ok(whole), "{text:?}");
++    let local = dt.and_local_timezone(FixedOffset::east_opt(off.local_minus_utc() / 60 * 60).unwrap()).unwrap();
++    let text = local.format("%s%.f %z").to_string();
++    assert_eq!(DateTime::<FixedOffset>::parse_from_str(&text, "%s%.f %z"), Ok(local), "{text:?}");
++}
++
++/// `%::z` (`+hh:mm:ss`) and `%:::z` (`+hh`) are listed among the specifiers "available both to
++/// formatting and parsing", but the parser reads `+hh:mm` for both: the text `%::z` writes is
++/// `TooLong`, the text `%:::z` writes is `TooShort`. KNOWN FAILURE chrono/1.
++#[hegel::test]
++fn offset_specifiers_with_seconds_or_hours_only_parse_back(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    if dt.year() < 1 {
++        return;
++    }
++    let local = dt.and_local_timezone(off).unwrap();
++    let text = local.format("%F %T%.f %::z").to_string();
++    assert_eq!(DateTime::<FixedOffset>::parse_from_str(&text, "%F %T%.f %::z"), Ok(local), "{text:?}");
++    let text = local.format("%F %T%.f %:::z").to_string();
++    let expected = dt.and_local_timezone(FixedOffset::east_opt(off.local_minus_utc() / 3600 * 3600).unwrap()).unwrap();
++    assert_eq!(DateTime::<FixedOffset>::parse_from_str(&text, "%F %T%.f %:::z"), Ok(expected), "{text:?}");
++}
++
++#[hegel::test]
++fn rfc3339_and_rfc2822_agree_with_jiff(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    if !jiff_instant_ok(dt, off) {
++        return;
++    }
++    let local = dt.and_local_timezone(off).unwrap();
++    let jz = jiff_datetime(dt).to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(off.local_minus_utc()).unwrap())).unwrap();
++    if (0..=9999).contains(&dt.year()) && off.local_minus_utc() % 60 == 0 {
++        // RFC 3339 (`%+`): 0/3/6/9 fractional digits, colon offset; the same instant in jiff
++        let text = local.to_rfc3339();
++        assert_eq!(DateTime::parse_from_rfc3339(&text), Ok(local), "{text}");
++        assert_eq!(text, local.format("%+").to_string());
++        let ts: jiff::Timestamp = text.parse().unwrap_or_else(|e| panic!("jiff rejects {text}: {e}"));
++        assert_eq!(jiff_nanos(ts), nanos_of(local.naive_utc()), "{text}");
++        // jiff's RFC 3339 text is parsed back by chrono to the same instant and offset
++        let jtext = jz.timestamp().display_with_offset(jz.offset()).to_string();
++        let back = DateTime::parse_from_rfc3339(&jtext).unwrap_or_else(|e| panic!("chrono rejects jiff's {jtext}: {e}"));
++        assert_eq!(back, local, "{jtext}");
++        assert_eq!(back.offset(), local.offset(), "{jtext}");
++        // SecondsFormat variants read back to the truncated value
++        use chrono::SecondsFormat::*;
++        for (fmt, unit) in [(Secs, 1_000_000_000u32), (Millis, 1_000_000), (Micros, 1_000), (Nanos, 1)] {
++            for use_z in [false, true] {
++                let text = local.to_rfc3339_opts(fmt, use_z);
++                let expected = local.with_nanosecond(dt.nanosecond() / unit * unit).unwrap();
++                assert_eq!(DateTime::parse_from_rfc3339(&text), Ok(expected), "{text}");
++                assert_eq!(text.ends_with('Z'), use_z && off.local_minus_utc() == 0, "{text}");
++                let ts: jiff::Timestamp = text.parse().unwrap_or_else(|e| panic!("jiff rejects {text}: {e}"));
++                assert_eq!(jiff_nanos(ts), nanos_of(expected.naive_utc()), "{text}");
++            }
++        }
++        let auto = local.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false);
++        assert_eq!(auto, text);
++    }
++    if (1..=9999).contains(&dt.year()) && off.local_minus_utc() % 60 == 0 {
++        // RFC 2822: seconds precision, `+hhmm` offset
++        let whole = local.with_nanosecond(0).unwrap();
++        let text = whole.to_rfc2822();
++        assert_eq!(DateTime::parse_from_rfc2822(&text), Ok(whole), "{text}");
++        assert_eq!(local.to_rfc2822(), text, "fractions are dropped");
++        let jparsed = jiff::fmt::rfc2822::parse(&text).unwrap_or_else(|e| panic!("jiff rejects {text}: {e}"));
++        assert_eq!(jparsed.timestamp().as_second(), whole.timestamp(), "{text}");
++        assert_eq!(jparsed.offset().seconds(), off.local_minus_utc(), "{text}");
++        let jtext = jiff::fmt::rfc2822::to_string(&jz.with().subsec_nanosecond(0).build().unwrap()).unwrap();
++        let back = DateTime::parse_from_rfc2822(&jtext).unwrap_or_else(|e| panic!("chrono rejects jiff's {jtext}: {e}"));
++        assert_eq!(back, whole, "{jtext}");
++        assert_eq!(back.offset(), whole.offset(), "{jtext}");
++    }
++}
++
++// ----------------------------------------------------------------------------------------------
++// rounding
++
++#[hegel::test]
++fn rounding_matches_the_model(tc: hegel::TestCase) {
++    let Dt(dt) = tc.draw(arb_jiff_datetime());
++    let Off(off) = tc.draw(arb_offset());
++    let digits = tc.draw(int!(0u16, 12));
++    let span = match tc.draw(int!(0u8, 4)) {
++        0 => TimeDelta::nanoseconds(tc.draw(int!(1i64, 1_000_000_000))),
++        1 => TimeDelta::try_seconds(tc.draw(int!(1i64, 100_000))).unwrap(),
++        2 => TimeDelta::try_minutes(tc.draw(generators::sampled_from(vec![1i64, 5, 10, 15, 30, 60, 90, 1440]))).unwrap(),
++        3 => TimeDelta::try_days(tc.draw(int!(1i64, 400))).unwrap(),
++        _ => tc.draw(generators::sampled_from(vec![
++            Delta(TimeDelta::zero()),
++            Delta(TimeDelta::nanoseconds(-1)),
++            Delta(TimeDelta::try_days(-1).unwrap()),
++            Delta(TimeDelta::MAX),
++            Delta(TimeDelta::MIN),
++            Delta(TimeDelta::nanoseconds(i64::MAX)),
++            Delta(TimeDelta::try_milliseconds(i64::MAX / 1_000_000).unwrap()),
++        ])).0,
++    };
++    let local = dt.and_local_timezone(off).unwrap();
++    let utc = dt.and_utc();
++    // subsecond rounding: halfway rounds up, digits ≥ 9 leave it alone
++    let n = dt.nanosecond() as i128;
++    let unit = 10i128.pow(9 - digits.min(9) as u32);
++    let down = n / unit * unit;
++    let up = down + unit;
++    let rounded = if n - down >= up - n && n != down { up } else { down };
++    let with = |target: i128| -> NaiveDateTime { dt.with_nanosecond(0).unwrap() + TimeDelta::nanoseconds(target as i64) };
++    assert_eq!(dt.trunc_subsecs(digits), with(down), "{dt:?} trunc {digits}");
++    assert_eq!(dt.round_subsecs(digits), with(rounded), "{dt:?} round {digits}");
++    assert_eq!(utc.round_subsecs(digits).naive_utc(), with(rounded));
++    assert_eq!(local.round_subsecs(digits).naive_local(), with(rounded) + (local.naive_local() - dt));
++    assert_eq!(dt.time().trunc_subsecs(digits), with(down).time());
++    // rounding by a duration: on the *local* wall clock nanoseconds since the epoch
++    let model = |value: NaiveDateTime| -> Result<(i128, i128, i128), RoundingError> {
++        let span_nanos = i64::try_from(delta_nanos(span)).map_err(|_| RoundingError::DurationExceedsLimit)?;
++        if span_nanos <= 0 {
++            return Err(RoundingError::DurationExceedsLimit);
++        }
++        let stamp = i64::try_from(nanos_of(value)).map_err(|_| RoundingError::TimestampExceedsLimit)? as i128;
++        let span_nanos = span_nanos as i128;
++        let floor = stamp.div_euclid(span_nanos) * span_nanos;
++        let rem = stamp.rem_euclid(span_nanos);
++        let ceil = if rem == 0 { floor } else { floor + span_nanos };
++        let round = if rem == 0 { floor } else if rem * 2 >= span_nanos { ceil } else { floor };
++        Ok((floor, round, ceil))
++    };
++    for (name, value, result_nanos) in [
++        ("naive", dt, dt.duration_trunc(span).map(nanos_of).and_then(|f| Ok((f, nanos_of(dt.duration_round(span)?), nanos_of(dt.duration_round_up(span)?))))),
++        ("utc", dt, utc.duration_trunc(span).map(|x| nanos_of(x.naive_utc())).and_then(|f| Ok((f, nanos_of(utc.duration_round(span)?.naive_utc()), nanos_of(utc.duration_round_up(span)?.naive_utc()))))),
++        ("local", local.naive_local(), local.duration_trunc(span).map(|x| nanos_of(x.naive_local())).and_then(|f| Ok((f, nanos_of(local.duration_round(span)?.naive_local()), nanos_of(local.duration_round_up(span)?.naive_local()))))),
++    ] {
++        let expected = model(value);
++        // the result must exist as a NaiveDateTime; the model only knows nanoseconds
++        match (&expected, &result_nanos) {
++            (Ok(e), Ok(r)) => assert_eq!(r, e, "{name}: {value:?} by {span:?}"),
++            (Err(e), Err(r)) => assert_eq!(r, e, "{name}: {value:?} by {span:?}"),
++            _ => panic!("{name}: {value:?} by {span:?}: model {expected:?}, chrono {result_nanos:?}"),
++        }
++    }
++    // a rounded value is a multiple of the span and within a span of the input (naive)
++    if let Ok(r) = dt.duration_round(span) {
++        let s = delta_nanos(span);
++        assert_eq!(nanos_of(r).rem_euclid(s), 0);
++        assert!((nanos_of(r) - nanos_of(dt)).abs() * 2 <= s, "{dt:?} by {span:?} → {r:?}");
++        assert!(nanos_of(dt.duration_trunc(span).unwrap()) <= nanos_of(dt));
++        assert!(nanos_of(dt.duration_round_up(span).unwrap()) >= nanos_of(dt));
++        assert_eq!(dt.duration_trunc(span).unwrap().duration_trunc(span), dt.duration_trunc(span), "idempotent");
++        assert_eq!(r.duration_round(span), Ok(r), "idempotent");
++    }
++}
++
++// ----------------------------------------------------------------------------------------------
++// TimeDelta
++
++/// A `TimeDelta` holds ±i64::MAX milliseconds (`MIN`..=`MAX`); `checked_mul` "returns `None` if
++/// overflow occurred", but only checks that the seconds fit an `i64`, so it hands out values
++/// beyond `MAX` on which the other methods overflow. KNOWN FAILURE chrono/6.
++#[hegel::test]
++fn multiplication_beyond_the_range_is_none(tc: hegel::TestCase) {
++    let Delta(a) = tc.draw(arb_delta());
++    let k = tc.draw(int!(-1000i32, 1000));
++    let na = delta_nanos(a);
++    let product = na * k as i128;
++    let in_range = product >= delta_nanos(TimeDelta::MIN) && product <= delta_nanos(TimeDelta::MAX);
++    match a.checked_mul(k) {
++        Some(m) => {
++            assert!(in_range, "{a:?} × {k} = {m:?} is beyond MIN..=MAX");
++            assert!(m >= TimeDelta::MIN && m <= TimeDelta::MAX);
++        }
++        None => assert!(!in_range, "{a:?} × {k} fits but is None"),
++    }
++}
++
++/// Dividing a positive `TimeDelta` by `k` is the truncated quotient of its nanoseconds: in
++/// particular exact when `k` divides them. KNOWN FAILURE chrono/5.
++#[hegel::test]
++fn division_is_exact_to_the_nanosecond(tc: hegel::TestCase) {
++    let Delta(a) = tc.draw(arb_delta());
++    let k = tc.draw(int!(1i32, 1000));
++    let a = a.abs();
++    let na = delta_nanos(a);
++    let expected = TimeDelta::nanoseconds(0).checked_add(&TimeDelta::new((na / k as i128).div_euclid(1_000_000_000) as i64, (na / k as i128).rem_euclid(1_000_000_000) as u32).unwrap()).unwrap();
++    assert_eq!(a.checked_div(k), Some(expected), "{a:?} / {k}");
++    let exact = a.checked_mul(k).filter(|m| delta_nanos(*m) == na * k as i128);
++    if let Some(m) = exact {
++        assert_eq!(m.checked_div(k), Some(a), "({a:?} × {k}) / {k}");
++    }
++}
++
++#[hegel::test]
++fn time_delta_matches_i128_nanoseconds(tc: hegel::TestCase) {
++    let Delta(a) = tc.draw(arb_delta());
++    let Delta(b) = tc.draw(arb_delta());
++    let k = tc.draw(int!(-1000i32, 1000));
++    let lo = delta_nanos(TimeDelta::MIN);
++    let hi = delta_nanos(TimeDelta::MAX);
++    let make = |n: i128| -> Option<TimeDelta> {
++        if n < lo || n > hi {
++            return None;
++        }
++        TimeDelta::new(n.div_euclid(1_000_000_000) as i64, n.rem_euclid(1_000_000_000) as u32)
++    };
++    let (na, nb) = (delta_nanos(a), delta_nanos(b));
++    assert_eq!(make(na), Some(a), "{a:?} rebuilt from its nanoseconds");
++    // whole units truncate toward zero; the sub-second part carries the sign
++    assert_eq!(a.num_seconds() as i128, na / 1_000_000_000, "{a:?}");
++    assert_eq!(a.subsec_nanos() as i128, na % 1_000_000_000, "{a:?}");
++    assert_eq!(a.num_nanoseconds().map(i128::from), i64::try_from(na).ok().map(i128::from), "{a:?}");
++    assert_eq!(a.num_microseconds().map(i128::from), i64::try_from(na / 1_000).ok().map(i128::from), "{a:?}");
++    assert_eq!(a.num_milliseconds() as i128, na / 1_000_000, "{a:?}");
++    assert_eq!(a.num_minutes() as i128, (na / 1_000_000_000) / 60, "{a:?}: truncation toward zero");
++    assert_eq!(a.num_hours() as i128, (na / 1_000_000_000) / 3600);
++    assert_eq!(a.num_days() as i128, (na / 1_000_000_000) / 86_400);
++    assert_eq!(a.num_weeks() as i128, (na / 1_000_000_000) / 604_800);
++    // arithmetic
++    assert_eq!(a.checked_add(&b), make(na + nb), "{a:?} + {b:?}");
++    assert_eq!(a.checked_sub(&b), make(na - nb), "{a:?} - {b:?}");
++    // (a product beyond `MIN`/`MAX` is `multiplication_beyond_the_range_is_none`, KNOWN FAILURE
++    // chrono/6: `checked_mul` only checks that the seconds fit an i64)
++    if let Some(expected) = make(na * k as i128) {
++        assert_eq!(a.checked_mul(k), Some(expected), "{a:?} × {k}");
++    } else if let Some(product) = a.checked_mul(k) {
++        assert_eq!(delta_nanos(product), na * k as i128, "{a:?} × {k}: at least the right value");
++    }
++    if k != 0 {
++        // (exactness is `division_is_exact_to_the_nanosecond`, KNOWN FAILURE chrono/5: the
++        // quotient is computed part by part and can be 1 ns off)
++        let q = a.checked_div(k).unwrap();
++        assert!((delta_nanos(q) - na / k as i128).abs() <= 1, "{a:?} / {k} = {q:?}");
++        assert_eq!(a / k, q);
++    } else {
++        assert_eq!(a.checked_div(0), None);
++    }
++    assert_eq!(a.abs(), make(na.abs()).unwrap_or(TimeDelta::MAX), "{a:?}");
++    if na != lo {
++        assert_eq!(-a, make(-na).unwrap());
++    }
++    assert_eq!(a.is_zero(), na == 0);
++    assert_eq!(a.cmp(&b), na.cmp(&nb));
++    assert_eq!(a == b, na == nb);
++    // constructors
++    assert_eq!(TimeDelta::try_seconds(a.num_seconds()).map(delta_nanos), Some(a.num_seconds() as i128 * 1_000_000_000));
++    assert_eq!(TimeDelta::try_milliseconds(a.num_milliseconds()).map(delta_nanos), Some(a.num_milliseconds() as i128 * 1_000_000));
++    if let Some(us) = a.num_microseconds() {
++        assert_eq!(delta_nanos(TimeDelta::microseconds(us)), us as i128 * 1_000);
++    }
++    if let Some(ns) = a.num_nanoseconds() {
++        assert_eq!(TimeDelta::nanoseconds(ns), a);
++    }
++    assert_eq!(TimeDelta::new(a.num_seconds(), a.subsec_nanos().rem_euclid(1_000_000_000) as u32).map(delta_nanos), Some(a.num_seconds() as i128 * 1_000_000_000 + a.subsec_nanos().rem_euclid(1_000_000_000) as i128).filter(|n| *n <= hi));
++    assert_eq!(TimeDelta::new(0, 1_000_000_000), None);
++    assert_eq!(TimeDelta::new(TimeDelta::MAX.num_seconds() + 1, 0), None);
++    assert_eq!(TimeDelta::new(TimeDelta::MIN.num_seconds() - 1, 0), None);
++    // std conversions
++    let std = a.to_std();
++    if na >= 0 {
++        let std = std.unwrap();
++        assert_eq!(std.as_nanos(), na as u128, "{a:?}");
++        assert_eq!(TimeDelta::from_std(std), Ok(a));
++    } else {
++        assert!(std.is_err(), "{a:?}: negative to std");
++    }
++    assert!(TimeDelta::from_std(std::time::Duration::MAX).is_err());
++    // Display is an ISO 8601 duration: `P0D`, else `[-]PT<seconds>[.<fraction>]S` with the
++    // fraction's trailing zeros trimmed; jiff's `Span` reads it back when the seconds fit its range
++    let text = a.to_string();
++    let (abs_secs, abs_nanos) = (na.abs() / 1_000_000_000, na.abs() % 1_000_000_000);
++    let expected = if na == 0 {
++        "P0D".to_string()
++    } else {
++        let frac = if abs_nanos == 0 { String::new() } else { format!(".{}", format!("{abs_nanos:09}").trim_end_matches('0')) };
++        format!("{}PT{abs_secs}{frac}S", if na < 0 { "-" } else { "" })
++    };
++    assert_eq!(text, expected, "{a:?}");
++    if abs_secs <= 631_107_417_600 {
++        let span: jiff::Span = text.parse().unwrap_or_else(|e| panic!("jiff can't parse {text}: {e}"));
++        let total = span.get_days() as i128 * 86_400_000_000_000
++            + span.get_hours() as i128 * 3_600_000_000_000
++            + span.get_minutes() as i128 * 60_000_000_000
++            + span.get_seconds() as i128 * 1_000_000_000
++            + span.get_milliseconds() as i128 * 1_000_000
++            + span.get_microseconds() as i128 * 1_000
++            + span.get_nanoseconds() as i128;
++        assert_eq!(total, na, "{a:?} → {text} in jiff");
++    }
++}
