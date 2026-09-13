@@ -27,3 +27,4 @@
 - 2026-07-20: predecessor base commit `fed739a8c7fe` (try fuzz again).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/miniz_oxide.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped fed739a8c7fe → e2214d401a59 (2026-08-24, "fix: free buffers in tdefl mem-to-heap paths (#207)"; 0.9.1); 1 bug(s) still reproduce. 63 tests pass.
