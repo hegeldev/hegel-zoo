@@ -30,3 +30,4 @@
 - 2026-03-08: predecessor base commit `ed714652ab45` (chore: Bump hashbrown to ^0.16 (#967)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/petgraph.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped ed714652ab45 → e7fc31536a40 (2026-09-06, "ci: Fix clippy (#1037)"; 0.8.3); 0 bug(s) still reproduce. 406 tests pass.
