@@ -20,3 +20,4 @@
 - 2026-07-22: predecessor base commit `81eeedbae691` (ci toolchain in release update + bump version (#1181)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/pest.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 81eeedbae691 → 66513d259f85 (2026-09-05, "bump version to 2.9.1 (#1199)"; 2.9.1); 1 bug(s) still reproduce; fixed upstream: pest/1; 1 ignored reproducer(s) not run. 378 tests pass. pest/1 was fixed upstream in 2.9.1 (`clear_snapshot` merges into the parent snapshot; upstream's regression test `nested_snapshot_pop_clear_restore` is the zoo's exact sequence), and the pin now passes.
