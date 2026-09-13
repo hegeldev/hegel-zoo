@@ -39,3 +39,4 @@
 - 2026-09-13: base bumped a407990b4443 → 82335b426d88 (2026-09-13, "feat: serialize ASOF join plans (#23832)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
 - 2026-09-13: base bumped 82335b426d88 → 9082d6b10c29 (2026-09-13, "fix: discard parquet bounds when row group statistics are missing (#25228)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
 - 2026-09-13: base bumped 9082d6b10c29 → 681705e6fdc4 (2026-09-13, "fix: reject groups accumulator for bit_xor(DISTINCT) (#24989)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
+- 2026-09-13: base bumped 681705e6fdc4 → d9646f49fb6f (2026-09-13, "ci: share extended test commands through xtask (#25256)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
