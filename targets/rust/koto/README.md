@@ -26,3 +26,4 @@
 - 2026-07-05: predecessor base commit `4b433e7a7ce1` (Merge pull request #552 from koto-lang/koto-derive-improvements).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/koto.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 4b433e7a7ce1 → c579dcd02f01 (2026-08-06, "Expose top-level assigned IDs and accessed non-locals in the AST (#554)"; 0.17.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 45 tests pass.
