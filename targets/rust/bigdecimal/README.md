@@ -55,3 +55,8 @@
 - 2025-12-27: predecessor base commit `7f0243e73702` (Begin v0.4.11 development).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/bigdecimal.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: 10× budget run (`--test-cases 1000`) found two failures the default budget had
+  missed: `normalized_is_canonical` hits the known bigdecimal/1 overflow (scale i64::MIN), and
+  `engineering_notation_then_parse_roundtrips` is a new bug, **bigdecimal/4** — at scale i64::MAX
+  `to_engineering_notation()` prints `100e-9223372036854775809`, which the crate's `FromStr`
+  rejects with "Exponent overflow". Both pinned as intermittent expected failures.
