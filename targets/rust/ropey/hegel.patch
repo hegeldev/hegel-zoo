@@ -1,0 +1,672 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 0bce2de..a9a0ea0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,6 +28,7 @@ smallvec = "1.0.0"
+ str_indices = { version = "0.4", default-features = false }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ fastrand = "2.3.0"
+ proptest = "1.11.0"
+ criterion = { version = "0.8.2", features = ["html_reports"] }
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..422c975
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,645 @@
++//! Hegel property tests for `ropey`.
++//!
++//! The model is a `String` plus the crate's documented line-break rules (LF, CRLF as one break,
++//! CR, VT, FF, NEL, LS, PS; the start of the text and every position after a break start a
++//! line; a break belongs to the line it ends). Every `Rope` query is compared with the model on
++//! the rope's text, every `RopeSlice` with the model on the slice's text (so a slice that splits
++//! a CRLF pair counts like the standalone string would), and edits are mirrored on the `String`.
++//! Built with the crate's `small_chunks` feature (leaf chunks of at most 9 bytes, as its own
++//! fuzzers do), so a few dozen characters already make a tree several levels deep with chunk
++//! boundaries everywhere.
++
++// The crate has no `edition` key (2015), so crates must be declared.
++extern crate hegel;
++extern crate ropey;
++
++use std::borrow::Cow;
++use std::collections::hash_map::DefaultHasher;
++use std::hash::{Hash, Hasher};
++use std::io::Read;
++use std::ops::{Bound, RangeBounds};
++
++use hegel::generators;
++use hegel::Generator as _;
++use ropey::{str_utils, Error, Rope, RopeBuilder, RopeSlice};
++
++// ---------------------------------------------------------------------------------------------
++// The model
++// ---------------------------------------------------------------------------------------------
++
++fn is_break_char(c: char) -> bool {
++    matches!(c, '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}')
++}
++
++/// Byte offsets just after each line break of `text` (a CRLF pair is one break, ending after the
++/// LF).
++fn break_ends(text: &str) -> Vec<usize> {
++    let bytes = text.as_bytes();
++    let mut ends = Vec::new();
++    let mut iter = text.char_indices().peekable();
++    while let Some((i, c)) = iter.next() {
++        if c == '\r' && bytes.get(i + 1) == Some(&b'\n') {
++            iter.next();
++            ends.push(i + 2);
++        } else if is_break_char(c) {
++            ends.push(i + c.len_utf8());
++        }
++    }
++    ends
++}
++
++/// The lines of `text`, each including its break; the text after the last break is the final
++/// line even when empty.
++fn model_lines(text: &str) -> Vec<&str> {
++    let mut lines = Vec::new();
++    let mut start = 0;
++    for end in break_ends(text) {
++        lines.push(&text[start..end]);
++        start = end;
++    }
++    lines.push(&text[start..]);
++    lines
++}
++
++fn char_count(text: &str) -> usize {
++    text.chars().count()
++}
++
++fn utf16_len(text: &str) -> usize {
++    text.chars().map(char::len_utf16).sum()
++}
++
++/// Byte index of the `char_idx`-th char (`len` for one past the end).
++fn byte_of_char(text: &str, char_idx: usize) -> usize {
++    text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len())
++}
++
++fn char_of_byte(text: &str, byte_idx: usize) -> usize {
++    char_count(&text[..byte_idx])
++}
++
++/// Line index of a byte offset: the number of breaks that end at or before it.
++fn line_of_byte(text: &str, byte_idx: usize) -> usize {
++    break_ends(text).iter().filter(|&&e| e <= byte_idx).count()
++}
++
++fn byte_of_line(text: &str, line_idx: usize) -> usize {
++    if line_idx == 0 {
++        0
++    } else {
++        break_ends(text)[line_idx - 1]
++    }
++}
++
++fn utf16_of_char(text: &str, char_idx: usize) -> usize {
++    text.chars().take(char_idx).map(char::len_utf16).sum()
++}
++
++/// Char index of a utf16 code-unit index; an index pointing into a surrogate pair maps to the
++/// char containing it (the crate's rounding rule).
++fn char_of_utf16(text: &str, cu: usize) -> usize {
++    let mut acc = 0;
++    for (i, c) in text.chars().enumerate() {
++        if acc + c.len_utf16() > cu {
++            return i;
++        }
++        acc += c.len_utf16();
++    }
++    char_count(text)
++}
++
++/// Substring by char range.
++fn char_slice(text: &str, start: usize, end: usize) -> &str {
++    &text[byte_of_char(text, start)..byte_of_char(text, end)]
++}
++
++fn hash_of<H: Hash>(h: &H) -> u64 {
++    let mut hasher = DefaultHasher::new();
++    h.hash(&mut hasher);
++    hasher.finish()
++}
++
++// ---------------------------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------------------------
++
++/// Text rich in line breaks (every recognised kind, CR and LF adjacent often) and in multi-byte
++/// chars (2, 3 and 4 bytes), so 9-byte chunks split in every way.
++fn arb_text() -> impl hegel::PrintableGenerator<String> {
++    generators::text()
++        .alphabet("ab \n\r\n\u{0B}\u{0C}\u{85}\u{2028}\u{2029}é€😀")
++        .max_size(60)
++}
++
++fn arb_text_max(max: usize) -> impl hegel::PrintableGenerator<String> {
++    generators::text()
++        .alphabet("ab \n\r\n\u{0B}\u{0C}\u{85}\u{2028}\u{2029}é€😀")
++        .max_size(max)
++}
++
++#[derive(Clone, Debug)]
++enum Edit {
++    Insert(usize, String),
++    InsertChar(usize, char),
++    Remove(usize, usize),
++    SplitOffAppend(usize),
++    ShrinkToFit,
++}
++
++impl hegel::PrettyPrintable for Edit {
++    fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++    }
++}
++
++/// An edit script: positions are drawn as fractions of the current length so they are valid
++/// whatever the text has become; `Remove` holds a char range.
++#[hegel::composite]
++fn arb_edit(tc: &hegel::TestCase) -> Edit {
++    let kind = tc.draw(generators::integers::<u8>().max_value(9));
++    let p = tc.draw(generators::integers::<u32>().max_value(1000));
++    let q = tc.draw(generators::integers::<u32>().max_value(1000));
++    match kind {
++        0..=3 => Edit::Insert(p as usize, tc.draw(arb_text_max(20))),
++        4 => Edit::InsertChar(p as usize, tc.draw(generators::sampled_from("a\n\r\u{2028}é😀".chars().collect::<Vec<_>>()))),
++        5..=7 => Edit::Remove(p.min(q) as usize, p.max(q) as usize),
++        8 => Edit::SplitOffAppend(p as usize),
++        _ => Edit::ShrinkToFit,
++    }
++}
++
++/// Map a per-mille position onto a char index of the current text.
++fn pos(text: &str, permille: usize) -> usize {
++    let n = char_count(text);
++    (permille * (n + 1) / 1001).min(n)
++}
++
++/// Apply an edit to the rope and to the model.
++fn apply(edit: &Edit, rope: &mut Rope, model: &mut String) {
++    match edit {
++        Edit::Insert(p, s) => {
++            let i = pos(model, *p);
++            rope.insert(i, s);
++            model.insert_str(byte_of_char(model, i), s);
++        }
++        Edit::InsertChar(p, c) => {
++            let i = pos(model, *p);
++            rope.insert_char(i, *c);
++            model.insert(byte_of_char(model, i), *c);
++        }
++        Edit::Remove(p, q) => {
++            let (a, b) = (pos(model, *p), pos(model, *q));
++            let (ba, bb) = (byte_of_char(model, a), byte_of_char(model, b));
++            // Alternate between the range forms.
++            match (a, b == char_count(model), (p + q) % 3) {
++                (0, true, _) => rope.remove(..),
++                (0, false, _) => rope.remove(..b),
++                (_, true, _) => rope.remove(a..),
++                (_, false, 0) if b > a => rope.remove(a..=(b - 1)),
++                _ => rope.remove(a..b),
++            }
++            model.replace_range(ba..bb, "");
++        }
++        Edit::SplitOffAppend(p) => {
++            let i = pos(model, *p);
++            let right = rope.split_off(i);
++            assert_eq!(right.to_string(), model[byte_of_char(model, i)..], "split_off({i}) right part");
++            assert_eq!(rope.to_string(), model[..byte_of_char(model, i)], "split_off({i}) left part");
++            rope.append(right);
++        }
++        Edit::ShrinkToFit => rope.shrink_to_fit(),
++    }
++}
++
++/// A rope with the given text and a chunk structure produced by an arbitrary edit history.
++#[hegel::composite]
++fn arb_rope(tc: &hegel::TestCase) -> Built {
++    let mut model = tc.draw(arb_text());
++    let mut rope = Rope::from_str(&model);
++    let initial = model.clone();
++    let edits = tc.draw(generators::vecs(arb_edit()).max_size(8));
++    for e in &edits {
++        apply(e, &mut rope, &mut model);
++    }
++    Built(rope, model, initial, edits)
++}
++
++/// A rope, its text, and how it was built (initial text + edit script, so the chunk structure
++/// can be reproduced with `apply`).
++struct Built(Rope, String, String, Vec<Edit>);
++
++impl hegel::PrettyPrintable for Built {
++    fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(
++            &format!("Built {{ text: {:?}, initial: {:?}, edits: {:?} }}", self.1, self.2, self.3),
++            printer,
++        );
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Checks shared between Rope and RopeSlice
++// ---------------------------------------------------------------------------------------------
++
++/// Everything a `RopeSlice` answers, against the model on its own text.
++fn check_slice(slice: RopeSlice<'_>, text: &str, what: &str) {
++    assert_eq!(slice.to_string(), text, "{what}: text");
++    assert_eq!(slice.len_bytes(), text.len(), "{what}: len_bytes");
++    assert_eq!(slice.len_chars(), char_count(text), "{what}: len_chars");
++    assert_eq!(slice.len_utf16_cu(), utf16_len(text), "{what}: len_utf16_cu");
++    let lines = model_lines(text);
++    assert_eq!(slice.len_lines(), lines.len(), "{what}: len_lines of {text:?}");
++    // Every char boundary, both ways, and the line of every position.
++    let n_chars = char_count(text);
++    for (ci, (bi, c)) in text.char_indices().chain(std::iter::once((text.len(), '\0'))).enumerate() {
++        assert_eq!(slice.byte_to_char(bi), ci, "{what}: byte_to_char({bi}) in {text:?}");
++        assert_eq!(slice.char_to_byte(ci), bi, "{what}: char_to_byte({ci}) in {text:?}");
++        let li = line_of_byte(text, bi);
++        assert_eq!(slice.byte_to_line(bi), li, "{what}: byte_to_line({bi}) in {text:?}");
++        assert_eq!(slice.char_to_line(ci), li, "{what}: char_to_line({ci}) in {text:?}");
++        let cu = utf16_of_char(text, ci);
++        assert_eq!(slice.char_to_utf16_cu(ci), cu, "{what}: char_to_utf16_cu({ci})");
++        assert_eq!(slice.utf16_cu_to_char(cu), ci, "{what}: utf16_cu_to_char({cu})");
++        if ci < n_chars {
++            assert_eq!(slice.char(ci), c, "{what}: char({ci})");
++            assert_eq!(slice.get_char(ci), Some(c));
++            if c.len_utf16() == 2 {
++                assert_eq!(slice.utf16_cu_to_char(cu + 1), ci, "{what}: utf16_cu_to_char inside a surrogate pair");
++            }
++            // A byte in the middle of a multi-byte char belongs to that char (documented), and
++            // so does its line.
++            for k in 1..c.len_utf8() {
++                assert_eq!(slice.byte_to_char(bi + k), ci, "{what}: byte_to_char({}) mid-char", bi + k);
++                assert_eq!(slice.try_byte_to_char(bi + k).ok(), Some(ci), "{what}: try_byte_to_char({}) mid-char", bi + k);
++                assert_eq!(slice.byte_to_line(bi + k), li, "{what}: byte_to_line({}) mid-char", bi + k);
++            }
++        } else {
++            assert_eq!(slice.get_char(ci), None);
++            assert!(matches!(slice.try_char_to_byte(ci + 1), Err(Error::CharIndexOutOfBounds(i, n)) if i == ci + 1 && n == n_chars), "{what}: try_char_to_byte past the end");
++        }
++    }
++    for (bi, &b) in text.as_bytes().iter().enumerate() {
++        assert_eq!(slice.byte(bi), b, "{what}: byte({bi})");
++    }
++    assert_eq!(slice.get_byte(text.len()), None);
++    assert!(matches!(slice.try_byte_to_char(text.len() + 1), Err(Error::ByteIndexOutOfBounds(i, n)) if i == text.len() + 1 && n == text.len()));
++    // Lines.
++    for (li, line) in lines.iter().enumerate() {
++        assert_eq!(slice.line(li).to_string(), *line, "{what}: line({li}) of {text:?}");
++        assert_eq!(slice.line_to_byte(li), byte_of_line(text, li), "{what}: line_to_byte({li})");
++        assert_eq!(slice.line_to_char(li), char_of_byte(text, byte_of_line(text, li)), "{what}: line_to_char({li})");
++        assert_eq!(slice.get_line(li).map(|l| l.to_string()), Some(line.to_string()));
++    }
++    assert_eq!(slice.line_to_byte(lines.len()), text.len(), "{what}: line_to_byte(len_lines) is one past the end");
++    assert_eq!(slice.line_to_char(lines.len()), n_chars);
++    assert_eq!(slice.get_line(lines.len()).map(|l| l.to_string()), None, "{what}: get_line(len_lines)");
++    assert!(matches!(slice.try_line_to_char(lines.len() + 1), Err(Error::LineIndexOutOfBounds(i, n)) if i == lines.len() + 1 && n == lines.len()));
++    // Iterators, forwards and backwards.
++    assert_eq!(slice.bytes().collect::<Vec<_>>(), text.as_bytes(), "{what}: bytes()");
++    assert_eq!(slice.bytes().len(), text.len(), "{what}: bytes().len()");
++    assert_eq!(slice.chars().collect::<String>(), text, "{what}: chars()");
++    assert_eq!(slice.chars().len(), n_chars);
++    assert_eq!(slice.lines().map(|l| l.to_string()).collect::<Vec<_>>(), lines, "{what}: lines() of {text:?}");
++    assert_eq!(slice.lines().len(), lines.len(), "{what}: lines().len()");
++    // `reversed()` flips the direction in place (not `DoubleEndedIterator::rev`), so a backward
++    // walk over everything starts from an iterator positioned at the end.
++    let mut rev: Vec<char> = slice.chars_at(n_chars).reversed().collect();
++    rev.reverse();
++    assert_eq!(rev.into_iter().collect::<String>(), text, "{what}: chars_at(end).reversed()");
++    let mut rev: Vec<String> = slice.lines_at(lines.len()).reversed().map(|l| l.to_string()).collect();
++    rev.reverse();
++    assert_eq!(rev, lines, "{what}: lines_at(end).reversed() of {text:?}");
++    let mut rev: Vec<u8> = slice.bytes_at(text.len()).reversed().collect();
++    rev.reverse();
++    assert_eq!(rev, text.as_bytes(), "{what}: bytes_at(end).reversed()");
++    assert_eq!(slice.chars().reversed().count(), 0, "{what}: reversed() at the start yields nothing");
++    let chunks: Vec<&str> = slice.chunks().collect();
++    assert_eq!(chunks.concat(), text, "{what}: chunks() concatenate to the text");
++    let (at_end, eb, ec, el) = slice.chunks_at_byte(text.len());
++    assert_eq!((eb, ec, el), (text.len(), n_chars, lines.len() - 1), "{what}: chunks_at_byte(len) offsets");
++    let mut rev: Vec<&str> = at_end.reversed().collect();
++    rev.reverse();
++    assert_eq!(rev, chunks, "{what}: chunks_at_byte(end).reversed()");
++    // A forward iterator walked to the end and reversed comes back the same way.
++    let mut it = slice.lines();
++    let fwd: Vec<String> = it.by_ref().map(|l| l.to_string()).collect();
++    it.reverse();
++    let mut back: Vec<String> = it.map(|l| l.to_string()).collect();
++    back.reverse();
++    assert_eq!(back, fwd, "{what}: lines walked forward then reverse()d");
++    // as_str: whenever it answers, it answers the text.
++    if let Some(s) = slice.as_str() {
++        assert_eq!(s, text, "{what}: as_str()");
++    }
++    // Chunk lookups: the chunk containing an index (every byte, mid-char ones too), with the
++    // right start offsets.
++    for bi in 0..=text.len() {
++        let (chunk, cb, cc, cl) = slice.chunk_at_byte(bi);
++        assert!(cb <= bi && (bi < cb + chunk.len() || (bi == text.len() && bi == cb + chunk.len())), "{what}: chunk_at_byte({bi}) gave chunk at {cb} of {} bytes", chunk.len());
++        assert!(text.is_char_boundary(cb), "{what}: chunk_at_byte({bi}) starts mid-char at {cb}");
++        assert_eq!(chunk, &text[cb..cb + chunk.len()], "{what}: chunk_at_byte({bi}) content");
++        assert_eq!(cc, char_of_byte(text, cb), "{what}: chunk_at_byte({bi}) char offset");
++        assert_eq!(cl, line_of_byte(text, cb), "{what}: chunk_at_byte({bi}) line offset");
++        if text.is_char_boundary(bi) {
++            let ci = char_of_byte(text, bi);
++            let (chunk2, cb2, cc2, cl2) = slice.chunk_at_char(ci);
++            assert_eq!((chunk2, cb2, cc2, cl2), (chunk, cb, cc, cl), "{what}: chunk_at_char({ci}) vs chunk_at_byte({bi})");
++            let (chunks, b3, c3, l3) = slice.chunks_at_byte(bi);
++            if bi < text.len() {
++                assert_eq!((b3, c3, l3), (cb, cc, cl), "{what}: chunks_at_byte({bi}) offsets");
++                assert_eq!(chunks.collect::<Vec<_>>().concat(), &text[cb..], "{what}: chunks_at_byte({bi}) rest");
++            }
++        }
++    }
++    for lb in 0..=lines.len() {
++        let (chunk, cb, cc, cl) = slice.chunk_at_line_break(lb);
++        assert_eq!(chunk, &text[cb..cb + chunk.len()], "{what}: chunk_at_line_break({lb}) content");
++        assert_eq!((cc, cl), (char_of_byte(text, cb), line_of_byte(text, cb)), "{what}: chunk_at_line_break({lb}) offsets");
++        // Line break 0 is the start, len_lines the end, otherwise the break ending line lb-1.
++        let target = if lb == 0 { 0 } else if lb == lines.len() { text.len() } else { byte_of_line(text, lb) };
++        assert!(cb <= target && target <= cb + chunk.len(), "{what}: chunk_at_line_break({lb}) does not contain byte {target}");
++    }
++    // Iterators starting in the middle.
++    let mid_c = n_chars / 2;
++    let mid_b = byte_of_char(text, mid_c);
++    assert_eq!(slice.chars_at(mid_c).collect::<String>(), text[mid_b..], "{what}: chars_at({mid_c})");
++    assert_eq!(slice.bytes_at(mid_b).collect::<Vec<_>>(), text.as_bytes()[mid_b..], "{what}: bytes_at({mid_b})");
++    let mut back = slice.chars_at(mid_c);
++    let mut prevs = String::new();
++    while let Some(c) = back.prev() {
++        prevs.insert(0, c);
++    }
++    assert_eq!(prevs, text[..mid_b], "{what}: chars_at({mid_c}).prev() walks back to the start");
++    let mid_l = lines.len() / 2;
++    assert_eq!(slice.lines_at(mid_l).map(|l| l.to_string()).collect::<Vec<_>>(), lines[mid_l..], "{what}: lines_at({mid_l})");
++    assert_eq!(slice.get_chars_at(n_chars + 1).is_none(), true);
++    assert!(slice.get_lines_at(lines.len() + 1).is_none());
++}
++
++// ---------------------------------------------------------------------------------------------
++// Properties
++// ---------------------------------------------------------------------------------------------
++
++/// A rope edited by an arbitrary script (`insert`, `insert_char`, `remove` in every range form,
++/// `split_off` + `append`, `shrink_to_fit`) holds the same text as the `String` edited alike, its
++/// internal invariants hold after every step (`assert_invariants`, `assert_integrity`), and every
++/// query on it agrees with the model.
++#[hegel::test]
++fn edits_match_the_string_model(tc: hegel::TestCase) {
++    let mut model = tc.draw(arb_text());
++    let mut rope = Rope::from_str(&model);
++    let edits = tc.draw(generators::vecs(arb_edit()).max_size(12));
++    rope.assert_invariants();
++    for e in &edits {
++        apply(e, &mut rope, &mut model);
++        rope.assert_integrity();
++        rope.assert_invariants();
++        assert_eq!(rope.to_string(), model, "after {e:?}");
++        assert_eq!(rope.len_chars(), char_count(&model), "len_chars after {e:?}");
++        assert!(rope.capacity() >= rope.len_bytes(), "capacity below length after {e:?}");
++    }
++    check_slice(rope.slice(..), &model, "edited rope");
++    assert_eq!(rope, model.as_str());
++    assert_eq!(rope, Rope::from_str(&model), "a rope built by edits equals one built from the text");
++    // Clones share structure but edit independently.
++    let mut clone = rope.clone();
++    assert!(clone.is_instance(&rope));
++    clone.insert(0, "x");
++    assert_eq!(rope.to_string(), model, "editing a clone changed the original");
++    assert_eq!(clone.to_string(), format!("x{model}"));
++    assert!(!clone.is_instance(&rope));
++    clone.assert_invariants();
++}
++
++/// Every query on a rope of arbitrary chunk structure agrees with the model (see `check_slice`),
++/// and the `get_*`/`try_*` variants give `None`/the documented `Error` exactly out of bounds.
++#[hegel::test]
++fn queries_match_the_model(tc: hegel::TestCase) {
++    let Built(mut rope, text, ..) = tc.draw(arb_rope());
++    check_slice(rope.slice(..), &text, "rope");
++    let n = rope.len_chars();
++    assert!(matches!(rope.try_insert(n + 1, "a"), Err(Error::CharIndexOutOfBounds(i, len)) if i == n + 1 && len == n));
++    assert!(matches!(rope.try_char_to_line(n + 1), Err(Error::CharIndexOutOfBounds(..))));
++    assert!(matches!(rope.try_line_to_byte(rope.len_lines() + 1), Err(Error::LineIndexOutOfBounds(..))));
++    assert!(matches!(rope.try_utf16_cu_to_char(rope.len_utf16_cu() + 1), Err(Error::Utf16IndexOutOfBounds(i, len)) if i == rope.len_utf16_cu() + 1 && len == rope.len_utf16_cu()));
++    assert!(rope.get_slice(n + 1..).is_none());
++    assert!(rope.get_line(rope.len_lines()).is_none());
++    assert_eq!(rope.get_chunk_at_byte(rope.len_bytes() + 1).is_none(), true);
++}
++
++/// A slice, by char range in any range form or by byte range on char boundaries, behaves in every
++/// respect like a rope of exactly its text — including line counts when the slice splits a CRLF
++/// pair; slices of slices too; invalid byte ranges are refused with the documented errors.
++#[hegel::test]
++fn slices_behave_like_ropes_of_their_text(tc: hegel::TestCase) {
++    let Built(rope, text, ..) = tc.draw(arb_rope());
++    let n = char_count(&text);
++    let a = tc.draw(generators::integers::<usize>().max_value(n));
++    let b = tc.draw(generators::integers::<usize>().min_value(a).max_value(n));
++    let form = tc.draw(generators::integers::<u8>().max_value(4));
++    let sub = char_slice(&text, a, b);
++    let slice = match form {
++        0 => rope.slice(a..b),
++        1 if b > a => rope.slice(a..=(b - 1)),
++        2 if a == 0 => rope.slice(..b),
++        3 if b == n => rope.slice(a..),
++        4 => rope.byte_slice(byte_of_char(&text, a)..byte_of_char(&text, b)),
++        _ => rope.slice(a..b),
++    };
++    check_slice(slice, sub, &format!("slice {a}..{b} of {text:?}"));
++    assert_eq!(slice, sub, "slice == &str");
++    assert_eq!(slice, Rope::from_str(sub), "slice == Rope of its text");
++    assert_eq!(Rope::from(slice).to_string(), sub, "Rope::from(slice)");
++    assert_eq!(String::from(slice), sub);
++    // A slice of the slice.
++    let m = char_count(sub);
++    let c = tc.draw(generators::integers::<usize>().max_value(m));
++    let d = tc.draw(generators::integers::<usize>().min_value(c).max_value(m));
++    let subsub = char_slice(sub, c, d);
++    check_slice(slice.slice(c..d), subsub, &format!("slice {c}..{d} of slice {a}..{b} of {text:?}"));
++    assert_eq!(slice.byte_slice(byte_of_char(sub, c)..byte_of_char(sub, d)).to_string(), subsub, "byte_slice of a slice");
++    assert!(slice.get_slice(c..m + 1).is_none(), "get_slice past the end");
++    if c > d.min(m) {
++        unreachable!()
++    }
++    // Byte ranges off a char boundary are refused.
++    for (bi, ch) in sub.char_indices() {
++        if ch.len_utf8() > 1 {
++            let off = bi + 1;
++            assert!(slice.get_byte_slice(off..sub.len()).is_none(), "get_byte_slice starting mid-char {off}");
++            assert!(slice.get_byte_slice(0..off).is_none(), "get_byte_slice ending mid-char {off}");
++            assert!(rope.get_byte_slice(byte_of_char(&text, a) + off..).is_none());
++            break;
++        }
++    }
++    let _ = Bound::<usize>::Unbounded; // range-form coverage is in `apply` and above
++}
++
++/// A slice taken by byte range equals the slice taken by the same char range in every respect —
++/// in particular `len_lines()` when the range ends between the CR and the LF of a CRLF pair,
++/// where the lone CR is a line break of the slice's text (as the char-range slice and the docs
++/// say). The range end is aimed at such CRs. KNOWN FAILURE ropey/1.
++#[hegel::test]
++fn byte_slices_count_lines_like_char_slices(tc: hegel::TestCase) {
++    let Built(rope, text, ..) = tc.draw(arb_rope());
++    let n = char_count(&text);
++    // Char positions just after a CR that is followed by an LF.
++    let after_cr: Vec<usize> = text
++        .char_indices()
++        .filter(|&(b, c)| c == '\r' && text.as_bytes().get(b + 1) == Some(&b'\n'))
++        .map(|(b, _)| char_of_byte(&text, b) + 1)
++        .collect();
++    let a = tc.draw(generators::integers::<usize>().max_value(n));
++    let b = if after_cr.is_empty() || tc.draw(generators::weighted_booleans(0.2)) {
++        tc.draw(generators::integers::<usize>().min_value(a).max_value(n))
++    } else {
++        tc.draw(generators::sampled_from(after_cr.iter().copied().filter(|&p| p >= a).collect::<Vec<_>>().into_iter().chain(std::iter::once(n)).collect::<Vec<_>>()))
++    };
++    let sub = char_slice(&text, a, b);
++    let by_char = rope.slice(a..b);
++    let by_byte = rope.byte_slice(byte_of_char(&text, a)..byte_of_char(&text, b));
++    assert_eq!(by_byte.len_lines(), model_lines(sub).len(), "byte_slice {a}..{b} of {text:?}: len_lines of {sub:?}");
++    assert_eq!(by_byte.len_lines(), by_char.len_lines(), "byte_slice vs slice {a}..{b} of {text:?}: len_lines");
++    assert_eq!(by_byte.lines().count(), by_byte.len_lines(), "byte_slice {a}..{b} of {text:?}: lines() vs len_lines()");
++    check_slice(by_byte, sub, &format!("byte_slice {a}..{b} of {text:?}"));
++}
++
++/// `==`, `Ord` (byte-wise, like `str`) and `Hash` on ropes and slices agree with the strings,
++/// whatever the chunk structure — including the comparisons with `&str`, `String` and `Cow` in
++/// both directions and between a rope and a slice.
++#[hegel::test]
++fn comparisons_and_hash_match_strings(tc: hegel::TestCase) {
++    let Built(r1, t1, ..) = tc.draw(arb_rope());
++    let Built(r2, t2, ..) = tc.draw(arb_rope());
++    // A third rope with r1's text but another structure.
++    let r3 = {
++        let mut r = Rope::new();
++        for line in model_lines(&t1) {
++            let at = r.len_chars();
++            r.insert(at, line);
++        }
++        r
++    };
++    assert_eq!(r1 == r2, t1 == t2, "Rope == Rope for {t1:?} vs {t2:?}");
++    assert_eq!(r1.cmp(&r2), t1.cmp(&t2), "Rope cmp for {t1:?} vs {t2:?}");
++    assert_eq!(r1.partial_cmp(&r2), Some(t1.cmp(&t2)));
++    assert_eq!(r1.slice(..).cmp(&r2.slice(..)), t1.cmp(&t2), "RopeSlice cmp");
++    assert_eq!(r1, r3, "same text, different structure");
++    assert_eq!(r1.cmp(&r3), std::cmp::Ordering::Equal);
++    assert_eq!(hash_of(&r1), hash_of(&r3), "Hash depends on chunk structure for {t1:?}");
++    assert_eq!(hash_of(&r1.slice(..)), hash_of(&r3.slice(..)), "RopeSlice Hash depends on chunk structure");
++    assert_eq!(hash_of(&r1) == hash_of(&r2), t1 == t2 || hash_of(&r1) == hash_of(&r2));
++    if t1 != t2 {
++        // Not required, but with the default hasher a collision on short texts would be a sign.
++        assert_ne!(hash_of(&r1), hash_of(&r2), "collision for {t1:?} vs {t2:?}");
++    }
++    assert_eq!(r1 == t2.as_str(), t1 == t2);
++    assert_eq!(t2.as_str() == r1, t1 == t2);
++    assert_eq!(r1 == t2, t1 == t2);
++    assert_eq!(t2 == r1, t1 == t2);
++    assert_eq!(r1 == Cow::Borrowed(t2.as_str()), t1 == t2);
++    assert_eq!(r1.slice(..) == r2, t1 == t2, "RopeSlice == Rope");
++    assert_eq!(r2 == r1.slice(..), t1 == t2, "Rope == RopeSlice");
++    assert_eq!(r1.slice(..) == t2.as_str(), t1 == t2);
++    assert_eq!(*t2 == r1.slice(..), t1 == t2);
++    // Prefix comparison: a rope is less than any proper extension of it.
++    if !t2.is_empty() {
++        let mut ext = r1.clone();
++        ext.append(r2.clone());
++        assert_eq!(r1.cmp(&ext), std::cmp::Ordering::Less, "prefix ordering");
++        assert_eq!(ext.cmp(&r1), std::cmp::Ordering::Greater);
++    }
++    assert_eq!(format!("{r1}"), t1);
++    assert_eq!(format!("{}", r1.slice(..)), t1);
++    // Debug lists the chunks; it need only be valid Debug output of the text's pieces.
++    assert!(format!("{r1:?}").starts_with('[') && format!("{:?}", r1.slice(..)).starts_with('['));
++}
++
++/// Builders and conversions: `RopeBuilder` fed arbitrary pieces, `From`/`FromIterator` from
++/// strings and `Cow`s, `From<Rope>` for `String` and `Cow`, and `from_reader` over a reader with
++/// arbitrary short reads (multi-byte chars split across reads) then `write_to`, all give the text;
++/// invalid UTF-8 from the reader is an `InvalidData` error.
++#[hegel::test]
++fn builders_and_conversions_round_trip(tc: hegel::TestCase) {
++    let pieces = tc.draw(generators::vecs(arb_text_max(15)).max_size(8));
++    let text: String = pieces.concat();
++    let mut b = RopeBuilder::new();
++    for p in &pieces {
++        b.append(p);
++    }
++    let built = b.finish();
++    built.assert_invariants();
++    assert_eq!(built.to_string(), text, "RopeBuilder");
++    assert_eq!(built, Rope::from_str(&text));
++    let from_iter: Rope = pieces.iter().map(String::as_str).collect();
++    assert_eq!(from_iter.to_string(), text, "FromIterator<&str>");
++    let from_iter: Rope = pieces.iter().cloned().collect();
++    assert_eq!(from_iter.to_string(), text, "FromIterator<String>");
++    assert_eq!(Rope::from(text.clone()).to_string(), text, "From<String>");
++    assert_eq!(Rope::from(Cow::Borrowed(text.as_str())).to_string(), text, "From<Cow>");
++    assert_eq!(String::from(built.clone()), text, "From<Rope> for String");
++    assert_eq!(String::from(&built), text);
++    assert_eq!(Cow::from(&built), text.as_str(), "From<&Rope> for Cow");
++    assert_eq!(Rope::default(), Rope::new());
++    assert_eq!(Rope::new().len_lines(), 1, "an empty rope has one (empty) line");
++    // from_reader with awkward read sizes.
++    let sizes = tc.draw(generators::vecs(generators::integers::<usize>().min_value(1).max_value(7)).min_size(1).max_size(6));
++    let reader = Choppy { data: text.as_bytes().to_vec(), pos: 0, sizes, i: 0 };
++    let read = Rope::from_reader(reader).expect("from_reader failed on valid UTF-8");
++    read.assert_invariants();
++    assert_eq!(read.to_string(), text, "from_reader");
++    let mut out = Vec::new();
++    read.write_to(&mut out).unwrap();
++    assert_eq!(out, text.as_bytes(), "write_to");
++    // Invalid UTF-8 (a stray continuation byte) is InvalidData.
++    let cut = tc.draw(generators::integers::<usize>().max_value(text.len()));
++    let mut bad = text.as_bytes().to_vec();
++    bad.insert(cut, 0x80);
++    let err = Rope::from_reader(&bad[..]).err().expect("from_reader accepted invalid UTF-8");
++    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "error kind for invalid UTF-8");
++}
++
++/// A reader returning the data in the given (cycling) piece sizes.
++struct Choppy {
++    data: Vec<u8>,
++    pos: usize,
++    sizes: Vec<usize>,
++    i: usize,
++}
++
++impl Read for Choppy {
++    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++        let size = self.sizes[self.i % self.sizes.len()];
++        self.i += 1;
++        let n = size.min(buf.len()).min(self.data.len() - self.pos);
++        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
++        self.pos += n;
++        Ok(n)
++    }
++}
++
++/// The `str_utils` conversions on plain strings agree with the model, including their documented
++/// clamping of past-the-end indices.
++#[hegel::test]
++fn str_utils_agree_with_the_model(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let lines = model_lines(&text);
++    let n_chars = char_count(&text);
++    for (ci, (bi, _)) in text.char_indices().chain(std::iter::once((text.len(), '\0'))).enumerate() {
++        assert_eq!(str_utils::byte_to_char_idx(&text, bi), ci, "byte_to_char_idx({bi}) in {text:?}");
++        assert_eq!(str_utils::char_to_byte_idx(&text, ci), bi, "char_to_byte_idx({ci})");
++        assert_eq!(str_utils::byte_to_line_idx(&text, bi), line_of_byte(&text, bi), "byte_to_line_idx({bi}) in {text:?}");
++        assert_eq!(str_utils::char_to_line_idx(&text, ci), line_of_byte(&text, bi), "char_to_line_idx({ci}) in {text:?}");
++    }
++    for li in 0..lines.len() {
++        assert_eq!(str_utils::line_to_byte_idx(&text, li), byte_of_line(&text, li), "line_to_byte_idx({li}) in {text:?}");
++        assert_eq!(str_utils::line_to_char_idx(&text, li), char_of_byte(&text, byte_of_line(&text, li)), "line_to_char_idx({li}) in {text:?}");
++    }
++    // Past-the-end indices clamp as documented.
++    assert_eq!(str_utils::char_to_byte_idx(&text, n_chars + 5), text.len());
++    assert_eq!(str_utils::byte_to_char_idx(&text, text.len() + 5), n_chars);
++    assert_eq!(str_utils::char_to_line_idx(&text, n_chars + 5), lines.len() - 1, "char_to_line_idx past the end is the last line");
++    assert_eq!(str_utils::byte_to_line_idx(&text, text.len() + 5), lines.len() - 1);
++    assert_eq!(str_utils::line_to_char_idx(&text, lines.len() + 5), n_chars, "line_to_char_idx past the end is one past the end");
++    assert_eq!(str_utils::line_to_byte_idx(&text, lines.len() + 5), text.len());
++}
+diff --git a/tests/proptest_tests.proptest-regressions b/tests/proptest_tests.proptest-regressions
+index dc1917f..1169d8c 100644
+--- a/tests/proptest_tests.proptest-regressions
++++ b/tests/proptest_tests.proptest-regressions
+@@ -15,3 +15,4 @@ cc c263569742fedaf3cdfee5398cbe1c0d761179ff67d54984695e17b8ac601e12 # shrinks to
+ cc 92cbac03b8c705ff1c62e10d689efaee7363e8ca27da4dee474f80e9e9fdb7cc # shrinks to char_idx = 17630, ref ins_text = "A"
+ cc 530b4c5540b55e91808e710667a15d18081849b99ce32f42aa5c0739a362c7d0 # shrinks to idx = 10494
+ cc 3f41757544c527c968ee0bd9c6941025b092acab605a2d228176209af312862e # shrinks to idx = 16928
++cc 5af31a7f53530262401d04bd298f7d8cc9e24a0fc17470773d3f5b6e3eda9023 # shrinks to ref gen_text = "aA𑙐¥¥ 0®a𞹂𑰀AΣ A", range = (175685, 319427)
