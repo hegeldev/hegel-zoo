@@ -44,3 +44,8 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-12: base bumped e29daecac529 → 7d1435f71454 (2026-09-12, "Merge pull request #628 from xtqqczze/msrv-reduce"; 0.16.3); 1 bug(s) still reproduce. 234 tests pass.
 - 2026-09-13: base bumped 7d1435f71454 → 7debe996ca88 (2026-09-13, "Merge pull request #629 from xtqqczze/authors"; 0.16.3); 1 bug(s) still reproduce. 234 tests pass.
+- 2026-09-13: 10× budget run (`--test-cases 1000`) failed `hegel_wrap_is_idempotent`: new bug
+  **textwrap/2** — with `UnicodeBreakProperties` and `break_words`, a space after opening
+  punctuation stays inside the word (UAX #14 LB14), so `wrap("( ab", 2)` is `["( ", "ab"]`, a
+  line with trailing whitespace the docs say is discarded, and re-wrapping differs. Pinned as an
+  intermittent expected failure.
