@@ -32,3 +32,4 @@
 - 2026-05-04: predecessor base commit `0e45728195d9` (chore: fmt).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/rasn.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 0e45728195d9 → dd1a65948089 (2026-08-22, "fix(aper): APER byte-alignment for constrained strings inside CHOICE + SEQUENCE(OPTIONAL) nesting (#564)"; 0.28.14); 1 bug(s) still reproduce. 40 tests pass.
