@@ -36,3 +36,4 @@
 - 2026-07-02: predecessor base commit `2f0b1f87fbb4` (chore(deps): update dtolnay/rust-toolchain digest to 4be7066 (#546)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/hcl-rs.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 2f0b1f87fbb4 → f7b17594f8d7 (2026-09-06, "chore(deps): update github actions (#564)"; 0.19.8); 4 bug(s) still reproduce; 1 ignored reproducer(s) not run. 156 tests pass.
