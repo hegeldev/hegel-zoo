@@ -27,3 +27,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1. Five upstream
   `assert_eq!(x, [])`-style asserts in `src/tests.rs` rewritten as `assert!(x.is_empty())`: with
   hegeltest's `serde_json` in scope the element type of the empty array is ambiguous (E0282/E0283).
+- 2026-09-13: base bumped bc8a854926a8 → 053f1a7b71b4 (2026-09-11, "refactor: create `src/iterators/` folder and move `rayon.rs` (closes #598) (#600)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass. Upstream moved its unit tests from `src/tests.rs` to `tests/main.rs` (and dropped the `assert_eq!(x, [])` sites the zoo had to disambiguate), so the hegel module now lives at the end of `tests/main.rs` as an integration test (`smallvec::` paths instead of `crate::`/`alloc::`).
