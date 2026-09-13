@@ -32,3 +32,4 @@
 - 2026-07-14: predecessor base commit `f4f624772f13` (stricter lints).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/lz4_flex.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped f4f624772f13 → f6251928e30a (2026-08-11, "Merge pull request #234 from teddytennant/fix-max8mb-frame-header"; 0.14.0); 1 bug(s) still reproduce; fixed upstream: lz4_flex/1. 83 tests pass. lz4_flex/1 was fixed by making `BlockSize::Max8MB` `#[non_exhaustive]` (legacy frames only, unconstructible from outside), so the `frame_config` generator no longer draws it and `hegel_frame_roundtrip_any_config` now passes.
