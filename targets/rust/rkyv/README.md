@@ -42,3 +42,4 @@
 - 2026-07-02: predecessor base commit `46e143d6e4c8` (Release 0.8.17).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/rkyv.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 46e143d6e4c8 → 4845668ae973 (2026-09-09, "Fix unused import in test"; 0.8.18); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 192 tests pass.

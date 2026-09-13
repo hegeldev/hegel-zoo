@@ -43,3 +43,4 @@
 - 2026-07-18: predecessor base commit `950b724b8f1d` (Merge pull request #1106 from yuvalrakavy/fix-compact-script-operat...).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/rhai.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 950b724b8f1d → 4d9e4d80809f (2026-09-09, "Merge pull request #1162 from rhaiscript/vm-refine-switch-stmt"; 1.26.0); 0 bug(s) still reproduce. 389 tests pass.
