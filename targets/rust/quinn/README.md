@@ -43,3 +43,4 @@
 - 2026-07-20: predecessor base commit `fec2f8960df4` (build(deps): bump rustls from 0.23.41 to 0.23.42).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/quinn.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped fec2f8960df4 → 621e38abbccd (2026-09-10, "proto: reject transport parameters with a mismatched length"; 0.12.0); 1 bug(s) still reproduce. 332 tests pass.
