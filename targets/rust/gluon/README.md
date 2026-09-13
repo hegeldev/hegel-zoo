@@ -24,3 +24,4 @@
 - 2026-07-10: predecessor base commit `418c6b7de22b` (Merge pull request #978 from Marwes/more).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/gluon.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 418c6b7de22b → 38ee70113b58 (2026-08-06, "chore: Get the ui tests working with windows paths"; 0.18.4); 2 bug(s) still reproduce; 1 ignored reproducer(s) not run; add/add conflicts in Cargo.toml resolved by keeping both sides. 10 tests pass.
