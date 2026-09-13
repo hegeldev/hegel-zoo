@@ -24,3 +24,4 @@
 - 2026-07-21: predecessor base commit `27166baaee68` (minor: add .zed to gitignore (#679)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/bson.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 27166baaee68 → 4b677e343d55 (2026-09-04, "RUST-2471 Fix Eq implementation for Bson; extend Eq/Hash to raw types (#686)"; 3.1.0); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 433 tests pass.
