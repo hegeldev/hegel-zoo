@@ -1,0 +1,1197 @@
+diff --git a/apt-sources/Cargo.toml b/apt-sources/Cargo.toml
+index 7f490d3..6a141f2 100644
+--- a/apt-sources/Cargo.toml
++++ b/apt-sources/Cargo.toml
+@@ -64,5 +64,7 @@ path = "src/bin/ppa-info.rs"
+ required-features = ["launchpad", "cli"]
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
+ indoc = { version = "2.0.6" }
+ tempfile = "3"
+diff --git a/apt-sources/tests/hegel.rs b/apt-sources/tests/hegel.rs
+new file mode 100644
+index 0000000..ebcdc39
+--- /dev/null
++++ b/apt-sources/tests/hegel.rs
+@@ -0,0 +1,1179 @@
++//! Hegel property tests for apt-sources, checked against APT itself
++//! (`apt-get update --print-uris` on a temporary configuration: the index
++//! URIs APT derives from a sources file, run offline) and python-apt's
++//! `aptsources.sourceslist.SourceEntry` (a persistent Python child), plus a
++//! model of both file formats built into the generators.
++#![allow(clippy::all, dead_code)]
++
++use apt_sources::legacy::{LegacyRepositories, LegacyRepository};
++use apt_sources::signature::Signature;
++use apt_sources::{Repositories, Repository, RepositoryType, YesNoForce};
++use hegel::generators::{self, Generator};
++use std::collections::{BTreeSet, HashSet};
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::path::PathBuf;
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Mutex, OnceLock};
++use url::Url;
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracle 1: APT
++// ---------------------------------------------------------------------------
++
++/// An index APT would fetch: (type, base URI, suite, component or "" for a
++/// flat repository, architecture / language / "" for sources).
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
++struct Target {
++    typ: String,
++    base: String,
++    suite: String,
++    component: String,
++    what: String,
++}
++
++static APT_COUNTER: AtomicUsize = AtomicUsize::new(0);
++
++/// Run `apt-get update --print-uris` on a one-line-style list and a deb822
++/// sources file and return the index targets, or APT's error lines.
++fn apt_targets(list: &str, sources: &str) -> Result<BTreeSet<Target>, String> {
++    let n = APT_COUNTER.fetch_add(1, Ordering::SeqCst);
++    let dir = std::env::temp_dir().join(format!("hegel-apt-sources-{}-{n}", std::process::id()));
++    let parts = dir.join("parts");
++    let lists = dir.join("lists").join("partial");
++    std::fs::create_dir_all(&parts).unwrap();
++    std::fs::create_dir_all(&lists).unwrap();
++    std::fs::write(dir.join("sources.list"), list).unwrap();
++    std::fs::write(parts.join("zoo.sources"), sources).unwrap();
++    let out = Command::new("apt-get")
++        .arg("-o")
++        .arg(format!("Dir::Etc::sourcelist={}", dir.join("sources.list").display()))
++        .arg("-o")
++        .arg(format!("Dir::Etc::sourceparts={}", parts.display()))
++        .arg("-o")
++        .arg(format!("Dir::State::lists={}", dir.join("lists").display()))
++        .args(["-o", "APT::Architectures::=amd64", "-o", "Acquire::Languages=none"])
++        .args(["update", "--print-uris"])
++        .stdin(Stdio::null())
++        .output()
++        .expect("apt-get");
++    let _ = std::fs::remove_dir_all(&dir);
++    let stderr = String::from_utf8_lossy(&out.stderr);
++    let errors: Vec<&str> = stderr.lines().filter(|l| l.starts_with("E:")).collect();
++    if !errors.is_empty() {
++        return Err(errors.join(" | "));
++    }
++    let stdout = String::from_utf8_lossy(&out.stdout);
++    let mut set = BTreeSet::new();
++    for line in stdout.lines() {
++        let Some(rest) = line.strip_prefix('\'') else { continue };
++        let Some(end) = rest.find('\'') else { continue };
++        if let Some(t) = target_of_uri(&rest[..end]) {
++            set.insert(t);
++        }
++    }
++    Ok(set)
++}
++
++/// Strip a compression suffix.
++fn plain(name: &str) -> &str {
++    for suf in [".gz", ".xz", ".bz2", ".lzma", ".lz4", ".zst"] {
++        if let Some(s) = name.strip_suffix(suf) {
++            return s;
++        }
++    }
++    name
++}
++
++/// Recognise the index URIs the model predicts; other targets (InRelease,
++/// DEP-11, command-not-found, binary-all) are ignored.
++fn target_of_uri(uri: &str) -> Option<Target> {
++    let (base, rest) = uri.split_once("/dists/").map(|(b, r)| (b.to_string(), r.to_string())).or_else(|| {
++        // Flat repository: <base>/<suite>Packages
++        let (path, file) = uri.rsplit_once('/')?;
++        let file = plain(file);
++        if file != "Packages" && file != "Sources" {
++            return None;
++        }
++        return Some((path.to_string(), format!("FLAT/{file}")));
++    })?;
++    if let Some(file) = rest.strip_prefix("FLAT/") {
++        // base is "<uri without trailing slash>/<suite without trailing slash>";
++        // the suite is the last path element.
++        let (b, s) = base.rsplit_once('/')?;
++        let typ = if file == "Packages" { "deb" } else { "deb-src" };
++        return Some(Target {
++            typ: typ.to_string(),
++            base: b.to_string(),
++            suite: format!("{s}/"),
++            component: String::new(),
++            what: String::new(),
++        });
++    }
++    let parts: Vec<&str> = rest.split('/').collect();
++    if parts.len() != 4 {
++        return None;
++    }
++    let (suite, comp, dir, file) = (parts[0], parts[1], parts[2], plain(parts[3]));
++    if dir == "source" && file == "Sources" {
++        return Some(Target { typ: "deb-src".into(), base, suite: suite.into(), component: comp.into(), what: String::new() });
++    }
++    if let Some(arch) = dir.strip_prefix("binary-") {
++        if file == "Packages" && arch != "all" {
++            return Some(Target { typ: "deb".into(), base, suite: suite.into(), component: comp.into(), what: arch.into() });
++        }
++    }
++    if dir == "i18n" {
++        if let Some(lang) = file.strip_prefix("Translation-") {
++            return Some(Target { typ: "deb".into(), base, suite: suite.into(), component: comp.into(), what: format!("lang:{lang}") });
++        }
++    }
++    None
++}
++
++fn base_of(url: &Url) -> String {
++    url.as_str().trim_end_matches('/').to_string()
++}
++
++/// The targets APT should derive from a parsed repository (default
++/// architecture amd64, no languages unless given).
++fn model_targets(
++    enabled: bool,
++    types: &BTreeSet<String>,
++    uris: &[Url],
++    suites: &[String],
++    components: &[String],
++    archs: &[String],
++    langs: &[String],
++) -> BTreeSet<Target> {
++    let mut set = BTreeSet::new();
++    if !enabled {
++        return set;
++    }
++    let archs: Vec<String> = if archs.is_empty() { vec!["amd64".to_string()] } else { archs.to_vec() };
++    for typ in types {
++        for uri in uris {
++            let base = base_of(uri);
++            for suite in suites {
++                if suite.ends_with('/') {
++                    set.insert(Target { typ: typ.clone(), base: base.clone(), suite: suite.clone(), component: String::new(), what: String::new() });
++                    continue;
++                }
++                for comp in components {
++                    if typ == "deb" {
++                        for a in &archs {
++                            set.insert(Target { typ: typ.clone(), base: base.clone(), suite: suite.clone(), component: comp.clone(), what: a.clone() });
++                        }
++                        for l in langs {
++                            set.insert(Target { typ: typ.clone(), base: base.clone(), suite: suite.clone(), component: comp.clone(), what: format!("lang:{l}") });
++                        }
++                    } else {
++                        set.insert(Target { typ: typ.clone(), base: base.clone(), suite: suite.clone(), component: comp.clone(), what: String::new() });
++                    }
++                }
++            }
++        }
++    }
++    set
++}
++
++// ---------------------------------------------------------------------------
++// Oracle 2: python-apt's SourceEntry
++// ---------------------------------------------------------------------------
++
++const PYTHON_SCRIPT: &str = r#"
++import sys, json, binascii
++from aptsources.sourceslist import SourceEntry
++for line in sys.stdin:
++    cmd, _, arg = line.rstrip('\n').partition(' ')
++    text = binascii.unhexlify(arg).decode('utf-8')
++    out = []
++    for l in text.split('\n'):
++        try:
++            e = SourceEntry(l)
++            out.append({'invalid': e.invalid, 'disabled': e.disabled, 'type': e.type,
++                        'uri': e.uri, 'dist': e.dist, 'comps': e.comps,
++                        'arch': e.architectures, 'trusted': None if e.trusted is None else bool(e.trusted), 'comment': e.comment})
++        except Exception as ex:
++            out.append({'error': repr(ex)})
++    sys.stdout.write(json.dumps(out) + '\n')
++    sys.stdout.flush()
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn python() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| {
++        let mut child = Command::new("/usr/bin/python3")
++            .args(["-c", PYTHON_SCRIPT])
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::null())
++            .spawn()
++            .expect("python3");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Child2 { _child: child, stdin, stdout })
++    })
++}
++
++#[derive(Clone, Debug, PartialEq)]
++struct PyEntry {
++    invalid: bool,
++    disabled: bool,
++    typ: String,
++    uri: String,
++    dist: String,
++    comps: Vec<String>,
++    arch: Vec<String>,
++    trusted: Option<bool>,
++    comment: String,
++}
++
++fn python_apt(text: &str) -> Vec<PyEntry> {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
++    writeln!(c.stdin, "P {hex}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut line = String::new();
++    c.stdout.read_line(&mut line).unwrap();
++    assert!(!line.is_empty(), "python child died");
++    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
++    v.as_array()
++        .unwrap()
++        .iter()
++        .map(|e| {
++            if let Some(err) = e.get("error") {
++                panic!("python-apt raised {err} on {text:?}");
++            }
++            let strs = |k: &str| -> Vec<String> {
++                e[k].as_array().map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect()).unwrap_or_default()
++            };
++            PyEntry {
++                invalid: e["invalid"].as_bool().unwrap(),
++                disabled: e["disabled"].as_bool().unwrap(),
++                typ: e["type"].as_str().unwrap_or("").to_string(),
++                uri: e["uri"].as_str().unwrap_or("").to_string(),
++                dist: e["dist"].as_str().unwrap_or("").to_string(),
++                comps: strs("comps"),
++                arch: strs("arch"),
++                trusted: e["trusted"].as_bool(),
++                comment: e["comment"].as_str().unwrap_or("").to_string(),
++            }
++        })
++        .collect()
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn subset<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T], max: usize) -> Vec<T> {
++    let n = tc.draw(int!(0, max.min(items.len()) as i64)) as usize;
++    let mut out: Vec<T> = Vec::new();
++    let mut idx: Vec<usize> = (0..items.len()).collect();
++    for _ in 0..n {
++        let i = tc.draw(int!(0, idx.len() as i64 - 1)) as usize;
++        out.push(items[idx.remove(i)].clone());
++    }
++    out
++}
++
++const SUITES: &[&str] = &["bookworm", "stable", "s1", "jammy-updates", "sid", "trixie-backports"];
++const FLAT_SUITES: &[&str] = &["./", "stable/", "x/"];
++const COMPONENTS: &[&str] = &["main", "contrib", "universe", "restricted", "x1", "multiverse"];
++/// Components the legacy regex cannot match (bug /1).
++const DASHED_COMPONENTS: &[&str] = &["non-free", "non-free-firmware"];
++const ARCHS: &[&str] = &["amd64", "i386", "armhf", "arm64"];
++const LANGS: &[&str] = &["en", "de", "fr"];
++const KEYS: &[&str] = &["/usr/share/keyrings/x.gpg", "/etc/apt/keyrings/y.asc"];
++
++#[hegel::composite]
++fn arb_http_uri(tc: &hegel::TestCase, i: usize) -> String {
++    let scheme = pick(tc, &["http", "https"]);
++    let host = format!("h{i}.example.org");
++    let path = pick(tc, &["", "/", "/debian", "/debian/", "/a/b"]);
++    format!("{scheme}://{host}{path}")
++}
++
++/// Options of a one-line entry, in the order they are written.
++#[derive(Clone, Debug, Default)]
++struct Options {
++    arch: Vec<String>,
++    lang: Vec<String>,
++    target: Vec<String>,
++    pdiffs: Option<bool>,
++    by_hash: Option<YesNoForce>,
++    allow_insecure: bool,
++    allow_weak: bool,
++    allow_downgrade_to_insecure: bool,
++    trusted: Option<bool>,
++    signed_by: Option<String>,
++    /// Keys in the order written (all of the above that are set).
++    order: Vec<String>,
++}
++
++fn yn(b: bool) -> &'static str {
++    if b { "yes" } else { "no" }
++}
++
++impl Options {
++    fn pairs(&self) -> Vec<(String, String)> {
++        let mut v = Vec::new();
++        for k in &self.order {
++            let val = match k.as_str() {
++                "arch" => self.arch.join(","),
++                "lang" => self.lang.join(","),
++                "target" => self.target.join(","),
++                "pdiffs" => yn(self.pdiffs.unwrap()).to_string(),
++                "by-hash" => self.by_hash.unwrap().to_string(),
++                "allow-insecure" => "yes".to_string(),
++                "allow-weak" => "yes".to_string(),
++                "allow-downgrade-to-insecure" => "yes".to_string(),
++                "trusted" => yn(self.trusted.unwrap()).to_string(),
++                "signed-by" => self.signed_by.clone().unwrap(),
++                _ => unreachable!(),
++            };
++            v.push((k.clone(), val));
++        }
++        v
++    }
++    fn render(&self) -> String {
++        if self.order.is_empty() {
++            return String::new();
++        }
++        let inner = self.pairs().iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
++        format!("[{inner}]")
++    }
++    /// Only `arch` and `trusted` are understood by python-apt.
++    fn python_compatible(&self) -> bool {
++        self.order.iter().all(|k| k == "arch" || k == "trusted")
++    }
++}
++
++#[hegel::composite]
++fn arb_options(tc: &hegel::TestCase) -> Options {
++    let mut o = Options::default();
++    let keys = subset(
++        tc,
++        &["arch", "lang", "target", "pdiffs", "by-hash", "allow-insecure", "allow-weak", "allow-downgrade-to-insecure", "trusted", "signed-by"],
++        4,
++    );
++    for k in keys {
++        match k {
++            "arch" => {
++                let mut a = subset(tc, ARCHS, 3);
++                if a.is_empty() {
++                    a.push("amd64");
++                }
++                o.arch = a.iter().map(|s| s.to_string()).collect();
++            }
++            "lang" => {
++                let mut l = subset(tc, LANGS, 2);
++                if l.is_empty() {
++                    l.push("en");
++                }
++                o.lang = l.iter().map(|s| s.to_string()).collect();
++            }
++            "target" => o.target = vec![pick(tc, &["Packages", "Contents-deb"]).to_string()],
++            "pdiffs" => o.pdiffs = Some(tc.draw(generators::booleans())),
++            "by-hash" => o.by_hash = Some(pick(tc, &[YesNoForce::Yes, YesNoForce::No, YesNoForce::Force])),
++            "allow-insecure" => o.allow_insecure = true,
++            "allow-weak" => o.allow_weak = true,
++            "allow-downgrade-to-insecure" => o.allow_downgrade_to_insecure = true,
++            "trusted" => o.trusted = Some(tc.draw(generators::booleans())),
++            "signed-by" => o.signed_by = Some(pick(tc, KEYS).to_string()),
++            _ => unreachable!(),
++        }
++        o.order.push(k.to_string());
++    }
++    o
++}
++
++#[derive(Clone, Debug)]
++struct LegLine {
++    disabled: bool,
++    typ: RepositoryType,
++    options: Options,
++    uri: String,
++    suite: String,
++    comps: Vec<String>,
++    comment: Option<String>,
++    /// Separator between the words: " ", "  " or "\t".
++    sep: String,
++}
++
++impl LegLine {
++    fn flat(&self) -> bool {
++        self.suite.ends_with('/')
++    }
++    fn render(&self) -> String {
++        let mut words = vec![self.typ.to_string()];
++        let opts = self.options.render();
++        if !opts.is_empty() {
++            words.push(opts);
++        }
++        words.push(self.uri.clone());
++        words.push(self.suite.clone());
++        words.extend(self.comps.iter().cloned());
++        let mut s = words.join(&self.sep);
++        if let Some(c) = &self.comment {
++            s.push_str(&format!(" #{c}"));
++        }
++        if self.disabled {
++            s = format!("# {s}");
++        }
++        s
++    }
++    fn expected(&self) -> LegacyRepository {
++        let mut r = LegacyRepository::default();
++        r.typ = self.typ.clone();
++        r.uri = Url::parse(&self.uri).unwrap();
++        r.suite = self.suite.clone();
++        r.components = self.comps.clone();
++        r.architectures = self.options.arch.clone();
++        r.languages = self.options.lang.clone();
++        r.targets = self.options.target.clone();
++        r.pdiffs = self.options.pdiffs;
++        r.by_hash = self.options.by_hash;
++        r.allow_insecure = self.options.allow_insecure;
++        r.allow_weak = self.options.allow_weak;
++        r.allow_downgrade_to_insecure = self.options.allow_downgrade_to_insecure;
++        r.trusted = self.options.trusted;
++        r.signature = self.options.signed_by.as_ref().map(|p| Signature::KeyPath(PathBuf::from(p)));
++        r
++    }
++    fn targets(&self) -> BTreeSet<Target> {
++        let types: BTreeSet<String> = [self.typ.to_string()].into_iter().collect();
++        model_targets(
++            !self.disabled,
++            &types,
++            &[Url::parse(&self.uri).unwrap()],
++            &[self.suite.clone()],
++            &self.comps,
++            &self.options.arch,
++            &self.options.lang,
++        )
++    }
++}
++
++#[derive(Clone, Debug, Default)]
++struct LegOpts {
++    flat: bool,
++    dashed: bool,
++    comments: bool,
++    disabled: bool,
++    targets: bool,
++    wide_seps: bool,
++}
++
++#[hegel::composite]
++fn arb_leg_line(tc: &hegel::TestCase, i: usize, opts: LegOpts) -> LegLine {
++    let typ = pick(tc, &[RepositoryType::Binary, RepositoryType::Source]);
++    let mut options = tc.draw(arb_options().print_as_debug());
++    if !opts.targets {
++        options.target.clear();
++        options.order.retain(|k| k != "target");
++    }
++    let uri = tc.draw(arb_http_uri(i));
++    let flat = opts.flat && tc.draw(int!(0, 3)) == 0;
++    let suite = if flat { pick(tc, FLAT_SUITES) } else { pick(tc, SUITES) }.to_string();
++    let comps: Vec<String> = if flat {
++        vec![]
++    } else {
++        let pool: Vec<&str> = if opts.dashed {
++            COMPONENTS.iter().chain(DASHED_COMPONENTS).cloned().collect()
++        } else {
++            COMPONENTS.to_vec()
++        };
++        let mut c = subset(tc, &pool, 3);
++        if c.is_empty() {
++            c.push("main");
++        }
++        c.iter().map(|s| s.to_string()).collect()
++    };
++    let comment = if opts.comments && tc.draw(int!(0, 3)) == 0 {
++        Some(pick(tc, &["", " a comment", "x=y"]).to_string())
++    } else {
++        None
++    };
++    let disabled = opts.disabled && tc.draw(int!(0, 3)) == 0;
++    // apt-sources/11: two or more spaces between components drop the line.
++    let sep = if opts.wide_seps { pick(tc, &[" ", "  ", "\t", " \t"]) } else { pick(tc, &[" ", "\t"]) }.to_string();
++    LegLine { disabled, typ, options, uri, suite, comps, comment, sep }
++}
++
++#[derive(Clone, Debug)]
++struct LegFile {
++    lines: Vec<LegLine>,
++    /// Comment / blank lines interleaved: index -> lines before entry i.
++    extra: Vec<Vec<String>>,
++}
++
++impl LegFile {
++    fn text(&self) -> String {
++        let mut out = Vec::new();
++        for (i, l) in self.lines.iter().enumerate() {
++            out.extend(self.extra[i].iter().cloned());
++            out.push(l.render());
++        }
++        out.extend(self.extra[self.lines.len()].iter().cloned());
++        let mut s = out.join("\n");
++        s.push('\n');
++        s
++    }
++    fn enabled(&self) -> Vec<&LegLine> {
++        self.lines.iter().filter(|l| !l.disabled).collect()
++    }
++    fn targets(&self) -> BTreeSet<Target> {
++        self.lines.iter().flat_map(|l| l.targets()).collect()
++    }
++}
++
++#[hegel::composite]
++fn arb_leg_file(tc: &hegel::TestCase, opts: LegOpts) -> LegFile {
++    let n = tc.draw(int!(0, 3)) as usize;
++    let mut lines = Vec::new();
++    for i in 0..n {
++        lines.push(tc.draw(arb_leg_line(i, opts.clone()).print_as_debug()));
++    }
++    let mut extra = Vec::new();
++    for _ in 0..=n {
++        let k = tc.draw(int!(0, 2));
++        let mut e = Vec::new();
++        for _ in 0..k {
++            e.push(pick(tc, &["", "# a comment", "## deb not really", "#"]).to_string());
++        }
++        extra.push(e);
++    }
++    LegFile { lines, extra }
++}
++
++/// A deb822 stanza.
++#[derive(Clone, Debug)]
++struct Stanza {
++    enabled: Option<bool>,
++    types: BTreeSet<String>,
++    uris: Vec<String>,
++    suites: Vec<String>,
++    components: Option<Vec<String>>,
++    architectures: Option<Vec<String>>,
++    languages: Option<Vec<String>>,
++    targets: Option<Vec<String>>,
++    pdiffs: Option<bool>,
++    by_hash: Option<YesNoForce>,
++    allow_insecure: Option<bool>,
++    allow_weak: Option<bool>,
++    allow_downgrade_to_insecure: Option<bool>,
++    trusted: Option<bool>,
++    signed_by: Option<String>,
++    x_repolib_name: Option<String>,
++    description: Option<String>,
++    /// Field order as written.
++    order: Vec<String>,
++}
++
++impl Stanza {
++    fn flat(&self) -> bool {
++        self.suites.iter().any(|s| s.ends_with('/'))
++    }
++    fn fields(&self) -> Vec<(String, String)> {
++        let mut v = Vec::new();
++        for k in &self.order {
++            let val = match k.as_str() {
++                "Enabled" => yn(self.enabled.unwrap()).to_string(),
++                "Types" => self.types.iter().cloned().collect::<Vec<_>>().join(" "),
++                "URIs" => self.uris.join(" "),
++                "Suites" => self.suites.join(" "),
++                "Components" => self.components.clone().unwrap().join(" "),
++                "Architectures" => self.architectures.clone().unwrap().join(" "),
++                "Languages" => self.languages.clone().unwrap().join(" "),
++                "Targets" => self.targets.clone().unwrap().join(" "),
++                "PDiffs" => yn(self.pdiffs.unwrap()).to_string(),
++                "By-Hash" => self.by_hash.unwrap().to_string(),
++                "Allow-Insecure" => yn(self.allow_insecure.unwrap()).to_string(),
++                "Allow-Weak" => yn(self.allow_weak.unwrap()).to_string(),
++                "Allow-Downgrade-To-Insecure" => yn(self.allow_downgrade_to_insecure.unwrap()).to_string(),
++                "Trusted" => yn(self.trusted.unwrap()).to_string(),
++                "Signed-By" => self.signed_by.clone().unwrap(),
++                "X-Repolib-Name" => self.x_repolib_name.clone().unwrap(),
++                "Description" => self.description.clone().unwrap(),
++                _ => unreachable!(),
++            };
++            v.push((k.clone(), val));
++        }
++        v
++    }
++    fn text(&self) -> String {
++        let mut s = String::new();
++        for (k, v) in self.fields() {
++            s.push_str(&format!("{k}: {v}\n"));
++        }
++        s
++    }
++    fn expected(&self) -> Repository {
++        Repository {
++            enabled: self.enabled,
++            types: self.types.iter().map(|t| RepositoryType::from_str(t).unwrap()).collect(),
++            uris: self.uris.iter().map(|u| Url::parse(u).unwrap()).collect(),
++            suites: self.suites.clone(),
++            components: self.components.clone(),
++            architectures: self.architectures.clone(),
++            languages: self.languages.clone(),
++            targets: self.targets.clone(),
++            pdiffs: self.pdiffs,
++            by_hash: self.by_hash,
++            allow_insecure: self.allow_insecure,
++            allow_weak: self.allow_weak,
++            allow_downgrade_to_insecure: self.allow_downgrade_to_insecure,
++            trusted: self.trusted,
++            signature: self.signed_by.as_ref().map(|p| Signature::KeyPath(PathBuf::from(p))),
++            x_repolib_name: self.x_repolib_name.clone(),
++            description: self.description.clone(),
++        }
++    }
++    fn targets(&self) -> BTreeSet<Target> {
++        model_targets(
++            self.enabled.unwrap_or(true),
++            &self.types,
++            &self.uris.iter().map(|u| Url::parse(u).unwrap()).collect::<Vec<_>>(),
++            &self.suites,
++            self.components.as_deref().unwrap_or(&[]),
++            self.architectures.as_deref().unwrap_or(&[]),
++            self.languages.as_deref().unwrap_or(&[]),
++        )
++    }
++    /// deb822-fast/… and apt-sources: uses of the yes/no fields the crate
++    /// reads as `true`/`false` (bug /6).
++    fn uses_bool_fields(&self) -> bool {
++        self.allow_insecure.is_some() || self.allow_weak.is_some() || self.allow_downgrade_to_insecure.is_some() || self.trusted.is_some()
++    }
++}
++
++#[derive(Clone, Debug, Default)]
++struct StanzaOpts {
++    flat: bool,
++    bool_fields: bool,
++    pdiffs: bool,
++    targets: bool,
++}
++
++#[hegel::composite]
++fn arb_stanza(tc: &hegel::TestCase, i: usize, opts: StanzaOpts) -> Stanza {
++    let mut types: BTreeSet<String> = subset(tc, &["deb", "deb-src"], 2).into_iter().map(|s| s.to_string()).collect();
++    if types.is_empty() {
++        types.insert("deb".to_string());
++    }
++    let n_uris = tc.draw(int!(1, 2)) as usize;
++    let uris: Vec<String> = (0..n_uris).map(|j| tc.draw(arb_http_uri(i * 10 + j))).collect();
++    let flat = opts.flat && tc.draw(int!(0, 3)) == 0;
++    let mut suites: Vec<String> = if flat {
++        vec![pick(tc, FLAT_SUITES).to_string()]
++    } else {
++        subset(tc, SUITES, 2).into_iter().map(|s| s.to_string()).collect()
++    };
++    if suites.is_empty() {
++        suites.push("stable".to_string());
++    }
++    let components = if flat {
++        None
++    } else {
++        let mut c = subset(tc, COMPONENTS, 3);
++        if c.is_empty() {
++            c.push("main");
++        }
++        Some(c.into_iter().map(|s| s.to_string()).collect())
++    };
++    let mut s = Stanza {
++        enabled: None,
++        types,
++        uris,
++        suites,
++        components,
++        architectures: None,
++        languages: None,
++        targets: None,
++        pdiffs: None,
++        by_hash: None,
++        allow_insecure: None,
++        allow_weak: None,
++        allow_downgrade_to_insecure: None,
++        trusted: None,
++        signed_by: None,
++        x_repolib_name: None,
++        description: None,
++        order: vec![],
++    };
++    let mut optional: Vec<&str> = vec!["Enabled", "Architectures", "Languages", "By-Hash", "Signed-By", "X-Repolib-Name", "Description"];
++    if opts.bool_fields {
++        optional.extend(["Allow-Insecure", "Allow-Weak", "Allow-Downgrade-To-Insecure", "Trusted"]);
++    }
++    if opts.pdiffs {
++        optional.push("PDiffs");
++    }
++    if opts.targets {
++        optional.push("Targets");
++    }
++    let chosen = subset(tc, &optional, 4);
++    for k in &chosen {
++        match *k {
++            "Enabled" => s.enabled = Some(tc.draw(generators::booleans())),
++            "Architectures" => {
++                let mut a = subset(tc, ARCHS, 2);
++                if a.is_empty() {
++                    a.push("i386");
++                }
++                s.architectures = Some(a.into_iter().map(|x| x.to_string()).collect());
++            }
++            "Languages" => {
++                let mut l = subset(tc, LANGS, 2);
++                if l.is_empty() {
++                    l.push("de");
++                }
++                s.languages = Some(l.into_iter().map(|x| x.to_string()).collect());
++            }
++            "Targets" => s.targets = Some(vec![pick(tc, &["Packages", "Contents-deb"]).to_string()]),
++            "PDiffs" => s.pdiffs = Some(tc.draw(generators::booleans())),
++            "By-Hash" => s.by_hash = Some(pick(tc, &[YesNoForce::Yes, YesNoForce::No, YesNoForce::Force])),
++            "Allow-Insecure" => s.allow_insecure = Some(tc.draw(generators::booleans())),
++            "Allow-Weak" => s.allow_weak = Some(tc.draw(generators::booleans())),
++            "Allow-Downgrade-To-Insecure" => s.allow_downgrade_to_insecure = Some(tc.draw(generators::booleans())),
++            "Trusted" => s.trusted = Some(tc.draw(generators::booleans())),
++            "Signed-By" => s.signed_by = Some(pick(tc, KEYS).to_string()),
++            "X-Repolib-Name" => s.x_repolib_name = Some(pick(tc, &["Zoo", "my-repo"]).to_string()),
++            "Description" => s.description = Some(pick(tc, &["A repository", "x"]).to_string()),
++            _ => unreachable!(),
++        }
++    }
++    // Field order: the mandatory ones first in a random arrangement, then the
++    // optional ones in the drawn order, with `Enabled` sometimes first.
++    let mut order: Vec<String> = vec!["Types".into(), "URIs".into(), "Suites".into()];
++    if s.components.is_some() {
++        order.push("Components".into());
++    }
++    if tc.draw(generators::booleans()) {
++        order.reverse();
++    }
++    let mut opt_order: Vec<String> = chosen.iter().map(|k| k.to_string()).collect();
++    if opt_order.contains(&"Enabled".to_string()) && tc.draw(generators::booleans()) {
++        opt_order.retain(|k| k != "Enabled");
++        order.insert(0, "Enabled".into());
++    }
++    order.extend(opt_order);
++    s.order = order;
++    s
++}
++
++#[hegel::composite]
++fn arb_stanzas(tc: &hegel::TestCase, opts: StanzaOpts) -> Vec<Stanza> {
++    let n = tc.draw(int!(0, 3)) as usize;
++    (0..n).map(|i| tc.draw(arb_stanza(i, opts.clone()).print_as_debug())).collect()
++}
++
++fn stanzas_text(stanzas: &[Stanza]) -> String {
++    stanzas.iter().map(|s| s.text()).collect::<Vec<_>>().join("\n")
++}
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++fn type_names(types: &HashSet<RepositoryType>) -> BTreeSet<String> {
++    types.iter().map(|t| t.to_string()).collect()
++}
++
++fn repo_targets(r: &Repository) -> BTreeSet<Target> {
++    model_targets(
++        r.enabled.unwrap_or(true),
++        &type_names(&r.types),
++        &r.uris,
++        &r.suites,
++        r.components.as_deref().unwrap_or(&[]),
++        r.architectures.as_deref().unwrap_or(&[]),
++        r.languages.as_deref().unwrap_or(&[]),
++    )
++}
++
++fn legacy_targets(r: &LegacyRepository) -> BTreeSet<Target> {
++    let types: BTreeSet<String> = [r.typ.to_string()].into_iter().collect();
++    model_targets(true, &types, &[r.uri.clone()], &[r.suite.clone()], &r.components, &r.architectures, &r.languages)
++}
++
++// ---------------------------------------------------------------------------
++// One-line format
++// ---------------------------------------------------------------------------
++
++/// Plain files: LF, http(s) URIs, no flat repositories, no dashed components,
++/// no comments after an entry, no disabled entries.
++#[hegel::test]
++fn legacy_lines_are_read_as_the_model_says(tc: hegel::TestCase) {
++    let file = tc.draw(arb_leg_file(LegOpts { targets: true, ..Default::default() }).print_as_debug());
++    let text = file.text();
++    let parsed = LegacyRepositories::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let expected: Vec<LegacyRepository> = file.lines.iter().map(|l| l.expected()).collect();
++    assert_eq!(parsed.iter().cloned().collect::<Vec<_>>(), expected, "for {text:?}");
++    assert_eq!(parsed.len(), file.lines.len());
++    assert_eq!(parsed.is_empty(), file.lines.is_empty());
++    assert_eq!(parsed.repositories().count(), file.lines.len());
++}
++
++#[hegel::test]
++fn legacy_lines_are_read_like_python_apt(tc: hegel::TestCase) {
++    let file = tc.draw(arb_leg_file(LegOpts::default()).print_as_debug());
++    let text = file.text();
++    let parsed = LegacyRepositories::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let py = python_apt(&text);
++    let py_valid: Vec<&PyEntry> = py.iter().filter(|e| !e.invalid && !e.disabled).collect();
++    // python-apt marks entries with options other than arch/trusted invalid.
++    let comparable = file.lines.iter().filter(|l| l.options.python_compatible()).count();
++    assert_eq!(py_valid.len(), comparable, "python-apt on {text:?}: {py:?}");
++    let ours: Vec<&LegacyRepository> = parsed
++        .iter()
++        .zip(&file.lines)
++        .filter(|(_, l)| l.options.python_compatible())
++        .map(|(r, _)| r)
++        .collect();
++    for (r, e) in ours.iter().zip(&py_valid) {
++        assert_eq!(r.typ.to_string(), e.typ, "type for {text:?}");
++        assert_eq!(r.uri, Url::parse(&e.uri).unwrap(), "uri for {text:?}");
++        assert_eq!(r.suite, e.dist, "suite for {text:?}");
++        assert_eq!(r.components, e.comps, "components for {text:?}");
++        assert_eq!(r.architectures, e.arch, "architectures for {text:?}");
++        assert_eq!(r.trusted, e.trusted, "trusted for {text:?}");
++    }
++}
++
++#[hegel::test]
++fn legacy_lines_yield_the_indexes_apt_fetches(tc: hegel::TestCase) {
++    let file = tc.draw(arb_leg_file(LegOpts::default()).print_as_debug());
++    let text = file.text();
++    let parsed = LegacyRepositories::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let ours: BTreeSet<Target> = parsed.iter().flat_map(legacy_targets).collect();
++    let apt = apt_targets(&text, "").unwrap_or_else(|e| panic!("apt rejected {text:?}: {e}"));
++    assert_eq!(ours, apt, "for {text:?}");
++    assert_eq!(file.targets(), apt, "model for {text:?}");
++}
++
++#[hegel::test]
++fn legacy_display_round_trips(tc: hegel::TestCase) {
++    let file = tc.draw(arb_leg_file(LegOpts { targets: true, ..Default::default() }).print_as_debug());
++    // apt-sources/5: `pdiffs` is written as `pdiff`.
++    if file.lines.iter().any(|l| l.options.pdiffs.is_some()) {
++        return;
++    }
++    let text = file.text();
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    if parsed.is_empty() {
++        assert_eq!(parsed.to_string(), "");
++        return;
++    }
++    let shown = format!("{parsed}\n");
++    let again = LegacyRepositories::from_str(&shown).unwrap_or_else(|e| panic!("{shown:?}: {e}"));
++    assert_eq!(again, parsed, "display {shown:?} of {text:?}");
++    // The display is one line per repository, and each line alone parses.
++    assert_eq!(shown.lines().count(), parsed.len());
++    for (line, r) in shown.lines().zip(parsed.iter()) {
++        assert_eq!(r.to_string(), line);
++        let one = LegacyRepositories::from_str(line).unwrap();
++        assert_eq!(one.iter().collect::<Vec<_>>(), vec![r]);
++    }
++    // APT reads the display the same way (a `target=` option changes the
++    // indexes, so only lines without one are compared).
++    if !parsed.is_empty() && parsed.iter().all(|r| r.targets.is_empty()) {
++        let apt = apt_targets(&shown, "").unwrap_or_else(|e| panic!("apt rejected display {shown:?}: {e}"));
++        assert_eq!(apt, parsed.iter().flat_map(legacy_targets).collect::<BTreeSet<_>>());
++    }
++}
++
++// ---------------------------------------------------------------------------
++// deb822 format
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn stanzas_are_read_as_the_model_says(tc: hegel::TestCase) {
++    let stanzas = tc.draw(arb_stanzas(StanzaOpts { flat: true, pdiffs: true, targets: true, ..Default::default() }).print_as_debug());
++    let text = stanzas_text(&stanzas);
++    let parsed = Repositories::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let expected: Vec<Repository> = stanzas.iter().map(|s| s.expected()).collect();
++    assert_eq!(parsed.iter().cloned().collect::<Vec<_>>(), expected, "for {text:?}");
++    for (r, s) in parsed.iter().zip(&stanzas) {
++        assert_eq!(type_names(r.types()), s.types);
++        assert_eq!(r.suites(), s.suites.as_slice());
++        assert_eq!(r.uris().len(), s.uris.len());
++        assert_eq!(r.components().map(|c| c.to_vec()), s.components);
++        assert_eq!(r.architectures(), s.architectures.as_deref().unwrap_or(&[]));
++    }
++}
++
++#[hegel::test]
++fn stanzas_yield_the_indexes_apt_fetches(tc: hegel::TestCase) {
++    let stanzas = tc.draw(arb_stanzas(StanzaOpts { flat: true, ..Default::default() }).print_as_debug());
++    let text = stanzas_text(&stanzas);
++    let parsed = Repositories::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let ours: BTreeSet<Target> = parsed.iter().flat_map(repo_targets).collect();
++    let apt = apt_targets("", &text).unwrap_or_else(|e| panic!("apt rejected {text:?}: {e}"));
++    assert_eq!(ours, apt, "for {text:?}");
++    assert_eq!(stanzas.iter().flat_map(|s| s.targets()).collect::<BTreeSet<_>>(), apt, "model for {text:?}");
++}
++
++#[hegel::test]
++fn stanza_display_round_trips(tc: hegel::TestCase) {
++    let stanzas = tc.draw(arb_stanzas(StanzaOpts { flat: true, targets: true, ..Default::default() }).print_as_debug());
++    let text = stanzas_text(&stanzas);
++    let parsed = Repositories::from_str(&text).unwrap();
++    let shown = parsed.to_string();
++    let again = Repositories::from_str(&shown).unwrap_or_else(|e| panic!("{shown:?}: {e}"));
++    assert_eq!(again, parsed, "display {shown:?} of {text:?}");
++    if !parsed.is_empty() && parsed.iter().all(|r| r.targets.is_none()) {
++        let apt = apt_targets("", &shown).unwrap_or_else(|e| panic!("apt rejected display {shown:?}: {e}"));
++        assert_eq!(apt, parsed.iter().flat_map(repo_targets).collect::<BTreeSet<_>>());
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Conversions between the two formats
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn legacy_to_deb822_and_back_is_the_identity(tc: hegel::TestCase) {
++    let line = tc.draw(arb_leg_line(0, LegOpts { flat: true, targets: true, ..Default::default() }).print_as_debug());
++    let l = line.expected();
++    let r: Repository = (&l).into();
++    assert_eq!(r.enabled, Some(true));
++    assert_eq!(type_names(&r.types), [l.typ.to_string()].into_iter().collect());
++    assert_eq!(r.uris, vec![l.uri.clone()]);
++    assert_eq!(r.suites, vec![l.suite.clone()]);
++    assert_eq!(r.components.clone().unwrap_or_default(), l.components);
++    assert_eq!(r.architectures.clone().unwrap_or_default(), l.architectures);
++    assert_eq!(r.languages.clone().unwrap_or_default(), l.languages);
++    assert_eq!(r.targets.clone().unwrap_or_default(), l.targets);
++    assert_eq!(r.pdiffs, l.pdiffs);
++    assert_eq!(r.by_hash, l.by_hash);
++    assert_eq!(r.allow_insecure.unwrap_or(false), l.allow_insecure);
++    assert_eq!(r.allow_weak.unwrap_or(false), l.allow_weak);
++    assert_eq!(r.allow_downgrade_to_insecure.unwrap_or(false), l.allow_downgrade_to_insecure);
++    assert_eq!(r.trusted, l.trusted);
++    assert_eq!(r.signature, l.signature);
++    assert_eq!(repo_targets(&r), legacy_targets(&l));
++    let by_value: Repository = l.clone().into();
++    assert_eq!(by_value, r);
++    let back = LegacyRepositories::from(&r);
++    assert_eq!(back.iter().cloned().collect::<Vec<_>>(), vec![l.clone()], "via {r:?}");
++}
++
++#[hegel::test]
++fn deb822_to_legacy_lines_keeps_the_indexes(tc: hegel::TestCase) {
++    let stanza = tc.draw(arb_stanza(0, StanzaOpts { flat: true, pdiffs: true, targets: true, ..Default::default() }).print_as_debug());
++    let r = stanza.expected();
++    let lines = LegacyRepositories::from(&r);
++    assert_eq!(lines.len(), r.types.len() * r.uris.len() * r.suites.len());
++    let mut seen = BTreeSet::new();
++    for l in lines.iter() {
++        assert!(seen.insert((l.typ.to_string(), l.uri.to_string(), l.suite.clone())), "duplicate line");
++        assert_eq!(l.components, r.components.clone().unwrap_or_default());
++        assert_eq!(l.architectures, r.architectures.clone().unwrap_or_default());
++        assert_eq!(l.pdiffs, r.pdiffs);
++        assert_eq!(l.trusted, r.trusted);
++        assert_eq!(l.signature, r.signature);
++    }
++    if r.enabled != Some(false) {
++        let from_lines: BTreeSet<Target> = lines.iter().flat_map(legacy_targets).collect();
++        assert_eq!(from_lines, repo_targets(&r));
++    }
++    // And back again, as one repository per line.
++    let again: Repositories = lines.into();
++    assert_eq!(again.len(), r.types.len() * r.uris.len() * r.suites.len());
++    let merged: BTreeSet<Target> = again.iter().flat_map(repo_targets).collect();
++    if r.enabled != Some(false) {
++        assert_eq!(merged, repo_targets(&r));
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pinned bugs
++// ---------------------------------------------------------------------------
++
++/// apt-sources/1: a component containing `-` (`non-free`, `non-free-firmware`)
++/// makes the line silently disappear.
++#[hegel::test]
++fn components_with_a_dash_are_read(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.comps.push(pick(&tc, DASHED_COMPONENTS).to_string());
++    let text = format!("{}\n", line.render());
++    let apt = apt_targets(&text, "").unwrap();
++    assert_eq!(apt, line.targets());
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert_eq!(parsed.iter().cloned().collect::<Vec<_>>(), vec![line.expected()], "for {text:?}");
++}
++
++/// apt-sources/2: a flat repository (`deb http://x/ ./`, no components) is
++/// silently dropped, and one written by `Display` (trailing space) too.
++#[hegel::test]
++fn flat_repositories_are_read(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.suite = pick(&tc, FLAT_SUITES).to_string();
++    line.comps.clear();
++    let text = format!("{}\n", line.render());
++    let apt = apt_targets(&text, "").unwrap();
++    assert_eq!(apt, line.targets());
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert_eq!(parsed.iter().cloned().collect::<Vec<_>>(), vec![line.expected()], "for {text:?}");
++}
++
++/// apt-sources/3: a trailing `# comment` makes the line disappear.
++#[hegel::test]
++fn a_trailing_comment_does_not_drop_the_line(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.comment = Some(pick(&tc, &["", " a comment", "x"]).to_string());
++    let text = format!("{}\n", line.render());
++    let apt = apt_targets(&text, "").unwrap();
++    assert_eq!(apt, line.targets());
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert_eq!(parsed.iter().cloned().collect::<Vec<_>>(), vec![line.expected()], "for {text:?}");
++}
++
++/// apt-sources/4: a commented-out entry (`# deb …`) is documented as a
++/// disabled repository but is not read at all.
++#[hegel::test]
++fn disabled_entries_are_read_as_disabled(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.disabled = true;
++    let text = format!("{}\n", line.render());
++    let py = python_apt(&text);
++    assert!(py[0].disabled && (!py[0].invalid || !line.options.python_compatible()));
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert_eq!(parsed.len(), 1, "for {text:?}: {parsed:?}");
++    let r: Repository = parsed.iter().next().unwrap().into();
++    assert_eq!(r.enabled, Some(false));
++}
++
++/// apt-sources/5: `Display` writes the `pdiffs` option as `pdiff`, which
++/// the parser (and APT) do not know.
++#[hegel::test]
++fn the_pdiffs_option_round_trips_through_display(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    let v = tc.draw(generators::booleans());
++    line.options.pdiffs = Some(v);
++    line.options.order.retain(|k| k != "pdiffs");
++    line.options.order.push("pdiffs".to_string());
++    let text = format!("{}\n", line.render());
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert_eq!(parsed.len(), 1);
++    let shown = format!("{parsed}\n");
++    let again = LegacyRepositories::from_str(&shown).map_err(|e| e.to_string());
++    assert_eq!(again.map(|a| a.iter().cloned().collect::<Vec<_>>()), Ok(vec![line.expected()]), "display {shown:?}");
++    apt_targets(&shown, "").unwrap_or_else(|e| panic!("apt rejected display {shown:?}: {e}"));
++}
++
++/// apt-sources/6: the yes/no fields `Allow-Insecure`, `Allow-Weak`,
++/// `Allow-Downgrade-To-Insecure` and `Trusted` are read with `bool::from_str`
++/// (`true`/`false`), so the values sources.list(5) specifies are rejected.
++#[hegel::test]
++fn yes_no_fields_are_read(tc: hegel::TestCase) {
++    let mut stanza = tc.draw(arb_stanza(0, StanzaOpts::default()).print_as_debug());
++    let field = pick(&tc, &["Allow-Insecure", "Allow-Weak", "Allow-Downgrade-To-Insecure", "Trusted"]);
++    let v = tc.draw(generators::booleans());
++    match field {
++        "Allow-Insecure" => stanza.allow_insecure = Some(v),
++        "Allow-Weak" => stanza.allow_weak = Some(v),
++        "Allow-Downgrade-To-Insecure" => stanza.allow_downgrade_to_insecure = Some(v),
++        _ => stanza.trusted = Some(v),
++    }
++    stanza.order.push(field.to_string());
++    let text = stanza.text();
++    apt_targets("", &text).unwrap_or_else(|e| panic!("apt rejected {text:?}: {e}"));
++    let parsed = Repositories::from_str(&text).map_err(|e| e.to_string());
++    assert_eq!(parsed.map(|p| p.iter().cloned().collect::<Vec<_>>()), Ok(vec![stanza.expected()]), "for {text:?}");
++}
++
++/// apt-sources/7: `PDiffs: yes` is displayed as `PDiffs: true`, which the
++/// parser rejects.
++#[hegel::test]
++fn the_pdiffs_field_round_trips_through_display(tc: hegel::TestCase) {
++    let mut stanza = tc.draw(arb_stanza(0, StanzaOpts::default()).print_as_debug());
++    stanza.pdiffs = Some(tc.draw(generators::booleans()));
++    stanza.order.push("PDiffs".to_string());
++    let text = stanza.text();
++    let parsed = Repositories::from_str(&text).unwrap();
++    let shown = parsed.to_string();
++    let again = Repositories::from_str(&shown).map_err(|e| e.to_string());
++    assert_eq!(again.map(|a| a.iter().cloned().collect::<Vec<_>>()), Ok(vec![stanza.expected()]), "display {shown:?}");
++}
++
++/// apt-sources/8: an embedded `Signed-By` key block does not round-trip
++/// through `Display` (an extra empty line is added on every pass).
++#[hegel::test]
++fn an_embedded_key_block_round_trips_through_display(tc: hegel::TestCase) {
++    let stanza = tc.draw(arb_stanza(0, StanzaOpts::default()).print_as_debug());
++    let mut text = stanza.text();
++    if stanza.signed_by.is_some() {
++        text = text.lines().filter(|l| !l.starts_with("Signed-By")).map(|l| format!("{l}\n")).collect();
++    }
++    let n = tc.draw(int!(1, 3));
++    let body: Vec<String> = (0..n).map(|i| format!(" line{i}")).collect();
++    text.push_str(&format!("Signed-By:\n -----BEGIN PGP PUBLIC KEY BLOCK-----\n{}\n -----END PGP PUBLIC KEY BLOCK-----\n", body.join("\n")));
++    let parsed = Repositories::from_str(&text).unwrap();
++    let shown = parsed.to_string();
++    let again = Repositories::from_str(&shown).unwrap_or_else(|e| panic!("{shown:?}: {e}"));
++    assert_eq!(again, parsed, "display {shown:?} of {text:?}");
++}
++
++/// apt-sources/9: the regex spans lines, so `deb http://a/ s` followed by a
++/// line `main` (two malformed lines for APT) is read as one entry.
++#[hegel::test]
++fn entries_do_not_span_lines(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.comps = vec!["main".to_string()];
++    let one = line.render();
++    let (head, _) = one.rsplit_once(&line.sep).unwrap();
++    let text = format!("{head}\nmain\n");
++    assert!(apt_targets(&text, "").is_err(), "apt accepted {text:?}");
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert!(parsed.is_empty(), "read {parsed:?} from {text:?}");
++}
++
++/// apt-sources/10: `arch+=`/`arch-=` (sources.list(5)) are rejected as an
++/// unrecognised option.
++#[hegel::test]
++fn arch_add_and_remove_options_are_accepted(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.options = Options::default();
++    let op = pick(&tc, &["+", "-"]);
++    let text = format!("deb [arch{op}=i386] {} {} main\n", line.uri, line.suite);
++    apt_targets(&text, "").unwrap();
++    let parsed = LegacyRepositories::from_str(&text).map_err(|e| e.to_string());
++    assert!(parsed.is_ok(), "{parsed:?} for {text:?}");
++}
++
++/// apt-sources/11: two or more spaces (or a space and a tab) between two
++/// components make the line disappear (APT accepts any whitespace).
++#[hegel::test]
++fn components_separated_by_several_spaces_are_read(tc: hegel::TestCase) {
++    let mut line = tc.draw(arb_leg_line(0, LegOpts::default()).print_as_debug());
++    line.sep = pick(&tc, &["  ", " \t", "\t ", "   "]).to_string();
++    if line.comps.len() < 2 {
++        line.comps = vec!["main".to_string(), "contrib".to_string()];
++    }
++    let text = format!("{}\n", line.render());
++    let apt = apt_targets(&text, "").unwrap();
++    assert_eq!(apt, line.targets());
++    let parsed = LegacyRepositories::from_str(&text).unwrap();
++    assert_eq!(parsed.iter().cloned().collect::<Vec<_>>(), vec![line.expected()], "for {text:?}");
++}
