@@ -1,0 +1,890 @@
+diff --git a/regex-lite/Cargo.toml b/regex-lite/Cargo.toml
+index b230501..548312b 100644
+--- a/regex-lite/Cargo.toml
++++ b/regex-lite/Cargo.toml
+@@ -28,11 +28,17 @@ string = []
+ [dev-dependencies]
+ anyhow = "1.0.69"
+ regex-test = { path = "../regex-test", version = "0.1.0" }
++hegeltest = "0.44.1"
++regex = { path = "..", version = "1" }
+ 
+ [[test]]
+ path = "tests/lib.rs"
+ name = "integration"
+ 
++[[test]]
++path = "tests/hegel.rs"
++name = "hegel"
++
+ [package.metadata.docs.rs]
+ # We want to document all features.
+ all-features = true
+diff --git a/regex-lite/tests/hegel.rs b/regex-lite/tests/hegel.rs
+new file mode 100644
+index 0000000..10a4869
+--- /dev/null
++++ b/regex-lite/tests/hegel.rs
+@@ -0,0 +1,862 @@
++//! Differential property tests: `regex-lite` against the `regex` crate.
++//!
++//! The crate documentation says that, apart from a short list of syntax-level
++//! differences (ASCII-only Perl classes, word boundaries and case folding; no
++//! `\p{..}`; no class set operations; no octal) and API-level ones (no `&[u8]`
++//! haystacks, no `RegexSet`, opaque errors), `regex-lite` "is intended to be a
++//! drop-in replacement for the `regex` crate". The `regex` crate is in the same
++//! workspace, so it is the oracle: every property below draws a regex, spells it
++//! once for `regex-lite` and once for `regex` (Perl classes written out as the
++//! ASCII brackets the docs define them as, word boundaries wrapped in `(?-u:..)`,
++//! everything else verbatim), and checks that the two crates report the same
++//! matches, captures, replacements and splits on the same haystack.
++//!
++//! Alphabets are chosen so that the documented differences cannot show:
++//! haystacks and literals use ASCII letters/digits/punctuation plus two caseless
++//! non-ASCII scalars (`☃`, 3 bytes, and `💩`, 4 bytes), so ASCII and Unicode
++//! case folding agree (the only non-ASCII codepoints that fold to ASCII letters
++//! are U+212A KELVIN SIGN and U+017F LONG S, and neither can be drawn).
++
++use std::ops::Range;
++
++use hegel::generators;
++use hegel::Generator as _;
++
++// ---------------------------------------------------------------------------
++// A small regex AST with two printers
++// ---------------------------------------------------------------------------
++
++/// Characters that may appear as literals in generated regexes and in
++/// haystacks: word and non-word ASCII, line terminators (for `(?m)`, `(?R)`,
++/// `.`), and two caseless multi-byte scalars.
++const CHARS: &[char] = &[
++    'a', 'b', 'A', 'B', '_', '0', '1', ' ', '\n', '\r', '\t', '-', '.', '☃', '💩',
++];
++
++/// The `regex-lite` documentation's definition of each Perl class, as an ASCII
++/// bracket expression the `regex` crate interprets identically.
++fn perl_ascii(class: char, negated: bool) -> String {
++    let body = match class {
++        'd' => "0-9",
++        's' => "\\t\\n\\x0B\\x0C\\r ",
++        'w' => "0-9A-Za-z_",
++        _ => unreachable!(),
++    };
++    format!("[{}{}]", if negated { "^" } else { "" }, body)
++}
++
++const POSIX_CLASSES: &[&str] = &[
++    "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
++    "space", "upper", "word", "xdigit",
++];
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Target {
++    Lite,
++    Reference,
++}
++
++#[derive(Debug, Clone)]
++enum Item {
++    Char(char),
++    Range(char, char),
++    Perl { class: char, negated: bool },
++    Posix { name: &'static str, negated: bool },
++}
++
++#[derive(Debug, Clone, Copy)]
++enum Assertion {
++    Start,
++    End,
++    StartText,
++    EndText,
++    WordBoundary,
++    NotWordBoundary,
++    WordStart,
++    WordEnd,
++    WordStartHalf,
++    WordEndHalf,
++}
++
++#[derive(Debug, Clone, Copy)]
++enum RepKind {
++    Star,
++    Plus,
++    Question,
++    Exactly(u8),
++    AtLeast(u8),
++    Between(u8, u8),
++}
++
++#[derive(Debug, Clone)]
++enum Capture {
++    No,
++    Index,
++    Named(String),
++}
++
++#[derive(Debug, Clone)]
++enum Node {
++    Empty,
++    Lit(char),
++    Dot,
++    Perl { class: char, negated: bool },
++    Bracket { negated: bool, items: Vec<Item> },
++    Assert(Assertion),
++    Concat(Vec<Node>),
++    Alt(Vec<Node>),
++    Repeat { node: Box<Node>, kind: RepKind, greedy: bool },
++    Group { node: Box<Node>, capture: Capture },
++    /// `(?flags)` (no node) or `(?flags:node)`.
++    Flags { set: Vec<char>, clear: Vec<char>, node: Option<Box<Node>> },
++}
++
++/// Push `c` as a literal, escaped the way both crates document: any ASCII
++/// punctuation except `<`/`>` may be backslash-escaped; control characters
++/// are written with their `\n`-style escapes.
++fn push_literal(out: &mut String, c: char) {
++    match c {
++        '\n' => out.push_str("\\n"),
++        '\r' => out.push_str("\\r"),
++        '\t' => out.push_str("\\t"),
++        c if c.is_ascii_punctuation() && c != '<' && c != '>' => {
++            out.push('\\');
++            out.push(c);
++        }
++        c => out.push(c),
++    }
++}
++
++impl Item {
++    fn emit(&self, out: &mut String, target: Target) {
++        match self {
++            Item::Char(c) => push_literal(out, *c),
++            Item::Range(lo, hi) => {
++                push_literal(out, *lo);
++                out.push('-');
++                push_literal(out, *hi);
++            }
++            Item::Perl { class, negated } => match target {
++                Target::Lite => {
++                    out.push('\\');
++                    out.push(if *negated { class.to_ascii_uppercase() } else { *class });
++                }
++                // Nested bracket classes are part of both crates' syntax.
++                Target::Reference => out.push_str(&perl_ascii(*class, *negated)),
++            },
++            Item::Posix { name, negated } => {
++                out.push_str("[:");
++                if *negated {
++                    out.push('^');
++                }
++                out.push_str(name);
++                out.push_str(":]");
++            }
++        }
++    }
++}
++
++impl Assertion {
++    fn emit(&self, out: &mut String, target: Target) {
++        let word = |s: &str, out: &mut String| match target {
++            Target::Lite => out.push_str(s),
++            // The `regex` crate's ASCII word boundaries, which its docs list as
++            // allowed on `&str` haystacks since they never consume input.
++            Target::Reference => {
++                out.push_str("(?-u:");
++                out.push_str(s);
++                out.push(')');
++            }
++        };
++        match self {
++            Assertion::Start => out.push('^'),
++            Assertion::End => out.push('$'),
++            Assertion::StartText => out.push_str("\\A"),
++            Assertion::EndText => out.push_str("\\z"),
++            Assertion::WordBoundary => word("\\b", out),
++            Assertion::NotWordBoundary => word("\\B", out),
++            Assertion::WordStart => word("\\b{start}", out),
++            Assertion::WordEnd => word("\\b{end}", out),
++            Assertion::WordStartHalf => word("\\b{start-half}", out),
++            Assertion::WordEndHalf => word("\\b{end-half}", out),
++        }
++    }
++}
++
++impl Node {
++    fn is_atom(&self) -> bool {
++        matches!(
++            self,
++            Node::Lit(_) | Node::Dot | Node::Perl { .. } | Node::Bracket { .. } | Node::Group { .. }
++        )
++    }
++
++    fn emit(&self, out: &mut String, target: Target) {
++        match self {
++            Node::Empty => {}
++            Node::Lit(c) => push_literal(out, *c),
++            Node::Dot => out.push('.'),
++            Node::Perl { class, negated } => match target {
++                Target::Lite => {
++                    out.push('\\');
++                    out.push(if *negated { class.to_ascii_uppercase() } else { *class });
++                }
++                Target::Reference => out.push_str(&perl_ascii(*class, *negated)),
++            },
++            Node::Bracket { negated, items } => {
++                out.push('[');
++                if *negated {
++                    out.push('^');
++                }
++                for item in items {
++                    item.emit(out, target);
++                }
++                out.push(']');
++            }
++            Node::Assert(a) => a.emit(out, target),
++            Node::Concat(nodes) => {
++                for n in nodes {
++                    // An alternation inside a concatenation needs its own group.
++                    if matches!(n, Node::Alt(_)) {
++                        out.push_str("(?:");
++                        n.emit(out, target);
++                        out.push(')');
++                    } else {
++                        n.emit(out, target);
++                    }
++                }
++            }
++            Node::Alt(nodes) => {
++                for (i, n) in nodes.iter().enumerate() {
++                    if i > 0 {
++                        out.push('|');
++                    }
++                    n.emit(out, target);
++                }
++            }
++            Node::Repeat { node, kind, greedy } => {
++                if node.is_atom() {
++                    node.emit(out, target);
++                } else {
++                    out.push_str("(?:");
++                    node.emit(out, target);
++                    out.push(')');
++                }
++                match kind {
++                    RepKind::Star => out.push('*'),
++                    RepKind::Plus => out.push('+'),
++                    RepKind::Question => out.push('?'),
++                    RepKind::Exactly(n) => out.push_str(&format!("{{{n}}}")),
++                    RepKind::AtLeast(n) => out.push_str(&format!("{{{n},}}")),
++                    RepKind::Between(lo, hi) => out.push_str(&format!("{{{lo},{hi}}}")),
++                }
++                if !greedy {
++                    out.push('?');
++                }
++            }
++            Node::Group { node, capture } => {
++                match capture {
++                    Capture::No => out.push_str("(?:"),
++                    Capture::Index => out.push('('),
++                    // Both spellings of a named group are documented.
++                    Capture::Named(name) if name.len() % 2 == 0 => {
++                        out.push_str("(?P<");
++                        out.push_str(name);
++                        out.push('>');
++                    }
++                    Capture::Named(name) => {
++                        out.push_str("(?<");
++                        out.push_str(name);
++                        out.push('>');
++                    }
++                }
++                node.emit(out, target);
++                out.push(')');
++            }
++            Node::Flags { set, clear, node } => {
++                out.push_str("(?");
++                for f in set {
++                    out.push(*f);
++                }
++                if !clear.is_empty() {
++                    out.push('-');
++                    for f in clear {
++                        out.push(*f);
++                    }
++                }
++                match node {
++                    None => out.push(')'),
++                    Some(n) => {
++                        out.push(':');
++                        n.emit(out, target);
++                        out.push(')');
++                    }
++                }
++            }
++        }
++    }
++
++    /// Give every named group a distinct name (`g0`, `g1`, ... in pattern
++    /// order): both crates reject duplicate names, which is not what these
++    /// tests are about.
++    fn name_groups(&mut self, counter: &mut usize) {
++        match self {
++            Node::Empty | Node::Lit(_) | Node::Dot | Node::Perl { .. } | Node::Bracket { .. } | Node::Assert(_) => {}
++            Node::Concat(nodes) | Node::Alt(nodes) => {
++                for n in nodes {
++                    n.name_groups(counter);
++                }
++            }
++            Node::Repeat { node, .. } => node.name_groups(counter),
++            Node::Group { node, capture } => {
++                if let Capture::Named(name) = capture {
++                    *name = if *counter % 2 == 0 { format!("g{counter}") } else { format!("_g{counter}") };
++                    *counter += 1;
++                }
++                node.name_groups(counter);
++            }
++            Node::Flags { node, .. } => {
++                if let Some(n) = node {
++                    n.name_groups(counter);
++                }
++            }
++        }
++    }
++
++    fn pattern(&self, target: Target) -> String {
++        let mut out = String::new();
++        self.emit(&mut out, target);
++        out
++    }
++}
++
++impl hegel::PrettyPrintable for Item {
++    fn pretty_print(&self, printer: &mut hegel::PrettyPrinter) {
++        let mut out = String::new();
++        self.emit(&mut out, Target::Lite);
++        hegel::pretty::print_debug_repr(&out, printer);
++    }
++}
++
++impl hegel::PrettyPrintable for Node {
++    fn pretty_print(&self, printer: &mut hegel::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(&format!("/{}/", self.pattern(Target::Lite)), printer);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn chars() -> impl hegel::PrintableGenerator<char> {
++    generators::sampled_from(CHARS.to_vec())
++}
++
++/// Letters and digits only, so that `lo <= hi` gives a valid range.
++fn range_ends() -> impl hegel::PrintableGenerator<char> {
++    generators::sampled_from(vec!['a', 'b', 'A', 'B', '0', '1', 'z', 'Z', '9'])
++}
++
++fn perl_class() -> impl hegel::PrintableGenerator<char> {
++    generators::sampled_from(vec!['d', 's', 'w'])
++}
++
++/// `i m s U R`; verbose mode (`x`) is left out because generated patterns
++/// contain literal whitespace.
++fn flag_chars() -> impl hegel::PrintableGenerator<char> {
++    generators::sampled_from(vec!['i', 'm', 's', 'U', 'R'])
++}
++
++#[hegel::composite]
++fn arb_item(tc: &hegel::TestCase) -> Item {
++    match tc.draw(generators::integers::<u8>().max_value(5)) {
++        0 | 1 => Item::Char(tc.draw(chars())),
++        2 => {
++            let a = tc.draw(range_ends());
++            let b = tc.draw(range_ends());
++            Item::Range(a.min(b), a.max(b))
++        }
++        3 => Item::Perl { class: tc.draw(perl_class()), negated: tc.draw(generators::booleans()) },
++        _ => Item::Posix {
++            name: tc.draw(generators::sampled_from(POSIX_CLASSES.to_vec())),
++            negated: tc.draw(generators::booleans()),
++        },
++    }
++}
++
++fn arb_assertion(tc: &hegel::TestCase) -> Assertion {
++    tc.draw(generators::sampled_from(vec![
++        Assertion::Start,
++        Assertion::End,
++        Assertion::StartText,
++        Assertion::EndText,
++        Assertion::WordBoundary,
++        Assertion::NotWordBoundary,
++        Assertion::WordStart,
++        Assertion::WordEnd,
++        Assertion::WordStartHalf,
++        Assertion::WordEndHalf,
++    ])
++    .print_as_debug())
++}
++
++fn arb_rep_kind(tc: &hegel::TestCase) -> RepKind {
++    match tc.draw(generators::integers::<u8>().max_value(5)) {
++        0 => RepKind::Star,
++        1 => RepKind::Plus,
++        2 => RepKind::Question,
++        3 => RepKind::Exactly(tc.draw(generators::integers::<u8>().max_value(3))),
++        4 => RepKind::AtLeast(tc.draw(generators::integers::<u8>().max_value(2))),
++        _ => {
++            let a = tc.draw(generators::integers::<u8>().max_value(3));
++            let b = tc.draw(generators::integers::<u8>().max_value(3));
++            RepKind::Between(a.min(b), a.max(b))
++        }
++    }
++}
++
++/// A random regex of nesting depth at most `depth`.
++#[hegel::composite]
++fn arb_node(tc: &hegel::TestCase, depth: u8) -> Node {
++    let max = if depth == 0 { 6 } else { 12 };
++    match tc.draw(generators::integers::<u8>().max_value(max)) {
++        0 => Node::Empty,
++        1 | 2 => Node::Lit(tc.draw(chars())),
++        3 => Node::Dot,
++        4 => Node::Perl { class: tc.draw(perl_class()), negated: tc.draw(generators::booleans()) },
++        5 => Node::Bracket {
++            negated: tc.draw(generators::booleans()),
++            items: tc.draw(generators::vecs(arb_item()).min_size(1).max_size(3)),
++        },
++        6 => Node::Assert(arb_assertion(tc)),
++        7 | 8 => Node::Concat(tc.draw(generators::vecs(arb_node(depth - 1)).min_size(2).max_size(3))),
++        9 => Node::Alt(tc.draw(generators::vecs(arb_node(depth - 1)).min_size(2).max_size(3))),
++        10 => Node::Repeat {
++            node: Box::new(tc.draw(arb_node(depth - 1))),
++            kind: arb_rep_kind(tc),
++            greedy: tc.draw(generators::booleans()),
++        },
++        11 => Node::Group {
++            node: Box::new(tc.draw(arb_node(depth - 1))),
++            capture: match tc.draw(generators::integers::<u8>().max_value(2)) {
++                0 => Capture::No,
++                1 => Capture::Index,
++                _ => Capture::Named(String::new()),
++            },
++        },
++        _ => {
++            let mut set: Vec<char> = tc.draw(generators::vecs(flag_chars()).max_size(2));
++            set.dedup();
++            let mut clear: Vec<char> = tc.draw(generators::vecs(flag_chars()).max_size(2));
++            clear.retain(|c| !set.contains(c));
++            clear.dedup();
++            if set.is_empty() && clear.is_empty() {
++                set.push('i');
++            }
++            let node = if tc.draw(generators::booleans()) {
++                Some(Box::new(tc.draw(arb_node(depth - 1))))
++            } else {
++                None
++            };
++            Node::Flags { set, clear, node }
++        }
++    }
++}
++
++/// `RegexBuilder` options, applied identically to both crates.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++struct Flags {
++    case_insensitive: bool,
++    multi_line: bool,
++    dot_matches_new_line: bool,
++    swap_greed: bool,
++    crlf: bool,
++}
++
++/// A regex to compare: the AST, its two spellings and the builder options.
++#[derive(Debug, Clone)]
++struct Setup {
++    lite: String,
++    reference: String,
++    flags: Flags,
++}
++
++impl hegel::PrettyPrintable for Setup {
++    fn pretty_print(&self, printer: &mut hegel::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(
++            &format!("lite=/{}/ regex=/{}/ {:?}", self.lite, self.reference, self.flags),
++            printer,
++        );
++    }
++}
++
++#[hegel::composite]
++fn arb_setup(tc: &hegel::TestCase) -> Setup {
++    let mut node = tc.draw(arb_node(3));
++    node.name_groups(&mut 0);
++    let flags = if tc.draw(generators::booleans()) {
++        Flags::default()
++    } else {
++        Flags {
++            case_insensitive: tc.draw(generators::booleans()),
++            multi_line: tc.draw(generators::booleans()),
++            dot_matches_new_line: tc.draw(generators::booleans()),
++            swap_greed: tc.draw(generators::booleans()),
++            crlf: tc.draw(generators::booleans()),
++        }
++    };
++    Setup { lite: node.pattern(Target::Lite), reference: node.pattern(Target::Reference), flags }
++}
++
++fn haystacks() -> impl hegel::PrintableGenerator<String> {
++    let alphabet: String = CHARS.iter().collect();
++    generators::text().alphabet(&alphabet).max_size(12)
++}
++
++/// Compile the same regex with both crates. Generated patterns are valid by
++/// construction, so both compilations must succeed.
++fn compile(setup: &Setup) -> (regex_lite::Regex, regex::Regex) {
++    let f = setup.flags;
++    let lite = regex_lite::RegexBuilder::new(&setup.lite)
++        .case_insensitive(f.case_insensitive)
++        .multi_line(f.multi_line)
++        .dot_matches_new_line(f.dot_matches_new_line)
++        .swap_greed(f.swap_greed)
++        .crlf(f.crlf)
++        .build();
++    let reference = regex::RegexBuilder::new(&setup.reference)
++        .case_insensitive(f.case_insensitive)
++        .multi_line(f.multi_line)
++        .dot_matches_new_line(f.dot_matches_new_line)
++        .swap_greed(f.swap_greed)
++        .crlf(f.crlf)
++        .build();
++    match (lite, reference) {
++        (Ok(l), Ok(r)) => (l, r),
++        (l, r) => panic!(
++            "compilation disagrees: regex-lite {:?} for /{}/, regex {:?} for /{}/",
++            l.map(|_| ()),
++            setup.lite,
++            r.as_ref().map(|_| ()).map_err(|e| e.to_string()),
++            setup.reference
++        ),
++    }
++}
++
++/// A byte offset of `hay` on a char boundary (possibly `hay.len()`).
++fn char_boundary(tc: &hegel::TestCase, hay: &str) -> usize {
++    let mut bounds: Vec<usize> = hay.char_indices().map(|(i, _)| i).collect();
++    bounds.push(hay.len());
++    tc.draw(generators::sampled_from(bounds))
++}
++
++fn lite_ranges(re: &regex_lite::Regex, hay: &str) -> Vec<Range<usize>> {
++    re.find_iter(hay).map(|m| m.range()).collect()
++}
++
++fn ref_ranges(re: &regex::Regex, hay: &str) -> Vec<Range<usize>> {
++    re.find_iter(hay).map(|m| m.range()).collect()
++}
++
++// ---------------------------------------------------------------------------
++// Properties
++// ---------------------------------------------------------------------------
++
++/// `Regex::find_iter`, `find`, `find_at`, `is_match` and `is_match_at` report
++/// the same (byte-offset) matches as the `regex` crate.
++#[hegel::test]
++fn find_agrees_with_regex(tc: hegel::TestCase) {
++    let setup = tc.draw(arb_setup());
++    let hay = tc.draw(haystacks());
++    let (lite, reference) = compile(&setup);
++
++    let got = lite_ranges(&lite, &hay);
++    let want = ref_ranges(&reference, &hay);
++    assert_eq!(got, want, "find_iter on {hay:?}");
++
++    assert_eq!(lite.is_match(&hay), reference.is_match(&hay), "is_match on {hay:?}");
++    assert_eq!(lite.find(&hay).map(|m| m.range()), want.first().cloned(), "find on {hay:?}");
++
++    let start = char_boundary(&tc, &hay);
++    assert_eq!(
++        lite.find_at(&hay, start).map(|m| m.range()),
++        reference.find_at(&hay, start).map(|m| m.range()),
++        "find_at({start}) on {hay:?}"
++    );
++    assert_eq!(
++        lite.is_match_at(&hay, start),
++        reference.is_match_at(&hay, start),
++        "is_match_at({start}) on {hay:?}"
++    );
++}
++
++/// Capture groups: names, counts and every group's span in every match agree
++/// with the `regex` crate; `Captures::name` agrees with indexing by number.
++#[hegel::test]
++fn captures_agree_with_regex(tc: hegel::TestCase) {
++    let setup = tc.draw(arb_setup());
++    let hay = tc.draw(haystacks());
++    let (lite, reference) = compile(&setup);
++
++    let names: Vec<Option<&str>> = lite.capture_names().collect();
++    let ref_names: Vec<Option<&str>> = reference.capture_names().collect();
++    assert_eq!(names, ref_names, "capture_names");
++    assert_eq!(lite.captures_len(), reference.captures_len(), "captures_len");
++    assert_eq!(lite.static_captures_len(), reference.static_captures_len(), "static_captures_len");
++
++    let got: Vec<Vec<Option<Range<usize>>>> = lite
++        .captures_iter(&hay)
++        .map(|c| c.iter().map(|m| m.map(|m| m.range())).collect())
++        .collect();
++    let want: Vec<Vec<Option<Range<usize>>>> = reference
++        .captures_iter(&hay)
++        .map(|c| c.iter().map(|m| m.map(|m| m.range())).collect())
++        .collect();
++    assert_eq!(got, want, "captures_iter on {hay:?}");
++
++    // `captures` is the first of `captures_iter`, and named lookup agrees with
++    // positional lookup.
++    let first = lite.captures(&hay);
++    assert_eq!(
++        first.as_ref().map(|c| c.iter().map(|m| m.map(|m| m.range())).collect::<Vec<_>>()),
++        got.first().cloned(),
++        "captures on {hay:?}"
++    );
++    if let Some(caps) = &first {
++        for (i, name) in names.iter().enumerate() {
++            if let Some(name) = name {
++                assert_eq!(
++                    caps.name(name).map(|m| m.range()),
++                    caps.get(i).map(|m| m.range()),
++                    "group {i} named {name}"
++                );
++            }
++        }
++    }
++
++    let start = char_boundary(&tc, &hay);
++    let got_at: Option<Vec<Option<Range<usize>>>> =
++        lite.captures_at(&hay, start).map(|c| c.iter().map(|m| m.map(|m| m.range())).collect());
++    let want_at: Option<Vec<Option<Range<usize>>>> =
++        reference.captures_at(&hay, start).map(|c| c.iter().map(|m| m.map(|m| m.range())).collect());
++    assert_eq!(got_at, want_at, "captures_at({start}) on {hay:?}");
++}
++
++/// Pieces of a replacement string: literal text, `$$`, unbraced and braced
++/// group references (by index or name, existing or not), and stray `$`s.
++fn arb_replacement(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(generators::integers::<usize>().max_value(4));
++    let mut out = String::new();
++    for _ in 0..n {
++        match tc.draw(generators::integers::<u8>().max_value(7)) {
++            0 | 1 => out.push(tc.draw(chars())),
++            2 => out.push_str("$$"),
++            3 => out.push_str(&format!("${}", tc.draw(generators::integers::<u8>().max_value(3)))),
++            4 => out.push_str(&format!("${{{}}}", tc.draw(generators::integers::<u8>().max_value(3)))),
++            5 => out.push_str(tc.draw(generators::sampled_from(vec!["$g0", "$g1", "$_g1", "$g0a", "$_"]))),
++            6 => out.push_str(tc.draw(generators::sampled_from(vec!["${g0}", "${g1}", "${_g1}", "${g0}a", "${", "${}"]))),
++            _ => out.push('$'),
++        }
++    }
++    out
++}
++
++/// `replace`, `replace_all` and `replacen` with a `&str` replacement (capture
++/// interpolation included) produce the same string as the `regex` crate.
++#[hegel::test]
++fn replacements_agree_with_regex(tc: hegel::TestCase) {
++    let setup = tc.draw(arb_setup());
++    let hay = tc.draw(haystacks());
++    let rep = arb_replacement(&tc);
++    let (lite, reference) = compile(&setup);
++
++    assert_eq!(
++        lite.replace_all(&hay, rep.as_str()).into_owned(),
++        reference.replace_all(&hay, rep.as_str()).into_owned(),
++        "replace_all({hay:?}, {rep:?})"
++    );
++    assert_eq!(
++        lite.replace(&hay, rep.as_str()).into_owned(),
++        reference.replace(&hay, rep.as_str()).into_owned(),
++        "replace({hay:?}, {rep:?})"
++    );
++    let limit = tc.draw(generators::integers::<usize>().max_value(3));
++    assert_eq!(
++        lite.replacen(&hay, limit, rep.as_str()).into_owned(),
++        reference.replacen(&hay, limit, rep.as_str()).into_owned(),
++        "replacen({hay:?}, {limit}, {rep:?})"
++    );
++
++    // `Captures::expand` is the same interpolation, exposed directly.
++    if let (Some(l), Some(r)) = (lite.captures(&hay), reference.captures(&hay)) {
++        let (mut dl, mut dr) = (String::new(), String::new());
++        l.expand(&rep, &mut dl);
++        r.expand(&rep, &mut dr);
++        assert_eq!(dl, dr, "expand({rep:?}) on {hay:?}");
++    }
++}
++
++/// `split` and `splitn` agree with the `regex` crate.
++#[hegel::test]
++fn split_agrees_with_regex(tc: hegel::TestCase) {
++    let setup = tc.draw(arb_setup());
++    let hay = tc.draw(haystacks());
++    let (lite, reference) = compile(&setup);
++
++    let got: Vec<&str> = lite.split(&hay).collect();
++    let want: Vec<&str> = reference.split(&hay).collect();
++    assert_eq!(got, want, "split on {hay:?}");
++
++    let limit = tc.draw(generators::integers::<usize>().max_value(4));
++    let got: Vec<&str> = lite.splitn(&hay, limit).collect();
++    let want: Vec<&str> = reference.splitn(&hay, limit).collect();
++    assert_eq!(got, want, "splitn({limit}) on {hay:?}");
++}
++
++/// `shortest_match` is documented to return *an* end offset of the leftmost
++/// match, possibly before `find`'s end; so it must exist exactly when `find`
++/// finds something, and lie within that match. Its existence must also agree
++/// with the `regex` crate.
++#[hegel::test]
++fn shortest_match_is_consistent(tc: hegel::TestCase) {
++    let setup = tc.draw(arb_setup());
++    let hay = tc.draw(haystacks());
++    let (lite, reference) = compile(&setup);
++
++    let found = lite.find(&hay).map(|m| m.range());
++    let shortest = lite.shortest_match(&hay);
++    assert_eq!(shortest.is_some(), found.is_some(), "shortest_match vs find on {hay:?}");
++    assert_eq!(shortest.is_some(), reference.shortest_match(&hay).is_some(), "shortest_match vs regex on {hay:?}");
++    if let (Some(end), Some(range)) = (shortest, &found) {
++        assert!(range.start <= end && end <= range.end, "shortest_match end {end} outside find's {range:?} on {hay:?}");
++    }
++
++    let start = char_boundary(&tc, &hay);
++    assert_eq!(
++        lite.shortest_match_at(&hay, start).is_some(),
++        lite.find_at(&hay, start).is_some(),
++        "shortest_match_at({start}) vs find_at on {hay:?}"
++    );
++}
++
++/// Random *strings* as patterns: both crates accept or reject the same
++/// pattern (the documented differences — `\p{..}`, class set operations,
++/// the `u` flag, octal — are kept out of the alphabet or assumed away), and
++/// when both accept it, they find the same matches. This covers syntax the
++/// structured generator never writes (odd escapes, `{,n}`, empty groups,
++/// nested repetitions, ...).
++#[hegel::test]
++fn random_pattern_acceptance_agrees_with_regex(tc: hegel::TestCase) {
++    let pat = tc.draw(
++        generators::text()
++            .alphabet("ab1 ()[]{}*+?|^$.\\-:<>#&~_,dswDSWAzBbimsURxnrt0123")
++            .max_size(8),
++    );
++    // Documented differences: no class set operations in regex-lite. (`\p`,
++    // `\P` and the `u` flag cannot be spelled with this alphabet; octal
++    // escapes are rejected by both crates by default.)
++    tc.assume(!pat.contains("&&") && !pat.contains("--") && !pat.contains("~~"));
++
++    let lite = regex_lite::Regex::new(&pat);
++    let reference = regex::Regex::new(&pat);
++    assert_eq!(
++        lite.is_ok(),
++        reference.is_ok(),
++        "acceptance of /{pat}/: regex-lite {:?}, regex {:?}",
++        lite.as_ref().map(|_| ()).map_err(|e| e.to_string()),
++        reference.as_ref().map(|_| ()).map_err(|e| e.to_string())
++    );
++    if let (Ok(lite), Ok(reference)) = (lite, reference) {
++        // The alphabet has no ASCII letters that Unicode-fold to non-ASCII
++        // ones, but `\d\s\w` and `\b` in a random pattern do differ by
++        // design (ASCII vs Unicode) when the haystack has non-ASCII digits,
++        // spaces or letters; the haystack alphabet has none.
++        let hay = tc.draw(haystacks());
++        assert_eq!(lite_ranges(&lite, &hay), ref_ranges(&reference, &hay), "find_iter of /{pat}/ on {hay:?}");
++    }
++}
++
++/// `escape` agrees with the `regex` crate, and the escaped text compiles to a
++/// regex that finds exactly the leftmost non-overlapping literal occurrences.
++#[hegel::test]
++fn escape_is_literal(tc: hegel::TestCase) {
++    let text = tc.draw(
++        generators::text()
++            .alphabet("ab1 ()[]{}*+?|^$.\\-:<>#&~_,\n\r\t☃💩")
++            .max_size(4),
++    );
++    let hay = tc.draw(
++        generators::text()
++            .alphabet("ab1 ()[]{}*+?|^$.\\-:<>#&~_,\n\r\t☃💩")
++            .max_size(12),
++    );
++    let escaped = regex_lite::escape(&text);
++    assert_eq!(escaped, regex::escape(&text), "escape({text:?})");
++
++    let re = regex_lite::Regex::new(&escaped)
++        .unwrap_or_else(|e| panic!("escape({text:?}) = /{escaped}/ does not compile: {e}"));
++    let got = lite_ranges(&re, &hay);
++
++    // Leftmost, non-overlapping occurrences; the empty literal matches at
++    // every char boundary, as the empty regex is documented to.
++    let mut want = Vec::new();
++    let mut i = 0;
++    loop {
++        if hay[i..].starts_with(&text) {
++            want.push(i..i + text.len());
++            if !text.is_empty() {
++                i += text.len();
++                continue;
++            }
++        }
++        match hay[i..].chars().next() {
++            Some(c) => i += c.len_utf8(),
++            None => break,
++        }
++    }
++    assert_eq!(got, want, "/{escaped}/ on {hay:?}");
++}
++
++// ---------------------------------------------------------------------------
++// Known bugs, pinned to their failing region
++// ---------------------------------------------------------------------------
++
++/// KNOWN FAILURE (regex-lite/1). A bracket range spanning both letter cases
++/// is only half folded under `(?i)`: `ClassRange::ascii_case_fold` folds the
++/// `a-z` part of the range and returns, so the `A-Z` part of `[A-a]` is never
++/// lower-cased. `(?i)[A-a]` contains `B`..`Z`, so case-insensitively it must
++/// match every lowercase letter (`B` ∈ `[A-a]`, and the `regex` crate agrees);
++/// regex-lite matches none of `b`..`z`, and the negated class `(?i)[^A-a]`
++/// matches all of them.
++#[hegel::test]
++fn known_bug_case_insensitive_range_spanning_cases(tc: hegel::TestCase) {
++    let letter = tc.draw(generators::characters().min_codepoint('b' as u32).max_codepoint('z' as u32));
++    let hay = letter.to_string();
++    let lite = regex_lite::Regex::new("(?i)[A-a]").unwrap();
++    let reference = regex::Regex::new("(?i)[A-a]").unwrap();
++    assert!(reference.is_match(&hay), "oracle: {hay:?} must match (?i)[A-a]");
++    assert!(lite.is_match(&hay), "(?i)[A-a] does not match {hay:?} case-insensitively");
++    let negated = regex_lite::Regex::new("(?i)[^A-a]").unwrap();
++    assert!(!negated.is_match(&hay), "(?i)[^A-a] matches {hay:?} case-insensitively");
++}
++
++/// KNOWN FAILURE (regex-lite/2). A negated POSIX class is negated *before*
++/// case folding: `maybe_parse_posix_class` negates `[:^lower:]` to "anything
++/// but `a-z`" and only then does `(?i)` fold the class, which adds `a-z` back,
++/// so `(?i)[[:^lower:]]` matches every character. The crate documents
++/// `[[:^lower:]]` as `[^a-z]`, and its own `(?i)[^a-z]` folds before negating
++/// (the parser comments on why) and matches no letter at all — as does the
++/// `regex` crate for both spellings. Same for `[[:^upper:]]`.
++#[hegel::test]
++fn known_bug_case_insensitive_negated_posix_class(tc: hegel::TestCase) {
++    let letter = tc.draw(generators::characters().min_codepoint('a' as u32).max_codepoint('z' as u32));
++    let upper = tc.draw(generators::booleans());
++    let hay = if upper { letter.to_ascii_uppercase().to_string() } else { letter.to_string() };
++    let (posix, bracket) = if upper { ("(?i)[[:^upper:]]", "(?i)[^A-Z]") } else { ("(?i)[[:^lower:]]", "(?i)[^a-z]") };
++    let via_bracket = regex_lite::Regex::new(bracket).unwrap().is_match(&hay);
++    let via_posix = regex_lite::Regex::new(posix).unwrap().is_match(&hay);
++    let reference = regex::Regex::new(posix).unwrap().is_match(&hay);
++    assert!(!via_bracket, "{bracket} matches {hay:?}");
++    assert_eq!(via_posix, reference, "{posix} on {hay:?}: regex-lite {via_posix}, regex {reference}");
++    assert_eq!(via_posix, via_bracket, "{posix} and {bracket} disagree on {hay:?}");
++}
