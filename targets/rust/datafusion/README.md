@@ -41,3 +41,4 @@
 - 2026-09-13: base bumped 9082d6b10c29 → 681705e6fdc4 (2026-09-13, "fix: reject groups accumulator for bit_xor(DISTINCT) (#24989)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
 - 2026-09-13: base bumped 681705e6fdc4 → d9646f49fb6f (2026-09-13, "ci: share extended test commands through xtask (#25256)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
 - 2026-09-13: base bumped d9646f49fb6f → e4c4fa43d29d (2026-09-13, "Fix `Numeric` signature coercion to properly handle null types (#24988)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
+- 2026-09-13: base bumped e4c4fa43d29d → c5257f0540b9 (2026-09-13, "fix: preserve computed projections in unions_to_filter (#25074)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
