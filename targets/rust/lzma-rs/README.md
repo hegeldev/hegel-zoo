@@ -35,3 +35,4 @@
 - 2024-05-06: predecessor base commit `1f14478def43` (Remove CARGO_UNSTABLE_SPARSE_REGISTRY from GitHub actions.).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/lzma-rs.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: `[run] command` gained `--features stream`: the three `prop_lzma_stream_*` properties are `#[cfg(feature = "stream")]` and had never run in the zoo (the judge reported them NOTRUN in a re-run; the target had never been bumped or re-run since import because upstream has not moved). With the feature on, 74 tests pass, no bug found.
