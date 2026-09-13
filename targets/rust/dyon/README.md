@@ -26,3 +26,4 @@
 - 2025-12-23: predecessor base commit `3fb34a313a37` (Merge pull request #797 from bvssvni/master).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/dyon.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-12: base bumped 3fb34a313a37 → b122d4425048 (2026-09-12, "Merge pull request #814 from bvssvni/master"; 0.51.3); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 18 tests pass.

@@ -33,3 +33,4 @@
 - 2026-07-05: predecessor base commit `d00f0f7a2382` (Merge pull request #263 from fancy-regex/anchored_search).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/fancy-regex.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped d00f0f7a2382 → 6d43a32c8de1 (2026-09-06, "CHANGELOG: Add Unreleased section"; 0.19.1); 1 bug(s) still reproduce; add/add conflicts in tests/matching.rs resolved by keeping both sides. 640 tests pass.
