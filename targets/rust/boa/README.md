@@ -39,3 +39,4 @@
 - 2026-07-22: predecessor base commit `5718cc81111c` (Add console.exception() as alias for console.error() (#5425)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/boa.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 5718cc81111c → 257bc301afa0 (2026-09-06, "fix(engine): return null from IsHTMLDDA [[Call]] per Annex B §B.3.6.1 (#5511)"; 0.22.0); 0 bug(s) still reproduce; fixed upstream: boa/1. 1132 tests pass. boa/1 is fixed: the loop-iteration check is now `>=`, so `for` loops honour the documented limit exactly; the tight-bound property no longer excludes them.
