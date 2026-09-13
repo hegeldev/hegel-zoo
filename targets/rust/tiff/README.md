@@ -27,3 +27,4 @@
 - 2026-07-20: predecessor base commit `f3f9ff1244e5` (Merge pull request #398 from Shnatsel/safe-rust-zstd-2).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/tiff.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped f3f9ff1244e5 → 3302936b08e2 (2026-09-06, "Merge pull request #415 from paolobarbolini/zstd-0.14"; 0.11.3); 1 bug(s) still reproduce; add/add conflicts in tests/decode_images.rs resolved by keeping both sides. 259 tests pass.
