@@ -38,3 +38,4 @@
 - 2026-07-21: predecessor base commit `f296bc36b18d` (cli: show workspace roots in workspace list).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/jj.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped f296bc36b18d → f532eadfc228 (2026-09-13, "cli: diff: add utility command for comparing materialized files"; 0.45.1); 0 bug(s) still reproduce; fixed upstream: jj/1. 1957 tests pass. jj/1 is fixed (issue #9868, someone reported the same lone-CR loss): the generated round-trip property covers lone CRs again. Upstream split `dag_walk`, `diff` and `merge` into the new `jj-core` crate; the patch's properties for them moved along and `[run] command` now tests `-p jj-core` too.
