@@ -32,4 +32,4 @@
 - 2026-04-15: predecessor base commit `47d4bf94104c` (2.2.0).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/full_moon.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
-- 2026-09-13: base bumped 47d4bf94104c → 60f02d5dc223 (2026-08-25, "Shrink AST nodes to fix recursive-parse stack overflows (#346) (#355)"; 3.0.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 59 tests pass.
+- 2026-09-13: base bumped 47d4bf94104c → 60f02d5dc223 (2026-08-25, "Shrink AST nodes to fix recursive-parse stack overflows (#346) (#355)"; 3.0.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 59 tests pass. full_moon/2's stack-overflow reproducer (ignored, run by hand) still aborts at 3.0.0 despite upstream's #346/#355.
