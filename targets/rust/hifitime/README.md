@@ -34,3 +34,4 @@
 - 2026-07-21: predecessor base commit `b2ccd8f1163f` (Merge pull request #493 from nyx-space/derive-partial-eq-duration-1...).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/hifitime.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: `prop_epoch_utc_roundtrip_away_from_leap_boundaries`'s leap-boundary exclusion filter computed `(ns - l).abs()` in i64, which overflows for `ns` near `i64::MIN` (Hegel found `ns - l == i64::MIN` exactly); now uses `abs_diff`.
