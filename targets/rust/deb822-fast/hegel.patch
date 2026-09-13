@@ -1,0 +1,1288 @@
+diff --git a/deb822-fast/Cargo.toml b/deb822-fast/Cargo.toml
+index 8aca3f2..8ced08b 100644
+--- a/deb822-fast/Cargo.toml
++++ b/deb822-fast/Cargo.toml
+@@ -13,6 +13,10 @@ keywords = ["debian", "deb822", "control", "rfc822"]
+ [dependencies]
+ deb822-derive = { path = "../deb822-derive", version = "^0.3", optional = true }
+ 
++[dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
++
+ [features]
+ derive = ["dep:deb822-derive"]
+ 
+diff --git a/deb822-fast/tests/hegel.rs b/deb822-fast/tests/hegel.rs
+new file mode 100644
+index 0000000..c07f593
+--- /dev/null
++++ b/deb822-fast/tests/hegel.rs
+@@ -0,0 +1,1267 @@
++//! Hegel property tests for deb822-fast, checked against the two reference
++//! implementations installed on the system: dpkg's `Dpkg::Control::HashCore`
++//! (Perl) and python-debian's `Deb822` (Python), and against each other: the
++//! crate has three parsers (the owned `Deb822: FromStr`, the borrowed
++//! `BorrowedParser` and the streaming `ParagraphReader`) that must agree.
++#![allow(clippy::all, dead_code)]
++
++use deb822_fast::borrowed::{iter_paragraphs_borrowed, parse_borrowed};
++use deb822_fast::convert::{
++    format_folded, format_multi_line, format_single_line, Deb822LikeParagraph,
++};
++use deb822_fast::{Deb822, Error, Field, Paragraph, BINARY_FIELD_ORDER, SOURCE_FIELD_ORDER};
++use hegel::generators::{self, Generator};
++use std::collections::BTreeSet;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracles
++// ---------------------------------------------------------------------------
++
++const PYTHON_SCRIPT: &str = r#"
++import sys, json, binascii
++from debian.deb822 import Deb822
++for line in sys.stdin:
++    cmd, _, arg = line.rstrip('\n').partition(' ')
++    text = binascii.unhexlify(arg).decode('utf-8')
++    try:
++        if cmd == 'P':
++            paras = []
++            for p in Deb822.iter_paragraphs(text):
++                paras.append([[k, v] for k, v in p.items()])
++            out = {'paras': paras}
++        else:
++            out = {'error': 'unknown command'}
++    except Exception as e:
++        out = {'error': repr(e)}
++    sys.stdout.write(json.dumps(out) + '\n')
++    sys.stdout.flush()
++"#;
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use JSON::PP;
++use Dpkg::Control::HashCore;
++$| = 1;
++my $json = JSON::PP->new->canonical->utf8;
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, $arg) = split / /, $line, 2;
++    my $text = pack('H*', $arg);
++    my $out;
++    if ($cmd eq 'P') {
++        open(my $fh, '<', \$text) or die;
++        my @paras;
++        my $ok = eval {
++            while (1) {
++                my $h = Dpkg::Control::HashCore->new(allow_pgp => 0, allow_duplicate => 0);
++                my $n = $h->parse($fh, 'zoo');
++                last unless $n;
++                my @f;
++                for my $k (keys %$h) {
++                    my ($kk, $vv) = ($k, $h->{$k});
++                    utf8::decode($kk);
++                    utf8::decode($vv) if defined $vv;
++                    push @f, [$kk, $vv];
++                }
++                push @paras, \@f;
++            }
++            1;
++        };
++        if ($ok) { $out = { paras => \@paras } }
++        else { my $e = "$@"; $e =~ s/\s+/ /g; $out = { error => $e } }
++    } else {
++        $out = { error => 'unknown command' };
++    }
++    print $json->encode($out), "\n";
++}
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn ask(c: &mut Child2, cmd: &str, text: &str) -> serde_json::Value {
++    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
++    writeln!(c.stdin, "{cmd} {hex}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut line = String::new();
++    c.stdout.read_line(&mut line).unwrap();
++    assert!(!line.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad oracle reply {line:?}: {e}"))
++}
++
++fn python() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("/usr/bin/python3", &["-c", PYTHON_SCRIPT])))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++/// Paragraphs as a reader reads them: key, value.
++type Paras = Vec<Vec<(String, String)>>;
++
++fn paras_of(v: &serde_json::Value) -> Result<Paras, String> {
++    if let Some(e) = v.get("error") {
++        return Err(e.to_string());
++    }
++    Ok(v["paras"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|p| {
++            p.as_array()
++                .unwrap()
++                .iter()
++                .map(|kv| {
++                    let k = kv[0].as_str().unwrap().to_string();
++                    let v = kv[1].as_str().unwrap_or("").to_string();
++                    (k, v)
++                })
++                .collect()
++        })
++        .collect())
++}
++
++fn pydebian(text: &str) -> Result<Paras, String> {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    paras_of(&ask(&mut c, "P", text))
++}
++
++fn dpkg(text: &str) -> Result<Paras, String> {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    paras_of(&ask(&mut c, "P", text))
++}
++
++// ---------------------------------------------------------------------------
++// Normalisation
++// ---------------------------------------------------------------------------
++
++/// A value as a list of lines with the surrounding whitespace of each line
++/// removed: the common ground of the crate (which drops continuation indents
++/// and keeps trailing whitespace), python-debian (which keeps continuation
++/// lines verbatim) and dpkg (which strips one indent character and trailing
++/// whitespace).
++fn norm(value: &str) -> Vec<String> {
++    value.split('\n').map(|l| l.trim().to_string()).collect()
++}
++
++/// dpkg unescapes a continuation line consisting of a single `.` into an
++/// empty line; undo that so dpkg's values compare with the others.
++fn norm_dpkg(value: &str) -> Vec<String> {
++    let mut lines = norm(value);
++    for l in lines.iter_mut().skip(1) {
++        if l.is_empty() {
++            *l = ".".to_string();
++        }
++    }
++    lines
++}
++
++fn crate_paras(doc: &Deb822) -> Paras {
++    doc.iter().map(|p| para_items(p)).collect()
++}
++
++fn para_items(p: &Paragraph) -> Vec<(String, String)> {
++    p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
++}
++
++fn keys_ci(p: &[(String, String)]) -> Vec<String> {
++    p.iter().map(|(k, _)| k.to_ascii_lowercase()).collect()
++}
++
++fn err_key(e: &Error) -> String {
++    match e {
++        Error::UnexpectedToken(t) => format!("UnexpectedToken({t:?})"),
++        Error::UnexpectedEof => "UnexpectedEof".to_string(),
++        Error::ExpectedEof => "ExpectedEof".to_string(),
++        Error::Io(e) => format!("Io({e})"),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++const KEY_FIRST: &[char] = &[
++    'A', 'B', 'C', 'D', 'P', 'S', 'V', 'X', 'a', 'b', 'd', 'k', 'm', 'p', 's', 'x',
++];
++const KEY_REST: &[char] = &[
++    'a', 'b', 'c', 'd', 'e', 'r', 's', 't', 'A', 'B', 'D', 'S', '0', '1', '9', '-', '_', '.', '+',
++    '~',
++];
++const WORD_CHARS: &[char] = &[
++    'a', 'b', 'c', 'x', 'y', 'z', 'A', 'M', '0', '1', '9', '.', ',', ';', '(', ')', '<', '>', '=',
++    '|', '/', '@', '+', '-', '_', '~', ':', '#', '!', '"', '\'', 'é', 'ĳ',
++];
++
++#[hegel::composite]
++fn arb_key(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(0, 7));
++    let mut s = String::new();
++    s.push(pick(tc, KEY_FIRST));
++    for _ in 0..n {
++        s.push(pick(tc, KEY_REST));
++    }
++    // dpkg silently drops a field whose name ends in `-`.
++    if s.ends_with('-') {
++        s.push('x');
++    }
++    s
++}
++
++#[hegel::composite]
++fn arb_word(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(1, 6));
++    (0..n).map(|_| pick(tc, WORD_CHARS)).collect()
++}
++
++/// A line of value text without leading or trailing whitespace.
++#[hegel::composite]
++fn arb_line(tc: &hegel::TestCase, allow_empty: bool) -> String {
++    let n = tc.draw(int!(if allow_empty { 0 } else { 1 }, 3));
++    let mut words: Vec<String> = Vec::new();
++    for _ in 0..n {
++        words.push(tc.draw(arb_word()));
++    }
++    let sep = pick(tc, &[" ", "  ", " \t"]);
++    words.join(sep)
++}
++
++/// dpkg unescapes a continuation line of two or more dots (` ..` reads as
++/// `.`); keep such lines out of the generated documents.
++fn no_dot_run(mut line: String) -> String {
++    if line.len() > 1 && line.chars().all(|c| c == '.') {
++        line.insert(0, 'x');
++    }
++    line
++}
++
++#[hegel::composite]
++fn arb_hws(tc: &hegel::TestCase, allow_empty: bool) -> String {
++    let opts: &[&str] = if allow_empty {
++        &["", " ", "  ", "\t", " \t ", "    "]
++    } else {
++        &[" ", "  ", "\t", " \t ", "    "]
++    };
++    pick(tc, opts).to_string()
++}
++
++#[derive(Clone, Debug, Default)]
++struct Opts {
++    crlf: bool,
++    trailing_ws: bool,
++    comments: bool,
++    empty_first_line: bool,
++    no_final_newline: bool,
++    ws_separator: bool,
++}
++
++#[hegel::composite]
++fn arb_opts(tc: &hegel::TestCase) -> Opts {
++    Opts {
++        crlf: tc.draw(generators::booleans()),
++        trailing_ws: tc.draw(generators::booleans()),
++        comments: tc.draw(generators::booleans()),
++        empty_first_line: tc.draw(generators::booleans()),
++        no_final_newline: tc.draw(generators::booleans()),
++        ws_separator: tc.draw(generators::booleans()),
++    }
++}
++
++#[derive(Clone, Debug)]
++struct ContLine {
++    comment_before: Option<String>,
++    indent: String,
++    text: String,
++    trail: String,
++}
++
++#[derive(Clone, Debug)]
++struct GenEntry {
++    comments_before: Vec<String>,
++    key: String,
++    post_colon: String,
++    first: String,
++    first_trail: String,
++    cont: Vec<ContLine>,
++}
++
++impl GenEntry {
++    /// The value lines without surrounding whitespace.
++    fn value_lines(&self) -> Vec<String> {
++        let mut v = vec![self.first.clone()];
++        v.extend(self.cont.iter().map(|c| c.text.clone()));
++        v
++    }
++    /// The value as the crate reads it: leading whitespace of every line
++    /// dropped, trailing whitespace kept (LF documents).
++    fn crate_value(&self) -> String {
++        let mut v = if self.first.is_empty() {
++            String::new()
++        } else {
++            format!("{}{}", self.first, self.first_trail)
++        };
++        for c in &self.cont {
++            v.push('\n');
++            v.push_str(&c.text);
++            v.push_str(&c.trail);
++        }
++        v
++    }
++    fn render(&self, out: &mut Vec<String>) {
++        for c in &self.comments_before {
++            out.push(c.clone());
++        }
++        out.push(format!(
++            "{}:{}{}{}",
++            self.key, self.post_colon, self.first, self.first_trail
++        ));
++        for c in &self.cont {
++            if let Some(cm) = &c.comment_before {
++                out.push(cm.clone());
++            }
++            out.push(format!("{}{}{}", c.indent, c.text, c.trail));
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++struct GenPara {
++    entries: Vec<GenEntry>,
++}
++
++#[derive(Clone, Debug)]
++struct GenDoc {
++    leading: Vec<String>,
++    paras: Vec<GenPara>,
++    /// Separator lines between paragraphs (paras.len() - 1 of them).
++    seps: Vec<Vec<String>>,
++    trailing_newline: bool,
++    crlf: bool,
++    opts: Opts,
++}
++
++impl GenDoc {
++    fn text(&self) -> String {
++        let mut lines: Vec<String> = self.leading.clone();
++        for (i, p) in self.paras.iter().enumerate() {
++            if i > 0 {
++                lines.extend(self.seps[i - 1].iter().cloned());
++            }
++            for e in &p.entries {
++                e.render(&mut lines);
++            }
++        }
++        let nl = if self.crlf { "\r\n" } else { "\n" };
++        let mut s = lines.join(nl);
++        if self.trailing_newline && !lines.is_empty() {
++            s.push_str(nl);
++        }
++        s
++    }
++    /// What every reader should see: paragraphs of (key, value lines).
++    fn model(&self) -> Vec<Vec<(String, Vec<String>)>> {
++        self.paras
++            .iter()
++            .map(|p| {
++                p.entries
++                    .iter()
++                    .map(|e| (e.key.clone(), e.value_lines()))
++                    .collect()
++            })
++            .collect()
++    }
++    /// What the owned parser reads (LF documents).
++    fn crate_model(&self) -> Paras {
++        self.paras
++            .iter()
++            .map(|p| {
++                p.entries
++                    .iter()
++                    .map(|e| (e.key.clone(), e.crate_value()))
++                    .collect()
++            })
++            .collect()
++    }
++}
++
++#[hegel::composite]
++fn arb_comment(tc: &hegel::TestCase) -> String {
++    let body = tc.draw(arb_line(true));
++    let sep = pick(tc, &["", " "]);
++    format!("#{sep}{body}")
++}
++
++#[hegel::composite]
++fn arb_entry(tc: &hegel::TestCase, key: String, opts: Opts) -> GenEntry {
++    let n_comments = if opts.comments { tc.draw(int!(0, 1)) } else { 0 };
++    let mut comments_before = Vec::new();
++    for _ in 0..n_comments {
++        comments_before.push(tc.draw(arb_comment()));
++    }
++    let post_colon = tc.draw(arb_hws(true));
++    let first = if opts.empty_first_line && tc.draw(generators::booleans()) {
++        String::new()
++    } else {
++        tc.draw(arb_line(true))
++    };
++    let first_trail = if opts.trailing_ws {
++        tc.draw(arb_hws(true))
++    } else {
++        String::new()
++    };
++    let n_cont = tc.draw(int!(0, 3));
++    let mut cont = Vec::new();
++    for _ in 0..n_cont {
++        let comment_before = if opts.comments && tc.draw(generators::booleans()) {
++            Some(tc.draw(arb_comment()))
++        } else {
++            None
++        };
++        let dot = tc.draw(int!(0, 5)) == 0;
++        let indent = if dot {
++            " ".to_string()
++        } else {
++            tc.draw(arb_hws(false))
++        };
++        let text = if dot { ".".to_string() } else { no_dot_run(tc.draw(arb_line(false))) };
++        let trail = if opts.trailing_ws {
++            tc.draw(arb_hws(true))
++        } else {
++            String::new()
++        };
++        cont.push(ContLine { comment_before, indent, text, trail });
++    }
++    let first = if first.is_empty() && !cont.is_empty() && !opts.empty_first_line {
++        "x".to_string()
++    } else {
++        first
++    };
++    GenEntry { comments_before, key, post_colon, first, first_trail, cont }
++}
++
++/// Distinct keys (case-insensitively).
++#[hegel::composite]
++fn arb_keys(tc: &hegel::TestCase, n: usize) -> Vec<String> {
++    let mut seen: BTreeSet<String> = BTreeSet::new();
++    let mut keys = Vec::new();
++    for i in 0..n {
++        let mut k = tc.draw(arb_key());
++        if !seen.insert(k.to_ascii_lowercase()) {
++            k = format!("{k}{i}");
++            if !seen.insert(k.to_ascii_lowercase()) {
++                continue;
++            }
++        }
++        keys.push(k);
++    }
++    keys
++}
++
++#[hegel::composite]
++fn arb_para(tc: &hegel::TestCase, opts: Opts) -> GenPara {
++    let n = tc.draw(int!(1, 4)) as usize;
++    let keys = tc.draw(arb_keys(n).print_as_debug());
++    let mut entries = Vec::new();
++    for k in keys {
++        entries.push(tc.draw(arb_entry(k, opts.clone()).print_as_debug()));
++    }
++    GenPara { entries }
++}
++
++#[hegel::composite]
++fn arb_doc(tc: &hegel::TestCase, opts: Opts) -> GenDoc {
++    let n = tc.draw(int!(0, 3));
++    let mut paras = Vec::new();
++    for _ in 0..n {
++        paras.push(tc.draw(arb_para(opts.clone()).print_as_debug()));
++    }
++    let mut seps = Vec::new();
++    for _ in 1..paras.len().max(1) {
++        let k = tc.draw(int!(1, 2));
++        let mut sep = Vec::new();
++        for _ in 0..k {
++            let line = if opts.ws_separator && tc.draw(int!(0, 3)) == 0 {
++                tc.draw(arb_hws(false))
++            } else {
++                String::new()
++            };
++            sep.push(line);
++        }
++        if opts.comments && tc.draw(int!(0, 3)) == 0 {
++            sep.push(tc.draw(arb_comment()));
++        }
++        seps.push(sep);
++    }
++    let mut leading = Vec::new();
++    if opts.comments && tc.draw(int!(0, 3)) == 0 {
++        leading.push(tc.draw(arb_comment()));
++    }
++    if tc.draw(int!(0, 5)) == 0 {
++        leading.push(String::new());
++    }
++    let trailing_newline = !(opts.no_final_newline && tc.draw(generators::booleans()));
++    GenDoc { leading, paras, seps, trailing_newline, crlf: opts.crlf, opts }
++}
++
++/// A document with default options (LF, no trailing whitespace, no comments).
++#[hegel::composite]
++fn arb_plain_doc(tc: &hegel::TestCase) -> GenDoc {
++    tc.draw(arb_doc(Opts::default()).print_as_debug())
++}
++
++/// Arbitrary text: a generated document with a few random mutations.
++#[hegel::composite]
++fn arb_text(tc: &hegel::TestCase) -> String {
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    let mut chars: Vec<char> = doc.text().chars().collect();
++    let n = tc.draw(int!(0, 4));
++    for _ in 0..n {
++        let c = pick(tc, &[':', '#', '\n', '\r', ' ', '\t', 'x', '-', '\u{a0}']);
++        let pos = tc.draw(int!(0, chars.len() as i64)) as usize;
++        if tc.draw(generators::booleans()) || pos == chars.len() {
++            chars.insert(pos, c);
++        } else {
++            chars[pos] = c;
++        }
++    }
++    chars.into_iter().collect()
++}
++
++/// A constructed field value: lines without leading whitespace, joined by
++/// newlines; may contain empty lines and may end in one.
++#[hegel::composite]
++fn arb_value(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(1, 4));
++    let mut lines = Vec::new();
++    for _ in 0..n {
++        // dpkg unescapes ` ..` to `.`: no runs of dots.
++        let l = no_dot_run(tc.draw(arb_line(true)));
++        // Leading whitespace of a line is dropped by the parser (by design),
++        // so a whitespace-only line would not survive: trailing whitespace
++        // only on lines with content.
++        let trail = if !l.is_empty() && tc.draw(int!(0, 4)) == 0 { " " } else { "" };
++        lines.push(format!("{l}{trail}"));
++    }
++    lines.join("\n")
++}
++
++/// A constructed paragraph with distinct keys.
++#[hegel::composite]
++fn arb_built_para(tc: &hegel::TestCase) -> Paragraph {
++    let n = tc.draw(int!(1, 4)) as usize;
++    let keys = tc.draw(arb_keys(n).print_as_debug());
++    let mut p = Paragraph { fields: vec![] };
++    for k in keys {
++        let v = tc.draw(arb_value());
++        p.insert(&k, &v);
++    }
++    p
++}
++
++// ---------------------------------------------------------------------------
++// Known-bug detectors (the general properties skip exactly these inputs; each
++// bug has its own pinned test below)
++// ---------------------------------------------------------------------------
++
++/// Lines of a text, without the line terminator (`\r\n` or `\n`).
++fn lines_of(text: &str) -> Vec<&str> {
++    let mut v: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
++    if v.last() == Some(&"") {
++        v.pop();
++    }
++    v
++}
++
++fn is_ws_only(line: &str) -> bool {
++    line.chars().any(|c| c == ' ' || c == '\t')
++        && line.chars().all(|c| c == ' ' || c == '\t' || c == '\r')
++}
++
++/// deb822-fast/1 and /2: a whitespace-only line anywhere in the document.
++fn has_ws_only_line(text: &str) -> bool {
++    text.split('\n')
++        .map(|l| l.strip_suffix('\r').unwrap_or(l))
++        .any(is_ws_only)
++}
++
++/// deb822-fast/1: a whitespace-only separator line in a generated document.
++fn hits_ws_separator_bug(doc: &GenDoc) -> bool {
++    doc.seps.iter().flatten().any(|l| is_ws_only(l))
++}
++
++/// deb822-fast/2: a whitespace-only line where the owned parser is between
++/// paragraphs (at the start, after a blank line or after a comment there).
++fn hits_ws_between_paragraphs(text: &str) -> bool {
++    let mut in_para = false;
++    for line in lines_of(text) {
++        // The borrowed parser also takes a `\r` after the whitespace as the
++        // end of a whitespace-only line (` \r:` is skipped up to the colon).
++        let rest = line.trim_start_matches(|c| c == ' ' || c == '\t');
++        let ws_prefix = rest.len() < line.len() && (rest.is_empty() || rest.starts_with('\r'));
++        if line.is_empty() {
++            in_para = false;
++        } else if is_ws_only(line) || ws_prefix {
++            if !in_para {
++                return true;
++            }
++        } else if line.starts_with('#') {
++            // comments do not change the state
++        } else {
++            in_para = true;
++        }
++    }
++    false
++}
++
++/// deb822-fast/3: a CRLF document with a blank line inside it.
++fn hits_crlf_bug(doc: &GenDoc) -> bool {
++    doc.crlf && (doc.paras.len() > 1 || (!doc.paras.is_empty() && doc.leading.iter().any(|l| l.is_empty())))
++}
++
++/// deb822-fast/3 in arbitrary text: a `\r` byte on a line of its own.
++fn has_bare_cr_line(text: &str) -> bool {
++    text.split('\n').any(|l| l.trim_end_matches('\r').is_empty() && l.contains('\r'))
++}
++
++/// deb822-fast/7: an indented comment line where the streaming reader is
++/// between paragraphs.
++fn has_indented_comment_between_paragraphs(text: &str) -> bool {
++    let mut in_para = false;
++    for line in lines_of(text) {
++        if line.trim().is_empty() {
++            in_para = false;
++        } else if line.starts_with(|c: char| c.is_whitespace()) && line.trim_start().starts_with('#')
++        {
++            if !in_para {
++                return true;
++            }
++        } else if line.starts_with('#') {
++        } else {
++            in_para = true;
++        }
++    }
++    false
++}
++
++/// deb822-fast/5: a value with an empty line after the first.
++fn has_empty_continuation(p: &Paragraph) -> bool {
++    p.iter().any(|(_, v)| v.split('\n').skip(1).any(|l| l.is_empty()))
++}
++
++/// deb822-fast/6: a value ending in a newline.
++fn has_trailing_newline(p: &Paragraph) -> bool {
++    p.iter().any(|(_, v)| v.ends_with('\n'))
++}
++
++fn skip_for_oracles(doc: &GenDoc) -> bool {
++    hits_ws_separator_bug(doc) || hits_crlf_bug(doc)
++}
++
++fn compare_paras(what: &str, text: &str, ours: &Paras, theirs: &Paras, dpkg_style: bool) {
++    assert_eq!(
++        ours.len(),
++        theirs.len(),
++        "{what}: paragraph count differs for {text:?}\nours: {ours:?}\ntheirs: {theirs:?}"
++    );
++    for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
++        let mut a = a.clone();
++        let mut b = b.clone();
++        if dpkg_style {
++            // dpkg returns its fields as a hash: compare sorted.
++            a.sort_by_key(|(k, _)| k.to_ascii_lowercase());
++            b.sort_by_key(|(k, _)| k.to_ascii_lowercase());
++        }
++        assert_eq!(keys_ci(&a), keys_ci(&b), "{what}: keys of paragraph {i} differ for {text:?}");
++        for ((k, va), (_, vb)) in a.iter().zip(b.iter()) {
++            let (na, nb) = if dpkg_style {
++                (norm_dpkg(va), norm_dpkg(vb))
++            } else {
++                (norm(va), norm(vb))
++            };
++            assert_eq!(na, nb, "{what}: value of {k:?} in paragraph {i} differs for {text:?}");
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Reading: the crate vs the references vs the model
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn paragraphs_are_read_like_python_debian(tc: hegel::TestCase) {
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    if skip_for_oracles(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let ours: Deb822 = text.parse().unwrap_or_else(|e| panic!("parse failed for {text:?}: {e}"));
++    let theirs = pydebian(&text).unwrap();
++    compare_paras("python-debian", &text, &crate_paras(&ours), &theirs, false);
++}
++
++#[hegel::test]
++fn paragraphs_are_read_like_dpkg(tc: hegel::TestCase) {
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    if skip_for_oracles(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let ours: Deb822 = text.parse().unwrap_or_else(|e| panic!("parse failed for {text:?}: {e}"));
++    let theirs = dpkg(&text).unwrap_or_else(|e| panic!("dpkg failed for {text:?}: {e}"));
++    compare_paras("dpkg", &text, &crate_paras(&ours), &theirs, true);
++}
++
++#[hegel::test]
++fn the_model_is_what_the_parser_reads(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    if hits_ws_separator_bug(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let ours: Deb822 = text.parse().unwrap_or_else(|e| panic!("parse failed for {text:?}: {e}"));
++    assert_eq!(crate_paras(&ours), doc.crate_model(), "for {text:?}");
++    assert_eq!(ours.len(), doc.paras.len());
++    assert_eq!(ours.is_empty(), doc.paras.is_empty());
++    // `Deb822::from_reader` is `FromStr` on the whole input.
++    let via_reader = Deb822::from_reader(text.as_bytes()).unwrap();
++    assert_eq!(via_reader, ours);
++    // `get` is case-insensitive and finds every field.
++    for (p, gp) in ours.iter().zip(&doc.paras) {
++        assert_eq!(p.len(), gp.entries.len());
++        for e in &gp.entries {
++            assert_eq!(p.get(&e.key), Some(e.crate_value().as_str()));
++            assert_eq!(p.get(&e.key.to_ascii_uppercase()), Some(e.crate_value().as_str()));
++            assert_eq!(p.get(&e.key.to_ascii_lowercase()), Some(e.crate_value().as_str()));
++        }
++        assert_eq!(p.get("no-such-field-here"), None);
++    }
++    // `Paragraph: FromStr` reads exactly a one-paragraph document.
++    let single = text.parse::<Paragraph>();
++    match doc.paras.len() {
++        0 => assert!(matches!(single, Err(Error::UnexpectedEof)), "{single:?}"),
++        1 => assert_eq!(single.unwrap(), ours.iter().next().unwrap().clone()),
++        _ => assert!(matches!(single, Err(Error::ExpectedEof)), "{single:?}"),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// The three parsers of the crate agree
++// ---------------------------------------------------------------------------
++
++fn borrowed_paras(text: &str) -> Result<Paras, String> {
++    let paras = parse_borrowed(text).map_err(|e| err_key(&e))?;
++    let mut out = Vec::new();
++    for p in &paras {
++        let mut fields = Vec::new();
++        for f in p.iter() {
++            // Every accessor tells the same story.
++            let joined = f.join();
++            let lines: Vec<&str> = joined.split('\n').collect();
++            assert_eq!(f.lines(), lines.as_slice(), "lines() vs join() for {text:?}");
++            assert_eq!(f.is_single_line(), !joined.contains('\n'));
++            assert_eq!(f.is_multi_line(), joined.contains('\n'));
++            assert_eq!(f.as_single_line(), if joined.contains('\n') { None } else { Some(joined.as_str()) });
++            assert_eq!(p.get(f.name()).map(|l| l.len()), p.get_field(f.name()).map(|g| g.lines().len()));
++            fields.push((f.name().to_string(), joined));
++        }
++        assert_eq!(p.len(), fields.len());
++        assert_eq!(p.is_empty(), fields.is_empty());
++        out.push(fields);
++    }
++    // The streaming borrowed iterator yields the same paragraphs.
++    let mut iterated = Vec::new();
++    for r in iter_paragraphs_borrowed(text) {
++        iterated.push(r.unwrap_or_else(|e| panic!("iterator failed where parse_all succeeded: {e}")));
++    }
++    assert_eq!(iterated, paras, "iter_paragraphs_borrowed vs parse_borrowed for {text:?}");
++    Ok(out)
++}
++
++#[hegel::test]
++fn the_borrowed_parser_agrees_with_the_owned_parser(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text().print_as_debug());
++    if hits_ws_between_paragraphs(&text) {
++        return;
++    }
++    let owned = text.parse::<Deb822>().map_err(|e| err_key(&e));
++    let borrowed = borrowed_paras(&text);
++    match (&owned, &borrowed) {
++        (Ok(o), Ok(b)) => assert_eq!(&crate_paras(o), b, "for {text:?}"),
++        (Err(eo), Err(eb)) => assert_eq!(eo, eb, "errors differ for {text:?}"),
++        _ => panic!("owned: {owned:?}\nborrowed: {borrowed:?}\nfor {text:?}"),
++    }
++}
++
++fn reader_paras(text: &str) -> Vec<Result<Paragraph, String>> {
++    Deb822::iter_paragraphs_from_reader(BufReader::new(text.as_bytes()))
++        .map(|r| r.map_err(|e| err_key(&e)))
++        .collect()
++}
++
++#[hegel::test]
++fn the_paragraph_reader_agrees_with_from_str(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text().print_as_debug());
++    if text.split('\n').any(|l| l.trim().is_empty() && !l.is_empty())
++        || has_indented_comment_between_paragraphs(&text)
++    {
++        return;
++    }
++    let owned = text.parse::<Deb822>();
++    let streamed = reader_paras(&text);
++    match owned {
++        Ok(doc) => {
++            let got: Vec<Paragraph> = streamed
++                .into_iter()
++                .map(|r| r.unwrap_or_else(|e| panic!("reader failed where from_str succeeded: {e} for {text:?}")))
++                .collect();
++            assert_eq!(got, doc.into_iter().collect::<Vec<_>>(), "for {text:?}");
++        }
++        Err(e) => {
++            assert!(
++                streamed.iter().any(|r| r.is_err()),
++                "from_str failed ({e}) but the reader read {streamed:?} for {text:?}"
++            );
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Display
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn display_of_a_parsed_document_round_trips(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.ws_separator = false;
++    // deb822-fast/3: the values of a CRLF document keep their `\r`, which
++    // `Display` (through `str::lines`) drops again.
++    opts.crlf = false;
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    let text = doc.text();
++    let ours: Deb822 = text.parse().unwrap();
++    let shown = ours.to_string();
++    let again: Deb822 = shown.parse().unwrap_or_else(|e| panic!("{shown:?} does not parse: {e}"));
++    assert_eq!(again, ours, "display {shown:?} of {text:?}");
++    // Paragraph and Field displays compose the document's.
++    let composed: Vec<String> = ours.iter().map(|p| p.to_string()).collect();
++    assert_eq!(composed.join("\n"), shown);
++    for p in ours.iter() {
++        let fields: String = p.fields.iter().map(|f| f.to_string()).collect();
++        assert_eq!(fields, p.to_string());
++    }
++}
++
++#[hegel::test]
++fn display_of_a_built_paragraph_round_trips(tc: hegel::TestCase) {
++    let para = tc.draw(arb_built_para().print_as_debug());
++    if has_trailing_newline(&para) {
++        return;
++    }
++    let shown = para.to_string();
++    let again: Paragraph = shown.parse().unwrap_or_else(|e| panic!("{shown:?} does not parse: {e}"));
++    assert_eq!(again, para, "display {shown:?}");
++}
++
++#[hegel::test]
++fn display_output_is_read_by_the_references(tc: hegel::TestCase) {
++    let para = tc.draw(arb_built_para().print_as_debug());
++    if has_trailing_newline(&para) || has_empty_continuation(&para) {
++        return;
++    }
++    let shown = para.to_string();
++    let ours = vec![para_items(&para)];
++    let py = pydebian(&shown).unwrap();
++    compare_paras("python-debian", &shown, &ours, &py, false);
++    let dp = dpkg(&shown).unwrap_or_else(|e| panic!("dpkg failed for {shown:?}: {e}"));
++    compare_paras("dpkg", &shown, &ours, &dp, true);
++}
++
++// ---------------------------------------------------------------------------
++// Editing a paragraph against a list model
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++enum Edit {
++    Insert(String, String),
++    Set(String, String),
++    SetOrdered(String, String, bool),
++    Remove(String),
++    TraitSet(String, String),
++    TraitRemove(String),
++}
++
++#[hegel::composite]
++fn arb_edit(tc: &hegel::TestCase, keys: Vec<String>) -> Edit {
++    let key = {
++        let k = pick(tc, &keys);
++        match tc.draw(int!(0, 3)) {
++            0 => k.to_ascii_uppercase(),
++            1 => k.to_ascii_lowercase(),
++            _ => k,
++        }
++    };
++    let value = tc.draw(arb_line(true));
++    match tc.draw(int!(0, 5)) {
++        0 => Edit::Insert(key, value),
++        1 => Edit::Set(key, value),
++        2 => Edit::SetOrdered(key, value, tc.draw(generators::booleans())),
++        3 => Edit::Remove(key),
++        4 => Edit::TraitSet(key, value),
++        _ => Edit::TraitRemove(key),
++    }
++}
++
++type Model = Vec<(String, String)>;
++
++fn model_apply(model: &mut Model, edit: &Edit) {
++    match edit {
++        Edit::Insert(k, v) => model.push((k.clone(), v.clone())),
++        Edit::Set(k, v) | Edit::TraitSet(k, v) | Edit::SetOrdered(k, v, _) => {
++            if let Some(f) = model.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(k)) {
++                f.1 = v.clone();
++            } else {
++                // `set` appends; `set_with_field_order` places the field
++                // somewhere (checked separately) — mark with a placeholder.
++                model.push((k.clone(), v.clone()));
++            }
++        }
++        Edit::Remove(k) | Edit::TraitRemove(k) => model.retain(|(n, _)| !n.eq_ignore_ascii_case(k)),
++    }
++}
++
++fn position_in(order: &[&str], name: &str) -> Option<usize> {
++    order.iter().position(|f| f.eq_ignore_ascii_case(name))
++}
++
++fn known_in_order(p: &Paragraph, order: &[&str]) -> Vec<usize> {
++    p.fields.iter().filter_map(|f| position_in(order, &f.name)).collect()
++}
++
++fn is_sorted<T: PartialOrd>(v: &[T]) -> bool {
++    v.windows(2).all(|w| w[0] <= w[1])
++}
++
++#[hegel::test]
++fn edits_follow_the_list_model(tc: hegel::TestCase) {
++    let mut para = tc.draw(arb_built_para().print_as_debug());
++    let mut model: Model = para_items(&para);
++    let mut keys: Vec<String> = model.iter().map(|(k, _)| k.clone()).collect();
++    let extra = tc.draw(arb_keys(3).print_as_debug());
++    keys.extend(extra);
++    let n = tc.draw(int!(0, 6));
++    for _ in 0..n {
++        let edit = tc.draw(arb_edit(keys.clone()).print_as_debug());
++        match &edit {
++            Edit::Insert(k, v) => para.insert(k, v),
++            Edit::Set(k, v) => para.set(k, v),
++            Edit::TraitSet(k, v) => Deb822LikeParagraph::set(&mut para, k, v),
++            Edit::Remove(k) => para.remove(k),
++            Edit::TraitRemove(k) => Deb822LikeParagraph::remove(&mut para, k),
++            Edit::SetOrdered(k, v, binary) => {
++                let order = if *binary { BINARY_FIELD_ORDER } else { SOURCE_FIELD_ORDER };
++                let before = para.clone();
++                para.set_with_field_order(k, v, order);
++                // The value is set (on the first of any duplicates `insert`
++                // made), no field is added if one existed …
++                assert_eq!(para.get(k), Some(v.as_str()), "after {edit:?} on {before:?}");
++                let count = |p: &Paragraph| p.fields.iter().filter(|f| f.name.eq_ignore_ascii_case(k)).count();
++                assert_eq!(count(&para), count(&before).max(1), "after {edit:?} on {before:?}");
++                if before.get(k).is_some() {
++                    // … in place for an existing field …
++                    assert_eq!(
++                        para.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
++                        before.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
++                        "set_with_field_order moved fields: {edit:?} on {before:?}"
++                    );
++                } else {
++                    // … and a new field keeps the others in their order.
++                    let others: Vec<&Field> =
++                        para.fields.iter().filter(|f| !f.name.eq_ignore_ascii_case(k)).collect();
++                    assert_eq!(
++                        others.iter().map(|f| (*f).clone()).collect::<Vec<_>>(),
++                        before.fields,
++                        "set_with_field_order reordered fields: {edit:?} on {before:?}"
++                    );
++                    let known_before = known_in_order(&before, order);
++                    if is_sorted(&known_before) && position_in(order, k).is_some() {
++                        assert!(
++                            is_sorted(&known_in_order(&para, order)),
++                            "canonical order broken by {edit:?} on {before:?}: {para:?}"
++                        );
++                    }
++                }
++                // The model does not know where it went: realign it.
++                model_apply(&mut model, &edit);
++                let mut m2 = para_items(&para);
++                m2.sort();
++                let mut m1 = model.clone();
++                m1.sort();
++                assert_eq!(m2, m1, "after {edit:?} on {before:?}");
++                model = para_items(&para);
++                continue;
++            }
++        }
++        model_apply(&mut model, &edit);
++        assert_eq!(para_items(&para), model, "after {edit:?}");
++    }
++    // Accessors agree with the model.
++    assert_eq!(para.len(), model.len());
++    assert_eq!(para.is_empty(), model.is_empty());
++    for k in &keys {
++        let expect = model.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str());
++        assert_eq!(para.get(k), expect, "get({k:?})");
++        assert_eq!(Deb822LikeParagraph::get(&para, k), expect.map(|s| s.to_string()));
++    }
++    // iter_mut edits every value in place.
++    for (_, v) in para.iter_mut() {
++        v.push('!');
++    }
++    let bumped: Model = model.iter().map(|(k, v)| (k.clone(), format!("{v}!"))).collect();
++    assert_eq!(para_items(&para), bumped);
++    // Collecting the items rebuilds the paragraph.
++    let rebuilt: Paragraph = para.clone().into_iter().collect();
++    assert_eq!(rebuilt, para);
++    let from_vec = Paragraph::from(para.clone().into_iter().collect::<Vec<_>>());
++    assert_eq!(from_vec, para);
++}
++
++#[hegel::test]
++fn set_with_field_order_keeps_unknown_fields_sorted(tc: hegel::TestCase) {
++    // All-unknown paragraphs whose names are sorted stay sorted.
++    let n = tc.draw(int!(0, 4)) as usize;
++    let mut keys: Vec<String> = tc.draw(arb_keys(n + 1).print_as_debug());
++    keys.retain(|k| position_in(BINARY_FIELD_ORDER, k).is_none());
++    if keys.is_empty() {
++        return;
++    }
++    keys.sort();
++    keys.dedup();
++    let new = keys.remove(tc.draw(int!(0, keys.len() as i64 - 1)) as usize);
++    let mut para = Paragraph { fields: vec![] };
++    for k in &keys {
++        para.insert(k, "v");
++    }
++    para.set_with_field_order(&new, "new", BINARY_FIELD_ORDER);
++    let names: Vec<&String> = para.fields.iter().map(|f| &f.name).collect();
++    assert!(is_sorted(&names), "{names:?} after inserting {new:?} into {keys:?}");
++}
++
++// ---------------------------------------------------------------------------
++// convert
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn format_multi_line_is_read_back(tc: hegel::TestCase) {
++    let value = tc.draw(arb_value());
++    if value.ends_with('\n') {
++        return;
++    }
++    let formatted = format_multi_line(&value);
++    if !value.contains('\n') {
++        assert_eq!(formatted, value);
++    }
++    let text = format!("K: {formatted}\n");
++    let doc: Deb822 = text.parse().unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(doc.len(), 1);
++    let got = doc.iter().next().unwrap().get("K").unwrap().to_string();
++    let expect: Vec<String> = value
++        .split('\n')
++        .enumerate()
++        .map(|(i, l)| if i > 0 && l.is_empty() { ".".to_string() } else { l.to_string() })
++        .collect();
++    assert_eq!(got.split('\n').collect::<Vec<_>>(), expect, "for {value:?} -> {formatted:?}");
++    // Every reference reads it too.
++    let py = pydebian(&text).unwrap();
++    assert_eq!(py.len(), 1, "python-debian on {text:?}");
++    assert_eq!(norm(&py[0][0].1), norm(&got), "python-debian on {text:?}");
++    let dp = dpkg(&text).unwrap();
++    assert_eq!(norm_dpkg(&dp[0][0].1), norm_dpkg(&got), "dpkg on {text:?}");
++}
++
++#[hegel::test]
++fn format_folded_keeps_the_words(tc: hegel::TestCase) {
++    let value = tc.draw(arb_value());
++    let folded = format_folded(&value);
++    assert!(!folded.contains('\n'));
++    assert_eq!(folded.trim(), folded);
++    assert_eq!(
++        folded.split_whitespace().collect::<Vec<_>>(),
++        value.split_whitespace().collect::<Vec<_>>()
++    );
++    assert_eq!(format_folded(&folded), folded);
++}
++
++#[hegel::test]
++fn format_single_line_accepts_exactly_single_lines(tc: hegel::TestCase) {
++    let value = tc.draw(arb_value());
++    let r = std::panic::catch_unwind(|| format_single_line(&value, "K"));
++    if value.contains('\n') {
++        assert!(r.is_err(), "no panic for {value:?}");
++    } else {
++        assert_eq!(r.unwrap(), value);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pinned bugs
++// ---------------------------------------------------------------------------
++
++/// deb822-fast/1: a whitespace-only line ends a paragraph for dpkg,
++/// python-debian and the crate's own `ParagraphReader`; the owned and the
++/// borrowed parser read it as an (empty) continuation line of the last field.
++#[hegel::test]
++fn a_whitespace_only_line_ends_a_paragraph(tc: hegel::TestCase) {
++    let ws = tc.draw(arb_hws(false));
++    let text = format!("K: a\n{ws}\nJ: b\n");
++    let py = pydebian(&text).unwrap();
++    let dp = dpkg(&text).unwrap();
++    assert_eq!(py.len(), 2);
++    assert_eq!(dp.len(), 2);
++    let streamed: Vec<Paragraph> = reader_paras(&text).into_iter().map(|r| r.unwrap()).collect();
++    assert_eq!(streamed.len(), 2);
++    let owned: Deb822 = text.parse().unwrap();
++    assert_eq!(owned.len(), 2, "owned parser read {owned:?} for {text:?}");
++    let borrowed = parse_borrowed(&text).unwrap();
++    assert_eq!(borrowed.len(), 2);
++}
++
++/// deb822-fast/2: a whitespace-only line between paragraphs (or before the
++/// first) is skipped by the borrowed parser, the `ParagraphReader`, dpkg and
++/// python-debian, and rejected by the owned parser.
++#[hegel::test]
++fn a_whitespace_only_line_between_paragraphs_is_skipped(tc: hegel::TestCase) {
++    let ws = tc.draw(arb_hws(false));
++    let text = if tc.draw(generators::booleans()) {
++        format!("K: a\n\n{ws}\nJ: b\n")
++    } else {
++        format!("{ws}\nK: a\n\nJ: b\n")
++    };
++    assert_eq!(pydebian(&text).unwrap().len(), 2);
++    assert_eq!(dpkg(&text).unwrap().len(), 2);
++    assert_eq!(parse_borrowed(&text).unwrap().len(), 2);
++    let streamed: Vec<Paragraph> = reader_paras(&text).into_iter().map(|r| r.unwrap()).collect();
++    assert_eq!(streamed.len(), 2);
++    let owned = text.parse::<Deb822>();
++    assert_eq!(owned.map(|d| d.len()).map_err(|e| e.to_string()), Ok(2), "for {text:?}");
++}
++
++/// deb822-fast/3: a CRLF document with two paragraphs does not parse (the
++/// `\r` of the blank line is read as a field name without a colon), and the
++/// values of a CRLF document keep their `\r`.
++#[hegel::test]
++fn crlf_documents_are_read_like_python_debian(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = true;
++    opts.ws_separator = false;
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    let text = doc.text();
++    let py = pydebian(&text).unwrap();
++    let ours: Deb822 = text.parse().unwrap_or_else(|e| panic!("parse failed for {text:?}: {e}"));
++    compare_paras("python-debian", &text, &crate_paras(&ours), &py, false);
++    for p in ours.iter() {
++        for (k, v) in p.iter() {
++            assert!(!v.contains('\r'), "{k}: {v:?} keeps a carriage return in {text:?}");
++        }
++    }
++}
++
++/// deb822-fast/4: whitespace between the field name and the colon is part of
++/// the name (dpkg and python-debian: the name is `K`), and a name containing
++/// whitespace is accepted (dpkg: syntax error).
++#[hegel::test]
++fn whitespace_before_the_colon_is_not_part_of_the_field_name(tc: hegel::TestCase) {
++    let key = tc.draw(arb_key());
++    let ws = tc.draw(arb_hws(false));
++    let text = format!("{key}{ws}: v\n");
++    let dp = dpkg(&text).unwrap();
++    assert_eq!(dp, vec![vec![(key.clone(), "v".to_string())]]);
++    let py = pydebian(&text).unwrap();
++    assert_eq!(py, vec![vec![(key.clone(), "v".to_string())]]);
++    let ours: Deb822 = text.parse().unwrap();
++    let p = ours.iter().next().unwrap();
++    assert_eq!(p.get(&key), Some("v"), "for {text:?}: {p:?}");
++    assert_eq!(p.fields[0].name, key);
++}
++
++/// deb822-fast/5: `Display` writes an empty continuation line as a single
++/// space, which dpkg and python-debian read as the end of the paragraph
++/// (`convert::format_multi_line` writes ` .`).
++#[hegel::test]
++fn display_of_an_empty_continuation_line_is_read_by_the_references(tc: hegel::TestCase) {
++    let a = tc.draw(arb_line(false));
++    let b = tc.draw(arb_line(false));
++    let mut para = Paragraph { fields: vec![] };
++    para.insert("K", &format!("{a}\n\n{b}"));
++    para.insert("J", "x");
++    let shown = para.to_string();
++    let ours = vec![para_items(&para)];
++    let py = pydebian(&shown).unwrap();
++    compare_paras("python-debian", &shown, &ours, &py, false);
++    let dp = dpkg(&shown).unwrap_or_else(|e| panic!("dpkg failed for {shown:?}: {e}"));
++    compare_paras("dpkg", &shown, &ours, &dp, true);
++}
++
++/// deb822-fast/6: `Display` of a value ending in a newline (as the parser
++/// produces for a trailing ` ` continuation line) writes a blank line after
++/// the field, so the paragraph is split in two on re-parse.
++#[hegel::test]
++fn display_of_a_value_ending_in_a_newline_round_trips(tc: hegel::TestCase) {
++    let a = tc.draw(arb_line(false));
++    let mut para = Paragraph { fields: vec![] };
++    para.insert("K", &format!("{a}\n"));
++    para.insert("J", "x");
++    let shown = para.to_string();
++    let again: Deb822 = shown.parse().unwrap();
++    assert_eq!(again.len(), 1, "display {shown:?} of {para:?} re-parses as {again:?}");
++    assert_eq!(again.iter().next().unwrap().len(), 2);
++}
++
++/// deb822-fast/7: the `ParagraphReader` skips an indented comment line before
++/// a paragraph that `from_str` (and the borrowed parser) reject.
++#[hegel::test]
++fn the_paragraph_reader_rejects_what_from_str_rejects(tc: hegel::TestCase) {
++    let ws = tc.draw(arb_hws(false));
++    let text = format!("{ws}# c\nK: a\n");
++    assert!(text.parse::<Deb822>().is_err());
++    assert!(parse_borrowed(&text).is_err());
++    let streamed = reader_paras(&text);
++    assert!(streamed.iter().any(|r| r.is_err()), "reader read {streamed:?} for {text:?}");
++}
