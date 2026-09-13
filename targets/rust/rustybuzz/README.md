@@ -18,3 +18,4 @@
 - 2025-06-09: predecessor base commit `51d99b83ae78` ([buffer] Fix buffer size enlargement (harfruzz PR #62)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/rustybuzz.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 51d99b83ae78 → 9faca9674086 (2026-07-26, "Deprecate in preference to HarfRust"; 0.20.1); 2 bug(s) still reproduce. 10 tests pass.

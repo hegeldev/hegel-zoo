@@ -37,3 +37,4 @@
 - 2026-06-22: predecessor base commit `05e6d58c5e03` (Bump actions/checkout from 6 to 7 (#234)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/rstar.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 05e6d58c5e03 → 8a0f397dcf6a (2026-09-11, "chore(rstar): Get rid of unnecessary trait bounds (#248)"; 0.13.0); 2 bug(s) still reproduce; 2 ignored reproducer(s) not run. 89 tests pass.
