@@ -1,0 +1,602 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9cf6a8e..1038974 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -34,6 +34,8 @@ required-features = ["alloc"]
+ rustdoc-args = ["--generate-link-to-definition"]
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++data-encoding = "2"
+ # 0.8.0 uses alloca, which breaks miri compilation
+ criterion = "0.7.0"
+ rand = "0.10.2"
+@@ -58,3 +60,7 @@ debug = true
+ [profile.test]
+ # Faster tests save much more than the increase in compilation time
+ opt-level = 3
++
++[[test]]
++name = "hegel"
++required-features = ["std"]
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..664b45a
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,575 @@
++//! Property tests for `base64`.
++//!
++//! Oracles, in order of strength:
++//! - `data-encoding`, an independent RFC 4648 implementation, configured through its
++//!   `Specification` with the very same symbols and padding as the `base64` alphabet under
++//!   test (so every built-in alphabet and random custom ones are covered): encodings must be
++//!   identical, and under the strict padding modes both crates must accept exactly the same
++//!   inputs and decode them to the same bytes;
++//! - the crate's own engines against each other: `GeneralPurpose` (the default, scalar with
++//!   8-byte fast paths) and `Simd` / `Avx2` (the runtime-dispatched vector engines, STANDARD
++//!   and URL_SAFE only). Same alphabet, same config: encodings, decodings and decode *errors*
++//!   must be identical;
++//! - the documented contracts: `encoded_len`, `decoded_len_estimate`, the `DecodePaddingMode`
++//!   rules, which `DecodeError` a single corruption of a canonical encoding produces, and the
++//!   streaming reader/writer being equivalent to the one-shot functions.
++
++use std::io::{Read, Write};
++
++use base64::alphabet::{self, Alphabet, ParseAlphabetError};
++use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
++use base64::engine::simd::{Avx2, Simd};
++use base64::engine::{DecodePaddingMode, Engine};
++use base64::{DecodeError, DecodeSliceError, EncodeSliceError};
++use hegel::generators;
++use hegel::Generator as _;
++
++// ---------------------------------------------------------------------------
++// Configurations and engines
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Which {
++    Standard,
++    UrlSafe,
++    Crypt,
++    Bcrypt,
++    ImapMutf7,
++    BinHex,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct Config {
++    alphabet: Which,
++    encode_padding: bool,
++    allow_trailing_bits: bool,
++    padding_mode: DecodePaddingMode,
++}
++
++impl hegel::PrettyPrintable for Config {
++    fn pretty_print(&self, printer: &mut hegel::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++    }
++}
++
++fn alphabet_of(which: Which) -> &'static Alphabet {
++    match which {
++        Which::Standard => &alphabet::STANDARD,
++        Which::UrlSafe => &alphabet::URL_SAFE,
++        Which::Crypt => &alphabet::CRYPT,
++        Which::Bcrypt => &alphabet::BCRYPT,
++        Which::ImapMutf7 => &alphabet::IMAP_MUTF7,
++        Which::BinHex => &alphabet::BIN_HEX,
++    }
++}
++
++/// `data-encoding` codec with the given symbols, `=` padding (or none) and trailing-bit check.
++fn reference_codec(alphabet: &Alphabet, padding: bool, check_trailing_bits: bool) -> data_encoding::Encoding {
++    let mut spec = data_encoding::Specification::new();
++    spec.symbols.push_str(alphabet.as_str());
++    spec.padding = if padding { Some('=') } else { None };
++    spec.check_trailing_bits = check_trailing_bits;
++    spec.encoding().unwrap_or_else(|e| panic!("data-encoding rejects alphabet {:?}: {e}", alphabet.as_str()))
++}
++
++impl Config {
++    fn general(&self) -> GeneralPurposeConfig {
++        GeneralPurposeConfig::new()
++            .with_encode_padding(self.encode_padding)
++            .with_decode_allow_trailing_bits(self.allow_trailing_bits)
++            .with_decode_padding_mode(self.padding_mode)
++    }
++
++    fn general_purpose(&self) -> GeneralPurpose {
++        GeneralPurpose::new(alphabet_of(self.alphabet), self.general())
++    }
++
++    /// The SIMD engine, for the two alphabets it supports.
++    fn simd(&self) -> Option<Simd> {
++        match self.alphabet {
++            Which::Standard => Some(Simd::standard(self.general())),
++            Which::UrlSafe => Some(Simd::url_safe(self.general())),
++            _ => None,
++        }
++    }
++
++    /// The AVX2 engine when this machine has AVX2 (what `Simd` dispatches to then; constructed
++    /// explicitly so that it is exercised even if detection picked another backend).
++    fn avx2(&self) -> Option<Avx2> {
++        match self.alphabet {
++            Which::Standard => Avx2::standard(self.general()),
++            Which::UrlSafe => Avx2::url_safe(self.general()),
++            _ => None,
++        }
++    }
++
++    /// `data-encoding` codec producing the same encoding as this config.
++    fn encoder_reference(&self) -> data_encoding::Encoding {
++        reference_codec(alphabet_of(self.alphabet), self.encode_padding, true)
++    }
++
++    /// `data-encoding` codec accepting exactly the inputs this config's *decoder* accepts:
++    /// `RequireCanonical` ↔ padding required when needed, `RequireNone` ↔ no padding at all;
++    /// `Indifferent` has no counterpart.
++    fn decoder_reference(&self) -> Option<data_encoding::Encoding> {
++        let padding = match self.padding_mode {
++            DecodePaddingMode::RequireCanonical => true,
++            DecodePaddingMode::RequireNone => false,
++            DecodePaddingMode::Indifferent => return None,
++        };
++        Some(reference_codec(alphabet_of(self.alphabet), padding, !self.allow_trailing_bits))
++    }
++}
++
++#[hegel::composite]
++fn arb_config(tc: &hegel::TestCase) -> Config {
++    Config {
++        alphabet: tc.draw(
++            generators::sampled_from(vec![
++                Which::Standard,
++                Which::Standard,
++                Which::UrlSafe,
++                Which::UrlSafe,
++                Which::Crypt,
++                Which::Bcrypt,
++                Which::ImapMutf7,
++                Which::BinHex,
++            ])
++            .print_as_debug(),
++        ),
++        encode_padding: tc.draw(generators::booleans()),
++        allow_trailing_bits: tc.draw(generators::booleans()),
++        padding_mode: tc.draw(
++            generators::sampled_from(vec![
++                DecodePaddingMode::Indifferent,
++                DecodePaddingMode::RequireCanonical,
++                DecodePaddingMode::RequireNone,
++            ])
++            .print_as_debug(),
++        ),
++    }
++}
++
++/// Input bytes: mostly short, sometimes long enough to run the vector engines' bulk loops
++/// (AVX2 consumes 32 input bytes per iteration) several times plus a tail.
++fn arb_bytes() -> impl hegel::PrintableGenerator<Vec<u8>> {
++    generators::binary().max_size(160)
++}
++
++fn lossy(bytes: &[u8]) -> String {
++    String::from_utf8_lossy(bytes).into_owned()
++}
++
++
++/// Compare a `base64` decode result with `data-encoding`'s on the same input. One documented
++/// difference: `base64` rejects `=` anywhere but in the final quad ("Padding characters (`=`)
++/// interspersed in the encoded form are invalid"), while `data-encoding` decodes concatenated
++/// padded blocks such as `AA==AA==`. For such inputs `base64` must fail; otherwise both must
++/// agree on acceptance and bytes.
++fn compare_with_reference(got: &Result<Vec<u8>, DecodeError>, reference: Result<Vec<u8>, data_encoding::DecodeError>, input: &[u8]) {
++    let interior_padding = match input.iter().position(|&b| b == b'=') {
++        Some(first) => input[first..].iter().any(|&b| b != b'='),
++        None => false,
++    };
++    if interior_padding {
++        assert!(got.is_err(), "base64 accepted interspersed padding in {:?}: {got:?}", lossy(input));
++        return;
++    }
++    match (got, reference) {
++        (Ok(a), Ok(b)) => assert_eq!(*a, b, "bytes for {:?}", lossy(input)),
++        (Ok(a), Err(e)) => panic!("base64 decodes {:?} to {a:?} but data-encoding rejects it: {e}", lossy(input)),
++        (Err(e), Ok(b)) => panic!("base64 rejects {:?} with {e:?} but data-encoding decodes it to {b:?}", lossy(input)),
++        (Err(_), Err(_)) => {}
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Encoding
++// ---------------------------------------------------------------------------
++
++/// Every engine encodes identically and `data-encoding` agrees; `encoded_len`,
++/// `encode_string`, `encode_slice` (including `OutputSliceTooSmall`), `Base64Display` and
++/// `EncoderWriter`/`EncoderStringWriter` all produce that encoding.
++#[hegel::test]
++fn encoding_agrees_with_reference_and_across_apis(tc: hegel::TestCase) {
++    let cfg = tc.draw(arb_config());
++    let input = tc.draw(arb_bytes());
++    let gp = cfg.general_purpose();
++    let encoded = gp.encode(&input);
++
++    assert_eq!(cfg.encoder_reference().encode(&input), encoded, "data-encoding vs GeneralPurpose");
++    if let Some(simd) = cfg.simd() {
++        assert_eq!(simd.encode(&input), encoded, "Simd vs GeneralPurpose");
++    }
++    if let Some(avx2) = cfg.avx2() {
++        assert_eq!(avx2.encode(&input), encoded, "Avx2 vs GeneralPurpose");
++    }
++
++    // Documented length.
++    let want_len = base64::encoded_len(input.len(), cfg.encode_padding).expect("small input");
++    assert_eq!(encoded.len(), want_len, "encoded_len({}, {})", input.len(), cfg.encode_padding);
++    if cfg.encode_padding {
++        assert_eq!(encoded.len() % 4, 0, "padded output is a whole number of quads");
++    } else {
++        assert!(!encoded.ends_with('='), "unpadded output has no `=`");
++    }
++
++    // encode_string appends.
++    let mut s = String::from("prefix:");
++    gp.encode_string(&input, &mut s);
++    assert_eq!(s, format!("prefix:{encoded}"), "encode_string appends");
++
++    // encode_slice: exact buffer works, one byte short is OutputSliceTooSmall, larger works.
++    let mut exact = vec![0u8; encoded.len()];
++    assert_eq!(gp.encode_slice(&input, &mut exact), Ok(encoded.len()));
++    assert_eq!(exact, encoded.as_bytes(), "encode_slice into an exact buffer");
++    if !encoded.is_empty() {
++        let mut short = vec![0u8; encoded.len() - 1];
++        assert_eq!(gp.encode_slice(&input, &mut short), Err(EncodeSliceError::OutputSliceTooSmall));
++    }
++    let extra = tc.draw(generators::integers::<usize>().max_value(8));
++    let mut large = vec![b'!'; encoded.len() + extra];
++    assert_eq!(gp.encode_slice(&input, &mut large), Ok(encoded.len()));
++    assert_eq!(&large[..encoded.len()], encoded.as_bytes());
++    assert!(large[encoded.len()..].iter().all(|&b| b == b'!'), "encode_slice writes only the encoding");
++
++    // Display.
++    assert_eq!(base64::display::Base64Display::new(&input, &gp).to_string(), encoded, "Base64Display");
++
++    // Streaming writer, fed in arbitrary pieces.
++    let mut out = Vec::new();
++    {
++        let mut w = base64::write::EncoderWriter::new(&mut out, &gp);
++        let mut rest: &[u8] = &input;
++        while !rest.is_empty() {
++            let n = tc.draw(generators::integers::<usize>().min_value(1).max_value(rest.len().min(40)));
++            w.write_all(&rest[..n]).unwrap();
++            if tc.draw(generators::weighted_booleans(0.2)) {
++                w.flush().unwrap();
++            }
++            rest = &rest[n..];
++        }
++        w.finish().unwrap();
++    }
++    assert_eq!(String::from_utf8(out).unwrap(), encoded, "EncoderWriter");
++
++    let mut sw = base64::write::EncoderStringWriter::new(&gp);
++    sw.write_all(&input).unwrap();
++    assert_eq!(sw.into_inner(), encoded, "EncoderStringWriter");
++}
++
++// ---------------------------------------------------------------------------
++// Decoding canonical input
++// ---------------------------------------------------------------------------
++
++/// What decoding a canonical encoding (padded or not) must give under each padding mode: the
++/// modes are documented as "canonical padding is allowed, but any fewer padding bytes than that
++/// is also allowed" / "padding must be canonical" / "padding must be absent".
++fn expected_canonical(decoded: &[u8], padded: bool, mode: DecodePaddingMode) -> Result<Vec<u8>, DecodeError> {
++    let pad_needed = decoded.len() % 3 != 0;
++    let has_pad = padded && pad_needed;
++    match mode {
++        DecodePaddingMode::Indifferent => Ok(decoded.to_vec()),
++        DecodePaddingMode::RequireCanonical => {
++            if pad_needed && !has_pad { Err(DecodeError::InvalidPadding) } else { Ok(decoded.to_vec()) }
++        }
++        DecodePaddingMode::RequireNone => {
++            if has_pad { Err(DecodeError::InvalidPadding) } else { Ok(decoded.to_vec()) }
++        }
++    }
++}
++
++/// Decoding a canonical encoding round-trips (or is rejected exactly as the padding mode
++/// says), identically for every engine; `decode_vec`, `decode_slice` (with
++/// `OutputSliceTooSmall`) and `decode_slice_unchecked` agree with `decode`.
++#[hegel::test]
++fn canonical_decoding_round_trips(tc: hegel::TestCase) {
++    let cfg = tc.draw(arb_config());
++    let input = tc.draw(arb_bytes());
++    // The encoding may come from a padded or an unpadded encoder, independently of how we decode.
++    let encoder_padded = tc.draw(generators::booleans());
++    let encoded = (Config { encode_padding: encoder_padded, ..cfg }).general_purpose().encode(&input);
++
++    let want = expected_canonical(&input, encoder_padded, cfg.padding_mode);
++    let gp = cfg.general_purpose();
++    let got = gp.decode(&encoded);
++    assert_eq!(got, want, "GeneralPurpose::decode({encoded:?}) with {:?}", cfg.padding_mode);
++    if let Some(simd) = cfg.simd() {
++        assert_eq!(simd.decode(&encoded), want, "Simd::decode({encoded:?})");
++    }
++    if let Some(avx2) = cfg.avx2() {
++        assert_eq!(avx2.decode(&encoded), want, "Avx2::decode({encoded:?})");
++    }
++
++    let Ok(decoded) = got else { return };
++
++    let mut v = vec![0xAA, 0xBB];
++    gp.decode_vec(&encoded, &mut v).unwrap();
++    assert_eq!(v, [vec![0xAA, 0xBB], decoded.clone()].concat(), "decode_vec appends");
++
++    let estimate = base64::decoded_len_estimate(encoded.len());
++    assert!(estimate >= decoded.len(), "decoded_len_estimate({}) = {estimate} < {}", encoded.len(), decoded.len());
++
++    let mut exact = vec![0u8; decoded.len()];
++    assert_eq!(gp.decode_slice(&encoded, &mut exact), Ok(decoded.len()), "decode_slice exact buffer");
++    assert_eq!(exact, decoded);
++    if !decoded.is_empty() {
++        let mut short = vec![0u8; decoded.len() - 1];
++        assert_eq!(gp.decode_slice(&encoded, &mut short), Err(DecodeSliceError::OutputSliceTooSmall));
++    }
++    let mut large = vec![0x55u8; estimate + 3];
++    assert_eq!(gp.decode_slice(&encoded, &mut large), Ok(decoded.len()));
++    assert_eq!(&large[..decoded.len()], &decoded[..]);
++    assert!(large[decoded.len()..].iter().all(|&b| b == 0x55), "decode_slice writes only the decoded bytes");
++    let mut unchecked = vec![0u8; estimate];
++    assert_eq!(gp.decode_slice_unchecked(&encoded, &mut unchecked), Ok(decoded.len()), "decode_slice_unchecked");
++    assert_eq!(&unchecked[..decoded.len()], &decoded[..]);
++}
++
++// ---------------------------------------------------------------------------
++// Decoding arbitrary and corrupted input
++// ---------------------------------------------------------------------------
++
++/// Arbitrary input for the decoder: mostly bytes from the alphabet plus `=`, with occasional
++/// other bytes, at lengths that cover every residue mod 4 and the vector engines' bulk paths.
++#[hegel::composite]
++fn arb_encoded_like(tc: &hegel::TestCase, symbols: Vec<u8>) -> Vec<u8> {
++    let len = tc.draw(generators::integers::<usize>().max_value(120));
++    let mut out = Vec::with_capacity(len);
++    for _ in 0..len {
++        let b = match tc.draw(generators::integers::<u8>().max_value(31)) {
++            0 => b'=',
++            1 => tc.draw(generators::integers::<u8>()),
++            _ => symbols[tc.draw(generators::integers::<usize>().max_value(63))],
++        };
++        out.push(b);
++    }
++    out
++}
++
++/// Under the strict padding modes, `GeneralPurpose` accepts exactly the inputs `data-encoding`
++/// accepts and decodes them to the same bytes; the `Simd`/`Avx2` engines give exactly the same
++/// `Result` as `GeneralPurpose` — same bytes, or the same `DecodeError` with the same offsets —
++/// on any input, valid or not.
++#[hegel::test]
++fn arbitrary_input_decodes_alike(tc: hegel::TestCase) {
++    let cfg = tc.draw(arb_config());
++    let input = tc.draw(arb_encoded_like(alphabet_of(cfg.alphabet).as_str().as_bytes().to_vec()));
++    let gp = cfg.general_purpose();
++    let got = gp.decode(&input);
++
++    if let Some(reference) = cfg.decoder_reference() {
++        compare_with_reference(&got, reference.decode(&input), &input);
++    }
++    if let Some(simd) = cfg.simd() {
++        assert_eq!(simd.decode(&input), got, "Simd vs GeneralPurpose on {:?}", lossy(&input));
++    }
++    if let Some(avx2) = cfg.avx2() {
++        assert_eq!(avx2.decode(&input), got, "Avx2 vs GeneralPurpose on {:?}", lossy(&input));
++    }
++    // decode_slice with a generous buffer reports the same error, or the same bytes.
++    let mut buf = vec![0u8; base64::decoded_len_estimate(input.len()) + 4];
++    match (&got, gp.decode_slice(&input, &mut buf)) {
++        (Ok(bytes), Ok(n)) => assert_eq!(&buf[..n], &bytes[..], "decode_slice bytes"),
++        (Err(e), Err(DecodeSliceError::DecodeError(e2))) => assert_eq!(e2, *e, "decode_slice error"),
++        (w, s) => panic!("decode gave {w:?} but decode_slice gave {s:?}"),
++    }
++}
++
++/// A single corruption of a canonical encoding produces the documented error:
++/// - a byte outside the alphabet (and not `=`) replacing a symbol → `InvalidByte(offset, byte)`;
++/// - a symbol whose discarded low bits are nonzero as the last symbol → `InvalidLastSymbol`
++///   at its offset, or with `decode_allow_trailing_bits` the same bytes as the canonical
++///   encoding decodes to;
++/// - one symbol dropped so that a lone symbol ends the input → `InvalidLength`;
++/// - a `=` replacing a symbol before the end → `InvalidByte` at the `=`.
++#[hegel::test]
++fn single_corruption_gives_documented_error(tc: hegel::TestCase) {
++    let cfg = tc.draw(arb_config());
++    let input = tc.draw(generators::binary().min_size(1).max_size(96));
++    let padded = cfg.padding_mode != DecodePaddingMode::RequireNone;
++    let encoded = (Config { encode_padding: padded, ..cfg }).general_purpose().encode(&input).into_bytes();
++    let symbols = alphabet_of(cfg.alphabet).as_str().as_bytes();
++    let n_symbols = encoded.iter().take_while(|&&b| b != b'=').count();
++    // Decode under a padding mode that matches the encoding, so padding itself is fine.
++    let strict_mode = if padded { DecodePaddingMode::RequireCanonical } else { DecodePaddingMode::RequireNone };
++    let decoder = (Config { padding_mode: strict_mode, ..cfg }).general_purpose();
++    let indifferent = (Config { padding_mode: DecodePaddingMode::Indifferent, ..cfg }).general_purpose();
++
++    match tc.draw(generators::integers::<u8>().max_value(3)) {
++        0 => {
++            // Replace one symbol with a byte outside the alphabet.
++            let pos = tc.draw(generators::integers::<usize>().max_value(n_symbols - 1));
++            let bad = tc.draw(generators::integers::<u8>());
++            tc.assume(!symbols.contains(&bad) && bad != b'=');
++            let mut corrupted = encoded.clone();
++            corrupted[pos] = bad;
++            assert_eq!(decoder.decode(&corrupted), Err(DecodeError::InvalidByte(pos, bad)), "{:?}", lossy(&corrupted));
++            assert_eq!(indifferent.decode(&corrupted), Err(DecodeError::InvalidByte(pos, bad)), "{:?} (indifferent)", lossy(&corrupted));
++        }
++        1 => {
++            // Set discarded bits of the last symbol.
++            let rem = n_symbols % 4;
++            tc.assume(rem == 2 || rem == 3);
++            let last = n_symbols - 1;
++            let value = symbols.iter().position(|&s| s == encoded[last]).unwrap() as u8;
++            let mask: u8 = if rem == 2 { 0b1111 } else { 0b11 };
++            let extra = tc.draw(generators::integers::<u8>().min_value(1).max_value(mask));
++            let new_value = value | extra;
++            tc.assume(new_value != value);
++            let mut corrupted = encoded.clone();
++            corrupted[last] = symbols[new_value as usize];
++            let got = decoder.decode(&corrupted);
++            if cfg.allow_trailing_bits {
++                assert_eq!(got, Ok(input.clone()), "trailing bits allowed: {:?}", lossy(&corrupted));
++            } else {
++                assert_eq!(
++                    got,
++                    Err(DecodeError::InvalidLastSymbol { offset: last, symbol: symbols[new_value as usize], symbol_value: new_value }),
++                    "{:?}",
++                    lossy(&corrupted)
++                );
++            }
++        }
++        2 => {
++            // Drop the last symbol (and any padding) so that a lone symbol ends the input.
++            tc.assume(n_symbols % 4 == 2);
++            let corrupted = encoded[..n_symbols - 1].to_vec();
++            let got = indifferent.decode(&corrupted);
++            assert!(matches!(got, Err(DecodeError::InvalidLength(_))), "{:?} gave {got:?}", lossy(&corrupted));
++        }
++        _ => {
++            // A `=` replacing a symbol before the last one is an invalid byte there.
++            tc.assume(n_symbols >= 2);
++            let pos = tc.draw(generators::integers::<usize>().max_value(n_symbols - 2));
++            let mut corrupted = encoded.clone();
++            corrupted[pos] = b'=';
++            assert_eq!(indifferent.decode(&corrupted), Err(DecodeError::InvalidByte(pos, b'=')), "{:?}", lossy(&corrupted));
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Streaming decoder
++// ---------------------------------------------------------------------------
++
++/// `DecoderReader`, read in arbitrary chunk sizes from a reader that also returns arbitrary
++/// short reads, yields exactly `decode`'s bytes for valid input and an error for input
++/// `decode` rejects.
++#[hegel::test]
++fn streaming_decoder_matches_decode(tc: hegel::TestCase) {
++    let cfg = tc.draw(arb_config());
++    let valid = tc.draw(generators::weighted_booleans(0.7));
++    let input: Vec<u8> = if valid {
++        let bytes = tc.draw(arb_bytes());
++        let padded = tc.draw(generators::booleans());
++        (Config { encode_padding: padded, ..cfg }).general_purpose().encode(bytes).into_bytes()
++    } else {
++        tc.draw(arb_encoded_like(alphabet_of(cfg.alphabet).as_str().as_bytes().to_vec()))
++    };
++    let engine = cfg.general_purpose();
++    let want = engine.decode(&input);
++
++    // A reader that hands out at most a chosen number of bytes per call.
++    struct Choppy<'a> {
++        data: &'a [u8],
++        chunks: Vec<usize>,
++    }
++    impl Read for Choppy<'_> {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            let n = self.chunks.pop().unwrap_or(usize::MAX).min(buf.len()).min(self.data.len());
++            buf[..n].copy_from_slice(&self.data[..n]);
++            self.data = &self.data[n..];
++            Ok(n)
++        }
++    }
++    let chunks: Vec<usize> = tc.draw(generators::vecs(generators::integers::<usize>().min_value(1).max_value(13)).max_size(40));
++    let reader = Choppy { data: &input, chunks };
++    let mut decoder = base64::read::DecoderReader::new(reader, &engine);
++    let mut out = Vec::new();
++    let mut buf = vec![0u8; tc.draw(generators::integers::<usize>().min_value(1).max_value(17))];
++    let result = loop {
++        match decoder.read(&mut buf) {
++            Ok(0) => break Ok(()),
++            Ok(n) => out.extend_from_slice(&buf[..n]),
++            Err(e) => break Err(e),
++        }
++    };
++    match want {
++        Ok(bytes) => {
++            result.unwrap_or_else(|e| panic!("DecoderReader failed on valid {:?}: {e}", lossy(&input)));
++            assert_eq!(out, bytes, "DecoderReader bytes for {:?}", lossy(&input));
++        }
++        Err(e) => {
++            assert!(result.is_err(), "DecoderReader accepted {:?} which decode rejects with {e:?}", lossy(&input));
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Custom alphabets
++// ---------------------------------------------------------------------------
++
++/// `Alphabet::new` accepts exactly 64 unique printable ASCII bytes without `=` (and reports the
++/// documented error otherwise), and an engine built on any such alphabet encodes like
++/// `data-encoding` with the same symbols, round-trips, and — under the strict padding modes —
++/// accepts exactly what `data-encoding` accepts.
++#[hegel::test]
++fn custom_alphabets_round_trip(tc: hegel::TestCase) {
++    // A pool of printable ASCII without `=`; take 64 distinct symbols in random order.
++    let pool: Vec<u8> = (0x20u8..=0x7E).filter(|&b| b != b'=').collect();
++    let perm: Vec<u8> = tc.draw(generators::permutations(pool));
++    let symbols: Vec<u8> = perm[..64].to_vec();
++    let s = std::str::from_utf8(&symbols).unwrap();
++    let alphabet = Alphabet::new(s).unwrap_or_else(|e| panic!("Alphabet::new({s:?}): {e}"));
++
++    // The documented rejections.
++    assert_eq!(Alphabet::new(&s[..63]).err(), Some(ParseAlphabetError::InvalidLength));
++    let mut with_pad = symbols.clone();
++    with_pad[tc.draw(generators::integers::<usize>().max_value(63))] = b'=';
++    assert_eq!(
++        Alphabet::new(std::str::from_utf8(&with_pad).unwrap()).err(),
++        Some(ParseAlphabetError::ReservedByte(b'=')),
++        "alphabet containing `=`"
++    );
++    let mut dup = symbols.clone();
++    let (i, j) = (tc.draw(generators::integers::<usize>().max_value(63)), tc.draw(generators::integers::<usize>().max_value(63)));
++    tc.assume(i != j);
++    dup[i] = dup[j];
++    assert_eq!(
++        Alphabet::new(std::str::from_utf8(&dup).unwrap()).err(),
++        Some(ParseAlphabetError::DuplicatedByte(dup[j])),
++        "alphabet with a duplicate"
++    );
++
++    let padding = tc.draw(generators::booleans());
++    let allow_trailing_bits = tc.draw(generators::booleans());
++    let mode = tc.draw(
++        generators::sampled_from(vec![DecodePaddingMode::Indifferent, DecodePaddingMode::RequireCanonical, DecodePaddingMode::RequireNone])
++            .print_as_debug(),
++    );
++    let gp = GeneralPurpose::new(
++        &alphabet,
++        GeneralPurposeConfig::new()
++            .with_encode_padding(padding)
++            .with_decode_allow_trailing_bits(allow_trailing_bits)
++            .with_decode_padding_mode(mode),
++    );
++    let input = tc.draw(arb_bytes());
++    let encoded = gp.encode(&input);
++    assert_eq!(reference_codec(&alphabet, padding, true).encode(&input), encoded, "data-encoding encode with a custom alphabet");
++    assert_eq!(gp.decode(&encoded), expected_canonical(&input, padding, mode), "decode of the canonical encoding");
++
++    // Arbitrary input over this alphabet.
++    let junk = tc.draw(arb_encoded_like(symbols.clone()));
++    let got = gp.decode(&junk);
++    let reference_padding = match mode {
++        DecodePaddingMode::RequireCanonical => Some(true),
++        DecodePaddingMode::RequireNone => Some(false),
++        DecodePaddingMode::Indifferent => None,
++    };
++    if let Some(reference_padding) = reference_padding {
++        let reference = reference_codec(&alphabet, reference_padding, !allow_trailing_bits);
++        compare_with_reference(&got, reference.decode(&junk), &junk);
++    }
++}
