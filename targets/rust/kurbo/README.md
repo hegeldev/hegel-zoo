@@ -35,3 +35,8 @@
 - 2026-07-23: predecessor base commit `ca273499e3e4` (ci: Update to stable Rust 1.97.1, typos 1.48.0 (#596)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/kurbo.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: a 10× budget run (`--test-cases 1000`) failed `pathseg_arclen_between_chord_and_control_polygon`
+  with a *non-degenerate* quad: new bug **kurbo/5** — `QuadBez::arclen`'s analytical formula
+  computes `a + b + c` (mathematically `|p2 − p1|²`) from terms of ~1e18 when p0 is ~1e9 away
+  and p2 is within ~1 of p1, and the sum rounds negative → `sqrt` → NaN. Distinct from kurbo/4
+  (the fully degenerate quad). Pinned as an intermittent expected failure.
