@@ -45,3 +45,4 @@
 - 2026-06-08: predecessor base commit `287e4b26b5b5` (little cleanup).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/h3o.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 287e4b26b5b5 → fa1557fd1edd (2026-08-29, "release 0.11.0"; 0.11.0); 0 bug(s) still reproduce. 987 tests pass.

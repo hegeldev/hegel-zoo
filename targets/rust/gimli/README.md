@@ -29,3 +29,4 @@
 - 2026-07-06: predecessor base commit `843c38e886f5` (read/cfi: validate eh_frame_hdr fde_count against table length (#897)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/gimli.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1. Two upstream `assert_eq!(x, [])` on `&[u8]` in `#[cfg(test)]` code (`src/read/line.rs`, `src/write/str.rs`) rewritten as `assert!(x.is_empty())`: hegeltest 0.44 pulls in `serde_json`, whose `PartialEq` impls make the literal ambiguous (E0282/E0283). The `#[ignore]` on `known_bug_debug_line_address_size_zero_panics` (a panic, not an abort) was dropped and the test listed as an expected failure.
+- 2026-09-13: base bumped 843c38e886f5 → 8817b2af596f (2026-09-04, "read: fix doc for Operation::Wasm* (#900)"; 0.34.0); 1 bug(s) still reproduce. 596 tests pass.

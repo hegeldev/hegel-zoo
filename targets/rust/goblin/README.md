@@ -23,3 +23,4 @@
 - 2026-06-13: predecessor base commit `dca2e753b2ab` (Fix Actions badge (#540)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/goblin.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped dca2e753b2ab → 24a62600a4a7 (2026-08-30, "chore: remove redundant casts (#543)"; 0.10.6); 0 bug(s) still reproduce. 193 tests pass.
