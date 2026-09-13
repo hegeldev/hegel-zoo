@@ -1,0 +1,269 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 78ffd9a..c639c10 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,6 +22,7 @@ harness = false
+ core = { version = '1.0.0', optional = true, package = 'rustc-std-workspace-core' }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ ## Messes with minimum rust version and drags in deps just for running tests
+ ## so just comment out for now and enable manually when needed for enabling benches
+ ## criterion = "0.3.2"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..c09d71b
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,251 @@
++//! Hegel property tests for `adler2`: the checksum is RFC 1950's Adler-32 (the byte-at-a-time
++//! definition), however the input is split, resumed or fed through `Hasher`/`BufRead`.
++//!
++//! Oracle: a byte-at-a-time model of the definition (`a = (a + byte) mod 65521`,
++//! `b = (b + a) mod 65521`, `b << 16 | a`), which the crate's unrolled, deferred-modulo,
++//! four-lane implementation must equal on every split of every input.
++
++use hegel::generators;
++use std::hash::{Hash, Hasher};
++use std::io::{BufRead, BufReader, Read};
++
++const MOD: u32 = 65521;
++/// The crate's inner chunk: 5552 bytes × 4 lanes between deferred `% MOD` reductions.
++const CHUNK: usize = 5552 * 4;
++
++/// The definition, one byte at a time, from an initial `(a, b)`.
++fn model(mut a: u32, mut b: u32, data: &[u8]) -> u32 {
++    for &byte in data {
++        a = (a + u32::from(byte)) % MOD;
++        b = (b + a) % MOD;
++    }
++    (b << 16) | a
++}
++
++fn model_slice(data: &[u8]) -> u32 {
++    model(1, 0, data)
++}
++
++/// Input bytes with a summary `Debug` (the vectors run to tens of kilobytes).
++#[derive(Clone, PartialEq)]
++struct Data(Vec<u8>);
++
++impl std::fmt::Debug for Data {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let n = self.0.len();
++        if n <= 32 {
++            write!(f, "Data({:?})", self.0)
++        } else {
++            write!(f, "Data(len {n}, {:?}…, sum {})", &self.0[..16], self.0.iter().map(|&b| u64::from(b)).sum::<u64>())
++        }
++    }
++}
++
++impl hegel::PrettyPrintable for Data {
++    fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++    }
++}
++
++/// A length biased to the implementation's boundaries: 0, 1–3 (the serial tail), multiples of 4
++/// ± 1, around 5552 and the 22208-byte chunk (× 1, 2, 3) and anywhere up to 3 chunks.
++#[hegel::composite]
++fn arb_data(tc: &hegel::TestCase) -> Data {
++    let len = match tc.draw(generators::integers::<u8>().min_value(0).max_value(3)) {
++        0 => tc.draw(generators::integers::<usize>().min_value(0).max_value(64)),
++        1 => {
++            let base = tc.draw(generators::sampled_from(vec![4usize, 5552, CHUNK, 2 * CHUNK, 3 * CHUNK]));
++            let delta = tc.draw(generators::integers::<i8>().min_value(-5).max_value(5));
++            base.saturating_add_signed(delta as isize)
++        }
++        2 => tc.draw(generators::integers::<usize>().min_value(0).max_value(3 * CHUNK + 7)),
++        _ => tc.draw(generators::integers::<usize>().min_value(0).max_value(1024)),
++    };
++    let fill = tc.draw(generators::integers::<u8>().min_value(0).max_value(4));
++    let bytes = match fill {
++        // the deferred-modulo worst case: every byte 255
++        0 => vec![0xff; len],
++        1 => {
++            let b = tc.draw(generators::integers::<u8>());
++            vec![b; len]
++        }
++        2 => {
++            // a short drawn pattern, repeated
++            let pat: Vec<u8> = tc.draw(generators::vecs(generators::integers::<u8>()).min_size(1).max_size(9));
++            pat.iter().copied().cycle().take(len).collect()
++        }
++        3 => {
++            // pseudo-random bytes from a drawn seed (xorshift64*), so long inputs stay cheap to draw
++            let mut s = tc.draw(generators::integers::<u64>()) | 1;
++            (0..len)
++                .map(|_| {
++                    s ^= s >> 12;
++                    s ^= s << 25;
++                    s ^= s >> 27;
++                    (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
++                })
++                .collect()
++        }
++        _ => {
++            // fully drawn bytes, short
++            let len = len.min(300);
++            tc.draw(generators::vecs(generators::integers::<u8>()).min_size(len).max_size(len))
++        }
++    };
++    Data(bytes)
++}
++
++/// Cut points for feeding `data` piecewise: sorted offsets within `0..=len`.
++#[hegel::composite]
++fn arb_cuts(tc: &hegel::TestCase, len: usize) -> Vec<usize> {
++    let n = tc.draw(generators::integers::<u8>().min_value(0).max_value(6));
++    let mut cuts: Vec<usize> = (0..n).map(|_| tc.draw(generators::integers::<usize>().min_value(0).max_value(len))).collect();
++    cuts.sort_unstable();
++    cuts
++}
++
++/// Whole-slice checksum against the definition, and against the RFC's initial values.
++#[hegel::test]
++fn adler32_slice_matches_the_definition(tc: hegel::TestCase) {
++    let data = tc.draw(arb_data());
++    let expected = model_slice(&data.0);
++    assert_eq!(adler2::adler32_slice(&data.0), expected, "{data:?}");
++    let mut h = adler2::Adler32::new();
++    assert_eq!(h.checksum(), 1, "the empty checksum is 1");
++    h.write_slice(&data.0);
++    assert_eq!(h.checksum(), expected, "{data:?}");
++    // both halves are reduced: a and b below MOD
++    let sum = h.checksum();
++    assert!(sum & 0xffff < MOD && sum >> 16 < MOD, "{sum:#x}");
++    assert_eq!(adler2::Adler32::default().checksum(), adler2::Adler32::new().checksum());
++    // the low half depends only on the byte sum
++    let byte_sum: u64 = data.0.iter().map(|&b| u64::from(b)).sum();
++    assert_eq!(u64::from(sum & 0xffff), (1 + byte_sum) % u64::from(MOD));
++}
++
++/// Splitting the input across `write_slice` calls, `Hasher::write`, and stopping to resume from
++/// the checksum with `from_checksum`, never changes the result.
++#[hegel::test]
++fn piecewise_and_resumed_checksums_match_the_whole(tc: hegel::TestCase) {
++    let data = tc.draw(arb_data());
++    let cuts = tc.draw(arb_cuts(data.0.len()));
++    let expected = model_slice(&data.0);
++
++    let mut pieces = Vec::new();
++    let mut start = 0;
++    for &cut in &cuts {
++        pieces.push(&data.0[start..cut]);
++        start = cut;
++    }
++    pieces.push(&data.0[start..]);
++
++    let mut piecewise = adler2::Adler32::new();
++    let mut hasher = adler2::Adler32::new();
++    let mut resumed = adler2::Adler32::new().checksum();
++    let mut prefix = 0;
++    for piece in &pieces {
++        piecewise.write_slice(piece);
++        hasher.write(piece);
++        let mut r = adler2::Adler32::from_checksum(resumed);
++        r.write_slice(piece);
++        resumed = r.checksum();
++        prefix += piece.len();
++        // every intermediate state is the checksum of the prefix
++        let expected_prefix = model_slice(&data.0[..prefix]);
++        assert_eq!(piecewise.checksum(), expected_prefix, "{data:?} after {prefix} bytes");
++        assert_eq!(hasher.finish(), u64::from(expected_prefix), "{data:?} after {prefix} bytes");
++        assert_eq!(resumed, expected_prefix, "{data:?} after {prefix} bytes");
++    }
++    assert_eq!(piecewise.checksum(), expected, "{data:?} cuts {cuts:?}");
++    // `Copy`/`Clone` of the state carry the checksum; `Debug` exists
++    let copy = piecewise;
++    assert_eq!(copy.checksum(), piecewise.clone().checksum());
++    let _ = format!("{piecewise:?}");
++    // `from_checksum(checksum())` is the identity on states
++    assert_eq!(adler2::Adler32::from_checksum(piecewise.checksum()).checksum(), expected);
++    // continuing from a resumed state equals continuing from the live one
++    let tail = &data.0[..data.0.len() / 2];
++    let mut a = adler2::Adler32::from_checksum(expected);
++    let mut b = piecewise;
++    a.write_slice(tail);
++    b.write_slice(tail);
++    assert_eq!(a.checksum(), b.checksum());
++    assert_eq!(a.checksum(), model(expected & 0xffff, expected >> 16, tail));
++}
++
++/// `Hash` values go through `Hasher::write`: hashing a `[u8]` writes its length (as `usize`
++/// bytes) then the bytes, so the checksum is the checksum of that byte stream.
++#[hegel::test]
++fn hashing_is_the_checksum_of_the_written_bytes(tc: hegel::TestCase) {
++    let data = tc.draw(arb_data());
++    let word = tc.draw(generators::integers::<u64>());
++    let mut h = adler2::Adler32::new();
++    data.0.as_slice().hash(&mut h);
++    let mut stream = data.0.len().to_ne_bytes().to_vec();
++    stream.extend_from_slice(&data.0);
++    assert_eq!(h.finish(), u64::from(model_slice(&stream)), "{data:?}");
++    let mut h = adler2::Adler32::new();
++    word.hash(&mut h);
++    assert_eq!(h.finish(), u64::from(model_slice(&word.to_ne_bytes())));
++    // `finish` does not consume: writing more continues
++    h.write_u8(7);
++    let mut stream = word.to_ne_bytes().to_vec();
++    stream.push(7);
++    assert_eq!(h.finish(), u64::from(model_slice(&stream)));
++}
++
++/// A `BufRead` of any buffer size shows the same checksum as the slice, and the reader's error
++/// is returned as is.
++#[hegel::test]
++fn buf_read_matches_the_slice_and_propagates_errors(tc: hegel::TestCase) {
++    let data = tc.draw(arb_data());
++    let capacity = tc.draw(generators::integers::<usize>().min_value(1).max_value(9000));
++    let expected = model_slice(&data.0);
++    let reader = BufReader::with_capacity(capacity, data.0.as_slice());
++    assert_eq!(adler2::adler32(reader).unwrap(), expected, "{data:?} capacity {capacity}");
++    assert_eq!(adler2::adler32(data.0.as_slice()).unwrap(), expected);
++    // a chain of two readers is the concatenation
++    let cut = tc.draw(generators::integers::<usize>().min_value(0).max_value(data.0.len()));
++    let chained = BufReader::with_capacity(capacity, data.0[..cut].chain(&data.0[cut..]));
++    assert_eq!(adler2::adler32(chained).unwrap(), expected);
++    // an error after `cut` bytes comes back
++    struct Failing<'a> {
++        data: &'a [u8],
++        error: bool,
++    }
++    impl Read for Failing<'_> {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            if self.data.is_empty() {
++                if self.error {
++                    self.error = false;
++                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
++                }
++                return Ok(0);
++            }
++            let n = self.data.len().min(buf.len());
++            buf[..n].copy_from_slice(&self.data[..n]);
++            self.data = &self.data[n..];
++            Ok(n)
++        }
++    }
++    let failing = BufReader::with_capacity(capacity, Failing { data: &data.0[..cut], error: true });
++    let err = adler2::adler32(failing).unwrap_err();
++    assert_eq!(err.kind(), std::io::ErrorKind::Other);
++    assert_eq!(err.to_string(), "boom");
++    let mut failing = BufReader::with_capacity(capacity, Failing { data: &data.0[..cut], error: true });
++    assert!(adler2::adler32(&mut failing).is_err());
++    // after the error the rest reads normally: the reader was consumed up to the error
++    assert_eq!(failing.fill_buf().unwrap().len(), 0);
++}
++
++/// Known values: RFC 1950's example, zlib's, and the byte-sum identity for a single byte.
++#[hegel::test]
++fn known_vectors(tc: hegel::TestCase) {
++    let byte = tc.draw(generators::integers::<u8>());
++    let b = u32::from(byte);
++    assert_eq!(adler2::adler32_slice(&[byte]), ((b + 1) << 16) | (b + 1));
++    assert_eq!(adler2::adler32_slice(b"Wikipedia"), 0x11E6_0398);
++    assert_eq!(adler2::adler32_slice(b""), 1);
++    assert_eq!(adler2::adler32_slice(&[0; 1024]), 0x0400_0001);
++    assert_eq!(adler2::adler32_slice(b"abc"), 0x024d_0127);
++}
