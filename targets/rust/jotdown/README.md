@@ -28,3 +28,4 @@
 - 2026-07-06: predecessor base commit `56d6d1b3d707` (.gitignore: add afl output dir).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/jotdown.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 56d6d1b3d707 → cf898a37746d (2026-08-13, "tests/parse_events: rm redundant .into()"; 0.10.0); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 346 tests pass.
