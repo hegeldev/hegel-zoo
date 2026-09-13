@@ -33,3 +33,4 @@
 - 2026-07-07: predecessor base commit `20d89e23b873` (0.33.0).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/jsonc-parser.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 20d89e23b873 → e6e383704fd9 (2026-09-12, "0.33.2"; 0.33.2); 0 bug(s) still reproduce; fixed upstream: jsonc-parser/1. 194 tests pass. jsonc-parser/1 (strict mode accepted missing array commas) is fixed upstream in 0.33.2.
