@@ -43,3 +43,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/textwrap.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-12: base bumped e29daecac529 → 7d1435f71454 (2026-09-12, "Merge pull request #628 from xtqqczze/msrv-reduce"; 0.16.3); 1 bug(s) still reproduce. 234 tests pass.
+- 2026-09-13: base bumped 7d1435f71454 → 7debe996ca88 (2026-09-13, "Merge pull request #629 from xtqqczze/authors"; 0.16.3); 1 bug(s) still reproduce. 234 tests pass.
