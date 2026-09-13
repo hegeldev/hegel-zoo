@@ -1,0 +1,1143 @@
+diff --git a/compact_str/Cargo.toml b/compact_str/Cargo.toml
+index 16a8f39..ff26eb1 100644
+--- a/compact_str/Cargo.toml
++++ b/compact_str/Cargo.toml
+@@ -75,6 +75,7 @@ static_assertions = "1"
+ defmt = { version = "1", optional = true }
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
+ cfg-if = "1"
+ proptest = { version = "1", default-features = false, features = ["std"] }
+ quickcheck = { version = "1", default-features = false }
+diff --git a/compact_str/tests/hegel.rs b/compact_str/tests/hegel.rs
+new file mode 100644
+index 0000000..08b536b
+--- /dev/null
++++ b/compact_str/tests/hegel.rs
+@@ -0,0 +1,1125 @@
++//! Hegel property tests for `compact_str`: a `CompactString` behaves like a `String` holding the
++//! same text, and its documented storage contract holds — inline up to `size_of::<String>()`
++//! bytes (the minimum capacity), heap above with a minimum heap capacity of 4 words, a
++//! `&'static str` variant from `const_new` whose capacity is its length, eager inlining when a
++//! string is created, cloned or shrunk, and buffer re-use with `String`.
++//!
++//! The oracle is `std`: a `String` mirror of every edit, `str`'s own case conversions, decoders
++//! and formatting.
++
++use std::borrow::Cow;
++use std::collections::{BTreeSet, HashMap};
++use std::fmt::{self, Display, Write as _};
++use std::hash::{Hash, Hasher};
++use std::panic::{catch_unwind, AssertUnwindSafe};
++use std::sync::Once;
++
++use compact_str::{CompactString, CompactStringExt, ToCompactString, ToCompactStringError};
++use hegel::generators;
++use hegel::Generator as _;
++
++/// Longest string kept inline; also the minimum capacity of every non-static `CompactString`.
++const MAX_INLINE: usize = std::mem::size_of::<String>();
++/// Smallest heap allocation the crate makes.
++const MIN_HEAP: usize = MAX_INLINE + std::mem::size_of::<usize>();
++
++fn quiet_panics() {
++    static ONCE: Once = Once::new();
++    ONCE.call_once(|| std::panic::set_hook(Box::new(|_| {})));
++}
++
++fn panics<R>(f: impl FnOnce() -> R) -> bool {
++    quiet_panics();
++    catch_unwind(AssertUnwindSafe(f)).is_err()
++}
++
++// ---------------------------------------------------------------------------------------------
++// Generators
++
++/// Text over an alphabet of ASCII (both cases), the case-interesting letters (ß, İ, ﬁ, the
++/// sigmas), 2-, 3- and 4-byte chars and NUL, up to 40 chars (160 bytes) so the inline/heap
++/// boundary at 24 bytes and the minimum heap capacity at 32 are crossed constantly.
++fn arb_text() -> impl hegel::PrintableGenerator<String> {
++    generators::text()
++        .alphabet("abcxyzAZ ,.Σσς ßİﬁé€😀\u{0}\n")
++        .max_size(40)
++}
++
++fn arb_text_max(max: usize) -> impl hegel::PrintableGenerator<String> {
++    generators::text()
++        .alphabet("abcxyzAZ ,.Σσς ßİﬁé€😀\u{0}\n")
++        .max_size(max)
++}
++
++fn arb_char() -> impl hegel::PrintableGenerator<char> {
++    generators::sampled_from("abZ Σσß€😀\u{0}".chars().collect::<Vec<_>>())
++}
++
++/// A byte offset on a char boundary of `s`, `permille` thousandths of the way in.
++fn pos(s: &str, permille: u32) -> usize {
++    let mut b = s.len() * permille as usize / 1000;
++    while !s.is_char_boundary(b) {
++        b -= 1;
++    }
++    b
++}
++
++/// `&'static str`s for `const_new`: below, at and above the inline limit.
++const STATICS: &[&str] = &[
++    "",
++    "short",
++    "exactly twenty-four byt.",
++    "twenty-five bytes long!!!",
++    "a static string well beyond the inline capacity of twenty-four bytes",
++    "ὈΔΥΣΣΕΎΣ ὁ Λαερτιάδης καὶ Σίσυφος",
++    "😀😀😀😀😀😀😀😀😀😀",
++];
++
++/// How the string under test is created.
++#[derive(Debug, Clone)]
++enum Start {
++    New,
++    TryNew,
++    FromString { extra: usize },
++    FromStringBuffer { extra: usize },
++    ConstNew(usize),
++    WithCapacity(usize),
++    Default,
++    CollectChars,
++    FromUtf8,
++    Parse,
++    FromBoxStr,
++    FromCowOwned,
++    FromCowBorrowed,
++    FromStringRef,
++}
++
++impl hegel::PrettyPrintable for Start {
++    fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++    }
++}
++
++#[hegel::composite]
++fn arb_start(tc: &hegel::TestCase) -> Start {
++    let kind = tc.draw(generators::integers::<u8>().max_value(13));
++    let extra = tc.draw(generators::integers::<usize>().max_value(40));
++    match kind {
++        0 => Start::New,
++        1 => Start::TryNew,
++        2 => Start::FromString { extra },
++        3 => Start::FromStringBuffer { extra },
++        4 => Start::ConstNew(tc.draw(generators::integers::<usize>().max_value(STATICS.len() - 1))),
++        5 => Start::WithCapacity(tc.draw(generators::integers::<usize>().max_value(80))),
++        6 => Start::Default,
++        7 => Start::CollectChars,
++        8 => Start::FromUtf8,
++        9 => Start::Parse,
++        10 => Start::FromBoxStr,
++        11 => Start::FromCowOwned,
++        12 => Start::FromCowBorrowed,
++        _ => Start::FromStringRef,
++    }
++}
++
++/// One edit, mirrored on the `String` model. Positions are thousandths of the current length.
++#[derive(Debug, Clone)]
++enum Op {
++    Push(char),
++    PushStr(String),
++    Pop,
++    Remove(u32),
++    Insert(u32, char),
++    InsertStr(u32, String),
++    Truncate(u32),
++    Clear,
++    SplitOff(u32),
++    /// range, how much of the iterator is consumed and how, range form
++    Drain(u32, u32, u8, u8),
++    /// range, replacement, range form
++    ReplaceRange(u32, u32, String, u8),
++    Retain(u8, u8),
++    Reserve(usize),
++    ShrinkTo(usize),
++    ShrinkToFit,
++    Clone,
++    CloneFrom(String),
++    Repeat(usize),
++    IntoStringAndBack,
++    FromStringBuffer(usize),
++    MakeAsciiUppercase,
++    WriteFmt(String, char),
++    Add(String),
++    Extend(u8, Vec<String>),
++}
++
++impl hegel::PrettyPrintable for Op {
++    fn pretty_print(&self, printer: &mut hegel::pretty::PrettyPrinter) {
++        hegel::pretty::print_debug_repr(&format!("{self:?}"), printer);
++    }
++}
++
++#[hegel::composite]
++fn arb_op(tc: &hegel::TestCase) -> Op {
++    let kind = tc.draw(generators::integers::<u8>().max_value(23));
++    let p = tc.draw(generators::integers::<u32>().max_value(1000));
++    let q = tc.draw(generators::integers::<u32>().max_value(1000));
++    match kind {
++        0 => Op::Push(tc.draw(arb_char())),
++        1 => Op::PushStr(tc.draw(arb_text_max(30))),
++        2 => Op::Pop,
++        3 => Op::Remove(p),
++        4 => Op::Insert(p, tc.draw(arb_char())),
++        5 => Op::InsertStr(p, tc.draw(arb_text_max(30))),
++        6 => Op::Truncate(p),
++        7 => Op::Clear,
++        8 => Op::SplitOff(p),
++        9 => Op::Drain(
++            p.min(q),
++            p.max(q),
++            tc.draw(generators::integers::<u8>().max_value(6)),
++            tc.draw(generators::integers::<u8>().max_value(4)),
++        ),
++        10 => Op::ReplaceRange(
++            p.min(q),
++            p.max(q),
++            tc.draw(arb_text_max(30)),
++            tc.draw(generators::integers::<u8>().max_value(4)),
++        ),
++        11 => Op::Retain(
++            tc.draw(generators::integers::<u8>().max_value(4)),
++            tc.draw(generators::integers::<u8>()),
++        ),
++        12 => Op::Reserve(tc.draw(generators::integers::<usize>().max_value(100))),
++        13 => Op::ShrinkTo(tc.draw(generators::integers::<usize>().max_value(150))),
++        14 => Op::ShrinkToFit,
++        15 => Op::Clone,
++        16 => Op::CloneFrom(tc.draw(arb_text_max(40))),
++        17 => Op::Repeat(tc.draw(generators::integers::<usize>().max_value(3))),
++        18 => Op::IntoStringAndBack,
++        19 => Op::FromStringBuffer(tc.draw(generators::integers::<usize>().max_value(40))),
++        20 => Op::MakeAsciiUppercase,
++        21 => Op::WriteFmt(tc.draw(arb_text_max(10)), tc.draw(arb_char())),
++        22 => Op::Add(tc.draw(arb_text_max(30))),
++        _ => Op::Extend(
++            tc.draw(generators::integers::<u8>().max_value(6)),
++            tc.draw(generators::vecs(arb_text_max(10)).max_size(4)),
++        ),
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// The model and the storage contract
++
++/// Everything a `CompactString` must agree with `str` on, plus the storage invariants.
++fn check(c: &CompactString, m: &str) {
++    assert_eq!(c.as_str(), m);
++    assert_eq!(c.len(), m.len());
++    assert_eq!(c.is_empty(), m.is_empty());
++    assert_eq!(c.as_bytes(), m.as_bytes());
++    assert!(c == m, "PartialEq<str>");
++    assert_eq!(&**c, m, "Deref");
++    assert_eq!(c.chars().rev().collect::<String>(), m.chars().rev().collect::<String>());
++    assert_eq!(format!("{c}"), m);
++    assert_eq!(format!("{c:?}"), format!("{m:?}"));
++    assert!(c.capacity() >= c.len(), "capacity {} < len {}", c.capacity(), c.len());
++    if let Some(s) = c.as_static_str() {
++        assert_eq!(s, m, "as_static_str is the text");
++        assert!(!c.is_heap_allocated(), "a static string is not heap allocated");
++        assert_eq!(c.capacity(), c.len(), "a static string's capacity is its length");
++    } else if !c.is_heap_allocated() {
++        assert_eq!(c.capacity(), MAX_INLINE, "an inline string's capacity is the inline size");
++        assert!(c.len() <= MAX_INLINE);
++    }
++}
++
++/// The eager-inlining contract at creation, clone and shrink: short strings are never on the heap.
++fn inlined_if_short(c: &CompactString, what: &str) {
++    if c.len() <= MAX_INLINE {
++        assert!(!c.is_heap_allocated(), "{what}: {} bytes should be inline", c.len());
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++struct Shape {
++    heap: bool,
++    is_static: bool,
++    cap: usize,
++}
++
++fn shape(c: &CompactString) -> Shape {
++    Shape { heap: c.is_heap_allocated(), is_static: c.as_static_str().is_some(), cap: c.capacity() }
++}
++
++/// After an operation that needed `needed` bytes of capacity (`reserve`'s rule): no change if
++/// it already fitted (a static string never "fits", it has to be converted), inline if the
++/// need fits inline, heap otherwise.
++fn check_growth(before: Shape, needed: usize, c: &CompactString) {
++    if !before.is_static && needed <= before.cap {
++        assert_eq!(c.capacity(), before.cap, "growth within capacity keeps it ({before:?})");
++        assert_eq!(c.is_heap_allocated(), before.heap, "growth within capacity keeps the storage");
++    } else if needed <= MAX_INLINE {
++        assert!(!c.is_heap_allocated(), "{needed} bytes fit inline ({before:?})");
++        assert_eq!(c.capacity(), MAX_INLINE);
++    } else {
++        assert!(c.is_heap_allocated(), "{needed} bytes need the heap ({before:?})");
++        assert!(c.capacity() >= needed);
++    }
++}
++
++/// After an operation that only shortens the string: capacity and storage are untouched
++/// (a static string is left alone here since some of these convert it).
++fn check_unchanged(before: Shape, c: &CompactString) {
++    if !before.is_static {
++        assert_eq!(c.capacity(), before.cap, "shortening keeps the capacity ({before:?})");
++        assert_eq!(c.is_heap_allocated(), before.heap, "shortening keeps the storage ({before:?})");
++    }
++}
++
++fn build(start: &Start, text: &str) -> CompactString {
++    match *start {
++        Start::New => {
++            let c = CompactString::new(text);
++            inlined_if_short(&c, "new");
++            if c.is_heap_allocated() {
++                assert_eq!(c.capacity(), text.len().max(MIN_HEAP), "new: exact heap capacity");
++            }
++            c
++        }
++        Start::TryNew => {
++            let c = CompactString::try_new(text).expect("try_new");
++            inlined_if_short(&c, "try_new");
++            c
++        }
++        Start::FromString { extra } => {
++            let mut s = String::with_capacity(text.len() + extra);
++            s.push_str(text);
++            let (ptr, cap) = (s.as_ptr(), s.capacity());
++            let c = CompactString::from(s);
++            inlined_if_short(&c, "From<String>");
++            if text.len() > MAX_INLINE {
++                assert!(c.is_heap_allocated());
++                assert_eq!(c.as_ptr(), ptr, "From<String> re-uses the buffer");
++                assert_eq!(c.capacity(), cap, "From<String> keeps the String's capacity");
++            }
++            c
++        }
++        Start::FromStringBuffer { extra } => {
++            let mut s = String::with_capacity(text.len() + extra);
++            s.push_str(text);
++            let (ptr, cap) = (s.as_ptr(), s.capacity());
++            let c = CompactString::from_string_buffer(s);
++            if cap == 0 {
++                assert!(!c.is_heap_allocated());
++            } else {
++                assert!(c.is_heap_allocated(), "from_string_buffer never inlines");
++                assert_eq!(c.as_ptr(), ptr, "from_string_buffer re-uses the buffer");
++                assert_eq!(c.capacity(), cap);
++            }
++            c
++        }
++        Start::ConstNew(i) => {
++            let s = STATICS[i];
++            let c = CompactString::const_new(s);
++            assert!(!c.is_heap_allocated());
++            if s.len() <= MAX_INLINE {
++                assert_eq!(c.as_static_str(), None, "short const_new is inlined");
++            } else {
++                assert_eq!(c.as_static_str(), Some(s));
++            }
++            c
++        }
++        Start::WithCapacity(n) => {
++            let mut c = CompactString::with_capacity(n);
++            assert!(c.is_empty());
++            if n <= MAX_INLINE {
++                assert!(!c.is_heap_allocated());
++                assert_eq!(c.capacity(), MAX_INLINE);
++            } else {
++                assert!(c.is_heap_allocated());
++                assert_eq!(c.capacity(), n.max(MIN_HEAP), "with_capacity is exact above the minimum");
++            }
++            assert_eq!(CompactString::try_with_capacity(n).unwrap().capacity(), c.capacity());
++            let before = shape(&c);
++            c.push_str(text);
++            if !text.is_empty() {
++                check_growth(before, text.len(), &c);
++            }
++            c
++        }
++        Start::Default => {
++            let mut c = CompactString::default();
++            assert_eq!(c, "");
++            assert_eq!(c.capacity(), MAX_INLINE);
++            c.push_str(text);
++            c
++        }
++        Start::CollectChars => {
++            let c: CompactString = text.chars().collect();
++            inlined_if_short(&c, "FromIterator<char>");
++            c
++        }
++        Start::FromUtf8 => {
++            let c = CompactString::from_utf8(text.as_bytes()).expect("valid utf-8");
++            inlined_if_short(&c, "from_utf8");
++            c
++        }
++        Start::Parse => {
++            let c: CompactString = text.parse().expect("FromStr is infallible");
++            inlined_if_short(&c, "FromStr");
++            c
++        }
++        Start::FromBoxStr => {
++            let b: Box<str> = text.into();
++            let ptr = b.as_ptr();
++            let c = CompactString::from(b);
++            inlined_if_short(&c, "From<Box<str>>");
++            if text.len() > MAX_INLINE {
++                assert!(c.is_heap_allocated());
++                assert_eq!(c.as_ptr(), ptr, "From<Box<str>> re-uses the buffer");
++                assert_eq!(c.capacity(), text.len());
++            }
++            c
++        }
++        Start::FromCowOwned => {
++            let c = CompactString::from(Cow::<str>::Owned(text.to_owned()));
++            inlined_if_short(&c, "From<Cow::Owned>");
++            c
++        }
++        Start::FromCowBorrowed => {
++            let c = CompactString::from(Cow::Borrowed(text));
++            inlined_if_short(&c, "From<Cow::Borrowed>");
++            c
++        }
++        Start::FromStringRef => {
++            let s = text.to_owned();
++            let c = CompactString::from(&s);
++            inlined_if_short(&c, "From<&String>");
++            c
++        }
++    }
++}
++
++/// Which byte range an (a, b) pair means in each `RangeBounds` form; the model gets the same.
++fn apply_replace(c: &mut CompactString, m: &mut String, a: usize, b: usize, s: &str, form: u8) {
++    match form {
++        0 => {
++            c.replace_range(a..b, s);
++            m.replace_range(a..b, s);
++        }
++        1 if b > a => {
++            c.replace_range(a..=b - 1, s);
++            m.replace_range(a..=b - 1, s);
++        }
++        2 => {
++            c.replace_range(..b, s);
++            m.replace_range(..b, s);
++        }
++        3 => {
++            c.replace_range(a.., s);
++            m.replace_range(a.., s);
++        }
++        _ => {
++            c.replace_range(.., s);
++            m.replace_range(.., s);
++        }
++    }
++}
++
++fn apply(op: &Op, c: &mut CompactString, m: &mut String) {
++    let before = shape(c);
++    match op {
++        Op::Push(ch) => {
++            c.push(*ch);
++            m.push(*ch);
++            check_growth(before, m.len(), c);
++        }
++        Op::PushStr(s) => {
++            c.push_str(s);
++            m.push_str(s);
++            if s.is_empty() {
++                assert_eq!(shape(c).cap, before.cap, "pushing nothing changes nothing");
++            } else {
++                check_growth(before, m.len(), c);
++            }
++        }
++        Op::Pop => {
++            assert_eq!(c.pop(), m.pop());
++            check_unchanged(before, c);
++        }
++        Op::Remove(p) => {
++            if m.is_empty() {
++                assert!(panics(|| c.remove(0)), "remove on an empty string panics");
++            } else {
++                let idx = pos(m, *p);
++                let idx = if idx == m.len() { 0 } else { idx };
++                assert_eq!(c.remove(idx), m.remove(idx));
++                check_unchanged(before, c);
++            }
++        }
++        Op::Insert(p, ch) => {
++            let idx = pos(m, *p);
++            c.insert(idx, *ch);
++            m.insert(idx, *ch);
++            check_growth(before, m.len(), c);
++        }
++        Op::InsertStr(p, s) => {
++            let idx = pos(m, *p);
++            c.insert_str(idx, s);
++            m.insert_str(idx, s);
++            check_growth(before, m.len(), c);
++        }
++        Op::Truncate(p) => {
++            let idx = pos(m, *p);
++            c.truncate(idx);
++            m.truncate(idx);
++            check_unchanged(before, c);
++            c.truncate(idx + 100);
++            check_unchanged(before, c);
++        }
++        Op::Clear => {
++            c.clear();
++            m.clear();
++            check_unchanged(before, c);
++        }
++        Op::SplitOff(p) => {
++            let at = pos(m, *p);
++            let tail = c.split_off(at);
++            let mtail = m.split_off(at);
++            check(&tail, &mtail);
++            if before.is_static {
++                assert_eq!(c.capacity(), at, "split_off of a static string: capacity is the cut");
++            } else {
++                check_unchanged(before, c);
++            }
++        }
++        Op::Drain(p, q, how, form) => {
++            let (a, b) = (pos(m, *p), pos(m, *q));
++            let (a, b) = (a.min(b), a.max(b));
++            let range = match form {
++                0 => a..b,
++                1 if b > a => a..b,
++                2 => 0..b,
++                3 => a..m.len(),
++                _ => 0..m.len(),
++            };
++            let expected = m[range.clone()].to_owned();
++            {
++                let mut d = match form {
++                    0 => c.drain(a..b),
++                    1 if b > a => c.drain(a..=b - 1),
++                    2 => c.drain(..b),
++                    3 => c.drain(a..),
++                    _ => c.drain(..),
++                };
++                let mut md = m.drain(range);
++                assert_eq!(d.as_str(), md.as_str(), "drain holds the removed text");
++                assert_eq!(&*d, md.as_str(), "Deref");
++                assert_eq!(format!("{d}"), md.as_str());
++                assert_eq!(format!("{d:?}"), format!("Drain({:?})", md.as_str()));
++                assert_eq!(d.size_hint(), md.size_hint());
++                match how {
++                    0 => {}
++                    1 => {
++                        for _ in 0..3 {
++                            assert_eq!(d.next(), md.next());
++                            assert_eq!(d.as_str(), md.as_str());
++                        }
++                    }
++                    2 => {
++                        for _ in 0..3 {
++                            assert_eq!(d.next_back(), md.next_back());
++                            assert_eq!(d.as_str(), md.as_str());
++                        }
++                    }
++                    3 => {
++                        assert_eq!(d.next(), md.next());
++                        assert_eq!(d.next_back(), md.next_back());
++                        assert_eq!(d.next(), md.next());
++                        assert_eq!(d.as_str(), md.as_str());
++                    }
++                    4 => assert_eq!(d.count(), md.count()),
++                    5 => assert_eq!(d.last(), md.last()),
++                    _ => {
++                        let all: String = d.by_ref().collect();
++                        assert_eq!(all, expected);
++                        assert_eq!(d.next(), None, "fused");
++                        assert_eq!(d.as_str(), "");
++                    }
++                }
++            }
++            check_unchanged(before, c);
++        }
++        Op::ReplaceRange(p, q, s, form) => {
++            let (a, b) = (pos(m, *p), pos(m, *q));
++            let (a, b) = (a.min(b), a.max(b));
++            apply_replace(c, m, a, b, s, *form);
++            check_growth_or_unchanged(before, c, m);
++        }
++        Op::Retain(nth, threshold) => {
++            let n = *nth as u32 + 2;
++            let t = *threshold as u32 * 512;
++            let pred = |ch: char| (ch as u32 % n != 0) && (ch as u32) <= t.max(0x7f);
++            c.retain(pred);
++            m.retain(pred);
++            check_unchanged(before, c);
++        }
++        Op::Reserve(n) => {
++            c.reserve(*n);
++            check_growth(before, m.len() + n, c);
++            c.try_reserve(*n).expect("already reserved");
++            assert_eq!(c.capacity(), shape(c).cap);
++        }
++        Op::ShrinkTo(min) => {
++            c.shrink_to(*min);
++            m.shrink_to(*min);
++            check_shrink(before, *min, c);
++        }
++        Op::ShrinkToFit => {
++            c.shrink_to_fit();
++            m.shrink_to_fit();
++            check_shrink(before, 0, c);
++            inlined_if_short(c, "shrink_to_fit");
++        }
++        Op::Clone => {
++            let d = c.clone();
++            check(&d, m);
++            inlined_if_short(&d, "clone");
++            if before.is_static {
++                assert_eq!(d.as_static_str(), c.as_static_str(), "a static clone stays static");
++            }
++            let mut e = CompactString::new("something else entirely, long enough for the heap");
++            e.clone_from(c);
++            check(&e, m);
++            *c = d;
++        }
++        Op::CloneFrom(other) => {
++            let mut d = CompactString::new(other);
++            d.clone_from(c);
++            check(&d, m);
++            c.clone_from(&d);
++            check(c, m);
++        }
++        Op::Repeat(n) => {
++            let r = c.repeat(*n);
++            let mr = m.repeat(*n);
++            check(&r, &mr);
++            inlined_if_short(&r, "repeat");
++            *c = r;
++            *m = mr;
++        }
++        Op::IntoStringAndBack => {
++            let (ptr, cap) = (c.as_ptr(), c.capacity());
++            let s = std::mem::take(c).into_string();
++            assert_eq!(s, *m);
++            if before.heap {
++                assert_eq!(s.as_ptr(), ptr, "into_string hands the heap buffer over");
++                assert_eq!(s.capacity(), cap);
++            }
++            let (ptr, cap) = (s.as_ptr(), s.capacity());
++            *c = CompactString::from(s);
++            check(c, m);
++            inlined_if_short(c, "From<String>");
++            if m.len() > MAX_INLINE {
++                assert_eq!(c.as_ptr(), ptr, "From<String> takes the buffer back");
++                assert_eq!(c.capacity(), cap);
++            }
++        }
++        Op::FromStringBuffer(extra) => {
++            let mut s = String::with_capacity(m.len() + extra);
++            s.push_str(m);
++            let (ptr, cap) = (s.as_ptr(), s.capacity());
++            *c = CompactString::from_string_buffer(s);
++            if cap == 0 {
++                assert!(!c.is_heap_allocated());
++            } else {
++                assert!(c.is_heap_allocated(), "from_string_buffer never inlines");
++                assert_eq!(c.as_ptr(), ptr);
++                assert_eq!(c.capacity(), cap);
++            }
++        }
++        Op::MakeAsciiUppercase => {
++            c.as_mut_str().make_ascii_uppercase();
++            m.make_ascii_uppercase();
++            assert_eq!(c.as_bytes(), m.as_bytes());
++        }
++        Op::WriteFmt(s, ch) => {
++            write!(c, "{s}{ch:?}").unwrap();
++            write!(m, "{s}{ch:?}").unwrap();
++            c.write_char(*ch).unwrap();
++            m.push(*ch);
++            c.write_str(s).unwrap();
++            m.push_str(s);
++        }
++        Op::Add(s) => {
++            let sum = c.clone() + s.as_str();
++            assert_eq!(sum, format!("{m}{s}"));
++            *c += s.as_str();
++            m.push_str(s);
++            check_growth(before, m.len(), c);
++        }
++        Op::Extend(kind, pieces) => {
++            let joined: String = pieces.concat();
++            match kind {
++                0 => c.extend(joined.chars()),
++                1 => c.extend(pieces.iter().map(|s| s.as_str())),
++                2 => c.extend(pieces.iter().cloned()),
++                3 => c.extend(pieces.iter().map(CompactString::new)),
++                4 => c.extend(pieces.iter().map(|s| Box::<str>::from(s.as_str()))),
++                5 => c.extend(pieces.iter().map(|s| Cow::Borrowed(s.as_str()))),
++                _ => c.extend(joined.chars().collect::<Vec<_>>().iter()),
++            }
++            m.push_str(&joined);
++        }
++    }
++    check(c, m);
++}
++
++/// `replace_range`: growing beyond the capacity goes through `reserve`; otherwise no capacity
++/// changes (a static string is converted in place, which is left alone here).
++fn check_growth_or_unchanged(before: Shape, c: &CompactString, m: &str) {
++    if m.len() > before.cap {
++        check_growth(before, m.len(), c);
++    } else if !before.is_static {
++        check_unchanged(before, c);
++    }
++}
++
++/// `shrink_to(min)`: only a heap string changes; to inline if the result fits, otherwise to
++/// exactly `max(len, min)` clamped at the minimum heap capacity, never growing.
++fn check_shrink(before: Shape, min: usize, c: &CompactString) {
++    if !before.heap {
++        assert_eq!(c.capacity(), before.cap, "shrink_to on inline/static: no-op");
++        assert_eq!(c.as_static_str().is_some(), before.is_static);
++        return;
++    }
++    let target = c.len().max(min);
++    if target <= MAX_INLINE {
++        assert!(!c.is_heap_allocated(), "shrink_to {min}: {} bytes fit inline", c.len());
++        assert_eq!(c.capacity(), MAX_INLINE);
++    } else if target >= before.cap {
++        assert_eq!(c.capacity(), before.cap, "shrink_to {min} cannot grow");
++    } else {
++        assert!(c.is_heap_allocated());
++        assert_eq!(c.capacity(), target.max(MIN_HEAP), "shrink_to {min} is exact");
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Properties
++
++#[hegel::test]
++fn edits_match_the_string_model(tc: hegel::TestCase) {
++    let start = tc.draw(arb_start());
++    let text = if let Start::ConstNew(i) = start { STATICS[i].to_owned() } else { tc.draw(arb_text()) };
++    let ops = tc.draw(generators::vecs(arb_op()).max_size(16));
++    let mut c = build(&start, &text);
++    let mut m = text.clone();
++    check(&c, &m);
++    for op in &ops {
++        apply(op, &mut c, &mut m);
++    }
++    let final_len = m.len();
++    assert_eq!(c.into_string(), m);
++    assert_eq!(m.len(), final_len);
++}
++
++#[hegel::test]
++fn out_of_bounds_and_split_chars_are_refused(tc: hegel::TestCase) {
++    let start = tc.draw(arb_start());
++    let text = if let Start::ConstNew(i) = start { STATICS[i].to_owned() } else { tc.draw(arb_text()) };
++    let mut c = build(&start, &text);
++    let m = text.clone();
++    // a byte offset inside a multi-byte char, if there is one
++    let inside: Vec<usize> = (1..m.len()).filter(|&b| !m.is_char_boundary(b)).collect();
++    let which = tc.draw(generators::integers::<u8>().max_value(7));
++    let n = m.len();
++    if let Some(&mid) = inside.first() {
++        let at = tc.draw(generators::sampled_from(inside.clone()));
++        match which {
++            0 => assert!(panics(|| c.remove(at)), "remove inside a char"),
++            1 => assert!(panics(|| c.insert(at, 'x')), "insert inside a char"),
++            2 => assert!(panics(|| c.insert_str(at, "xy")), "insert_str inside a char"),
++            3 => assert!(panics(|| c.truncate(at)), "truncate inside a char"),
++            4 => assert!(panics(|| c.split_off(at)), "split_off inside a char"),
++            5 => assert!(panics(|| c.replace_range(at.., "x")), "replace_range inside a char"),
++            6 => assert!(panics(|| drop(c.drain(..at))), "drain inside a char"),
++            _ => assert!(panics(|| c.replace_range(0..mid, "x")), "replace_range inside a char"),
++        }
++        check(&c, &m);
++    }
++    match which {
++        0 => assert!(panics(|| c.remove(n)), "remove at the end"),
++        1 => assert!(panics(|| c.insert(n + 1, 'x')), "insert past the end"),
++        2 => assert!(panics(|| c.insert_str(n + 1, "xy")), "insert_str past the end"),
++        3 => assert!(panics(|| c.split_off(n + 1)), "split_off past the end"),
++        4 => assert!(panics(|| c.replace_range(n + 1.., "x")), "replace_range past the end"),
++        5 => assert!(panics(|| drop(c.drain(..n + 1))), "drain past the end"),
++        6 => assert!(panics(|| c.replace_range(2..1, "x")), "reversed range"),
++        _ => {
++            let d = c.drain(n..n);
++            assert_eq!(d.as_str(), "");
++            drop(d);
++            c.replace_range(n..n, "");
++            c.truncate(n + 1);
++            c.insert_str(n, "");
++        }
++    }
++    check(&c, &m);
++    if !m.is_empty() {
++        assert!(c.try_reserve(usize::MAX).is_err(), "len + usize::MAX overflows: an error");
++        assert!(panics(|| c.repeat(usize::MAX)), "repeat overflow panics");
++    } else {
++        assert_eq!(c.repeat(usize::MAX), "");
++    }
++    check(&c, &m);
++}
++
++/// The fallible constructors' contract for a capacity no allocator can provide: `ReserveError`,
++/// never a panic; the infallible ones panic with that error.
++fn check_huge_capacity(c: &mut CompactString, m: &str, n: usize) {
++    assert!(
++        CompactString::try_with_capacity(n).is_err(),
++        "try_with_capacity({n:#x}) is an error, not a panic (compact_str/1)"
++    );
++    assert!(c.try_reserve(n).is_err(), "try_reserve({n:#x}) is an error, not a panic (compact_str/1)");
++    check(c, m);
++    assert!(panics(|| CompactString::with_capacity(n)), "with_capacity({n:#x}) panics");
++    assert!(panics(|| c.reserve(n)), "reserve({n:#x}) panics");
++    check(c, m);
++    if !m.is_empty() {
++        assert!(panics(|| c.repeat(n)), "repeat({n:#x}) panics");
++    }
++    check(c, m);
++}
++
++#[hegel::test]
++fn huge_capacities_are_reserve_errors(tc: hegel::TestCase) {
++    // 2^40 .. 2^56 - 2: representable in the crate's 56-bit capacity, unobtainable from any allocator
++    let n = tc.draw(generators::integers::<usize>().min_value(1 << 40).max_value((1 << 56) - 2 - 200));
++    let text = tc.draw(arb_text());
++    let mut c = build(&tc.draw(arb_start_owned()), &text);
++    check_huge_capacity(&mut c, &text, n);
++}
++
++#[hegel::test]
++fn capacities_beyond_56_bits_are_reserve_errors(tc: hegel::TestCase) {
++    // KNOWN FAILURE compact_str/1: `Capacity::new` asserts (debug) / assumes (release) that the
++    // capacity fits in 56 bits before the allocation is even attempted.
++    let n = tc.draw(generators::integers::<usize>().min_value((1 << 56) - 1));
++    let text = tc.draw(arb_text());
++    let mut c = build(&tc.draw(arb_start_owned()), &text);
++    check_huge_capacity(&mut c, &text, n);
++}
++
++#[hegel::test]
++fn comparisons_and_hash_match_str(tc: hegel::TestCase) {
++    let a = tc.draw(arb_text());
++    let b = if tc.draw(generators::booleans()) { a.clone() } else { tc.draw(arb_text()) };
++    let ca = build(&tc.draw(arb_start_owned()), &a);
++    let cb = build(&tc.draw(arb_start_owned()), &b);
++    assert_eq!(ca == cb, a == b);
++    assert_eq!(ca.cmp(&cb), a.cmp(&b));
++    assert_eq!(ca.partial_cmp(&cb), a.partial_cmp(&b));
++    assert_eq!(ca < cb, a < b);
++    // every PartialEq impl, both directions
++    assert_eq!(ca == b.as_str(), a == b);
++    assert_eq!(ca == b, a == b);
++    assert_eq!(ca == &b, a == b);
++    assert_eq!(ca == Cow::Borrowed(b.as_str()), a == b);
++    assert_eq!(&ca == cb, a == b);
++    assert_eq!(&ca == b, a == b);
++    assert_eq!(&ca == Cow::Borrowed(b.as_str()), a == b);
++    assert_eq!(b == ca, a == b);
++    assert_eq!(b == &ca, a == b);
++    assert_eq!(&b == ca, a == b);
++    assert_eq!(*b.as_str() == ca, a == b);
++    assert_eq!(*b.as_str() == &ca, a == b);
++    assert_eq!(b.as_str() == ca, a == b);
++    assert_eq!(&b.as_str() == ca, a == b);
++    assert_eq!(Cow::Borrowed(b.as_str()) == ca, a == b);
++    assert_eq!(&Cow::Borrowed(b.as_str()) == ca, a == b);
++    // Hash agrees with str (the Borrow<str> contract HashMap lookups rely on)
++    fn hash_of<T: Hash + ?Sized>(t: &T) -> u64 {
++        let mut h = std::collections::hash_map::DefaultHasher::new();
++        t.hash(&mut h);
++        h.finish()
++    }
++    assert_eq!(hash_of(&ca), hash_of(a.as_str()));
++    let mut map: HashMap<CompactString, usize> = HashMap::new();
++    map.insert(ca.clone(), 1);
++    map.insert(cb.clone(), 2);
++    assert_eq!(map.get(a.as_str()).is_some(), true);
++    assert_eq!(map.get(b.as_str()), Some(&2));
++    assert_eq!(map.len(), if a == b { 1 } else { 2 });
++    // ordering agrees with String's in a set
++    let set: BTreeSet<CompactString> = [ca.clone(), cb.clone()].into_iter().collect();
++    let mset: BTreeSet<String> = [a.clone(), b.clone()].into_iter().collect();
++    assert!(set.iter().map(|s| s.as_str()).eq(mset.iter().map(|s| s.as_str())));
++    // AsRef / Borrow views
++    assert_eq!(AsRef::<str>::as_ref(&ca), a);
++    assert_eq!(AsRef::<[u8]>::as_ref(&ca), a.as_bytes());
++    assert_eq!(AsRef::<std::ffi::OsStr>::as_ref(&ca), std::ffi::OsStr::new(&a));
++    assert_eq!(AsRef::<std::path::Path>::as_ref(&ca), std::path::Path::new(&a));
++    assert_eq!(std::borrow::Borrow::<str>::borrow(&ca), a);
++}
++
++/// A start that does not need a `&'static str` (for tests that draw their own text).
++fn arb_start_owned() -> impl hegel::PrintableGenerator<Start> {
++    arb_start().filter(|s: &Start| !matches!(s, Start::ConstNew(_)))
++}
++
++#[hegel::test]
++fn conversions_round_trip(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let c = build(&tc.draw(arb_start_owned()), &text);
++    assert_eq!(String::from(c.clone()), text);
++    assert_eq!(c.clone().into_string(), text);
++    assert_eq!(Cow::<str>::from(c.clone()), text);
++    assert_eq!(Cow::<str>::from(&c), text);
++    assert!(matches!(Cow::<str>::from(&c), Cow::Borrowed(_)), "a borrowed Cow from a reference");
++    assert_eq!(&*std::sync::Arc::<str>::from(c.clone()), text);
++    assert_eq!(&*std::rc::Rc::<str>::from(c.clone()), text);
++    assert_eq!(&*Box::<str>::from(c.clone()), text);
++    assert_eq!(Vec::<u8>::from(c.clone()), text.as_bytes());
++    assert_eq!(std::ffi::OsString::from(c.clone()), std::ffi::OsString::from(&text));
++    assert_eq!(std::path::PathBuf::from(c.clone()), std::path::PathBuf::from(&text));
++    let e: Box<dyn std::error::Error + Send + Sync> = c.clone().into();
++    assert_eq!(e.to_string(), text);
++    assert_eq!(format!("{e:?}"), format!("{text:?}"));
++    let e: Box<dyn std::error::Error> = c.clone().into();
++    assert_eq!(e.to_string(), text);
++    // FromIterator / Extend in every form
++    let pieces = tc.draw(generators::vecs(arb_text_max(10)).max_size(6));
++    let joined: String = pieces.concat();
++    let from_strs: CompactString = pieces.iter().map(String::as_str).collect();
++    let from_strings: CompactString = pieces.iter().cloned().collect();
++    let from_boxes: CompactString = pieces.iter().map(|s| Box::<str>::from(s.as_str())).collect();
++    let from_cows: CompactString = pieces.iter().map(|s| Cow::Borrowed(s.as_str())).collect();
++    let from_compacts: CompactString = pieces.iter().map(CompactString::new).collect();
++    let from_chars: CompactString = joined.chars().collect();
++    let from_char_refs: CompactString = joined.chars().collect::<Vec<_>>().iter().collect();
++    for (what, got) in [
++        ("&str", &from_strs),
++        ("String", &from_strings),
++        ("Box<str>", &from_boxes),
++        ("Cow", &from_cows),
++        ("CompactString", &from_compacts),
++        ("char", &from_chars),
++        ("&char", &from_char_refs),
++    ] {
++        check(got, &joined);
++        inlined_if_short(got, what);
++    }
++    let s: String = pieces.iter().map(CompactString::new).collect();
++    assert_eq!(s, joined);
++    let cow: Cow<str> = pieces.iter().map(CompactString::new).collect();
++    assert_eq!(cow, joined);
++    let mut s = text.clone();
++    s.extend(pieces.iter().map(CompactString::new));
++    assert_eq!(s, format!("{text}{joined}"));
++    let mut cow: Cow<str> = Cow::Borrowed(text.as_str());
++    cow.extend(pieces.iter().map(CompactString::new));
++    assert_eq!(cow, format!("{text}{joined}"));
++    // concat / join
++    let sep = tc.draw(arb_text_max(3));
++    assert_eq!(pieces.iter().concat_compact(), joined);
++    assert_eq!(pieces.iter().join_compact(&sep), pieces.join(&sep));
++    assert_eq!(pieces.iter().map(String::as_str).join_compact(sep.as_str()), pieces.join(&sep));
++    assert_eq!(pieces.iter().map(CompactString::new).concat_compact(), joined);
++    assert_eq!(pieces.clone().into_iter().join_compact(CompactString::new(&sep)), pieces.join(&sep));
++    inlined_if_short(&pieces.iter().join_compact(&sep), "join_compact");
++    // to_compact_string of strings
++    assert_eq!(text.to_compact_string(), text);
++    assert_eq!(text.as_str().to_compact_string(), text);
++    assert_eq!(c.to_compact_string(), text);
++    assert_eq!(text.try_to_compact_string().unwrap(), text);
++}
++
++#[hegel::test]
++fn case_conversions_match_str(tc: hegel::TestCase) {
++    // a run of ASCII first, so the word-at-a-time ASCII fast path runs into the non-ASCII rest
++    let prefix = tc.draw(generators::text().alphabet("aZ .").max_size(40));
++    let rest = if tc.draw(generators::booleans()) {
++        tc.draw(arb_text())
++    } else {
++        tc.draw(generators::text().max_size(30))
++    };
++    let text = format!("{prefix}{rest}");
++    let c = build(&tc.draw(arb_start_owned()), &text);
++    assert_eq!(c.to_lowercase(), text.to_lowercase());
++    assert_eq!(c.to_uppercase(), text.to_uppercase());
++    assert_eq!(CompactString::from_str_to_lowercase(&text), text.to_lowercase());
++    assert_eq!(CompactString::from_str_to_uppercase(&text), text.to_uppercase());
++    assert_eq!(c.to_ascii_lowercase(), text.to_ascii_lowercase());
++    assert_eq!(c.to_ascii_uppercase(), text.to_ascii_uppercase());
++    check(&c.to_lowercase(), &text.to_lowercase());
++    check(&c.to_uppercase(), &text.to_uppercase());
++    // Not asserted: that a short result is inline. The result is sized from the input, so a
++    // 25-byte "…ﬀ" uppercased to 24 bytes stays on the heap; nothing documents otherwise.
++    inlined_if_short(&c.to_ascii_lowercase(), "to_ascii_lowercase");
++    inlined_if_short(&c.to_ascii_uppercase(), "to_ascii_uppercase");
++    assert_eq!(c, text, "the original is untouched");
++}
++
++#[hegel::test]
++fn to_compact_string_matches_display(tc: hegel::TestCase) {
++    macro_rules! ints {
++        ($($t:ty => $nz:ty),*) => {$(
++            let v = tc.draw(generators::integers::<$t>());
++            let c = v.to_compact_string();
++            assert_eq!(c, v.to_string(), stringify!($t));
++            inlined_if_short(&c, stringify!($t));
++            assert_eq!(v.try_to_compact_string().unwrap(), v.to_string());
++            if let Some(nz) = <$nz>::new(v) {
++                assert_eq!(nz.to_compact_string(), nz.to_string(), stringify!($nz));
++            }
++            for v in [<$t>::MIN, <$t>::MAX, 0] {
++                assert_eq!(v.to_compact_string(), v.to_string());
++            }
++        )*};
++    }
++    ints!(
++        u8 => std::num::NonZeroU8, i8 => std::num::NonZeroI8,
++        u16 => std::num::NonZeroU16, i16 => std::num::NonZeroI16,
++        u32 => std::num::NonZeroU32, i32 => std::num::NonZeroI32,
++        u64 => std::num::NonZeroU64, i64 => std::num::NonZeroI64,
++        u128 => std::num::NonZeroU128, i128 => std::num::NonZeroI128,
++        usize => std::num::NonZeroUsize, isize => std::num::NonZeroIsize
++    );
++    let b = tc.draw(generators::booleans());
++    assert_eq!(b.to_compact_string(), b.to_string());
++    let ch = tc.draw(arb_char());
++    assert_eq!(ch.to_compact_string(), ch.to_string());
++    // floats: zmij's shortest representation must at least round-trip and keep the sign
++    let f = tc.draw(generators::floats::<f64>());
++    let s = f.to_compact_string();
++    assert!(!s.is_heap_allocated(), "an f64 is always inline: {s:?} ({} bytes)", s.len());
++    let back: f64 = s.parse().unwrap_or_else(|e| panic!("{f:?} printed as {s:?}: {e}"));
++    if f.is_nan() {
++        assert!(back.is_nan());
++    } else {
++        assert_eq!(back.to_bits(), f.to_bits(), "{f:?} printed as {s:?} reads back as {back:?}");
++    }
++    let g = tc.draw(generators::floats::<f32>());
++    let s = g.to_compact_string();
++    let back: f32 = s.parse().unwrap_or_else(|e| panic!("{g:?} printed as {s:?}: {e}"));
++    if g.is_nan() {
++        assert!(back.is_nan());
++    } else {
++        assert_eq!(back.to_bits(), g.to_bits(), "{g:?} printed as {s:?} reads back as {back:?}");
++    }
++    // the generic Display path, and a Display that fails
++    struct Shown(String);
++    impl Display for Shown {
++        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++            write!(f, "<{}>", self.0)
++        }
++    }
++    let text = tc.draw(arb_text());
++    let c = Shown(text.clone()).to_compact_string();
++    assert_eq!(c, format!("<{text}>"));
++    inlined_if_short(&c, "to_compact_string");
++    struct Bad;
++    impl Display for Bad {
++        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
++            Err(fmt::Error)
++        }
++    }
++    assert_eq!(Bad.try_to_compact_string(), Err(ToCompactStringError::Fmt(fmt::Error)));
++    assert!(panics(|| Bad.to_compact_string()), "a failing Display panics to_compact_string");
++    struct Partial;
++    impl Display for Partial {
++        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++            f.write_str("some output before the error, more than 24 bytes")?;
++            Err(fmt::Error)
++        }
++    }
++    assert!(matches!(Partial.try_to_compact_string(), Err(ToCompactStringError::Fmt(_))));
++}
++
++/// The `Result` `char::decode_utf16` gives, as a whole string or the first error.
++fn decode_utf16(units: &[u16]) -> Option<String> {
++    char::decode_utf16(units.iter().copied()).collect::<Result<String, _>>().ok()
++}
++
++#[hegel::test]
++fn decoding_matches_std(tc: hegel::TestCase) {
++    // UTF-8: valid text with random bytes spliced in
++    let text = tc.draw(arb_text());
++    let mut bytes = text.into_bytes();
++    let junk = tc.draw(generators::binary().max_size(4));
++    let at = tc.draw(generators::integers::<usize>().max_value(bytes.len()));
++    bytes.splice(at..at, junk);
++    match (CompactString::from_utf8(&bytes), std::str::from_utf8(&bytes)) {
++        (Ok(c), Ok(s)) => {
++            check(&c, s);
++            inlined_if_short(&c, "from_utf8");
++        }
++        (Err(e), Err(f)) => {
++            assert_eq!(e.valid_up_to(), f.valid_up_to());
++            assert_eq!(e.error_len(), f.error_len());
++            assert_eq!(e.to_string(), f.to_string());
++        }
++        (c, s) => panic!("from_utf8 disagrees with str: {c:?} vs {s:?}"),
++    }
++    let lossy = CompactString::from_utf8_lossy(&bytes);
++    check(&lossy, &String::from_utf8_lossy(&bytes));
++    inlined_if_short(&lossy, "from_utf8_lossy");
++    assert_eq!(CompactString::from_utf8(bytes.clone()).is_ok(), std::str::from_utf8(&bytes).is_ok(), "by value");
++
++    // UTF-16: valid code units with random ones spliced in (lone surrogates included)
++    let text = tc.draw(arb_text());
++    let mut units: Vec<u16> = text.encode_utf16().collect();
++    let junk = tc.draw(generators::vecs(generators::integers::<u16>().min_value(0xD000).max_value(0xE000)).max_size(3));
++    let at = tc.draw(generators::integers::<usize>().max_value(units.len()));
++    units.splice(at..at, junk);
++    let expected = decode_utf16(&units);
++    match (CompactString::from_utf16(&units), &expected) {
++        (Ok(c), Some(s)) => {
++            check(&c, s);
++            inlined_if_short(&c, "from_utf16");
++        }
++        (Err(e), None) => assert_eq!(e.to_string(), "invalid utf-16: lone surrogate found"),
++        (c, s) => panic!("from_utf16 disagrees with char::decode_utf16: {c:?} vs {s:?}"),
++    }
++    let lossy = CompactString::from_utf16_lossy(&units);
++    check(&lossy, &String::from_utf16_lossy(&units));
++    assert_eq!(CompactString::from_utf16(units.clone()).is_ok(), expected.is_some(), "by value");
++
++    // the byte-oriented decoders, both endiannesses, aligned and misaligned, even and odd
++    let le: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
++    let be: Vec<u8> = units.iter().flat_map(|u| u.to_be_bytes()).collect();
++    let odd = tc.draw(generators::booleans());
++    let misaligned = tc.draw(generators::booleans());
++    for (name, bytes) in [("le", le), ("be", be)] {
++        let little = name == "le";
++        let decode = |v: &[u8]| if little { CompactString::from_utf16le(v) } else { CompactString::from_utf16be(v) };
++        let decode_lossy = |v: &[u8]| if little { CompactString::from_utf16le_lossy(v) } else { CompactString::from_utf16be_lossy(v) };
++        let mut buf = Vec::with_capacity(bytes.len() + 2);
++        if misaligned {
++            buf.push(0);
++        }
++        buf.extend_from_slice(&bytes);
++        if odd {
++            buf.push(0x41);
++        }
++        let view = if misaligned { &buf[1..] } else { &buf[..] };
++        assert_eq!(view.len() % 2 == 1, odd);
++        let lossy_expected = if odd {
++            format!("{}\u{FFFD}", String::from_utf16_lossy(&units))
++        } else {
++            String::from_utf16_lossy(&units)
++        };
++        check(&decode_lossy(view), &lossy_expected);
++        match decode(view) {
++            Ok(c) => {
++                assert!(!odd, "{name}: an odd number of bytes is an error");
++                check(&c, expected.as_deref().unwrap_or_else(|| panic!("{name}: decoded {c:?} but decode_utf16 fails")));
++            }
++            Err(e) => {
++                assert!(odd || expected.is_none(), "{name}: {e} for valid input {units:?}");
++            }
++        }
++    }
++}
