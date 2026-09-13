@@ -25,3 +25,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/ruzstd.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped e7cc3b92895f → 1f76b371c69d (2026-09-04, "Decrease memory usage"; 0.9.1); 0 bug(s) still reproduce. 88 tests pass.
+- 2026-09-13: base bumped 1f76b371c69d → fe37617b53d6 (2026-09-13, "avoid allocating bigger buffers by adding the sentinel after rounding up"; 0.9.1); 0 bug(s) still reproduce. 88 tests pass.
