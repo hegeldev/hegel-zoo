@@ -1,0 +1,1768 @@
+diff --git a/deb822-lossless/Cargo.toml b/deb822-lossless/Cargo.toml
+index aeed6bf..5df60da 100644
+--- a/deb822-lossless/Cargo.toml
++++ b/deb822-lossless/Cargo.toml
+@@ -25,6 +25,8 @@ python-debian = ["dep:pyo3"]
+ deb822-fast = ["dep:deb822-fast"]
+ 
+ [dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
+ criterion = { version = ">=0.5, <0.9", features = ["html_reports"] }
+ 
+ [[bench]]
+diff --git a/deb822-lossless/tests/hegel.rs b/deb822-lossless/tests/hegel.rs
+new file mode 100644
+index 0000000..742963a
+--- /dev/null
++++ b/deb822-lossless/tests/hegel.rs
+@@ -0,0 +1,1749 @@
++//! Hegel property tests for deb822-lossless, checked against the two reference
++//! implementations installed on the system: dpkg's `Dpkg::Control::HashCore`
++//! (Perl) and python-debian's `Deb822` (Python).
++#![allow(clippy::all, dead_code)]
++
++use deb822_lossless::{Deb822, Entry, IndentPattern, Indentation, Paragraph};
++use hegel::generators::{self, Generator};
++use std::collections::BTreeSet;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracles
++// ---------------------------------------------------------------------------
++
++const PYTHON_SCRIPT: &str = r#"
++import sys, json, binascii
++from debian.deb822 import Deb822
++for line in sys.stdin:
++    cmd, _, arg = line.rstrip('\n').partition(' ')
++    text = binascii.unhexlify(arg).decode('utf-8')
++    try:
++        if cmd == 'P':
++            paras = []
++            for p in Deb822.iter_paragraphs(text):
++                paras.append([[k, v] for k, v in p.items()])
++            out = {'paras': paras}
++        elif cmd == 'D':
++            out = {'dump': ''.join(p.dump() for p in Deb822.iter_paragraphs(text))}
++        else:
++            out = {'error': 'unknown command'}
++    except Exception as e:
++        out = {'error': repr(e)}
++    sys.stdout.write(json.dumps(out) + '\n')
++    sys.stdout.flush()
++"#;
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use JSON::PP;
++use Dpkg::Control::HashCore;
++$| = 1;
++my $json = JSON::PP->new->canonical->utf8;
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, $arg) = split / /, $line, 2;
++    my $text = pack('H*', $arg);
++    my $out;
++    if ($cmd eq 'P') {
++        open(my $fh, '<', \$text) or die;
++        my @paras;
++        my $ok = eval {
++            while (1) {
++                my $h = Dpkg::Control::HashCore->new(allow_pgp => 0, allow_duplicate => 0);
++                my $n = $h->parse($fh, 'zoo');
++                last unless $n;
++                my @f;
++                for my $k (keys %$h) {
++                    my ($kk, $vv) = ($k, $h->{$k});
++                    utf8::decode($kk);
++                    utf8::decode($vv) if defined $vv;
++                    push @f, [$kk, $vv];
++                }
++                push @paras, \@f;
++            }
++            1;
++        };
++        if ($ok) { $out = { paras => \@paras } }
++        else { my $e = "$@"; $e =~ s/\s+/ /g; $out = { error => $e } }
++    } else {
++        $out = { error => 'unknown command' };
++    }
++    print $json->encode($out), "\n";
++}
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn ask(c: &mut Child2, cmd: &str, text: &str) -> serde_json::Value {
++    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
++    writeln!(c.stdin, "{cmd} {hex}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut line = String::new();
++    c.stdout.read_line(&mut line).unwrap();
++    assert!(!line.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad oracle reply {line:?}: {e}"))
++}
++
++fn python() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("/usr/bin/python3", &["-c", PYTHON_SCRIPT])))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++/// Paragraphs as the oracle reads them: key, value.
++type Paras = Vec<Vec<(String, String)>>;
++
++fn paras_of(v: &serde_json::Value) -> Result<Paras, String> {
++    if let Some(e) = v.get("error") {
++        return Err(e.to_string());
++    }
++    Ok(v["paras"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|p| {
++            p.as_array()
++                .unwrap()
++                .iter()
++                .map(|kv| {
++                    let k = kv[0].as_str().unwrap().to_string();
++                    let v = kv[1].as_str().unwrap_or("").to_string();
++                    (k, v)
++                })
++                .collect()
++        })
++        .collect())
++}
++
++fn pydebian(text: &str) -> Result<Paras, String> {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    paras_of(&ask(&mut c, "P", text))
++}
++
++fn pydebian_dump(text: &str) -> String {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "D", text);
++    v["dump"].as_str().unwrap_or("").to_string()
++}
++
++fn dpkg(text: &str) -> Result<Paras, String> {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    paras_of(&ask(&mut c, "P", text))
++}
++
++// ---------------------------------------------------------------------------
++// Normalisation
++// ---------------------------------------------------------------------------
++
++/// A value as a list of lines with the surrounding whitespace of each line
++/// removed: the common ground of the crate (which drops continuation
++/// indents), python-debian (which keeps continuation lines verbatim) and dpkg
++/// (which strips one indent character and trailing whitespace).
++fn norm(value: &str) -> Vec<String> {
++    value.split('\n').map(|l| l.trim().to_string()).collect()
++}
++
++/// dpkg unescapes a continuation line consisting of a single `.` into an
++/// empty line; undo that so dpkg's values compare with the others.
++fn norm_dpkg(value: &str) -> Vec<String> {
++    let mut lines = norm(value);
++    for l in lines.iter_mut().skip(1) {
++        if l.is_empty() {
++            *l = ".".to_string();
++        }
++    }
++    lines
++}
++
++fn crate_paras(doc: &Deb822) -> Paras {
++    doc.paragraphs().map(|p| p.items().collect()).collect()
++}
++
++fn keys_ci(p: &[(String, String)]) -> Vec<String> {
++    p.iter().map(|(k, _)| k.to_ascii_lowercase()).collect()
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++const KEY_FIRST: &[char] = &[
++    'A', 'B', 'C', 'D', 'P', 'S', 'V', 'X', 'a', 'b', 'd', 'k', 'm', 'p', 's', 'x',
++];
++const KEY_REST: &[char] = &[
++    'a', 'b', 'c', 'd', 'e', 'r', 's', 't', 'A', 'B', 'D', 'S', '0', '1', '9', '-', '_', '.', '+',
++    '~',
++];
++const WORD_CHARS: &[char] = &[
++    'a', 'b', 'c', 'x', 'y', 'z', 'A', 'M', '0', '1', '9', '.', ',', ';', '(', ')', '<', '>', '=',
++    '|', '/', '@', '+', '-', '_', '~', ':', '#', '!', '"', '\'', 'é', 'ĳ',
++];
++
++#[hegel::composite]
++fn arb_key(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(0, 7));
++    let mut s = String::new();
++    s.push(pick(tc, KEY_FIRST));
++    for _ in 0..n {
++        s.push(pick(tc, KEY_REST));
++    }
++    // dpkg silently drops a field whose name ends in `-`.
++    if s.ends_with('-') {
++        s.push('x');
++    }
++    s
++}
++
++#[hegel::composite]
++fn arb_word(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(1, 6));
++    (0..n).map(|_| pick(tc, WORD_CHARS)).collect()
++}
++
++/// A line of value text without leading or trailing whitespace.
++#[hegel::composite]
++fn arb_line(tc: &hegel::TestCase, allow_empty: bool) -> String {
++    let n = tc.draw(int!(if allow_empty { 0 } else { 1 }, 3));
++    let mut words: Vec<String> = Vec::new();
++    for _ in 0..n {
++        words.push(tc.draw(arb_word()));
++    }
++    let sep = pick(tc, &[" ", "  ", " \t"]);
++    words.join(sep)
++}
++
++/// dpkg unescapes a continuation line of two or more dots (` ..` reads as
++/// `.`); keep such lines out of the generated documents.
++fn no_dot_run(mut line: String) -> String {
++    if line.len() > 1 && line.chars().all(|c| c == '.') {
++        line.insert(0, 'x');
++    }
++    line
++}
++
++#[hegel::composite]
++fn arb_hws(tc: &hegel::TestCase, allow_empty: bool) -> String {
++    let opts: &[&str] = if allow_empty {
++        &["", " ", "  ", "\t", " \t ", "    "]
++    } else {
++        &[" ", "  ", "\t", " \t ", "    "]
++    };
++    pick(tc, opts).to_string()
++}
++
++#[derive(Clone, Debug, Default)]
++struct Opts {
++    crlf: bool,
++    trailing_ws: bool,
++    comments: bool,
++    empty_first_line: bool,
++    no_final_newline: bool,
++    ws_separator: bool,
++}
++
++#[hegel::composite]
++fn arb_opts(tc: &hegel::TestCase) -> Opts {
++    Opts {
++        crlf: tc.draw(generators::booleans()),
++        trailing_ws: tc.draw(generators::booleans()),
++        comments: tc.draw(generators::booleans()),
++        empty_first_line: tc.draw(generators::booleans()),
++        no_final_newline: tc.draw(generators::booleans()),
++        ws_separator: tc.draw(generators::booleans()),
++    }
++}
++
++#[derive(Clone, Debug)]
++struct ContLine {
++    comment_before: Option<String>,
++    indent: String,
++    text: String,
++    trail: String,
++}
++
++#[derive(Clone, Debug)]
++struct GenEntry {
++    comments_before: Vec<String>,
++    key: String,
++    post_colon: String,
++    first: String,
++    first_trail: String,
++    cont: Vec<ContLine>,
++}
++
++impl GenEntry {
++    fn value_lines(&self) -> Vec<String> {
++        let mut v = vec![self.first.clone()];
++        v.extend(self.cont.iter().map(|c| c.text.clone()));
++        v
++    }
++    fn render(&self, out: &mut Vec<String>) {
++        for c in &self.comments_before {
++            out.push(c.clone());
++        }
++        out.push(format!(
++            "{}:{}{}{}",
++            self.key, self.post_colon, self.first, self.first_trail
++        ));
++        for c in &self.cont {
++            if let Some(cm) = &c.comment_before {
++                out.push(cm.clone());
++            }
++            out.push(format!("{}{}{}", c.indent, c.text, c.trail));
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++struct GenPara {
++    entries: Vec<GenEntry>,
++}
++
++#[derive(Clone, Debug)]
++struct GenDoc {
++    leading: Vec<String>,
++    paras: Vec<GenPara>,
++    /// Separator lines between paragraphs (paras.len() - 1 of them).
++    seps: Vec<Vec<String>>,
++    trailing_newline: bool,
++    crlf: bool,
++    opts: Opts,
++}
++
++impl GenDoc {
++    fn text(&self) -> String {
++        let mut lines: Vec<String> = self.leading.clone();
++        for (i, p) in self.paras.iter().enumerate() {
++            if i > 0 {
++                lines.extend(self.seps[i - 1].iter().cloned());
++            }
++            for e in &p.entries {
++                e.render(&mut lines);
++            }
++        }
++        let nl = if self.crlf { "\r\n" } else { "\n" };
++        let mut s = lines.join(nl);
++        if self.trailing_newline && !lines.is_empty() {
++            s.push_str(nl);
++        }
++        s
++    }
++    /// What every reader should see: paragraphs of (key, value lines).
++    fn model(&self) -> Vec<Vec<(String, Vec<String>)>> {
++        self.paras
++            .iter()
++            .map(|p| {
++                p.entries
++                    .iter()
++                    .map(|e| (e.key.clone(), e.value_lines()))
++                    .collect()
++            })
++            .collect()
++    }
++}
++
++#[hegel::composite]
++fn arb_comment(tc: &hegel::TestCase) -> String {
++    let body = tc.draw(arb_line(true));
++    let sep = pick(tc, &["", " "]);
++    format!("#{sep}{body}")
++}
++
++#[hegel::composite]
++fn arb_entry(tc: &hegel::TestCase, key: String, opts: Opts) -> GenEntry {
++    let n_comments = if opts.comments { tc.draw(int!(0, 1)) } else { 0 };
++    let mut comments_before = Vec::new();
++    for _ in 0..n_comments {
++        comments_before.push(tc.draw(arb_comment()));
++    }
++    let post_colon = tc.draw(arb_hws(true));
++    let first = if opts.empty_first_line && tc.draw(generators::booleans()) {
++        String::new()
++    } else {
++        tc.draw(arb_line(true))
++    };
++    let first_trail = if opts.trailing_ws {
++        tc.draw(arb_hws(true))
++    } else {
++        String::new()
++    };
++    let n_cont = tc.draw(int!(0, 3));
++    let mut cont = Vec::new();
++    for _ in 0..n_cont {
++        let comment_before = if opts.comments && tc.draw(generators::booleans()) {
++            Some(tc.draw(arb_comment()))
++        } else {
++            None
++        };
++        let dot = tc.draw(int!(0, 5)) == 0;
++        let indent = if dot {
++            " ".to_string()
++        } else {
++            tc.draw(arb_hws(false))
++        };
++        let text = if dot { ".".to_string() } else { no_dot_run(tc.draw(arb_line(false))) };
++        let trail = if opts.trailing_ws {
++            tc.draw(arb_hws(true))
++        } else {
++            String::new()
++        };
++        cont.push(ContLine { comment_before, indent, text, trail });
++    }
++    let first = if first.is_empty() && !cont.is_empty() && !opts.empty_first_line {
++        "x".to_string()
++    } else {
++        first
++    };
++    GenEntry { comments_before, key, post_colon, first, first_trail, cont }
++}
++
++/// Distinct keys (case-insensitively).
++#[hegel::composite]
++fn arb_keys(tc: &hegel::TestCase, n: usize) -> Vec<String> {
++    let mut seen: BTreeSet<String> = BTreeSet::new();
++    let mut keys = Vec::new();
++    for i in 0..n {
++        let mut k = tc.draw(arb_key());
++        if !seen.insert(k.to_ascii_lowercase()) {
++            k = format!("{k}{i}");
++            if !seen.insert(k.to_ascii_lowercase()) {
++                continue;
++            }
++        }
++        keys.push(k);
++    }
++    keys
++}
++
++#[hegel::composite]
++fn arb_para(tc: &hegel::TestCase, opts: Opts) -> GenPara {
++    let n = tc.draw(int!(1, 4)) as usize;
++    let keys = tc.draw(arb_keys(n).print_as_debug());
++    let mut entries = Vec::new();
++    for k in keys {
++        entries.push(tc.draw(arb_entry(k, opts.clone()).print_as_debug()));
++    }
++    GenPara { entries }
++}
++
++#[hegel::composite]
++fn arb_doc(tc: &hegel::TestCase, opts: Opts) -> GenDoc {
++    let n = tc.draw(int!(0, 3));
++    let mut paras = Vec::new();
++    for _ in 0..n {
++        paras.push(tc.draw(arb_para(opts.clone()).print_as_debug()));
++    }
++    let mut seps = Vec::new();
++    for _ in 1..paras.len().max(1) {
++        let k = tc.draw(int!(1, 2));
++        let mut sep = Vec::new();
++        for _ in 0..k {
++            let line = if opts.ws_separator && tc.draw(int!(0, 3)) == 0 {
++                tc.draw(arb_hws(false))
++            } else {
++                String::new()
++            };
++            sep.push(line);
++        }
++        if opts.comments && tc.draw(int!(0, 3)) == 0 {
++            sep.push(tc.draw(arb_comment()));
++        }
++        seps.push(sep);
++    }
++    let mut leading = Vec::new();
++    if opts.comments && tc.draw(int!(0, 3)) == 0 {
++        leading.push(tc.draw(arb_comment()));
++    }
++    if tc.draw(int!(0, 5)) == 0 {
++        leading.push(String::new());
++    }
++    let trailing_newline = !(opts.no_final_newline && tc.draw(generators::booleans()));
++    GenDoc { leading, paras, seps, trailing_newline, crlf: opts.crlf, opts }
++}
++
++/// A document with default options (LF, no trailing whitespace, no comments).
++#[hegel::composite]
++fn arb_plain_doc(tc: &hegel::TestCase) -> GenDoc {
++    tc.draw(arb_doc(Opts::default()).print_as_debug())
++}
++
++/// Arbitrary text: a generated document with a few random mutations.
++#[hegel::composite]
++fn arb_text(tc: &hegel::TestCase) -> String {
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    let mut chars: Vec<char> = doc.text().chars().collect();
++    let n = tc.draw(int!(0, 4));
++    for _ in 0..n {
++        let c = pick(tc, &[':', '#', '\n', '\r', ' ', '\t', 'x', '-', '\u{a0}']);
++        let pos = tc.draw(int!(0, chars.len() as i64)) as usize;
++        if tc.draw(generators::booleans()) || pos == chars.len() {
++            chars.insert(pos, c);
++        } else {
++            chars[pos] = c;
++        }
++    }
++    chars.into_iter().collect()
++}
++
++// ---------------------------------------------------------------------------
++// Known-bug detectors (the general properties skip exactly these inputs; each
++// bug has its own pinned test below)
++// ---------------------------------------------------------------------------
++
++/// deb822-lossless/1: trailing whitespace on a value line is part of `value()`.
++fn hits_trailing_ws_bug(doc: &GenDoc) -> bool {
++    doc.paras.iter().flat_map(|p| &p.entries).any(|e| {
++        (!e.first.is_empty() && !e.first_trail.is_empty())
++            || e.cont.iter().any(|c| !c.trail.is_empty())
++    })
++}
++
++/// deb822-lossless/2: an empty first line (`Key:\n value`) is dropped from
++/// `value()`, shifting the continuation lines up.
++fn hits_empty_first_line_bug(doc: &GenDoc) -> bool {
++    doc.paras
++        .iter()
++        .flat_map(|p| &p.entries)
++        .any(|e| e.first.is_empty() && !e.cont.is_empty())
++}
++
++/// deb822-lossless/3: `\r` is a newline of its own, so CRLF files fall apart
++/// (one paragraph per line, continuation lines orphaned).
++fn hits_crlf_bug(doc: &GenDoc) -> bool {
++    doc.crlf && !doc.paras.is_empty()
++}
++
++/// deb822-lossless/4: a continuation line whose text starts with `#` is
++/// lexed as a comment and the field is rejected as an empty continuation.
++fn hits_indented_hash_bug(doc: &GenDoc) -> bool {
++    doc.paras
++        .iter()
++        .flat_map(|p| &p.entries)
++        .any(|e| e.cont.iter().any(|c| c.text.starts_with('#')))
++}
++
++/// Whitespace-only separator lines are legal for dpkg and python-debian but
++/// rejected by the strict parser (Policy lets parsers choose).
++fn has_ws_separator(doc: &GenDoc) -> bool {
++    doc.seps.iter().flatten().any(|l| !l.is_empty() && l.trim().is_empty())
++}
++
++/// deb822-lossless/6: `wrap_and_sort` turns a comment line inside a
++/// paragraph into value text (`A:\n#c` -> `A: #c`, `A: x\n#c` -> `A: x\n #c`).
++fn hits_wrap_comment_bug(doc: &GenDoc) -> bool {
++    doc.paras.iter().any(|p| {
++        p.entries.iter().skip(1).any(|e| !e.comments_before.is_empty())
++            || p.entries.iter().any(|e| e.cont.iter().any(|c| c.comment_before.is_some()))
++    })
++}
++
++/// deb822-lossless/4 again: with `immediate_empty_line`, `wrap_and_sort` moves
++/// a first line starting with `#` onto a continuation line, where it lexes as
++/// a comment.
++fn hits_immediate_hash_bug(doc: &GenDoc) -> bool {
++    doc.paras
++        .iter()
++        .flat_map(|p| &p.entries)
++        .any(|e| e.first.starts_with('#') && !e.cont.is_empty())
++}
++
++/// deb822-lossless/7: `convert_index(0)` is root child 0 whatever it is, so
++/// `remove_paragraph(0)` / `move_paragraph` act on a leading blank line or a
++/// comment instead of the paragraph.
++fn hits_index_bug(doc: &Deb822, edit: &Edit) -> bool {
++    use rowan::ast::AstNode;
++    let kinds: Vec<(deb822_lossless::SyntaxKind, String)> = doc
++        .syntax()
++        .children_with_tokens()
++        .map(|c| (c.kind(), c.to_string()))
++        .collect();
++    let leading_non_paragraph = kinds
++        .first()
++        .map(|(k, _)| *k != deb822_lossless::SyntaxKind::PARAGRAPH)
++        .unwrap_or(false);
++    // Paragraphs separated by exactly one blank line and nothing else: the
++    // only layout in which `move_paragraph`'s index arithmetic holds
++    // (comments and repeated blank lines are root children it miscounts).
++    let canonical_layout = kinds.iter().enumerate().all(|(i, (k, text))| {
++        if i % 2 == 0 {
++            *k == deb822_lossless::SyntaxKind::PARAGRAPH
++        } else {
++            *k == deb822_lossless::SyntaxKind::EMPTY_LINE && text == "\n"
++        }
++    });
++    match edit {
++        Edit::RemoveParagraph { index: 0 } => leading_non_paragraph,
++        Edit::MoveParagraph { .. } => {
++            // deb822-lossless/11: with three or more paragraphs the move eats
++            // the blank line the next paragraph needs.
++            !canonical_layout || doc.paragraphs().count() != 2
++        }
++        _ => false,
++    }
++}
++
++/// deb822-lossless/8: rewriting a field whose first line is empty (`Key:` or
++/// `Key: ` followed by a newline) breaks the line structure: `set` writes the
++/// new value on the next line unindented, `change_field_indent` adds a blank
++/// line that splits the paragraph.
++fn hits_set_bare_colon_bug(doc: &Deb822, edit: &Edit) -> bool {
++    match edit {
++        Edit::Set { para, key, .. }
++        | Edit::SetMultiline { para, key, .. }
++        | Edit::ChangeIndent { para, key, .. } => nth_para(doc, *para)
++            .get_entry(key)
++            .map(|e| {
++                let text = e.to_string();
++                let first = text.split('\n').next().unwrap_or("");
++                let after_colon = first.split_once(':').map(|(_, v)| v).unwrap_or("");
++                after_colon.trim().is_empty()
++            })
++            .unwrap_or(false),
++        _ => false,
++    }
++}
++
++/// deb822-lossless/9: edits after a last line without a trailing newline
++/// glue lines together (`A: 1` + insert -> `A: 1B: 2`; swapping or moving the
++/// last paragraph merges it with its new neighbour).
++fn hits_missing_newline_bug(doc: &Deb822, edit: &Edit) -> bool {
++    let text = doc.to_string();
++    if text.is_empty() || text.ends_with('\n') {
++        return false;
++    }
++    matches!(
++        edit,
++        Edit::Insert { .. }
++            | Edit::Set { .. }
++            | Edit::SetMultiline { .. }
++            | Edit::AddParagraph { .. }
++            | Edit::InsertParagraph { .. }
++            | Edit::SwapParagraphs { .. }
++            | Edit::MoveParagraph { .. }
++    )
++}
++
++/// deb822-lossless/10: `Deb822::wrap_and_sort` flattens the comment lines
++/// before a paragraph into bare root tokens; a second pass keeps the COMMENT
++/// tokens and drops their newlines (`# c\nA: 1\n` -> `# cA: 1\n`), and the
++/// paragraph operations, which count node children, insert at the wrong place.
++fn hits_flattened_comment_bug(doc: &Deb822, edit: &Edit) -> bool {
++    use rowan::ast::AstNode;
++    matches!(
++        edit,
++        Edit::WrapAndSortDocument { .. }
++            | Edit::AddParagraph { .. }
++            | Edit::InsertParagraph { .. }
++            | Edit::RemoveParagraph { .. }
++            | Edit::MoveParagraph { .. }
++            | Edit::SwapParagraphs { .. }
++    ) && doc
++        .syntax()
++        .children_with_tokens()
++        .any(|c| c.as_token().is_some() && c.kind() == deb822_lossless::SyntaxKind::COMMENT)
++}
++
++fn hits_any_parse_bug(doc: &GenDoc) -> bool {
++    hits_trailing_ws_bug(doc)
++        || hits_empty_first_line_bug(doc)
++        || hits_crlf_bug(doc)
++        || hits_indented_hash_bug(doc)
++}
++
++fn skip_for_oracles(doc: &GenDoc) -> bool {
++    hits_any_parse_bug(doc) || has_ws_separator(doc)
++}
++
++// ---------------------------------------------------------------------------
++// Parsing against the oracles
++// ---------------------------------------------------------------------------
++
++fn compare_paras(what: &str, text: &str, ours: &Paras, theirs: &Paras, dpkg_style: bool) {
++    let n = |v: &str| if dpkg_style { norm_dpkg(v) } else { norm(v) };
++    assert_eq!(
++        ours.len(),
++        theirs.len(),
++        "{what}: paragraph count differs for {text:?}\nours: {ours:?}\ntheirs: {theirs:?}"
++    );
++    for (o, t) in ours.iter().zip(theirs) {
++        assert_eq!(
++            keys_ci(o),
++            keys_ci(t),
++            "{what}: keys differ for {text:?}\nours: {o:?}\ntheirs: {t:?}"
++        );
++        for ((k, ov), (_, tv)) in o.iter().zip(t) {
++            assert_eq!(
++                norm(ov),
++                n(tv),
++                "{what}: value of {k} differs for {text:?}\nours: {ov:?}\ntheirs: {tv:?}"
++            );
++        }
++    }
++}
++
++#[hegel::test]
++fn paragraphs_are_read_like_python_debian(tc: hegel::TestCase) {
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    if skip_for_oracles(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let parsed = Deb822::from_str(&text).unwrap_or_else(|e| panic!("strict parse of {text:?}: {e}"));
++    let ours = crate_paras(&parsed);
++    let theirs = pydebian(&text).unwrap();
++    compare_paras("python-debian", &text, &ours, &theirs, false);
++}
++
++#[hegel::test]
++fn paragraphs_are_read_like_dpkg(tc: hegel::TestCase) {
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    if skip_for_oracles(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let parsed = Deb822::from_str(&text).unwrap_or_else(|e| panic!("strict parse of {text:?}: {e}"));
++    let ours = crate_paras(&parsed);
++    let theirs = dpkg(&text).unwrap_or_else(|e| panic!("dpkg rejects {text:?}: {e}"));
++    compare_paras("dpkg", &text, &ours, &theirs, true);
++}
++
++#[hegel::test]
++fn the_model_is_what_the_parser_reads(tc: hegel::TestCase) {
++    // Sanity check of the generator itself: the model equals what the crate
++    // reads (normalised), so the oracle comparisons above test the crate.
++    let opts = tc.draw(arb_opts().print_as_debug());
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    if skip_for_oracles(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let parsed = Deb822::from_str(&text).unwrap();
++    let ours = crate_paras(&parsed);
++    let model = doc.model();
++    assert_eq!(ours.len(), model.len(), "{text:?}");
++    for (o, m) in ours.iter().zip(&model) {
++        let ok: Vec<&String> = o.iter().map(|(k, _)| k).collect();
++        let mk: Vec<&String> = m.iter().map(|(k, _)| k).collect();
++        assert_eq!(ok, mk, "{text:?}");
++        for ((_, ov), (_, mv)) in o.iter().zip(m) {
++            assert_eq!(norm(ov), *mv, "{text:?}");
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// The CST
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn the_tree_is_lossless_for_any_text(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let parse = Deb822::parse(&text);
++    let tree = parse.tree();
++    assert_eq!(tree.to_string(), text, "relaxed tree text");
++    let strict = Deb822::from_str(&text);
++    assert_eq!(
++        strict.is_ok(),
++        parse.errors().is_empty(),
++        "strict {:?} vs errors {:?} for {text:?}",
++        strict.as_ref().map(|_| ()),
++        parse.errors()
++    );
++    let (relaxed, errors) = Deb822::from_str_relaxed(&text);
++    assert_eq!(relaxed.to_string(), text);
++    assert_eq!(errors, parse.errors().to_vec());
++    assert_eq!(parse.positioned_errors().len(), parse.errors().len());
++    for e in parse.positioned_errors() {
++        assert!(usize::from(e.range.end()) <= text.len(), "error range {e:?} outside {text:?}");
++    }
++    // Accessors never panic on any tree.
++    for p in tree.paragraphs() {
++        let _ = p.text_range();
++        let _ = p.line_col();
++        for e in p.entries() {
++            let _ = e.key();
++            let _ = e.value();
++            let _ = e.value_with_comments();
++            let _ = e.key_range();
++            let _ = e.colon_range();
++            let _ = e.value_range();
++            let _ = e.value_line_ranges();
++            let _ = e.value_token_range();
++            let _ = e.line_col();
++        }
++        for k in p.keys() {
++            let _ = p.get(&k);
++            let _ = p.get_with_comments(&k);
++            let _ = p.get_multiline(&k);
++            let _ = p.get_entry(&k);
++        }
++    }
++    let lines = text.lines().count();
++    for l in 0..=lines {
++        let _ = tree.paragraph_at_line(l);
++        let _ = tree.entry_at_line_col(l, 0);
++    }
++    for off in 0..=text.len() as u32 {
++        let _ = tree.paragraph_at_position(off.into());
++    }
++    // Paragraph texts concatenate to the document text in order.
++    let joined: String = tree.paragraphs().map(|p| p.to_string()).collect();
++    for p in tree.paragraphs() {
++        assert!(text.contains(&p.to_string()));
++    }
++    assert!(joined.len() <= text.len());
++}
++
++#[hegel::test]
++fn strict_documents_are_accepted_by_the_oracles(tc: hegel::TestCase) {
++    // Whatever the strict parser accepts, dpkg reads without complaint.
++    let text = tc.draw(arb_text());
++    if text.contains('\r') {
++        return;
++    }
++    let doc = match Deb822::from_str(&text) {
++        Ok(d) => d,
++        Err(_) => return,
++    };
++    // dpkg rejects duplicate fields; the crate (like python-debian) reads them.
++    for p in doc.paragraphs() {
++        let keys: Vec<String> = p.keys().map(|k| k.to_ascii_lowercase()).collect();
++        let set: BTreeSet<&String> = keys.iter().collect();
++        if set.len() != keys.len() {
++            return;
++        }
++    }
++    if let Err(e) = dpkg(&text) {
++        panic!("strict parse accepts {text:?} but dpkg says: {e}");
++    }
++}
++
++/// The edit used by the arbitrary-text reparse properties.
++fn arb_reparse_edit(tc: &hegel::TestCase, text: &str) -> (String, rowan::TextRange) {
++    let chars: Vec<char> = text.chars().collect();
++    let a = tc.draw(int!(0, chars.len() as i64)) as usize;
++    let b = tc.draw(int!(a as i64, chars.len() as i64)) as usize;
++    let n = tc.draw(int!(0, 3));
++    let insert: String = (0..n)
++        .map(|_| pick(tc, &[':', '#', '\n', ' ', '\t', 'x', 'K', '-', '\r']))
++        .collect();
++    let start: usize = chars[..a].iter().map(|c| c.len_utf8()).sum();
++    let end: usize = chars[..b].iter().map(|c| c.len_utf8()).sum();
++    let new_text = format!("{}{}{}", &text[..start], insert, &text[end..]);
++    // The edited range in the coordinates of the new text.
++    let range = rowan::TextRange::new((start as u32).into(), ((start + insert.len()) as u32).into());
++    (new_text, range)
++}
++
++#[hegel::test]
++fn incremental_reparse_equals_a_full_parse(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let parse = Deb822::parse(&text);
++    let (new_text, range) = arb_reparse_edit(&tc, &text);
++    let re = parse.reparse(&new_text, range);
++    let full = Deb822::parse(&new_text);
++    assert_eq!(re.tree().to_string(), new_text, "reparse text {text:?} -> {new_text:?}");
++    assert_eq!(
++        crate_paras(&re.tree()),
++        crate_paras(&full.tree()),
++        "structure differs after editing {text:?} at {range:?} into {new_text:?}"
++    );
++    assert!(
++        re.tree().tree_eq(&full.tree()),
++        "trees differ after editing {text:?} at {range:?} into {new_text:?}"
++    );
++}
++
++#[hegel::test]
++fn incremental_reparse_reports_the_same_errors(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let parse = Deb822::parse(&text);
++    let (new_text, range) = arb_reparse_edit(&tc, &text);
++    let re = parse.reparse(&new_text, range);
++    let full = Deb822::parse(&new_text);
++    assert_eq!(
++        re.errors(),
++        full.errors(),
++        "errors differ after editing {text:?} at {range:?} into {new_text:?}"
++    );
++}
++
++#[hegel::test]
++fn incremental_reparse_is_lossless(tc: hegel::TestCase) {
++    let text = tc.draw(arb_text());
++    let parse = Deb822::parse(&text);
++    let chars: Vec<char> = text.chars().collect();
++    let a = tc.draw(int!(0, chars.len() as i64)) as usize;
++    let b = tc.draw(int!(a as i64, chars.len() as i64)) as usize;
++    let n = tc.draw(int!(0, 3));
++    let insert: String = (0..n)
++        .map(|_| pick(&tc, &[':', '#', '\n', ' ', '\t', 'x', 'K', '-', '\r']))
++        .collect();
++    let start: usize = chars[..a].iter().map(|c| c.len_utf8()).sum();
++    let end: usize = chars[..b].iter().map(|c| c.len_utf8()).sum();
++    let new_text = format!("{}{}{}", &text[..start], insert, &text[end..]);
++    let range = rowan::TextRange::new((start as u32).into(), ((start + insert.len()) as u32).into());
++    let re = parse.reparse(&new_text, range);
++    assert_eq!(re.tree().to_string(), new_text, "reparse text {text:?} -> {new_text:?}");
++    for e in re.positioned_errors() {
++        assert!(usize::from(e.range.end()) <= new_text.len(), "error range {e:?} outside {new_text:?}");
++    }
++    let _ = crate_paras(&re.tree());
++}
++
++#[hegel::test]
++fn incremental_reparse_of_a_value_edit_equals_a_full_parse(tc: hegel::TestCase) {
++    // Editing inside one value line, without touching line structure.
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    let gen = tc.draw(arb_doc(opts).print_as_debug());
++    let text = gen.text();
++    let parse = Deb822::parse(&text);
++    if !parse.errors().is_empty() {
++        return;
++    }
++    let entries: Vec<Entry> = parse.tree().paragraphs().flat_map(|p| p.entries().collect::<Vec<_>>()).collect();
++    if entries.is_empty() {
++        return;
++    }
++    let e = pick(&tc, &(0..entries.len()).collect::<Vec<_>>());
++    let vr = match entries[e].value_token_range() {
++        Some(r) => r,
++        None => return,
++    };
++    let start: usize = vr.start().into();
++    let end: usize = vr.end().into();
++    if text[start..end].contains('\n') {
++        return;
++    }
++    let replacement = tc.draw(arb_line(false));
++    let new_text = format!("{}{}{}", &text[..start], replacement, &text[end..]);
++    let range = rowan::TextRange::new((start as u32).into(), ((start + replacement.len()) as u32).into());
++    let re = parse.reparse(&new_text, range);
++    let full = Deb822::parse(&new_text);
++    assert_eq!(re.tree().to_string(), new_text, "reparse text {text:?} -> {new_text:?}");
++    assert_eq!(re.errors(), full.errors(), "errors differ after editing {text:?} at {range:?} into {new_text:?}");
++    assert_eq!(crate_paras(&re.tree()), crate_paras(&full.tree()), "structure differs after editing {text:?} at {range:?} into {new_text:?}");
++    assert!(re.tree().tree_eq(&full.tree()), "trees differ after editing {text:?} at {range:?} into {new_text:?}");
++}
++
++#[hegel::test]
++fn incremental_reparse_of_valid_documents_equals_a_full_parse(tc: hegel::TestCase) {
++    // Replace one field line or continuation line by another one (edits that
++    // touch blank lines or comments hit deb822-lossless/5).
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    let gen = tc.draw(arb_doc(opts).print_as_debug());
++    let text = gen.text();
++    let parse = Deb822::parse(&text);
++    if !parse.errors().is_empty() {
++        return;
++    }
++    let lines: Vec<&str> = text.split_inclusive('\n').collect();
++    let candidates: Vec<usize> = (0..lines.len())
++        .filter(|&i| {
++            let l = lines[i];
++            !l.trim().is_empty() && !l.starts_with('#') && l.ends_with('\n')
++        })
++        .collect();
++    if candidates.is_empty() {
++        return;
++    }
++    let li = pick(&tc, &candidates);
++    let start: usize = lines[..li].iter().map(|l| l.len()).sum();
++    let end = start + lines[li].len();
++    let replacement = if lines[li].starts_with([' ', '\t']) {
++        format!(" {}\n", tc.draw(arb_line(false)))
++    } else {
++        format!("{}: {}\n", tc.draw(arb_key()), tc.draw(arb_line(true)))
++    };
++    let new_text = format!("{}{}{}", &text[..start], replacement, &text[end..]);
++    let range = rowan::TextRange::new((start as u32).into(), ((start + replacement.len()) as u32).into());
++    let re = parse.reparse(&new_text, range);
++    let full = Deb822::parse(&new_text);
++    assert_eq!(re.tree().to_string(), new_text, "reparse text {text:?} -> {new_text:?}");
++    assert_eq!(re.errors(), full.errors(), "errors differ after editing {text:?} at {range:?} into {new_text:?}");
++    assert_eq!(
++        crate_paras(&re.tree()),
++        crate_paras(&full.tree()),
++        "structure differs after editing {text:?} at {range:?} into {new_text:?}"
++    );
++    assert!(re.tree().tree_eq(&full.tree()), "trees differ after editing {text:?} at {range:?} into {new_text:?}");
++}
++
++#[hegel::test]
++fn position_queries_agree_with_ranges(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    let doc = tc.draw(arb_doc(opts).print_as_debug());
++    let text = doc.text();
++    let tree = match Deb822::from_str(&text) {
++        Ok(t) => t,
++        Err(_) => return,
++    };
++    let line_of = |off: usize| text[..off].matches('\n').count();
++    let col_of = |off: usize| off - text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
++    for p in tree.paragraphs() {
++        let r = p.text_range();
++        let start: usize = r.start().into();
++        let end: usize = r.end().into();
++        assert_eq!(p.line_col(), (line_of(start), col_of(start)), "{text:?}");
++        let found = tree.paragraph_at_position(r.start()).expect("paragraph at its own start");
++        assert_eq!(found.text_range(), r, "{text:?}");
++        if end > start {
++            let found = tree.paragraph_at_position((end as u32 - 1).into()).unwrap();
++            assert_eq!(found.text_range(), r, "{text:?}");
++        }
++        let found = tree.paragraph_at_line(p.line()).expect("paragraph at its own line");
++        assert_eq!(found.text_range(), r, "paragraph_at_line({}) for {text:?}", p.line());
++        for e in p.entries() {
++            let er = e.text_range();
++            let es: usize = er.start().into();
++            let (l, c) = e.line_col();
++            assert_eq!((l, c), (line_of(es), col_of(es)), "{text:?}");
++            let found = tree.entry_at_line_col(l, c).expect("entry at its own start");
++            assert_eq!(found.text_range(), er, "entry_at_line_col({l},{c}) for {text:?}");
++            if let Some(kr) = e.key_range() {
++                assert_eq!(&text[usize::from(kr.start())..usize::from(kr.end())], e.key().unwrap());
++            }
++            if let Some(cr) = e.colon_range() {
++                assert_eq!(&text[usize::from(cr.start())..usize::from(cr.end())], ":");
++            }
++            for lr in e.value_line_ranges() {
++                assert!(er.contains_range(lr), "value line range {lr:?} outside entry {er:?} in {text:?}");
++            }
++            if let Some(vr) = e.value_range() {
++                assert!(er.contains_range(vr), "{text:?}");
++            }
++        }
++        // Entries in the paragraph are found by position too.
++        for e in p.entries() {
++            let er = e.text_range();
++            let found = p.entry_at_position(er.start()).unwrap();
++            assert_eq!(found.text_range(), er);
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Lookups
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn lookups_are_case_insensitive_first_matches(tc: hegel::TestCase) {
++    let doc = tc.draw(arb_plain_doc().print_as_debug());
++    if hits_indented_hash_bug(&doc) {
++        return;
++    }
++    let text = doc.text();
++    let tree = Deb822::from_str(&text).unwrap();
++    for p in tree.paragraphs() {
++        let items: Vec<(String, String)> = p.items().collect();
++        let keys: Vec<String> = p.keys().collect();
++        assert_eq!(keys, items.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
++        for (k, v) in &items {
++            for probe in [k.clone(), k.to_ascii_uppercase(), k.to_ascii_lowercase()] {
++                let expected = items
++                    .iter()
++                    .find(|(kk, _)| kk.eq_ignore_ascii_case(&probe))
++                    .map(|(_, v)| v.clone());
++                assert_eq!(p.get(&probe), expected, "get({probe:?}) in {text:?}");
++                assert!(p.contains_key(&probe));
++                assert_eq!(p.get_entry(&probe).map(|e| e.value()), expected);
++                assert_eq!(
++                    p.get_all(&probe).collect::<Vec<_>>(),
++                    items
++                        .iter()
++                        .filter(|(kk, _)| kk.eq_ignore_ascii_case(&probe))
++                        .map(|(_, v)| v.clone())
++                        .collect::<Vec<_>>()
++                );
++            }
++            let _ = v;
++        }
++        let missing = format!("{}zz", keys.first().cloned().unwrap_or_default());
++        assert_eq!(p.get(&missing), None);
++        assert!(!p.contains_key(&missing));
++    }
++    // `Paragraph::from_str` is the first-paragraph view.
++    if let Some(first) = tree.paragraphs().next() {
++        let single = Paragraph::from_str(&text).unwrap();
++        assert_eq!(single.items().collect::<Vec<_>>(), first.items().collect::<Vec<_>>());
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Editing
++// ---------------------------------------------------------------------------
++
++type Model = Vec<Vec<(String, Vec<String>)>>;
++
++#[derive(Clone, Debug)]
++enum Edit {
++    Set { para: usize, key: String, lines: Vec<String> },
++    Insert { para: usize, key: String, lines: Vec<String> },
++    Remove { para: usize, key: String },
++    Rename { para: usize, key: String, new_key: String },
++    SetMultiline { para: usize, key: String, lines: Vec<String> },
++    ChangeIndent { para: usize, key: String, indent: u32 },
++    NormalizeSpacing { para: usize },
++    InsertComment { para: usize, text: String },
++    WrapAndSortParagraph { para: usize, indent: u32, sort: bool },
++    WrapAndSortDocument { sort: bool },
++    InsertParagraph { index: usize, fields: Vec<(String, Vec<String>)> },
++    AddParagraph { fields: Vec<(String, Vec<String>)> },
++    RemoveParagraph { index: usize },
++    MoveParagraph { from: usize, to: usize },
++    SwapParagraphs { a: usize, b: usize },
++}
++
++#[hegel::composite]
++fn arb_value_lines(tc: &hegel::TestCase) -> Vec<String> {
++    let n = tc.draw(int!(1, 3));
++    // An empty first line with continuation lines hits deb822-lossless/2 and a
++    // continuation line starting with `#` hits deb822-lossless/4.
++    let mut lines = vec![tc.draw(arb_line(n == 1))];
++    for _ in 1..n {
++        let mut l = no_dot_run(tc.draw(arb_line(false)));
++        if l.starts_with('#') {
++            l.insert(0, 'x');
++        }
++        lines.push(l);
++    }
++    lines
++}
++
++fn fresh_key(tc: &hegel::TestCase, model: &Model, para: usize) -> String {
++    let mut k = tc.draw(arb_key());
++    if model[para].iter().any(|(kk, _)| kk.eq_ignore_ascii_case(&k)) {
++        k.push_str("new");
++    }
++    if model[para].iter().any(|(kk, _)| kk.eq_ignore_ascii_case(&k)) {
++        k.push_str("er");
++    }
++    k
++}
++
++fn existing_or_fresh_key(tc: &hegel::TestCase, model: &Model, para: usize) -> String {
++    if !model[para].is_empty() && tc.draw(int!(0, 3)) != 0 {
++        let (k, _) = pick(tc, &model[para]);
++        match tc.draw(int!(0, 2)) {
++            0 => k.to_ascii_uppercase(),
++            1 => k.to_ascii_lowercase(),
++            _ => k,
++        }
++    } else {
++        fresh_key(tc, model, para)
++    }
++}
++
++#[hegel::composite]
++fn arb_fields(tc: &hegel::TestCase) -> Vec<(String, Vec<String>)> {
++    let n = tc.draw(int!(1, 3)) as usize;
++    let keys = tc.draw(arb_keys(n).print_as_debug());
++    let mut fields = Vec::new();
++    for k in keys {
++        fields.push((k, tc.draw(arb_value_lines().print_as_debug())));
++    }
++    fields
++}
++
++fn arb_edit(tc: &hegel::TestCase, model: &Model, allow_wrap: bool) -> Edit {
++    let n = model.len();
++    let kind = if n == 0 {
++        tc.draw(int!(9, 10))
++    } else if allow_wrap {
++        tc.draw(int!(0, 14))
++    } else {
++        let k = tc.draw(int!(0, 12));
++        if k >= 8 { k + 1 } else { k }
++    };
++    let para = if n == 0 { 0 } else { tc.draw(int!(0, n as i64 - 1)) as usize };
++    match kind {
++        0 => Edit::Set {
++            para,
++            key: existing_or_fresh_key(tc, model, para),
++            lines: tc.draw(arb_value_lines().print_as_debug()),
++        },
++        1 => Edit::Insert { para, key: fresh_key(tc, model, para), lines: tc.draw(arb_value_lines().print_as_debug()) },
++        2 => Edit::Remove { para, key: existing_or_fresh_key(tc, model, para) },
++        3 => Edit::Rename {
++            para,
++            key: existing_or_fresh_key(tc, model, para),
++            new_key: fresh_key(tc, model, para),
++        },
++        4 => Edit::SetMultiline {
++            para,
++            key: existing_or_fresh_key(tc, model, para),
++            lines: tc.draw(arb_value_lines().print_as_debug()),
++        },
++        5 => Edit::ChangeIndent {
++            para,
++            key: existing_or_fresh_key(tc, model, para),
++            indent: tc.draw(int!(1, 4)) as u32,
++        },
++        6 => Edit::NormalizeSpacing { para },
++        7 => Edit::InsertComment { para, text: tc.draw(arb_line(true)) },
++        8 => Edit::WrapAndSortParagraph {
++            para,
++            indent: tc.draw(int!(1, 4)) as u32,
++            sort: tc.draw(generators::booleans()),
++        },
++        9 => Edit::InsertParagraph {
++            index: tc.draw(int!(0, n as i64)) as usize,
++            fields: tc.draw(arb_fields().print_as_debug()),
++        },
++        10 => Edit::AddParagraph { fields: tc.draw(arb_fields().print_as_debug()) },
++        11 => Edit::RemoveParagraph { index: para },
++        12 => Edit::MoveParagraph { from: para, to: tc.draw(int!(0, n as i64 - 1)) as usize },
++        13 => Edit::SwapParagraphs { a: para, b: tc.draw(int!(0, n as i64 - 1)) as usize },
++        _ => Edit::WrapAndSortDocument { sort: tc.draw(generators::booleans()) },
++    }
++}
++
++fn model_set(p: &mut Vec<(String, Vec<String>)>, key: &str, lines: &[String]) {
++    if let Some(e) = p.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
++        e.1 = lines.to_vec();
++    } else {
++        p.push((key.to_string(), lines.to_vec()));
++    }
++}
++
++fn sort_model_para(p: &mut Vec<(String, Vec<String>)>) {
++    p.sort_by(|a, b| a.0.cmp(&b.0));
++}
++
++fn nth_para(doc: &Deb822, i: usize) -> Paragraph {
++    doc.paragraphs().nth(i).unwrap_or_else(|| panic!("no paragraph {i} in {:?}", doc.to_string()))
++}
++
++/// Apply an edit to the live tree and to the model.
++fn apply(doc: &mut Deb822, model: &mut Model, edit: &Edit) {
++    match edit {
++        Edit::Set { para, key, lines } => {
++            let mut p = nth_para(doc, *para);
++            p.set(key, &lines.join("\n"));
++            model_set(&mut model[*para], key, lines);
++        }
++        Edit::Insert { para, key, lines } => {
++            let mut p = nth_para(doc, *para);
++            p.insert(key, &lines.join("\n"));
++            model[*para].push((key.clone(), lines.clone()));
++        }
++        Edit::Remove { para, key } => {
++            let mut p = nth_para(doc, *para);
++            p.remove(key);
++            model[*para].retain(|(k, _)| !k.eq_ignore_ascii_case(key));
++        }
++        Edit::Rename { para, key, new_key } => {
++            let mut p = nth_para(doc, *para);
++            let existed = model[*para].iter().any(|(k, _)| k.eq_ignore_ascii_case(key));
++            let renamed = p.rename(key, new_key);
++            assert_eq!(renamed, existed, "rename({key:?}, {new_key:?}) return value");
++            if let Some(e) = model[*para].iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
++                e.0 = new_key.clone();
++            }
++        }
++        Edit::SetMultiline { para, key, lines } => {
++            let mut p = nth_para(doc, *para);
++            p.set_multiline(key, &lines.join("\n"), None)
++                .unwrap_or_else(|e| panic!("set_multiline({key:?}, {lines:?}): {e}"));
++            model_set(&mut model[*para], key, lines);
++        }
++        Edit::ChangeIndent { para, key, indent } => {
++            let mut p = nth_para(doc, *para);
++            let existed = model[*para].iter().any(|(k, _)| k.eq_ignore_ascii_case(key));
++            let changed = p
++                .change_field_indent(key, &IndentPattern::Fixed(*indent as usize))
++                .unwrap_or_else(|e| panic!("change_field_indent({key:?}, {indent}): {e}"));
++            assert_eq!(changed, existed, "change_field_indent({key:?}) return value");
++        }
++        Edit::NormalizeSpacing { para } => {
++            let mut p = nth_para(doc, *para);
++            let _ = p.normalize_field_spacing();
++        }
++        Edit::InsertComment { para, text } => {
++            let mut p = nth_para(doc, *para);
++            p.insert_comment_before(text);
++        }
++        Edit::WrapAndSortParagraph { para, indent, sort } => {
++            let p = nth_para(doc, *para);
++            let cmp = |a: &Entry, b: &Entry| a.key().cmp(&b.key());
++            let sorter: Option<&dyn Fn(&Entry, &Entry) -> std::cmp::Ordering> =
++                if *sort { Some(&cmp) } else { None };
++            let new_p = p.wrap_and_sort(Indentation::Spaces(*indent), false, None, sorter, None);
++            // Put the rewritten paragraph in place of the old one.
++            let idx = p.syntax_index();
++            doc.replace_paragraph(idx, new_p);
++            if *sort {
++                sort_model_para(&mut model[*para]);
++            }
++        }
++        Edit::WrapAndSortDocument { sort } => {
++            let cmp = |a: &Entry, b: &Entry| a.key().cmp(&b.key());
++            let sorter: Option<&dyn Fn(&Entry, &Entry) -> std::cmp::Ordering> =
++                if *sort { Some(&cmp) } else { None };
++            let wrap = |p: &Paragraph| p.wrap_and_sort(Indentation::Spaces(1), false, None, sorter, None);
++            *doc = doc.wrap_and_sort(None, Some(&wrap));
++            if *sort {
++                for p in model.iter_mut() {
++                    sort_model_para(p);
++                }
++            }
++        }
++        Edit::InsertParagraph { index, fields } => {
++            let mut p = doc.insert_paragraph(*index);
++            for (k, lines) in fields {
++                p.set(k, &lines.join("\n"));
++            }
++            model.insert(*index, fields.clone());
++        }
++        Edit::AddParagraph { fields } => {
++            let mut p = doc.add_paragraph();
++            for (k, lines) in fields {
++                p.set(k, &lines.join("\n"));
++            }
++            model.push(fields.clone());
++        }
++        Edit::RemoveParagraph { index } => {
++            doc.remove_paragraph(*index);
++            model.remove(*index);
++        }
++        Edit::MoveParagraph { from, to } => {
++            doc.move_paragraph(*from, *to);
++            let p = model.remove(*from);
++            model.insert(*to, p);
++        }
++        Edit::SwapParagraphs { a, b } => {
++            doc.swap_paragraphs(*a, *b);
++            model.swap(*a, *b);
++        }
++    }
++}
++
++trait ParagraphIndex {
++    fn syntax_index(&self) -> usize;
++}
++impl ParagraphIndex for Paragraph {
++    fn syntax_index(&self) -> usize {
++        use rowan::ast::AstNode;
++        self.syntax().index()
++    }
++}
++
++trait ReplaceParagraph {
++    fn replace_paragraph(&mut self, syntax_index: usize, new_p: Paragraph);
++}
++impl ReplaceParagraph for Deb822 {
++    fn replace_paragraph(&mut self, syntax_index: usize, new_p: Paragraph) {
++        use rowan::ast::AstNode;
++        let root = self.syntax();
++        root.splice_children(syntax_index..syntax_index + 1, vec![new_p.syntax().clone().into()]);
++    }
++}
++
++fn check_model(what: &str, doc: &Deb822, model: &Model, trail: &[Edit]) {
++    let text = doc.to_string();
++    // A paragraph whose last field was removed has no text; nobody can read it back.
++    let live: Paras = crate_paras(doc).into_iter().filter(|p| !p.is_empty()).collect();
++    let model: Model = model.iter().filter(|p| !p.is_empty()).cloned().collect();
++    let model = &model;
++    let expect: Paras = model
++        .iter()
++        .map(|p| p.iter().map(|(k, v)| (k.clone(), v.join("\n"))).collect())
++        .collect();
++    let normalise = |ps: &Paras| -> Vec<Vec<(String, Vec<String>)>> {
++        ps.iter()
++            .map(|p| p.iter().map(|(k, v)| (k.clone(), norm(v))).collect())
++            .collect()
++    };
++    assert_eq!(
++        normalise(&live),
++        normalise(&expect),
++        "{what}: live tree differs from the model after {trail:?}\ntext: {text:?}"
++    );
++    let reparsed = Deb822::from_str(&text)
++        .unwrap_or_else(|e| panic!("{what}: text does not re-parse after {trail:?}: {e}\ntext: {text:?}"));
++    assert_eq!(
++        normalise(&crate_paras(&reparsed)),
++        normalise(&expect),
++        "{what}: re-parse differs from the model after {trail:?}\ntext: {text:?}"
++    );
++    let py = pydebian(&text).unwrap();
++    compare_paras(&format!("{what}: python-debian after {trail:?}"), &text, &expect, &py, false);
++    let dp = dpkg(&text).unwrap_or_else(|e| panic!("{what}: dpkg rejects {text:?} after {trail:?}: {e}"));
++    compare_paras(&format!("{what}: dpkg after {trail:?}"), &text, &expect, &dp, true);
++}
++
++#[hegel::test]
++fn edits_are_read_back(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    opts.trailing_ws = false;
++    opts.empty_first_line = false;
++    let gen = tc.draw(arb_doc(opts).print_as_debug());
++    if hits_any_parse_bug(&gen) {
++        return;
++    }
++    let text = gen.text();
++    let mut doc = match Deb822::from_str(&text) {
++        Ok(d) => d,
++        Err(_) => return,
++    };
++    let mut model: Model = gen.model();
++    let n = tc.draw(int!(1, 4));
++    let mut trail = Vec::new();
++    let allow_wrap = !hits_wrap_comment_bug(&gen);
++    for _ in 0..n {
++        let edit = arb_edit(&tc, &model, allow_wrap);
++        if hits_index_bug(&doc, &edit)
++            || hits_set_bare_colon_bug(&doc, &edit)
++            || hits_missing_newline_bug(&doc, &edit)
++            || hits_flattened_comment_bug(&doc, &edit)
++        {
++            continue;
++        }
++        trail.push(edit.clone());
++        apply(&mut doc, &mut model, &edit);
++        check_model("edit", &doc, &model, &trail);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Builders and canonicalisers
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn built_documents_are_read_back(tc: hegel::TestCase) {
++    let n = tc.draw(int!(0, 3));
++    let mut fields_per_para = Vec::new();
++    for _ in 0..n {
++        fields_per_para.push(tc.draw(arb_fields().print_as_debug()));
++    }
++    let doc: Deb822 = fields_per_para
++        .iter()
++        .map(|fields| {
++            let v: Vec<(String, String)> =
++                fields.iter().map(|(k, l)| (k.clone(), l.join("\n"))).collect();
++            Paragraph::from(v)
++        })
++        .collect();
++    let model: Model = fields_per_para.clone();
++    check_model("builder", &doc, &model, &[]);
++    // The `&str` builder and `FromIterator<(String, String)>` agree with `From<Vec>`.
++    for fields in &fields_per_para {
++        let v: Vec<(&str, &str)> = Vec::new();
++        let _ = Paragraph::from(v);
++        let joined: Vec<(String, String)> =
++            fields.iter().map(|(k, l)| (k.clone(), l.join("\n"))).collect();
++        let a = Paragraph::from(joined.clone());
++        let b: Paragraph = joined.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
++        assert_eq!(a.to_string(), b.to_string());
++    }
++}
++
++#[hegel::test]
++fn entries_with_formatting_are_read_back(tc: hegel::TestCase) {
++    let key = tc.draw(arb_key());
++    let lines = tc.draw(arb_value_lines().print_as_debug());
++    let value = lines.join("\n");
++    let post_colon = tc.draw(arb_hws(true));
++    let indent = tc.draw(arb_hws(false));
++    let entry = match Entry::try_with_formatting(&key, &value, &post_colon, &indent) {
++        Ok(e) => e,
++        Err(e) => panic!("try_with_formatting({key:?}, {value:?}, {post_colon:?}, {indent:?}): {e}"),
++    };
++    assert_eq!(entry.key().as_deref(), Some(key.as_str()));
++    assert_eq!(norm(&entry.value()), lines);
++    let text = entry.to_string();
++    let p = Paragraph::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let items: Vec<(String, String)> = p.items().collect();
++    assert_eq!(items.len(), 1, "{text:?}");
++    assert_eq!(items[0].0, key);
++    assert_eq!(norm(&items[0].1), lines, "{text:?}");
++    let plain = Entry::new(&key, &value);
++    assert_eq!(norm(&plain.value()), lines);
++    let with_indent = Entry::with_indentation(&key, &value, &indent);
++    assert_eq!(norm(&with_indent.value()), lines);
++    let py = pydebian(&text).unwrap();
++    assert_eq!(py.len(), 1, "{text:?}");
++    assert_eq!(norm(&py[0][0].1), lines, "{text:?}");
++}
++
++#[hegel::test]
++fn wrap_and_sort_is_canonical(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    let gen = tc.draw(arb_doc(opts).print_as_debug());
++    let text = gen.text();
++    let doc = match Deb822::from_str(&text) {
++        Ok(d) => d,
++        Err(_) => return,
++    };
++    if hits_wrap_comment_bug(&gen) {
++        return;
++    }
++    let indent = tc.draw(int!(1, 4)) as u32;
++    let immediate = tc.draw(generators::booleans());
++    if immediate && hits_immediate_hash_bug(&gen) {
++        return;
++    }
++    let max_len = if tc.draw(generators::booleans()) { Some(tc.draw(int!(10, 80)) as usize) } else { None };
++    let cmp = |a: &Entry, b: &Entry| a.key().cmp(&b.key());
++    let wrap = |p: &Paragraph| p.wrap_and_sort(Indentation::Spaces(indent), immediate, max_len, Some(&cmp), None);
++    let once = doc.wrap_and_sort(None, Some(&wrap));
++    let once_text = once.to_string();
++    let reparsed = Deb822::from_str(&once_text)
++        .unwrap_or_else(|e| panic!("wrap_and_sort output does not parse: {e}\nfrom {text:?}\nto {once_text:?}"));
++    let mut model = gen.model();
++    for p in model.iter_mut() {
++        sort_model_para(p);
++    }
++    let normalise = |ps: Paras| -> Vec<Vec<(String, Vec<String>)>> {
++        ps.iter().map(|p| p.iter().map(|(k, v)| (k.clone(), norm(v))).collect()).collect()
++    };
++    if !skip_for_oracles(&gen) {
++        assert_eq!(normalise(crate_paras(&once)), model, "wrap_and_sort of {text:?} -> {once_text:?}");
++        assert_eq!(normalise(crate_paras(&reparsed)), model, "re-parse of {once_text:?}");
++    }
++    let twice = reparsed.wrap_and_sort(None, Some(&wrap));
++    assert_eq!(twice.to_string(), once_text, "wrap_and_sort is not idempotent on {text:?}");
++    // Directly on its own tree too (with comments this hits deb822-lossless/10).
++    if !text.lines().any(|l| l.starts_with('#')) {
++        let again = once.wrap_and_sort(None, Some(&wrap));
++        assert_eq!(again.to_string(), once_text, "wrap_and_sort on its own output of {text:?}");
++    }
++    // Comments survive.
++    for line in text.lines() {
++        if line.starts_with('#') {
++            assert!(once_text.contains(line), "comment {line:?} lost by wrap_and_sort of {text:?}");
++        }
++    }
++}
++
++#[hegel::test]
++fn normalize_field_spacing_keeps_the_values(tc: hegel::TestCase) {
++    let mut opts = tc.draw(arb_opts().print_as_debug());
++    opts.crlf = false;
++    let gen = tc.draw(arb_doc(opts).print_as_debug());
++    let text = gen.text();
++    let mut doc = match Deb822::from_str(&text) {
++        Ok(d) => d,
++        Err(_) => return,
++    };
++    let before = crate_paras(&doc);
++    let _changed = doc.normalize_field_spacing();
++    let after_text = doc.to_string();
++    let after = crate_paras(&doc);
++    let n = |ps: &Paras| -> Vec<Vec<(String, Vec<String>)>> {
++        ps.iter().map(|p| p.iter().map(|(k, v)| (k.clone(), norm(v))).collect()).collect()
++    };
++    assert_eq!(n(&after), n(&before), "normalize_field_spacing changed values of {text:?} -> {after_text:?}");
++    let reparsed = Deb822::from_str(&after_text).unwrap_or_else(|e| panic!("{after_text:?}: {e}"));
++    assert_eq!(n(&crate_paras(&reparsed)), n(&before));
++    // Every first line now has exactly `Key: value` (or `Key:` for an empty first line).
++    for p in reparsed.paragraphs() {
++        for e in p.entries() {
++            let s = e.to_string();
++            let k = e.key().unwrap();
++            let rest = &s[k.len()..];
++            assert!(
++                rest.starts_with(": ") || rest.starts_with(":\n") || rest == ":",
++                "entry {s:?} not normalised in {after_text:?}"
++            );
++        }
++    }
++    // Idempotent.
++    let mut again = reparsed;
++    let changed_again = again.normalize_field_spacing();
++    assert!(!changed_again, "normalize_field_spacing not idempotent on {after_text:?}");
++    assert_eq!(again.to_string(), after_text);
++}
++
++// ---------------------------------------------------------------------------
++// Pinned bugs
++// ---------------------------------------------------------------------------
++
++/// deb822-lossless/1
++#[test]
++fn trailing_whitespace_is_not_part_of_the_value() {
++    let d = Deb822::from_str("Section: net   \nA: 1\n cont  \n").unwrap();
++    let p = d.paragraphs().next().unwrap();
++    assert_eq!(p.get("Section").as_deref(), Some("net"));
++    assert_eq!(p.get("A").as_deref(), Some("1\ncont"));
++}
++
++/// deb822-lossless/2
++#[test]
++fn an_empty_first_line_is_kept_in_the_value() {
++    let d = Deb822::from_str("Description:\n long text\n").unwrap();
++    let p = d.paragraphs().next().unwrap();
++    assert_eq!(p.get("Description").as_deref(), Some("\nlong text"));
++}
++
++/// deb822-lossless/3
++#[test]
++fn crlf_documents_keep_their_paragraphs() {
++    let d = Deb822::from_str("A: 1\r\nB: 2\r\n").unwrap();
++    assert_eq!(d.paragraphs().count(), 1, "{:?}", d.to_string());
++    let d = Deb822::from_str("A: a\r\n b\r\n").unwrap_or_else(|e| panic!("{e}"));
++    assert_eq!(d.paragraphs().next().unwrap().get("A").as_deref(), Some("a\nb"));
++}
++
++/// deb822-lossless/4
++#[test]
++fn an_indented_hash_is_value_text() {
++    let d = Deb822::from_str("A: a\n #c\n b\n").unwrap_or_else(|e| panic!("{e}"));
++    assert_eq!(d.paragraphs().next().unwrap().get("A").as_deref(), Some("a\n#c\nb"));
++}
++
++
++/// deb822-lossless/6
++#[test]
++fn wrap_and_sort_keeps_comments_out_of_the_values() {
++    let wrap = |p: &Paragraph| p.wrap_and_sort(Indentation::Spaces(1), false, None, None, None);
++    let d = Deb822::from_str("A: x\n#c\nB: y\n").unwrap();
++    let w = d.wrap_and_sort(None, Some(&wrap)).to_string();
++    let re = Deb822::from_str(&w).unwrap_or_else(|e| panic!("{w:?}: {e}"));
++    assert_eq!(re.paragraphs().next().unwrap().get("A").as_deref(), Some("x"), "{w:?}");
++    let d = Deb822::from_str("A:\n#c\nB: y\n").unwrap();
++    let w = d.wrap_and_sort(None, Some(&wrap)).to_string();
++    let re = Deb822::from_str(&w).unwrap_or_else(|e| panic!("{w:?}: {e}"));
++    assert_eq!(re.paragraphs().next().unwrap().get("A").as_deref(), Some(""), "{w:?}");
++}
++
++/// deb822-lossless/5
++#[test]
++fn reparse_matches_a_full_parse() {
++    // Filling the blank line before a comment joins two paragraphs; the
++    // incremental reparse keeps them apart.
++    let re = Deb822::parse("\n#\nA:\n").reparse("A: \n#\nA:\n", rowan::TextRange::new(0.into(), 4.into()));
++    let full = Deb822::parse("A: \n#\nA:\n");
++    assert_eq!(re.tree().to_string(), "A: \n#\nA:\n");
++    assert_eq!(crate_paras(&re.tree()), crate_paras(&full.tree()));
++    assert!(re.tree().tree_eq(&full.tree()));
++    // Errors outside the reparsed region are dropped, even for a no-op edit.
++    let re = Deb822::parse(":\r\n").reparse(":\r\n", rowan::TextRange::new(2.into(), 2.into()));
++    assert_eq!(re.errors(), Deb822::parse(":\r\n").errors());
++}
++
++/// deb822-lossless/7
++#[test]
++fn remove_paragraph_removes_the_paragraph_after_a_blank_line() {
++    let mut d = Deb822::from_str("\nA: 1\n").unwrap();
++    d.remove_paragraph(0);
++    assert_eq!(d.paragraphs().count(), 0, "{:?}", d.to_string());
++    let mut d = Deb822::from_str("A: 1\n\n# about B\nB: 2\n").unwrap();
++    d.move_paragraph(0, 1);
++    let keys: Vec<String> = d.paragraphs().map(|p| p.keys().next().unwrap()).collect();
++    assert_eq!(keys, ["B", "A"], "{:?}", d.to_string());
++    let mut d = Deb822::from_str("A: 1\n\n\nB: 2\n").unwrap();
++    d.move_paragraph(0, 1);
++    let text = d.to_string();
++    let keys: Vec<String> = Deb822::from_str(&text).unwrap().paragraphs().map(|p| p.keys().next().unwrap()).collect();
++    assert_eq!(keys, ["B", "A"], "{text:?}");
++}
++
++/// deb822-lossless/8
++#[test]
++fn set_writes_the_value_after_a_bare_colon() {
++    for input in ["A:\nB: 1\n", "A: \nB: 1\n"] {
++        let d = Deb822::from_str(input).unwrap();
++        let mut p = d.paragraphs().next().unwrap();
++        p.set("A", "a");
++        let text = d.to_string();
++        let re = Deb822::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++        assert_eq!(re.paragraphs().next().unwrap().get("A").as_deref(), Some("a"), "{text:?}");
++    }
++    let d = Deb822::from_str("A:\nB: 1\n").unwrap();
++    let mut p = d.paragraphs().next().unwrap();
++    p.change_field_indent("A", &IndentPattern::Fixed(1)).unwrap();
++    let text = d.to_string();
++    assert_eq!(Deb822::from_str(&text).unwrap().paragraphs().count(), 1, "{text:?}");
++}
++
++/// deb822-lossless/9
++#[test]
++fn inserting_after_an_unterminated_last_line_starts_a_new_line() {
++    let d = Deb822::from_str("A: 1").unwrap();
++    let mut p = d.paragraphs().next().unwrap();
++    p.insert("B", "2");
++    let text = d.to_string();
++    let re = Deb822::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let p = re.paragraphs().next().unwrap();
++    assert_eq!(p.get("A").as_deref(), Some("1"), "{text:?}");
++    assert_eq!(p.get("B").as_deref(), Some("2"), "{text:?}");
++    let mut d = Deb822::from_str("A: 1\n\nB: 2").unwrap();
++    d.swap_paragraphs(0, 1);
++    let text = d.to_string();
++    assert_eq!(Deb822::from_str(&text).unwrap().paragraphs().count(), 2, "{text:?}");
++}
++
++
++/// deb822-lossless/10
++#[test]
++fn wrap_and_sort_twice_keeps_the_comment_lines() {
++    let wrap = |p: &Paragraph| p.wrap_and_sort(Indentation::Spaces(1), false, None, None, None);
++    let d = Deb822::from_str("# c\nA: 1\n").unwrap();
++    let twice = d.wrap_and_sort(None, Some(&wrap)).wrap_and_sort(None, Some(&wrap));
++    let text = twice.to_string();
++    assert_eq!(text, "# c\nA: 1\n");
++    let mut once = Deb822::from_str("# c\nA: 1\n").unwrap().wrap_and_sort(None, Some(&wrap));
++    let mut p = once.add_paragraph();
++    p.set("B", "2");
++    let keys: Vec<String> = once.paragraphs().map(|p| p.keys().next().unwrap()).collect();
++    assert_eq!(keys, ["A", "B"], "{:?}", once.to_string());
++}
++
++/// deb822-lossless/11
++#[test]
++fn moving_a_paragraph_forward_keeps_the_other_paragraphs_apart() {
++    let mut d = Deb822::from_str("A: 1\n\nB: 2\n\nC: 3\n").unwrap();
++    d.move_paragraph(1, 2);
++    let text = d.to_string();
++    let keys: Vec<String> = Deb822::from_str(&text)
++        .unwrap()
++        .paragraphs()
++        .map(|p| p.keys().next().unwrap())
++        .collect();
++    assert_eq!(keys, ["A", "C", "B"], "{text:?}");
++}
