@@ -27,3 +27,4 @@
 - 2026-07-22: predecessor base commit `6844fc7c9d8f` (chore: version packages (#1042)).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/loro.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 6844fc7c9d8f → d5da57dd2a91 (2026-09-10, "chore: version packages"; 1.16.0); 2 bug(s) still reproduce. 556 tests pass.
