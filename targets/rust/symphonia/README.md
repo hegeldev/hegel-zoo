@@ -40,3 +40,4 @@
 - 2026-07-23: predecessor base commit `5f26f020b3a1` (core (io): Clamp scan_bytes_aligned_ref to scan_len to prevent over...).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/symphonia.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 5f26f020b3a1 → ee35874b571a (2026-08-12, "chore: Release v0.6.1."; 0.6.1); 0 bug(s) still reproduce. 84 tests pass.
