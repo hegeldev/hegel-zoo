@@ -49,3 +49,4 @@
   punctuation stays inside the word (UAX #14 LB14), so `wrap("( ab", 2)` is `["( ", "ab"]`, a
   line with trailing whitespace the docs say is discarded, and re-wrapping differs. Pinned as an
   intermittent expected failure.
+- 2026-09-13: base bumped 7debe996ca88 → 85da244320f3 (2026-09-13, "Merge pull request #632 from xtqqczze/lint-fuzz"; 0.16.3); 2 bug(s) still reproduce. 233 tests pass.
