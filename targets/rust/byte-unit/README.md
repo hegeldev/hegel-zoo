@@ -30,3 +30,4 @@
 - 2026-06-28: predecessor base commit `8acd4c0cd85e` (update docs cfg).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/byte-unit.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-13: base bumped 8acd4c0cd85e → 3f2dcb8c0f3f (2026-09-13, "bump version"; 5.2.6); 0 bug(s) still reproduce; fixed upstream: byte-unit/1. 83 tests pass. byte-unit/1: `AdjustedByte::get_byte` now saturates at `Byte::MAX` instead of unwrapping `None` (docs: "Values rounded above the supported range return the maximum value"); `known_bug_adjusted_byte_get_byte_panics_near_max` stays as a regression test and the sibling properties (`appropriate_unit_get_byte_is_close`, `adjusted_byte_ordering_is_monotone`) no longer exclude the near-maximum region.
