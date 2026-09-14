@@ -1,0 +1,641 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 733e8a5..fbe1c1d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -12,4 +12,6 @@ readme = "README.md"
+ 
+ 
+ [dependencies]
+-regex = "1.3.6"
+\ No newline at end of file
++regex = "1.3.6"
++[dev-dependencies.hegeltest]
++version = "0.44.1"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..32a14f4
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,622 @@
++//! Hegel properties for `format_num`, checked against Python's `format()` — the crate's
++//! documented model — for the Python-compatible part of the mini-language, against a model of
++//! d3-format's SI placement for the `s` type, and against the documentation's own padding rules.
++//!
++//! Documented deviations from Python that the oracle emulates or the generators avoid:
++//! a negative value that prints as zero loses its sign unless `+` was requested (d3's rule),
++//! `#X` prefixes `0x`, the `0` flag overrides an explicit alignment, a zero-padded grouped
++//! field is widened by its sign or `0x` prefix (pinned upstream), `,` and a precision are not
++//! combined with the integer types (Python rejects them), `#` is not combined with `%`
++//! (format_num/9) and the `s` type is not sent to Python at all.
++
++use format_num::{format_num, NumberFormat};
++use hegel::{generators, TestCase};
++use std::io::{BufRead, BufReader, Write};
++use std::panic::catch_unwind;
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo as i64).max_value($hi as i64)
++    };
++}
++
++fn n(tc: &mut TestCase, lo: i64, hi: i64) -> i64 {
++    tc.draw(int!(lo, hi))
++}
++
++fn pick<T: Copy>(tc: &mut TestCase, xs: &[T]) -> T {
++    xs[n(tc, 0, xs.len() as i64 - 1) as usize]
++}
++
++fn chance(tc: &mut TestCase, pct: i64) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++fn fmt(spec: &str, v: f64) -> String {
++    NumberFormat::new().format(spec, v)
++}
++
++/// The crate's result, or `None` when it panicked.
++fn try_fmt(spec: &str, v: f64) -> Option<String> {
++    catch_unwind(|| fmt(spec, v)).ok()
++}
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys, re, math
++
++RE = re.compile(r'^(?:(.)?([<>=^]))?([+\- ])?([$#])?(0)?(\d+)?(,)?(\.\d+)?([A-Za-z%])?$')
++PREFIXES = ["y", "z", "a", "f", "p", "n", "µ", "m", "", "k", "M", "G", "T", "P", "E", "Z", "Y"]
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def python_format(spec, text, kind):
++    """Python's format() with the crate's documented deviations emulated."""
++    m = RE.match(spec)
++    sign = m.group(3) or '-'
++    typ = m.group(9) or ''
++    integer_type = typ in ('b', 'o', 'd', 'x', 'X')
++    if kind == 'i':
++        mag = int(text.lstrip('-'))
++        neg = text.startswith('-')
++    else:
++        x = float(text)
++        mag = abs(x)
++        neg = math.copysign(1.0, x) < 0
++        if integer_type:
++            mag = round(mag)          # half to even, like Rust's `{:.0}`
++    r = format(mag, spec)
++    if integer_type:
++        zero_result = mag == 0
++    else:
++        # Judge the digits on the unpadded result: the fill character may be a digit.
++        core = (m.group(3) or '') + (m.group(4) or '') + (m.group(7) or '') + (m.group(8) or '') + typ
++        zero_result = not any(c in '123456789' for c in format(mag, core).split('e')[0])
++    # d3's rule: a negative value that prints as zero has no sign unless `+` was requested.
++    if neg and not (zero_result and sign != '+'):
++        r = format(-mag, spec)
++    if '#' in spec and typ == 'X':
++        r = r.replace('0X', '0x', 1)
++    return r
++
++def si_model(text, p):
++    """d3-format's formatPrefixAuto: `p` significant digits placed against an SI prefix."""
++    v = abs(float(text))
++    m = format(v, '.%de' % max(0, p - 1))
++    mant, exp = m.split('e')
++    exp = int(exp)
++    digits = mant.replace('.', '')
++    pe = max(-8, min(8, exp // 3))
++    i = exp - pe * 3 + 1
++    n = len(digits)
++    if i == n:
++        core = digits
++    elif i > n:
++        core = digits + '0' * (i - n)
++    elif i > 0:
++        core = digits[:i] + '.' + digits[i:]
++    else:
++        return None
++    return core, PREFIXES[pe + 8]
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'F':
++            out = ['ok', python_format(args[0], args[1], args[2])]
++        elif cmd == 'S':
++            r = si_model(args[0], int(args[1]))
++            out = ['err'] if r is None else ['ok', r[0], r[1]]
++        else:
++            out = ['bad', cmd]
++    except ValueError as e:
++        out = ['err', str(e)]
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{:02x}", b)).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let mut child = Command::new("python3")
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("python3 is needed as the format() oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++/// Ask the oracle; returns the status and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({:?})", status);
++    }
++    let mut it = reply.trim_end_matches(|c| c == '\n' || c == '\r').split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(status == "ok" || status == "err", "oracle said {:?} to {:?}", reply, line);
++    (status, it.map(unhex).collect())
++}
++
++fn python(spec: &str, text: &str, kind: &str) -> String {
++    let (status, fields) = ask("F", &[spec, text, kind]);
++    assert_eq!(status, "ok", "Python rejected {:?} of {}: {:?}", spec, text, fields);
++    fields[0].clone()
++}
++
++// --------------------------------------------------------------------------- generators
++
++const PREFIXES: [&str; 17] = ["y", "z", "a", "f", "p", "n", "µ", "m", "", "k", "M", "G", "T", "P", "E", "Z", "Y"];
++const INT_TYPES: [char; 5] = ['b', 'o', 'd', 'x', 'X'];
++
++/// A finite value of either sign: small integers, short decimals, ties, log-uniform magnitudes
++/// between 10^-12 and 10^24, and the occasional huge or zero value.
++fn arb_value(tc: &mut TestCase) -> f64 {
++    let mag = match n(tc, 0, 9) {
++        0 => n(tc, 0, 1000) as f64,
++        1 => n(tc, 0, 1_000_000_000) as f64 / 10f64.powi(n(tc, 0, 6) as i32),
++        2 => n(tc, 0, 100_000) as f64 + pick(tc, &[0.5, 0.25, 0.125, 0.75, 0.05, 0.005]),
++        3 => n(tc, 1, 999_999) as f64 * 10f64.powi(n(tc, 25, 300) as i32),
++        4 => {
++            if chance(tc, 50) {
++                0.0
++            } else {
++                n(tc, 1, 999_999) as f64 * 10f64.powi(n(tc, -20, -8) as i32)
++            }
++        }
++        _ => n(tc, 1, 999_999) as f64 * 10f64.powi(n(tc, -17, 19) as i32),
++    };
++    if chance(tc, 40) {
++        -mag
++    } else {
++        mag
++    }
++}
++
++fn arb_fill_ascii(tc: &mut TestCase) -> char {
++    // Any printable ASCII character but a newline (the regex's `.` does not match one).
++    n(tc, 0x20, 0x7e) as u8 as char
++}
++
++fn arb_fill_wide(tc: &mut TestCase) -> char {
++    pick(tc, &['é', 'ß', '→', '─', '█', '€', '🦀', '中', '·', '…'])
++}
++
++#[derive(Clone, Debug)]
++struct Spec {
++    fill: Option<char>,
++    align: Option<char>,
++    sign: Option<char>,
++    alt: bool,
++    zero: bool,
++    width: Option<usize>,
++    grouping: bool,
++    precision: Option<usize>,
++    typ: char,
++}
++
++impl Spec {
++    fn render(&self) -> String {
++        let mut s = String::new();
++        if let Some(a) = self.align {
++            if let Some(f) = self.fill {
++                s.push(f);
++            }
++            s.push(a);
++        }
++        if let Some(c) = self.sign {
++            s.push(c);
++        }
++        if self.alt {
++            s.push('#');
++        }
++        if self.zero {
++            s.push('0');
++        }
++        if let Some(w) = self.width {
++            s.push_str(&w.to_string());
++        }
++        if self.grouping {
++            s.push(',');
++        }
++        if let Some(p) = self.precision {
++            s.push_str(&format!(".{}", p));
++        }
++        s.push(self.typ);
++        s
++    }
++
++    /// The spec without its layout (fill, align, zero, width).
++    fn core(&self) -> Spec {
++        Spec { fill: None, align: None, zero: false, width: None, ..self.clone() }
++    }
++
++    fn is_integer_type(&self) -> bool {
++        INT_TYPES.contains(&self.typ)
++    }
++}
++
++/// A spec for the given type within the Python-compatible grammar (see the module comment).
++fn arb_spec(tc: &mut TestCase, typ: char, wide_fill: bool) -> Spec {
++    let integer = INT_TYPES.contains(&typ);
++    let zero = chance(tc, 25);
++    let align = if zero || chance(tc, 30) { None } else { Some(pick(tc, &['<', '>', '^', '='])) };
++    let fill = if align.is_some() && chance(tc, 60) {
++        Some(if wide_fill && chance(tc, 30) { arb_fill_wide(tc) } else { arb_fill_ascii(tc) })
++    } else {
++        None
++    };
++    Spec {
++        fill,
++        align,
++        sign: if chance(tc, 50) { Some(pick(tc, &['-', '+', ' '])) } else { None },
++        alt: typ != '%' && chance(tc, 30),
++        zero,
++        width: if zero || chance(tc, 50) { Some(n(tc, 0, 30) as usize) } else { None },
++        grouping: !integer && chance(tc, 40) || typ == 'd' && chance(tc, 40),
++        precision: if integer { None } else if chance(tc, 80) { Some(n(tc, 0, 20) as usize) } else { None },
++        typ,
++    }
++}
++
++// --------------------------------------------------------------------------- the documented layout
++
++/// The prefix a `=` alignment keeps to the left of the padding: the sign, then `0b`/`0o`/`0x`.
++fn split_prefix<'a>(core: &'a str, alt_prefix: bool) -> (&'a str, &'a str) {
++    let mut i = 0;
++    if core.starts_with(|c| c == '-' || c == '+' || c == ' ') {
++        i = 1;
++    }
++    if alt_prefix && core[i..].len() >= 2 && core[i..].starts_with('0') && core[i + 1..].starts_with(|c: char| c.is_ascii_alphabetic()) {
++        i += 2;
++    }
++    core.split_at(i)
++}
++
++/// The documented padding: `<`, `>`, `^` (the odd fill goes to the right), `=`.
++fn pad(core: &str, fill: char, align: char, width: usize, alt_prefix: bool) -> String {
++    let len = core.chars().count();
++    if len >= width {
++        return core.to_string();
++    }
++    let p = width - len;
++    let f = |k: usize| fill.to_string().repeat(k);
++    match align {
++        '<' => format!("{}{}", core, f(p)),
++        '>' => format!("{}{}", f(p), core),
++        '^' => format!("{}{}{}", f(p / 2), core, f(p - p / 2)),
++        _ => {
++            let (prefix, rest) = split_prefix(core, alt_prefix);
++            format!("{}{}{}", prefix, f(p), rest)
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- properties
++
++/// Everything Python's mini-language and the crate's share formats the same: the types `f`,
++/// `e`, `%`, `d`, `b`, `o`, `x`, `X` with fill, alignment, sign, `#`, `0`, width, grouping
++/// and precision.
++#[hegel::test]
++fn python_formats_the_same(mut tc: TestCase) {
++    let typ = pick(&mut tc, &['f', 'e', '%', 'd', 'b', 'o', 'x', 'X', 'f', 'd']);
++    let spec = arb_spec(&mut tc, typ, false);
++    let (v, text, kind) = if spec.is_integer_type() && (typ != 'd' || chance(&mut tc, 50)) {
++        let i = n(&mut tc, -(1 << 53), 1 << 53);
++        (i as f64, i.to_string(), "i")
++    } else {
++        let v = arb_value(&mut tc);
++        (v, format!("{:?}", v), "f")
++    };
++    // A zero-padded grouped field is widened by its sign or `0x` prefix (pinned upstream, d3's
++    // behaviour): keep such fields to a bare positive number.
++    let negative = v.is_sign_negative();
++    tc.assume(!(spec.zero && spec.grouping) || (spec.sign.unwrap_or('-') == '-' && !negative && !(spec.alt && spec.is_integer_type())));
++    // Python's `d` has no sign to keep on a negative zero.
++    tc.assume(!(spec.typ == 'd' && negative && spec.sign == Some('+') && v.abs() < 0.5));
++    // A zero-padded grouped field with fewer padding characters than separators to insert loses
++    // digits (format_num/11): keep the padding at least as long as the integer digits, or absent.
++    if spec.zero && spec.grouping {
++        let mut plain = spec.core();
++        plain.grouping = false;
++        let core = fmt(&plain.render(), v);
++        let digits = core.chars().take_while(|c| c.is_ascii_digit()).count();
++        let width = spec.width.unwrap_or(0);
++        tc.assume(width <= core.chars().count() || width >= core.chars().count() + digits);
++    }
++    let pattern = spec.render();
++    let expected = python(&pattern, &text, kind);
++    let got = fmt(&pattern, v);
++    assert_eq!(got, expected, "format({:?}, {:?}) [{}]", pattern, v, text);
++}
++
++/// `s`: the coefficient carries the requested significant digits and the decimal point sits
++/// where d3-format puts it against the SI prefix (values from 10^-24 up; below is format_num/2).
++#[hegel::test]
++fn si_prefix_matches_the_model(mut tc: TestCase) {
++    let mag = if chance(&mut tc, 10) {
++        0.0
++    } else {
++        n(&mut tc, 1, 999_999_999) as f64 * 10f64.powi(n(&mut tc, -24, 22) as i32)
++    };
++    let v = if chance(&mut tc, 40) { -mag } else { mag };
++    let p = n(&mut tc, 0, 17) as usize;
++    let grouping = chance(&mut tc, 30);
++    let sign = if chance(&mut tc, 50) { Some(pick(&mut tc, &['-', '+', ' '])) } else { None };
++    let (status, fields) = ask("S", &[&format!("{:?}", v), &p.to_string()]);
++    tc.assume(status == "ok"); // below one yocto the model stops (format_num/2)
++    let mut core = fields[0].clone();
++    if grouping {
++        let (int, rest) = core.split_at(core.find('.').unwrap_or(core.len()));
++        let mut grouped = String::new();
++        for (i, c) in int.chars().enumerate() {
++            if i > 0 && (int.len() - i) % 3 == 0 {
++                grouped.push(',');
++            }
++            grouped.push(c);
++        }
++        core = format!("{}{}", grouped, rest);
++    }
++    let zero_result = !core.contains(|c: char| ('1'..='9').contains(&c));
++    let sign_text = if v.is_sign_negative() && !(zero_result && sign != Some('+')) {
++        "-"
++    } else {
++        match sign {
++            Some('+') => "+",
++            Some(' ') => " ",
++            _ => "",
++        }
++    };
++    let expected = format!("{}{}{}", sign_text, core, fields[1]);
++    let pattern = format!("{}{}.{}s", sign.map(|c| c.to_string()).unwrap_or_default(), if grouping { "," } else { "" }, p);
++    let got = fmt(&pattern, v);
++    assert_eq!(got, expected, "format({:?}, {:?})", pattern, v);
++}
++
++/// Fill, alignment, `0` and width are the documented padding of the unpadded result, for
++/// every type including `s`.
++#[hegel::test]
++fn layout_matches_the_documented_padding(mut tc: TestCase) {
++    let typ = pick(&mut tc, &['f', 'e', '%', 'd', 'b', 'o', 'x', 'X', 's', 's']);
++    let mut spec = arb_spec(&mut tc, typ, true);
++    spec.grouping = spec.grouping && !spec.zero; // zero-padded grouping re-groups the padding (Python-tested above)
++    let width = spec.width.unwrap_or(0);
++    tc.assume(width > 0 && (spec.zero || spec.align.is_some()));
++    // A wide fill with `^` is format_num/4.
++    tc.assume(!(spec.align == Some('^') && spec.fill.map_or(false, |c| c.len_utf8() > 1)));
++    let v = if spec.is_integer_type() { n(&mut tc, -(1 << 53), 1 << 53) as f64 } else { arb_value(&mut tc) };
++    let core = fmt(&spec.core().render(), v);
++    // The width is counted in bytes when the SI prefix is `µ` (format_num/5).
++    tc.assume(!core.contains('µ'));
++    let (fill, align) = if spec.zero { ('0', '=') } else { (spec.fill.unwrap_or(' '), spec.align.unwrap()) };
++    let expected = pad(&core, fill, align, width, spec.alt && spec.is_integer_type());
++    let pattern = spec.render();
++    let got = fmt(&pattern, v);
++    assert_eq!(got, expected, "format({:?}, {:?}); unpadded {:?}", pattern, v, core);
++}
++
++/// The `format_num!` macro is the method.
++#[hegel::test]
++fn macro_is_the_method(mut tc: TestCase) {
++    let typ = pick(&mut tc, &['f', 'e', '%', 'd', 's']);
++    let spec = arb_spec(&mut tc, typ, false).render();
++    let v = arb_value(&mut tc);
++    assert_eq!(format_num!(spec.as_str(), v), fmt(&spec, v));
++}
++
++/// format_num/1: an infinite or NaN input is formatted as text (`inf`, `-inf`, `NaN`), as the
++/// `f`, `d` and `%` types do, whatever the type.
++#[hegel::test]
++fn non_finite_values_format_as_text(mut tc: TestCase) {
++    let typ = pick(&mut tc, &['f', 'e', '%', 'd', 'b', 'o', 'x', 'X', 's']);
++    let spec = arb_spec(&mut tc, typ, false).render();
++    let v = pick(&mut tc, &[f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -f64::NAN]);
++    let got = try_fmt(&spec, v);
++    assert!(got.is_some(), "format({:?}, {:?}) panicked", spec, v);
++    let text = got.unwrap().to_lowercase();
++    assert!(text.contains("inf") || text.contains("nan"), "format({:?}, {:?}) = {:?}", spec, v, text);
++}
++
++/// format_num/2: `s` below one yocto prints `0.000…y` with the requested precision reduced,
++/// never panics, and reads back to the value within a unit of its last digit.
++#[hegel::test]
++fn si_prefix_handles_sub_yocto_values(mut tc: TestCase) {
++    let mag = n(&mut tc, 1, 999_999) as f64 * 10f64.powi(n(&mut tc, -60, -30) as i32);
++    let p = n(&mut tc, 0, 8) as usize;
++    let spec = format!(".{}s", p);
++    let got = try_fmt(&spec, mag);
++    assert!(got.is_some(), "format({:?}, {:e}) panicked", spec, mag);
++    let text = got.unwrap();
++    assert!(text.ends_with('y') && text.starts_with("0."), "format({:?}, {:e}) = {:?}", spec, mag, text);
++    let num: f64 = text[..text.len() - 1].parse().unwrap();
++    let decimals = text.len() - 3;
++    let unit = 10f64.powi(-(decimals as i32));
++    assert!((num - mag * 1e24).abs() <= unit, "format({:?}, {:e}) = {:?}: off by more than a unit of the last digit", spec, mag, text);
++}
++
++/// format_num/3: `E` is the exponent form with an upper-case `E`.
++#[hegel::test]
++fn capital_e_is_the_upper_case_exponent_form(mut tc: TestCase) {
++    let v = arb_value(&mut tc);
++    let p = n(&mut tc, 0, 12);
++    let lower = fmt(&format!(".{}e", p), v);
++    let got = try_fmt(&format!(".{}E", p), v);
++    assert_eq!(got.as_deref(), Some(lower.to_uppercase().as_str()), "format(\".{}E\", {:?})", p, v);
++}
++
++/// format_num/4: "the fill can be any character", centred too.
++#[hegel::test]
++fn fill_can_be_any_character(mut tc: TestCase) {
++    let fill = if chance(&mut tc, 80) { arb_fill_wide(&mut tc) } else { arb_fill_ascii(&mut tc) };
++    let width = n(&mut tc, 1, 30) as usize;
++    let typ = pick(&mut tc, &['d', 'f', 'e']);
++    let v = if typ == 'd' { n(&mut tc, -100_000, 100_000) as f64 } else { arb_value(&mut tc) };
++    let core = fmt(&format!("{}", typ), v);
++    let spec = format!("{}^{}{}", fill, width, typ);
++    let got = try_fmt(&spec, v);
++    assert_eq!(got.as_deref(), Some(pad(&core, fill, '^', width, false).as_str()), "format({:?}, {:?})", spec, v);
++}
++
++/// format_num/5: the width is a number of characters, also when the SI prefix is `µ`.
++#[hegel::test]
++fn width_counts_characters(mut tc: TestCase) {
++    let mag = n(&mut tc, 1_000_000, 949_999_999) as f64 * 1e-12; // 1 µ … 950 µ, which never rounds up to 1m
++    let v = if chance(&mut tc, 30) { -mag } else { mag };
++    let width = n(&mut tc, 10, 30) as usize;
++    let align = pick(&mut tc, &["", "<", ">", "^", "=", "0"]);
++    let spec = format!("{}{}.{}s", align, width, n(&mut tc, 1, 6));
++    let got = fmt(&spec, v);
++    assert!(got.contains('µ'), "{:?} should be in the micro range: {:?}", v, got);
++    assert_eq!(got.chars().count(), width, "format({:?}, {:?}) = {:?}", spec, v, got);
++}
++
++/// format_num/6: `b`, `o`, `x`, `X` are "rounded to integer", like `d`.
++#[hegel::test]
++fn integer_types_round_to_integer(mut tc: TestCase) {
++    let v = n(&mut tc, 0, 1_000_000) as f64 + n(&mut tc, 1, 999) as f64 / 1000.0;
++    let rounded: i64 = fmt("d", v).parse().unwrap();
++    let typ = pick(&mut tc, &['b', 'o', 'x', 'X']);
++    let expected = match typ {
++        'b' => format!("{:b}", rounded),
++        'o' => format!("{:o}", rounded),
++        'x' => format!("{:x}", rounded),
++        _ => format!("{:X}", rounded),
++    };
++    assert_eq!(fmt(&typ.to_string(), v), expected, "format({:?}, {:?}); d gives {}", typ, v, rounded);
++}
++
++/// format_num/7: the integer types print the value's digits up to `u64::MAX`, the documented
++/// useful range, as `d` does.
++#[hegel::test]
++fn integer_types_are_exact_in_the_u64_range(mut tc: TestCase) {
++    // 53 significant bits shifted into [2^62, 2^64): exact in an f64 and in a u64.
++    let v = if chance(&mut tc, 20) { 1e19 } else { ((n(&mut tc, 1 << 52, (1 << 53) - 1) as u64) << n(&mut tc, 10, 11)) as f64 };
++    let u = v as u64;
++    assert_eq!(u as f64, v);
++    assert_eq!(fmt("d", v), u.to_string());
++    let typ = pick(&mut tc, &['b', 'o', 'x', 'X']);
++    let expected = match typ {
++        'b' => format!("{:b}", u),
++        'o' => format!("{:o}", u),
++        'x' => format!("{:x}", u),
++        _ => format!("{:X}", u),
++    };
++    assert_eq!(fmt(&typ.to_string(), v), expected, "format({:?}, {:?})", typ, v);
++}
++
++/// format_num/8: a value that prints as zero has no minus sign, in hexadecimal too.
++#[hegel::test]
++fn hex_of_a_value_that_prints_as_zero_has_no_sign(mut tc: TestCase) {
++    let v = -(n(&mut tc, 0, 999) as f64 / 1000.0);
++    let typ = pick(&mut tc, &['x', 'X']);
++    let reference = fmt(&pick(&mut tc, &['b', 'o', 'd']).to_string(), v);
++    assert_eq!(reference, "0");
++    assert_eq!(fmt(&typ.to_string(), v), "0", "format({:?}, {:?})", typ, v);
++}
++
++/// format_num/9: the alternate form "always contains a decimal-point character" for floats;
++/// `%` is a float conversion.
++#[hegel::test]
++fn alternate_form_applies_to_percent(mut tc: TestCase) {
++    let v = arb_value(&mut tc);
++    let got = fmt("#.0%", v);
++    let plain = fmt("#.0f", v * 100.0);
++    assert!(got.ends_with(".%"), "format(\"#.0%\", {:?}) = {:?} while #.0f of the percentage is {:?}", v, got, plain);
++}
++
++/// format_num/10: the grammar accepts what the formatter does not implement — an unknown type
++/// letter, the `$` symbol and grouping of a binary/octal/hexadecimal — and formats something else
++/// instead of rejecting the pattern like a malformed one.
++#[hegel::test]
++fn unimplemented_spec_combinations_are_rejected(mut tc: TestCase) {
++    let v = arb_value(&mut tc);
++    let spec = match n(&mut tc, 0, 2) {
++        0 => {
++            let letters: Vec<char> = ('A'..='Z').chain('a'..='z').filter(|c| !"bodxXeEfs%O".contains(*c)).collect();
++            format!("{}{}", if chance(&mut tc, 50) { ".2" } else { "" }, pick(&mut tc, &letters))
++        }
++        1 => format!("${}", pick(&mut tc, &[".2f", "d", ",d", "s"])),
++        _ => format!(",{}", pick(&mut tc, &['b', 'o', 'x', 'X'])),
++    };
++    let got = try_fmt(&spec, v);
++    assert!(got.is_none(), "format({:?}, {:?}) = {:?}: the pattern is not in the documented grammar", spec, v, got);
++}
++
++/// format_num/11: a zero-padded grouped field keeps every digit of the value — the width is a
++/// minimum, and the separators go into the padding, not into the number.
++#[hegel::test]
++fn zero_padded_grouping_keeps_every_digit(mut tc: TestCase) {
++    let digits = n(&mut tc, 4, 15);
++    let v = n(&mut tc, 10i64.pow(digits as u32 - 1), 10i64.pow(digits as u32) - 1) as f64;
++    let (typ, v) = match n(&mut tc, 0, 2) {
++        0 => ("d".to_string(), v),
++        1 => (format!(".{}f", n(&mut tc, 0, 3)), v),
++        _ => (".0%".to_string(), v / 100.0),
++    };
++    let core = fmt(&format!("{}", typ), v);
++    let width = core.chars().count() + n(&mut tc, 1, 3) as usize;
++    let spec = format!("0{},{}", width, typ);
++    let got = fmt(&spec, v);
++    let digits_of = |s: &str| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>().trim_start_matches('0').to_string();
++    assert_eq!(digits_of(&got), digits_of(&core), "format({:?}, {:?}) = {:?} while {:?} gives {:?}", spec, v, got, typ, core);
++}
++
++/// The crate's documented examples, as a guard on the harness itself.
++#[test]
++fn doc_examples() {
++    let num = NumberFormat::new();
++    assert_eq!(num.format(".1f", 0.06), "0.1");
++    assert_eq!(num.format("#.0f", 10.1), "10.");
++    assert_eq!(num.format("+14d", 2_147_483_647), "   +2147483647");
++    assert_eq!(num.format("#b", 3), "0b11");
++    assert_eq!(num.format("#X", 48879), "0xBEEF");
++    assert_eq!(num.format(".2s", 42e6), "42M");
++    assert_eq!(num.format(".^20d", 12), ".........12.........");
++    assert_eq!(num.format("+10.0f", 255), "      +255");
++    assert_eq!(num.format(".0%", 0.123), "12%");
++    assert_eq!(num.format("+016,.2s", 42e12), "+000,000,000,042T");
++    assert_eq!(format_num!(".2s", 0.012345), "12m");
++    assert_eq!(python("+14d", "2147483647", "i"), "   +2147483647");
++    assert_eq!(pad("-0xff", '*', '=', 8, true), "-0x***ff");
++    assert_eq!(PREFIXES[8], "");
++}
