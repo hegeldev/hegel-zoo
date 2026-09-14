@@ -96,3 +96,4 @@ crate's `bad_semvers`).
   triple (versions/3); the 1 000-case run added versions/8. Test defects on the way: the model
   assumed `Version ⊂ Mess`; `Requirement::new("*")` is the wildcard even without an operator;
   a `chunk_of` on a non-chunk piece. Clean at 100 + 3 × 1 000 + 10 000 cases with the eight pins.
+- 2026-09-14: base bumped 3ae61d089e38 → 4fdfd94332f6 (2026-09-14, "release: 8.0.1"; 8.0.1); 8 bug(s) still reproduce. 70 tests pass.
