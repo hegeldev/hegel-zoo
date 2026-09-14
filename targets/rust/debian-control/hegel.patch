@@ -1893,3 +1893,1048 @@ index 0000000..93e9ba9
 +    let d = dpkg(&rels.to_string()).unwrap_or_else(|| panic!("dpkg does not parse {:?}", rels.to_string()));
 +    assert_eq!(d.entries, expected, "dpkg reads {:?}", rels.to_string());
 +}
+diff --git a/debian-control/tests/hegel_control.rs b/debian-control/tests/hegel_control.rs
+new file mode 100644
+index 0000000..a4e70a0
+--- /dev/null
++++ b/debian-control/tests/hegel_control.rs
+@@ -0,0 +1,1039 @@
++//! Hegel property tests for debian-control's `debian/control` layer: the
++//! lossless `Control`/`Source`/`Binary` (over deb822-lossless), the lossy
++//! `Control` (deb822-fast derive), the typed field values (`fields.rs`) and the
++//! `Vcs-*` parsing (`vcs.rs`).
++//!
++//! References: **dpkg's `Dpkg::Control::Info`** (the parser `dpkg-source` uses
++//! for debian/control, in a persistent Perl child) for the field values and
++//! the structural rules; **lintian's `Vcs-*` regexes** (`Lintian::Check::Fields::Vcs`,
++//! same child) for the `url -b branch [path]` grammar; Debian Policy §5.2/§5.6
++//! as the generated model; and the two layers against each other.
++//! The relations parsers are covered by `tests/hegel.rs`.
++
++use debian_control::fields::{format_description, MultiArch, PackageListEntry, Priority, StandardsVersion, Urgency};
++use debian_control::lossless::control::{Binary, Control, Source, BINARY_FIELD_ORDER, SOURCE_FIELD_ORDER};
++use debian_control::lossless::relations::Relations;
++use debian_control::vcs::{ParsedVcs, Vcs};
++use hegel::generators;
++use hegel::Generator;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracles: dpkg and lintian
++// ---------------------------------------------------------------------------
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use Dpkg::Control::Info;
++use JSON::PP;
++$| = 1;
++my $json = JSON::PP->new->canonical;
++# lintian's Lintian::Check::Fields::Vcs extractors
++my %VCS = (
++    Cvs => sub { return shift =~ /^(.+?)(?:\s+(\S*))?$/; },
++    Hg  => sub { return shift =~ /^(.+?)(?:\s+-b\s+(\S*))?$/; },
++    Git => sub { return shift =~ /^(.+?)(?:(?:\s+\[(\S*)\])?(?:\s+-b\s+(\S*))?){0,2}$/; },
++);
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, @args) = split / /, $line;
++    my @a = map { pack('H*', $_) } @args;
++    if ($cmd eq 'C') {
++        my ($text) = @a;
++        my ($src, @pkgs, $err);
++        eval {
++            local $SIG{__WARN__} = sub {};
++            my $info = Dpkg::Control::Info->new(filename => undef);
++            open my $fh, '<', \$text or die;
++            $info->parse($fh, 'x');
++            my $s = $info->get_source();
++            $src = { map { $_ => $s->{$_} } keys %$s };
++            for my $p ($info->get_packages()) { push @pkgs, { map { $_ => $p->{$_} } keys %$p }; }
++        };
++        if ($@) { $err = "$@"; }
++        print $json->encode({ source => $src, packages => \@pkgs, err => $err }), "\n";
++    } elsif ($cmd eq 'V') {
++        my ($kind, $value) = @a;
++        my @m = $VCS{$kind}->($value);
++        print $json->encode({ m => [ map { defined $_ ? $_ : undef } @m ] }), "\n";
++    } else {
++        print "{}\n";
++    }
++}
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn ask(c: &mut Child2, cmd: &str, args: &[&str]) -> serde_json::Value {
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    writeln!(c.stdin, "{line}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut reply = String::new();
++    c.stdout.read_line(&mut reply).unwrap();
++    assert!(!reply.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&reply).unwrap_or_else(|e| panic!("bad oracle reply {reply:?}: {e}"))
++}
++
++fn oracle() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++type Fields = Vec<(String, String)>;
++
++/// dpkg's reading of a debian/control: (source fields, per-package fields), or
++/// the error message (`first stanza lacks a 'Source' field`, …).
++fn dpkg_control(text: &str) -> Result<(Fields, Vec<Fields>), String> {
++    let mut c = oracle().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "C", &[text]);
++    if let Some(e) = v["err"].as_str() {
++        return Err(e.to_string());
++    }
++    let fields = |o: &serde_json::Value| -> Fields {
++        let mut f: Fields = o.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
++        f.sort();
++        f
++    };
++    let src = fields(&v["source"]);
++    let pkgs = v["packages"].as_array().unwrap().iter().map(fields).collect();
++    Ok((src, pkgs))
++}
++
++/// lintian's extraction of a Vcs value: the captures of its regex.
++fn lintian_vcs(kind: &str, value: &str) -> Vec<Option<String>> {
++    let mut c = oracle().lock().unwrap_or_else(|e| e.into_inner());
++    ask(&mut c, "V", &[kind, value])["m"].as_array().unwrap().iter().map(|x| x.as_str().map(|s| s.to_string())).collect()
++}
++
++// ---------------------------------------------------------------------------
++// Model and generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++const NAMES: &[&str] = &["foo", "libfoo-dev", "bar1", "python3-baz", "a.b+c"];
++const PEOPLE: &[&str] = &["John Doe <john@example.com>", "A. Maintainer <am@debian.org>", "Debian QA Group <packages@qa.debian.org>"];
++const SECTIONS: &[&str] = &["misc", "libs", "python", "non-free/utils"];
++const ARCHES: &[&str] = &["any", "all", "amd64", "linux-any", "amd64 i386"];
++const URLS: &[&str] = &["https://salsa.debian.org/foo/foo.git", "https://github.com/foo/bar", "git://git.example.org/x/y", "https://example.com/"];
++const BRANCHES: &[&str] = &["debian/latest", "main", "debian/sid"];
++const PATHS: &[&str] = &["pkg", "debian/foo", "sub/dir"];
++const RELATIONS: &[&str] = &["debhelper-compat (= 13)", "foo", "bar (>= 1.0), baz", "libc6 | libc6.1", "x [amd64] <!nocheck>"];
++const WORDS: &[&str] = &["Fix", "widget", "frobnication", "speeds", "on", "mips/mipsel", "(etch)", "a:b", "very-long-word-to-fill-the-line"];
++
++fn arb_words(tc: &hegel::TestCase, min: i64, max: i64) -> String {
++    let n = tc.draw(int!(min, max)) as usize;
++    (0..n).map(|_| pick(tc, WORDS).to_string()).collect::<Vec<_>>().join(" ")
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct GenVcs {
++    url: String,
++    branch: Option<String>,
++    path: Option<String>,
++    /// `[path]` before `-b branch` (lintian accepts both orders).
++    path_first: bool,
++}
++
++impl GenVcs {
++    fn text(&self) -> String {
++        let mut parts = vec![self.url.clone()];
++        let b = self.branch.as_ref().map(|b| format!("-b {b}"));
++        let p = self.path.as_ref().map(|p| format!("[{p}]"));
++        if self.path_first {
++            parts.extend(p);
++            parts.extend(b);
++        } else {
++            parts.extend(b);
++            parts.extend(p);
++        }
++        parts.join(" ")
++    }
++}
++
++fn arb_vcs(tc: &hegel::TestCase) -> GenVcs {
++    GenVcs {
++        url: pick(tc, URLS).to_string(),
++        branch: if tc.draw(generators::booleans()) { Some(pick(tc, BRANCHES).to_string()) } else { None },
++        path: if tc.draw(generators::booleans()) { Some(pick(tc, PATHS).to_string()) } else { None },
++        path_first: tc.draw(generators::booleans()),
++    }
++}
++
++/// A description value: the synopsis and the long lines; `""` is a blank
++/// line (`.` in deb822), a line starting with a space is verbatim.
++#[derive(Debug, Clone, PartialEq)]
++struct GenDescription {
++    synopsis: String,
++    long: Vec<String>,
++}
++
++impl GenDescription {
++    /// The deb822 value as the lossless layer reads it (`get_multiline`):
++    /// `.` markers kept, verbatim lines keep their extra indentation.
++    fn value(&self) -> String {
++        let mut s = self.synopsis.clone();
++        for l in &self.long {
++            s.push('\n');
++            s.push_str(if l.is_empty() { "." } else { l });
++        }
++        s
++    }
++    /// dpkg's reading: `.` → empty line, one indent stripped (extra kept).
++    fn dpkg_value(&self) -> String {
++        let mut s = self.synopsis.clone();
++        for l in &self.long {
++            s.push('\n');
++            s.push_str(l);
++        }
++        s
++    }
++    fn has_verbatim(&self) -> bool {
++        self.long.iter().any(|l| l.starts_with(' '))
++    }
++}
++
++fn arb_description(tc: &hegel::TestCase, verbatim: bool) -> GenDescription {
++    let n = tc.draw(int!(0, 4)) as usize;
++    let mut long: Vec<String> = (0..n)
++        .map(|_| match tc.draw(int!(0, 4)) {
++            0 => String::new(),
++            1 if verbatim => format!(" {}", arb_words(tc, 1, 3)),
++            _ => arb_words(tc, 1, 5),
++        })
++        .collect();
++    // dpkg drops a trailing empty line of a value; keep the ends non-blank.
++    if let Some(l) = long.last_mut() {
++        if l.is_empty() {
++            *l = "end".into();
++        }
++    }
++    if let Some(l) = long.first_mut() {
++        if l.is_empty() {
++            *l = "start".into();
++        }
++    }
++    GenDescription { synopsis: arb_words(tc, 1, 4), long }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct GenSource {
++    name: String,
++    maintainer: String,
++    uploaders: Vec<String>,
++    section: Option<String>,
++    priority: Option<Priority>,
++    standards_version: Option<String>,
++    build_depends: Option<String>,
++    build_depends_indep: Option<String>,
++    vcs_git: Option<GenVcs>,
++    vcs_browser: Option<String>,
++    homepage: Option<String>,
++    /// Only `no` here (Policy's `binary-targets` and keyword forms are pinned).
++    rules_requires_root: Option<bool>,
++    testsuite: Option<String>,
++    order: Vec<usize>,
++}
++
++impl GenSource {
++    fn fields(&self) -> Fields {
++        let mut f: Fields = vec![("Source".into(), self.name.clone()), ("Maintainer".into(), self.maintainer.clone())];
++        if !self.uploaders.is_empty() {
++            f.push(("Uploaders".into(), self.uploaders.join(", ")));
++        }
++        if let Some(s) = &self.section {
++            f.push(("Section".into(), s.clone()));
++        }
++        if let Some(p) = &self.priority {
++            f.push(("Priority".into(), p.to_string()));
++        }
++        if let Some(v) = &self.standards_version {
++            f.push(("Standards-Version".into(), v.clone()));
++        }
++        if let Some(v) = &self.build_depends {
++            f.push(("Build-Depends".into(), v.clone()));
++        }
++        if let Some(v) = &self.build_depends_indep {
++            f.push(("Build-Depends-Indep".into(), v.clone()));
++        }
++        if let Some(v) = &self.vcs_git {
++            f.push(("Vcs-Git".into(), v.text()));
++        }
++        if let Some(v) = &self.vcs_browser {
++            f.push(("Vcs-Browser".into(), v.clone()));
++        }
++        if let Some(v) = &self.homepage {
++            f.push(("Homepage".into(), v.clone()));
++        }
++        if let Some(v) = &self.rules_requires_root {
++            f.push(("Rules-Requires-Root".into(), if *v { "yes" } else { "no" }.into()));
++        }
++        if let Some(v) = &self.testsuite {
++            f.push(("Testsuite".into(), v.clone()));
++        }
++        f
++    }
++    fn ordered(&self) -> Fields {
++        let f = self.fields();
++        self.order.iter().map(|&i| f[i].clone()).collect()
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct GenBinary {
++    name: String,
++    architecture: String,
++    section: Option<String>,
++    priority: Option<Priority>,
++    multi_arch: Option<MultiArch>,
++    essential: bool,
++    depends: Option<String>,
++    recommends: Option<String>,
++    description: GenDescription,
++    homepage: Option<String>,
++    order: Vec<usize>,
++}
++
++impl GenBinary {
++    fn fields(&self) -> Fields {
++        let mut f: Fields = vec![("Package".into(), self.name.clone()), ("Architecture".into(), self.architecture.clone())];
++        if let Some(s) = &self.section {
++            f.push(("Section".into(), s.clone()));
++        }
++        if let Some(p) = &self.priority {
++            f.push(("Priority".into(), p.to_string()));
++        }
++        if let Some(m) = &self.multi_arch {
++            f.push(("Multi-Arch".into(), m.to_string()));
++        }
++        if self.essential {
++            f.push(("Essential".into(), "yes".into()));
++        }
++        if let Some(v) = &self.depends {
++            f.push(("Depends".into(), v.clone()));
++        }
++        if let Some(v) = &self.recommends {
++            f.push(("Recommends".into(), v.clone()));
++        }
++        f.push(("Description".into(), self.description.value()));
++        if let Some(v) = &self.homepage {
++            f.push(("Homepage".into(), v.clone()));
++        }
++        f
++    }
++    fn ordered(&self) -> Fields {
++        let f = self.fields();
++        self.order.iter().map(|&i| f[i].clone()).collect()
++    }
++}
++
++#[derive(Debug, Clone)]
++struct GenControl {
++    source: GenSource,
++    binaries: Vec<GenBinary>,
++    trailing_newline: bool,
++}
++
++fn render(fields: &Fields) -> String {
++    let mut s = String::new();
++    for (k, v) in fields {
++        s.push_str(k);
++        s.push(':');
++        let mut lines = v.split('\n');
++        let first = lines.next().unwrap();
++        if !first.is_empty() {
++            s.push(' ');
++            s.push_str(first);
++        }
++        s.push('\n');
++        for l in lines {
++            s.push(' ');
++            s.push_str(l);
++            s.push('\n');
++        }
++    }
++    s
++}
++
++impl GenControl {
++    fn text(&self) -> String {
++        let mut s = render(&self.source.ordered());
++        for b in &self.binaries {
++            s.push('\n');
++            s.push_str(&render(&b.ordered()));
++        }
++        if !self.trailing_newline {
++            s.pop();
++        }
++        s
++    }
++    fn has_verbatim(&self) -> bool {
++        self.binaries.iter().any(|b| b.description.has_verbatim())
++    }
++}
++
++fn permutation(tc: &hegel::TestCase, n: usize) -> Vec<usize> {
++    let mut idx: Vec<usize> = (0..n).collect();
++    let mut order = Vec::new();
++    while !idx.is_empty() {
++        let i = tc.draw(int!(0, idx.len() as i64 - 1)) as usize;
++        order.push(idx.remove(i));
++    }
++    order
++}
++
++fn opt<T>(tc: &hegel::TestCase, f: impl FnOnce(&hegel::TestCase) -> T) -> Option<T> {
++    if tc.draw(generators::booleans()) {
++        Some(f(tc))
++    } else {
++        None
++    }
++}
++
++fn arb_priority(tc: &hegel::TestCase) -> Priority {
++    pick(tc, &[Priority::Required, Priority::Important, Priority::Standard, Priority::Optional, Priority::Extra])
++}
++
++fn arb_multi_arch(tc: &hegel::TestCase) -> MultiArch {
++    pick(tc, &[MultiArch::Same, MultiArch::Foreign, MultiArch::No, MultiArch::Allowed])
++}
++
++fn arb_standards_version(tc: &hegel::TestCase) -> String {
++    let mut s = format!("{}.{}.{}", tc.draw(int!(3, 4)), tc.draw(int!(0, 9)), tc.draw(int!(1, 9)));
++    if tc.draw(generators::booleans()) {
++        s.push_str(&format!(".{}", tc.draw(int!(1, 3))));
++    }
++    s
++}
++
++#[hegel::composite]
++fn arb_control(tc: &hegel::TestCase, verbatim: bool) -> GenControl {
++    let n_up = tc.draw(int!(0, 2)) as usize;
++    let mut source = GenSource {
++        name: pick(tc, NAMES).to_string(),
++        maintainer: pick(tc, PEOPLE).to_string(),
++        uploaders: (0..n_up).map(|_| pick(tc, PEOPLE).to_string()).collect(),
++        section: opt(tc, |tc| pick(tc, SECTIONS).to_string()),
++        priority: opt(tc, arb_priority),
++        standards_version: opt(tc, arb_standards_version),
++        build_depends: opt(tc, |tc| pick(tc, RELATIONS).to_string()),
++        build_depends_indep: opt(tc, |tc| pick(tc, RELATIONS).to_string()),
++        vcs_git: opt(tc, arb_vcs),
++        vcs_browser: opt(tc, |tc| pick(tc, URLS).to_string()),
++        homepage: opt(tc, |tc| pick(tc, URLS).to_string()),
++        rules_requires_root: opt(tc, |_| false),
++        testsuite: opt(tc, |_| "autopkgtest".to_string()),
++        order: Vec::new(),
++    };
++    source.order = permutation(tc, source.fields().len());
++    let n_bin = tc.draw(int!(0, 3)) as usize;
++    let mut names: Vec<String> = Vec::new();
++    let mut binaries = Vec::new();
++    for _ in 0..n_bin {
++        let name = pick(tc, NAMES).to_string();
++        if names.contains(&name) {
++            continue; // distinct package names (dpkg and the model index by name)
++        }
++        names.push(name.clone());
++        let mut b = GenBinary {
++            name,
++            architecture: pick(tc, ARCHES).to_string(),
++            section: opt(tc, |tc| pick(tc, SECTIONS).to_string()),
++            priority: opt(tc, arb_priority),
++            multi_arch: opt(tc, arb_multi_arch),
++            essential: tc.draw(int!(0, 3)) == 0,
++            depends: opt(tc, |tc| pick(tc, RELATIONS).to_string()),
++            recommends: opt(tc, |tc| pick(tc, RELATIONS).to_string()),
++            description: arb_description(tc, verbatim),
++            homepage: opt(tc, |tc| pick(tc, URLS).to_string()),
++            order: Vec::new(),
++        };
++        b.order = permutation(tc, b.fields().len());
++        binaries.push(b);
++    }
++    GenControl { source, binaries, trailing_newline: tc.draw(generators::booleans()) }
++}
++
++/// dpkg's view of a field list: sorted, `.` lines decoded.
++fn as_dpkg(fields: &Fields) -> Fields {
++    let mut f: Fields = fields
++        .iter()
++        .map(|(k, v)| (k.clone(), v.split('\n').map(|l| if l == "." { "" } else { l }).collect::<Vec<_>>().join("\n")))
++        .collect();
++    f.sort();
++    f
++}
++
++/// deb822-lossless's `items()`/`get()` drop the whole continuation indent
++/// (documented there; debian-control's `description()` uses `get_multiline`
++/// to keep the verbatim indentation).
++fn dedent(fields: &Fields) -> Fields {
++    fields.iter().map(|(k, v)| (k.clone(), v.split('\n').map(|l| l.trim_start()).collect::<Vec<_>>().join("\n"))).collect()
++}
++
++fn rel_eq(a: Option<Relations>, b: Option<&String>) -> bool {
++    match (a, b) {
++        (None, None) => true,
++        (Some(a), Some(b)) => a.to_string() == Relations::from_str(b).unwrap().to_string(),
++        _ => false,
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Reading: lossless against dpkg and the model
++// ---------------------------------------------------------------------------
++
++fn check_source(s: &Source, g: &GenSource) {
++    assert_eq!(s.name(), Some(g.name.clone()), "source name");
++    assert_eq!(s.maintainer(), Some(g.maintainer.clone()), "maintainer");
++    assert_eq!(s.uploaders(), if g.uploaders.is_empty() { None } else { Some(g.uploaders.clone()) }, "uploaders");
++    assert_eq!(s.section(), g.section, "section");
++    assert_eq!(s.priority(), g.priority, "priority");
++    assert_eq!(s.standards_version(), g.standards_version, "standards_version");
++    assert!(rel_eq(s.build_depends(), g.build_depends.as_ref()), "build_depends");
++    assert!(rel_eq(s.build_depends_indep(), g.build_depends_indep.as_ref()), "build_depends_indep");
++    assert_eq!(s.vcs_git(), g.vcs_git.as_ref().map(|v| v.text()), "vcs_git");
++    assert_eq!(s.vcs_browser(), g.vcs_browser, "vcs_browser");
++    assert_eq!(s.homepage(), g.homepage.as_ref().map(|u| url::Url::parse(u).unwrap()), "homepage");
++    assert_eq!(s.rules_requires_root(), g.rules_requires_root, "rules_requires_root");
++    assert_eq!(s.testsuite(), g.testsuite, "testsuite");
++    assert_eq!(s.is_qa_package(), g.maintainer.contains("packages@qa.debian.org"), "is_qa_package");
++    let idents: Vec<(String, String)> = s.maintainer_identities().iter().map(|i| (i.name.clone(), i.email.clone())).collect();
++    let (name, email) = debian_control::parse_identity(&g.maintainer).unwrap();
++    assert_eq!(idents, vec![(name.to_string(), email.to_string())], "maintainer identities");
++    let ups: Vec<(String, String)> = s.uploaders_identities().iter().map(|i| (i.name.clone(), i.email.clone())).collect();
++    let expected: Vec<(String, String)> = g
++        .uploaders
++        .iter()
++        .map(|u| {
++            let (n, e) = debian_control::parse_identity(u).unwrap();
++            (n.to_string(), e.to_string())
++        })
++        .collect();
++    assert_eq!(ups, expected, "uploader identities");
++}
++
++fn check_binary(b: &Binary, g: &GenBinary) {
++    assert_eq!(b.name(), Some(g.name.clone()), "package name");
++    assert_eq!(b.architecture(), Some(g.architecture.clone()), "architecture");
++    assert_eq!(b.section(), g.section, "section");
++    assert_eq!(b.priority(), g.priority, "priority");
++    assert_eq!(b.multi_arch(), g.multi_arch, "multi_arch");
++    assert_eq!(b.essential(), g.essential, "essential");
++    assert!(rel_eq(b.depends(), g.depends.as_ref()), "depends");
++    assert!(rel_eq(b.recommends(), g.recommends.as_ref()), "recommends");
++    assert_eq!(b.description(), Some(g.description.value()), "description");
++    assert_eq!(b.homepage(), g.homepage.as_ref().map(|u| url::Url::parse(u).unwrap()), "homepage");
++}
++
++#[hegel::test]
++fn control_files_are_read_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_control(true).print_as_debug());
++    let text = g.text();
++    let c = Control::from_str(&text).expect("a valid control file parses");
++    assert_eq!(c.to_string(), text, "lossless");
++    let s = c.source().expect("a source paragraph");
++    check_source(&s, &g.source);
++    let bins: Vec<Binary> = c.binaries().collect();
++    assert_eq!(bins.len(), g.binaries.len(), "binary count");
++    for (b, gb) in bins.iter().zip(g.binaries.iter()) {
++        check_binary(b, gb);
++    }
++    // Raw fields in order.
++    let raw: Fields = s.as_deb822().items().collect();
++    assert_eq!(raw, g.source.ordered(), "source fields");
++    for (b, gb) in bins.iter().zip(g.binaries.iter()) {
++        let raw: Fields = b.as_deb822().items().collect();
++        assert_eq!(raw, dedent(&gb.ordered()), "binary fields");
++    }
++    // Identity ranges slice the text to the emails.
++    for id in s.maintainer_identities().into_iter().chain(s.uploaders_identities()) {
++        let r = id.email_range;
++        assert_eq!(&text[usize::from(r.start())..usize::from(r.end())], id.email, "email range");
++    }
++    // dpkg reads the same fields.
++    let (dsrc, dpkgs) = dpkg_control(&text).expect("dpkg reads a valid control file");
++    assert_eq!(dsrc, as_dpkg(&g.source.fields()), "dpkg's source fields");
++    assert_eq!(dpkgs.len(), g.binaries.len());
++    for (d, gb) in dpkgs.iter().zip(g.binaries.iter()) {
++        assert_eq!(*d, as_dpkg(&gb.fields()), "dpkg's binary fields");
++    }
++    // Ranges: each binary is found by its own range and no other.
++    for (i, b) in bins.iter().enumerate() {
++        let r = b.as_deb822().text_range();
++        let found: Vec<Option<String>> = c.binaries_in_range(r).map(|x| x.name()).collect();
++        assert_eq!(found, vec![b.name()], "binaries_in_range of binary {i}");
++        assert!(b.overlaps_range(r));
++        assert_eq!(c.source_in_range(r).is_some(), false, "the source does not overlap a binary");
++        let n_fields = b.as_deb822().items().count();
++        assert_eq!(b.fields_in_range(r).count(), n_fields, "fields_in_range of a whole binary");
++    }
++    let sr = s.as_deb822().text_range();
++    assert_eq!(c.source_in_range(sr).map(|s| s.name()), Some(Some(g.source.name.clone())));
++    assert_eq!(c.fields_in_range(sr).count(), g.source.fields().len(), "fields_in_range of the source");
++}
++
++// ---------------------------------------------------------------------------
++// Reading: lossy against the model and the lossless layer
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn lossy_control_files_are_read_like_the_model(tc: hegel::TestCase) {
++    // No verbatim description lines: the lossy layer's indentation is pinned.
++    let g = tc.draw(arb_control(false).print_as_debug());
++    let text = g.text();
++    let l = debian_control::lossy::Control::from_str(&text).expect("lossy parse");
++    let gs = &g.source;
++    assert_eq!(l.source.name, gs.name);
++    assert_eq!(l.source.maintainer, Some(gs.maintainer.clone()));
++    assert_eq!(l.source.uploaders, if gs.uploaders.is_empty() { None } else { Some(gs.uploaders.join(", ")) });
++    assert_eq!(l.source.section, gs.section);
++    assert_eq!(l.source.priority, gs.priority);
++    assert_eq!(l.source.standards_version, gs.standards_version);
++    assert_eq!(l.source.build_depends.as_ref().map(|r| r.to_string()), gs.build_depends.as_ref().map(|r| Relations::from_str(r).unwrap().to_string()), "build_depends");
++    assert_eq!(l.source.homepage, gs.homepage.as_ref().map(|u| url::Url::parse(u).unwrap()));
++    assert_eq!(l.source.vcs_browser, gs.vcs_browser.as_ref().map(|u| url::Url::parse(u).unwrap()));
++    assert_eq!(l.source.vcs_git.as_ref().map(|v| v.to_string()), gs.vcs_git.as_ref().map(|v| GenVcs { path_first: false, ..v.clone() }.text()), "vcs_git");
++    assert_eq!(l.source.rules_requires_root, gs.rules_requires_root);
++    assert_eq!(l.source.testsuite, gs.testsuite);
++    assert_eq!(l.binaries.len(), g.binaries.len());
++    for (b, gb) in l.binaries.iter().zip(g.binaries.iter()) {
++        assert_eq!(b.name, gb.name);
++        assert_eq!(b.architecture, Some(gb.architecture.clone()));
++        assert_eq!(b.section, gb.section);
++        assert_eq!(b.priority, gb.priority);
++        assert_eq!(b.multi_arch, gb.multi_arch);
++        assert_eq!(b.essential, if gb.essential { Some(true) } else { None });
++        assert_eq!(b.depends.as_ref().map(|r| r.to_string()), gb.depends.as_ref().map(|r| Relations::from_str(r).unwrap().to_string()), "depends");
++        assert_eq!(b.description, Some(gb.description.value()), "description");
++    }
++    // Display round trip.
++    let shown = l.to_string();
++    let again = debian_control::lossy::Control::from_str(&shown).expect("lossy re-parse of Display");
++    assert!(again == l, "lossy Display round trip: {shown:?}");
++    // dpkg reads the rendering too (every binary has Package and Architecture).
++    dpkg_control(&shown).expect("dpkg reads the lossy rendering");
++    // The lossless layer agrees on the typed fields.
++    let c = Control::from_str(&text).unwrap();
++    let s = c.source().unwrap();
++    assert_eq!(s.priority(), l.source.priority);
++    assert_eq!(s.section(), l.source.section);
++    assert_eq!(s.homepage(), l.source.homepage);
++    for (b, lb) in c.binaries().zip(l.binaries.iter()) {
++        assert_eq!(b.description(), lb.description, "layers: description");
++        assert_eq!(b.multi_arch(), lb.multi_arch);
++        assert_eq!(b.priority(), lb.priority);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Vcs fields against lintian's grammar
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn vcs_git_values_parse_like_lintian(tc: hegel::TestCase) {
++    let v = arb_vcs(&tc);
++    let text = v.text();
++    let m = lintian_vcs("Git", &text);
++    assert_eq!(m.len(), 3, "lintian matches every generated value");
++    assert_eq!(m[0].as_deref(), Some(v.url.as_str()), "lintian's url");
++    assert_eq!(m[1], v.path, "lintian's path");
++    assert_eq!(m[2], v.branch, "lintian's branch");
++    let p = ParsedVcs::from_str(&text).unwrap();
++    assert_eq!((p.repo_url.as_str(), p.branch.as_deref(), p.subpath.as_deref()), (v.url.as_str(), v.branch.as_deref(), v.path.as_deref()), "ParsedVcs of {text:?}");
++    let again = ParsedVcs::from_str(&p.to_string()).unwrap();
++    assert_eq!(again, p, "ParsedVcs Display round trip");
++    let vcs = Vcs::from_field("Git", &text).unwrap();
++    match &vcs {
++        Vcs::Git { repo_url, branch, subpath } => {
++            assert_eq!((repo_url, branch, subpath), (&v.url, &v.branch, &v.path));
++        }
++        other => panic!("not a Git vcs: {other:?}"),
++    }
++    let (kind, value) = vcs.to_field();
++    assert_eq!(kind, "Git");
++    assert_eq!(ParsedVcs::from_str(&value).unwrap(), p, "to_field round trip");
++    assert_eq!(vcs.subpath(), v.path.as_deref());
++    // Hg: url [-b branch] (no path).
++    let hg = if let Some(b) = &v.branch { format!("{} -b {b}", v.url) } else { v.url.clone() };
++    let m = lintian_vcs("Hg", &hg);
++    assert_eq!(m[0].as_deref(), Some(v.url.as_str()));
++    assert_eq!(m.get(1).cloned().flatten(), v.branch);
++    match Vcs::from_field("Hg", &hg).unwrap() {
++        Vcs::Hg { repo_url } => assert_eq!(repo_url, hg, "Hg keeps the whole value"),
++        other => panic!("{other:?}"),
++    }
++    // Cvs: root [module].
++    let cvs = if let Some(p) = &v.path { format!("{} {p}", v.url) } else { v.url.clone() };
++    let m = lintian_vcs("Cvs", &cvs);
++    match Vcs::from_field("Cvs", &cvs).unwrap() {
++        Vcs::Cvs { root, module } => {
++            assert_eq!(Some(root.as_str()), m[0].as_deref());
++            assert_eq!(module, m.get(1).cloned().flatten());
++        }
++        other => panic!("{other:?}"),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Typed fields
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn typed_fields_round_trip(tc: hegel::TestCase) {
++    let p = arb_priority(&tc);
++    assert_eq!(Priority::from_str(&p.to_string()), Ok(p.clone()));
++    let m = arb_multi_arch(&tc);
++    assert_eq!(MultiArch::from_str(&m.to_string()), Ok(m));
++    let u = pick(&tc, &[Urgency::Low, Urgency::Medium, Urgency::High, Urgency::Emergency, Urgency::Critical]);
++    assert_eq!(Urgency::from_str(&u.to_string()), Ok(u));
++    // Standards-Version: the value survives Display; Ord is the tuple order.
++    let a = (tc.draw(int!(0, 9)) as u8, tc.draw(int!(0, 9)) as u8, tc.draw(int!(0, 9)) as u8, tc.draw(int!(0, 3)) as u8);
++    let b = (tc.draw(int!(0, 9)) as u8, tc.draw(int!(0, 9)) as u8, tc.draw(int!(0, 9)) as u8, tc.draw(int!(0, 3)) as u8);
++    let sa = StandardsVersion::new(a.0, a.1, a.2, a.3);
++    let sb = StandardsVersion::new(b.0, b.1, b.2, b.3);
++    assert_eq!(sa.as_tuple(), a);
++    assert_eq!(StandardsVersion::from_str(&sa.to_string()), Ok(sa));
++    assert_eq!(sa.cmp(&sb), a.cmp(&b));
++    let s = arb_standards_version(&tc);
++    let parsed = StandardsVersion::from_str(&s).unwrap();
++    let comps: Vec<u8> = s.split('.').map(|c| c.parse().unwrap()).collect();
++    assert_eq!(parsed.major(), comps[0]);
++    assert_eq!(parsed.minor(), comps[1]);
++    assert_eq!(parsed.patch(), comps[2]);
++    assert_eq!(parsed.micro(), comps.get(3).copied().unwrap_or(0));
++    // Package-List entries: parse(display) is the same entry (extras as a map).
++    let n = tc.draw(int!(0, 3)) as usize;
++    let keys = ["arch", "profile", "essential", "protected"];
++    let mut e = PackageListEntry::new(&pick(&tc, NAMES), &pick(&tc, &["deb", "udeb"]), &pick(&tc, SECTIONS), arb_priority(&tc));
++    for k in keys.iter().take(n) {
++        e.extra.insert(k.to_string(), pick(&tc, &["amd64,i386", "yes", "!nocheck", "linux-any"]).to_string());
++    }
++    let again = PackageListEntry::from_str(&e.to_string()).unwrap();
++    assert_eq!(again, e, "PackageListEntry round trip: {:?}", e.to_string());
++    // format_description encodes blank lines as ` .` and indents every line.
++    let d = arb_description(&tc, true);
++    let formatted = format_description(&d.synopsis, &d.long.join("\n"));
++    let mut lines = formatted.split('\n');
++    assert_eq!(lines.next(), Some(d.synopsis.as_str()));
++    for (l, g) in lines.zip(d.long.iter()) {
++        if g.is_empty() {
++            assert_eq!(l, " .");
++        } else {
++            assert_eq!(l, format!(" {g}"));
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Building and editing
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn built_control_files_are_read_back(tc: hegel::TestCase) {
++    let g = tc.draw(arb_control(true).print_as_debug());
++    let mut c = Control::new();
++    {
++        let mut s = c.add_source(&g.source.name);
++        s.set_maintainer(&g.source.maintainer);
++        if !g.source.uploaders.is_empty() {
++            let ups: Vec<&str> = g.source.uploaders.iter().map(|s| s.as_str()).collect();
++            s.set_uploaders(&ups);
++        }
++        s.set_section(g.source.section.as_deref());
++        s.set_priority(g.source.priority.clone());
++        if let Some(v) = &g.source.standards_version {
++            s.set_standards_version(v);
++        }
++        if let Some(v) = &g.source.build_depends {
++            s.set_build_depends(&Relations::from_str(v).unwrap());
++        }
++        if let Some(v) = &g.source.build_depends_indep {
++            s.set_build_depends_indep(&Relations::from_str(v).unwrap());
++        }
++        if let Some(v) = &g.source.vcs_git {
++            s.set_vcs_git(&v.text());
++        }
++        s.set_vcs_browser(g.source.vcs_browser.as_deref());
++        if let Some(v) = &g.source.homepage {
++            s.set_homepage(&url::Url::parse(v).unwrap());
++        }
++        if let Some(v) = g.source.rules_requires_root {
++            s.set_rules_requires_root(v);
++        }
++        if let Some(v) = &g.source.testsuite {
++            s.set_testsuite(v);
++        }
++    }
++    for gb in &g.binaries {
++        let mut b = c.add_binary(&gb.name);
++        b.set_architecture(Some(&gb.architecture));
++        b.set_section(gb.section.as_deref());
++        b.set_priority(gb.priority.clone());
++        b.set_multi_arch(gb.multi_arch.clone());
++        b.set_essential(gb.essential);
++        b.set_depends(gb.depends.as_ref().map(|d| Relations::from_str(d).unwrap()).as_ref());
++        b.set_recommends(gb.recommends.as_ref().map(|d| Relations::from_str(d).unwrap()).as_ref());
++        b.set_description(Some(&gb.description.value()));
++        if let Some(v) = &gb.homepage {
++            b.set_homepage(&url::Url::parse(v).unwrap());
++        }
++    }
++    let text = c.to_string();
++    let again = Control::from_str(&text).expect("the built text parses");
++    if !g.has_verbatim() {
++        // With a verbatim description line `set_description` builds a tree
++        // whose tokens differ from the parse of its text (values agree below).
++        assert!(c.tree_eq(&again), "the built tree is the parse of its text: {text:?}");
++    }
++    for cc in [&c, &again] {
++        let s = cc.source().expect("source");
++        check_source(&s, &g.source);
++        let bins: Vec<Binary> = cc.binaries().collect();
++        assert_eq!(bins.len(), g.binaries.len());
++        for (b, gb) in bins.iter().zip(g.binaries.iter()) {
++            check_binary(b, gb);
++        }
++        // Fields are in canonical order: the known ones as listed, the others
++        // (Homepage is not in BINARY_FIELD_ORDER) after them in insertion order.
++        let canonical = |keys: &[String], order: &[&str]| -> Vec<String> {
++            let mut c: Vec<String> = order.iter().filter(|k| keys.contains(&k.to_string())).map(|k| k.to_string()).collect();
++            c.extend(keys.iter().filter(|k| !order.contains(&k.as_str())).cloned());
++            c
++        };
++        let keys: Vec<String> = s.as_deb822().items().map(|(k, _)| k).collect();
++        assert_eq!(keys, canonical(&keys, SOURCE_FIELD_ORDER), "source field order");
++        for b in &bins {
++            let keys: Vec<String> = b.as_deb822().items().map(|(k, _)| k).collect();
++            assert_eq!(keys, canonical(&keys, BINARY_FIELD_ORDER), "binary field order");
++        }
++    }
++    // dpkg reads the built file.
++    let (dsrc, dpkgs) = dpkg_control(&text).expect("dpkg reads the built file");
++    let mut expected_src = as_dpkg(&g.source.fields());
++    // Relations are canonicalised by the setters; compare through the parser.
++    let canon = |f: &mut Fields| {
++        for (k, v) in f.iter_mut() {
++            if k.starts_with("Build-Depends") || k == "Depends" || k == "Recommends" {
++                *v = Relations::from_str(v).unwrap().to_string();
++            }
++        }
++    };
++    canon(&mut expected_src);
++    let mut dsrc = dsrc;
++    canon(&mut dsrc);
++    assert_eq!(dsrc, expected_src, "dpkg's source fields of the built file");
++    assert_eq!(dpkgs.len(), g.binaries.len());
++    // Removing a binary removes exactly that paragraph.
++    if let Some(gb) = g.binaries.first() {
++        let mut c2 = again;
++        assert!(c2.remove_binary(&gb.name));
++        assert!(!c2.remove_binary(&gb.name), "gone");
++        let names: Vec<Option<String>> = c2.binaries().map(|b| b.name()).collect();
++        let expected: Vec<Option<String>> = g.binaries.iter().skip(1).map(|b| Some(b.name.clone())).collect();
++        assert_eq!(names, expected, "remaining binaries");
++        check_source(&c2.source().unwrap(), &g.source);
++        Control::from_str(&c2.to_string()).expect("still parses");
++    }
++}
++
++#[hegel::test]
++fn sort_binaries_orders_the_paragraphs(tc: hegel::TestCase) {
++    let mut g = tc.draw(arb_control(true).print_as_debug());
++    // Moving the last paragraph of a file without a final newline glues it to
++    // its neighbour (deb822-lossless/9); the property needs the newline.
++    g.trailing_newline = true;
++    let keep_first = tc.draw(generators::booleans());
++    let text = g.text();
++    let mut c = Control::from_str(&text).unwrap();
++    c.sort_binaries(keep_first);
++    let names: Vec<String> = c.binaries().map(|b| b.name().unwrap()).collect();
++    let mut expected: Vec<String> = g.binaries.iter().map(|b| b.name.clone()).collect();
++    if keep_first && expected.len() > 1 {
++        expected[1..].sort();
++    } else {
++        expected.sort();
++    }
++    assert_eq!(names, expected, "binary order");
++    // Every paragraph keeps its text; the file re-parses to the same values.
++    let sorted_text = c.to_string();
++    let again = Control::from_str(&sorted_text).expect("sorted text parses");
++    assert!(c.tree_eq(&again), "sorted tree is the parse of its text: {sorted_text:?}");
++    check_source(&again.source().unwrap(), &g.source);
++    for b in again.binaries() {
++        let gb = g.binaries.iter().find(|x| Some(x.name.clone()) == b.name()).unwrap();
++        check_binary(&b, gb);
++        let raw: Fields = b.as_deb822().items().collect();
++        assert_eq!(raw, dedent(&gb.ordered()), "fields untouched");
++    }
++    let (_, dpkgs) = dpkg_control(&sorted_text).expect("dpkg reads the sorted file");
++    assert_eq!(dpkgs.len(), g.binaries.len());
++}
++
++#[hegel::test]
++fn wrap_and_sort_keeps_the_values_and_is_idempotent(tc: hegel::TestCase) {
++    // No verbatim description lines (their indentation under wrap_and_sort is pinned).
++    let g = tc.draw(arb_control(false).print_as_debug());
++    let text = g.text();
++    let mut c = Control::from_str(&text).unwrap();
++    c.wrap_and_sort(deb822_lossless::Indentation::Spaces(1), false, Some(79));
++    let once = c.to_string();
++    // The live tree after wrap_and_sort is not the parse of its text
++    // (deb822-lossless/12: continuation lines are rebuilt as KEY tokens), so
++    // everything below reads the re-parsed text.
++    let again = Control::from_str(&once).expect("wrapped text parses");
++    // Source first, binaries by name.
++    let names: Vec<String> = again.binaries().map(|b| b.name().unwrap()).collect();
++    let mut expected: Vec<String> = g.binaries.iter().map(|b| b.name.clone()).collect();
++    expected.sort();
++    assert_eq!(names, expected, "binary order");
++    assert!(again.as_deb822().paragraphs().next().unwrap().get("Source").is_some(), "source first");
++    // Values survive (relations canonicalised).
++    check_source(&again.source().unwrap(), &g.source);
++    for b in again.binaries() {
++        let gb = g.binaries.iter().find(|x| Some(x.name.clone()) == b.name()).unwrap();
++        check_binary(&b, gb);
++    }
++    let (dsrc, dpkgs) = dpkg_control(&once).expect("dpkg reads the wrapped file");
++    assert_eq!(dsrc.len(), g.source.fields().len());
++    assert_eq!(dpkgs.len(), g.binaries.len());
++    // Idempotent.
++    let mut c2 = again;
++    c2.wrap_and_sort(deb822_lossless::Indentation::Spaces(1), false, Some(79));
++    assert_eq!(c2.to_string(), once, "wrap_and_sort is idempotent");
++}
++
++// ---------------------------------------------------------------------------
++// Pins
++// ---------------------------------------------------------------------------
++
++#[test]
++fn source_vcs_reads_the_vcs_field() {
++    let c = Control::from_str("Source: foo\nVcs-Git: https://salsa.debian.org/foo/foo.git -b debian/latest [pkg]\nVcs-Browser: https://salsa.debian.org/foo/foo\n").unwrap();
++    let s = c.source().unwrap();
++    match s.vcs() {
++        Some(Vcs::Git { repo_url, branch, subpath }) => {
++            assert_eq!(repo_url, "https://salsa.debian.org/foo/foo.git");
++            assert_eq!(branch.as_deref(), Some("debian/latest"));
++            assert_eq!(subpath.as_deref(), Some("pkg"));
++        }
++        other => panic!("Source::vcs() = {other:?}"),
++    }
++}
++
++#[test]
++fn rules_requires_root_accepts_policy_values() {
++    // Policy §5.6.31: `no`, `binary-targets`, or `<namespace>/<case>` keywords.
++    for v in ["binary-targets", "dpkg/target-subcommand", "foo/bar baz/qux"] {
++        let text = format!("Source: foo\nRules-Requires-Root: {v}\n\nPackage: bar\nArchitecture: all\nDescription: x\n");
++        let c = Control::from_str(&text).unwrap();
++        let s = c.source().unwrap();
++        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.rules_requires_root()));
++        assert!(got.is_ok(), "rules_requires_root() panics on {v:?}");
++        assert_eq!(got.unwrap(), Some(true), "{v:?} requires root");
++        debian_control::lossy::Control::from_str(&text).unwrap_or_else(|e| panic!("lossy refuses {v:?}: {e}"));
++    }
++}
++
++#[test]
++fn multi_arch_does_not_panic_on_an_unknown_value() {
++    let c = Control::from_str("Source: foo\n\nPackage: bar\nArchitecture: all\nMulti-Arch: bogus\nDescription: x\n").unwrap();
++    let b = c.binaries().next().unwrap();
++    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.multi_arch()));
++    assert!(got.is_ok(), "multi_arch() panics like priority() does not");
++    assert_eq!(got.unwrap(), None);
++}
++
++#[test]
++fn to_branch_url_without_a_branch_does_not_panic() {
++    let vcs = Vcs::from_field("Git", "https://salsa.debian.org/foo/foo.git").unwrap();
++    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vcs.to_branch_url()));
++    assert!(got.is_ok(), "to_branch_url panics without a branch");
++    assert_eq!(got.unwrap(), Some("https://salsa.debian.org/foo/foo.git".to_string()));
++}
++
++#[test]
++fn vcs_values_with_wider_whitespace_parse_like_lintian() {
++    for text in ["https://x/y.git  -b  main", "https://x/y.git\t-b main", "https://x/y.git -b main  [sub]", "https://x/y.git\t[sub]"] {
++        let m = lintian_vcs("Git", text);
++        let p = ParsedVcs::from_str(text).unwrap();
++        assert_eq!((Some(p.repo_url.as_str()), p.subpath.as_deref(), p.branch.as_deref()), (m[0].as_deref(), m[1].as_deref(), m[2].as_deref()), "{text:?}");
++    }
++}
++
++#[test]
++fn wrap_and_sort_keeps_verbatim_description_lines() {
++    let text = "Source: foo\n\nPackage: bar\nArchitecture: all\nDescription: short\n long\n  verbatim  x\n .\n more\n";
++    let mut c = Control::from_str(text).unwrap();
++    c.wrap_and_sort(deb822_lossless::Indentation::Spaces(1), false, Some(79));
++    // Read the re-parsed text (the live tree is deb822-lossless/12).
++    let again = Control::from_str(&c.to_string()).unwrap();
++    let b = again.binaries().next().unwrap();
++    assert_eq!(b.description(), Some("short\nlong\n verbatim  x\n.\nmore".to_string()), "{}", c.to_string());
++}
++
++#[test]
++fn lossy_descriptions_keep_verbatim_indentation() {
++    let text = "Source: foo\n\nPackage: bar\nArchitecture: all\nDescription: short\n long\n  verbatim  x\n .\n more\n";
++    let l = debian_control::lossy::Control::from_str(text).unwrap();
++    let c = Control::from_str(text).unwrap();
++    assert_eq!(l.binaries[0].description, c.binaries().next().unwrap().description());
++    assert_eq!(l.binaries[0].description.as_deref(), Some("short\nlong\n verbatim  x\n.\nmore"));
++}
++
++#[test]
++fn format_description_feeds_set_description() {
++    let mut c = Control::from_str("Source: foo\n\nPackage: bar\nArchitecture: all\nDescription: x\n").unwrap();
++    let mut b = c.binaries().next().unwrap();
++    b.set_description(Some(&format_description("short", "long\n\nmore")));
++    assert_eq!(b.description(), Some("short\nlong\n.\nmore".to_string()), "{}", b.to_string());
++    let again = Control::from_str(&b.to_string()).unwrap();
++    assert_eq!(again.binaries().next().unwrap().description(), Some("short\nlong\n.\nmore".to_string()));
++}
++
++#[test]
++fn package_list_entries_display_deterministically() {
++    // dpkg-source writes Package-List extras in a fixed order; Display iterates a HashMap.
++    let s = "foo deb misc optional arch=amd64 profile=!nocheck essential=yes protected=yes a=1 b=2";
++    let e = PackageListEntry::from_str(s).unwrap();
++    assert_eq!(e.to_string(), s);
++    let e2 = PackageListEntry::from_str("foo deb misc optional x=a=b").unwrap();
++    assert_eq!(e2.extra.get("x").map(|s| s.as_str()), Some("a=b"), "a value containing `=`");
++}
