@@ -14,8 +14,10 @@ queries, identities), `lossy::control`, the typed values in `fields` (`Priority`
 entry types (`Md5Checksum`, `Sha1Checksum`, `Sha256Checksum`, `Sha512Checksum`, `changes::File`)
 and `pgp::strip_pgp_signature`; and, in `tests/hegel_apt.rs`, the apt index stanzas:
 `lossless::apt::{Package, Source, Release}` (Packages, Sources, Release/InRelease) and their
-`lossy::apt` derive twins. Written in the zoo at 0.3.14 (debian-parsers commit `4dc04da`,
-2026-09-05). The crate is a workspace member: `subdir = "debian-control"`.
+`lossy::apt` derive twins; and, in `tests/hegel_ftpmaster.rs`, `lossy::ftpmaster::Removal` (dak's
+`removals.822` stanzas). That is every module of the crate. Written in the zoo at 0.3.14
+(debian-parsers commit `4dc04da`, 2026-09-05). The crate is a workspace member:
+`subdir = "debian-control"`.
 
 ## The oracles
 
@@ -55,6 +57,11 @@ and `pgp::strip_pgp_signature`; and, in `tests/hegel_apt.rs`, the apt index stan
   them, the **real Packages and InRelease files under `/var/lib/apt/lists`** (Packages decompressed
   with `/usr/lib/apt/apt-helper cat-file`, up to 4000 stanzas; InRelease through
   `strip_pgp_signature`) as a corpus — the two corpus properties return early where there are none.
+- **python-debian's `Deb822`** (raw fields, a Python child in `hegel_ftpmaster.rs`) and **dak's
+  `removals.822`** itself: the 2026 file (3295 stanzas, fields `Date`/`Ftpmaster`/`Suite`/
+  `Sources`/`Binaries`/`Reason`/`Bug`/`Also-Bugs`/`Also-WNPP`, list fields with the first entry
+  on a continuation line, `Also-WNPP:` mostly empty) was surveyed for the model and seven of its
+  stanzas are embedded as a corpus.
 
 `[run] setup` checks that `Dpkg::Deps`, `Dpkg::Control::Info`, `Dpkg::Control`,
 `Dpkg::Control::Types` and `Dpkg::Control::FieldsCore` load, that `gpg` is present, and warns when
@@ -159,7 +166,19 @@ without apt's size padding, `.` blank lines in descriptions):
   lossless getters, the lossy `Display` round-trips (Packages without a source version), dpkg sees
   as many fields as python-debian, apt reads the `Date`.
 
-## Bugs (39, all zoo-original)
+Removals (`tests/hegel_ftpmaster.rs`): `removals_are_read_like_python_debian` — generated dak-style
+stanzas (optional `Suite`, `Sources`, `Binaries` with `[arch, …]`, `Bug`, `Also-Bugs`, empty or
+numbered `Also-WNPP`; list fields with the first entry on the key line — dak's layout is pinned)
+are read field for field, python-debian sees the same values, and the struct's `to_paragraph()`
+reads back equal and is read the same by python-debian; `real_removals_are_read_like_python_debian`
+does the same on the embedded real stanzas (list entries compared without the pinned empty one).
+
+## Bugs (40, all zoo-original)
+
+Removals (found 2026-09-14):
+
+- **debian-control/40** (medium) — `Removal::sources`/`binaries` start with an empty entry for
+  every real dak stanza (`Sources:\n foo` — `lines()` keeps the empty key line).
 
 apt index files (found 2026-09-14):
 
@@ -297,3 +316,7 @@ its own pinned test asserting dpkg's behaviour.
   rest; it parses back, cosmetic. The general generators avoid the pinned shapes: `+0000` dates,
   `Source:` without a version, the lossy `Source` round trip only with one binary and ≤1 trigger,
   well-formed values.
+- Removals: `Removal` has no `Display` and `to_paragraph()` is generic over the paragraph type
+  (`let p: deb822_fast::Paragraph = r.to_paragraph()`); `Also-Bugs`/`Also-WNPP` are not modelled,
+  so a round trip through the struct drops them (a lossy struct — noted, not recorded). The general
+  generator writes list fields with the first entry on the key line; dak's layout is the pin.
