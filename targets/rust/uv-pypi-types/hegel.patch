@@ -1,0 +1,885 @@
+diff --git a/crates/uv-pypi-types/Cargo.toml b/crates/uv-pypi-types/Cargo.toml
+index 81398db..67f52d8 100644
+--- a/crates/uv-pypi-types/Cargo.toml
++++ b/crates/uv-pypi-types/Cargo.toml
+@@ -46,6 +46,7 @@ url = { workspace = true }
+ anyhow = { workspace = true }
+ insta = { workspace = true }
+ serde_json = { workspace = true }
++hegeltest = "0.44.1"
+ 
+ [features]
+ schemars = ["dep:schemars", "uv-normalize/schemars"]
+diff --git a/crates/uv-pypi-types/tests/hegel.rs b/crates/uv-pypi-types/tests/hegel.rs
+new file mode 100644
+index 0000000..f066743
+--- /dev/null
++++ b/crates/uv-pypi-types/tests/hegel.rs
+@@ -0,0 +1,867 @@
++//! Hegel properties for `uv-pypi-types`' metadata module — `Metadata23` (core metadata in the
++//! `METADATA`/`PKG-INFO` email format, and its `core_metadata_format` writer),
++//! `ResolutionMetadata` (`parse_metadata`, `parse_pkg_info`, `parse_pyproject_toml`),
++//! `Metadata10`, `RequiresDist`, `PyProjectToml::requires_python`, and the
++//! `LenientRequirement`/`LenientVersionSpecifiers` fix-ups — with PyPA's **`packaging.metadata`**
++//! (`parse_email`), **`packaging.requirements`/`specifiers`/`version`** and the PEP 621 reference
++//! **`pyproject_metadata`** (`StandardMetadata.from_pyproject`) as the oracles, driven as one
++//! persistent Python child.
++
++use std::collections::BTreeMap;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++use hegel::{generators, TestCase};
++use serde_json::Value;
++use uv_pep440::{Version, VersionSpecifiers};
++use uv_pep508::{Requirement, VersionOrUrl};
++use uv_pypi_types::{
++    LenientRequirement, LenientVersionSpecifiers, Metadata10, Metadata23, MetadataError,
++    PyProjectToml, RequiresDist, ResolutionMetadata, VerbatimParsedUrl,
++};
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import json
++import sys
++import tomllib
++from packaging.metadata import parse_email
++from packaging.requirements import Requirement
++from packaging.specifiers import SpecifierSet
++from packaging.utils import canonicalize_name
++from packaging.version import Version
++from pyproject_metadata import StandardMetadata
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def requirement(text):
++    req = Requirement(text)
++    return {
++        'name': canonicalize_name(req.name),
++        'specs': sorted(str(s).replace(' ', '') for s in req.specifier),
++        'extras': sorted(canonicalize_name(e) for e in req.extras),
++        'marker': req.marker is not None,
++        'url': req.url,
++    }
++
++def pyproject(text):
++    data = tomllib.loads(text)
++    m = StandardMetadata.from_pyproject(data, allow_extra_keys=True)
++    return {
++        'name': str(m.canonical_name),
++        'version': str(m.version) if m.version is not None else None,
++        'requires_python': str(m.requires_python) if m.requires_python is not None else None,
++        'dependencies': [str(r) for r in m.dependencies],
++        'optional': {k: [str(r) for r in v] for k, v in m.optional_dependencies.items()},
++        'dynamic': list(m.dynamic),
++    }
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'E':
++            raw, unparsed = parse_email(args[0])
++            out = ['ok', json.dumps({'raw': raw, 'unparsed': unparsed})]
++        elif cmd == 'R':
++            out = ['ok', json.dumps(requirement(args[0]))]
++        elif cmd == 'S':
++            out = ['ok', json.dumps(sorted(str(s).replace(' ', '') for s in SpecifierSet(args[0])))]
++        elif cmd == 'V':
++            out = ['ok', str(Version(args[0]))]
++        elif cmd == 'N':
++            out = ['ok', canonicalize_name(args[0], validate=True)]
++        elif cmd == 'P':
++            out = ['ok', json.dumps(pyproject(args[0]))]
++        else:
++            out = ['bad', cmd]
++    except Exception as e:
++        out = ['err', f"{type(e).__name__}: {e}"]
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
++        .collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let python = ["python3", "/usr/bin/python3"]
++            .into_iter()
++            .find(|py| {
++                Command::new(py)
++                    .args(["-c", "import packaging.metadata, pyproject_metadata"])
++                    .stdout(Stdio::null())
++                    .stderr(Stdio::null())
++                    .status()
++                    .is_ok_and(|s| s.success())
++            })
++            .expect("a python3 with `packaging` and `pyproject_metadata` is needed as the oracle");
++        let mut child = Command::new(python)
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the packaging oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle {
++            child,
++            stdin,
++            stdout,
++        })
++    })
++}
++
++/// Ask the oracle: the status (`ok` or `err`) and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?})");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(matches!(status.as_str(), "ok" | "err"), "oracle said {reply:?} to {line:?}");
++    (status, it.filter(|s| !s.is_empty()).map(unhex).collect())
++}
++
++fn ask_ok(cmd: &str, args: &[&str]) -> String {
++    let (status, fields) = ask(cmd, args);
++    assert_eq!(status, "ok", "{cmd} {args:?}: {fields:?}");
++    fields.into_iter().next().unwrap_or_default()
++}
++
++fn ask_json(cmd: &str, args: &[&str]) -> Value {
++    serde_json::from_str(&ask_ok(cmd, args)).expect("oracle JSON")
++}
++
++fn ask_result(cmd: &str, args: &[&str]) -> Result<Value, String> {
++    let (status, fields) = ask(cmd, args);
++    if status == "ok" {
++        Ok(serde_json::from_str(&fields[0]).expect("oracle JSON"))
++    } else {
++        Err(fields.join(" "))
++    }
++}
++
++// --------------------------------------------------------------------------- helpers
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    items[n(tc, 0, items.len() - 1)].clone()
++}
++
++fn chance(tc: &TestCase, pct: usize) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++fn strs(v: &Value) -> Vec<String> {
++    v.as_array()
++        .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
++        .unwrap_or_default()
++}
++
++/// The reference's view of a requirement, for comparison with uv's parse.
++#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
++struct ReqView {
++    name: String,
++    specs: Vec<String>,
++    extras: Vec<String>,
++    marker: bool,
++}
++
++fn view_of_json(v: &Value) -> ReqView {
++    ReqView {
++        name: v["name"].as_str().unwrap().to_string(),
++        specs: strs(&v["specs"]),
++        extras: strs(&v["extras"]),
++        marker: v["marker"].as_bool().unwrap(),
++    }
++}
++
++fn view_of_uv(r: &Requirement<VerbatimParsedUrl>) -> ReqView {
++    let mut specs = match &r.version_or_url {
++        Some(VersionOrUrl::VersionSpecifier(vs)) => {
++            vs.iter().map(|s| s.to_string().replace(' ', "")).collect::<Vec<_>>()
++        }
++        Some(VersionOrUrl::Url(_)) => vec!["<url>".to_string()],
++        None => Vec::new(),
++    };
++    specs.sort();
++    let mut extras: Vec<String> = r.extras.iter().map(|e| e.to_string()).collect();
++    extras.sort();
++    extras.dedup();
++    ReqView {
++        name: r.name.to_string(),
++        specs,
++        extras,
++        marker: r.marker.contents().is_some(),
++    }
++}
++
++fn specs_of_uv(vs: &VersionSpecifiers) -> Vec<String> {
++    let mut v: Vec<String> = vs.iter().map(|s| s.to_string().replace(' ', "")).collect();
++    v.sort();
++    v
++}
++
++const NAMES: &[&str] = &["requests", "Flask", "numpy", "a-b_c.d", "Zope.Interface", "x1"];
++const VERSIONS: &[&str] = &["1.0", "2.31.0", "0.1a1", "1.0.post1", "3.9.0rc2", "1.0+local.1", "10"];
++const REQUIREMENTS: &[&str] = &[
++    "requests",
++    "Flask>=2",
++    "numpy (>=1.19,<2)",
++    "a-b_c.d[Extra_1,x]==1.0.*",
++    "Zope.Interface ; python_version >= '3.8'",
++    "x1 ~=1.4 ; sys_platform == \"linux\"",
++    "requests[security] !=2.0.0 ; extra == 'sec'",
++];
++const SPECIFIER_SETS: &[&str] = &[">=3.8", ">=3.8,<4", "~=3.9", "!=3.0.*,>=2.7", ">3.6.0", "==3.12.*"];
++const EXTRAS: &[&str] = &["security", "Extra_1", "tests", "a.b", "x"];
++const WORDS: &[&str] = &[
++    "hello", "World", "a b c", "x/y", "https://example.com/p", "Zoë", "v1.0", "(c) 2026", "a;b", "k=v",
++];
++const CLASSIFIERS: &[&str] = &[
++    "Programming Language :: Python :: 3",
++    "License :: OSI Approved :: MIT License",
++    "Operating System :: OS Independent",
++];
++
++fn word(tc: &TestCase) -> String {
++    pick(tc, WORDS).to_string()
++}
++
++fn words(tc: &TestCase, lo: usize, hi: usize) -> Vec<String> {
++    (0..n(tc, lo, hi)).map(|_| word(tc)).collect()
++}
++
++fn opt_word(tc: &TestCase, pct: usize) -> Option<String> {
++    chance(tc, pct).then(|| word(tc))
++}
++
++// --------------------------------------------------------------------------- generated metadata
++
++/// A generated `METADATA` file: the fields and their rendering.
++#[derive(Debug, Clone, Default)]
++struct Spec {
++    metadata_version: String,
++    name: String,
++    version: String,
++    platforms: Vec<String>,
++    supported_platforms: Vec<String>,
++    summary: Option<String>,
++    description_header: Option<String>,
++    description_body: Option<String>,
++    description_content_type: Option<String>,
++    keywords: Option<Vec<String>>,
++    home_page: Option<String>,
++    download_url: Option<String>,
++    author: Option<String>,
++    author_email: Option<String>,
++    maintainer: Option<String>,
++    maintainer_email: Option<String>,
++    license: Option<String>,
++    license_expression: Option<String>,
++    license_files: Vec<String>,
++    classifiers: Vec<String>,
++    requires_dist: Vec<String>,
++    provides_dist: Vec<String>,
++    obsoletes_dist: Vec<String>,
++    requires_python: Option<String>,
++    requires_external: Vec<String>,
++    project_urls: Vec<(String, String)>,
++    provides_extra: Vec<String>,
++    import_names: Vec<String>,
++    import_namespaces: Vec<String>,
++    dynamic: Vec<String>,
++}
++
++const DYNAMIC_FIELDS: &[&str] = &[
++    "Version",
++    "Requires-Dist",
++    "Provides-Extra",
++    "Requires-Python",
++    "License-File",
++    "Summary",
++];
++
++fn arb_spec(tc: &TestCase) -> Spec {
++    let mut s = Spec {
++        metadata_version: pick(tc, &["1.0", "1.2", "2.1", "2.2", "2.3", "2.4", "2.5"]).to_string(),
++        name: pick(tc, NAMES).to_string(),
++        version: pick(tc, VERSIONS).to_string(),
++        ..Default::default()
++    };
++    s.platforms = words(tc, 0, 2);
++    s.supported_platforms = words(tc, 0, 2);
++    s.summary = opt_word(tc, 50);
++    match n(tc, 0, 3) {
++        0 => s.description_header = Some(word(tc)),
++        1 => s.description_body = Some(format!("{}\n\n{}\n", word(tc), word(tc))),
++        2 => s.description_body = Some(word(tc)),
++        _ => {}
++    }
++    s.description_content_type = chance(tc, 30).then(|| pick(tc, &["text/markdown", "text/x-rst"]).to_string());
++    s.keywords = chance(tc, 40).then(|| (0..n(tc, 1, 3)).map(|_| pick(tc, &["dog", "puppy", "voting", "x-y"]).to_string()).collect());
++    s.home_page = opt_word(tc, 30);
++    s.download_url = opt_word(tc, 20);
++    s.author = opt_word(tc, 40);
++    s.author_email = chance(tc, 30).then(|| "Ann <ann@example.com>".to_string());
++    s.maintainer = opt_word(tc, 20);
++    s.maintainer_email = chance(tc, 20).then(|| "m@example.com".to_string());
++    s.license = opt_word(tc, 40);
++    s.license_expression = chance(tc, 30).then(|| pick(tc, &["MIT", "Apache-2.0 OR BSD-2-Clause"]).to_string());
++    s.license_files = (0..n(tc, 0, 2)).map(|_| pick(tc, &["LICENSE", "LICENSES/MIT.txt"]).to_string()).collect();
++    s.classifiers = (0..n(tc, 0, 3)).map(|_| pick(tc, CLASSIFIERS).to_string()).collect();
++    s.requires_dist = (0..n(tc, 0, 4)).map(|_| pick(tc, REQUIREMENTS).to_string()).collect();
++    s.provides_dist = (0..n(tc, 0, 1)).map(|_| pick(tc, NAMES).to_string()).collect();
++    s.obsoletes_dist = (0..n(tc, 0, 1)).map(|_| pick(tc, NAMES).to_string()).collect();
++    s.requires_python = chance(tc, 50).then(|| pick(tc, SPECIFIER_SETS).to_string());
++    s.requires_external = words(tc, 0, 1);
++    let labels: Vec<&str> = ["Homepage", "Bug Tracker", "Docs"].into_iter().take(n(tc, 0, 3)).collect();
++    s.project_urls = labels.iter().map(|l| (l.to_string(), format!("https://example.com/{}", l.to_lowercase().replace(' ', "-")))).collect();
++    s.provides_extra = (0..n(tc, 0, 3)).map(|_| pick(tc, EXTRAS).to_string()).collect();
++    s.import_names = (0..n(tc, 0, 2)).map(|_| pick(tc, &["spam.foo", "spam.eggs; private", "ham"]).to_string()).collect();
++    s.import_namespaces = (0..n(tc, 0, 1)).map(|_| pick(tc, &["zope", "flask_ext"]).to_string()).collect();
++    s.dynamic = (0..n(tc, 0, 2)).map(|_| pick(tc, DYNAMIC_FIELDS).to_string()).collect();
++    s
++}
++
++impl Spec {
++    /// Render as email-style metadata, headers in a random-but-stable order per kind.
++    fn render(&self, tc: &TestCase) -> String {
++        let mut headers: Vec<(String, Vec<String>)> = Vec::new();
++        let mut single = |key: &str, value: &Option<String>| {
++            if let Some(v) = value {
++                headers.push((key.to_string(), vec![v.clone()]));
++            }
++        };
++        single("Summary", &self.summary);
++        single("Description", &self.description_header);
++        single("Description-Content-Type", &self.description_content_type);
++        single("Keywords", &self.keywords.as_ref().map(|k| k.join(",")));
++        single("Home-page", &self.home_page);
++        single("Download-URL", &self.download_url);
++        single("Author", &self.author);
++        single("Author-email", &self.author_email);
++        single("Maintainer", &self.maintainer);
++        single("Maintainer-email", &self.maintainer_email);
++        single("License", &self.license);
++        single("License-Expression", &self.license_expression);
++        single("Requires-Python", &self.requires_python);
++        let mut multi = |key: &str, values: &[String]| {
++            if !values.is_empty() {
++                headers.push((key.to_string(), values.to_vec()));
++            }
++        };
++        multi("Platform", &self.platforms);
++        multi("Supported-Platform", &self.supported_platforms);
++        multi("License-File", &self.license_files);
++        multi("Classifier", &self.classifiers);
++        multi("Requires-Dist", &self.requires_dist);
++        multi("Provides-Dist", &self.provides_dist);
++        multi("Obsoletes-Dist", &self.obsoletes_dist);
++        multi("Requires-External", &self.requires_external);
++        multi(
++            "Project-URL",
++            &self.project_urls.iter().map(|(l, u)| format!("{l}, {u}")).collect::<Vec<_>>(),
++        );
++        multi("Provides-Extra", &self.provides_extra);
++        multi("Import-Name", &self.import_names);
++        multi("Import-Namespace", &self.import_namespaces);
++        multi("Dynamic", &self.dynamic);
++        // Shuffle the header kinds (draw-driven), keeping the mandatory three first.
++        let mut out = format!(
++            "Metadata-Version: {}\nName: {}\nVersion: {}\n",
++            self.metadata_version, self.name, self.version
++        );
++        let mut rest = headers;
++        while !rest.is_empty() {
++            let (key, values) = rest.remove(n(tc, 0, rest.len() - 1));
++            for v in values {
++                out.push_str(&format!("{key}: {v}\n"));
++            }
++        }
++        if let Some(body) = &self.description_body {
++            out.push('\n');
++            out.push_str(body);
++        }
++        out
++    }
++}
++
++fn opt_str(v: &Value, key: &str) -> Option<String> {
++    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
++}
++
++fn list(v: &Value, key: &str) -> Vec<String> {
++    v.get(key).map(strs).unwrap_or_default()
++}
++
++// --------------------------------------------------------------------------- properties
++
++/// `Metadata23::parse` reads every core-metadata field exactly as `packaging.metadata.parse_email`
++/// does (strings, multi-use lists in order, keywords, project URLs, the description as header or
++/// body), leaves nothing unparsed, and `core_metadata_format` round-trips the value.
++#[hegel::test]
++fn metadata23_fields_match_packaging(tc: TestCase) {
++    let spec = arb_spec(&tc);
++    let text = spec.render(&tc);
++    let parsed = Metadata23::parse(text.as_bytes()).unwrap_or_else(|e| panic!("{e}\n{text}"));
++    let ref_ = ask_json("E", &[&text]);
++    let raw = &ref_["raw"];
++    assert_eq!(ref_["unparsed"].as_object().map(|o| o.len()).unwrap_or(0), 0, "unparsed: {}\n{text}", ref_["unparsed"]);
++    assert_eq!(Some(parsed.metadata_version.clone()), opt_str(raw, "metadata_version"), "{text}");
++    assert_eq!(Some(parsed.name.clone()), opt_str(raw, "name"));
++    assert_eq!(Some(parsed.version.clone()), opt_str(raw, "version"));
++    assert_eq!(parsed.platforms, list(raw, "platforms"), "{text}");
++    assert_eq!(parsed.supported_platforms, list(raw, "supported_platforms"));
++    assert_eq!(parsed.summary, opt_str(raw, "summary"), "{text}");
++    assert_eq!(parsed.description, opt_str(raw, "description"), "{text}");
++    assert_eq!(parsed.description_content_type, opt_str(raw, "description_content_type"));
++    assert_eq!(parsed.keywords.as_ref().map(|k| k.as_metadata()), raw.get("keywords").map(|k| strs(k).join(",")), "{text}");
++    assert_eq!(parsed.home_page, opt_str(raw, "home_page"));
++    assert_eq!(parsed.download_url, opt_str(raw, "download_url"));
++    assert_eq!(parsed.author, opt_str(raw, "author"));
++    assert_eq!(parsed.author_email, opt_str(raw, "author_email"));
++    assert_eq!(parsed.maintainer, opt_str(raw, "maintainer"));
++    assert_eq!(parsed.maintainer_email, opt_str(raw, "maintainer_email"));
++    assert_eq!(parsed.license, opt_str(raw, "license"));
++    assert_eq!(parsed.license_expression, opt_str(raw, "license_expression"));
++    assert_eq!(parsed.license_files, list(raw, "license_files"));
++    assert_eq!(parsed.classifiers, list(raw, "classifiers"));
++    assert_eq!(parsed.requires_dist, list(raw, "requires_dist"), "{text}");
++    assert_eq!(parsed.provides_dist, list(raw, "provides_dist"));
++    assert_eq!(parsed.obsoletes_dist, list(raw, "obsoletes_dist"));
++    assert_eq!(parsed.requires_python, opt_str(raw, "requires_python"));
++    assert_eq!(parsed.requires_external, list(raw, "requires_external"));
++    let urls: BTreeMap<String, String> = parsed
++        .project_urls
++        .to_vec_str()
++        .iter()
++        .map(|s| {
++            let (l, u) = s.split_once(", ").unwrap();
++            (l.to_string(), u.to_string())
++        })
++        .collect();
++    let ref_urls: BTreeMap<String, String> = raw
++        .get("project_urls")
++        .and_then(|o| o.as_object())
++        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect())
++        .unwrap_or_default();
++    assert_eq!(urls, ref_urls, "{text}");
++    assert_eq!(parsed.provides_extra, list(raw, "provides_extra"));
++    assert_eq!(parsed.import_names, list(raw, "import_names"));
++    assert_eq!(parsed.import_namespaces, list(raw, "import_namespaces"));
++    assert_eq!(parsed.dynamic, list(raw, "dynamic"));
++    // `FromStr` is `parse`.
++    assert_eq!(Metadata23::from_str(&text).unwrap(), parsed);
++    // Writer round trip.
++    let written = parsed.core_metadata_format();
++    let again = Metadata23::parse(written.as_bytes()).unwrap_or_else(|e| panic!("{e}\n{written}"));
++    assert_eq!(again, parsed, "round trip through\n{written}");
++}
++
++/// `ResolutionMetadata::parse_metadata` agrees with packaging on the resolution fields (name
++/// normalised, version, `Requires-Dist`, `Requires-Python`, `Provides-Extra`, dynamic version);
++/// `parse_pkg_info` is the same read behind the Metadata-Version and `Dynamic` gates;
++/// `Metadata10` reads name and version.
++#[hegel::test]
++fn resolution_metadata_matches_packaging(tc: TestCase) {
++    let spec = arb_spec(&tc);
++    let text = spec.render(&tc);
++    let raw = &ask_json("E", &[&text])["raw"];
++    let meta = ResolutionMetadata::parse_metadata(text.as_bytes()).unwrap_or_else(|e| panic!("{e}\n{text}"));
++    assert_eq!(meta.name.to_string(), ask_ok("N", &[&spec.name]));
++    assert_eq!(meta.version.to_string(), ask_ok("V", &[&spec.version]));
++    let expected: Vec<ReqView> = list(raw, "requires_dist").iter().map(|r| view_of_json(&ask_json("R", &[r]))).collect();
++    let actual: Vec<ReqView> = meta.requires_dist.iter().map(view_of_uv).collect();
++    assert_eq!(actual, expected, "{text}");
++    let expected_python = spec.requires_python.as_deref().map(|s| strs(&ask_json("S", &[s])));
++    assert_eq!(meta.requires_python.as_ref().map(specs_of_uv), expected_python, "{text}");
++    let expected_extras: Vec<String> = spec.provides_extra.iter().map(|e| ask_ok("N", &[e])).collect();
++    let actual_extras: Vec<String> = meta.provides_extra.iter().map(|e| e.to_string()).collect();
++    assert_eq!(actual_extras, expected_extras);
++    assert_eq!(meta.dynamic, spec.dynamic.iter().any(|d| d == "Version"), "{text}");
++
++    let ten = Metadata10::parse_pkg_info(text.as_bytes()).unwrap();
++    assert_eq!(ten.name, meta.name);
++    assert_eq!(ten.version, spec.version);
++
++    let pkg_info = ResolutionMetadata::parse_pkg_info(text.as_bytes());
++    let (major, minor) = spec.metadata_version.split_once('.').unwrap();
++    let mv: (u8, u8) = (major.parse().unwrap(), minor.parse().unwrap());
++    let blocked = spec
++        .dynamic
++        .iter()
++        .find(|d| matches!(d.as_str(), "Requires-Dist" | "Requires-Python" | "Provides-Extra"));
++    if mv < (2, 2) {
++        assert!(matches!(pkg_info, Err(MetadataError::UnsupportedMetadataVersion(_))), "{pkg_info:?}\n{text}");
++    } else if let Some(field) = blocked {
++        match pkg_info {
++            Err(MetadataError::DynamicField(f)) => assert!(spec.dynamic.iter().any(|d| d == f), "{f} vs {field}"),
++            other => panic!("expected a DynamicField error for {field}, got {other:?}\n{text}"),
++        }
++    } else {
++        let pkg_info = pkg_info.unwrap_or_else(|e| panic!("{e}\n{text}"));
++        assert_eq!(serde_json::to_value(&pkg_info).unwrap(), serde_json::to_value(&meta).unwrap(), "{text}");
++    }
++}
++
++/// Valid requirements and specifier sets pass through the lenient parsers unchanged.
++#[hegel::test]
++fn lenient_parsing_is_transparent_on_valid_input(tc: TestCase) {
++    let text = pick(&tc, REQUIREMENTS);
++    let strict = Requirement::<VerbatimParsedUrl>::from_str(text).unwrap();
++    let lenient: Requirement<VerbatimParsedUrl> = LenientRequirement::from_str(text).unwrap().into();
++    assert_eq!(lenient, strict);
++    assert_eq!(view_of_uv(&lenient), view_of_json(&ask_json("R", &[text])), "{text}");
++    let specs = pick(&tc, SPECIFIER_SETS);
++    let strict = VersionSpecifiers::from_str(specs).unwrap();
++    let lenient: VersionSpecifiers = LenientVersionSpecifiers::from_str(specs).unwrap().into();
++    assert_eq!(lenient, strict);
++    assert_eq!(specs_of_uv(&lenient), strs(&ask_json("S", &[specs])), "{specs}");
++}
++
++/// One version specifier with the given component digits.
++fn arb_version(tc: &TestCase, max_digit: usize) -> String {
++    (0..n(tc, 1, 3)).map(|_| n(tc, 0, max_digit).to_string()).collect::<Vec<_>>().join(".")
++}
++
++/// A documented breakage of a valid specifier set, and the set the fix-up should recover.
++fn arb_breakage(tc: &TestCase, max_digit: usize) -> (String, String, &'static str) {
++    let v = arb_version(tc, max_digit);
++    let ops = ["<=", ">=", "<", ">"];
++    match n(tc, 0, 7) {
++        0 => {
++            // Missing comma between two specifiers.
++            let w = arb_version(tc, max_digit);
++            let (a, b) = (pick(tc, &ops), pick(tc, &ops));
++            (format!("{a}{v}{b}{w}"), format!("{a}{v},{b}{w}"), "missing comma")
++        }
++        1 => (format!("!=~{v},>=1"), format!("!={v}.*,>=1"), "invalid tilde"),
++        2 => {
++            let op = pick(tc, &ops);
++            let space = if chance(tc, 50) { " " } else { "" };
++            (format!("{op}{space}{v}.*"), format!("{op}{v}"), "star after comparison")
++        }
++        3 => {
++            let v = format!("{}.{}", n(tc, 0, max_digit), n(tc, 0, max_digit));
++            (format!(">=2.7,!={v}*"), format!(">=2.7,!={v}.*"), "missing dot")
++        }
++        4 => {
++            let space = if chance(tc, 50) { " " } else { "" };
++            (format!(">={v},{space}"), format!(">={v}"), "trailing comma")
++        }
++        5 => (">dev".to_string(), ">0.0.0dev".to_string(), "dev"),
++        6 => {
++            let tag = pick(tc, &["a", "b", "rc", "post", "dev"]);
++            let k = n(tc, 0, max_digit);
++            (format!(">={v}{tag}{k}.0"), format!(">={v}{tag}{k}"), "trailing zero")
++        }
++        _ => {
++            let q = pick(tc, &["'", "\""]);
++            match n(tc, 0, 2) {
++                0 => (format!(">= {q}{v}{q}"), format!(">={v}"), "quoted version"),
++                1 => (format!(">={v}{q}"), format!(">={v}"), "stray quote"),
++                _ => (format!("{q}>={v}{q}"), format!(">={v}"), "quoted specifier"),
++            }
++        }
++    }
++}
++
++fn check_breakage(broken: &str, expected: &str, what: &str, tc: &TestCase) {
++    let expected_set = VersionSpecifiers::from_str(expected).unwrap_or_else(|e| panic!("{expected}: {e}"));
++    let fixed: VersionSpecifiers = LenientVersionSpecifiers::from_str(broken)
++        .unwrap_or_else(|e| panic!("{what}: {broken:?} not repaired: {e}"))
++        .into();
++    assert_eq!(fixed, expected_set, "{what}: {broken:?}");
++    let name = pick(tc, NAMES);
++    let marker = if chance(tc, 30) { " ; python_version >= '3.8'" } else { "" };
++    let (req_broken, req_expected) = if chance(tc, 40) {
++        (format!("{name} ({broken}){marker}"), format!("{name} ({expected}){marker}"))
++    } else {
++        (format!("{name} {broken}{marker}"), format!("{name} {expected}{marker}"))
++    };
++    let expected_req = Requirement::<VerbatimParsedUrl>::from_str(&req_expected).unwrap();
++    let fixed: Requirement<VerbatimParsedUrl> = LenientRequirement::from_str(&req_broken)
++        .unwrap_or_else(|e| panic!("{what}: {req_broken:?} not repaired: {e}"))
++        .into();
++    assert_eq!(fixed, expected_req, "{what}: {req_broken:?}");
++}
++
++/// Each documented fix-up repairs its breakage to the intended specifier set (and requirement),
++/// for versions with single-digit components.
++#[hegel::test]
++fn lenient_parsing_repairs_documented_breakages(tc: TestCase) {
++    let (broken, expected, what) = arb_breakage(&tc, 9);
++    check_breakage(&broken, &expected, what, &tc);
++}
++
++/// Pinned: uv-pypi-types/2 — the "missing dot" and "invalid tilde" fix-ups match single digits
++/// only (`(\d\.\d)+\*`, `!=~((?:\d\.)*\d)`): `!=3.10*` and `!=~5.10` are not repaired.
++#[hegel::test]
++fn lenient_fixups_handle_multi_digit_components(tc: TestCase) {
++    let major = n(&tc, 0, 9);
++    let minor = n(&tc, 10, 99);
++    let (broken, expected, what) = if chance(&tc, 50) {
++        (format!(">=2.7,!={major}.{minor}*"), format!(">=2.7,!={major}.{minor}.*"), "missing dot")
++    } else {
++        (format!("!=~{major}.{minor},>=1"), format!("!={major}.{minor}.*,>=1"), "invalid tilde")
++    };
++    check_breakage(&broken, &expected, what, &tc);
++}
++
++/// Pinned: uv-pypi-types/1 — `Dynamic` field names are matched case-sensitively
++/// (`field == "Requires-Dist"`), where core metadata field names are case-insensitive and
++/// `packaging` lowercases them: a `PKG-INFO` with `Dynamic: requires-dist` is trusted.
++#[hegel::test]
++fn dynamic_field_names_are_case_insensitive(tc: TestCase) {
++    let field = pick(&tc, &["Requires-Dist", "Requires-Python", "Provides-Extra"]);
++    let spelling = match n(&tc, 0, 2) {
++        0 => field.to_lowercase(),
++        1 => field.to_uppercase(),
++        _ => {
++            let (a, b) = field.split_once('-').unwrap();
++            format!("{}-{}", a.to_lowercase(), b)
++        }
++    };
++    let version_spelling = pick(&tc, &["version", "VERSION"]);
++    let text = format!(
++        "Metadata-Version: 2.3\nName: x\nVersion: 1.0\nDynamic: {spelling}\nDynamic: {version_spelling}\n"
++    );
++    let ref_ = ask_json("E", &[&text]);
++    assert_eq!(list(&ref_["raw"], "dynamic"), vec![spelling.clone(), version_spelling.to_string()]);
++    let pkg_info = ResolutionMetadata::parse_pkg_info(text.as_bytes());
++    assert!(
++        matches!(pkg_info, Err(MetadataError::DynamicField(_))),
++        "Dynamic: {spelling} should block reading PKG-INFO, got {pkg_info:?}"
++    );
++    let meta = ResolutionMetadata::parse_metadata(text.as_bytes()).unwrap();
++    assert!(meta.dynamic, "Dynamic: {version_spelling} should mark the version dynamic");
++}
++
++// --------------------------------------------------------------------------- pyproject.toml
++
++struct PyprojectSpec {
++    name: String,
++    version: Option<String>,
++    requires_python: Option<String>,
++    dependencies: Option<Vec<String>>,
++    optional: Vec<(String, Vec<String>)>,
++    dynamic: Vec<String>,
++    poetry: bool,
++}
++
++fn toml_str(s: &str) -> String {
++    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
++}
++
++fn arb_pyproject(tc: &TestCase) -> (PyprojectSpec, String) {
++    let mut dynamic: Vec<String> = Vec::new();
++    for field in ["version", "dependencies", "optional-dependencies", "requires-python", "description"] {
++        if chance(tc, 12) {
++            dynamic.push(field.to_string());
++        }
++    }
++    let spec = PyprojectSpec {
++        name: pick(tc, NAMES).to_string(),
++        // PEP 621: the version is either given or declared dynamic.
++        version: (!dynamic.iter().any(|d| d == "version")).then(|| pick(tc, VERSIONS).to_string()),
++        requires_python: (!dynamic.iter().any(|d| d == "requires-python") && chance(tc, 60)).then(|| pick(tc, SPECIFIER_SETS).to_string()),
++        dependencies: (!dynamic.iter().any(|d| d == "dependencies") && chance(tc, 75))
++            .then(|| (0..n(tc, 0, 3)).map(|_| pick(tc, REQUIREMENTS).to_string()).collect()),
++        optional: if !dynamic.iter().any(|d| d == "optional-dependencies") && chance(tc, 50) {
++            let mut seen = Vec::new();
++            let mut out = Vec::new();
++            for _ in 0..n(tc, 1, 2) {
++                let extra = pick(tc, EXTRAS).to_string();
++                let canonical = extra.to_lowercase().replace(['_', '.'], "-");
++                if seen.contains(&canonical) {
++                    continue;
++                }
++                seen.push(canonical);
++                out.push((extra, (0..n(tc, 0, 2)).map(|_| pick(tc, REQUIREMENTS).to_string()).collect()));
++            }
++            out
++        } else {
++            Vec::new()
++        },
++        dynamic,
++        poetry: chance(tc, 15),
++    };
++    let mut toml = String::from("[project]\n");
++    toml.push_str(&format!("name = {}\n", toml_str(&spec.name)));
++    if let Some(v) = &spec.version {
++        toml.push_str(&format!("version = {}\n", toml_str(v)));
++    }
++    if let Some(rp) = &spec.requires_python {
++        toml.push_str(&format!("requires-python = {}\n", toml_str(rp)));
++    }
++    if let Some(deps) = &spec.dependencies {
++        toml.push_str(&format!("dependencies = [{}]\n", deps.iter().map(|d| toml_str(d)).collect::<Vec<_>>().join(", ")));
++    }
++    if !spec.dynamic.is_empty() {
++        toml.push_str(&format!("dynamic = [{}]\n", spec.dynamic.iter().map(|d| toml_str(d)).collect::<Vec<_>>().join(", ")));
++    }
++    if !spec.optional.is_empty() {
++        toml.push_str("\n[project.optional-dependencies]\n");
++        for (extra, deps) in &spec.optional {
++            toml.push_str(&format!("{} = [{}]\n", toml_str(extra), deps.iter().map(|d| toml_str(d)).collect::<Vec<_>>().join(", ")));
++        }
++    }
++    if spec.poetry {
++        toml.push_str("\n[tool.poetry]\nname = \"poetic\"\n");
++    }
++    (spec, toml)
++}
++
++/// `ResolutionMetadata::parse_pyproject_toml`, `RequiresDist::from_pyproject_toml` and
++/// `PyProjectToml::requires_python` agree with `pyproject_metadata` on PEP 621 metadata:
++/// normalised name, version, requires-python, dependencies plus optional dependencies under
++/// `extra == …` markers, the extras, and the dynamic gates uv documents.
++#[hegel::test]
++fn pyproject_metadata_matches_the_reference(tc: TestCase) {
++    let (spec, toml) = arb_pyproject(&tc);
++    let reference = ask_result("P", &[&toml]).unwrap_or_else(|e| panic!("reference: {e}\n{toml}"));
++    let pyproject = PyProjectToml::from_toml(&toml, "pyproject.toml").unwrap_or_else(|e| panic!("{e}\n{toml}"));
++    let has = |d: &str| spec.dynamic.iter().any(|x| x == d);
++    let sdist_version = chance(&tc, 50).then(|| Version::from_str(pick(&tc, VERSIONS)).unwrap());
++
++    // requires_python() only cares about its own field being dynamic.
++    let rp = pyproject.requires_python();
++    if has("requires-python") {
++        assert!(matches!(rp, Err(MetadataError::DynamicField("requires-python"))), "{rp:?}\n{toml}");
++    } else {
++        let expected = reference["requires_python"].as_str().map(|s| strs(&ask_json("S", &[s])));
++        assert_eq!(rp.unwrap().as_ref().map(specs_of_uv), expected, "{toml}");
++    }
++
++    // Expected requirements: dependencies, then each extra's, marked with the extra.
++    let mut expected: Vec<(ReqView, Option<String>)> = strs(&reference["dependencies"])
++        .iter()
++        .map(|d| (view_of_json(&ask_json("R", &[d])), None))
++        .collect();
++    let mut expected_extras: Vec<String> = Vec::new();
++    if let Some(optional) = reference["optional"].as_object() {
++        for (extra, deps) in optional {
++            let canonical = ask_ok("N", &[extra]);
++            for d in strs(deps) {
++                let mut view = view_of_json(&ask_json("R", &[&d]));
++                view.marker = true;
++                expected.push((view, Some(canonical.clone())));
++            }
++            expected_extras.push(canonical);
++        }
++    }
++    let check_requirements = |requires_dist: &[Requirement<VerbatimParsedUrl>], provides_extra: &[String]| {
++        // The reference's optional-dependency table arrives sorted by extra (JSON object), uv keeps
++        // the TOML order: compare as sorted lists.
++        let mut actual: Vec<(ReqView, Option<String>)> = requires_dist
++            .iter()
++            .map(|r| {
++                let marker = r.marker.contents().map(|c| c.to_string()).unwrap_or_default();
++                let extra = expected_extras.iter().find(|e| marker.contains(&format!("extra == '{e}'"))).cloned();
++                (view_of_uv(r), extra)
++            })
++            .collect();
++        actual.sort();
++        let mut expected = expected.clone();
++        expected.sort();
++        assert_eq!(actual, expected, "{toml}");
++        let mut provides_extra = provides_extra.to_vec();
++        provides_extra.sort();
++        let mut expected_extras = expected_extras.clone();
++        expected_extras.sort();
++        assert_eq!(provides_extra, expected_extras, "{toml}");
++    };
++
++    let meta = ResolutionMetadata::parse_pyproject_toml(pyproject.clone(), sdist_version.as_ref());
++    let requires = RequiresDist::from_pyproject_toml(pyproject.clone());
++    // The crate walks `dynamic` in order and stops at the first field it cannot tolerate.
++    let meta_block = spec.dynamic.iter().find(|d| {
++        matches!(d.as_str(), "dependencies" | "optional-dependencies" | "requires-python")
++            || (d.as_str() == "version" && sdist_version.is_none())
++    });
++    let requires_block = spec
++        .dynamic
++        .iter()
++        .find(|d| matches!(d.as_str(), "dependencies" | "optional-dependencies"));
++    let poetry_blocks = spec.poetry && spec.dependencies.is_none();
++    if let Some(field) = meta_block {
++        assert!(matches!(&meta, Err(MetadataError::DynamicField(f)) if *f == field.as_str()), "{meta:?}\n{toml}");
++    } else if poetry_blocks {
++        assert!(matches!(&meta, Err(MetadataError::PoetrySyntax)), "{meta:?}\n{toml}");
++    } else if spec.version.is_none() && sdist_version.is_none() {
++        assert!(matches!(&meta, Err(MetadataError::FieldNotFound("version"))), "{meta:?}\n{toml}");
++    } else {
++        let meta = meta.unwrap_or_else(|e| panic!("{e}\n{toml}"));
++        assert_eq!(meta.name.to_string(), reference["name"].as_str().unwrap(), "{toml}");
++        let expected_version = spec.version.as_deref().map(|v| ask_ok("V", &[v])).or_else(|| sdist_version.as_ref().map(|v| v.to_string()));
++        assert_eq!(Some(meta.version.to_string()), expected_version, "{toml}");
++        let expected_python = reference["requires_python"].as_str().map(|s| strs(&ask_json("S", &[s])));
++        assert_eq!(meta.requires_python.as_ref().map(specs_of_uv), expected_python, "{toml}");
++        assert_eq!(meta.dynamic, has("version"), "{toml}");
++        let extras: Vec<String> = meta.provides_extra.iter().map(|e| e.to_string()).collect();
++        check_requirements(&meta.requires_dist, &extras);
++    }
++    if let Some(field) = requires_block {
++        assert!(matches!(&requires, Err(MetadataError::DynamicField(f)) if *f == field.as_str()), "{requires:?}\n{toml}");
++        return;
++    }
++    if poetry_blocks {
++        assert!(matches!(&requires, Err(MetadataError::PoetrySyntax)), "{requires:?}\n{toml}");
++        return;
++    }
++    let requires = requires.unwrap_or_else(|e| panic!("{e}\n{toml}"));
++    assert_eq!(requires.name.to_string(), reference["name"].as_str().unwrap());
++    assert_eq!(requires.dynamic, has("version"));
++    let extras: Vec<String> = requires.provides_extra.iter().map(|e| e.to_string()).collect();
++    check_requirements(&requires.requires_dist, &extras);
++}
