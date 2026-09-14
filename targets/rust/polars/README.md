@@ -27,3 +27,4 @@
 - 2026-09-13: base bumped 1f6362635a59 → ccff55e4f507 (2026-09-12, "perf: Improve cache-removal and join-order cost estimates (#29263)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-13: base bumped ccff55e4f507 → a8811c306720 (2026-09-13, "perf: Use stats to decide cross join buffering side (#29270)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-13: base bumped a8811c306720 → d84c1d4f28b0 (2026-09-13, "feat: Fix tpch SQL issues  (#29269)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-14: base bumped d84c1d4f28b0 → effe7e05942f (2026-09-14, "perf: Push inner joins before outer joins and rewrite left-join-is-null to anti join (#29277)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
