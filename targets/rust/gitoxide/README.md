@@ -22,3 +22,4 @@
 - 2026-09-13: base bumped 19beb949b897 → 4f29e0cd4c85 (2026-09-13, "Merge pull request #2992 from GitoxideLabs/fix-message-newline"; 0.58.0); 2 bug(s) still reproduce. 656 tests pass.
 - 2026-09-14: base bumped 4f29e0cd4c85 → c609062db5e7 (2026-09-14, "Merge pull request #2990 from GitoxideLabs/various-improvements"; 0.58.0); 2 bug(s) still reproduce. 656 tests pass.
 - 2026-09-14: base bumped c609062db5e7 → 65c5dfe8895a (2026-09-14, "Merge pull request #2993 from youdie006/fix-blank-space-character-classes"; 0.58.0); 2 bug(s) still reproduce. 656 tests pass.
+- 2026-09-14: base bumped 65c5dfe8895a → 37149b894efa (2026-09-14, "Merge pull request #2994 from rawsun007/fix-date-offset-range"; 0.58.0); 2 bug(s) still reproduce. 656 tests pass.

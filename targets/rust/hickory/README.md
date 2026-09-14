@@ -40,3 +40,4 @@
 - 2026-09-14: base bumped 254f95d3a021 → b78ac510a14d (2026-09-14, "proto: truncate encoding after rollback"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
 - 2026-09-14: base bumped b78ac510a14d → e640429a586b (2026-09-14, "bin: refuse to treat empty zone as root"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
 - 2026-09-14: base bumped e640429a586b → 5276716c9f4b (2026-09-14, "Change default group setting"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
+- 2026-09-14: base bumped 5276716c9f4b → 1b1084e2a0b4 (2026-09-14, "Update rustls"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
