@@ -9,8 +9,11 @@ satisfaction checks, substvars) and the plain-struct parser in `lossy::relations
 `Binary` getters/setters, `add_*`/`remove_binary`, `sort_binaries`, `wrap_and_sort`, range
 queries, identities), `lossy::control`, the typed values in `fields` (`Priority`, `MultiArch`,
 `Urgency`, `StandardsVersion`, `PackageListEntry`, `format_description`) and `vcs` (`ParsedVcs`,
-`Vcs`). Written in the zoo at 0.3.14 (debian-parsers commit `4dc04da`, 2026-09-05). The crate is a
-workspace member: `subdir = "debian-control"`.
+`Vcs`); and, in `tests/hegel_files.rs`, the upload-side files: `lossless::changes::Changes`
+(`.changes`), `lossless::buildinfo::Buildinfo` (`.buildinfo`, getters and setters), the checksum
+entry types (`Md5Checksum`, `Sha1Checksum`, `Sha256Checksum`, `Sha512Checksum`, `changes::File`)
+and `pgp::strip_pgp_signature`. Written in the zoo at 0.3.14 (debian-parsers commit `4dc04da`,
+2026-09-05). The crate is a workspace member: `subdir = "debian-control"`.
 
 ## The oracles
 
@@ -31,8 +34,17 @@ workspace member: `subdir = "debian-control"`.
   is the generated model (field sets of the two paragraph kinds, `Rules-Requires-Root`,
   `Multi-Arch`, `Essential`, description paragraphs with `.` blank lines and verbatim lines).
 
-`[run] setup` checks that `Dpkg::Deps` and `Dpkg::Control::Info` load and warns when python-debian
-is missing (that property then returns early).
+- **dpkg's `Dpkg::Control` with a file type** (`CTRL_FILE_CHANGES`, `CTRL_FILE_BUILDINFO`; a Perl
+  child in `hegel_files.rs`): the fields dpkg reads from a `.changes`/`.buildinfo`, whether it saw
+  an OpenPGP signature (`is_pgp_signed`), and `field_is_allowed_in` for the model's field sets.
+- **python-debian's `Changes`** (`Files`/`Checksums-*` entries, `get_pool_path`) and
+  `Deb822.split_gpg_and_payload` (a Python child), **gpg** (`--clearsign` with an ephemeral key
+  generated once per test process, on a fixed pool of payloads), and the layout `dpkg-genchanges`
+  and `dpkg-genbuildinfo` write (probed on a real build) as the generated model.
+
+`[run] setup` checks that `Dpkg::Deps`, `Dpkg::Control::Info`, `Dpkg::Control` and
+`Dpkg::Control::FieldsCore` load, that `gpg` is present, and warns when python-debian is missing
+(the relations property then returns early; `hegel_files.rs` needs it).
 
 ## Properties
 
@@ -89,7 +101,41 @@ subset of the Policy source fields in random order and 0–3 binary paragraphs w
   honoured), every field is untouched / every value preserved, the source stays first, dpkg still
   reads the file, and `wrap_and_sort` is idempotent on the re-parsed text (no verbatim lines).
 
-## Bugs (27, all zoo-original)
+Upload-side files (`tests/hegel_files.rs`):
+
+- **`.changes`** (`changes_files_are_read_like_dpkg_and_python_debian`): files laid out as
+  dpkg-genchanges writes them (all standard fields, list fields one entry per continuation line,
+  `Changes` with `.` blank lines, optional `Changed-By`/`Closes`) print back verbatim, every getter
+  follows the model, `parse` has no errors, dpkg reads the same values and allows every field,
+  python-debian's `Files`/`Checksums-*` entries and `get_pool_path` agree.
+- **Signatures** (`clearsigned_files_are_split_like_python_debian_and_dpkg`): gpg-clearsigned
+  payloads, also with CRLF, without a final newline or with an extra armor header, are split by
+  `strip_pgp_signature` into python-debian's payload lines and the glued armor block; dpkg reads
+  the same fields signed and unsigned; unsigned text passes through.
+- **`.buildinfo`** (`buildinfo_files_are_read_like_dpkg`, `built_buildinfo_files_are_read_back`):
+  the getters follow the model and dpkg on files laid out like dpkg-genbuildinfo's (single-line
+  `Build-Tainted-By`, unquoted `Environment` — the real layouts are pinned), and a file built with
+  `Buildinfo::new()` and every setter is read back by the getters, a re-parse and dpkg.
+- **Checksum entries** (`checksum_entries_round_trip`): the four checksum types and
+  `changes::File` survive `Display` → `FromStr`, accept extra whitespace and reject missing parts.
+
+## Bugs (34, all zoo-original)
+
+Upload-side files (found 2026-09-14):
+
+- **debian-control/28** (medium) — `Changes::read`/`from_file` cannot read a clearsigned
+  `.changes`; the crate's own `strip_pgp_signature` is never applied.
+- **debian-control/29** (low) — `strip_pgp_signature` calls a blank line after the signature
+  block junk.
+- **debian-control/30** (medium) — `get_pool_path` puts `lib*` sources under `lib/` instead of
+  `libX/` (python-debian's `source[:4]`).
+- **debian-control/31** (medium) — `version()`, `urgency()`, `checksums_*()`, `files()` and
+  `get_pool_path()` panic on malformed fields.
+- **debian-control/32** (medium) — `Buildinfo::build_tainted_by`/`binaries` split on a single
+  space; dpkg-genbuildinfo's one-tag-per-line field reads as one entry.
+- **debian-control/33** (medium) — `Buildinfo::environment` keeps dpkg-genbuildinfo's `"…"`
+  quoting and panics on a line without `=`.
+- **debian-control/34** (low) — `set_environment` writes unquoted values in `HashMap` order.
 
 `debian/control` layer (found 2026-09-14):
 
@@ -176,3 +222,13 @@ its own pinned test asserting dpkg's behaviour.
   only, valid `Multi-Arch`, single-spaced Vcs values, no verbatim lines for the lossy and
   `wrap_and_sort` properties, `set_description` with the value convention, ≤3 `PackageListEntry`
   extras without `=` in the values.
+- Upload-side files: `Changes` and `Buildinfo` implement neither `Display` nor (for `Changes`)
+  `FromStr` — the tests read the text through `rowan::ast::AstNode::syntax()` and `Changes::read`;
+  noted, not recorded. The leading empty line of a list field (`Files:\n …`) is dropped by
+  `description()` (deb822-lossless/2, inherited). gpg's dash-escaping (`- ` before lines starting
+  with `-` or `From `) is left in place by `strip_pgp_signature`, but dpkg's `Dpkg::Control::HashCore`
+  and python-debian do the same, and no deb822 line starts that way; not recorded. The general
+  generators avoid the pinned shapes: no `lib*` source names, well-formed fields, single-line
+  `Build-Tainted-By`, unquoted `Environment` values, signed texts without a trailing blank line.
+  gpg signs a fixed pool of six payloads once per process (an ephemeral ed25519 key in a temporary
+  `GNUPGHOME`) so the property costs no signing per case.

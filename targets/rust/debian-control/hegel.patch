@@ -2938,3 +2938,903 @@ index 0000000..a4e70a0
 +    let e2 = PackageListEntry::from_str("foo deb misc optional x=a=b").unwrap();
 +    assert_eq!(e2.extra.get("x").map(|s| s.as_str()), Some("a=b"), "a value containing `=`");
 +}
+diff --git a/debian-control/tests/hegel_files.rs b/debian-control/tests/hegel_files.rs
+new file mode 100644
+index 0000000..c6eb4d1
+--- /dev/null
++++ b/debian-control/tests/hegel_files.rs
+@@ -0,0 +1,894 @@
++//! Hegel property tests for debian-control's upload-side files: the lossless
++//! `Changes` (`.changes`) and `Buildinfo` (`.buildinfo`) paragraphs, the
++//! checksum entry types (`Md5Checksum`, `Sha1Checksum`, `Sha256Checksum`,
++//! `Sha512Checksum`, `changes::File`) and `pgp::strip_pgp_signature`.
++//!
++//! References: **dpkg's `Dpkg::Control`** with the matching file type
++//! (`CTRL_FILE_CHANGES` / `CTRL_FILE_BUILDINFO`: the field values dpkg reads,
++//! its OpenPGP handling, `field_is_allowed_in` for the model's field set),
++//! **python-debian's `Changes`** (`Files`/`Checksums-*` entries and
++//! `get_pool_path`) and `Deb822.split_gpg_and_payload`, **gpg** (real
++//! clearsigned files, one ephemeral key per test process), and the layout
++//! `dpkg-genchanges` / `dpkg-genbuildinfo` write as the generated model.
++//! The relations and `debian/control` parsers are covered by `tests/hegel.rs`
++//! and `tests/hegel_control.rs`.
++
++use debian_control::fields::{Md5Checksum, Sha1Checksum, Sha256Checksum, Sha512Checksum, Urgency};
++use debian_control::lossless::buildinfo::Buildinfo;
++use debian_control::lossless::changes::{Changes, File};
++use debian_control::lossless::relations::Relations;
++use debian_control::pgp::strip_pgp_signature;
++use debian_control::Priority;
++use hegel::generators;
++use hegel::Generator;
++use rowan::ast::AstNode;
++use std::collections::HashMap;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracles: dpkg, python-debian, gpg
++// ---------------------------------------------------------------------------
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use Dpkg::Control;
++use Dpkg::Control::Types;
++use Dpkg::Control::FieldsCore;
++use JSON::PP;
++$| = 1;
++my $json = JSON::PP->new->canonical;
++my %TYPES = (changes => CTRL_FILE_CHANGES, buildinfo => CTRL_FILE_BUILDINFO);
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, @args) = split / /, $line;
++    my @a = map { pack('H*', $_) } @args;
++    if ($cmd eq 'C') {
++        my ($type, $text) = @a;
++        my ($fields, $signed, $err);
++        eval {
++            local $SIG{__WARN__} = sub {};
++            my $c = Dpkg::Control->new(type => $TYPES{$type});
++            open my $fh, '<', \$text or die;
++            $c->parse($fh, 'x');
++            $fields = { map { $_ => $c->{$_} } keys %$c };
++            $signed = $c->get_option('is_pgp_signed') ? JSON::PP::true : JSON::PP::false;
++        };
++        if ($@) { $err = "$@"; }
++        print $json->encode({ fields => $fields, signed => $signed, err => $err }), "\n";
++    } elsif ($cmd eq 'A') {
++        my ($type, $field) = @a;
++        print $json->encode({ allowed => (field_is_allowed_in($field, $TYPES{$type}) ? JSON::PP::true : JSON::PP::false) }), "\n";
++    } else {
++        print "{}\n";
++    }
++}
++"#;
++
++const PYTHON_SCRIPT: &str = r#"
++import sys, json, binascii
++from debian.deb822 import Changes, Deb822
++for line in sys.stdin:
++    parts = line.rstrip("\n").split(" ")
++    cmd, args = parts[0], [binascii.unhexlify(a) for a in parts[1:]]
++    out = {}
++    try:
++        if cmd == "F":
++            c = Changes(args[0].splitlines(True))
++            plain = lambda entries: None if entries is None else [dict(e) for e in entries]
++            out["source"] = c.get("Source")
++            out["files"] = plain(c.get("Files"))
++            out["sha1"] = plain(c.get("Checksums-Sha1"))
++            out["sha256"] = plain(c.get("Checksums-Sha256"))
++            out["binary"] = c.get("Binary")
++            try:
++                out["pool"] = c.get_pool_path()
++            except Exception as e:
++                out["pool_err"] = type(e).__name__
++        elif cmd == "G":
++            pre, payload, post = Deb822.split_gpg_and_payload(args[0].splitlines(True))
++            out["pre"] = [p.decode("utf-8", "replace") for p in pre]
++            out["payload"] = [p.decode("utf-8", "replace") for p in payload]
++            out["post"] = [p.decode("utf-8", "replace") for p in post]
++    except Exception as e:
++        out["err"] = "%s: %s" % (type(e).__name__, e)
++    sys.stdout.write(json.dumps(out) + "\n")
++    sys.stdout.flush()
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn ask(c: &mut Child2, cmd: &str, args: &[&str]) -> serde_json::Value {
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    writeln!(c.stdin, "{line}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut reply = String::new();
++    c.stdout.read_line(&mut reply).unwrap();
++    assert!(!reply.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&reply).unwrap_or_else(|e| panic!("bad oracle reply {reply:?}: {e}"))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++fn python() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    // `/usr/bin/python3` is the interpreter python-debian is installed for.
++    P.get_or_init(|| Mutex::new(spawn("/usr/bin/python3", &["-c", PYTHON_SCRIPT])))
++}
++
++type Fields = Vec<(String, String)>;
++
++/// dpkg's reading of a `.changes`/`.buildinfo` text: sorted fields and whether
++/// it saw an OpenPGP signature.
++fn dpkg_read(kind: &str, text: &str) -> Result<(Fields, bool), String> {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "C", &[kind, text]);
++    if let Some(e) = v["err"].as_str() {
++        return Err(e.to_string());
++    }
++    let mut f: Fields = v["fields"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
++    f.sort();
++    Ok((f, v["signed"].as_bool().unwrap()))
++}
++
++fn dpkg_allows(kind: &str, field: &str) -> bool {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    ask(&mut c, "A", &[kind, field])["allowed"].as_bool().unwrap()
++}
++
++fn python_changes(text: &str) -> serde_json::Value {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    ask(&mut c, "F", &[text])
++}
++
++fn python_split_gpg(text: &str) -> serde_json::Value {
++    let mut c = python().lock().unwrap_or_else(|e| e.into_inner());
++    ask(&mut c, "G", &[text])
++}
++
++/// Clearsigned copies of a fixed pool of `.changes` texts, signed once per
++/// process with an ephemeral gpg key.
++fn signed_pool() -> &'static Vec<(String, String)> {
++    static POOL: OnceLock<Vec<(String, String)>> = OnceLock::new();
++    POOL.get_or_init(|| {
++        let home = std::env::temp_dir().join(format!("hegel-zoo-gpg-{}", std::process::id()));
++        std::fs::create_dir_all(&home).unwrap();
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
++        }
++        let gen = Command::new("gpg")
++            .env("GNUPGHOME", &home)
++            .args(["--batch", "--quiet", "--passphrase", "", "--quick-gen-key", "Zoo <zoo@example.com>", "ed25519", "sign", "0"])
++            .stderr(Stdio::null())
++            .status()
++            .expect("gpg is installed");
++        assert!(gen.success(), "gpg key generation");
++        let pool = SIGNED_PAYLOADS
++            .iter()
++            .map(|payload| {
++                let mut child = Command::new("gpg")
++                    .env("GNUPGHOME", &home)
++                    .args(["--batch", "--quiet", "--clearsign", "-u", "zoo@example.com"])
++                    .stdin(Stdio::piped())
++                    .stdout(Stdio::piped())
++                    .stderr(Stdio::null())
++                    .spawn()
++                    .unwrap();
++                child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
++                let out = child.wait_with_output().unwrap();
++                assert!(out.status.success(), "gpg --clearsign");
++                (payload.to_string(), String::from_utf8(out.stdout).unwrap())
++            })
++            .collect();
++        let _ = Command::new("gpgconf").env("GNUPGHOME", &home).args(["--kill", "all"]).stderr(Stdio::null()).status();
++        let _ = std::fs::remove_dir_all(&home);
++        pool
++    })
++}
++
++const SIGNED_PAYLOADS: &[&str] = &[
++    "Format: 1.8\nSource: foo\nBinary: foo\nArchitecture: all\nVersion: 1.0-1\nDistribution: unstable\nUrgency: medium\nMaintainer: Zoo <zoo@example.com>\nDescription:\n foo - short\nChanges:\n foo (1.0-1) unstable; urgency=medium\n .\n   * Initial release.\nFiles:\n d41d8cd98f00b204e9800998ecf8427e 0 misc optional foo_1.0-1_all.deb\n",
++    "Format: 1.8\nSource: bar\nVersion: 2:1.2.3~rc1-4\nMaintainer: Zoë Ünïcode <z@example.com>\nChanges:\n bar (2:1.2.3~rc1-4) experimental; urgency=low\n .\n   * Dash - in the middle, and a line\n   - starting with a dash after the indent.\n",
++    "Source: baz\nBinary: baz libbaz1 libbaz-dev\nArchitecture: amd64 source\nChecksums-Sha256:\n e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 baz_1.0.orig.tar.gz\n",
++    "Format: 1.8\nSource: qux\nCloses: 123 456\nDescription:\n qux - a\n qux-doc - b\n",
++    "A: 1\n",
++    "Long: line line line line line line line line line line line line line line line line line line line line line line line line line line line line line line line line line line line\nTab:\tvalue\n",
++];
++
++// ---------------------------------------------------------------------------
++// Model and generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn opt<T>(tc: &hegel::TestCase, f: impl FnOnce(&hegel::TestCase) -> T) -> Option<T> {
++    if tc.draw(generators::booleans()) {
++        Some(f(tc))
++    } else {
++        None
++    }
++}
++
++const SOURCES: &[&str] = &["foo", "bar1", "python-baz", "a.b+c", "zzz"];
++const PEOPLE: &[&str] = &["John Doe <john@example.com>", "A. Maintainer <am@debian.org>", "Zoë Ünïcode <z@example.com>"];
++const SECTIONS: &[&str] = &["misc", "libs", "python", "contrib/net", "non-free/utils"];
++const ARCHES: &[&str] = &["all", "amd64", "source", "i386"];
++const VERSIONS: &[&str] = &["1.0-1", "2:1.2.3~rc1-4", "0.1", "1.0+dfsg-2ubuntu1", "3.14.15-9.2"];
++const DISTS: &[&str] = &["unstable", "experimental", "bookworm-security", "UNRELEASED"];
++const DATES: &[&str] = &["Mon, 14 Sep 2026 00:00:00 +0000", "Tue, 01 Jan 2030 23:59:59 -0500", "Thu, 02 Jan 2020 12:00:00 +0100"];
++const WORDS: &[&str] = &["Fix", "widget", "frobnication", "speeds", "on", "mips/mipsel", "(etch)", "a:b", "very-long-word-to-fill-the-line", "#42"];
++const PRIORITIES: &[Priority] = &[Priority::Required, Priority::Important, Priority::Standard, Priority::Optional, Priority::Extra];
++
++fn arb_words(tc: &hegel::TestCase, min: i64, max: i64) -> String {
++    let n = tc.draw(int!(min, max)) as usize;
++    (0..n).map(|_| pick(tc, WORDS).to_string()).collect::<Vec<_>>().join(" ")
++}
++
++fn arb_hex(tc: &hegel::TestCase, len: usize) -> String {
++    (0..len).map(|_| pick(tc, &"0123456789abcdef".chars().collect::<Vec<_>>())).collect()
++}
++
++fn arb_filename(tc: &hegel::TestCase, source: &str, version: &str) -> String {
++    let v = version.split_once(':').map(|(_, v)| v).unwrap_or(version);
++    match tc.draw(int!(0, 3)) {
++        0 => format!("{source}_{v}.dsc"),
++        1 => format!("{source}_{v}_{}.deb", pick(tc, ARCHES)),
++        2 => format!("{source}_{}.orig.tar.xz", v.split_once('-').map(|(u, _)| u).unwrap_or(v)),
++        _ => format!("{source}_{v}_{}.buildinfo", pick(tc, ARCHES)),
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct Sum {
++    hash: String,
++    size: u64,
++    filename: String,
++}
++
++impl Sum {
++    fn line(&self) -> String {
++        format!("{} {} {}", self.hash, self.size, self.filename)
++    }
++}
++
++fn arb_sums(tc: &hegel::TestCase, hex_len: usize, filenames: &[String]) -> Vec<Sum> {
++    filenames.iter().map(|f| Sum { hash: arb_hex(tc, hex_len), size: tc.draw(int!(0, 1i64 << 40)) as u64, filename: f.clone() }).collect()
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct GenFile {
++    md5: String,
++    size: u64,
++    section: String,
++    priority: Priority,
++    filename: String,
++}
++
++impl GenFile {
++    fn line(&self) -> String {
++        format!("{} {} {} {} {}", self.md5, self.size, self.section, self.priority, self.filename)
++    }
++}
++
++/// A `.changes` file as dpkg-genchanges writes it (fields in dpkg's order,
++/// list fields as one entry per continuation line).
++#[derive(Debug, Clone)]
++struct GenChanges {
++    date: String,
++    source: String,
++    binary: Vec<String>,
++    architecture: Vec<String>,
++    version: String,
++    distribution: String,
++    urgency: Urgency,
++    maintainer: String,
++    changed_by: Option<String>,
++    description: Vec<(String, String)>,
++    closes: Option<Vec<u32>>,
++    changes: Vec<String>,
++    sha1: Vec<Sum>,
++    sha256: Vec<Sum>,
++    files: Vec<GenFile>,
++}
++
++fn multi(lines: Vec<String>) -> String {
++    lines.iter().map(|l| format!("\n{l}")).collect()
++}
++
++impl GenChanges {
++    fn fields(&self) -> Fields {
++        let mut f: Fields = vec![
++            ("Format".into(), "1.8".into()),
++            ("Date".into(), self.date.clone()),
++            ("Source".into(), self.source.clone()),
++            ("Binary".into(), self.binary.join(" ")),
++            ("Architecture".into(), self.architecture.join(" ")),
++            ("Version".into(), self.version.clone()),
++            ("Distribution".into(), self.distribution.clone()),
++            ("Urgency".into(), self.urgency.to_string()),
++            ("Maintainer".into(), self.maintainer.clone()),
++        ];
++        if let Some(c) = &self.changed_by {
++            f.push(("Changed-By".into(), c.clone()));
++        }
++        f.push(("Description".into(), multi(self.description.iter().map(|(p, s)| format!("{p} - {s}")).collect())));
++        if let Some(c) = &self.closes {
++            f.push(("Closes".into(), c.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ")));
++        }
++        f.push(("Changes".into(), multi(self.changes.iter().map(|l| if l.is_empty() { ".".to_string() } else { l.clone() }).collect())));
++        f.push(("Checksums-Sha1".into(), multi(self.sha1.iter().map(Sum::line).collect())));
++        f.push(("Checksums-Sha256".into(), multi(self.sha256.iter().map(Sum::line).collect())));
++        f.push(("Files".into(), multi(self.files.iter().map(GenFile::line).collect())));
++        f
++    }
++    fn text(&self) -> String {
++        render(&self.fields())
++    }
++    /// python-debian's `get_pool_path`.
++    fn pool_path(&self) -> String {
++        let section = self.files[0].section.split_once('/').map(|(s, _)| s).unwrap_or("main");
++        let subdir = if self.source.starts_with("lib") { &self.source[..4] } else { &self.source[..1] };
++        format!("pool/{section}/{subdir}/{}", self.source)
++    }
++}
++
++/// Render fields; a value starting with `\n` is a list field whose entries
++/// each go on their own continuation line (`Key:\n entry`).
++fn render(fields: &Fields) -> String {
++    let mut s = String::new();
++    for (k, v) in fields {
++        s.push_str(k);
++        s.push(':');
++        let mut lines = v.split('\n');
++        let first = lines.next().unwrap();
++        if !first.is_empty() {
++            s.push(' ');
++            s.push_str(first);
++        }
++        s.push('\n');
++        for l in lines {
++            s.push(' ');
++            s.push_str(l);
++            s.push('\n');
++        }
++    }
++    s
++}
++
++/// dpkg's view: the same values (a list field's value keeps its leading `\n`),
++/// with a `.` line decoded to an empty line.
++fn as_dpkg(fields: &Fields) -> Fields {
++    let mut f: Fields = fields
++        .iter()
++        .map(|(k, v)| (k.clone(), v.split('\n').map(|l| if l == "." { "" } else { l }).collect::<Vec<_>>().join("\n")))
++        .collect();
++    f.sort();
++    f
++}
++
++#[hegel::composite]
++fn arb_changes(tc: &hegel::TestCase) -> GenChanges {
++    // Sources starting with `lib` are pinned (pool path); the pool of names has none.
++    let source = pick(tc, SOURCES).to_string();
++    let version = pick(tc, VERSIONS).to_string();
++    let n_bin = tc.draw(int!(1, 3)) as usize;
++    let mut binary = vec![source.clone()];
++    for _ in 1..n_bin {
++        let b = format!("{source}-{}", pick(tc, &["dev", "doc", "utils"]));
++        if !binary.contains(&b) {
++            binary.push(b);
++        }
++    }
++    let n_arch = tc.draw(int!(1, 2)) as usize;
++    let mut architecture: Vec<String> = Vec::new();
++    for _ in 0..n_arch {
++        let a = pick(tc, ARCHES).to_string();
++        if !architecture.contains(&a) {
++            architecture.push(a);
++        }
++    }
++    let n_files = tc.draw(int!(1, 3)) as usize;
++    let mut filenames: Vec<String> = Vec::new();
++    for _ in 0..n_files {
++        let f = arb_filename(tc, &source, &version);
++        if !filenames.contains(&f) {
++            filenames.push(f);
++        }
++    }
++    let description = binary.iter().map(|b| (b.clone(), arb_words(tc, 1, 4))).collect();
++    let n_changes = tc.draw(int!(1, 4)) as usize;
++    let changes: Vec<String> = (0..n_changes)
++        .map(|i| match (i, tc.draw(int!(0, 3))) {
++            (0, _) => format!("{source} ({version}) unstable; urgency=medium"),
++            (_, 0) => String::new(),
++            (_, 1) => format!("  * {}", arb_words(tc, 1, 5)),
++            _ => format!("  - {}", arb_words(tc, 1, 3)),
++        })
++        .collect();
++    let files = filenames
++        .iter()
++        .map(|f| GenFile { md5: arb_hex(tc, 32), size: tc.draw(int!(0, 1i64 << 40)) as u64, section: pick(tc, SECTIONS).to_string(), priority: pick(tc, PRIORITIES), filename: f.clone() })
++        .collect();
++    GenChanges {
++        date: pick(tc, DATES).to_string(),
++        source,
++        binary,
++        architecture,
++        version,
++        distribution: pick(tc, DISTS).to_string(),
++        urgency: pick(tc, &[Urgency::Low, Urgency::Medium, Urgency::High, Urgency::Emergency, Urgency::Critical]),
++        maintainer: pick(tc, PEOPLE).to_string(),
++        changed_by: opt(tc, |tc| pick(tc, PEOPLE).to_string()),
++        description,
++        closes: opt(tc, |tc| (0..tc.draw(int!(1, 3))).map(|_| tc.draw(int!(1, 1_100_000)) as u32).collect()),
++        changes,
++        sha1: arb_sums(tc, 40, &filenames),
++        sha256: arb_sums(tc, 64, &filenames),
++        files,
++    }
++}
++
++fn check_changes(c: &Changes, g: &GenChanges) {
++    assert_eq!(c.format(), Some("1.8".to_string()));
++    assert_eq!(c.source(), Some(g.source.clone()));
++    assert_eq!(c.binary(), Some(g.binary.clone()));
++    assert_eq!(c.architecture(), Some(g.architecture.clone()));
++    assert_eq!(c.version().map(|v| v.to_string()), Some(g.version.clone()));
++    assert_eq!(c.distribution(), Some(g.distribution.clone()));
++    assert_eq!(c.urgency(), Some(g.urgency.clone()));
++    assert_eq!(c.maintainer(), Some(g.maintainer.clone()));
++    assert_eq!(c.changed_by(), g.changed_by);
++    // The leading empty line of a list field is not kept (deb822-lossless/2).
++    let description: Vec<String> = g.description.iter().map(|(p, s)| format!("{p} - {s}")).collect();
++    assert_eq!(c.description(), Some(description.join("\n")), "description");
++    let sha1: Vec<Sha1Checksum> = g.sha1.iter().map(|s| Sha1Checksum { sha1: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect();
++    assert_eq!(c.checksums_sha1(), Some(sha1));
++    let sha256: Vec<Sha256Checksum> = g.sha256.iter().map(|s| Sha256Checksum { sha256: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect();
++    assert_eq!(c.checksums_sha256(), Some(sha256));
++    let files: Vec<File> = g.files.iter().map(|f| File { md5sum: f.md5.clone(), size: f.size as usize, section: f.section.clone(), priority: f.priority.clone(), filename: f.filename.clone() }).collect();
++    assert_eq!(c.files(), Some(files));
++    assert_eq!(c.get_pool_path(), Some(g.pool_path()), "pool path");
++}
++
++// ---------------------------------------------------------------------------
++// .changes
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn changes_files_are_read_like_dpkg_and_python_debian(tc: hegel::TestCase) {
++    let g = tc.draw(arb_changes().print_as_debug());
++    let text = g.text();
++    let c = Changes::read(text.as_bytes()).unwrap_or_else(|e| panic!("Changes::read: {e}"));
++    assert_eq!(c.syntax().text().to_string(), text, "lossless");
++    check_changes(&c, &g);
++    // `parse` accepts it without errors, and reads the same.
++    let parsed = Changes::parse(&text);
++    assert!(parsed.errors().is_empty(), "parse errors: {:?}", parsed.errors());
++    check_changes(&parsed.tree(), &g);
++    // dpkg reads the same fields and every field belongs in a .changes file.
++    let (fields, signed) = dpkg_read("changes", &text).unwrap_or_else(|e| panic!("dpkg refuses the file: {e}"));
++    assert_eq!(fields, as_dpkg(&g.fields()), "dpkg's fields");
++    assert!(!signed);
++    for (k, _) in g.fields() {
++        assert!(dpkg_allows("changes", &k), "dpkg does not allow {k} in a .changes file");
++    }
++    // python-debian's typed entries agree with the crate's.
++    let py = python_changes(&text);
++    assert!(py["err"].is_null(), "python-debian: {}", py["err"]);
++    assert_eq!(py["source"].as_str(), Some(g.source.as_str()));
++    assert_eq!(py["pool"].as_str(), Some(g.pool_path().as_str()), "python-debian's pool path");
++    let files = py["files"].as_array().unwrap();
++    assert_eq!(files.len(), g.files.len());
++    for (f, gf) in files.iter().zip(g.files.iter()) {
++        assert_eq!(f["md5sum"].as_str(), Some(gf.md5.as_str()));
++        assert_eq!(f["size"].as_str().unwrap().parse::<u64>().unwrap(), gf.size);
++        assert_eq!(f["section"].as_str(), Some(gf.section.as_str()));
++        assert_eq!(f["priority"].as_str(), Some(gf.priority.to_string().as_str()));
++        assert_eq!(f["name"].as_str(), Some(gf.filename.as_str()));
++    }
++    for (key, sums) in [("sha1", &g.sha1), ("sha256", &g.sha256)] {
++        let entries = py[key].as_array().unwrap();
++        assert_eq!(entries.len(), sums.len());
++        for (e, s) in entries.iter().zip(sums.iter()) {
++            assert_eq!(e[key].as_str(), Some(s.hash.as_str()));
++            assert_eq!(e["size"].as_str().unwrap().parse::<u64>().unwrap(), s.size);
++            assert_eq!(e["name"].as_str(), Some(s.filename.as_str()));
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++enum Mutation {
++    None,
++    Crlf,
++    NoTrailingNewline,
++    ExtraArmorHeader,
++}
++
++#[hegel::test]
++fn clearsigned_files_are_split_like_python_debian_and_dpkg(tc: hegel::TestCase) {
++    let pool = signed_pool();
++    let (payload, signed) = pool[tc.draw(int!(0, pool.len() as i64 - 1)) as usize].clone();
++    let mutation = pick(&tc, &[Mutation::None, Mutation::Crlf, Mutation::NoTrailingNewline, Mutation::ExtraArmorHeader]);
++    let text = match mutation {
++        Mutation::None => signed.clone(),
++        Mutation::Crlf => signed.replace('\n', "\r\n"),
++        Mutation::NoTrailingNewline => signed.trim_end_matches('\n').to_string(),
++        Mutation::ExtraArmorHeader => signed.replacen("\nHash: ", "\nCharset: UTF-8\nHash: ", 1),
++    };
++    // gpg dash-escapes nothing here (no payload line starts with `-` or `From `);
++    // every reference leaves the payload lines as they are.
++    let (got_payload, got_sig) = strip_pgp_signature(&text).unwrap_or_else(|e| panic!("strip_pgp_signature on {mutation:?}: {e}"));
++    let py = python_split_gpg(&text);
++    assert!(py["err"].is_null(), "python-debian: {}", py["err"]);
++    let py_payload: Vec<String> = py["payload"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().trim_end_matches('\r').to_string()).collect();
++    let got_lines: Vec<String> = got_payload.lines().map(|l| l.to_string()).collect();
++    assert_eq!(got_lines, py_payload, "payload lines vs python-debian");
++    assert_eq!(got_payload, payload, "payload is the signed text");
++    let sig = got_sig.expect("a signature");
++    // The signature is the armored block's lines glued together (no blank, no armor lines).
++    let py_post = py["post"].as_array().unwrap();
++    let expected_sig: String = py_post[1..py_post.len() - 1].iter().map(|l| l.as_str().unwrap().trim_end_matches('\r')).collect();
++    assert_eq!(sig, expected_sig, "signature block");
++    // dpkg reads the payload's fields through the signature.
++    let (fields, is_signed) = dpkg_read("changes", &text).unwrap_or_else(|e| panic!("dpkg: {e}"));
++    assert!(is_signed);
++    let (plain, _) = dpkg_read("changes", &payload).unwrap();
++    assert_eq!(fields, plain, "dpkg reads the same fields signed and unsigned");
++    // Unsigned text passes through untouched.
++    assert_eq!(strip_pgp_signature(&payload), Ok((payload.clone(), None)));
++}
++
++// ---------------------------------------------------------------------------
++// .buildinfo
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone)]
++struct GenBuildinfo {
++    source: String,
++    binary: Vec<String>,
++    architecture: Vec<String>,
++    version: String,
++    md5: Vec<Sum>,
++    sha1: Vec<Sum>,
++    sha256: Vec<Sum>,
++    build_origin: Option<String>,
++    build_architecture: String,
++    build_date: String,
++    build_path: Option<String>,
++    /// Single-line in the general model (dpkg's one-per-line layout is pinned).
++    build_tainted_by: Option<Vec<String>>,
++    installed: Vec<(String, String)>,
++    /// Unquoted `KEY=value` lines (dpkg's quoted layout is pinned).
++    environment: Option<Vec<(String, String)>>,
++}
++
++impl GenBuildinfo {
++    fn fields(&self) -> Fields {
++        let mut f: Fields = vec![
++            ("Format".into(), "1.0".into()),
++            ("Source".into(), self.source.clone()),
++            ("Binary".into(), self.binary.join(" ")),
++            ("Architecture".into(), self.architecture.join(" ")),
++            ("Version".into(), self.version.clone()),
++            ("Checksums-Md5".into(), multi(self.md5.iter().map(Sum::line).collect())),
++            ("Checksums-Sha1".into(), multi(self.sha1.iter().map(Sum::line).collect())),
++            ("Checksums-Sha256".into(), multi(self.sha256.iter().map(Sum::line).collect())),
++        ];
++        if let Some(o) = &self.build_origin {
++            f.push(("Build-Origin".into(), o.clone()));
++        }
++        f.push(("Build-Architecture".into(), self.build_architecture.clone()));
++        f.push(("Build-Date".into(), self.build_date.clone()));
++        if let Some(p) = &self.build_path {
++            f.push(("Build-Path".into(), p.clone()));
++        }
++        if let Some(t) = &self.build_tainted_by {
++            f.push(("Build-Tainted-By".into(), t.join(" ")));
++        }
++        let n = self.installed.len();
++        f.push(("Installed-Build-Depends".into(), multi(self.installed.iter().enumerate().map(|(i, (p, v))| format!("{p} (= {v}){}", if i + 1 < n { "," } else { "" })).collect())));
++        if let Some(e) = &self.environment {
++            f.push(("Environment".into(), multi(e.iter().map(|(k, v)| format!("{k}={v}")).collect())));
++        }
++        f
++    }
++    fn text(&self) -> String {
++        render(&self.fields())
++    }
++    fn relations(&self) -> String {
++        self.installed.iter().map(|(p, v)| format!("{p} (= {v})")).collect::<Vec<_>>().join(", ")
++    }
++}
++
++#[hegel::composite]
++fn arb_buildinfo(tc: &hegel::TestCase) -> GenBuildinfo {
++    let source = pick(tc, SOURCES).to_string();
++    let version = pick(tc, VERSIONS).to_string();
++    let n_bin = tc.draw(int!(1, 3)) as usize;
++    let mut binary = vec![source.clone()];
++    for _ in 1..n_bin {
++        let b = format!("{source}-{}", pick(tc, &["dev", "doc", "utils"]));
++        if !binary.contains(&b) {
++            binary.push(b);
++        }
++    }
++    let mut architecture = vec![pick(tc, &["all", "amd64", "arm64"]).to_string()];
++    if tc.draw(generators::booleans()) {
++        architecture.push("source".into());
++    }
++    let n_files = tc.draw(int!(1, 3)) as usize;
++    let mut filenames = Vec::new();
++    for _ in 0..n_files {
++        let f = arb_filename(tc, &source, &version);
++        if !filenames.contains(&f) {
++            filenames.push(f);
++        }
++    }
++    let n_inst = tc.draw(int!(1, 4)) as usize;
++    let mut installed: Vec<(String, String)> = Vec::new();
++    for _ in 0..n_inst {
++        let p = pick(tc, &["base-files", "bash", "binutils", "gcc-13", "libc6:amd64"]).to_string();
++        if !installed.iter().any(|(q, _)| *q == p) {
++            installed.push((p, pick(tc, &["13ubuntu10.5", "5.2.21-2", "1:2.42-4", "2.39-0ubuntu8.4"]).to_string()));
++        }
++    }
++    installed.sort();
++    let environment = opt(tc, |tc| {
++        let n = tc.draw(int!(1, 3)) as usize;
++        let mut env: Vec<(String, String)> = Vec::new();
++        for _ in 0..n {
++            let k = pick(tc, &["LANG", "DEB_BUILD_OPTIONS", "SOURCE_DATE_EPOCH", "LC_ALL"]).to_string();
++            if !env.iter().any(|(q, _)| *q == k) {
++                env.push((k, pick(tc, &["C.UTF-8", "parallel=4", "1700000000", "nocheck"]).to_string()));
++            }
++        }
++        env.sort();
++        env
++    });
++    GenBuildinfo {
++        source,
++        binary,
++        architecture,
++        version,
++        md5: arb_sums(tc, 32, &filenames),
++        sha1: arb_sums(tc, 40, &filenames),
++        sha256: arb_sums(tc, 64, &filenames),
++        build_origin: opt(tc, |tc| pick(tc, &["Debian", "Ubuntu"]).to_string()),
++        build_architecture: pick(tc, &["amd64", "arm64"]).to_string(),
++        build_date: pick(tc, DATES).to_string(),
++        build_path: opt(tc, |tc| format!("/build/{}-{}", pick(tc, SOURCES), arb_hex(tc, 6))),
++        build_tainted_by: opt(tc, |tc| vec![pick(tc, &["merged-usr-via-aliased-dirs", "usr-local-has-libraries", "usr-local-has-programs"]).to_string()]),
++        installed,
++        environment,
++    }
++}
++
++fn check_buildinfo(b: &Buildinfo, g: &GenBuildinfo) {
++    assert_eq!(b.format(), Some("1.0".to_string()));
++    assert_eq!(b.source(), Some(g.source.clone()));
++    assert_eq!(b.binaries(), Some(g.binary.clone()));
++    assert_eq!(b.architecture(), Some(g.architecture.join(" ")));
++    assert_eq!(b.version().map(|v| v.to_string()), Some(g.version.clone()));
++    let md5: Vec<Md5Checksum> = g.md5.iter().map(|s| Md5Checksum { md5sum: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect();
++    assert_eq!(b.checksums_md5(), md5);
++    let sha1: Vec<Sha1Checksum> = g.sha1.iter().map(|s| Sha1Checksum { sha1: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect();
++    assert_eq!(b.checksums_sha1(), sha1);
++    let sha256: Vec<Sha256Checksum> = g.sha256.iter().map(|s| Sha256Checksum { sha256: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect();
++    assert_eq!(b.checksums_sha256(), sha256);
++    assert_eq!(b.build_origin(), g.build_origin);
++    assert_eq!(b.build_architecture(), Some(g.build_architecture.clone()));
++    assert_eq!(b.build_date(), Some(g.build_date.clone()));
++    assert_eq!(b.build_path(), g.build_path);
++    assert_eq!(b.build_tainted_by(), g.build_tainted_by);
++    let rels = b.installed_build_depends().expect("Installed-Build-Depends");
++    assert_eq!(rels.to_string().split_whitespace().collect::<Vec<_>>(), g.relations().split_whitespace().collect::<Vec<_>>(), "installed build depends");
++    let env: Option<HashMap<String, String>> = g.environment.as_ref().map(|e| e.iter().cloned().collect());
++    assert_eq!(b.environment(), env);
++}
++
++#[hegel::test]
++fn buildinfo_files_are_read_like_dpkg(tc: hegel::TestCase) {
++    let g = tc.draw(arb_buildinfo().print_as_debug());
++    let text = g.text();
++    let b = Buildinfo::from_str(&text).unwrap_or_else(|e| panic!("Buildinfo::from_str: {e}"));
++    assert_eq!(b.syntax().text().to_string(), text, "lossless");
++    check_buildinfo(&b, &g);
++    let parsed = Buildinfo::parse(&text);
++    assert!(parsed.errors().is_empty(), "parse errors: {:?}", parsed.errors());
++    let (fields, signed) = dpkg_read("buildinfo", &text).unwrap_or_else(|e| panic!("dpkg refuses the file: {e}"));
++    assert_eq!(fields, as_dpkg(&g.fields()), "dpkg's fields");
++    assert!(!signed);
++    for (k, _) in g.fields() {
++        assert!(dpkg_allows("buildinfo", &k), "dpkg does not allow {k} in a .buildinfo file");
++    }
++}
++
++#[hegel::test]
++fn built_buildinfo_files_are_read_back(tc: hegel::TestCase) {
++    let g = tc.draw(arb_buildinfo().print_as_debug());
++    let mut b = Buildinfo::new();
++    b.set_format("1.0");
++    b.set_source(&g.source);
++    b.set_binaries(g.binary.clone());
++    b.set_architecture(&g.architecture.join(" "));
++    b.set_version(debversion::Version::from_str(&g.version).unwrap());
++    b.set_checksums_md5(g.md5.iter().map(|s| Md5Checksum { md5sum: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect());
++    b.set_checksums_sha1(g.sha1.iter().map(|s| Sha1Checksum { sha1: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect());
++    b.set_checksums_sha256(g.sha256.iter().map(|s| Sha256Checksum { sha256: s.hash.clone(), size: s.size as usize, filename: s.filename.clone() }).collect());
++    if let Some(o) = &g.build_origin {
++        b.set_build_origin(o);
++    }
++    b.set_build_architecture(&g.build_architecture);
++    b.set_build_date(&g.build_date);
++    if let Some(p) = &g.build_path {
++        b.set_build_path(p);
++    }
++    if let Some(t) = &g.build_tainted_by {
++        b.set_build_tainted_by(t.clone());
++    }
++    b.set_installed_build_depends(Relations::from_str(&g.relations()).unwrap());
++    if let Some(e) = &g.environment {
++        b.set_environment(e.iter().cloned().collect());
++    }
++    check_buildinfo(&b, &g);
++    let text = b.syntax().text().to_string();
++    let again = Buildinfo::from_str(&text).unwrap_or_else(|e| panic!("the built text parses: {e}\n{text}"));
++    check_buildinfo(&again, &g);
++    let (fields, _) = dpkg_read("buildinfo", &text).unwrap_or_else(|e| panic!("dpkg refuses the built file: {e}\n{text}"));
++    let keys: Vec<String> = fields.iter().map(|(k, _)| k.clone()).collect();
++    let mut expected: Vec<String> = g.fields().iter().map(|(k, _)| k.clone()).collect();
++    expected.sort();
++    assert_eq!(keys, expected, "dpkg's field set of the built file");
++}
++
++// ---------------------------------------------------------------------------
++// Checksum entries
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn checksum_entries_round_trip(tc: hegel::TestCase) {
++    let filename = arb_filename(&tc, &pick(&tc, SOURCES), &pick(&tc, VERSIONS));
++    let size = tc.draw(int!(0, 1i64 << 40)) as usize;
++    let md5 = Md5Checksum { md5sum: arb_hex(&tc, 32), size, filename: filename.clone() };
++    assert_eq!(Md5Checksum::from_str(&md5.to_string()), Ok(md5.clone()));
++    let sha1 = Sha1Checksum { sha1: arb_hex(&tc, 40), size, filename: filename.clone() };
++    assert_eq!(Sha1Checksum::from_str(&sha1.to_string()), Ok(sha1.clone()));
++    let sha256 = Sha256Checksum { sha256: arb_hex(&tc, 64), size, filename: filename.clone() };
++    assert_eq!(Sha256Checksum::from_str(&sha256.to_string()), Ok(sha256.clone()));
++    let sha512 = Sha512Checksum { sha512: arb_hex(&tc, 128), size, filename: filename.clone() };
++    assert_eq!(Sha512Checksum::from_str(&sha512.to_string()), Ok(sha512.clone()));
++    let file = File { md5sum: md5.md5sum.clone(), size, section: pick(&tc, SECTIONS).to_string(), priority: pick(&tc, PRIORITIES), filename: filename.clone() };
++    assert_eq!(File::from_str(&file.to_string()), Ok(file.clone()));
++    // Extra whitespace is accepted; a missing part is an error, not a panic.
++    assert_eq!(Sha1Checksum::from_str(&format!("  {}\t{} {}  ", sha1.sha1, size, filename)), Ok(sha1.clone()));
++    assert!(Sha1Checksum::from_str(&format!("{} {}", sha1.sha1, size)).is_err());
++    assert!(Sha1Checksum::from_str(&format!("{} x {}", sha1.sha1, filename)).is_err());
++    assert!(File::from_str(&format!("{} {} {}", md5.md5sum, size, filename)).is_err(), "a .dsc-style 3-part Files line is not a .changes File");
++}
++
++// ---------------------------------------------------------------------------
++// Pins
++// ---------------------------------------------------------------------------
++
++#[test]
++fn signed_changes_files_can_be_read() {
++    let (payload, signed) = signed_pool()[0].clone();
++    let plain = Changes::read(payload.as_bytes()).unwrap();
++    let c = Changes::read(signed.as_bytes()).unwrap_or_else(|e| panic!("Changes::read on a clearsigned .changes: {e}"));
++    assert_eq!(c.source(), plain.source());
++    assert_eq!(c.files(), plain.files());
++}
++
++#[test]
++fn a_blank_line_after_the_signature_is_not_junk() {
++    let (payload, signed) = signed_pool()[0].clone();
++    let text = format!("{signed}\n");
++    dpkg_read("changes", &text).expect("dpkg reads it");
++    assert!(python_split_gpg(&text)["err"].is_null());
++    assert_eq!(strip_pgp_signature(&text).map(|(p, _)| p), Ok(payload));
++}
++
++#[test]
++fn pool_path_of_a_lib_package_uses_four_letters() {
++    let text = "Source: libfoo\nFiles:\n d41d8cd98f00b204e9800998ecf8427e 0 libs optional libfoo1_1.0-1_amd64.deb\n";
++    let py = python_changes(text);
++    assert_eq!(py["pool"].as_str(), Some("pool/main/libf/libfoo"));
++    let c = Changes::read(text.as_bytes()).unwrap();
++    assert_eq!(c.get_pool_path().as_deref(), Some("pool/main/libf/libfoo"));
++}
++
++#[test]
++fn changes_getters_do_not_panic_on_malformed_fields() {
++    let cases: &[(&str, fn(&Changes) -> String)] = &[
++        ("Version: 1_2\n", |c| format!("{:?}", c.version())),
++        ("Urgency: low (HIGH for users of foo)\n", |c| format!("{:?}", c.urgency())),
++        ("Checksums-Sha1:\n abc foo\n", |c| format!("{:?}", c.checksums_sha1())),
++        ("Files:\n abc 12 foo.tar.gz\n", |c| format!("{:?}", c.files())),
++        ("Source: foo\nFiles:\n", |c| format!("{:?}", c.get_pool_path())),
++    ];
++    let mut panics = Vec::new();
++    for (text, getter) in cases {
++        let c = Changes::read(text.as_bytes()).unwrap();
++        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| getter(&c))).is_err() {
++            panics.push(*text);
++        }
++    }
++    assert!(panics.is_empty(), "getters panic on {panics:?}");
++}
++
++#[test]
++fn build_tainted_by_reads_one_entry_per_line() {
++    // dpkg-genbuildinfo writes one tag per continuation line.
++    let b = Buildinfo::from_str("Build-Tainted-By:\n merged-usr-via-aliased-dirs\n usr-local-has-libraries\n").unwrap();
++    assert_eq!(b.build_tainted_by(), Some(vec!["merged-usr-via-aliased-dirs".to_string(), "usr-local-has-libraries".to_string()]));
++    let b = Buildinfo::from_str("Binary: foo  bar\n").unwrap();
++    assert_eq!(b.binaries(), Some(vec!["foo".to_string(), "bar".to_string()]));
++}
++
++#[test]
++fn environment_reads_the_values_dpkg_genbuildinfo_writes() {
++    // dpkg-genbuildinfo: `$var="$value"` with `"` escaped as `\"`, sorted by name.
++    let b = Buildinfo::from_str("Environment:\n DEB_BUILD_OPTIONS=\"parallel=4 nocheck\"\n LANG=\"C.UTF-8\"\n QUOTED=\"say \\\"hi\\\"\"\n").unwrap();
++    let env = b.environment().unwrap();
++    assert_eq!(env.get("LANG").map(|s| s.as_str()), Some("C.UTF-8"));
++    assert_eq!(env.get("DEB_BUILD_OPTIONS").map(|s| s.as_str()), Some("parallel=4 nocheck"));
++    assert_eq!(env.get("QUOTED").map(|s| s.as_str()), Some("say \"hi\""));
++}
++
++#[test]
++fn set_environment_writes_dpkgs_layout() {
++    let mut b = Buildinfo::new();
++    let env: HashMap<String, String> = [("LANG", "C.UTF-8"), ("DEB_BUILD_OPTIONS", "parallel=4 nocheck"), ("SOURCE_DATE_EPOCH", "1"), ("A", "1"), ("B", "2"), ("C", "3")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
++    b.set_environment(env);
++    let text = b.syntax().text().to_string();
++    assert_eq!(text, "Environment:\n A=\"1\"\n B=\"2\"\n C=\"3\"\n DEB_BUILD_OPTIONS=\"parallel=4 nocheck\"\n LANG=\"C.UTF-8\"\n SOURCE_DATE_EPOCH=\"1\"\n");
++}
++
++#[test]
++fn environment_without_an_equals_sign_does_not_panic() {
++    let b = Buildinfo::from_str("Environment:\n FOO\n").unwrap();
++    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| b.environment()));
++    assert!(got.is_ok(), "environment() panics on a line without `=`");
++}
