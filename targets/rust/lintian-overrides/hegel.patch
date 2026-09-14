@@ -1,0 +1,1006 @@
+diff --git a/lintian-overrides/Cargo.toml b/lintian-overrides/Cargo.toml
+index 9703ce4..845dd62 100644
+--- a/lintian-overrides/Cargo.toml
++++ b/lintian-overrides/Cargo.toml
+@@ -14,3 +14,7 @@ documentation = "https://docs.rs/lintian-overrides"
+ rowan = { workspace = true }
+ lazy_static = "1"
+ regex = "1"
++
++[dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
+diff --git a/lintian-overrides/tests/hegel.rs b/lintian-overrides/tests/hegel.rs
+new file mode 100644
+index 0000000..9cbc272
+--- /dev/null
++++ b/lintian-overrides/tests/hegel.rs
+@@ -0,0 +1,988 @@
++//! Hegel property tests for lintian-overrides, against lintian itself.
++//!
++//! The reference is lintian's own override parser and glob matcher —
++//! `Lintian::Processable::Overrides::parse_overrides` (applied to a fake
++//! processable with the generated package name and type) and
++//! `Lintian::Util::match_glob` (Regexp::Wildcards, "jokers") — driven as a
++//! persistent Perl child; plus the generators' own model of the line grammar
++//! from the lintian manual: `[[<package>][ <archlist>][ <type>]: ]<tag>[ <context>]`.
++
++use hegel::generators;
++use hegel::Generator;
++use lintian_overrides::*;
++use rowan::TextSize;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracle: lintian
++// ---------------------------------------------------------------------------
++
++const PERL_SCRIPT: &str = r#"
++use v5.20; use warnings;
++use lib '/usr/share/lintian/lib';
++package FakeFile { use Moo; sub pointer { my ($s, $p) = @_; return $p } }
++package Fake {
++    use Moo;
++    has name => (is => 'rw');
++    has type => (is => 'rw');
++    has override_file => (is => 'rw', default => sub { FakeFile->new });
++    with 'Lintian::Processable::Overrides';
++}
++package main;
++use JSON::PP;
++use Lintian::Util qw(match_glob);
++my $json = JSON::PP->new->canonical;
++$| = 1;
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, @args) = split / /, $line;
++    my @a = map { pack('H*', $_) } @args;
++    if ($cmd eq 'P') {
++        my ($name, $type, $text) = @a;
++        my $p = Fake->new(name => $name, type => $type);
++        my $r = $p->parse_overrides($text);
++        my @lines = map { { tag => $_->tag_name, arch => $_->architectures, pattern => $_->pattern,
++                            just => $_->justification, pos => $_->position } } @$r;
++        my @errors = map { { message => $_->{message}, pos => $_->{pointer} } } @{$p->override_errors};
++        print $json->encode({ lines => \@lines, errors => \@errors }), "\n";
++    } elsif ($cmd eq 'G') {
++        my ($glob, $value) = @a;
++        my @m = match_glob($glob, $value);
++        print $json->encode({ m => (@m ? 1 : 0) }), "\n";
++    } else {
++        print "{}\n";
++    }
++}
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn ask(c: &mut Child2, cmd: &str, args: &[&str]) -> serde_json::Value {
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    writeln!(c.stdin, "{line}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut reply = String::new();
++    c.stdout.read_line(&mut reply).unwrap();
++    assert!(!reply.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&reply).unwrap_or_else(|e| panic!("bad oracle reply {reply:?}: {e}"))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct LintianOverride {
++    tag: String,
++    arch: Vec<String>,
++    pattern: String,
++    justification: String,
++    position: usize,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct LintianParse {
++    lines: Vec<LintianOverride>,
++    /// 1-based line numbers of the malformed lines.
++    errors: Vec<usize>,
++}
++
++/// lintian's `parse_overrides` for a processable named `name` of type `ptype`.
++fn lintian_parse(name: &str, ptype: &str, text: &str) -> LintianParse {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "P", &[name, ptype, text]);
++    let lines = v["lines"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|l| LintianOverride {
++            tag: l["tag"].as_str().unwrap().to_string(),
++            arch: l["arch"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect(),
++            pattern: l["pattern"].as_str().unwrap().to_string(),
++            justification: l["just"].as_str().unwrap().to_string(),
++            position: l["pos"].as_u64().unwrap() as usize,
++        })
++        .collect();
++    let errors = v["errors"].as_array().unwrap().iter().map(|e| e["pos"].as_u64().unwrap() as usize).collect();
++    LintianParse { lines, errors }
++}
++
++/// lintian's `match_glob(glob, value)`.
++fn lintian_glob(glob: &str, value: &str) -> bool {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    ask(&mut c, "G", &[glob, value])["m"].as_u64().unwrap() == 1
++}
++
++// ---------------------------------------------------------------------------
++// Model and generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++const NAMES: &[&str] = &["foo", "libfoo-dev", "bar1", "python3-baz", "a.b"];
++const TAGS: &[&str] = &["some-tag", "x-y", "tag2", "T", "source-is-missing", "unusual-interpreter"];
++const TYPES: &[&str] = &["source", "binary", "udeb"];
++const ARCHES: &[&str] = &["amd64", "!i386", "any-i386", "!linux-any", "all", "arm64"];
++const INFO_WORDS: &[&str] = &[
++    "a", "b:c", "[debian/rules:3]", "*.js", "x?y", "usr/share/doc", "51:", "*", "binary", "foo", "#", "(", "]", "\\*",
++];
++const COMMENTS: &[&str] = &["# a comment", "#", "#foo: bar", "# some-tag x"];
++
++fn ws(tc: &hegel::TestCase) -> String {
++    pick(tc, &[" ", "  ", "\t", " \t"]).to_string()
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct Spec {
++    name: bool,
++    arch: Option<Vec<String>>,
++    ptype: bool,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++enum Line {
++    Empty(String),
++    Comment(String, String),
++    /// A spec with nothing after the colon: malformed for both parsers.
++    Tagless(Spec),
++    Override { spec: Option<Spec>, tag: String, info: Option<String> },
++}
++
++#[derive(Debug, Clone)]
++struct GenFile {
++    name: String,
++    ptype: String,
++    lines: Vec<Line>,
++    /// Rendered text of each line (without the newline).
++    texts: Vec<String>,
++    trailing_newline: bool,
++}
++
++impl GenFile {
++    fn text(&self) -> String {
++        let mut s = self.texts.join("\n");
++        if self.trailing_newline {
++            s.push('\n');
++        }
++        s
++    }
++}
++
++#[hegel::composite]
++fn arb_spec(tc: &hegel::TestCase) -> Spec {
++    let name = tc.draw(generators::booleans());
++    let arch = if tc.draw(generators::booleans()) {
++        let n = tc.draw(int!(0, 3)) as usize;
++        Some((0..n).map(|_| pick(tc, ARCHES).to_string()).collect())
++    } else {
++        None
++    };
++    let ptype = tc.draw(generators::booleans());
++    Spec { name, arch, ptype }
++}
++
++fn render_spec(tc: &hegel::TestCase, spec: &Spec, name: &str, ptype: &str) -> String {
++    let mut parts: Vec<String> = Vec::new();
++    if spec.name {
++        parts.push(name.to_string());
++    }
++    if let Some(arch) = &spec.arch {
++        let inner = if arch.is_empty() {
++            String::new()
++        } else {
++            let mut s = String::new();
++            if tc.draw(generators::booleans()) {
++                s.push(' ');
++            }
++            s.push_str(&arch.join(&ws(tc)));
++            if tc.draw(generators::booleans()) {
++                s.push(' ');
++            }
++            s
++        };
++        parts.push(format!("[{inner}]"));
++    }
++    if spec.ptype {
++        parts.push(ptype.to_string());
++    }
++    let mut s = String::new();
++    for (i, p) in parts.iter().enumerate() {
++        if i > 0 {
++            s.push_str(&ws(tc));
++        }
++        s.push_str(p);
++    }
++    // Whitespace before the colon of a bare type keyword is pinned separately
++    // (`whitespace_before_a_bare_type_colon_is_kept`).
++    if (spec.name || spec.arch.is_some()) && tc.draw(int!(0, 3)) == 0 {
++        s.push_str(&ws(tc));
++    }
++    s.push(':');
++    s
++}
++
++fn arb_info(tc: &hegel::TestCase) -> String {
++    let n = tc.draw(int!(1, 3)) as usize;
++    (0..n).map(|_| pick(tc, INFO_WORDS).to_string()).collect::<Vec<_>>().join(" ")
++}
++
++#[hegel::composite]
++fn arb_file(tc: &hegel::TestCase) -> GenFile {
++    let name = pick(tc, NAMES).to_string();
++    let ptype = pick(tc, TYPES).to_string();
++    let n = tc.draw(int!(0, 6)) as usize;
++    let mut lines = Vec::new();
++    let mut texts = Vec::new();
++    for _ in 0..n {
++        let kind = tc.draw(int!(0, 9));
++        let lead = if tc.draw(int!(0, 3)) == 0 { ws(tc) } else { String::new() };
++        let (line, text) = match kind {
++            0 => (Line::Empty(lead.clone()), lead.clone()),
++            1 | 2 => {
++                let c = pick(tc, COMMENTS).to_string();
++                (Line::Comment(lead.clone(), c.clone()), format!("{lead}{c}"))
++            }
++            3 => {
++                // A spec must have at least one part to be a spec at all.
++                let mut spec = tc.draw(arb_spec().print_as_debug());
++                if !spec.name && spec.arch.is_none() && !spec.ptype {
++                    spec.name = true;
++                }
++                let s = render_spec(tc, &spec, &name, &ptype);
++                let tail = if tc.draw(generators::booleans()) { ws(tc) } else { String::new() };
++                (Line::Tagless(spec), format!("{lead}{s}{tail}"))
++            }
++            _ => {
++                let spec = if tc.draw(generators::booleans()) {
++                    let mut spec = tc.draw(arb_spec().print_as_debug());
++                    if !spec.name && spec.arch.is_none() && !spec.ptype {
++                        spec.name = true;
++                    }
++                    Some(spec)
++                } else {
++                    None
++                };
++                let tag = pick(tc, TAGS).to_string();
++                let info = if tc.draw(generators::booleans()) { Some(arb_info(tc)) } else { None };
++                let mut text = lead.clone();
++                if let Some(spec) = &spec {
++                    text.push_str(&render_spec(tc, spec, &name, &ptype));
++                    text.push_str(&ws(tc));
++                }
++                text.push_str(&tag);
++                if let Some(info) = &info {
++                    text.push_str(&ws(tc));
++                    text.push_str(info);
++                }
++                if tc.draw(int!(0, 3)) == 0 {
++                    text.push_str(&ws(tc));
++                }
++                (Line::Override { spec, tag, info }, text)
++            }
++        };
++        lines.push(line);
++        texts.push(text);
++    }
++    // A trailing empty line is only a line when a newline follows it.
++    let trailing_newline = !lines.is_empty()
++        && (tc.draw(generators::booleans()) || matches!(lines.last(), Some(Line::Empty(s)) if s.is_empty()));
++    GenFile { name, ptype, lines, texts, trailing_newline }
++}
++
++/// The common ground of the crate's raw info and lintian's pattern:
++/// trimmed, inner whitespace collapsed.
++fn norm(s: &str) -> String {
++    s.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++// ---------------------------------------------------------------------------
++// Parsing against lintian and the model
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn files_are_read_like_lintian(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let parsed = LintianOverrides::parse(&text);
++    let tree = parsed.tree();
++    let ours: Vec<OverrideLine> = tree.lines().collect();
++    assert_eq!(ours.len(), f.lines.len(), "one OVERRIDE_LINE node per line");
++
++    let ref_parse = lintian_parse(&f.name, &f.ptype, &text);
++
++    let mut ref_lines = ref_parse.lines.iter();
++    let mut expected_error_lines = Vec::new();
++    for (i, (line, model)) in ours.iter().zip(f.lines.iter()).enumerate() {
++        match model {
++            Line::Empty(_) => {
++                assert!(line.is_empty(), "line {i}: empty");
++                assert!(!line.is_comment());
++                assert!(line.tag().is_none());
++                assert!(line.package_spec().is_none());
++            }
++            Line::Comment(_, _) => {
++                assert!(line.is_comment(), "line {i}: comment");
++                assert!(!line.is_empty());
++                assert!(line.tag().is_none());
++                assert!(line.package_spec().is_none());
++            }
++            Line::Tagless(spec) => {
++                expected_error_lines.push(i + 1);
++                assert!(line.tag().is_none(), "line {i}: no tag on a tagless spec");
++                check_spec(line, spec, &f);
++            }
++            Line::Override { spec, tag, info } => {
++                let r = ref_lines.next().unwrap_or_else(|| panic!("line {i}: lintian has no override here"));
++                assert_eq!(r.position, i + 1, "lintian's line number");
++                assert_eq!(line.tag().map(|t| t.text().to_string()), Some(tag.clone()), "line {i}: tag");
++                assert_eq!(r.tag, *tag, "line {i}: lintian's tag");
++                assert_eq!(norm(&line.info().unwrap_or_default()), info.as_deref().map(norm).unwrap_or_default(), "line {i}: info");
++                assert_eq!(r.pattern, info.as_deref().map(norm).unwrap_or_default(), "line {i}: lintian's pattern");
++                assert_eq!(line.info().is_some(), info.is_some(), "line {i}: info presence");
++                match spec {
++                    Some(spec) => {
++                        check_spec(line, spec, &f);
++                        assert_eq!(r.arch, spec.arch.clone().unwrap_or_default(), "line {i}: lintian's architectures");
++                    }
++                    None => {
++                        assert!(line.package_spec().is_none(), "line {i}: no spec");
++                        assert!(!line.has_colon());
++                        assert!(r.arch.is_empty());
++                    }
++                }
++                assert!(!line.is_comment() && !line.is_empty());
++            }
++        }
++    }
++    assert!(ref_lines.next().is_none(), "lintian read more overrides than the model has");
++
++    // Errors: exactly the tagless lines, for both.
++    assert_eq!(ref_parse.errors, expected_error_lines, "lintian's malformed lines");
++    let line_starts: Vec<usize> = {
++        let mut v = Vec::new();
++        let mut off = 0;
++        for t in &f.texts {
++            v.push(off);
++            off += t.len() + 1;
++        }
++        v
++    };
++    let our_errors: Vec<usize> = parsed
++        .errors_with_offsets()
++        .map(|(_, off)| line_starts.iter().position(|&s| s == usize::from(off)).map(|p| p + 1).unwrap_or(0))
++        .collect();
++    assert_eq!(our_errors, expected_error_lines, "the crate's malformed lines (by offset)");
++    assert_eq!(parsed.errors().len(), expected_error_lines.len());
++    assert_eq!(parsed.clone().ok().is_ok(), expected_error_lines.is_empty(), "ok() iff no errors");
++}
++
++fn check_spec(line: &OverrideLine, spec: &Spec, f: &GenFile) {
++    let s = line.package_spec().expect("a package spec");
++    assert!(line.has_colon());
++    assert_eq!(s.package_name(), spec.name.then(|| f.name.clone()), "package name");
++    assert_eq!(line.package(), spec.name.then(|| f.name.clone()));
++    assert_eq!(s.package_type(), spec.ptype.then(|| f.ptype.clone()), "package type");
++    assert_eq!(line.package_type(), spec.ptype.then(|| f.ptype.clone()));
++    assert_eq!(s.has_arch_list(), spec.arch.is_some(), "arch list presence");
++    assert_eq!(s.arch_list(), spec.arch.clone().unwrap_or_default(), "arch list");
++}
++
++#[hegel::test]
++fn the_tree_is_lossless(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let parsed = LintianOverrides::parse(&text);
++    let tree = parsed.tree();
++    assert_eq!(tree.text(), text);
++    assert_eq!(tree.to_string(), text);
++    assert_eq!(tree.syntax_node().text().to_string(), text);
++    for (line, t) in tree.lines().zip(f.texts.iter()) {
++        assert_eq!(line.text(), *t, "line text");
++        let r = line.text_range();
++        assert_eq!(&text[usize::from(r.start())..usize::from(r.end())], t, "line range");
++    }
++    // Snapshots are equal until the tree changes.
++    let snap = tree.snapshot();
++    assert!(tree.tree_eq(&snap));
++    assert!(snap.tree_eq(&tree));
++    assert_eq!(snap.text(), text);
++    let other = LintianOverrides::parse(&format!("{text}z-tag\n")).tree();
++    assert!(!tree.tree_eq(&other));
++}
++
++/// Any text at all round-trips, including CR, unterminated brackets and
++/// odd whitespace; `tree()` is always available.
++#[hegel::test]
++fn any_text_round_trips(tc: hegel::TestCase) {
++    let n = tc.draw(int!(0, 12)) as usize;
++    let pieces = [
++        "foo", " ", "\t", "\n", "\r\n", ":", "[", "]", "#", "*", "binary", "source", "some-tag", "[amd64", "]:", ": ", "é",
++    ];
++    let text: String = (0..n).map(|_| pick(&tc, &pieces)).collect();
++    if text.lines().any(bare_type_then_spaced_colon) {
++        return; // the pinned lossless bug (`whitespace_before_a_bare_type_colon_is_kept`)
++    }
++    let parsed = LintianOverrides::parse(&text);
++    let tree = parsed.tree();
++    assert_eq!(tree.text(), text);
++    let n_lines = text.split_inclusive('\n').count();
++    assert_eq!(tree.lines().count(), n_lines, "one line node per source line");
++    for (msg, off) in parsed.errors_with_offsets() {
++        assert!(!msg.is_empty());
++        assert!(usize::from(off) <= text.len());
++    }
++    assert_eq!(parsed.errors().len(), parsed.errors_with_offsets().count());
++}
++
++/// `source :` — a bare type keyword, whitespace, colon: the shape whose
++/// whitespace the lexer drops (pinned).
++fn bare_type_then_spaced_colon(line: &str) -> bool {
++    let t = line.trim_start();
++    PACKAGE_TYPES.iter().any(|k| {
++        t.strip_prefix(k).map_or(false, |r| {
++            let r2 = r.trim_start();
++            r2.len() < r.len() && r2.starts_with(':')
++        })
++    })
++}
++
++/// Whether the literal parts of a `*`-glob share no character (the shape the
++/// crate's matcher gets right; overlapping parts are pinned).
++fn disjoint_parts(glob: &str) -> bool {
++    let mut seen = std::collections::HashSet::new();
++    glob.split('*').all(|part| part.chars().all(|c| seen.insert(c)))
++}
++
++// ---------------------------------------------------------------------------
++// Offsets
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn offsets_follow_the_layout(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let tree = LintianOverrides::parse(&text).tree();
++    let slice = |r: rowan::TextRange| &text[usize::from(r.start())..usize::from(r.end())];
++    let lines: Vec<OverrideLine> = tree.lines().collect();
++    for (i, line) in lines.iter().enumerate() {
++        let lr = line.text_range();
++        if let Some(t) = line.tag() {
++            assert_eq!(line.tag_range(), Some(t.text_range()));
++            assert_eq!(slice(t.text_range()), t.text(), "tag range");
++            assert!(lr.contains_range(t.text_range()));
++        } else {
++            assert_eq!(line.tag_range(), None);
++        }
++        match (line.info(), line.info_range()) {
++            (Some(info), Some(r)) => {
++                assert_eq!(slice(r), info, "info range");
++                assert!(lr.contains_range(r));
++            }
++            (None, None) => {}
++            (a, b) => panic!("info {a:?} vs info_range {b:?}"),
++        }
++        if let Some(spec) = line.package_spec() {
++            let sr = spec.syntax().text_range();
++            assert!(lr.contains_range(sr));
++            assert!(slice(sr).ends_with(':'), "spec ends with its colon");
++            match (spec.package_type(), spec.package_type_range()) {
++                (Some(t), Some(r)) => assert_eq!(slice(r), t),
++                (None, None) => {}
++                (a, b) => panic!("type {a:?} vs range {b:?}"),
++            }
++            let open = slice(sr).find('[').map(|p| usize::from(sr.start()) + p);
++            let close = slice(sr).find(']').map(|p| usize::from(sr.start()) + p);
++            assert_eq!(open.is_some(), spec.has_arch_list());
++            for o in usize::from(lr.start())..=usize::from(lr.end()) {
++                let off = TextSize::from(o as u32);
++                let inside = match (open, close) {
++                    (Some(op), Some(cl)) => o > op && o <= cl,
++                    _ => false,
++                };
++                assert_eq!(spec.arch_list_contains_offset(off), inside, "arch_list_contains_offset({o})");
++                assert_eq!(spec.contains_offset(off), sr.contains(off), "contains_offset({o})");
++                assert_eq!(
++                    tree.package_name_at_offset(off),
++                    if sr.contains(off) { spec.package_name() } else { None },
++                    "package_name_at_offset({o})"
++                );
++            }
++        } else {
++            for o in usize::from(lr.start())..=usize::from(lr.end()) {
++                assert_eq!(tree.package_name_at_offset(TextSize::from(o as u32)), None);
++            }
++        }
++        // line_at_offset: inclusive at both ends, the first line wins a tie.
++        for o in usize::from(lr.start())..=usize::from(lr.end()) {
++            let off = TextSize::from(o as u32);
++            let found = tree.line_at_offset(off).expect("a line at every offset of a line");
++            let fr = found.text_range();
++            assert!(fr.start() <= off && off <= fr.end());
++            let expect_prev = i > 0 && lines[i - 1].text_range().end() == off;
++            if expect_prev {
++                assert_eq!(found, lines[i - 1], "the previous line wins the shared boundary");
++            } else {
++                assert_eq!(found, *line, "line_at_offset({o})");
++            }
++        }
++    }
++    assert_eq!(tree.line_at_offset(TextSize::from(text.len() as u32 + 1)), None);
++}
++
++// ---------------------------------------------------------------------------
++// Matching: `matches` and `info_matches` against lintian's glob
++// ---------------------------------------------------------------------------
++
++/// A glob whose literal parts share no character: the shape the crate's
++/// matcher gets right (overlapping parts are pinned separately).
++#[hegel::composite]
++fn arb_disjoint_glob(tc: &hegel::TestCase) -> String {
++    let alphabet = ['a', 'b', 'c', 'd', '/', '.', ':', '[', ']'];
++    let mut free: Vec<char> = alphabet.to_vec();
++    let n_parts = tc.draw(int!(1, 4)) as usize;
++    let mut s = String::new();
++    for i in 0..n_parts {
++        if i > 0 || tc.draw(generators::booleans()) {
++            let stars = tc.draw(int!(1, 2));
++            for _ in 0..stars {
++                s.push('*');
++            }
++        }
++        let len = tc.draw(int!(0, 2)) as usize;
++        for _ in 0..len {
++            if free.is_empty() {
++                break;
++            }
++            let k = tc.draw(int!(0, free.len() as i64 - 1)) as usize;
++            s.push(free.remove(k));
++        }
++    }
++    if tc.draw(generators::booleans()) {
++        s.push('*');
++    }
++    s
++}
++
++fn arb_value(tc: &hegel::TestCase) -> String {
++    let alphabet = ['a', 'b', 'c', 'd', '/', '.', ':', '[', ']', 'x'];
++    let n = tc.draw(int!(0, 6)) as usize;
++    (0..n).map(|_| pick(tc, &alphabet)).collect()
++}
++
++/// A model of lintian's `match_glob` for `*`-only globs.
++fn glob_model(pattern: &str, value: &str) -> bool {
++    fn go(p: &[char], v: &[char]) -> bool {
++        match p.split_first() {
++            None => v.is_empty(),
++            Some(('*', rest)) => (0..=v.len()).any(|k| go(rest, &v[k..])),
++            Some((c, rest)) => v.first() == Some(c) && go(rest, &v[1..]),
++        }
++    }
++    go(&pattern.chars().collect::<Vec<_>>(), &value.chars().collect::<Vec<_>>())
++}
++
++#[hegel::test]
++fn info_matches_is_lintians_glob(tc: hegel::TestCase) {
++    let glob = tc.draw(arb_disjoint_glob());
++    let value = if tc.draw(generators::booleans()) {
++        arb_value(&tc)
++    } else {
++        // A value built from the glob itself: replace each `*` by a short string.
++        let mut v = String::new();
++        for ch in glob.chars() {
++            if ch == '*' {
++                v.push_str(&arb_value(&tc));
++            } else {
++                v.push(ch);
++            }
++        }
++        v
++    };
++    let expected = lintian_glob(&glob, &value);
++    assert_eq!(glob_model(&glob, &value), expected, "the model agrees with lintian on {glob:?} ~ {value:?}");
++    assert_eq!(info_matches(&glob, &value), expected, "info_matches({glob:?}, {value:?})");
++}
++
++#[hegel::test]
++fn matches_follows_lintian(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let tree = LintianOverrides::parse(&text).tree();
++    // A hint for this processable.
++    let hint_tag = pick(&tc, TAGS).to_string();
++    let hint_info = if tc.draw(generators::booleans()) { Some(arb_info(&tc)) } else { None };
++    for (line, model) in tree.lines().zip(f.lines.iter()) {
++        let got = line.matches(Some(&hint_tag), Some(&f.name), Some(&f.ptype), hint_info.as_deref());
++        let expected = match model {
++            Line::Override { tag, info, .. } => {
++                *tag == hint_tag
++                    && match info {
++                        None => true,
++                        Some(pattern) => {
++                            let pattern = norm(pattern);
++                            // The general generator keeps `?` and `\` out of the
++                            // matched patterns (pinned separately).
++                            if pattern.contains('?') || pattern.contains('\\') || !disjoint_parts(&pattern) {
++                                continue;
++                            }
++                            if hint_info.is_none() {
++                                // Pinned: an override with a pattern against a hint without context.
++                                continue;
++                            }
++                            lintian_glob(&pattern, hint_info.as_deref().unwrap_or(""))
++                        }
++                    }
++            }
++            _ => false,
++        };
++        assert_eq!(got, expected, "matches on {:?} for hint {hint_tag} {hint_info:?}", line.text());
++        // A hint for another package or type never matches a spec that names them.
++        if let Line::Override { spec: Some(spec), tag, info: None } = model {
++            if *tag == hint_tag {
++                if spec.name {
++                    assert!(!line.matches(Some(&hint_tag), Some("other-pkg"), Some(&f.ptype), None));
++                }
++                if spec.ptype {
++                    let other = TYPES.iter().find(|t| **t != f.ptype).unwrap();
++                    assert!(!line.matches(Some(&hint_tag), Some(&f.name), Some(other), None));
++                }
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Builder and rewriters
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone)]
++enum Built {
++    Comment(String),
++    Override { pkg: Option<String>, tag: String, info: Option<String> },
++}
++
++#[hegel::composite]
++fn arb_built(tc: &hegel::TestCase) -> Vec<Built> {
++    let n = tc.draw(int!(0, 5)) as usize;
++    (0..n)
++        .map(|_| {
++            if tc.draw(int!(0, 3)) == 0 {
++                Built::Comment(pick(tc, COMMENTS).to_string())
++            } else {
++                Built::Override {
++                    pkg: if tc.draw(generators::booleans()) { Some(pick(tc, NAMES).to_string()) } else { None },
++                    tag: pick(tc, TAGS).to_string(),
++                    info: if tc.draw(generators::booleans()) { Some(arb_info(tc)) } else { None },
++                }
++            }
++        })
++        .collect()
++}
++
++#[hegel::test]
++fn built_files_are_read_back(tc: hegel::TestCase) {
++    let items = tc.draw(arb_built().print_as_debug());
++    let mut b = LintianOverridesBuilder::new();
++    for it in &items {
++        match it {
++            Built::Comment(c) => {
++                b.add_comment(c);
++            }
++            Built::Override { pkg, tag, info } => {
++                b.add_override(pkg.as_deref(), tag, info.as_deref());
++            }
++        }
++    }
++    let built = b.finish();
++    let text = built.text();
++    assert_eq!(text.lines().count(), items.len());
++    assert!(text.is_empty() || text.ends_with('\n'));
++    let parsed = LintianOverrides::parse(&text);
++    assert_eq!(parsed.errors(), &[] as &[String], "built text parses cleanly");
++    let reparsed = parsed.tree();
++    assert!(built.tree_eq(&reparsed), "the built tree is the parse of its text");
++    let live: Vec<OverrideLine> = built.lines().collect();
++    let again: Vec<OverrideLine> = reparsed.lines().collect();
++    assert_eq!(live.len(), items.len());
++    for ((it, l), r) in items.iter().zip(live.iter()).zip(again.iter()) {
++        for line in [l, r] {
++            match it {
++                Built::Comment(_) => {
++                    assert!(line.is_comment());
++                    assert!(line.tag().is_none());
++                }
++                Built::Override { pkg, tag, info } => {
++                    assert_eq!(line.tag().map(|t| t.text().to_string()), Some(tag.clone()));
++                    assert_eq!(line.package(), *pkg);
++                    assert_eq!(line.info(), *info);
++                    assert_eq!(line.package_type(), None);
++                }
++            }
++        }
++    }
++    // lintian reads the overrides the same way (for one package).
++    let overrides: Vec<&Built> = items.iter().filter(|i| matches!(i, Built::Override { .. })).collect();
++    if let Some(name) = overrides.iter().find_map(|i| match i {
++        Built::Override { pkg: Some(p), .. } => Some(p.clone()),
++        _ => None,
++    }) {
++        if overrides.iter().all(|i| matches!(i, Built::Override { pkg, .. } if pkg.as_deref().map_or(true, |p| p == name))) {
++            let r = lintian_parse(&name, "binary", &text);
++            assert!(r.errors.is_empty());
++            let tags: Vec<(String, String)> = r.lines.iter().map(|l| (l.tag.clone(), l.pattern.clone())).collect();
++            let expected: Vec<(String, String)> = overrides
++                .iter()
++                .map(|i| match i {
++                    Built::Override { tag, info, .. } => (tag.clone(), info.as_deref().map(norm).unwrap_or_default()),
++                    _ => unreachable!(),
++                })
++                .collect();
++            assert_eq!(tags, expected, "lintian reads the built file");
++        }
++    }
++}
++
++#[hegel::test]
++fn filter_keeps_exactly_the_selected_lines(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let tree = LintianOverrides::parse(&text).tree();
++    let keep_tag = pick(&tc, TAGS).to_string();
++    let keep_comments = tc.draw(generators::booleans());
++    let pred = |l: &OverrideLine| l.tag().map_or(keep_comments && (l.is_comment() || l.is_empty()), |t| t.text() == keep_tag);
++    let filtered = filter_overrides(&tree, pred);
++    let expected: Vec<String> = tree.lines().filter(|l| pred(l)).map(|l| l.text()).collect();
++    let got: Vec<String> = filtered.lines().map(|l| l.text()).collect();
++    assert_eq!(got, expected, "filtered lines");
++    let expected_text: String = expected.iter().map(|l| format!("{l}\n")).collect();
++    assert_eq!(filtered.text(), expected_text, "one newline per kept line");
++    let reparsed = LintianOverrides::parse(&filtered.text()).tree();
++    assert!(filtered.tree_eq(&reparsed), "the filtered tree is the parse of its text");
++}
++
++#[hegel::test]
++fn rename_tags_changes_only_the_tags(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let tree = LintianOverrides::parse(&text).tree();
++    let from = pick(&tc, TAGS).to_string();
++    let to = pick(&tc, TAGS).to_string();
++    let renamed = rename_tags(&tree, |t| (t == from).then(|| to.clone()));
++    let old: Vec<OverrideLine> = tree.lines().collect();
++    let new: Vec<OverrideLine> = renamed.lines().collect();
++    assert_eq!(old.len(), new.len());
++    let mut expected_text = String::new();
++    for (o, n) in old.iter().zip(new.iter()) {
++        let ot = o.tag().map(|t| t.text().to_string());
++        let nt = n.tag().map(|t| t.text().to_string());
++        assert_eq!(nt, ot.clone().map(|t| if t == from { to.clone() } else { t }), "tag after rename");
++        assert_eq!(n.info(), o.info());
++        assert_eq!(n.package(), o.package());
++        assert_eq!(n.package_type(), o.package_type());
++        assert_eq!(n.package_spec().map(|s| s.arch_list()), o.package_spec().map(|s| s.arch_list()));
++        assert_eq!(n.is_comment(), o.is_comment());
++        let ot_text = o.text();
++        let expect_line = match (&ot, o.tag_range()) {
++            (Some(t), Some(r)) if *t == from => {
++                let start = usize::from(r.start() - o.text_range().start());
++                format!("{}{}{}", &ot_text[..start], to, &ot_text[start + t.len()..])
++            }
++            _ => ot_text,
++        };
++        assert_eq!(n.text(), expect_line);
++        expected_text.push_str(&expect_line);
++        expected_text.push('\n');
++    }
++    if !f.trailing_newline && !f.texts.is_empty() {
++        expected_text.pop();
++    }
++    assert_eq!(renamed.text(), expected_text, "everything but the tags is verbatim");
++    let reparsed = LintianOverrides::parse(&renamed.text()).tree();
++    assert!(renamed.tree_eq(&reparsed), "the renamed tree is the parse of its text");
++}
++
++#[hegel::test]
++fn map_overrides_writes_the_transformed_lines(tc: hegel::TestCase) {
++    let f = tc.draw(arb_file().print_as_debug());
++    let text = f.text();
++    let tree = LintianOverrides::parse(&text).tree();
++    let new_tag = pick(&tc, TAGS).to_string();
++    let new_info = if tc.draw(generators::booleans()) { Some(arb_info(&tc)) } else { None };
++    let new_pkg = if tc.draw(generators::booleans()) { Some(pick(&tc, NAMES).to_string()) } else { None };
++    // The general property keeps the package type with a package name and only
++    // maps lines without an architecture list (both pinned separately).
++    let new_type = if new_pkg.is_some() && tc.draw(generators::booleans()) { Some(pick(&tc, TYPES).to_string()) } else { None };
++    let mapped = map_overrides(&tree, |l| {
++        if l.tag().is_some() && !l.package_spec().map_or(false, |s| s.has_arch_list()) {
++            Some((new_pkg.clone(), new_type.clone(), new_tag.clone(), new_info.clone()))
++        } else {
++            None
++        }
++    });
++    let old: Vec<OverrideLine> = tree.lines().collect();
++    let new: Vec<OverrideLine> = mapped.lines().collect();
++    assert_eq!(old.len(), new.len());
++    for (o, n) in old.iter().zip(new.iter()) {
++        if o.tag().is_some() && !o.package_spec().map_or(false, |s| s.has_arch_list()) {
++            assert_eq!(n.tag().map(|t| t.text().to_string()), Some(new_tag.clone()));
++            assert_eq!(n.info(), new_info);
++            assert_eq!(n.package(), new_pkg);
++            assert_eq!(n.package_type(), new_type);
++        } else {
++            assert_eq!(n.text(), o.text(), "untransformed lines are verbatim");
++        }
++    }
++    let reparsed = LintianOverrides::parse(&mapped.text());
++    let tagless = f.lines.iter().filter(|l| matches!(l, Line::Tagless(_))).count();
++    assert_eq!(reparsed.errors().len(), tagless, "only the untransformed tagless lines are errors");
++    assert!(mapped.tree_eq(&reparsed.tree()), "the mapped tree is the parse of its text");
++}
++
++// ---------------------------------------------------------------------------
++// Pins
++// ---------------------------------------------------------------------------
++
++#[test]
++fn whitespace_before_a_bare_type_colon_is_kept() {
++    // The lexer drops the whitespace between a bare type keyword and its colon,
++    // so the "format-preserving" tree renders differently from its source.
++    for text in ["source : some-tag\n", "binary\t: some-tag x\n", " udeb  :\n"] {
++        let tree = LintianOverrides::parse(text).tree();
++        assert_eq!(tree.text(), text);
++    }
++}
++
++#[test]
++fn a_colon_without_a_space_still_ends_the_package_spec() {
++    // lintian: `foo:tag` is package `foo`, tag `tag` (the colon may follow the
++    // name directly: `(?=\s|:)`).
++    let r = lintian_parse("foo", "binary", "foo:some-tag\n");
++    assert_eq!(r.lines.len(), 1);
++    assert_eq!(r.lines[0].tag, "some-tag");
++    let tree = LintianOverrides::parse("foo:some-tag\n").tree();
++    let line = tree.lines().next().unwrap();
++    assert_eq!(line.package(), Some("foo".to_string()));
++    assert_eq!(line.tag().unwrap().text(), "some-tag");
++}
++
++#[test]
++fn a_package_spec_without_a_colon_is_an_error() {
++    // lintian: "Expected a colon"; the crate reads a tag named `[amd64]`.
++    let r = lintian_parse("foo", "binary", "[amd64] some-tag\n");
++    assert!(r.lines.is_empty());
++    assert_eq!(r.errors, vec![1]);
++    let parsed = LintianOverrides::parse("[amd64] some-tag\n");
++    assert_eq!(parsed.errors().len(), 1, "one error");
++    assert!(parsed.tree().lines().next().unwrap().tag().is_none());
++}
++
++#[test]
++fn overlapping_literal_parts_do_not_match_twice() {
++    for (glob, value) in [("ab*b", "ab"), ("a*a", "a"), ("*foo*foo", "xfoo"), ("*b*bc", "xbc"), ("a*bc*cd", "abcd")] {
++        assert!(!lintian_glob(glob, value));
++        assert!(!glob_model(glob, value));
++        assert!(!info_matches(glob, value), "info_matches({glob:?}, {value:?})");
++    }
++}
++
++#[test]
++fn a_question_mark_matches_one_character() {
++    assert!(lintian_glob("a?c", "abc"));
++    assert!(!lintian_glob("a?c", "ac"));
++    assert!(info_matches("a?c", "abc"));
++    assert!(!info_matches("a?c", "a?c") || lintian_glob("a?c", "a?c"));
++}
++
++#[test]
++fn a_backslash_escapes_a_wildcard() {
++    assert!(lintian_glob("a\\*", "a*"));
++    assert!(!lintian_glob("a\\*", "ab"));
++    assert!(info_matches("a\\*", "a*"));
++    assert!(!info_matches("a\\*", "ab"));
++}
++
++#[test]
++fn an_override_with_a_pattern_does_not_match_a_hint_without_context() {
++    // lintian: only an override with an empty pattern (or one whose glob
++    // matches the empty string) applies to a hint with no context.
++    assert!(!lintian_glob("[debian/rules:3]", ""));
++    let tree = LintianOverrides::parse("foo: some-tag [debian/rules:3]\n").tree();
++    let line = tree.lines().next().unwrap();
++    assert!(line.matches(Some("some-tag"), Some("foo"), Some("binary"), Some("[debian/rules:3]")));
++    assert!(!line.matches(Some("some-tag"), Some("foo"), Some("binary"), None));
++}
++
++#[test]
++fn map_overrides_keeps_a_package_type_without_a_package_name() {
++    let tree = LintianOverrides::parse("source: some-tag\n").tree();
++    let mapped = map_overrides(&tree, |_| Some((None, Some("source".to_string()), "other-tag".to_string(), None)));
++    assert_eq!(mapped.text(), "source: other-tag\n");
++    assert_eq!(mapped.lines().next().unwrap().package_type(), Some("source".to_string()));
++}
++
++#[test]
++fn map_overrides_keeps_the_architecture_list() {
++    let tree = LintianOverrides::parse("foo [amd64] binary: some-tag\n").tree();
++    let mapped = map_overrides(&tree, |l| {
++        Some((l.package(), l.package_type(), "other-tag".to_string(), l.info()))
++    });
++    let line = mapped.lines().next().unwrap();
++    assert_eq!(line.tag().unwrap().text(), "other-tag");
++    assert_eq!(line.package_spec().unwrap().arch_list(), vec!["amd64".to_string()], "{}", mapped.text());
++}
++
++#[test]
++fn a_built_comment_is_a_comment_in_the_text() {
++    let mut b = LintianOverridesBuilder::new();
++    b.add_comment("a comment");
++    let built = b.finish();
++    assert!(built.lines().next().unwrap().is_comment());
++    let reparsed = LintianOverrides::parse(&built.text()).tree();
++    assert!(reparsed.lines().next().unwrap().is_comment(), "{:?}", built.text());
++    assert!(built.tree_eq(&reparsed));
++}
++
++#[test]
++fn info_is_the_context_without_trailing_whitespace() {
++    let r = lintian_parse("foo", "binary", "foo: some-tag ctx  \n");
++    assert_eq!(r.lines[0].pattern, "ctx");
++    let tree = LintianOverrides::parse("foo: some-tag ctx  \n").tree();
++    assert_eq!(tree.lines().next().unwrap().info(), Some("ctx".to_string()));
++}
