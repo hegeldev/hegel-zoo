@@ -1,0 +1,1435 @@
+diff --git a/go.mod b/go.mod
+index ea0e784..6f7d278 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/klauspost/compress
+ 
+-go 1.25
++go 1.26.0
+ 
+ retract (
+ 	// https://github.com/klauspost/compress/issues/1114
+@@ -11,3 +11,10 @@ retract (
+ 	v1.14.2
+ 	v1.14.1
+ )
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..b5348b1
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1406 @@
++package compress_test
++
++// Hegel property tests for github.com/klauspost/compress.
++//
++// Oracles: the standard library's compress/flate, compress/gzip and
++// compress/zlib (in process; klauspost's packages are documented drop-in
++// replacements, so a stream written by one side must decode byte-for-byte on
++// the other), the reference `zstd` command-line tool (v1.5.x on this machine;
++// a frame written by klauspost's Encoder must decode with `zstd -d`, and a
++// frame written by `zstd` at any level must decode with klauspost's Decoder),
++// and for the S2/Snappy block and stream formats the package's own decoders
++// under every encoder mode plus the format's invariants (DecodedLen,
++// MaxEncodedLen, block concatenation).
++//
++// Set COMPRESS_COLLECT=1 to make the properties record mismatches instead of
++// failing and print them (shortest first) at the end of each test.
++
++import (
++	"bytes"
++	stdflate "compress/flate"
++	stdgzip "compress/gzip"
++	stdzlib "compress/zlib"
++	"errors"
++	"fmt"
++	"io"
++	"math/rand"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/klauspost/compress/flate"
++	"github.com/klauspost/compress/gzip"
++	"github.com/klauspost/compress/s2"
++	"github.com/klauspost/compress/snappy"
++	"github.com/klauspost/compress/zlib"
++	"github.com/klauspost/compress/zstd"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Harness helpers.
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("COMPRESS_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++// fail reports a mismatch: normally ht.Fatalf, in collect mode it records the
++// message and abandons the case.
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func wide(tc hegel.TestCase, lo, hi int64) int64 {
++	return hegel.Draw(tc, hegel.Integers[int64](lo, hi))
++}
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---------------------------------------------------------------------------
++// Data generators.  Bulk bytes come from math/rand seeded by a drawn value, so
++// a case is reproducible from its choice sequence without drawing every byte.
++
++var words = []string{"the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dog ", "\n", "zstd ", "flate ", "0 ", "1 ", "42 ", ", ", ". ", "compress ", "klauspost ", "hegel ", "\t"}
++
++// genSize draws a length: mostly small, sometimes past the 32 KiB flate
++// window / 64 KiB snappy block, rarely past zstd's 128 KiB block.
++func genSize(tc hegel.TestCase) int {
++	switch n(tc, 0, 9) {
++	case 0:
++		return 0
++	case 1, 2, 3:
++		return n(tc, 1, 64)
++	case 4, 5, 6:
++		return n(tc, 65, 4096)
++	case 7, 8:
++		return n(tc, 4097, 70000)
++	default:
++		return n(tc, 70001, 300000)
++	}
++}
++
++type dataKind int
++
++const (
++	kindRandom dataKind = iota
++	kindSmallAlphabet
++	kindText
++	kindPattern
++	kindRun
++	kindMixed
++)
++
++func fill(r *rand.Rand, kind dataKind, size int) []byte {
++	out := make([]byte, 0, size)
++	switch kind {
++	case kindRandom:
++		out = out[:size]
++		r.Read(out)
++	case kindSmallAlphabet:
++		k := 1 + r.Intn(4)
++		base := byte(r.Intn(256))
++		for len(out) < size {
++			out = append(out, base+byte(r.Intn(k)))
++		}
++	case kindText:
++		for len(out) < size {
++			out = append(out, words[r.Intn(len(words))]...)
++		}
++		out = out[:size]
++	case kindPattern:
++		p := make([]byte, 1+r.Intn(300))
++		r.Read(p)
++		for len(out) < size {
++			out = append(out, p...)
++			if r.Intn(20) == 0 && len(out) > 0 {
++				out[len(out)-1] ^= byte(1 + r.Intn(255))
++			}
++		}
++		out = out[:size]
++	case kindRun:
++		b := byte(r.Intn(256))
++		out = out[:size]
++		for i := range out {
++			out[i] = b
++		}
++	default:
++		for len(out) < size {
++			seg := 1 + r.Intn(size-len(out)+1)
++			if seg > size-len(out) {
++				seg = size - len(out)
++			}
++			out = append(out, fill(r, dataKind(r.Intn(5)), seg)...)
++		}
++	}
++	return out
++}
++
++func genData(tc hegel.TestCase) []byte {
++	size := genSize(tc)
++	kind := dataKind(n(tc, 0, 5))
++	seed := wide(tc, 0, 1<<40)
++	return fill(rand.New(rand.NewSource(seed)), kind, size)
++}
++
++// genDict draws a dictionary: empty (no dictionary) or bytes that share
++// material with data so that it is actually used.
++func genDict(tc hegel.TestCase, data []byte) []byte {
++	if chance(tc, 50) || len(data) == 0 {
++		return nil
++	}
++	seed := wide(tc, 0, 1<<40)
++	r := rand.New(rand.NewSource(seed))
++	d := fill(r, dataKind(n(tc, 0, 3)), n(tc, 1, 4000))
++	if chance(tc, 60) {
++		// splice in a slice of the data
++		lo := r.Intn(len(data))
++		hi := lo + r.Intn(len(data)-lo+1)
++		d = append(d, data[lo:hi]...)
++	}
++	if len(d) > 32768 {
++		d = d[:32768]
++	}
++	return d
++}
++
++// writeChunks writes data through w in a few random pieces, optionally
++// calling Flush between them (a sync flush for flate/gzip/zlib, a frame
++// block flush for zstd, a chunk flush for s2/snappy).
++type flusher interface {
++	io.Writer
++	Flush() error
++}
++
++func writeChunks(tc hegel.TestCase, w flusher, data []byte) error {
++	k := n(tc, 1, 6)
++	pos := 0
++	for i := 0; i < k; i++ {
++		end := len(data)
++		if i < k-1 {
++			end = pos + n(tc, 0, len(data)-pos)
++		}
++		if _, err := w.Write(data[pos:end]); err != nil {
++			return err
++		}
++		pos = end
++		if chance(tc, 30) {
++			if err := w.Flush(); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func short(b []byte) string {
++	if len(b) > 64 {
++		return fmt.Sprintf("%x... (%d bytes)", b[:64], len(b))
++	}
++	return fmt.Sprintf("%x (%d bytes)", b, len(b))
++}
++
++func diffAt(a, b []byte) string {
++	i := 0
++	for i < len(a) && i < len(b) && a[i] == b[i] {
++		i++
++	}
++	lo := i - 16
++	if lo < 0 {
++		lo = 0
++	}
++	cut := func(s []byte) string {
++		if lo >= len(s) {
++			return ""
++		}
++		hi := i + 16
++		if hi > len(s) {
++			hi = len(s)
++		}
++		return fmt.Sprintf("%x", s[lo:hi])
++	}
++	return fmt.Sprintf("lengths %d vs %d, first difference at byte %d:\n   a %s\n   b %s", len(a), len(b), i, cut(a), cut(b))
++}
++
++// ---------------------------------------------------------------------------
++// The zstd command-line oracle.
++
++var (
++	zstdOnce sync.Once
++	zstdBin  string
++	zstdErr  error
++)
++
++func zstdPath(t testing.TB) string {
++	zstdOnce.Do(func() {
++		zstdBin = os.Getenv("HEGEL_ZSTD")
++		if zstdBin == "" {
++			zstdBin, zstdErr = exec.LookPath("zstd")
++		}
++	})
++	if zstdErr != nil {
++		t.Fatalf("the zstd command-line tool is required as the oracle: %v", zstdErr)
++	}
++	return zstdBin
++}
++
++// zstdCLI runs the zstd tool with args, feeding input on stdin, returning
++// stdout; stderr is returned in the error.
++func zstdCLI(t testing.TB, input []byte, args ...string) ([]byte, error) {
++	cmd := exec.Command(zstdPath(t), args...)
++	cmd.Stdin = bytes.NewReader(input)
++	var out, errb bytes.Buffer
++	cmd.Stdout = &out
++	cmd.Stderr = &errb
++	if err := cmd.Run(); err != nil {
++		return out.Bytes(), fmt.Errorf("zstd %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
++	}
++	return out.Bytes(), nil
++}
++
++// zstdCLIFile compresses a file (so the tool knows the content size) with the
++// given extra flags and returns the frame.
++func zstdCLIFile(t testing.TB, dir string, input []byte, args ...string) ([]byte, error) {
++	path := filepath.Join(dir, "in.bin")
++	if err := os.WriteFile(path, input, 0o644); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++	all := append([]string{"-q", "-c", "-f"}, args...)
++	all = append(all, path)
++	cmd := exec.Command(zstdPath(t), all...)
++	var out, errb bytes.Buffer
++	cmd.Stdout = &out
++	cmd.Stderr = &errb
++	if err := cmd.Run(); err != nil {
++		return out.Bytes(), fmt.Errorf("zstd %s: %v: %s", strings.Join(all, " "), err, strings.TrimSpace(errb.String()))
++	}
++	return out.Bytes(), nil
++}
++
++// ---------------------------------------------------------------------------
++// Properties: flate / gzip / zlib against the standard library.
++
++var flateLevels = []int{-2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
++
++// stdLevel caps the standard library writer's level at 6 when a dictionary
++// is used: Go 1.27's compress/flate at levels 7-9 with a short dictionary
++// emits the dictionary bytes inside its first stored block (its own reader
++// decodes dict+data too), which is the oracle's bug, not klauspost's.
++func stdLevel(level int, dict []byte) int {
++	if len(dict) > 0 && level >= 7 {
++		return 6
++	}
++	return level
++}
++
++// A flate stream written by klauspost (any level, optional dictionary,
++// random chunking and sync flushes, or the stateless encoder) inflates with
++// compress/flate to the input, and a stream written by compress/flate
++// inflates with klauspost's reader.
++func TestHegelFlateInteroperatesWithStdlib(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		dict := genDict(ht, data)
++		level := pick(ht, flateLevels)
++		note(ht, "level %d, dict %d bytes, data %s", level, len(dict), short(data))
++
++		// klauspost -> stdlib
++		var kb bytes.Buffer
++		if chance(ht, 15) {
++			if err := flate.StatelessDeflate(&kb, data, true, dict); err != nil {
++				fail(ht, "StatelessDeflate: %v", err)
++			}
++		} else if dict == nil && chance(ht, 15) {
++			ws := n(ht, flate.MinCustomWindowSize, 32768)
++			w, err := flate.NewWriterWindow(&kb, ws)
++			if err != nil {
++				fail(ht, "NewWriterWindow(%d): %v", ws, err)
++			}
++			if err := writeChunks(ht, w, data); err != nil {
++				fail(ht, "Write: %v", err)
++			}
++			if err := w.Close(); err != nil {
++				fail(ht, "Close: %v", err)
++			}
++		} else {
++			w, err := flate.NewWriterDict(&kb, level, dict)
++			if err != nil {
++				fail(ht, "NewWriterDict(level %d): %v", level, err)
++			}
++			if err := writeChunks(ht, w, data); err != nil {
++				fail(ht, "Write: %v", err)
++			}
++			if err := w.Close(); err != nil {
++				fail(ht, "Close: %v", err)
++			}
++		}
++		got, err := io.ReadAll(stdflate.NewReaderDict(bytes.NewReader(kb.Bytes()), dict))
++		if err != nil {
++			fail(ht, "compress/flate cannot read klauspost's level-%d stream: %v\n stream %s", level, err, short(kb.Bytes()))
++		}
++		if !bytes.Equal(got, data) {
++			fail(ht, "compress/flate reads klauspost's stream differently: %s", diffAt(got, data))
++		}
++
++		// stdlib -> klauspost
++		var sb bytes.Buffer
++		sw, err := stdflate.NewWriterDict(&sb, stdLevel(level, dict), dict)
++		if err != nil {
++			fail(ht, "compress/flate NewWriterDict(level %d): %v", level, err)
++		}
++		if err := writeChunks(ht, sw, data); err != nil {
++			fail(ht, "compress/flate Write: %v", err)
++		}
++		if err := sw.Close(); err != nil {
++			fail(ht, "compress/flate Close: %v", err)
++		}
++		var kr io.ReadCloser
++		if chance(ht, 50) {
++			kr = flate.NewReaderDict(bytes.NewReader(sb.Bytes()), dict)
++		} else {
++			kr = flate.NewReaderOpts(bytes.NewReader(sb.Bytes()), flate.WithDict(dict))
++		}
++		got, err = io.ReadAll(kr)
++		if err != nil {
++			fail(ht, "klauspost cannot read compress/flate's level-%d stream: %v\n stream %s", level, err, short(sb.Bytes()))
++		}
++		if !bytes.Equal(got, data) {
++			fail(ht, "klauspost reads compress/flate's stream differently: %s", diffAt(got, data))
++		}
++		if err := kr.Close(); err != nil {
++			fail(ht, "klauspost reader Close: %v", err)
++		}
++	})
++}
++
++// latin1 returns a string of n code points in U+0001..U+00FF, the gzip
++// header's alphabet.
++func latin1(tc hegel.TestCase, k int) string {
++	var b strings.Builder
++	for i := 0; i < k; i++ {
++		b.WriteRune(rune(n(tc, 1, 255)))
++	}
++	return b.String()
++}
++
++func genGzipHeader(tc hegel.TestCase) gzip.Header {
++	var h gzip.Header
++	if chance(tc, 60) {
++		h.Name = latin1(tc, n(tc, 0, 20))
++	}
++	if chance(tc, 40) {
++		h.Comment = latin1(tc, n(tc, 0, 40))
++	}
++	if chance(tc, 40) {
++		h.Extra = make([]byte, n(tc, 0, 40))
++		for i := range h.Extra {
++			h.Extra[i] = byte(n(tc, 0, 255))
++		}
++	}
++	// A zero ModTime is pinned separately (compress/1, compress/2): klauspost
++	// writes it as the year-2042 wrap-around and reads MTIME 0 as 1970.
++	h.ModTime = time.Unix(wide(tc, 1, 1<<32-1), 0)
++	h.OS = byte(n(tc, 0, 255))
++	return h
++}
++
++func sameHeader(a, b gzip.Header) bool {
++	return a.Name == b.Name && a.Comment == b.Comment && bytes.Equal(a.Extra, b.Extra) &&
++		a.ModTime.Unix() == b.ModTime.Unix() && a.OS == b.OS
++}
++
++// A gzip member (or several concatenated) written by klauspost with a random
++// header decodes with compress/gzip to the same header fields and data, and
++// vice versa; Multistream(false) stops at the first member on both sides.
++func TestHegelGzipInteroperatesWithStdlib(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		k := n(ht, 1, 3)
++		var datas [][]byte
++		var headers []gzip.Header
++		for i := 0; i < k; i++ {
++			datas = append(datas, genData(ht))
++			headers = append(headers, genGzipHeader(ht))
++		}
++		level := pick(ht, flateLevels)
++		note(ht, "%d members, level %d, first header %+v, first data %s", k, level, headers[0], short(datas[0]))
++
++		// klauspost -> stdlib
++		var kb bytes.Buffer
++		for i := 0; i < k; i++ {
++			w, err := gzip.NewWriterLevel(&kb, level)
++			if err != nil {
++				fail(ht, "NewWriterLevel(%d): %v", level, err)
++			}
++			w.Header = headers[i]
++			if err := writeChunks(ht, w, datas[i]); err != nil {
++				fail(ht, "Write: %v", err)
++			}
++			if err := w.Close(); err != nil {
++				fail(ht, "Close: %v", err)
++			}
++		}
++		sr, err := stdgzip.NewReader(bytes.NewReader(kb.Bytes()))
++		if err != nil {
++			fail(ht, "compress/gzip cannot open klauspost's stream: %v", err)
++		}
++		if !sameHeader(gzip.Header(sr.Header), headers[0]) {
++			fail(ht, "compress/gzip reads header %+v from klauspost's stream, written %+v", sr.Header, headers[0])
++		}
++		got, err := io.ReadAll(sr)
++		if err != nil {
++			fail(ht, "compress/gzip cannot read klauspost's stream: %v", err)
++		}
++		if !bytes.Equal(got, bytes.Join(datas, nil)) {
++			fail(ht, "compress/gzip reads klauspost's stream differently: %s", diffAt(got, bytes.Join(datas, nil)))
++		}
++
++		// stdlib -> klauspost
++		var sb bytes.Buffer
++		for i := 0; i < k; i++ {
++			w, err := stdgzip.NewWriterLevel(&sb, level)
++			if err != nil {
++				fail(ht, "compress/gzip NewWriterLevel(%d): %v", level, err)
++			}
++			w.Header = stdgzip.Header(headers[i])
++			if err := writeChunks(ht, w, datas[i]); err != nil {
++				fail(ht, "compress/gzip Write: %v", err)
++			}
++			if err := w.Close(); err != nil {
++				fail(ht, "compress/gzip Close: %v", err)
++			}
++		}
++		kr, err := gzip.NewReader(bytes.NewReader(sb.Bytes()))
++		if err != nil {
++			fail(ht, "klauspost cannot open compress/gzip's stream: %v", err)
++		}
++		if !sameHeader(kr.Header, headers[0]) {
++			fail(ht, "klauspost reads header %+v from compress/gzip's stream, written %+v", kr.Header, headers[0])
++		}
++		multi := chance(ht, 70)
++		kr.Multistream(multi)
++		got, err = io.ReadAll(kr)
++		if err != nil {
++			fail(ht, "klauspost cannot read compress/gzip's stream: %v", err)
++		}
++		want := bytes.Join(datas, nil)
++		if !multi {
++			want = datas[0]
++		}
++		if !bytes.Equal(got, want) {
++			fail(ht, "klauspost reads compress/gzip's stream differently (multistream=%v): %s", multi, diffAt(got, want))
++		}
++	})
++}
++
++// A zlib stream written by klauspost (levels, optional dictionary) inflates
++// with compress/zlib and vice versa; a stream needing a dictionary is
++// refused without it by both.
++func TestHegelZlibInteroperatesWithStdlib(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		dict := genDict(ht, data)
++		level := pick(ht, flateLevels)
++		note(ht, "level %d, dict %d bytes, data %s", level, len(dict), short(data))
++
++		var kb bytes.Buffer
++		w, err := zlib.NewWriterLevelDict(&kb, level, dict)
++		if err != nil {
++			fail(ht, "NewWriterLevelDict(%d): %v", level, err)
++		}
++		if err := writeChunks(ht, w, data); err != nil {
++			fail(ht, "Write: %v", err)
++		}
++		if err := w.Close(); err != nil {
++			fail(ht, "Close: %v", err)
++		}
++		sr, err := stdzlib.NewReaderDict(bytes.NewReader(kb.Bytes()), dict)
++		if err != nil {
++			fail(ht, "compress/zlib cannot open klauspost's stream: %v", err)
++		}
++		got, err := io.ReadAll(sr)
++		if err != nil {
++			fail(ht, "compress/zlib cannot read klauspost's stream: %v", err)
++		}
++		if !bytes.Equal(got, data) {
++			fail(ht, "compress/zlib reads klauspost's stream differently: %s", diffAt(got, data))
++		}
++
++		var sb bytes.Buffer
++		sw, err := stdzlib.NewWriterLevelDict(&sb, stdLevel(level, dict), dict)
++		if err != nil {
++			fail(ht, "compress/zlib NewWriterLevelDict(%d): %v", level, err)
++		}
++		if err := writeChunks(ht, sw, data); err != nil {
++			fail(ht, "compress/zlib Write: %v", err)
++		}
++		if err := sw.Close(); err != nil {
++			fail(ht, "compress/zlib Close: %v", err)
++		}
++		kr, err := zlib.NewReaderDict(bytes.NewReader(sb.Bytes()), dict)
++		if err != nil {
++			fail(ht, "klauspost cannot open compress/zlib's stream: %v", err)
++		}
++		got, err = io.ReadAll(kr)
++		if err != nil {
++			fail(ht, "klauspost cannot read compress/zlib's stream: %v", err)
++		}
++		if !bytes.Equal(got, data) {
++			fail(ht, "klauspost reads compress/zlib's stream differently: %s", diffAt(got, data))
++		}
++
++		if len(dict) > 0 {
++			// without the dictionary both must refuse the stream
++			_, ke := zlib.NewReader(bytes.NewReader(sb.Bytes()))
++			_, se := stdzlib.NewReader(bytes.NewReader(kb.Bytes()))
++			if (ke == nil) != (se == nil) {
++				fail(ht, "missing-dictionary verdicts differ: klauspost %v, compress/zlib %v", ke, se)
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Properties: zstd against the reference tool.
++
++var zstdLevels = []zstd.EncoderLevel{zstd.SpeedFastest, zstd.SpeedDefault, zstd.SpeedBetterCompression, zstd.SpeedBestCompression}
++
++var (
++	trainedOnce sync.Once
++	trainedDict []byte
++)
++
++// trainDict builds one zstd dictionary with the reference tool from fixed
++// text samples (the training is deterministic for fixed input), so cases
++// can use a dictionary both sides know.
++func trainDict(t testing.TB) []byte {
++	trainedOnce.Do(func() {
++		dir, err := os.MkdirTemp("", "hegel-zstd-dict")
++		if err != nil {
++			t.Fatalf("MkdirTemp: %v", err)
++		}
++		defer os.RemoveAll(dir)
++		r := rand.New(rand.NewSource(7))
++		args := []string{"-q", "--train", "--maxdict=8192", "-o", filepath.Join(dir, "dict")}
++		for i := 0; i < 40; i++ {
++			p := filepath.Join(dir, fmt.Sprintf("s%d", i))
++			if err := os.WriteFile(p, fill(r, kindText, 2000+r.Intn(3000)), 0o644); err != nil {
++				t.Fatalf("write sample: %v", err)
++			}
++			args = append(args, p)
++		}
++		out, err := exec.Command(zstdPath(t), args...).CombinedOutput()
++		if err != nil {
++			t.Fatalf("zstd --train: %v: %s", err, out)
++		}
++		trainedDict, err = os.ReadFile(filepath.Join(dir, "dict"))
++		if err != nil {
++			t.Fatalf("read dict: %v", err)
++		}
++	})
++	return trainedDict
++}
++
++// genZstdDict draws a dictionary mode: none, the trained dictionary, or raw
++// content (ID 0, which is what the reference tool uses for raw content).
++// It writes the dictionary to dir and returns its bytes, path, whether it is
++// raw, and a description.
++func genZstdDict(tc hegel.TestCase, t testing.TB, dir string) (dict []byte, path string, raw bool, desc string) {
++	switch n(tc, 0, 3) {
++	case 0, 1:
++		return nil, "", false, "nodict"
++	case 2:
++		dict = trainDict(t)
++		desc = "traineddict"
++	default:
++		seed := wide(tc, 0, 1<<40)
++		dict = fill(rand.New(rand.NewSource(seed)), dataKind(n(tc, 0, 3)), n(tc, 8, 5000))
++		raw = true
++		desc = fmt.Sprintf("rawdict(%d)", len(dict))
++	}
++	path = filepath.Join(dir, "dict")
++	if err := os.WriteFile(path, dict, 0o644); err != nil {
++		t.Fatalf("write dict: %v", err)
++	}
++	return dict, path, raw, desc
++}
++
++type encoderChoice struct {
++	opts          []zstd.EOption
++	desc          string
++	crc           bool
++	singleSegment bool
++	dict          []byte
++	dictPath      string
++	dictRaw       bool
++}
++
++func genEncoderOptions(tc hegel.TestCase, t testing.TB, dir string, allowDict bool) encoderChoice {
++	var opts []zstd.EOption
++	var desc []string
++	lvl := pick(tc, zstdLevels)
++	opts = append(opts, zstd.WithEncoderLevel(lvl), zstd.WithEncoderConcurrency(1))
++	desc = append(desc, lvl.String())
++	c := encoderChoice{crc: true}
++	if chance(tc, 30) {
++		opts = append(opts, zstd.WithEncoderCRC(false))
++		desc = append(desc, "nocrc")
++		c.crc = false
++	}
++	if allowDict {
++		dict, path, raw, ddesc := genZstdDict(tc, t, dir)
++		if dict != nil {
++			if raw {
++				opts = append(opts, zstd.WithEncoderDictRaw(0, dict))
++			} else {
++				opts = append(opts, zstd.WithEncoderDict(dict))
++			}
++		}
++		desc = append(desc, ddesc)
++		c.dict, c.dictPath, c.dictRaw = dict, path, raw
++	}
++	if chance(tc, 30) {
++		opts = append(opts, zstd.WithZeroFrames(true))
++		desc = append(desc, "zeroframes")
++	}
++	if chance(tc, 30) {
++		opts = append(opts, zstd.WithSingleSegment(true))
++		desc = append(desc, "singlesegment")
++		c.singleSegment = true
++	}
++	if chance(tc, 30) {
++		ws := 1 << n(tc, 10, 22)
++		opts = append(opts, zstd.WithWindowSize(ws))
++		desc = append(desc, fmt.Sprintf("window=%d", ws))
++	}
++	if chance(tc, 20) {
++		opts = append(opts, zstd.WithNoEntropyCompression(true))
++		desc = append(desc, "noentropy")
++	}
++	if chance(tc, 20) {
++		opts = append(opts, zstd.WithAllLitEntropyCompression(true))
++		desc = append(desc, "alllitentropy")
++	}
++	if chance(tc, 20) {
++		p := n(tc, 1, 64)
++		opts = append(opts, zstd.WithEncoderPadding(p))
++		desc = append(desc, fmt.Sprintf("padding=%d", p))
++	}
++	if chance(tc, 20) {
++		opts = append(opts, zstd.WithLowerEncoderMem(true))
++		desc = append(desc, "lowmem")
++	}
++	c.opts, c.desc = opts, strings.Join(desc, ",")
++	return c
++}
++
++// A zstd frame produced by klauspost's Encoder under random options, by
++// EncodeAll or by a streaming Writer with random chunking and flushes,
++// decompresses with the reference `zstd -d` to the input, and klauspost's own
++// Decoder agrees; the frame header klauspost parses from it is consistent
++// with the options.
++func TestHegelZstdEncoderOutputDecodesWithReferenceTool(t *testing.T) {
++	dir := t.TempDir()
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		c := genEncoderOptions(ht, t, dir, true)
++		desc := c.desc
++		note(ht, "options %s, data %s", desc, short(data))
++		enc, err := zstd.NewWriter(nil, c.opts...)
++		if err != nil {
++			fail(ht, "NewWriter(%s): %v", desc, err)
++		}
++		defer enc.Close()
++
++		var frame []byte
++		streaming := chance(ht, 50)
++		withSize := false
++		if streaming {
++			var b bytes.Buffer
++			if chance(ht, 40) {
++				enc.ResetContentSize(&b, int64(len(data)))
++				withSize = true
++			} else {
++				enc.Reset(&b)
++			}
++			if err := writeChunks(ht, enc, data); err != nil {
++				fail(ht, "Write: %v", err)
++			}
++			if err := enc.Close(); err != nil {
++				fail(ht, "Close: %v", err)
++			}
++			frame = b.Bytes()
++		} else {
++			frame = enc.EncodeAll(data, nil)
++		}
++		note(ht, "streaming=%v withSize=%v, frame %s", streaming, withSize, short(frame))
++
++		cliArgs := []string{"-d", "-c", "-q"}
++		if c.dict != nil {
++			cliArgs = append(cliArgs, "-D", c.dictPath)
++		}
++		got, err := zstdCLI(t, frame, cliArgs...)
++		if err != nil {
++			fail(ht, "reference zstd rejects klauspost's frame (%s, streaming=%v): %v\n frame %s", desc, streaming, err, short(frame))
++		}
++		if !bytes.Equal(got, data) {
++			fail(ht, "reference zstd decodes klauspost's frame differently (%s): %s", desc, diffAt(got, data))
++		}
++
++		dopts := []zstd.DOption{zstd.WithDecoderConcurrency(1)}
++		if c.dict != nil {
++			if c.dictRaw {
++				dopts = append(dopts, zstd.WithDecoderDictRaw(0, c.dict))
++			} else {
++				dopts = append(dopts, zstd.WithDecoderDicts(c.dict))
++			}
++		}
++		dec, err := zstd.NewReader(nil, dopts...)
++		if err != nil {
++			fail(ht, "NewReader: %v", err)
++		}
++		defer dec.Close()
++		back, err := dec.DecodeAll(frame, nil)
++		if err != nil || !bytes.Equal(back, data) {
++			fail(ht, "klauspost's own Decoder on its frame (%s): %v, %s", desc, err, diffAt(back, data))
++		}
++
++		if len(frame) == 0 {
++			return // zero-length input without WithZeroFrames
++		}
++		var h zstd.Header
++		if err := h.Decode(frame); err != nil {
++			fail(ht, "Header.Decode on klauspost's frame: %v", err)
++		}
++		if h.Skippable {
++			fail(ht, "Header says skippable for a data frame")
++		}
++		if re, err := h.AppendTo(nil); err != nil || !bytes.Equal(re, frame[:h.HeaderSize]) {
++			fail(ht, "Header.AppendTo re-encodes klauspost's header %x as %x (%v)", frame[:h.HeaderSize], re, err)
++		}
++		// compress/4: the canned zero-length frame of EncodeAll carries no
++		// checksum whatever WithEncoderCRC says; pinned separately.
++		if len(data) > 0 && h.HasCheckSum != c.crc {
++			fail(ht, "Header.HasCheckSum = %v for options %s", h.HasCheckSum, desc)
++		}
++		if !streaming && len(data) > 0 && c.singleSegment && !h.SingleSegment {
++			fail(ht, "EncodeAll with WithSingleSegment wrote a frame without the single-segment flag (%s)", desc)
++		}
++		if (!streaming && len(data) > 0 || withSize) && h.HasFCS && h.FrameContentSize != uint64(len(data)) {
++			fail(ht, "Header.FrameContentSize = %d for %d bytes (%s)", h.FrameContentSize, len(data), desc)
++		}
++		if len(data) > 0 && !streaming && len(data) >= 256 && !h.HasFCS {
++			fail(ht, "EncodeAll of %d bytes wrote no Frame_Content_Size (%s)", len(data), desc)
++		}
++	})
++}
++
++// A frame produced by the reference tool at a random level (with or without
++// checksum, with --long windows, small block sizes, or as several
++// concatenated frames) decompresses with klauspost's Decoder — DecodeAll,
++// the streaming Reader, and WriteTo — to the input.
++func TestHegelReferenceToolOutputDecodesWithKlauspost(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		dir := t.TempDir()
++		k := n(ht, 1, 3)
++		var datas [][]byte
++		var frames [][]byte
++		var descs []string
++		dict, dictPath, dictRaw, ddesc := genZstdDict(ht, t, dir)
++		for i := 0; i < k; i++ {
++			data := genData(ht)
++			var args []string
++			if dict != nil {
++				args = append(args, "-D", dictPath)
++			}
++			level := n(ht, 1, 19)
++			if chance(ht, 10) {
++				level = n(ht, 20, 22)
++				args = append(args, "--ultra")
++			}
++			args = append(args, fmt.Sprintf("-%d", level))
++			if chance(ht, 30) {
++				args = append(args, "--no-check")
++			}
++			if chance(ht, 20) {
++				args = append(args, "--long")
++			}
++			if chance(ht, 20) {
++				args = append(args, "--single-thread")
++			}
++			if chance(ht, 20) {
++				args = append(args, fmt.Sprintf("--block-size=%d", 1<<n(ht, 10, 17)))
++			}
++			if chance(ht, 20) {
++				args = append(args, "--no-content-size")
++			}
++			frame, err := zstdCLIFile(t, dir, data, args...)
++			if err != nil {
++				fail(ht, "reference zstd failed: %v", err)
++			}
++			datas = append(datas, data)
++			frames = append(frames, frame)
++			descs = append(descs, strings.Join(args, " "))
++		}
++		stream := bytes.Join(frames, nil)
++		want := bytes.Join(datas, nil)
++		note(ht, "%d frames (%s): %s; data %s; stream %s", k, ddesc, strings.Join(descs, " | "), short(want), short(stream))
++
++		dopts := []zstd.DOption{zstd.WithDecoderConcurrency(n(ht, 1, 2)), zstd.WithDecoderLowmem(chance(ht, 50))}
++		if dict != nil {
++			if dictRaw {
++				dopts = append(dopts, zstd.WithDecoderDictRaw(0, dict))
++			} else {
++				dopts = append(dopts, zstd.WithDecoderDicts(dict))
++			}
++		}
++		dec, err := zstd.NewReader(nil, dopts...)
++		if err != nil {
++			fail(ht, "NewReader: %v", err)
++		}
++		defer dec.Close()
++		got, err := dec.DecodeAll(stream, nil)
++		if err != nil {
++			fail(ht, "DecodeAll rejects the reference tool's output (%s): %v", strings.Join(descs, " | "), err)
++		}
++		if !bytes.Equal(got, want) {
++			fail(ht, "DecodeAll decodes the reference tool's output differently: %s", diffAt(got, want))
++		}
++
++		if err := dec.Reset(bytes.NewReader(stream)); err != nil {
++			fail(ht, "Reset: %v", err)
++		}
++		if chance(ht, 50) {
++			got, err = io.ReadAll(dec)
++		} else {
++			var b bytes.Buffer
++			_, err = dec.WriteTo(&b)
++			got = b.Bytes()
++		}
++		if err != nil {
++			fail(ht, "streaming decode rejects the reference tool's output (%s): %v", strings.Join(descs, " | "), err)
++		}
++		if !bytes.Equal(got, want) {
++			fail(ht, "streaming decode differs: %s", diffAt(got, want))
++		}
++
++		var h zstd.Header
++		if err := h.Decode(frames[0]); err != nil {
++			fail(ht, "Header.Decode on the reference tool's frame: %v", err)
++		}
++		if re, err := h.AppendTo(nil); err != nil || !bytes.Equal(re, frames[0][:h.HeaderSize]) {
++			fail(ht, "Header.AppendTo re-encodes the reference tool's header %x as %x (%v)", frames[0][:h.HeaderSize], re, err)
++		}
++		noCheck := strings.Contains(descs[0], "--no-check")
++		if h.HasCheckSum == noCheck {
++			fail(ht, "Header.HasCheckSum = %v for a frame written with %q", h.HasCheckSum, descs[0])
++		}
++		noSize := strings.Contains(descs[0], "--no-content-size")
++		if !noSize && (!h.HasFCS || h.FrameContentSize != uint64(len(datas[0]))) {
++			fail(ht, "Header: HasFCS=%v FrameContentSize=%d for %d bytes written with %q", h.HasFCS, h.FrameContentSize, len(datas[0]), descs[0])
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Properties: corrupted streams.  Both decoders of one format implement the
++// same specification, so a damaged stream must be accepted by both (with
++// identical output) or rejected by both.
++
++// mutate returns a copy of b with one corruption and a description.
++func mutate(tc hegel.TestCase, b []byte) ([]byte, string) {
++	c := append([]byte{}, b...)
++	if len(c) == 0 {
++		return append(c, byte(n(tc, 0, 255))), "append a byte to the empty stream"
++	}
++	i := n(tc, 0, len(c)-1)
++	switch n(tc, 0, 4) {
++	case 0:
++		bit := n(tc, 0, 7)
++		c[i] ^= 1 << bit
++		return c, fmt.Sprintf("flip bit %d of byte %d", bit, i)
++	case 1:
++		v := byte(n(tc, 0, 255))
++		c[i] = v
++		return c, fmt.Sprintf("set byte %d to %#x", i, v)
++	case 2:
++		return c[:i], fmt.Sprintf("truncate to %d bytes", i)
++	case 3:
++		v := byte(n(tc, 0, 255))
++		c = append(c[:i], append([]byte{v}, c[i:]...)...)
++		return c, fmt.Sprintf("insert %#x at %d", v, i)
++	default:
++		c = append(c[:i], c[i+1:]...)
++		return c, fmt.Sprintf("delete byte %d", i)
++	}
++}
++
++func verdict(err error) string {
++	if err == nil {
++		return "accepted"
++	}
++	return "rejected (" + err.Error() + ")"
++}
++
++// A flate, gzip or zlib stream with one corruption gets the same verdict
++// from klauspost's reader and the standard library's, and the same output
++// when both accept it.
++func TestHegelCorruptStreamsGetTheSameVerdictAsStdlib(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		if len(data) > 20000 {
++			data = data[:20000]
++		}
++		level := pick(ht, flateLevels)
++		format := pick(ht, []string{"flate", "gzip", "zlib"})
++		useStd := chance(ht, 50)
++		var b bytes.Buffer
++		var w io.WriteCloser
++		var err error
++		switch {
++		case format == "flate" && useStd:
++			w, err = stdflate.NewWriter(&b, level)
++		case format == "flate":
++			w, err = flate.NewWriter(&b, level)
++		case format == "gzip" && useStd:
++			w, err = stdgzip.NewWriterLevel(&b, level)
++		case format == "gzip":
++			w, err = gzip.NewWriterLevel(&b, level)
++		case useStd:
++			w, err = stdzlib.NewWriterLevel(&b, level)
++		default:
++			w, err = zlib.NewWriterLevel(&b, level)
++		}
++		if err != nil {
++			fail(ht, "writer: %v", err)
++		}
++		w.Write(data)
++		w.Close()
++		stream, how := mutate(ht, b.Bytes())
++		note(ht, "%s stream (level %d, std writer %v) of %s: %s -> %s", format, level, useStd, short(data), how, short(stream))
++
++		read := func(open func() (io.Reader, error)) ([]byte, error) {
++			r, err := open()
++			if err != nil {
++				return nil, err
++			}
++			return io.ReadAll(r)
++		}
++		var sGot, kGot []byte
++		var sErr, kErr error
++		switch format {
++		case "flate":
++			sGot, sErr = read(func() (io.Reader, error) { return stdflate.NewReader(bytes.NewReader(stream)), nil })
++			kGot, kErr = read(func() (io.Reader, error) { return flate.NewReader(bytes.NewReader(stream)), nil })
++		case "gzip":
++			sGot, sErr = read(func() (io.Reader, error) { return stdgzip.NewReader(bytes.NewReader(stream)) })
++			kGot, kErr = read(func() (io.Reader, error) { return gzip.NewReader(bytes.NewReader(stream)) })
++		default:
++			sGot, sErr = read(func() (io.Reader, error) { return stdzlib.NewReader(bytes.NewReader(stream)) })
++			kGot, kErr = read(func() (io.Reader, error) { return zlib.NewReader(bytes.NewReader(stream)) })
++		}
++		if format == "flate" && errors.Is(sErr, io.ErrUnexpectedEOF) && kErr == nil {
++			// compress/3: klauspost reports a clean end on a raw deflate stream
++			// cut inside a match; pinned separately.
++			note(ht, "pinned shape compress/3 (truncated raw deflate accepted)")
++			return
++		}
++		if (sErr == nil) != (kErr == nil) {
++			fail(ht, "%s verdicts differ after %q: stdlib %s, klauspost %s\n stream %s", format, how, verdict(sErr), verdict(kErr), short(stream))
++		}
++		if sErr == nil && !bytes.Equal(sGot, kGot) {
++			fail(ht, "%s outputs differ after %q: %s", format, how, diffAt(sGot, kGot))
++		}
++	})
++}
++
++// A zstd frame with one corruption that klauspost's Decoder accepts is
++// accepted by the reference tool with the same output (klauspost is never
++// more lenient than the reference), and DecodeAll and the streaming reader
++// agree with each other.  The reference tool is itself lenient about a few
++// things the specification forbids (reserved bits, padding bits, a frame
++// content size that does not match), so it accepting what klauspost rejects
++// is not compared.
++func TestHegelCorruptFramesAcceptedByKlauspostAreAcceptedByReferenceTool(t *testing.T) {
++	dir := t.TempDir()
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		if len(data) > 20000 {
++			data = data[:20000]
++		}
++		var frame []byte
++		var err error
++		fromCLI := chance(ht, 50)
++		if fromCLI {
++			args := []string{fmt.Sprintf("-%d", n(ht, 1, 19))}
++			if chance(ht, 30) {
++				args = append(args, "--no-check")
++			}
++			frame, err = zstdCLIFile(t, dir, data, args...)
++			if err != nil {
++				fail(ht, "reference zstd: %v", err)
++			}
++		} else {
++			c := genEncoderOptions(ht, t, dir, false)
++			enc, err := zstd.NewWriter(nil, append(c.opts, zstd.WithZeroFrames(true))...)
++			if err != nil {
++				fail(ht, "NewWriter: %v", err)
++			}
++			frame = enc.EncodeAll(data, nil)
++			enc.Close()
++		}
++		stream, how := mutate(ht, frame)
++		note(ht, "frame from CLI=%v of %s: %s -> %s", fromCLI, short(data), how, short(stream))
++		if len(stream) == 0 {
++			// Empty input: no frames at all. The tool calls it an unexpected
++			// end of file, klauspost returns nothing without error (as the
++			// standard library's readers do for an empty io.Reader). Not compared.
++			return
++		}
++
++		cliGot, cliErr := zstdCLI(t, stream, "-d", "-c", "-q")
++		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
++		if err != nil {
++			fail(ht, "NewReader: %v", err)
++		}
++		defer dec.Close()
++		kGot, kErr := dec.DecodeAll(stream, nil)
++		if err := dec.Reset(bytes.NewReader(stream)); err != nil {
++			fail(ht, "Reset: %v", err)
++		}
++		sGot, sErr := io.ReadAll(dec)
++		if (kErr == nil) != (sErr == nil) {
++			fail(ht, "DecodeAll %s but the streaming Decoder %s after %q\n stream %s", verdict(kErr), verdict(sErr), how, short(stream))
++		}
++		if kErr == nil && !bytes.Equal(kGot, sGot) {
++			fail(ht, "DecodeAll and the streaming Decoder disagree after %q: %s", how, diffAt(kGot, sGot))
++		}
++		if kErr != nil {
++			note(ht, "klauspost rejects (%v); reference %s", kErr, verdict(cliErr))
++			return
++		}
++		if cliErr != nil {
++			fail(ht, "klauspost accepts a frame the reference tool rejects after %q: %v\n stream %s", how, cliErr, short(stream))
++		}
++		if !bytes.Equal(cliGot, kGot) {
++			fail(ht, "outputs differ after %q: %s", how, diffAt(cliGot, kGot))
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Properties: S2 / Snappy.
++
++// Every S2 and Snappy block encoder's output decodes to the input with the
++// matching decoders, DecodedLen reads the right length, MaxEncodedLen bounds
++// the size, and concatenated S2 blocks decode to concatenated data.
++func TestHegelS2AndSnappyBlocksRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		mode := n(ht, 0, 5)
++		var block []byte
++		var name string
++		switch mode {
++		case 0:
++			block, name = s2.Encode(nil, data), "s2.Encode"
++		case 1:
++			block, name = s2.EncodeBetter(nil, data), "s2.EncodeBetter"
++		case 2:
++			block, name = s2.EncodeBest(nil, data), "s2.EncodeBest"
++		case 3:
++			block, name = s2.EncodeSnappy(nil, data), "s2.EncodeSnappy"
++		case 4:
++			block, name = s2.EncodeSnappyBetter(nil, data), "s2.EncodeSnappyBetter"
++		default:
++			block, name = snappy.Encode(nil, data), "snappy.Encode"
++		}
++		note(ht, "%s of %s -> %s", name, short(data), short(block))
++		if len(block) > s2.MaxEncodedLen(len(data)) {
++			fail(ht, "%s produced %d bytes, MaxEncodedLen says %d", name, len(block), s2.MaxEncodedLen(len(data)))
++		}
++		if l, err := s2.DecodedLen(block); err != nil || l != len(data) {
++			fail(ht, "s2.DecodedLen = %d, %v; want %d", l, err, len(data))
++		}
++		got, err := s2.Decode(nil, block)
++		if err != nil || !bytes.Equal(got, data) {
++			fail(ht, "s2.Decode of %s output: %v, %s", name, err, diffAt(got, data))
++		}
++		if mode >= 3 {
++			// Snappy-compatible output must decode with the Snappy decoders too.
++			got, err = snappy.Decode(nil, block)
++			if err != nil || !bytes.Equal(got, data) {
++				fail(ht, "snappy.Decode of %s output: %v, %s", name, err, diffAt(got, data))
++			}
++			got, err = snappy.DecodeStrict(nil, block)
++			if err != nil || !bytes.Equal(got, data) {
++				fail(ht, "snappy.DecodeStrict of %s output: %v, %s", name, err, diffAt(got, data))
++			}
++		}
++		// Dictionary round trip.
++		if dict := genDict(ht, data); len(dict) > 0 && len(dict) <= 65536 {
++			d := s2.MakeDict(dict, nil)
++			if d != nil {
++				var db []byte
++				switch n(ht, 0, 2) {
++				case 0:
++					db = d.Encode(nil, data)
++				case 1:
++					db = d.EncodeBetter(nil, data)
++				default:
++					db = d.EncodeBest(nil, data)
++				}
++				got, err = d.Decode(nil, db)
++				if err != nil || !bytes.Equal(got, data) {
++					fail(ht, "Dict.Decode of a dictionary-encoded block: %v, %s", err, diffAt(got, data))
++				}
++			}
++		}
++		// Concatenation of two blocks.
++		if mode < 3 {
++			other := genData(ht)
++			b2 := s2.Encode(nil, other)
++			cat, err := s2.ConcatBlocks(nil, block, b2)
++			if err != nil {
++				fail(ht, "ConcatBlocks: %v", err)
++			}
++			got, err = s2.Decode(nil, cat)
++			if err != nil || !bytes.Equal(got, append(append([]byte{}, data...), other...)) {
++				fail(ht, "Decode of ConcatBlocks: %v, %s", err, diffAt(got, append(append([]byte{}, data...), other...)))
++			}
++		}
++	})
++}
++
++// S2 and Snappy streams written with random chunking and flushes read back
++// to the input through the matching stream readers; a Snappy-format S2
++// stream reads with the Snappy reader.
++func TestHegelS2AndSnappyStreamsRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		data := genData(ht)
++		var b bytes.Buffer
++		var wopts []s2.WriterOption
++		snappyCompat := chance(ht, 40)
++		if snappyCompat {
++			wopts = append(wopts, s2.WriterSnappyCompat())
++		}
++		switch n(ht, 0, 2) {
++		case 0:
++			wopts = append(wopts, s2.WriterBetterCompression())
++		case 1:
++			wopts = append(wopts, s2.WriterBestCompression())
++		}
++		if chance(ht, 30) {
++			// Snappy-compatible output is limited to 4 KiB..64 KiB blocks (documented).
++			hi := 20
++			if snappyCompat {
++				hi = 16
++			}
++			wopts = append(wopts, s2.WriterBlockSize(1<<n(ht, 12, hi)))
++		}
++		if chance(ht, 30) {
++			wopts = append(wopts, s2.WriterPadding(n(ht, 1, 4096)))
++		}
++		if chance(ht, 30) {
++			wopts = append(wopts, s2.WriterUncompressed())
++		}
++		wopts = append(wopts, s2.WriterConcurrency(1))
++		note(ht, "snappy=%v data %s", snappyCompat, short(data))
++		w := s2.NewWriter(&b, wopts...)
++		if err := writeChunks(ht, w, data); err != nil {
++			fail(ht, "Write: %v", err)
++		}
++		if err := w.Close(); err != nil {
++			fail(ht, "Close: %v", err)
++		}
++		stream := b.Bytes()
++		got, err := io.ReadAll(s2.NewReader(bytes.NewReader(stream)))
++		if err != nil || !bytes.Equal(got, data) {
++			fail(ht, "s2.Reader: %v, %s", err, diffAt(got, data))
++		}
++		if snappyCompat {
++			got, err = io.ReadAll(snappy.NewReader(bytes.NewReader(stream)))
++			if err != nil || !bytes.Equal(got, data) {
++				fail(ht, "snappy.Reader on a Snappy-compatible S2 stream: %v, %s", err, diffAt(got, data))
++			}
++		}
++		// The Snappy stream writer read by both readers.
++		var sb bytes.Buffer
++		sw := snappy.NewBufferedWriter(&sb)
++		if err := writeChunks(ht, sw, data); err != nil {
++			fail(ht, "snappy Write: %v", err)
++		}
++		if err := sw.Close(); err != nil {
++			fail(ht, "snappy Close: %v", err)
++		}
++		got, err = io.ReadAll(snappy.NewReader(bytes.NewReader(sb.Bytes())))
++		if err != nil || !bytes.Equal(got, data) {
++			fail(ht, "snappy.Reader on snappy's stream: %v, %s", err, diffAt(got, data))
++		}
++		got, err = io.ReadAll(s2.NewReader(bytes.NewReader(sb.Bytes())))
++		if err != nil || !bytes.Equal(got, data) {
++			fail(ht, "s2.Reader on snappy's stream: %v, %s", err, diffAt(got, data))
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Pins.  Each records one difference found while writing the properties
++// above; they are listed in targets/go/compress/bugs.toml and expected to
++// fail until fixed upstream.
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// compress/1: a gzip Header with the zero ModTime is written as MTIME
++// 0xFFFFFFFF-ish wrap-around of time.Time{}.Unix() (the year 2042) instead
++// of 0 ("no time stamp is available", RFC 1952 §2.3.1), which is what
++// compress/gzip writes and what compress/gzip then reads back as a real date.
++func TestHegelPinZeroModTimeIsWrittenAsZero(t *testing.T) {
++	defer guard(t)
++	var b bytes.Buffer
++	w := gzip.NewWriter(&b)
++	w.Write([]byte("x"))
++	w.Close()
++	mtime := b.Bytes()[4:8]
++	if !bytes.Equal(mtime, []byte{0, 0, 0, 0}) {
++		t.Fatalf("MTIME bytes %x for a zero ModTime; want 00000000", mtime)
++	}
++	r, err := stdgzip.NewReader(bytes.NewReader(b.Bytes()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !r.ModTime.IsZero() {
++		t.Fatalf("compress/gzip reads ModTime %v from the stream", r.ModTime)
++	}
++}
++
++// compress/3: a raw deflate stream cut off inside a match (after the length
++// code, before the distance code or its extra bits is complete) is reported
++// as a clean end of stream: Read returns io.EOF, so the truncation goes
++// unnoticed; compress/flate returns io.ErrUnexpectedEOF, as it does for every
++// other truncation point (and so does klauspost for the other points).
++func TestHegelPinTruncatedStreamIsAnUnexpectedEOF(t *testing.T) {
++	defer guard(t)
++	var b bytes.Buffer
++	w, _ := stdflate.NewWriter(&b, 6)
++	w.Write(bytes.Repeat([]byte("hello world "), 50))
++	w.Close()
++	full := b.Bytes() // 21 bytes
++	for cut := len(full) - 1; cut >= 1; cut-- {
++		got, err := io.ReadAll(flate.NewReader(bytes.NewReader(full[:cut])))
++		if err == nil {
++			t.Fatalf("stream %x truncated to %d bytes decodes to %d bytes with a nil error; compress/flate: %v",
++				full, cut, len(got), func() error { _, e := io.ReadAll(stdflate.NewReader(bytes.NewReader(full[:cut]))); return e }())
++		}
++	}
++}
++
++// compress/4: EncodeAll of an empty input with WithZeroFrames(true) writes a
++// canned frame without a content checksum although WithEncoderCRC is on (the
++// default); the streaming Encoder's empty frame and the reference tool both
++// carry the checksum (28b52ffd 04 68 01000099e9d851 / 28b52ffd 24 00 010000 99e9d851).
++func TestHegelPinZeroFrameCarriesTheChecksum(t *testing.T) {
++	defer guard(t)
++	enc, err := zstd.NewWriter(nil, zstd.WithZeroFrames(true), zstd.WithEncoderCRC(true))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer enc.Close()
++	frame := enc.EncodeAll(nil, nil)
++	var h zstd.Header
++	if err := h.Decode(frame); err != nil {
++		t.Fatal(err)
++	}
++	if !h.HasCheckSum {
++		t.Fatalf("zero frame %x has no checksum with WithEncoderCRC(true)", frame)
++	}
++}
++
++// compress/2: reading a member whose MTIME field is 0 gives ModTime
++// 1970-01-01T00:00:00Z instead of the zero time.Time compress/gzip returns
++// (MTIME 0 means "not set").
++func TestHegelPinZeroMTimeReadsAsZeroTime(t *testing.T) {
++	defer guard(t)
++	var b bytes.Buffer
++	w := stdgzip.NewWriter(&b) // zero ModTime -> MTIME 0
++	w.Write([]byte("x"))
++	w.Close()
++	r, err := gzip.NewReader(bytes.NewReader(b.Bytes()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !r.ModTime.IsZero() {
++		t.Fatalf("ModTime = %v for MTIME 0; want the zero time", r.ModTime)
++	}
++}
