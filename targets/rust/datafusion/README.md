@@ -49,3 +49,4 @@
 - 2026-09-14: base bumped c2cf28940b1e → 17c6d74deb11 (2026-09-14, "fix: preserve target extension metadata in INSERT (#24971)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-14: base bumped 17c6d74deb11 → 7b00b63e048b (2026-09-14, "fix: stabilize grouped correlation with centered moments (#24953)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-14: base bumped 7b00b63e048b → 85d4cbb0a9a8 (2026-09-14, "Support ORDER BY ALL for projected expressions (#25243)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-14: base bumped 85d4cbb0a9a8 → c14976481ea5 (2026-09-14, "fix: preserve missing Parquet null counts (#25242)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.

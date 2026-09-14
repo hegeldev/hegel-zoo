@@ -39,3 +39,4 @@
 - 2026-09-13: base bumped 1b78772fcad0 → 254f95d3a021 (2026-09-11, "proto: preserve the OPT record when truncating responses"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 290 tests pass. The patch's test module in `crates/proto/src/rr/serial_number.rs` was renamed `hegel_tests` because upstream added its own `mod tests` there.
 - 2026-09-14: base bumped 254f95d3a021 → b78ac510a14d (2026-09-14, "proto: truncate encoding after rollback"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
 - 2026-09-14: base bumped b78ac510a14d → e640429a586b (2026-09-14, "bin: refuse to treat empty zone as root"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
+- 2026-09-14: base bumped e640429a586b → 5276716c9f4b (2026-09-14, "Change default group setting"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
