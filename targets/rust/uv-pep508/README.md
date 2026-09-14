@@ -109,3 +109,4 @@ segment (the crate's documented deviation, below).
 - 2026-09-14: created at c0df400 (0.0.80); 6 bugs (4 inherited from pep508_rs, 2 new; uv-pep508/6 re-found in pep508_rs as pep508_rs/9).
 - 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-14: base bumped 83d556d712c7 → c40e652bc385 (2026-09-14, "Exclude backports-zstd from the Sentry PGO corpus (#21678)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
+- 2026-09-14: base bumped c40e652bc385 → 595c8e2c6812 (2026-09-14, "Use cargo codspeed via astral-dev-toolchain (#21674)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
