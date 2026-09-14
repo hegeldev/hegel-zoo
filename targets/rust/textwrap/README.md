@@ -54,3 +54,4 @@
 - 2026-09-13: base bumped 932bd45e244d → 5246c6367058 (2026-09-13, "Merge pull request #638 from mgeisler/release-0.16.4"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
 - 2026-09-13: base bumped 5246c6367058 → 6df2560c0d87 (2026-09-13, "Merge pull request #641 from mgeisler/update-agent-guidelines-tooling"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
 - 2026-09-14: base bumped 6df2560c0d87 → 655a60a8af0d (2026-09-14, "Merge pull request #642 from mgeisler/crates-io-trusted-publishing"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
+- 2026-09-14: base bumped 655a60a8af0d → c54a1f3e8f24 (2026-09-14, "Merge pull request #644 from mgeisler/document-pr-separation-of-concerns"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.

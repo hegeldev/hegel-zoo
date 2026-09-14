@@ -42,3 +42,4 @@
 - 2026-09-13: base bumped f532eadfc228 → bd3d537a6308 (2026-09-13, "windows: don't attach an invisible console to subprocesses"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
 - 2026-09-13: base bumped bd3d537a6308 → 8504a124e3ca (2026-09-13, "docs: restore backend::Commit hyperlink"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
 - 2026-09-13: base bumped 8504a124e3ca → d737b32faa01 (2026-09-13, "cli: diff: remove repo dependency from utility command"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
+- 2026-09-14: base bumped d737b32faa01 → aa729d0f8b9d (2026-09-14, "rust: update MSRV to 1.97.1"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.

@@ -29,3 +29,4 @@
 - 2026-09-13: base bumped a8811c306720 → d84c1d4f28b0 (2026-09-13, "feat: Fix tpch SQL issues  (#29269)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-14: base bumped d84c1d4f28b0 → effe7e05942f (2026-09-14, "perf: Push inner joins before outer joins and rewrite left-join-is-null to anti join (#29277)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-14: base bumped effe7e05942f → abba65f36c11 (2026-09-14, "fix: Don't panic on an empty or null quantile expression input (#29240)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-14: base bumped abba65f36c11 → efbfd1f38072 (2026-09-14, "chore: More obvious `MapChunked` storage handling (#29248)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
