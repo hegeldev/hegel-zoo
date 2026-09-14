@@ -1,0 +1,587 @@
+diff --git a/binaries/Cargo.toml b/binaries/Cargo.toml
+index 4a0c994..582906e 100644
+--- a/binaries/Cargo.toml
++++ b/binaries/Cargo.toml
+@@ -12,3 +12,7 @@ anyhow = "1.0"
+ distro-info = { path = "../" }
+ chrono = "0.4.3"
+ clap = { version = "4.0", features = [ "cargo", "string" ] }
++
++[dev-dependencies]
++hegeltest = "0.44.1"
++csv = "1"
+diff --git a/binaries/tests/hegel.rs b/binaries/tests/hegel.rs
+new file mode 100644
+index 0000000..516a831
+--- /dev/null
++++ b/binaries/tests/hegel.rs
+@@ -0,0 +1,569 @@
++//! Hegel property tests for distro-info (the Rust port of Debian's distro-info: the
++//! `distro-info` library and its `debian-distro-info`/`ubuntu-distro-info` binaries).
++//!
++//! Reference: the C **`debian-distro-info` and `ubuntu-distro-info`** of the `distro-info`
++//! package (1.7 here), which read the same `/usr/share/distro-info/*.csv` files; upstream's
++//! own test suite for those tools is what the crate vendors as its acceptance tests. The CLI
++//! property runs the Rust binaries and the C ones with the same arguments and compares exit
++//! status and stdout; the library properties compare the `DistroInfo` selectors and
++//! `milestone_date` with the C tool's `--date` queries; the CSV property checks
++//! `from_csv_reader` against the fields it was given.
++//!
++//! In the C tools a milestone date is exclusive (`eol(date) = date >= eol`, so a release is
++//! unsupported *on* its EOL day) and every "days until" of a missing milestone prints
++//! `(unknown)`; the general properties keep away from the dates in the data files and from
++//! `--days` of milestones a release may lack, and those shapes are pinned separately.
++
++use chrono::NaiveDate;
++use distro_info::{DebianDistroInfo, DistroInfo, DistroRelease, Milestone, UbuntuDistroInfo};
++use hegel::generators;
++use hegel::Generator;
++use std::collections::BTreeSet;
++use std::fmt::Debug;
++use std::process::Command;
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++// ---------------------------------------------------------------------------
++// The data and the C tools
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, Copy, PartialEq)]
++enum Distro {
++    Debian,
++    Ubuntu,
++}
++
++const DISTROS: &[Distro] = &[Distro::Debian, Distro::Ubuntu];
++
++impl Distro {
++    fn csv(self) -> &'static str {
++        match self {
++            Distro::Debian => "/usr/share/distro-info/debian.csv",
++            Distro::Ubuntu => "/usr/share/distro-info/ubuntu.csv",
++        }
++    }
++    fn c_tool(self) -> &'static str {
++        match self {
++            Distro::Debian => "debian-distro-info",
++            Distro::Ubuntu => "ubuntu-distro-info",
++        }
++    }
++    fn rust_tool(self) -> &'static str {
++        match self {
++            Distro::Debian => env!("CARGO_BIN_EXE_debian-distro-info"),
++            Distro::Ubuntu => env!("CARGO_BIN_EXE_ubuntu-distro-info"),
++        }
++    }
++    /// The milestones the C tool's `--days` accepts for this distro.
++    fn milestones(self) -> &'static [&'static str] {
++        match self {
++            Distro::Debian => &["created", "release", "eol", "eol-lts", "eol-elts"],
++            Distro::Ubuntu => &["created", "release", "eol", "eol-server", "eol-esm"],
++        }
++    }
++}
++
++/// The CSV as (header, rows), split on commas (the data has no quoted fields).
++fn csv_rows(distro: Distro) -> (Vec<String>, Vec<Vec<String>>) {
++    let text = std::fs::read_to_string(distro.csv()).unwrap();
++    let mut lines = text.lines();
++    let header: Vec<String> = lines.next().unwrap().split(',').map(|s| s.to_string()).collect();
++    let rows = lines.filter(|l| !l.is_empty()).map(|l| l.split(',').map(|s| s.to_string()).collect()).collect();
++    (header, rows)
++}
++
++fn field<'a>(header: &[String], row: &'a [String], name: &str) -> Option<&'a str> {
++    header.iter().position(|h| h == name).and_then(|i| row.get(i)).map(|s| s.as_str()).filter(|s| !s.is_empty())
++}
++
++fn date(s: &str) -> NaiveDate {
++    NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap_or_else(|e| panic!("date {s:?}: {e}"))
++}
++
++fn series_of(distro: Distro) -> Vec<String> {
++    let (h, rows) = csv_rows(distro);
++    rows.iter().map(|r| field(&h, r, "series").unwrap().to_string()).collect()
++}
++
++/// Every date in the data file under the given columns (the boundaries the selectors turn on).
++fn dates_of(distro: Distro, columns: &[&str]) -> Vec<NaiveDate> {
++    let (h, rows) = csv_rows(distro);
++    let mut out = BTreeSet::new();
++    for r in &rows {
++        for c in columns {
++            if let Some(d) = field(&h, r, c) {
++                out.insert(date(d));
++            }
++        }
++    }
++    out.into_iter().collect()
++}
++
++const ALL_COLUMNS: &[&str] = &["created", "release", "eol", "eol-lts", "eol-elts", "eol-esm", "eol-server", "eol-legacy"];
++const EOL_COLUMNS: &[&str] = &["eol", "eol-lts", "eol-elts", "eol-esm", "eol-server"];
++
++/// A day between 1997 and mid-2028 (the data's horizon: after the last known release goes
++/// EOL nothing is "stable" and the tools disagree on what to answer) that is not a date of
++/// the data file (the boundary days are pinned separately: the C tools treat milestone dates
++/// as exclusive, the crate as inclusive).
++fn arb_date(tc: &hegel::TestCase, distro: Distro) -> NaiveDate {
++    let lo = NaiveDate::from_ymd_opt(1997, 1, 1).unwrap();
++    let hi = NaiveDate::from_ymd_opt(2028, 6, 1).unwrap();
++    let all = dates_of(distro, ALL_COLUMNS);
++    let mut d = lo + chrono::Duration::days(tc.draw(int!(0, (hi - lo).num_days())));
++    while all.contains(&d) {
++        d += chrono::Duration::days(1);
++    }
++    d
++}
++
++/// A milestone date of the data file, from the given columns.
++fn arb_boundary_date(tc: &hegel::TestCase, distro: Distro, columns: &[&str]) -> NaiveDate {
++    pick(tc, &dates_of(distro, columns))
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct Run {
++    code: i32,
++    stdout: String,
++}
++
++fn run(bin: &str, args: &[String]) -> Run {
++    let out = Command::new(bin).args(args).output().unwrap_or_else(|e| panic!("{bin}: {e}"));
++    Run { code: out.status.code().unwrap_or(-1), stdout: String::from_utf8_lossy(&out.stdout).to_string() }
++}
++
++fn strings(args: &[&str]) -> Vec<String> {
++    args.iter().map(|s| s.to_string()).collect()
++}
++
++/// The C tool's stdout lines for `args` (it must succeed).
++fn c_lines(distro: Distro, args: &[&str]) -> Vec<String> {
++    let r = run(distro.c_tool(), &strings(args));
++    assert_eq!(r.code, 0, "{} {args:?}: {}", distro.c_tool(), r.stdout);
++    r.stdout.lines().map(|l| l.to_string()).collect()
++}
++
++/// The C tool's answer to a single-release selector: `None` when it says the data is outdated.
++fn c_single(distro: Distro, args: &[&str]) -> Option<String> {
++    let r = run(distro.c_tool(), &strings(args));
++    if r.code == 1 && r.stdout.is_empty() {
++        None
++    } else {
++        assert_eq!(r.code, 0, "{} {args:?}", distro.c_tool());
++        Some(r.stdout.trim_end().to_string())
++    }
++}
++
++fn ymd(d: NaiveDate) -> String {
++    d.format("%Y-%m-%d").to_string()
++}
++
++fn series(rs: &[&DistroRelease]) -> Vec<String> {
++    rs.iter().map(|r| r.series().to_string()).collect()
++}
++
++/// Both binaries on the same arguments must agree on exit status and stdout.
++fn same_output(distro: Distro, args: &[String]) {
++    let c = run(distro.c_tool(), args);
++    let rust = run(distro.rust_tool(), args);
++    assert_eq!(rust, c, "{} {}", distro.c_tool(), args.join(" "));
++}
++
++// ---------------------------------------------------------------------------
++// The binaries against the C tools
++// ---------------------------------------------------------------------------
++
++fn arb_needle(tc: &hegel::TestCase, distro: Distro) -> String {
++    let all_series = series_of(distro);
++    match tc.draw(int!(0, 9)) {
++        0 => "nope".to_string(),
++        1 => {
++            let s = pick(tc, &all_series);
++            let mut c = s.chars();
++            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
++        }
++        _ => pick(tc, &all_series),
++    }
++}
++
++fn arb_selector(tc: &hegel::TestCase, distro: Distro) -> String {
++    let selectors: &[&str] = match distro {
++        Distro::Debian => &["--all", "-a", "--devel", "-d", "--testing", "-t", "--stable", "-s", "--oldstable", "-o", "--supported", "--lts", "-l", "--elts", "-e", "--unsupported", "--series", "--alias"],
++        // (`--lts` for Ubuntu is pinned: `lts_is_the_latest_released_lts`.)
++        Distro::Ubuntu => &["--all", "-a", "--devel", "-d", "--stable", "-s", "--latest", "-l", "--supported", "--unsupported", "--series", "--series"],
++    };
++    let sel = pick(tc, selectors).to_string();
++    match sel.as_str() {
++        "--series" | "--alias" => format!("{sel}={}", arb_needle(tc, distro)),
++        _ => sel,
++    }
++}
++
++fn arb_output_flag(tc: &hegel::TestCase) -> Option<String> {
++    match tc.draw(int!(0, 7)) {
++        1 => Some("-c"),
++        2 => Some("--codename"),
++        3 => Some("-f"),
++        4 => Some("--fullname"),
++        5 => Some("-r"),
++        6 => Some("--release"),
++        _ => None,
++    }
++    .map(|s| s.to_string())
++}
++
++/// Arguments for the general CLI property: a non-boundary date, any selector, any output
++/// flag, and `--days` only for milestones every release has or that both tools print as
++/// `(unknown)` (created, eol).
++fn arb_args(tc: &hegel::TestCase, distro: Distro) -> Vec<String> {
++    let mut args = vec![format!("--date={}", ymd(arb_date(tc, distro))), arb_selector(tc, distro)];
++    args.extend(arb_output_flag(tc));
++    match tc.draw(int!(0, 5)) {
++        0 => args.push("--days=created".to_string()),
++        1 => args.push("--days=eol".to_string()),
++        2 => args.push("-yeol".to_string()),
++        _ => {}
++    }
++    // The order of the options does not matter to either tool.
++    if tc.draw(int!(0, 1)) == 1 {
++        args.reverse();
++    }
++    args
++}
++
++#[hegel::test]
++fn binaries_agree_with_the_c_tools(tc: hegel::TestCase) {
++    let distro = pick(&tc, DISTROS);
++    let args = arb_args(&tc, distro);
++    let c = run(distro.c_tool(), &args);
++    if c.code == 0 && c.stdout.is_empty() {
++        // An empty list (nothing supported/LTS/… at that date): pinned in
++        // `empty_lists_exit_zero_like_the_c_tools`.
++        return;
++    }
++    if args.iter().any(|a| a == "--testing" || a == "-t" || a.starts_with("--alias")) {
++        // Debian's testing is pinned separately (the binary cannot find a testing without a
++        // release date, `testing_without_a_release_date_is_found`).
++        return;
++    }
++    let rust = run(distro.rust_tool(), &args);
++    assert_eq!(rust, c, "{} {}", distro.c_tool(), args.join(" "));
++}
++
++// ---------------------------------------------------------------------------
++// The library selectors against the C tool
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn debian_selectors_agree_with_the_c_tool(tc: hegel::TestCase) {
++    let distro = Distro::Debian;
++    let info = DebianDistroInfo::new().unwrap();
++    let d = arb_date(&tc, distro);
++    let ds = format!("--date={}", ymd(d));
++    assert_eq!(series(&info.supported(d, Milestone::Eol)), c_lines(distro, &[&ds, "--supported"]), "supported at {ds}");
++    assert_eq!(series(&info.unsupported(d, Milestone::Eol)), c_lines(distro, &[&ds, "--unsupported"]), "unsupported at {ds}");
++    assert_eq!(series(&info.debian_devel(d)), c_single(distro, &[&ds, "--devel"]).into_iter().collect::<Vec<_>>(), "devel at {ds}");
++    assert_eq!(info.stable(d).map(|r| r.series().to_string()), c_single(distro, &[&ds, "--stable"]), "stable at {ds}");
++    assert_eq!(info.latest(d).map(|r| r.series().to_string()), c_single(distro, &[&ds, "--stable"]), "latest at {ds}");
++    assert_eq!(DebianDistroInfo::oldstable(&info, d).map(|r| r.series().to_string()), c_single(distro, &[&ds, "--oldstable"]), "oldstable at {ds}");
++    assert_eq!(DistroInfo::oldstable(&info, d).map(|r| r.series().to_string()), c_single(distro, &[&ds, "--oldstable"]), "trait oldstable at {ds}");
++    let (h, rows) = csv_rows(distro);
++    // Beyond the data's horizon two unreleased releases can coexist (forky without a release
++    // date, duke created 2027-08-01); the C tool then takes the latest created, the crate the
++    // first. Real data never has two, so `testing` is only compared while there is one.
++    let unreleased = rows.iter().filter(|r| field(&h, r, "release").is_none() && field(&h, r, "created").map(|c| date(c) <= d).unwrap_or(false) && !matches!(field(&h, r, "series"), Some("sid" | "experimental"))).count();
++    if unreleased <= 1 {
++        assert_eq!(info.testing(d).map(|r| r.series().to_string()), c_single(distro, &[&ds, "--testing"]), "testing at {ds}");
++    }
++    assert_eq!(info.unstable().series(), "sid");
++    assert_eq!(info.experimental().series(), "experimental");
++    // `all_at`/`released`: every release created/released by the date, in file order.
++    let created: Vec<String> = rows.iter().filter(|r| field(&h, r, "created").map(|c| date(c) <= d).unwrap_or(false)).map(|r| field(&h, r, "series").unwrap().to_string()).collect();
++    assert_eq!(series(&info.all_at(d)), created, "all_at {ds}");
++    let released: Vec<String> = rows.iter().filter(|r| field(&h, r, "release").map(|c| date(c) <= d).unwrap_or(false)).map(|r| field(&h, r, "series").unwrap().to_string()).collect();
++    assert_eq!(series(&info.released(d)), released, "released {ds}");
++}
++
++#[hegel::test]
++fn ubuntu_selectors_agree_with_the_c_tool(tc: hegel::TestCase) {
++    let distro = Distro::Ubuntu;
++    let info = UbuntuDistroInfo::new().unwrap();
++    let d = arb_date(&tc, distro);
++    let ds = format!("--date={}", ymd(d));
++    assert_eq!(series(&info.ubuntu_supported(d)), c_lines(distro, &[&ds, "--supported"]), "supported at {ds}");
++    assert_eq!(series(&info.ubuntu_unsupported(d)), c_lines(distro, &[&ds, "--unsupported"]), "unsupported at {ds}");
++    assert_eq!(series(&info.ubuntu_devel(d)), c_single(distro, &[&ds, "--devel"]).into_iter().collect::<Vec<_>>(), "devel at {ds}");
++    assert_eq!(info.latest(d).map(|r| r.series().to_string()), c_single(distro, &[&ds, "--stable"]), "latest at {ds}");
++    // The C tool's `--lts`: the latest *released*, not yet EOL LTS (filter_lts +
++    // select_latest_release; EOL is `date >= eol` and, when set, `date >= eol-server`).
++    let eol = |r: &DistroRelease| r.eol().map(|e| d >= e).unwrap_or(false) && r.eol_server().map(|s| d >= s).unwrap_or(true);
++    let lts: Vec<String> = info.released(d).into_iter().filter(|r| r.ubuntu_is_lts() && !eol(r)).map(|r| r.series().to_string()).collect();
++    assert_eq!(lts.last().cloned(), c_single(distro, &[&ds, "--lts"]), "lts at {ds}");
++}
++
++/// `ubuntu-distro-info --lts` is the latest released LTS in the C tool; the Rust binary takes
++/// the latest *created* LTS, so for the six months between an LTS's creation and its release
++/// it names the one still in development (trusty on 2013-10-18, where C says precise).
++#[hegel::test]
++fn lts_is_the_latest_released_lts(tc: hegel::TestCase) {
++    same_output(Distro::Ubuntu, &strings(&["--date=2013-10-18", "--lts"]));
++    let mut args = vec![format!("--date={}", ymd(arb_date(&tc, Distro::Ubuntu))), "--lts".to_string()];
++    args.extend(arb_output_flag(&tc));
++    same_output(Distro::Ubuntu, &args);
++}
++
++fn milestone_of(flag: &str) -> Milestone {
++    match flag {
++        "eol" => Milestone::Eol,
++        "eol-lts" => Milestone::EolLTS,
++        "eol-elts" => Milestone::EolELTS,
++        "eol-server" => Milestone::EolServer,
++        "eol-esm" => Milestone::EolESM,
++        f => panic!("no milestone {f}"),
++    }
++}
++
++fn releases_of(distro: Distro) -> Vec<DistroRelease> {
++    match distro {
++        Distro::Debian => DebianDistroInfo::new().unwrap().into_iter().collect(),
++        Distro::Ubuntu => UbuntuDistroInfo::new().unwrap().into_iter().collect(),
++    }
++}
++
++/// `milestone_date`, `supported_at`, `created_at`, `released_at` of one release at one
++/// date, against the C tool's `--series=X --days=<milestone>` (days from the date to the
++/// milestone; `(unknown)` when there is none) and its rule "created <= date < milestone".
++fn check_milestone(distro: Distro, name: &str, flag: &str, d: NaiveDate) {
++    let ds = format!("--date={}", ymd(d));
++    let milestone = milestone_of(flag);
++    let releases = releases_of(distro);
++    let release = releases.iter().find(|r| r.series() == name).unwrap();
++    let c = c_lines(distro, &[&ds, &format!("--series={name}"), &format!("--days={flag}")]);
++    assert_eq!(c.len(), 1, "one line from the C tool");
++    let expected = if c[0] == "(unknown)" { None } else { Some(d + chrono::Duration::days(c[0].parse::<i64>().unwrap())) };
++    assert_eq!(release.milestone_date(&milestone), expected, "{name} {flag} at {ds}");
++    let supported = release.created_at(d)
++        && match expected {
++            Some(m) => d < m,
++            None => milestone == Milestone::Eol,
++        };
++    assert_eq!(release.supported_at(d, &milestone), supported, "{name} supported ({flag}) at {ds}");
++    assert_eq!(release.created_at(d), release.created().map(|c| d >= c).unwrap_or(false));
++    assert_eq!(release.released_at(d), release.release().map(|c| d >= c).unwrap_or(false));
++}
++
++#[hegel::test]
++fn milestones_agree_with_the_c_tool(tc: hegel::TestCase) {
++    let distro = pick(&tc, DISTROS);
++    let d = arb_date(&tc, distro);
++    let name = pick(&tc, &series_of(distro));
++    let flag = pick(&tc, EOL_COLUMNS);
++    if !distro.milestones().contains(&flag) {
++        return;
++    }
++    check_milestone(distro, &name, flag, d);
++}
++
++// ---------------------------------------------------------------------------
++// CSV parsing against the fields written
++// ---------------------------------------------------------------------------
++
++const COLUMNS: &[&str] = &["version", "codename", "series", "created", "release", "eol", "eol-lts", "eol-elts", "eol-esm", "eol-server"];
++
++fn arb_word(tc: &hegel::TestCase, may_be_empty: bool) -> String {
++    let w = pick(tc, &["1.1", "26.04 LTS", "12", "", "Trusty Tahr", "sid", "x"]).to_string();
++    if w.is_empty() && !may_be_empty {
++        "z".to_string()
++    } else {
++        w
++    }
++}
++
++fn arb_csv_date(tc: &hegel::TestCase) -> String {
++    ymd(NaiveDate::from_ymd_opt(1993, 1, 1).unwrap() + chrono::Duration::days(tc.draw(int!(0, 20000))))
++}
++
++/// A CSV text and, per row, the expected value of every column of `COLUMNS` (`None` when the
++/// column is absent from the header, cut off, or — with `empties` — written empty).
++fn arb_csv(tc: &hegel::TestCase, empties: bool) -> (String, Vec<Vec<Option<String>>>) {
++    // The three name columns first, as in the real files, then 0–7 date columns in any order.
++    let ndates = tc.draw(int!(0, 7)) as usize;
++    let mut dates: Vec<&str> = COLUMNS[3..3 + ndates].to_vec();
++    for i in 0..dates.len() {
++        let j = tc.draw(int!(i as i64, dates.len() as i64 - 1)) as usize;
++        dates.swap(i, j);
++    }
++    let header: Vec<&str> = COLUMNS[..3].iter().copied().chain(dates.iter().copied()).collect();
++    let nrows = tc.draw(int!(0, 4)) as usize;
++    let mut text = header.join(",") + "\n";
++    let mut expected = Vec::new();
++    for _ in 0..nrows {
++        let mut vals: Vec<Option<String>> = vec![Some(arb_word(tc, true)), Some(arb_word(tc, false)), Some(arb_word(tc, false))];
++        // Dates up to a cut; with `empties`, any date may also be written empty.
++        let cut = tc.draw(int!(3, header.len() as i64)) as usize;
++        for i in 3..header.len() {
++            vals.push(if i < cut && !(empties && tc.draw(int!(0, 2)) == 0) { Some(arb_csv_date(tc)) } else { None });
++        }
++        let written: Vec<String> = if empties { vals.iter().map(|v| v.clone().unwrap_or_default()).collect() } else { vals[..cut].iter().map(|v| v.clone().unwrap()).collect() };
++        text.push_str(&written.join(","));
++        text.push('\n');
++        let mut row = vec![None; COLUMNS.len()];
++        for (i, name) in header.iter().enumerate() {
++            row[COLUMNS.iter().position(|c| c == name).unwrap()] = vals[i].clone().filter(|s| !s.is_empty());
++        }
++        expected.push(row);
++    }
++    (text, expected)
++}
++
++fn check_csv(text: &str, expected: &[Vec<Option<String>>]) {
++    let reader = csv::ReaderBuilder::new().flexible(true).has_headers(true).from_reader(text.as_bytes());
++    let info = DebianDistroInfo::from_csv_reader(reader).unwrap_or_else(|e| panic!("parse of {text:?}: {e}"));
++    let parsed: Vec<&DistroRelease> = info.releases().iter().collect();
++    assert_eq!(parsed.len(), expected.len(), "row count for {text:?}");
++    for (p, row) in parsed.iter().zip(expected) {
++        let f = |name: &str| -> Option<String> { row[COLUMNS.iter().position(|c| *c == name).unwrap()].clone() };
++        let fd = |name: &str| f(name).map(|s| date(&s));
++        assert_eq!(p.version(), &f("version"), "version in {text:?}");
++        assert_eq!(p.codename(), &f("codename").unwrap(), "codename in {text:?}");
++        assert_eq!(p.series(), &f("series").unwrap(), "series in {text:?}");
++        assert_eq!(p.created(), &fd("created"), "created in {text:?}");
++        assert_eq!(p.release(), &fd("release"), "release in {text:?}");
++        assert_eq!(p.eol(), &fd("eol"), "eol in {text:?}");
++        assert_eq!(p.eol_lts(), &fd("eol-lts"), "eol-lts in {text:?}");
++        assert_eq!(p.eol_elts(), &fd("eol-elts"), "eol-elts in {text:?}");
++        assert_eq!(p.eol_esm(), &fd("eol-esm"), "eol-esm in {text:?}");
++        assert_eq!(p.eol_server(), &fd("eol-server"), "eol-server in {text:?}");
++        assert_eq!(p.ubuntu_is_lts(), f("version").map(|v| v.contains("LTS")).unwrap_or(false));
++    }
++}
++
++/// Rows cut after their last date (the shape of the real files); written-empty date fields
++/// are pinned in `empty_date_fields_parse_as_none`.
++#[hegel::test]
++fn csv_files_parse_like_their_fields(tc: hegel::TestCase) {
++    let (text, expected) = arb_csv(&tc, false);
++    check_csv(&text, &expected);
++}
++
++// ---------------------------------------------------------------------------
++// Pinned bugs
++// ---------------------------------------------------------------------------
++
++/// The C tools treat a milestone date as exclusive: on its EOL day a release is unsupported
++/// (`filter_supported = created && !eol`, `eol = date >= eol`), on its eol-lts day it leaves
++/// `--lts` for `--elts`. The crate uses `date <= eol` everywhere.
++#[hegel::test]
++fn eol_days_are_exclusive_like_the_c_tools(tc: hegel::TestCase) {
++    same_output(Distro::Ubuntu, &strings(&["--date=2006-04-30", "--supported"]));
++    same_output(Distro::Debian, &strings(&["--date=1997-06-05", "--supported"]));
++    let distro = pick(&tc, DISTROS);
++    let d = arb_boundary_date(&tc, distro, EOL_COLUMNS);
++    let ds = format!("--date={}", ymd(d));
++    for sel in ["--supported", "--unsupported"] {
++        same_output(distro, &strings(&[&ds, sel]));
++    }
++    if distro == Distro::Debian {
++        for sel in ["--lts", "--elts"] {
++            let c = run(distro.c_tool(), &strings(&[&ds, sel]));
++            if !(c.code == 0 && c.stdout.is_empty()) {
++                same_output(distro, &strings(&[&ds, sel]));
++            }
++        }
++    }
++    // The library's `supported_at` on the same day, for the release whose milestone it is.
++    let (h, rows) = csv_rows(distro);
++    for r in &rows {
++        for flag in EOL_COLUMNS {
++            if distro.milestones().contains(flag) && field(&h, r, flag).map(|x| date(x) == d).unwrap_or(false) {
++                check_milestone(distro, field(&h, r, "series").unwrap(), flag, d);
++            }
++        }
++    }
++}
++
++/// `--days` of a milestone a release does not have prints `(unknown)` in the C tools (their
++/// own test suite: `--devel --days=eol` → `Debian  "Sid" (unknown)`); the Rust binaries abort
++/// with an error for `release`/`created` and print nothing for `eol-lts`/`eol-elts`/`eol-esm`.
++#[hegel::test]
++fn days_until_missing_milestones_print_unknown(tc: hegel::TestCase) {
++    same_output(Distro::Debian, &strings(&["--date=2010-06-01", "--all", "-y"]));
++    same_output(Distro::Debian, &strings(&["--date=2010-06-01", "--supported", "--days=eol-lts"]));
++    same_output(Distro::Ubuntu, &strings(&["--date=2020-06-01", "--supported", "--days=eol-esm"]));
++    let distro = pick(&tc, DISTROS);
++    let mut args = vec![format!("--date={}", ymd(arb_date(&tc, distro))), pick(&tc, &["--all", "--supported", "--devel"]).to_string()];
++    args.extend(arb_output_flag(&tc));
++    args.push(match tc.draw(int!(0, 2)) {
++        0 => "-y".to_string(),
++        1 => "--days".to_string(),
++        _ => format!("--days={}", pick(&tc, distro.milestones())),
++    });
++    let c = run(distro.c_tool(), &args);
++    if c.code == 0 && c.stdout.is_empty() {
++        return;
++    }
++    same_output(distro, &args);
++}
++
++/// A list selector with no matches (`--lts` when no release is in LTS, `--supported` before
++/// the first release) prints nothing and exits 0 in the C tools; the Rust binaries exit 1
++/// with "Distribution data outdated".
++#[hegel::test]
++fn empty_lists_exit_zero_like_the_c_tools(tc: hegel::TestCase) {
++    same_output(Distro::Debian, &strings(&["--date=2010-06-01", "--lts"]));
++    same_output(Distro::Ubuntu, &strings(&["--date=2000-01-01", "--supported"]));
++    let distro = pick(&tc, DISTROS);
++    let sel = match distro {
++        Distro::Debian => pick(&tc, &["--lts", "--elts", "--supported", "--unsupported"]),
++        Distro::Ubuntu => pick(&tc, &["--supported", "--unsupported"]),
++    };
++    let ds = format!("--date={}", ymd(arb_date(&tc, distro)));
++    let args = strings(&[&ds, sel]);
++    let c = run(distro.c_tool(), &args);
++    if c.code == 0 && c.stdout.is_empty() {
++        same_output(distro, &args);
++    }
++}
++
++/// Debian's testing has no release date until it is released; the C tool finds it (created,
++/// not released), the Rust binary's `--testing` and `--alias` use `ubuntu_devel`, which needs
++/// a release date, and report the data as outdated / the codename as its own alias.
++#[hegel::test]
++fn testing_without_a_release_date_is_found(tc: hegel::TestCase) {
++    same_output(Distro::Debian, &strings(&["--date=2026-01-01", "--testing"]));
++    same_output(Distro::Debian, &strings(&["--date=2026-01-01", "--alias=forky"]));
++    let d = arb_date(&tc, Distro::Debian);
++    let ds = format!("--date={}", ymd(d));
++    same_output(Distro::Debian, &strings(&[&ds, "--testing"]));
++    same_output(Distro::Debian, &strings(&[&ds, &format!("--alias={}", pick(&tc, &series_of(Distro::Debian)))]));
++}
++
++/// The library's `DebianDistroInfo::testing` uses `date > created` where the C tool (and
++/// every other selector of the crate) uses `>=`: on the day a new testing is created it
++/// finds none.
++#[test]
++fn testing_on_its_creation_day() {
++    let info = DebianDistroInfo::new().unwrap();
++    let d = date("2025-08-09"); // trixie released, forky created
++    assert_eq!(c_single(Distro::Debian, &["--date=2025-08-09", "--testing"]), Some("forky".to_string()));
++    assert_eq!(info.testing(d).map(|r| r.series().to_string()), Some("forky".to_string()));
++}
++
++/// An empty date field (`eol` unknown while a later column is set) fails the whole parse
++/// with "premature end of input"; the C tool reads it as no date.
++#[hegel::test]
++fn empty_date_fields_parse_as_none(tc: hegel::TestCase) {
++    check_csv("version,codename,series,created,release,eol,eol-lts\n14,Forky,forky,2025-08-09,,,\n", &[vec![Some("14".into()), Some("Forky".into()), Some("forky".into()), Some("2025-08-09".into()), None, None, None, None, None, None]]);
++    let (text, expected) = arb_csv(&tc, true);
++    check_csv(&text, &expected);
++}
