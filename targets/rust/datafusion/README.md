@@ -47,3 +47,4 @@
 - 2026-09-14: base bumped 15f32dd7ac75 → 38d58ed09db2 (2026-09-14, "fix(physical-plan): honor distinct soft limits in SingleHashAggregateStream (#25158)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-14: base bumped 38d58ed09db2 → c2cf28940b1e (2026-09-14, "Reduce repetitive string formatting in push_projection_dedupl (#25236)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-14: base bumped c2cf28940b1e → 17c6d74deb11 (2026-09-14, "fix: preserve target extension metadata in INSERT (#24971)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-14: base bumped 17c6d74deb11 → 7b00b63e048b (2026-09-14, "fix: stabilize grouped correlation with centered moments (#24953)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
