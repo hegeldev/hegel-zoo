@@ -1,0 +1,1141 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 2e21a76..2c8b37f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,3 +23,5 @@ serde = ["dep:serde"]
+ 
+ [dev-dependencies]
+ serde_json = "1"
++hegeltest = "0.44.1"
++url = "2"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..52674d1
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,1125 @@
++//! Hegel properties for `r-description`, with R itself as the oracle.
++//!
++//! A persistent `Rscript` child answers questions with base R's own machinery:
++//! `read.dcf` for the DESCRIPTION file format, `tools:::.split_dependencies`
++//! for the `Depends`/`Imports`/… grammar, `package_version`/`numeric_version`
++//! for version syntax and ordering (what `loadNamespace` and `R CMD INSTALL`
++//! use to check version requirements) and `tools:::config_val_to_logical` for
++//! logical fields such as `LazyData`.
++
++use std::cmp::Ordering;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++use hegel::{generators, Generator, TestCase};
++use r_description::lossless::{
++    RDescription as LosslessDesc, Relation, Relations, Version as LVersion,
++};
++use r_description::lossy::{
++    RDescription as LossyDesc, Relation as LossyRelation, Relations as LossyRelations, UrlEntry,
++};
++use r_description::{Version, VersionConstraint};
++
++// ---------------------------------------------------------------------------
++// The R oracle
++// ---------------------------------------------------------------------------
++
++const ORACLE: &str = r#"
++invisible(Sys.setlocale("LC_ALL", "C.UTF-8"))
++con <- file("stdin"); open(con, "r")
++enc <- function(s) paste0("v", URLencode(as.character(s), reserved = TRUE))
++dec <- function(s) URLdecode(substring(s, 2))
++handle <- function(cmd, a) {
++  if (cmd == "ver") {
++    enc(as.character(package_version(a[1])))
++  } else if (cmd == "cmp") {
++    x <- numeric_version(a[1]); y <- numeric_version(a[2])
++    enc(if (x < y) "-1" else if (x > y) "1" else "0")
++  } else if (cmd == "sat") {
++    # op required actual: how loadNamespace() checks a version requirement
++    enc(as.character(do.call(a[1], list(as.numeric_version(a[3]), as.numeric_version(a[2])))))
++  } else if (cmd == "deps") {
++    x <- tools:::.split_dependencies(a[1])
++    out <- character()
++    for (e in x) {
++      out <- c(out, enc(e$name),
++               enc(if (is.null(e$op)) "" else e$op),
++               enc(if (is.null(e$version)) "" else as.character(e$version)))
++    }
++    out
++  } else if (cmd == "dcf") {
++    m <- read.dcf(textConnection(a[1]), fields = a[2])
++    v <- m[1, 1]
++    if (is.na(v)) "N" else enc(v)
++  } else if (cmd == "logical") {
++    v <- tools:::config_val_to_logical(a[1])
++    if (is.na(v)) "N" else enc(as.character(v))
++  } else stop("unknown command ", cmd)
++}
++while (length(line <- readLines(con, n = 1, warn = FALSE)) > 0) {
++  parts <- strsplit(line, " ", fixed = TRUE)[[1]]
++  cmd <- parts[1]
++  a <- vapply(parts[-1], dec, "", USE.NAMES = FALSE)
++  res <- tryCatch(suppressWarnings(handle(cmd, a)),
++                  error = function(e) paste0("E", URLencode(conditionMessage(e), reserved = TRUE)))
++  cat(paste(res, collapse = " "), "\n", sep = "")
++  flush(stdout())
++}
++"#;
++
++struct R {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE_R: OnceLock<Mutex<R>> = OnceLock::new();
++
++fn oracle() -> &'static Mutex<R> {
++    ORACLE_R.get_or_init(|| {
++        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hegel-oracle.R");
++        std::fs::write(&path, ORACLE).unwrap();
++        let mut child = Command::new("Rscript")
++            .arg("--vanilla")
++            .arg(&path)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("Rscript (r-base-core) must be installed");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(R {
++            _child: child,
++            stdin,
++            stdout,
++        })
++    })
++}
++
++fn enc(s: &str) -> String {
++    let mut out = String::from("v");
++    for b in s.bytes() {
++        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
++            out.push(b as char);
++        } else {
++            out.push_str(&format!("%{b:02X}"));
++        }
++    }
++    out
++}
++
++fn dec(s: &str) -> String {
++    let bytes = s.as_bytes();
++    let mut out = Vec::new();
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] == b'%' && i + 2 < bytes.len() {
++            let h = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
++            out.push(u8::from_str_radix(h, 16).unwrap());
++            i += 3;
++        } else {
++            out.push(bytes[i]);
++            i += 1;
++        }
++    }
++    String::from_utf8(out).unwrap()
++}
++
++/// One request to R. `Ok(fields)` with `None` for `NA`; `Err(message)` when R raised an error.
++fn r(cmd: &str, args: &[&str]) -> Result<Vec<Option<String>>, String> {
++    let mut g = oracle().lock().unwrap();
++    let mut line = String::from(cmd);
++    for a in args {
++        line.push(' ');
++        line.push_str(&enc(a));
++    }
++    line.push('\n');
++    g.stdin.write_all(line.as_bytes()).unwrap();
++    g.stdin.flush().unwrap();
++    let mut resp = String::new();
++    g.stdout.read_line(&mut resp).unwrap();
++    assert!(!resp.is_empty(), "the R oracle died");
++    let mut out = vec![];
++    for f in resp.trim_end_matches('\n').split(' ') {
++        if f.is_empty() {
++            continue;
++        }
++        match f.as_bytes()[0] {
++            b'v' => out.push(Some(dec(&f[1..]))),
++            b'N' => out.push(None),
++            b'E' => return Err(dec(&f[1..])),
++            _ => panic!("bad oracle field {f:?}"),
++        }
++    }
++    Ok(out)
++}
++
++/// `as.character(package_version(s))`, `None` when R rejects the string.
++fn r_version(s: &str) -> Option<String> {
++    r("ver", &[s]).ok().map(|v| v[0].clone().unwrap())
++}
++
++fn r_cmp(a: &str, b: &str) -> Ordering {
++    match r("cmp", &[a, b]).unwrap()[0].as_deref().unwrap() {
++        "-1" => Ordering::Less,
++        "0" => Ordering::Equal,
++        _ => Ordering::Greater,
++    }
++}
++
++/// `actual <op> required` the way `loadNamespace` evaluates a version requirement.
++fn r_satisfied(op: &str, required: &str, actual: &str) -> bool {
++    r("sat", &[op, required, actual]).unwrap()[0].as_deref() == Some("TRUE")
++}
++
++/// A relation as R sees it: name, and `(op, version)` with the version normalised.
++#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
++struct Rel {
++    name: String,
++    constraint: Option<(String, String)>,
++}
++
++fn r_deps(text: &str) -> Result<Vec<Rel>, String> {
++    let f = r("deps", &[text])?;
++    let mut out = vec![];
++    for chunk in f.chunks(3) {
++        let name = chunk[0].clone().unwrap();
++        let op = chunk[1].clone().unwrap();
++        let ver = chunk[2].clone().unwrap();
++        if name.is_empty() {
++            continue; // an empty entry (`a,,b`): R keeps it, the crate drops it
++        }
++        out.push(Rel {
++            name,
++            constraint: if op.is_empty() { None } else { Some((op, ver)) },
++        });
++    }
++    Ok(out)
++}
++
++/// `read.dcf(text, fields = field)[1, 1]`.
++fn r_dcf(text: &str, field: &str) -> Result<Option<String>, String> {
++    r("dcf", &[text, field]).map(|v| v[0].clone())
++}
++
++fn r_logical(s: &str) -> Option<bool> {
++    r("logical", &[s]).unwrap()[0].as_deref().map(|v| v == "TRUE")
++}
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++/// One chance in `k`.
++fn chance(tc: &TestCase, k: usize) -> bool {
++    n(tc, 1, k) == 1
++}
++
++/// The crate-independent normalisation of an R version string: integers joined by `.`.
++fn norm(v: &str) -> String {
++    v.split(['.', '-'])
++        .map(|c| c.parse::<u64>().unwrap().to_string())
++        .collect::<Vec<_>>()
++        .join(".")
++}
++
++fn lossy_rels(rels: &LossyRelations) -> Vec<Rel> {
++    rels.iter()
++        .map(|r| Rel {
++            name: r.name.clone(),
++            constraint: r
++                .version
++                .as_ref()
++                .map(|(c, v)| (c.to_string(), v.to_string())),
++        })
++        .collect()
++}
++
++fn lossless_rels(rels: &Relations) -> Vec<Rel> {
++    rels.relations()
++        .map(|r| Rel {
++            name: r.name(),
++            constraint: r
++                .version()
++                .map(|(c, v)| (c.to_string(), norm(v.as_str()))),
++        })
++        .collect()
++}
++
++const OPS: [&str; 6] = ["<", "<=", "==", "!=", ">", ">="];
++const LETTERS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
++const NAME_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.";
++
++fn arb_chars(tc: &TestCase, alphabet: &str, lo: usize, hi: usize) -> String {
++    let chars: Vec<char> = alphabet.chars().collect();
++    (0..n(tc, lo, hi)).map(|_| pick(tc, &chars)).collect()
++}
++
++/// An R package name: a letter, then letters, digits and dots.
++fn arb_name(tc: &TestCase) -> String {
++    let mut s = arb_chars(tc, LETTERS, 1, 1);
++    s.push_str(&arb_chars(tc, NAME_CHARS, 0, 6));
++    s
++}
++
++/// A version string of 2–5 components (`.`- or, when `dashes`, sometimes `-`-separated,
++/// occasionally with a leading zero); `nonzero_tail` keeps the last component ≥ 1.
++#[hegel::composite]
++fn arb_version(tc: &TestCase, nonzero_tail: bool, dashes: bool) -> String {
++    let k = n(tc, 2, 5);
++    let mut out = String::new();
++    for i in 0..k {
++        let mut c: u32 = pick(tc, &[0, 0, 1, 1, 2, 3, 4, 10, 12, 100, 9000]);
++        if i + 1 == k && nonzero_tail && c == 0 {
++            c = 1;
++        }
++        if i > 0 {
++            out.push(if dashes && chance(tc, 4) { '-' } else { '.' });
++        }
++        if chance(tc, 8) {
++            out.push('0');
++        }
++        out.push_str(&c.to_string());
++    }
++    out
++}
++
++/// Horizontal or continuation whitespace (a newline is always followed by indentation,
++/// so the text stays a valid DESCRIPTION field value).
++fn arb_ws(tc: &TestCase, at_least_one: bool) -> String {
++    let units = [" ", "  ", "\t", "\n  ", "\n\t", " \n   "];
++    let k = n(tc, if at_least_one { 1 } else { 0 }, 2);
++    let mut s = String::new();
++    for _ in 0..k {
++        let unit = pick(tc, &units);
++        // Two newlines in a row would make a whitespace-only line, which ends a DCF record.
++        if unit.contains('\n') && s.contains('\n') {
++            s.push(' ');
++        } else {
++            s.push_str(unit);
++        }
++    }
++    if at_least_one && s.is_empty() {
++        s.push(' ');
++    }
++    s
++}
++
++/// A relations field value R accepts, and the relations it lists: distinct names, each
++/// optionally `(<op><ws>version)`, comma-separated with arbitrary (continuation) whitespace.
++/// With `in_field` there is no leading or trailing whitespace.
++#[hegel::composite]
++fn arb_relations(tc: &TestCase, in_field: bool) -> (String, Vec<Rel>) {
++    let count = n(tc, 0, 5);
++    let mut names = std::collections::BTreeSet::new();
++    let mut text = if in_field {
++        String::new()
++    } else {
++        arb_ws(tc, false)
++    };
++    let mut rels = vec![];
++    for i in 0..count {
++        let mut name = arb_name(tc);
++        while !names.insert(name.clone()) {
++            name.push('x');
++        }
++        if i > 0 {
++            text.push_str(&arb_ws(tc, false));
++            text.push(',');
++            text.push_str(&arb_ws(tc, false));
++        }
++        text.push_str(&name);
++        let constraint = if chance(tc, 2) {
++            let op = pick(tc, &OPS).to_string();
++            let ver = tc.draw(arb_version(false, true));
++            text.push_str(&arb_ws(tc, false));
++            text.push('(');
++            text.push_str(&arb_ws(tc, false));
++            text.push_str(&op);
++            text.push_str(&arb_ws(tc, true));
++            text.push_str(&ver);
++            text.push(')');
++            Some((op, norm(&ver)))
++        } else {
++            None
++        };
++        rels.push(Rel { name, constraint });
++    }
++    if !in_field && count > 0 {
++        text.push_str(&arb_ws(tc, false));
++    }
++    (text, rels)
++}
++
++fn constraint_of(op: &str) -> VersionConstraint {
++    VersionConstraint::from_str(op).unwrap()
++}
++
++fn new_relation(rel: &Rel, spelled: Option<&str>) -> Relation {
++    match &rel.constraint {
++        None => Relation::simple(&rel.name),
++        Some((op, ver)) => Relation::new(
++            &rel.name,
++            Some((
++                constraint_of(op),
++                LVersion::from_str(spelled.unwrap_or(ver)).unwrap(),
++            )),
++        ),
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Versions
++// ---------------------------------------------------------------------------
++
++/// `Version` parses and orders like `numeric_version` (away from the pinned trailing-zero
++/// shape: the last component is never 0).
++#[hegel::test]
++fn versions_compare_like_numeric_version(tc: TestCase) {
++    let a = tc.draw(arb_version(true, true));
++    let b = tc.draw(arb_version(true, true));
++    let va = Version::from_str(&a).unwrap();
++    let vb = Version::from_str(&b).unwrap();
++    assert_eq!(va.to_string(), r_version(&a).unwrap(), "normalisation of {a:?}");
++    assert_eq!(vb.to_string(), r_version(&b).unwrap(), "normalisation of {b:?}");
++    let expected = r_cmp(&a, &b);
++    assert_eq!(va.cmp(&vb), expected, "{a:?} vs {b:?}");
++    assert_eq!(va == vb, expected == Ordering::Equal, "{a:?} == {b:?}");
++    // The lossless `Version` keeps the spelling but must order the same way.
++    let la = LVersion::from_str(&a).unwrap();
++    let lb = LVersion::from_str(&b).unwrap();
++    assert_eq!(la.as_str(), a);
++    assert_eq!(la.cmp(&lb), expected, "lossless {a:?} vs {b:?}");
++    assert_eq!(la.to_string(), a, "lossless Display keeps the spelling");
++}
++
++/// Version syntax: `Version::from_str` accepts exactly what `package_version` accepts.
++#[hegel::test]
++fn version_syntax_agrees_with_package_version(tc: TestCase) {
++    let s = arb_chars(&tc, "0123456789.-", 0, 8);
++    let ours = Version::from_str(&s);
++    let theirs = r_version(&s);
++    assert_eq!(
++        ours.is_ok(),
++        theirs.is_some(),
++        "{s:?}: crate {ours:?}, R {theirs:?}"
++    );
++    if let (Ok(v), Some(t)) = (ours, theirs) {
++        assert_eq!(v.to_string(), t, "{s:?}");
++    }
++}
++
++/// Pinned (r-description/1): `numeric_version("1.2") == numeric_version("1.2.0")` in R —
++/// trailing zero components do not count, and `loadNamespace` checks requirements with
++/// exactly that comparison — but the crate orders by length.
++#[hegel::test]
++fn trailing_zero_components_compare_equal_like_r(tc: TestCase) {
++    let a = Version::from_str("1.2").unwrap();
++    let b = Version::from_str("1.2.0").unwrap();
++    assert_eq!(r_cmp("1.2", "1.2.0"), Ordering::Equal);
++    assert_eq!(a.cmp(&b), Ordering::Equal, "1.2 vs 1.2.0");
++    assert!(a == b, "1.2 == 1.2.0");
++    let rel: LossyRelation = "R (>= 3.5.0)".parse().unwrap();
++    let r35 = |_: &str| -> Option<Version> { Some(Version::from_str("3.5").unwrap()) };
++    assert!(
++        rel.satisfied_by(r35),
++        "R 3.5 satisfies `R (>= 3.5.0)` in R"
++    );
++    let base = tc.draw(arb_version(false, false));
++    let zeros = ".0".repeat(n(&tc, 1, 3));
++    let padded = format!("{base}{zeros}");
++    assert_eq!(r_cmp(&base, &padded), Ordering::Equal);
++    assert_eq!(
++        Version::from_str(&base).unwrap().cmp(&Version::from_str(&padded).unwrap()),
++        Ordering::Equal,
++        "{base:?} vs {padded:?}"
++    );
++}
++
++/// Pinned (r-description/2): a `+` is not part of an R version component (`package_version`
++/// rejects `1.+2`), but `u32::from_str` accepts a leading `+`, so the crate parses it.
++#[hegel::test]
++fn plus_signs_are_not_version_components(tc: TestCase) {
++    assert!(r_version("1.+2").is_none());
++    assert!(Version::from_str("1.+2").is_err(), "`1.+2` parsed: {:?}", Version::from_str("1.+2"));
++    let base = tc.draw(arb_version(false, false));
++    let parts: Vec<&str> = base.split('.').collect();
++    let i = n(&tc, 0, parts.len() - 1);
++    let s = parts
++        .iter()
++        .enumerate()
++        .map(|(j, p)| if j == i { format!("+{p}") } else { p.to_string() })
++        .collect::<Vec<_>>()
++        .join(".");
++    assert!(r_version(&s).is_none(), "{s:?}");
++    assert!(Version::from_str(&s).is_err(), "{s:?} parsed");
++}
++
++// ---------------------------------------------------------------------------
++// Relations
++// ---------------------------------------------------------------------------
++
++/// Both relation parsers read an R-valid relations field like `tools:::.split_dependencies`;
++/// the lossless tree keeps the text; `wrap_and_sort` canonicalises to the sorted model.
++#[hegel::test]
++fn relations_parse_like_r(tc: TestCase) {
++    let (text, model) = tc.draw(arb_relations(false).print_as_debug());
++    let theirs = r_deps(&text).unwrap_or_else(|e| panic!("R rejected {text:?}: {e}"));
++    assert_eq!(theirs, model, "the generator disagrees with R on {text:?}");
++
++    let lossy = LossyRelations::from_str(&text).unwrap_or_else(|e| panic!("lossy: {text:?}: {e}"));
++    assert_eq!(lossy_rels(&lossy), model, "lossy parse of {text:?}");
++    let again = LossyRelations::from_str(&lossy.to_string()).unwrap();
++    assert_eq!(again, lossy, "lossy Display re-parses: {:?}", lossy.to_string());
++
++    let lossless = Relations::from_str(&text).unwrap_or_else(|e| panic!("lossless: {text:?}: {e}"));
++    assert_eq!(lossless.to_string(), text, "text identity");
++    assert_eq!(lossless_rels(&lossless), model, "lossless parse of {text:?}");
++    assert_eq!(lossless.len(), model.len());
++    assert_eq!(lossless.is_empty(), model.is_empty());
++    for (i, rel) in model.iter().enumerate() {
++        let got = lossless.get_relation(i).unwrap();
++        assert_eq!(got.name(), rel.name);
++        // A relation's own text re-parses to itself.
++        let solo = Relation::from_str(&got.to_string()).unwrap();
++        assert_eq!(solo.name(), rel.name);
++        assert_eq!(
++            solo.version().map(|(c, v)| (c.to_string(), norm(v.as_str()))),
++            rel.constraint
++        );
++    }
++
++    // wrap_and_sort: sorted by name, constraint, version; single spaces; the version spelling kept.
++    let sorted = Relations::from_str(&text).unwrap().wrap_and_sort();
++    let mut expected: Vec<(String, Option<(VersionConstraint, Vec<u32>)>, String)> = vec![];
++    for rel in lossless.relations() {
++        let key = rel
++            .version()
++            .map(|(c, v)| (c, v.components.clone()));
++        let spelled = rel
++            .version()
++            .map(|(c, v)| format!(" ({c} {})", v.as_str()))
++            .unwrap_or_default();
++        expected.push((rel.name(), key, format!("{}{spelled}", rel.name())));
++    }
++    expected.sort_by(|a, b| {
++        a.0.cmp(&b.0).then_with(|| match (&a.1, &b.1) {
++            (Some((ca, va)), Some((cb, vb))) => ca.cmp(cb).then_with(|| {
++                va.iter()
++                    .zip(vb.iter())
++                    .map(|(x, y)| x.cmp(y))
++                    .find(|o| *o != Ordering::Equal)
++                    .unwrap_or_else(|| va.len().cmp(&vb.len()))
++            }),
++            (Some(_), None) => Ordering::Greater,
++            (None, Some(_)) => Ordering::Less,
++            (None, None) => Ordering::Equal,
++        })
++    });
++    let expected_text = expected
++        .iter()
++        .map(|e| e.2.clone())
++        .collect::<Vec<_>>()
++        .join(", ");
++    assert_eq!(sorted.to_string(), expected_text, "wrap_and_sort of {text:?}");
++}
++
++/// A constrained relation is satisfied exactly when R's `do.call(op, list(actual, required))`
++/// says so (versions away from the pinned trailing-zero shape); an unconstrained one is
++/// satisfied by any installed version.
++#[hegel::test]
++fn satisfaction_agrees_with_r(tc: TestCase) {
++    let name = arb_name(&tc);
++    let op = pick(&tc, &OPS);
++    let required = tc.draw(arb_version(true, true));
++    let actual = tc.draw(arb_version(true, true));
++    let text = format!("{name} ({op} {required})");
++    let expected = r_satisfied(op, &required, &actual);
++    let installed = Version::from_str(&actual).unwrap();
++    let lookup = |pkg: &str| -> Option<Version> {
++        if pkg == name { Some(installed.clone()) } else { None }
++    };
++    let lookup = &lookup;
++    let lossy: LossyRelation = text.parse().unwrap();
++    assert_eq!(lossy.satisfied_by(lookup), expected, "lossy {text:?} by {actual:?}");
++    let lossless: Relation = text.parse().unwrap();
++    assert_eq!(lossless.satisfied_by(lookup), expected, "lossless {text:?} by {actual:?}");
++    // A relation on another package is never satisfied by this lookup …
++    let other = format!("{name}x ({op} {required})");
++    assert!(!LossyRelation::from_str(&other).unwrap().satisfied_by(lookup));
++    assert!(!Relation::from_str(&other).unwrap().satisfied_by(lookup));
++    // … and an unconstrained one is satisfied by any version of the package.
++    assert!(LossyRelation::from_str(&name).unwrap().satisfied_by(lookup));
++    assert!(Relation::from_str(&name).unwrap().satisfied_by(lookup));
++    let both: Relations = format!("{text}, {name}").parse().unwrap();
++    assert_eq!(both.satisfied_by(lookup), expected);
++    let both: LossyRelations = format!("{text}, {name}").parse().unwrap();
++    assert_eq!(both.satisfied_by(lookup), expected);
++}
++
++/// Pinned (r-description/3): a relation without a version constraint still needs the package
++/// to exist — `lossy::Relation::satisfied_by` says so, R says so, `lossless::Relation` says
++/// `true` for a package that is not there.
++#[hegel::test]
++fn unconstrained_lossless_relations_need_the_package(tc: TestCase) {
++    let missing = |_: &str| -> Option<Version> { None };
++    let missing = &missing;
++    assert!(!LossyRelation::from_str("cli").unwrap().satisfied_by(missing));
++    assert!(
++        !Relation::from_str("cli").unwrap().satisfied_by(missing),
++        "lossless `cli` is satisfied with no cli installed"
++    );
++    let (text, model) = tc.draw(arb_relations(false).print_as_debug());
++    let rels: Relations = text.parse().unwrap();
++    let lossy: LossyRelations = text.parse().unwrap();
++    assert_eq!(lossy.satisfied_by(missing), model.is_empty());
++    assert_eq!(rels.satisfied_by(missing), model.is_empty(), "{text:?} with nothing installed");
++}
++
++// ---------------------------------------------------------------------------
++// Editing the lossless tree
++// ---------------------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++enum Edit {
++    Push(Rel),
++    Insert(usize, Rel),
++    Remove(usize),
++    Replace(usize, Rel),
++    SetVersion(usize, Option<(String, String)>),
++    DropConstraint(usize),
++}
++
++#[hegel::composite]
++fn arb_rel(tc: &TestCase) -> Rel {
++    let name = arb_name(tc);
++    let constraint = if chance(tc, 2) {
++        let op = pick(tc, &OPS).to_string();
++        let ver = tc.draw(arb_version(false, false));
++        Some((op, ver))
++    } else {
++        None
++    };
++    Rel { name, constraint }
++}
++
++fn check_tree(rels: &Relations, model: &[Rel], context: &str) {
++    let text = rels.to_string();
++    assert_eq!(rels.len(), model.len(), "{context}: len of {text:?}");
++    assert_eq!(lossless_rels(rels), model.to_vec(), "{context}: tree {text:?}");
++    let reparsed = Relations::from_str(&text)
++        .unwrap_or_else(|e| panic!("{context}: {text:?} does not re-parse: {e}"));
++    assert_eq!(lossless_rels(&reparsed), model.to_vec(), "{context}: re-parse of {text:?}");
++    // R's `.split_dependencies` drops duplicate entries (`unique`), so only compare when
++    // the model has none.
++    let mut distinct = model.to_vec();
++    distinct.sort();
++    distinct.dedup();
++    if !model.is_empty() && distinct.len() == model.len() {
++        let theirs = r_deps(&text).unwrap_or_else(|e| panic!("{context}: R rejects {text:?}: {e}"));
++        assert_eq!(theirs, model.to_vec(), "{context}: R reads {text:?}");
++    }
++}
++
++/// Every editing method of `lossless::Relations`/`Relation`, applied to a parsed field, keeps
++/// the tree, its text (re-parsed by the crate and by R) and a `Vec` model in step.
++/// `insert` at index 0 of a one-relation list is pinned separately.
++#[hegel::test]
++fn lossless_edits_follow_a_model(tc: TestCase) {
++    let (text, mut model) = tc.draw(arb_relations(false).print_as_debug());
++    let mut rels = Relations::from_str(&text).unwrap();
++    let mut log = vec![format!("parse {text:?}")];
++    for _ in 0..n(&tc, 1, 6) {
++        let len = model.len();
++        let kind = n(&tc, 0, if len == 0 { 1 } else { 5 });
++        let edit = match kind {
++            0 => Edit::Push(tc.draw(arb_rel().print_as_debug())),
++            1 => {
++                let mut idx = n(&tc, 0, len);
++                if len == 1 && idx == 0 {
++                    idx = 1; // pinned: insert(0, _) into a one-relation list
++                }
++                Edit::Insert(idx, tc.draw(arb_rel().print_as_debug()))
++            }
++            2 => Edit::Remove(n(&tc, 0, len - 1)),
++            3 => Edit::Replace(n(&tc, 0, len - 1), tc.draw(arb_rel().print_as_debug())),
++            4 => {
++                let c = tc.draw(arb_rel().print_as_debug()).constraint;
++                Edit::SetVersion(n(&tc, 0, len - 1), c)
++            }
++            _ => Edit::DropConstraint(n(&tc, 0, len - 1)),
++        };
++        log.push(format!("{edit:?}"));
++        match &edit {
++            Edit::Push(rel) => {
++                rels.push(new_relation(rel, None));
++                model.push(rel.normalized());
++            }
++            Edit::Insert(idx, rel) => {
++                rels.insert(*idx, new_relation(rel, None));
++                model.insert(*idx, rel.normalized());
++            }
++            Edit::Remove(idx) => {
++                let removed = rels.remove_relation(*idx);
++                let gone = model.remove(*idx);
++                assert_eq!(removed.name(), gone.name, "{}", log.join("; "));
++            }
++            Edit::Replace(idx, rel) => {
++                rels.replace(*idx, new_relation(rel, None));
++                model[*idx] = rel.normalized();
++            }
++            Edit::SetVersion(idx, c) => {
++                let mut rel = rels.get_relation(*idx).unwrap();
++                rel.set_version(
++                    c.as_ref()
++                        .map(|(op, v)| (constraint_of(op), LVersion::from_str(v).unwrap())),
++                );
++                model[*idx].constraint = c.as_ref().map(|(op, v)| (op.clone(), norm(v)));
++                assert_eq!(
++                    rel.version().map(|(c, v)| (c.to_string(), norm(v.as_str()))),
++                    model[*idx].constraint,
++                    "{}: the edited relation itself",
++                    log.join("; ")
++                );
++            }
++            Edit::DropConstraint(idx) => {
++                let mut rel = rels.get_relation(*idx).unwrap();
++                let had = rel.drop_constraint();
++                assert_eq!(had, model[*idx].constraint.is_some(), "{}", log.join("; "));
++                model[*idx].constraint = None;
++                assert_eq!(rel.version(), None, "{}", log.join("; "));
++            }
++        }
++        check_tree(&rels, &model, &log.join("; "));
++    }
++}
++
++impl Rel {
++    fn normalized(&self) -> Rel {
++        Rel {
++            name: self.name.clone(),
++            constraint: self
++                .constraint
++                .as_ref()
++                .map(|(op, v)| (op.clone(), norm(v))),
++        }
++    }
++}
++
++/// Pinned (r-description/4): `Relations::insert(0, _)` into a list holding exactly one
++/// relation writes the new relation without a separating comma.
++#[hegel::test]
++fn insert_at_the_start_of_a_single_relation(tc: TestCase) {
++    let mut rels: Relations = "cli (>= 1.0)".parse().unwrap();
++    rels.insert(0, Relation::simple("R"));
++    assert_eq!(rels.to_string(), "R, cli (>= 1.0)");
++    let first = tc.draw(arb_rel().print_as_debug());
++    let second = tc.draw(arb_rel().print_as_debug());
++    let mut rels = Relations::from(vec![new_relation(&first, None)]);
++    rels.insert(0, new_relation(&second, None));
++    check_tree(&rels, &[second.normalized(), first.normalized()], "insert(0) into one");
++}
++
++// ---------------------------------------------------------------------------
++// DESCRIPTION files against read.dcf
++// ---------------------------------------------------------------------------
++
++const TEXT_CHARS: &str =
++    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ,.;:()<>@/=+'-";
++
++/// A line of field text: non-empty, no leading or trailing whitespace, never a lone `.`.
++fn arb_line(tc: &TestCase) -> String {
++    let mut s = arb_chars(tc, TEXT_CHARS, 1, 24).trim().to_string();
++    if s.is_empty() || s == "." {
++        s.push_str("text");
++    }
++    s
++}
++
++/// A field value of one line plus 0–3 indented continuation lines (as written after the colon).
++fn arb_text_value(tc: &TestCase, multiline: bool) -> String {
++    let mut raw = arb_line(tc);
++    if multiline {
++        for _ in 0..n(tc, 0, 3) {
++            raw.push('\n');
++            raw.push_str(pick(tc, &[" ", "  ", "    ", "\t"]));
++            raw.push_str(&arb_line(tc));
++        }
++    }
++    raw
++}
++
++fn arb_url(tc: &TestCase) -> String {
++    let host = format!("{}.org", arb_chars(tc, "abcdefghijklmnopqrstuvwxyz", 1, 8));
++    // No dots: the url crate normalises `/.` and `/..` path segments away.
++    let path = arb_chars(tc, "abcdefghijklmnopqrstuvwxyz0123456789/_-~", 0, 12);
++    format!("https://{host}/{path}")
++}
++
++#[derive(Clone, Debug)]
++struct Field {
++    name: &'static str,
++    raw: String,
++}
++
++const OPTIONAL_FIELDS: [&str; 19] = [
++    "Maintainer",
++    "Author",
++    "Encoding",
++    "URL",
++    "BugReports",
++    "Depends",
++    "Imports",
++    "Suggests",
++    "LinkingTo",
++    "Enhances",
++    "LazyData",
++    "Collate",
++    "VignetteBuilder",
++    "SystemRequirements",
++    "Date",
++    "Language",
++    "Repository",
++    "RoxygenNote",
++    "Roxygen",
++];
++
++/// A DESCRIPTION file: the five fields the lossy struct requires plus a random subset of the
++/// optional ones, in random order, with values shaped for each field.
++#[hegel::composite]
++fn arb_description(tc: &TestCase) -> (String, Vec<Field>, Vec<UrlEntry>) {
++    let mut names: Vec<&'static str> = vec!["Package", "Version", "Title", "Description", "License"];
++    for f in OPTIONAL_FIELDS {
++        if chance(tc, 3) {
++            names.push(f);
++        }
++    }
++    // Shuffle.
++    let mut order = vec![];
++    while !names.is_empty() {
++        let i = n(tc, 0, names.len() - 1);
++        order.push(names.remove(i));
++    }
++    let mut fields = vec![];
++    let mut urls = vec![];
++    for name in order {
++        let raw = match name {
++            "Package" | "VignetteBuilder" => arb_name(tc),
++            "Version" => tc.draw(arb_version(false, true)),
++            "Description" => arb_text_value(tc, true),
++            "Depends" | "Imports" | "Suggests" | "LinkingTo" | "Enhances" => {
++                tc.draw(arb_relations(true).print_as_debug()).0
++            }
++            "URL" => {
++                let mut raw = String::new();
++                for i in 0..n(tc, 1, 3) {
++                    let url = arb_url(tc);
++                    let label = if chance(tc, 3) {
++                        Some(arb_chars(tc, "abcdefghijklmnopqrstuvwxyz ", 1, 8).trim().to_string())
++                            .filter(|l| !l.is_empty())
++                    } else {
++                        None
++                    };
++                    if i > 0 {
++                        raw.push(',');
++                        raw.push_str(pick(tc, &[" ", "\n  ", "\n    ", " "]));
++                    }
++                    raw.push_str(&url);
++                    if let Some(l) = &label {
++                        raw.push_str(&format!(" ({l})"));
++                    }
++                    urls.push(UrlEntry {
++                        url: url::Url::parse(&url).unwrap(),
++                        label,
++                    });
++                }
++                raw
++            }
++            "BugReports" => arb_url(tc),
++            "LazyData" => pick(tc, &["true", "false"]).to_string(),
++            "Encoding" => pick(tc, &["UTF-8", "latin1"]).to_string(),
++            "Date" => format!("20{:02}-{:02}-{:02}", n(tc, 0, 26), n(tc, 1, 12), n(tc, 1, 28)),
++            "Language" => "en-US".to_string(),
++            "Repository" => pick(tc, &["CRAN", "RSPM", "Bioconductor"]).to_string(),
++            "RoxygenNote" => tc.draw(arb_version(false, false)),
++            "SystemRequirements" => arb_line(tc).replace(',', ";"),
++            _ => arb_text_value(tc, chance(tc, 2)),
++        };
++        fields.push(Field { name, raw });
++    }
++    let mut text = String::new();
++    for f in &fields {
++        text.push_str(f.name);
++        text.push(':');
++        if !f.raw.starts_with('\n') && !chance(tc, 6) {
++            text.push(' ');
++        } else if chance(tc, 2) {
++            text.push_str("  ");
++        }
++        text.push_str(&f.raw);
++        text.push('\n');
++    }
++    (text, fields, urls)
++}
++
++fn lossless_get(desc: &LosslessDesc, field: &str) -> Option<Option<String>> {
++    Some(match field {
++        "Package" => desc.package(),
++        "Title" => desc.title(),
++        "Description" => desc.description(),
++        "Version" => desc.version(),
++        "License" => desc.license(),
++        "Maintainer" => desc.maintainer(),
++        "Encoding" => desc.encoding(),
++        "Date" => desc.date(),
++        "Repository" => desc.repository(),
++        "Collate" => desc.collate(),
++        "URL" => desc.url(),
++        "RoxygenNote" => desc.roxygen_note(),
++        "Roxygen" => desc.roxygen(),
++        "Author" | "Language" | "Additional_repositories" => return None,
++        _ => return None,
++    })
++}
++
++fn lossless_relations_field(desc: &LosslessDesc, field: &str) -> Option<Relations> {
++    match field {
++        "Depends" => desc.depends(),
++        "Imports" => desc.imports(),
++        "Suggests" => desc.suggests(),
++        "LinkingTo" => desc.linking_to(),
++        "Enhances" => desc.enhances(),
++        _ => unreachable!(),
++    }
++}
++
++/// Every field of a generated DESCRIPTION reads, through the lossless getters and the lossy
++/// struct, as `read.dcf` reads it; relation fields as `.split_dependencies` reads them; the
++/// lossless text is kept; the lossy struct round-trips through its own `Display`.
++#[hegel::test]
++fn description_fields_read_like_read_dcf(tc: TestCase) {
++    let (text, fields, urls) = tc.draw(arb_description().print_as_debug());
++    let lossless = LosslessDesc::from_str(&text).unwrap_or_else(|e| panic!("lossless {text:?}: {e}"));
++    assert_eq!(lossless.to_string(), text, "text identity");
++    let lossy = LossyDesc::from_str(&text).unwrap_or_else(|e| panic!("lossy {text:?}: {e}"));
++
++    for f in &fields {
++        let value = r_dcf(&text, f.name)
++            .unwrap_or_else(|e| panic!("read.dcf rejects {text:?}: {e}"))
++            .unwrap_or_else(|| panic!("read.dcf has no {} in {text:?}", f.name));
++        let ctx = format!("{}: {:?} in {text:?}", f.name, f.raw);
++        if let Some(got) = lossless_get(&lossless, f.name) {
++            assert_eq!(got, Some(value.clone()), "lossless {ctx}");
++        }
++        match f.name {
++            "Depends" | "Imports" | "Suggests" | "LinkingTo" | "Enhances" => {
++                let expected = r_deps(&value).unwrap();
++                let got = lossless_relations_field(&lossless, f.name)
++                    .unwrap_or_else(|| panic!("lossless {ctx}: no field"));
++                assert_eq!(lossless_rels(&got), expected, "lossless {ctx}");
++                let got = match f.name {
++                    "Depends" => &lossy.depends,
++                    "Imports" => &lossy.imports,
++                    "Suggests" => &lossy.suggests,
++                    "LinkingTo" => &lossy.linking_to,
++                    _ => continue, // the lossy struct has no Enhances
++                };
++                assert_eq!(lossy_rels(got.as_ref().unwrap()), expected, "lossy {ctx}");
++            }
++            "LazyData" => {
++                let expected = r_logical(&value);
++                assert_eq!(lossless.lazy_data(), expected, "lossless {ctx}");
++                assert_eq!(lossy.lazy_data.as_deref(), Some(value.as_str()), "lossy {ctx}");
++            }
++            "BugReports" => {
++                assert_eq!(lossless.bug_reports().map(|u| u.to_string()), Some(value.clone()), "lossless {ctx}");
++                assert_eq!(lossy.bug_reports.as_deref(), Some(value.as_str()), "lossy {ctx}");
++            }
++            "URL" => {
++                assert_eq!(lossy.url.as_ref().unwrap(), &urls, "lossy {ctx}");
++            }
++            "VignetteBuilder" => {
++                assert_eq!(lossless.vignette_builder(), Some(vec![value.clone()]), "lossless {ctx}");
++                assert_eq!(lossy.vignette_builder.as_deref(), Some(value.as_str()), "lossy {ctx}");
++            }
++            "SystemRequirements" => {
++                assert_eq!(lossless.system_requirements(), Some(vec![value.clone()]), "lossless {ctx}");
++                assert_eq!(lossy.system_requirements.as_deref(), Some(value.as_str()), "lossy {ctx}");
++            }
++            "Version" => {
++                assert_eq!(lossy.version.to_string(), r_version(&value).unwrap(), "lossy {ctx}");
++            }
++            "Package" => assert_eq!(lossy.name, value, "lossy {ctx}"),
++            "Title" => assert_eq!(lossy.title, value, "lossy {ctx}"),
++            "Description" => assert_eq!(lossy.description, value, "lossy {ctx}"),
++            "License" => assert_eq!(lossy.license, value, "lossy {ctx}"),
++            "Maintainer" => assert_eq!(lossy.maintainer.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            "Author" => assert_eq!(lossy.author.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            "Encoding" => assert_eq!(lossy.encoding.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            "Collate" => assert_eq!(lossy.collate.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            "Date" => assert_eq!(lossy.date.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            "Language" => assert_eq!(lossy.language.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            "Repository" => assert_eq!(lossy.repository.as_deref(), Some(value.as_str()), "lossy {ctx}"),
++            _ => {}
++        }
++    }
++
++    // The lossy struct round-trips through its own Display.
++    let rendered = lossy.to_string();
++    let again = LossyDesc::from_str(&rendered).unwrap_or_else(|e| panic!("lossy re-parse of {rendered:?}: {e}"));
++    assert_eq!(again, lossy, "lossy round trip through {rendered:?}");
++    // … and R reads the same values back from it.
++    for f in &fields {
++        if matches!(f.name, "Version" | "URL" | "Enhances" | "RoxygenNote" | "Roxygen") {
++            continue; // normalised or re-rendered by the lossy struct, or not a field of it
++        }
++        let before = r_dcf(&text, f.name).unwrap();
++        let after = r_dcf(&rendered, f.name).unwrap();
++        if matches!(f.name, "Depends" | "Imports" | "Suggests" | "LinkingTo") {
++            // Re-rendered canonically; R must read the same relations.
++            assert_eq!(
++                r_deps(after.as_deref().unwrap_or("")).unwrap(),
++                r_deps(before.as_deref().unwrap_or("")).unwrap(),
++                "{}: .split_dependencies of the lossy rendering {rendered:?}",
++                f.name
++            );
++        } else {
++            assert_eq!(after, before, "{}: read.dcf of the lossy rendering {rendered:?}", f.name);
++        }
++    }
++}
++
++/// Pinned (r-description/5): `LazyData: TRUE` / `yes` — the logical spellings R accepts
++/// (`tools:::config_val_to_logical`) — read as `Some(false)` from `lazy_data()`, which only
++/// knows the word `true`.
++#[hegel::test]
++fn lazy_data_accepts_r_logicals(tc: TestCase) {
++    let desc = LosslessDesc::from_str("Package: p\nLazyData: TRUE\n").unwrap();
++    assert_eq!(r_logical("TRUE"), Some(true));
++    assert_eq!(desc.lazy_data(), Some(true), "LazyData: TRUE");
++    let word = pick(&tc, &["true", "TRUE", "True", "yes", "Yes", "YES", "false", "FALSE", "no", "No"]);
++    let desc = LosslessDesc::from_str(&format!("Package: p\nLazyData: {word}\n")).unwrap();
++    assert_eq!(desc.lazy_data(), r_logical(word), "LazyData: {word}");
++}
++
++/// Pinned (r-description/6): to `read.dcf` a continuation line holding a single `.` is an empty
++/// line (`"What it does.\n\nMore."`); the crate keeps the literal dot.
++#[hegel::test]
++fn dot_continuation_lines_are_blank_like_read_dcf(tc: TestCase) {
++    let text = "Package: p\nDescription:\n  What it does.\n  .\n  More.\nLicense: MIT\n";
++    let expected = r_dcf(text, "Description").unwrap().unwrap();
++    assert_eq!(expected, "What it does.\n\nMore.");
++    let lossless = LosslessDesc::from_str(text).unwrap();
++    assert_eq!(lossless.description(), Some(expected.clone()), "lossless");
++    let lossy = LossyDesc::from_str(&format!("{text}Title: t\nVersion: 1.0\n")).unwrap();
++    assert_eq!(lossy.description, expected, "lossy");
++    // Random: an empty first line, then indented lines, some of them ` .`.
++    let mut raw = String::new();
++    for _ in 0..n(&tc, 1, 4) {
++        raw.push('\n');
++        raw.push_str(pick(&tc, &[" ", "  ", "    "]));
++        let line = if chance(&tc, 3) { ".".to_string() } else { arb_line(&tc) };
++        raw.push_str(&line);
++    }
++    let text = format!("Package: p\nDescription:{raw}\nLicense: MIT\n");
++    let expected = r_dcf(&text, "Description").unwrap().unwrap();
++    let lossless = LosslessDesc::from_str(&text).unwrap();
++    assert_eq!(lossless.description(), Some(expected), "lossless {text:?}");
++}
++
++/// Pinned (r-description/7): the lossless accessors `unwrap()` their parses — `imports()`
++/// panics on a field R reads without complaint (`foo (>= 1.0) bar`: `.split_op_version`
++/// ignores what follows the closing parenthesis) and `bug_reports()` on any non-URL text.
++#[test]
++fn accessors_do_not_panic_on_fields_r_accepts() {
++    let text = "Package: p\nImports: foo (>= 1.0) bar\nBugReports: bugs at example.org\n";
++    assert_eq!(
++        r_deps("foo (>= 1.0) bar").unwrap(),
++        vec![Rel { name: "foo".into(), constraint: Some((">=".into(), "1.0".into())) }]
++    );
++    let desc = LosslessDesc::from_str(text).unwrap();
++    let imports = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| desc.imports().map(|r| r.to_string())));
++    assert!(imports.is_ok(), "imports() panicked on `foo (>= 1.0) bar`");
++    let bugs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| desc.bug_reports().map(|u| u.to_string())));
++    assert!(bugs.is_ok(), "bug_reports() panicked on `bugs at example.org`");
++}
++
++/// Pinned (r-description/9): Writing R Extensions allows the `URL` field to be "a list of URLs
++/// separated by commas or whitespace"; the lossy parser splits on commas and newlines only, so
++/// `https://a.org/ https://b.org/` becomes the single URL `https://a.org/%20https://b.org/`.
++#[hegel::test]
++fn url_lists_may_be_whitespace_separated(tc: TestCase) {
++    let text = "Package: p\nTitle: t\nVersion: 1.0\nDescription: d\nLicense: MIT\nURL: https://a.org/ https://b.org/\n";
++    let desc = LossyDesc::from_str(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let urls: Vec<String> = desc.url.unwrap().iter().map(|u| u.url.to_string()).collect();
++    assert_eq!(urls, ["https://a.org/", "https://b.org/"]);
++    let mut raw = String::new();
++    let mut expected = vec![];
++    for i in 0..n(&tc, 2, 3) {
++        if i > 0 {
++            raw.push_str(pick(&tc, &[" ", "  ", "\n  ", "\t"]));
++        }
++        let url = arb_url(&tc);
++        raw.push_str(&url);
++        expected.push(url);
++    }
++    let text = format!("Package: p\nTitle: t\nVersion: 1.0\nDescription: d\nLicense: MIT\nURL: {raw}\n");
++    let desc = LossyDesc::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    let urls: Vec<String> = desc.url.unwrap().iter().map(|u| u.url.to_string()).collect();
++    assert_eq!(urls, expected, "{text:?}");
++}
++
++// ---------------------------------------------------------------------------
++// URL entries
++// ---------------------------------------------------------------------------
++
++/// `UrlEntry` round-trips through `Display` for URLs without parentheses, with or without a label.
++#[hegel::test]
++fn url_entries_round_trip(tc: TestCase) {
++    let url = arb_url(&tc);
++    let label = if chance(&tc, 2) {
++        Some(arb_chars(&tc, "abcdefghijklmnopqrstuvwxyz ", 1, 8).trim().to_string()).filter(|l| !l.is_empty())
++    } else {
++        None
++    };
++    let text = match &label {
++        Some(l) => format!("{url} ({l})"),
++        None => url.clone(),
++    };
++    let entry = UrlEntry::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(entry.url.as_str(), url, "{text:?}");
++    assert_eq!(entry.label, label, "{text:?}");
++    assert_eq!(entry.to_string(), text);
++}
++
++/// Pinned (r-description/8): a URL with parentheses in its path (`R_(programming_language)`)
++/// is cut at the first `(` and its tail taken for a label.
++#[hegel::test]
++fn urls_with_parentheses_keep_their_path(tc: TestCase) {
++    let text = "https://en.wikipedia.org/wiki/R_(programming_language)";
++    let entry = UrlEntry::from_str(text).unwrap();
++    assert_eq!(entry.url.as_str(), text);
++    assert_eq!(entry.label, None);
++    let url = format!("{}({})", arb_url(&tc), arb_chars(&tc, "abcdefghijklmnopqrstuvwxyz", 1, 6));
++    let entry = UrlEntry::from_str(&url).unwrap();
++    assert_eq!(entry.url.as_str(), url, "{url:?}");
++    assert_eq!(entry.label, None, "{url:?}");
++}
