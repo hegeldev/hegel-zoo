@@ -1,0 +1,953 @@
+diff --git a/crates/uv-platform-tags/Cargo.toml b/crates/uv-platform-tags/Cargo.toml
+index e256496..a3c5232 100644
+--- a/crates/uv-platform-tags/Cargo.toml
++++ b/crates/uv-platform-tags/Cargo.toml
+@@ -27,3 +27,5 @@ thiserror = { workspace = true }
+ 
+ [dev-dependencies]
+ insta = { workspace = true }
++hegeltest = "0.44.1"
++serde_json = { workspace = true }
+diff --git a/crates/uv-platform-tags/tests/hegel.rs b/crates/uv-platform-tags/tests/hegel.rs
+new file mode 100644
+index 0000000..6ded3ae
+--- /dev/null
++++ b/crates/uv-platform-tags/tests/hegel.rs
+@@ -0,0 +1,937 @@
++//! Hegel properties for `uv-platform-tags` — uv's typed wheel tags (PEP 425 `LanguageTag`,
++//! `AbiTag`, `PlatformTag`) and the compatible-tag list of an interpreter (`Tags::from_env`,
++//! PEP 425/600/656, the macOS/iOS/Android conventions) — with PyPA's **`packaging.tags`** as
++//! the oracle, driven as one persistent Python child: `parse_tag` for the grammar,
++//! `mac_platforms`/`ios_platforms`/`android_platforms` for the platform lists, and
++//! `cpython_tags`/`generic_tags`/`compatible_tags` for the interpreter's ordered tag list over a
++//! given platform list. Linux platform lists are compared with a model of PEP 600/656 (packaging
++//! can only produce them for the running system), and the compatibility queries with the
++//! crate's own `Display` of the list.
++
++use std::collections::HashMap;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++use hegel::{generators, Generator, TestCase};
++use uv_platform_tags::{
++    AbiTag, Arch, CPythonAbiVariants, IncompatibleTag, LanguageTag, Os, Platform, PlatformTag,
++    TagCompatibility, Tags, TagsOptions,
++};
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys
++from packaging import tags as T
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def show(t):
++    return f"{t.interpreter}-{t.abi}-{t.platform}"
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'P':
++            T.parse_tag(args[0])
++            out = ['ok']
++        elif cmd == 'M':
++            out = ['ok'] + list(T.mac_platforms((int(args[0]), int(args[1])), args[2]))
++        elif cmd == 'I':
++            out = ['ok'] + list(T.ios_platforms((int(args[0]), int(args[1])), args[2]))
++        elif cmd == 'A':
++            out = ['ok'] + list(T.android_platforms(int(args[0]), args[1]))
++        elif cmd == 'N':
++            out = ['ok', T._normalize_string(args[0])]
++        elif cmd == 'C':
++            impl, major, minor, interp = args[0], int(args[1]), int(args[2]), args[3]
++            abis = [a for a in args[4].split(',') if a]
++            plats = args[5:]
++            if impl == 'cpython':
++                found = list(T.cpython_tags((major, minor), abis, plats))
++                interp = f"cp{major}{minor}"
++            else:
++                found = list(T.generic_tags(interp, abis, plats))
++            found += list(T.compatible_tags((major, minor), interp, plats))
++            out = ['ok'] + [show(t) for t in found]
++        else:
++            out = ['bad', cmd]
++    except Exception as e:
++        out = ['err', f"{type(e).__name__}: {e}"]
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
++        .collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let python = ["python3", "/usr/bin/python3"]
++            .into_iter()
++            .find(|py| {
++                Command::new(py)
++                    .args(["-c", "import packaging.tags"])
++                    .stdout(Stdio::null())
++                    .stderr(Stdio::null())
++                    .status()
++                    .is_ok_and(|s| s.success())
++            })
++            .expect("a python3 with the `packaging` module is needed as the tags oracle");
++        let mut child = Command::new(python)
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the packaging oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle {
++            child,
++            stdin,
++            stdout,
++        })
++    })
++}
++
++/// Ask the oracle: the status (`ok` or `err`) and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?})");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(matches!(status.as_str(), "ok" | "err"), "oracle said {reply:?} to {line:?}");
++    (status, it.filter(|s| !s.is_empty()).map(unhex).collect())
++}
++
++fn ask_list(cmd: &str, args: &[&str]) -> Vec<String> {
++    let (status, fields) = ask(cmd, args);
++    assert_eq!(status, "ok", "{cmd} {args:?}: {fields:?}");
++    fields
++}
++
++/// `packaging` 26.3 spells the macOS `fat32` binary format `fat3` (`_mac_binary_formats`; 24.0
++/// and the macOS convention say `fat32`, as the crate does): read through it.
++fn fix_fat32(tag: String) -> String {
++    if let Some(prefix) = tag.strip_suffix("_fat3") {
++        format!("{prefix}_fat32")
++    } else {
++        tag
++    }
++}
++
++// --------------------------------------------------------------------------- helpers
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn chance(tc: &TestCase, k: usize) -> bool {
++    n(tc, 1, k) == 1
++}
++
++// --------------------------------------------------------------------------- platforms
++
++const LINUX_ARCHES: [Arch; 12] = [
++    Arch::X86_64,
++    Arch::X86,
++    Arch::Aarch64,
++    Arch::Armv7L,
++    Arch::Powerpc64,
++    Arch::Powerpc64Le,
++    Arch::S390X,
++    Arch::Riscv64,
++    Arch::LoongArch64,
++    Arch::Armv6L,
++    Arch::Powerpc,
++    Arch::Armv5TEL,
++];
++
++const BSD_RELEASES: [&str; 6] = [
++    "14.0-RELEASE",
++    "13.2-RELEASE-p3",
++    "10.0_STABLE",
++    "7.4",
++    "6.4.1",
++    "1_2024_09",
++];
++
++/// A platform the crate supports (`Tags::from_env` succeeds), spread over every `Os` but
++/// illumos, whose tags are pinned (uv-platform-tags/2).
++fn arb_platform(tc: &TestCase) -> Platform {
++    match n(tc, 0, 10) {
++        0..=2 => Platform::new(
++            Os::Manylinux {
++                major: 2,
++                minor: n(tc, 5, 42) as u16,
++            },
++            pick(tc, &LINUX_ARCHES),
++        ),
++        3 => Platform::new(
++            Os::Musllinux {
++                major: 1,
++                minor: n(tc, 0, 3) as u16,
++            },
++            pick(tc, &LINUX_ARCHES),
++        ),
++        4 => Platform::new(Os::Windows, pick(tc, &[Arch::X86, Arch::X86_64, Arch::Aarch64])),
++        5 | 6 => {
++            if chance(tc, 3) {
++                Platform::new(
++                    Os::Macos {
++                        major: 10,
++                        minor: n(tc, 4, 16) as u16,
++                    },
++                    Arch::X86_64,
++                )
++            } else {
++                Platform::new(
++                    Os::Macos {
++                        major: n(tc, 11, 16) as u16,
++                        minor: n(tc, 0, 7) as u16,
++                    },
++                    pick(tc, &[Arch::X86_64, Arch::Aarch64]),
++                )
++            }
++        }
++        7 => {
++            let release = pick(tc, &BSD_RELEASES).to_string();
++            let arch = pick(
++                tc,
++                &[Arch::X86_64, Arch::Aarch64, Arch::X86, Arch::Armv7L, Arch::Powerpc64, Arch::Riscv64],
++            );
++            let os = match n(tc, 0, 4) {
++                0 => Os::FreeBsd { release },
++                1 => Os::NetBsd { release },
++                2 => Os::OpenBsd { release },
++                3 => Os::Dragonfly { release },
++                _ => Os::Haiku { release },
++            };
++            Platform::new(os, arch)
++        }
++        8 => Platform::new(
++            Os::Android {
++                api_level: n(tc, 16, 36) as u16,
++            },
++            pick(tc, &[Arch::Aarch64, Arch::Armv7L, Arch::X86, Arch::X86_64]),
++        ),
++        9 => {
++            let simulator = chance(tc, 2);
++            let arch = if simulator {
++                pick(tc, &[Arch::Aarch64, Arch::X86_64])
++            } else {
++                Arch::Aarch64
++            };
++            Platform::new(
++                Os::Ios {
++                    major: n(tc, 12, 18) as u16,
++                    minor: n(tc, 0, 9) as u16,
++                    simulator,
++                },
++                arch,
++            )
++        }
++        _ => {
++            let (major, minor) = (n(tc, 2024, 2026) as u16, n(tc, 0, 2) as u16);
++            let os = if chance(tc, 2) {
++                Os::Pyodide { major, minor }
++            } else {
++                Os::PyEmscripten { major, minor }
++            };
++            Platform::new(os, Arch::Wasm32)
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++struct Interp {
++    name: &'static str,
++    python: (u8, u8),
++    version: (u8, u8),
++    gil_disabled: bool,
++    debug: bool,
++    manylinux: bool,
++}
++
++fn arb_interp(tc: &TestCase) -> Interp {
++    let name = pick(tc, &["cpython", "cpython", "cpython", "pypy", "graalpy", "pyston"]);
++    // 3.3 and up: below that `packaging` adds the `u` (UCS-4) flag from the build configuration.
++    let python = (3, n(tc, 3, 15) as u8);
++    let version = match name {
++        "pypy" => (7, n(tc, 0, 3) as u8),
++        // (GraalPy's real versions have a two-digit major, 23–25; pinned as uv-platform-tags/3)
++        "graalpy" => (n(tc, 2, 9) as u8, n(tc, 0, 2) as u8),
++        "pyston" => (2, 3),
++        _ => python,
++    };
++    Interp {
++        name,
++        python,
++        version,
++        gil_disabled: name == "cpython" && python.1 >= 13 && chance(tc, 3),
++        debug: name == "cpython" && chance(tc, 4),
++        manylinux: !chance(tc, 6),
++    }
++}
++
++fn make_tags(platform: &Platform, interp: &Interp) -> Tags {
++    Tags::from_env(
++        platform.clone(),
++        interp.python,
++        interp.name,
++        interp.version,
++        TagsOptions {
++            manylinux_compatible: interp.manylinux,
++            gil_disabled: interp.gil_disabled,
++            debug_enabled: interp.debug,
++            is_cross: false,
++        },
++    )
++    .unwrap_or_else(|e| panic!("Tags::from_env({platform:?}, {interp:?}): {e}"))
++}
++
++/// The crate's tag list in priority order, from its `Display` (one `py-abi-platform` per line).
++fn tag_lines(tags: &Tags) -> Vec<(String, String, String)> {
++    tags.to_string()
++        .lines()
++        .map(|line| {
++            let mut it = line.splitn(3, '-');
++            (
++                it.next().unwrap().to_string(),
++                it.next().unwrap().to_string(),
++                it.next().unwrap_or_else(|| panic!("tag line {line:?}")).to_string(),
++            )
++        })
++        .collect()
++}
++
++/// The platform tags of the list: those of the leading `(python, abi)` run.
++fn platform_run(lines: &[(String, String, String)]) -> Vec<String> {
++    let (py0, abi0, _) = &lines[0];
++    lines
++        .iter()
++        .take_while(|(p, a, _)| p == py0 && a == abi0)
++        .map(|(_, _, pl)| pl.clone())
++        .collect()
++}
++
++fn arch_name(arch: Arch) -> &'static str {
++    arch.name()
++}
++
++// --------------------------------------------------------------------------- properties
++
++/// The ordered tag list of a CPython interpreter on a platform is `packaging`'s: `cpython_tags`
++/// followed by `compatible_tags`, over the crate's own platform list. (The other
++/// implementations' lists are pinned: uv-platform-tags/4.)
++#[hegel::test]
++fn tag_lists_match_packaging(tc: TestCase) {
++    let platform = arb_platform(&tc);
++    let mut interp = arb_interp(&tc);
++    interp.name = "cpython";
++    interp.version = interp.python;
++    let tags = make_tags(&platform, &interp);
++    let lines = tag_lines(&tags);
++    assert!(!lines.is_empty(), "{platform:?} {interp:?}: no tags");
++    let plats = platform_run(&lines);
++    let (py0, _, _) = &lines[0];
++    let mut abis: Vec<String> = Vec::new();
++    for (p, a, _) in &lines {
++        if p == py0 && !matches!(a.as_str(), "abi3" | "abi3t" | "none") && !abis.contains(a) {
++            abis.push(a.clone());
++        }
++    }
++    let major = interp.python.0.to_string();
++    let minor = interp.python.1.to_string();
++    let abis = abis.join(",");
++    let mut args: Vec<&str> = vec![interp.name, &major, &minor, py0, &abis];
++    args.extend(plats.iter().map(String::as_str));
++    let expected = ask_list("C", &args);
++    // (`packaging.tags.Tag` lowercases its components; the crate keeps a BSD release's case)
++    let ours: Vec<String> = lines.iter().map(|(p, a, pl)| format!("{p}-{a}-{pl}").to_lowercase()).collect();
++    assert_eq!(ours, expected, "{platform:?} {interp:?}");
++    // The best tag is the first one.
++    assert_eq!(tags.python_tag().unwrap().to_string(), lines[0].0);
++    assert_eq!(tags.abi_tag().unwrap().to_string(), lines[0].1);
++    assert_eq!(tags.platform_tag().unwrap().to_string(), lines[0].2);
++    assert_eq!(tags.python_version(), interp.python);
++    assert_eq!(tags.is_freethreaded(), interp.gil_disabled);
++}
++
++/// PEP 600: `manylinux_2_{m}` from the platform's glibc minor down to the architecture's
++/// baseline, each legacy alias right after its glibc version; then `linux_{arch}` (the crate
++/// puts it last, `packaging` first — a preference, not a compatibility matter).
++fn manylinux_model(minor: u16, arch: Arch, manylinux_compatible: bool) -> Vec<String> {
++    let name = arch.name();
++    let baseline = match arch {
++        Arch::X86 | Arch::X86_64 => Some(5),
++        Arch::Aarch64 | Arch::Armv7L | Arch::Powerpc64 | Arch::Powerpc64Le | Arch::S390X => Some(17),
++        Arch::Riscv64 => Some(31),
++        Arch::LoongArch64 => Some(36),
++        _ => None,
++    };
++    let mut out = Vec::new();
++    if manylinux_compatible {
++        if let Some(baseline) = baseline {
++            for m in (baseline..=minor).rev() {
++                out.push(format!("manylinux_2_{m}_{name}"));
++                match m {
++                    17 => out.push(format!("manylinux2014_{name}")),
++                    12 => out.push(format!("manylinux2010_{name}")),
++                    5 => out.push(format!("manylinux1_{name}")),
++                    _ => {}
++                }
++            }
++        }
++    }
++    out.push(format!("linux_{name}"));
++    out
++}
++
++/// The platform tag list of every `Os` is the reference's: `packaging.tags.mac_platforms` /
++/// `ios_platforms` / `android_platforms`, the PEP 600/656 model for Linux, the single tags
++/// of Windows and the BSDs; every tag re-parses to the same text.
++#[hegel::test]
++fn platform_tag_lists_match_the_reference(tc: TestCase) {
++    let platform = arb_platform(&tc);
++    check_platform_tags(&platform, !chance(&tc, 4));
++}
++
++fn check_platform_tags(platform: &Platform, manylinux_compatible: bool) {
++    let platform = platform.clone();
++    let interp = Interp {
++        name: "cpython",
++        python: (3, 12),
++        version: (3, 12),
++        gil_disabled: false,
++        debug: false,
++        manylinux: manylinux_compatible,
++    };
++    let tags = make_tags(&platform, &interp);
++    let plats = platform_run(&tag_lines(&tags));
++    for p in &plats {
++        let parsed = PlatformTag::from_str(p).unwrap_or_else(|e| panic!("{p:?} from {platform:?}: {e}"));
++        assert_eq!(parsed.to_string(), *p, "Display of the crate's own platform tag");
++        assert!(tags.platform_tag().is_some());
++    }
++    let arch = platform.arch();
++    let expected: Vec<String> = match platform.os() {
++        Os::Manylinux { minor, .. } => manylinux_model(*minor, arch, manylinux_compatible),
++        Os::Musllinux { major, minor } => {
++            let mut out: Vec<String> = (0..=*minor)
++                .rev()
++                .map(|m| format!("musllinux_{major}_{m}_{}", arch.name()))
++                .collect();
++            out.push(format!("linux_{}", arch.name()));
++            out
++        }
++        Os::Windows => vec![match arch {
++            Arch::X86 => "win32",
++            Arch::X86_64 => "win_amd64",
++            Arch::Aarch64 => "win_arm64",
++            _ => unreachable!(),
++        }
++        .to_string()],
++        Os::Macos { major, minor } => {
++            let arch = if arch == Arch::Aarch64 { "arm64" } else { arch_name(arch) };
++            ask_list("M", &[&major.to_string(), &minor.to_string(), arch])
++                .into_iter()
++                .map(fix_fat32)
++                .collect()
++        }
++        Os::Ios {
++            major,
++            minor,
++            simulator,
++        } => {
++            let multiarch = match (arch, simulator) {
++                (Arch::Aarch64, false) => "arm64_iphoneos",
++                (Arch::Aarch64, true) => "arm64_iphonesimulator",
++                (Arch::X86_64, true) => "x86_64_iphonesimulator",
++                _ => unreachable!(),
++            };
++            ask_list("I", &[&major.to_string(), &minor.to_string(), multiarch])
++        }
++        Os::Android { api_level } => {
++            let abi = match arch {
++                Arch::Aarch64 => "arm64_v8a",
++                Arch::Armv7L => "armeabi_v7a",
++                Arch::X86 => "x86",
++                Arch::X86_64 => "x86_64",
++                _ => unreachable!(),
++            };
++            ask_list("A", &[&api_level.to_string(), abi])
++        }
++        Os::Pyodide { major, minor } | Os::PyEmscripten { major, minor } => vec![
++            format!("pyemscripten_{major}_{minor}_wasm32"),
++            format!("pyodide_{major}_{minor}_wasm32"),
++        ],
++        Os::FreeBsd { release }
++        | Os::NetBsd { release }
++        | Os::OpenBsd { release }
++        | Os::Dragonfly { release }
++        | Os::Haiku { release } => {
++            // `sysconfig.get_platform()` is `{os}-{release}-{machine}`, normalised by
++            // `packaging`; the machine name is the kernel's (`amd64`, `arm64`, `i386`…).
++            let os = platform.os().to_string();
++            let machine = match arch {
++                Arch::X86_64 => "amd64",
++                Arch::Aarch64 => "arm64",
++                Arch::X86 => "i386",
++                Arch::Armv7L => "arm",
++                Arch::Powerpc64 => "powerpc",
++                Arch::Riscv64 => "riscv",
++                _ => unreachable!(),
++            };
++            let machine = if matches!(platform.os(), Os::Dragonfly { .. } | Os::Haiku { .. }) {
++                arch.name().to_string()
++            } else {
++                machine.to_string()
++            };
++            let normalised = ask_list("N", &[&format!("{os}-{release}-{machine}")]).remove(0);
++            // (release casing is the platform's own business: compared case-insensitively)
++            assert_eq!(plats.len(), 1, "{platform:?}: {plats:?}");
++            assert_eq!(plats[0].to_lowercase(), normalised.to_lowercase(), "{platform:?}");
++            return;
++        }
++        Os::Illumos { release, arch } => {
++            // SunOS 5.x is Solaris 2.x: `solaris_2_11_i86pc_64bit`.
++            let (major, rest) = release.split_once('_').unwrap();
++            let major: u64 = major.parse().unwrap();
++            vec![format!("solaris_{}_{rest}_{arch}_64bit", major - 3)]
++        }
++    };
++    assert_eq!(plats, expected, "{platform:?} (manylinux_compatible = {manylinux_compatible})");
++}
++
++// --------------------------------------------------------------------------- tag texts
++
++fn arb_language_tag(tc: &TestCase) -> LanguageTag {
++    let v = (n(tc, 2, 3) as u8, n(tc, 0, 15) as u8);
++    match n(tc, 0, 6) {
++        0 => LanguageTag::None,
++        1 => LanguageTag::Python {
++            major: v.0,
++            minor: None,
++        },
++        2 => LanguageTag::Python {
++            major: v.0,
++            minor: Some(v.1),
++        },
++        3 => LanguageTag::CPython { python_version: v },
++        4 => LanguageTag::PyPy { python_version: v },
++        5 => LanguageTag::GraalPy { python_version: v },
++        _ => LanguageTag::Pyston { python_version: v },
++    }
++}
++
++/// A canonical ABI tag text (the `CPythonAbiVariants` flags in their `Display` order `t d m u`).
++fn arb_abi_text(tc: &TestCase) -> String {
++    let py = format!("{}{}", n(tc, 2, 3), n(tc, 0, 15));
++    match n(tc, 0, 6) {
++        0 => "none".to_string(),
++        1 => "abi3".to_string(),
++        2 => "abi3t".to_string(),
++        3 => {
++            let mut flags = String::new();
++            for f in ["t", "d", "m", "u"] {
++                if chance(tc, 3) {
++                    flags.push_str(f);
++                }
++            }
++            format!("cp{py}{flags}")
++        }
++        4 => {
++            if chance(tc, 2) {
++                format!("pypy{py}_pp{}{}", n(tc, 5, 7), n(tc, 0, 9))
++            } else {
++                format!("pypy_{}{}", n(tc, 5, 7), n(tc, 0, 9))
++            }
++        }
++        5 => format!("graalpy{}{}_{py}_native", n(tc, 22, 25), n(tc, 0, 3)),
++        _ => format!("pyston_{}{}_x86_64_linux_gnu", n(tc, 2, 3), n(tc, 0, 9)),
++    }
++}
++
++fn arb_platform_tag_text(tc: &TestCase) -> String {
++    let arch = pick(tc, &LINUX_ARCHES[..9]).name();
++    match n(tc, 0, 12) {
++        0 => "any".to_string(),
++        1 => pick(tc, &["win32", "win_amd64", "win_arm64", "win_ia64"]).to_string(),
++        2 => format!("manylinux_{}_{}_{arch}", n(tc, 1, 3), n(tc, 0, 60)),
++        3 => format!("{}_{arch}", pick(tc, &["manylinux1", "manylinux2010", "manylinux2014", "linux"])),
++        4 => format!("musllinux_{}_{}_{arch}", n(tc, 1, 2), n(tc, 0, 9)),
++        5 => format!(
++            "macosx_{}_{}_{}",
++            n(tc, 10, 16),
++            n(tc, 0, 16),
++            pick(
++                tc,
++                &["arm64", "fat", "fat32", "fat64", "i386", "intel", "ppc", "ppc64", "universal", "universal2", "x86_64"]
++            )
++        ),
++        6 => format!(
++            "android_{}_{}",
++            n(tc, 16, 40),
++            pick(tc, &["armeabi_v7a", "arm64_v8a", "x86", "x86_64"])
++        ),
++        7 => format!(
++            "{}_{}_{}",
++            pick(tc, &["freebsd", "netbsd", "openbsd", "dragonfly", "haiku", "illumos"]),
++            pick(tc, &["14_0_release", "10_0_STABLE", "7_4", "5_11"]),
++            pick(tc, &["amd64", "arm64", "i386", "i86pc"])
++        ),
++        8 => format!("solaris_2_{}_{}_64bit", n(tc, 10, 12), pick(tc, &["i86pc", "sun4v"])),
++        9 => format!("pyodide_{}_{}_wasm32", n(tc, 2024, 2026), n(tc, 0, 3)),
++        10 => format!("pyemscripten_{}_{}_wasm32", n(tc, 2024, 2026), n(tc, 0, 3)),
++        _ => format!(
++            "ios_{}_{}_{}",
++            n(tc, 12, 20),
++            n(tc, 0, 9),
++            pick(tc, &["arm64_iphoneos", "arm64_iphonesimulator", "x86_64_iphonesimulator"])
++        ),
++    }
++}
++
++/// Every tag type round-trips through its text: `Display` re-parses to an equal value, a
++/// canonical text is the identity of parse-then-Display, and `packaging.tags.parse_tag`
++/// accepts the triple.
++#[hegel::test]
++fn tag_texts_round_trip(tc: TestCase) {
++    let lang = arb_language_tag(&tc);
++    let lang_text = lang.to_string();
++    assert_eq!(LanguageTag::from_str(&lang_text).ok(), Some(lang), "{lang_text:?}");
++    let abi_text = arb_abi_text(&tc);
++    let abi = AbiTag::from_str(&abi_text).unwrap_or_else(|e| panic!("{abi_text:?}: {e}"));
++    assert_eq!(abi.to_string(), abi_text);
++    assert_eq!(AbiTag::from_str(&abi.to_string()).ok(), Some(abi));
++    let plat_text = arb_platform_tag_text(&tc);
++    let plat = PlatformTag::from_str(&plat_text).unwrap_or_else(|e| panic!("{plat_text:?}: {e}"));
++    assert_eq!(plat.to_string(), plat_text);
++    assert_eq!(PlatformTag::from_str(&plat.to_string()).ok(), Some(plat));
++    let triple = format!("{lang_text}-{abi_text}-{plat_text}");
++    let (status, why) = ask("P", &[&triple]);
++    assert_eq!(status, "ok", "packaging rejects {triple:?}: {why:?}");
++}
++
++/// Pinned (uv-platform-tags/1): a tag is a string (PEP 425; `packaging` keeps the text), but
++/// the typed parsers read their numbers with `str::parse`, which takes a leading `+` and
++/// leading zeros, so `manylinux_02_17_x86_64`, `manylinux_+2_17_x86_64`, `pp3+9`,
++/// `pypy3013_pp73`, `cp3013` are accepted and `Display` rewrites them to the canonical tag —
++/// a spelling no wheel carries becomes compatible, and a filename changes under round trip.
++#[hegel::test]
++fn tag_numbers_are_taken_literally(tc: TestCase) {
++    fn check<T: FromStr + ToString + Debug>(text: &str) {
++        if let Ok(parsed) = T::from_str(text) {
++            assert_eq!(
++                parsed.to_string(),
++                text,
++                "{text:?} is accepted as {parsed:?} and rewritten",
++            );
++        }
++    }
++    for text in ["pp3+9", "graalpy3+11", "pyston3+9", "cp3+9", "py3+9"] {
++        check::<LanguageTag>(text);
++    }
++    for text in ["cp3013", "cp3+9", "pypy3+9_pp73", "pypy3013_pp73", "pypy_7+3", "pypy39_pp7+3", "pyston_2+3_x86_64_linux_gnu"] {
++        check::<AbiTag>(text);
++    }
++    for text in [
++        "manylinux_+2_17_x86_64",
++        "manylinux_02_17_x86_64",
++        "manylinux_2_017_x86_64",
++        "musllinux_1_+2_x86_64",
++        "macosx_+11_0_arm64",
++        "macosx_011_0_arm64",
++        "android_+21_arm64_v8a",
++        "ios_12_+0_arm64_iphoneos",
++        "pyodide_+2024_0_wasm32",
++    ] {
++        check::<PlatformTag>(text);
++    }
++    // Random: a canonical platform tag with one number respelled.
++    let text = arb_platform_tag_text(&tc);
++    let parts: Vec<&str> = text.split('_').collect();
++    let numeric: Vec<usize> = (0..parts.len())
++        .filter(|&i| !parts[i].is_empty() && parts[i].bytes().all(|b| b.is_ascii_digit()))
++        .collect();
++    if numeric.is_empty() {
++        return;
++    }
++    let i = pick(&tc, &numeric);
++    let respelled = format!("{}{}", pick(&tc, &["+", "0", "00", "+0"]), parts[i]);
++    let mut parts: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
++    parts[i] = respelled;
++    let mutant = parts.join("_");
++    check::<PlatformTag>(&mutant);
++}
++
++/// Pinned (uv-platform-tags/2): `sysconfig.get_platform()` on illumos/Solaris is
++/// `solaris-2.11-i86pc.64bit`, so the wheel tag is `solaris_2_11_i86pc_64bit`; the crate appends
++/// `_64bit` to the architecture *and* `Display` appends it again: `solaris_2_11_i86pc_64bit_64bit`.
++#[hegel::test]
++fn solaris_platform_tags_follow_sysconfig(tc: TestCase) {
++    let arch = pick(&tc, &["i86pc", "sun4v"]);
++    let platform = Platform::new(
++        Os::Illumos {
++            release: "5_11".to_string(),
++            arch: arch.to_string(),
++        },
++        Arch::X86_64,
++    );
++    let tags = make_tags(&platform, &cpython_312(true));
++    let plats = platform_run(&tag_lines(&tags));
++    assert_eq!(plats, vec![format!("solaris_2_11_{arch}_64bit")], "{platform:?}");
++    for p in &plats {
++        assert_eq!(PlatformTag::from_str(p).unwrap().to_string(), *p);
++    }
++}
++
++fn cpython_312(manylinux: bool) -> Interp {
++    Interp {
++        name: "cpython",
++        python: (3, 12),
++        version: (3, 12),
++        gil_disabled: false,
++        debug: false,
++        manylinux,
++    }
++}
++
++/// Pinned (uv-platform-tags/3): GraalPy's ABI tag is `graalpy{impl_major}{impl_minor}_{py}_native`
++/// with the two numbers run together, and its releases have a two-digit major (23.1, 24.1, 25.0):
++/// the interpreter's own tag for GraalPy 24.1 on 3.11 displays as `graalpy241_311_native`, but
++/// that text parses as implementation 2.41, so a wheel carrying the tag GraalPy itself produces
++/// is never compatible with the interpreter. (`packaging` compares the strings.)
++#[hegel::test]
++fn graalpy_abi_tags_carry_the_implementation_version(tc: TestCase) {
++    let implementation = (n(&tc, 10, 25) as u8, n(&tc, 0, 9) as u8);
++    let python = (3, n(&tc, 8, 13) as u8);
++    let platform = Platform::new(
++        Os::Manylinux {
++            major: 2,
++            minor: 28,
++        },
++        Arch::X86_64,
++    );
++    let tags = Tags::from_env(platform, python, "graalpy", implementation, TagsOptions {
++        manylinux_compatible: true,
++        ..TagsOptions::default()
++    })
++    .unwrap();
++    let abi = tags.abi_tag().unwrap();
++    assert_eq!(
++        abi,
++        AbiTag::GraalPy {
++            python_version: python,
++            implementation_version: implementation,
++        }
++    );
++    let text = abi.to_string();
++    let reparsed = AbiTag::from_str(&text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(reparsed, abi, "{text:?} re-parses to a different ABI tag");
++    let wheel_python = LanguageTag::from_str(&tags.python_tag().unwrap().to_string()).unwrap();
++    let wheel_platform = PlatformTag::from_str("manylinux_2_17_x86_64").unwrap();
++    assert!(
++        tags.is_compatible(&[wheel_python], &[reparsed], &[wheel_platform]),
++        "a wheel tagged {}-{text}-manylinux_2_17_x86_64 is incompatible with the interpreter that produces that tag",
++        tags.python_tag().unwrap()
++    );
++}
++
++/// Pinned (uv-platform-tags/4): `packaging` gives every interpreter the `<interpreter>-none-
++/// <platform>` tags (`generic_tags` adds the `none` ABI) and `<interpreter>-none-any`
++/// (`compatible_tags`), so `pp310-none-any` and `pp310-none-manylinux_2_17_x86_64` wheels install
++/// on PyPy 3.10 with pip; the crate adds those two groups for CPython only, so on PyPy, GraalPy
++/// and Pyston such wheels are incompatible.
++#[hegel::test]
++fn non_cpython_interpreters_get_none_abi_tags(tc: TestCase) {
++    let platform = arb_platform(&tc);
++    let mut interp = arb_interp(&tc);
++    interp.name = pick(&tc, &["pypy", "graalpy", "pyston"]);
++    interp.gil_disabled = false;
++    interp.debug = false;
++    if interp.name == "graalpy" {
++        interp.version = (n(&tc, 2, 9) as u8, 0);
++    }
++    let tags = make_tags(&platform, &interp);
++    let lines = tag_lines(&tags);
++    let plats = platform_run(&lines);
++    let python = tags.python_tag().unwrap();
++    assert!(
++        tags.is_compatible(&[python], &[AbiTag::None], &[PlatformTag::from_str("any").unwrap()]),
++        "{python}-none-any is incompatible with {interp:?}"
++    );
++    let major = interp.python.0.to_string();
++    let minor = interp.python.1.to_string();
++    let interp_tag = python.to_string();
++    let abi = tags.abi_tag().unwrap().to_string();
++    let mut args: Vec<&str> = vec![interp.name, &major, &minor, &interp_tag, &abi];
++    args.extend(plats.iter().map(String::as_str));
++    let expected = ask_list("C", &args);
++    // (`packaging.tags.Tag` lowercases its components; the crate keeps a BSD release's case)
++    let ours: Vec<String> = lines.iter().map(|(p, a, pl)| format!("{p}-{a}-{pl}").to_lowercase()).collect();
++    assert_eq!(ours, expected, "{platform:?} {interp:?}");
++}
++
++// --------------------------------------------------------------------------- compatibility
++
++/// `is_compatible`, `compatibility_tag` and `compatibility` agree with the tag list: a triple
++/// in the list is compatible with a priority that follows the list order, one outside it is
++/// incompatible with the first mismatching component (Python, then ABI, then platform; the
++/// free-threaded ABI gate first), and the set queries are the best over their members.
++#[hegel::test]
++fn compatibility_follows_the_tag_list(tc: TestCase) {
++    let platform = arb_platform(&tc);
++    let interp = arb_interp(&tc);
++    let tags = make_tags(&platform, &interp);
++    let lines = tag_lines(&tags);
++    let index: HashMap<(String, String, String), usize> =
++        lines.iter().cloned().enumerate().map(|(i, t)| (t, i)).collect();
++    let pys: Vec<String> = lines.iter().map(|t| t.0.clone()).collect();
++    let abis: Vec<String> = lines.iter().map(|t| t.1.clone()).collect();
++    let plats: Vec<String> = lines.iter().map(|t| t.2.clone()).collect();
++    let mut triples: Vec<(String, String, String)> = Vec::new();
++    for _ in 0..n(&tc, 1, 4) {
++        let triple = if chance(&tc, 2) {
++            pick(&tc, &lines)
++        } else {
++            (
++                if chance(&tc, 4) { "py2".to_string() } else { pick(&tc, &pys) },
++                if chance(&tc, 4) { "cp27m".to_string() } else { pick(&tc, &abis) },
++                if chance(&tc, 4) { "win_ia64".to_string() } else { pick(&tc, &plats) },
++            )
++        };
++        triples.push(triple);
++    }
++    let parsed: Vec<(LanguageTag, AbiTag, PlatformTag)> = triples
++        .iter()
++        .map(|(p, a, pl)| {
++            (
++                LanguageTag::from_str(p).unwrap(),
++                AbiTag::from_str(a).unwrap(),
++                PlatformTag::from_str(pl).unwrap(),
++            )
++        })
++        .collect();
++    let mut expected_any = false;
++    let mut best_index: Option<usize> = None;
++    for (triple, (py, abi, plat)) in triples.iter().zip(&parsed) {
++        let single = tags.compatibility_tag(py, abi, plat);
++        match index.get(triple) {
++            Some(&i) => {
++                assert!(matches!(single, TagCompatibility::Compatible(_)), "{triple:?} listed but {single:?}");
++                assert!(tags.is_compatible(&[*py], &[*abi], std::slice::from_ref(plat)));
++                expected_any = true;
++                best_index = Some(best_index.map_or(i, |b| b.min(i)));
++            }
++            None => {
++                let freethreaded_ok = matches!(abi, AbiTag::None | AbiTag::Abi3T)
++                    || matches!(abi, AbiTag::CPython { variant, .. } if variant.contains(CPythonAbiVariants::Freethreading));
++                let expected = if interp.gil_disabled && !freethreaded_ok {
++                    IncompatibleTag::FreethreadedAbi
++                } else if !pys.contains(&triple.0) {
++                    IncompatibleTag::Python
++                } else if !lines.iter().any(|t| t.0 == triple.0 && t.1 == triple.1) {
++                    IncompatibleTag::Abi
++                } else {
++                    IncompatibleTag::Platform
++                };
++                assert_eq!(single, TagCompatibility::Incompatible(expected), "{triple:?}");
++                assert!(!tags.is_compatible(&[*py], &[*abi], std::slice::from_ref(plat)));
++            }
++        }
++    }
++    // Priorities follow the list order: earlier lines are better.
++    let listed: Vec<(usize, TagCompatibility)> = triples
++        .iter()
++        .zip(&parsed)
++        .filter_map(|(t, (py, abi, plat))| index.get(t).map(|&i| (i, tags.compatibility_tag(py, abi, plat))))
++        .collect();
++    for (i, ci) in &listed {
++        for (j, cj) in &listed {
++            if i < j {
++                assert!(ci > cj, "line {i} ({ci:?}) should beat line {j} ({cj:?})");
++            }
++        }
++    }
++    // The set query over all the wheel's tags is compatible iff some member is.
++    let pys_v: Vec<LanguageTag> = parsed.iter().map(|t| t.0).collect();
++    let abis_v: Vec<AbiTag> = parsed.iter().map(|t| t.1).collect();
++    let plats_v: Vec<PlatformTag> = parsed.iter().map(|t| t.2.clone()).collect();
++    let cross_any = pys_v.iter().any(|py| {
++        abis_v.iter().any(|abi| {
++            plats_v
++                .iter()
++                .any(|pl| index.contains_key(&(py.to_string(), abi.to_string(), pl.to_string())))
++        })
++    });
++    assert_eq!(tags.is_compatible(&pys_v, &abis_v, &plats_v), cross_any);
++    assert!(cross_any || !expected_any);
++    let set = tags.compatibility(pys_v.iter(), abis_v.iter(), plats_v.iter());
++    assert_eq!(set.is_compatible(), cross_any, "{triples:?}: {set:?}");
++    assert!(!expected_any || best_index.is_some());
++    if let TagCompatibility::Compatible(p) = set {
++        // The best priority over the cross product.
++        let mut best = None;
++        for py in &pys_v {
++            for abi in &abis_v {
++                for pl in &plats_v {
++                    if let TagCompatibility::Compatible(q) = tags.compatibility_tag(py, abi, pl) {
++                        best = best.max(Some(q));
++                    }
++                }
++            }
++        }
++        assert_eq!(Some(p), best);
++    }
++}
