@@ -1,0 +1,718 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6420682..9dc686d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,6 +25,7 @@ zip = { version = ">=0.6,<9", default-features = false, features = ["deflate"] }
+ 
+ [dev-dependencies]
+ serde_json = "1.0.128"
++hegeltest = "0.44.1"
+ 
+ [features]
+ deprecated-formats = ["bzip2", "xz", "zip/bzip2"]
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..6091e38
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,700 @@
++//! Hegel properties for `python-pkginfo`.
++//!
++//! Oracles, in one persistent Python child (the first of `python3`, `/usr/bin/python3` that
++//! imports them): `packaging.metadata.parse_email` (PyPA's reader of the core metadata email
++//! format) for `Metadata::parse`, and the Python `pkginfo` package (the crate's namesake and
++//! model) for reading sdists, wheels and eggs and for its header conventions (dedenting the
++//! legacy `Description` header, unfolding). Alongside: RFC 2047 encoded words must decode to
++//! the raw text, and the wheel filename convention for `python_version()`.
++#![allow(clippy::all, dead_code)]
++use hegel::{generators, Generator, TestCase};
++use python_pkginfo::{Distribution, DistributionType, Metadata};
++use serde_json::Value;
++use std::collections::BTreeMap;
++use std::io::{BufRead, BufReader, Write};
++use std::path::{Path, PathBuf};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + std::fmt::Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn chance(tc: &TestCase, one_in: usize) -> bool {
++    n(tc, 0, one_in - 1) == 0
++}
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys, json
++from packaging.metadata import parse_email
++import pkginfo
++from pkginfo.distribution import Distribution as PkgDist
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++def enc(s):
++    return s.encode('utf-8').hex()
++
++FIELDS = ('metadata_version', 'name', 'version', 'summary', 'description', 'keywords', 'author',
++          'author_email', 'home_page', 'download_url', 'license', 'license_expression',
++          'maintainer', 'maintainer_email', 'requires_python', 'description_content_type',
++          'platforms', 'supported_platforms', 'classifiers', 'requires_dist', 'provides_dist',
++          'obsoletes_dist', 'requires_external', 'project_urls', 'provides_extras', 'dynamic',
++          'license_file')
++
++def pkginfo_fields(dist):
++    out = {}
++    for f in FIELDS:
++        v = getattr(dist, f, None)
++        if isinstance(v, tuple):
++            v = list(v)
++        out[f] = v
++    return out
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'P':
++            raw, unparsed = parse_email(args[0].encode('utf-8'))
++            res = ['ok', json.dumps({'raw': raw, 'unparsed': sorted(unparsed)})]
++        elif cmd == 'K':
++            dist = PkgDist()
++            dist.parse(args[0].encode('utf-8'))
++            res = ['ok', json.dumps(pkginfo_fields(dist))]
++        elif cmd == 'D':
++            kind, path = args
++            cls = {'sdist': pkginfo.SDist, 'wheel': pkginfo.Wheel, 'egg': pkginfo.BDist}[kind]
++            try:
++                dist = cls(path)
++            except Exception as e:
++                res = ['ok', json.dumps({'error': type(e).__name__ + ': ' + str(e)})]
++            else:
++                res = ['ok', json.dumps(pkginfo_fields(dist))]
++        else:
++            res = ['bad', cmd]
++    except Exception as e:
++        res = ['err', type(e).__name__ + ': ' + str(e)]
++    print(' '.join([res[0]] + [enc(x) for x in res[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn python() -> &'static str {
++    static PY: OnceLock<&'static str> = OnceLock::new();
++    PY.get_or_init(|| {
++        for py in ["python3", "/usr/bin/python3"] {
++            let ok = Command::new(py)
++                .args(["-c", "import packaging.metadata, pkginfo"])
++                .stderr(Stdio::null())
++                .status()
++                .map(|s| s.success())
++                .unwrap_or(false);
++            if ok {
++                return py;
++            }
++        }
++        panic!("no python3 with packaging and pkginfo")
++    })
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let mut child = Command::new(python())
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the python oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).unwrap();
++    let mut reply = String::new();
++    o.stdout.read_line(&mut reply).unwrap();
++    let mut parts = reply.trim_end().split(' ');
++    let status = parts.next().unwrap().to_string();
++    (status, parts.map(unhex).collect())
++}
++
++/// `packaging.metadata.parse_email`: the raw dict and the names of the unparsed fields.
++fn py_packaging(text: &str) -> (Value, Vec<String>) {
++    let (status, f) = ask("P", &[text]);
++    assert_eq!(status, "ok", "packaging failed on {text:?}: {f:?}");
++    let v: Value = serde_json::from_str(&f[0]).unwrap();
++    let unparsed = v["unparsed"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
++    (v["raw"].clone(), unparsed)
++}
++
++/// Python `pkginfo`'s `Distribution.parse` on metadata text.
++fn py_pkginfo(text: &str) -> Value {
++    let (status, f) = ask("K", &[text]);
++    assert_eq!(status, "ok", "pkginfo failed on {text:?}: {f:?}");
++    serde_json::from_str(&f[0]).unwrap()
++}
++
++/// Python `pkginfo` reading an archive (`sdist`, `wheel`, `egg`).
++fn py_distribution(kind: &str, path: &Path) -> Result<Value, String> {
++    let (status, f) = ask("D", &[kind, path.to_str().unwrap()]);
++    assert_eq!(status, "ok", "pkginfo failed on {path:?}: {f:?}");
++    let v: Value = serde_json::from_str(&f[0]).unwrap();
++    match v.get("error").and_then(|e| e.as_str()) {
++        Some(e) => Err(e.to_string()),
++        None => Ok(v),
++    }
++}
++
++// --------------------------------------------------------------------------- generators
++
++const WORDS: [&str; 12] = ["build", "Lovely Spam", "egg", "bacon", "Filipe Laíns", "中文", "café", "x", "MIT", "https://example.com/x", "3.9", "Wonderful Spam!"];
++const NAMES: [&str; 4] = ["build", "spam", "egg_salad", "py"];
++const VERSIONS: [&str; 4] = ["0.4.0", "1.0", "2020.0.0", "1.2.3a1"];
++const METADATA_VERSIONS: [&str; 5] = ["1.0", "1.2", "2.1", "2.3", "2.4"];
++/// Single-use fields: header name and `Metadata` accessor.
++const SINGLE: [(&str, fn(&Metadata) -> Option<&String>); 11] = [
++    ("Summary", |m| m.summary.as_ref()),
++    ("Home-Page", |m| m.home_page.as_ref()),
++    ("Download-URL", |m| m.download_url.as_ref()),
++    ("Author", |m| m.author.as_ref()),
++    ("Author-email", |m| m.author_email.as_ref()),
++    ("License", |m| m.license.as_ref()),
++    ("License-Expression", |m| m.license_expression.as_ref()),
++    ("Maintainer", |m| m.maintainer.as_ref()),
++    ("Maintainer-email", |m| m.maintainer_email.as_ref()),
++    ("Requires-Python", |m| m.requires_python.as_ref()),
++    ("Description-Content-Type", |m| m.description_content_type.as_ref()),
++];
++/// Multi-use fields: header name, `packaging` raw key and `Metadata` accessor.
++const MULTI: [(&str, &str, fn(&Metadata) -> &Vec<String>); 10] = [
++    ("Platform", "platforms", |m| &m.platforms),
++    ("Supported-Platform", "supported_platforms", |m| &m.supported_platforms),
++    ("License-File", "license_files", |m| &m.license_files),
++    ("Classifier", "classifiers", |m| &m.classifiers),
++    ("Requires-Dist", "requires_dist", |m| &m.requires_dist),
++    ("Provides-Dist", "provides_dist", |m| &m.provides_dist),
++    ("Obsoletes-Dist", "obsoletes_dist", |m| &m.obsoletes_dist),
++    ("Requires-External", "requires_external", |m| &m.requires_external),
++    ("Provides-Extra", "provides_extra", |m| &m.provides_extras),
++    ("Dynamic", "dynamic", |m| &m.dynamic),
++];
++
++fn raw_key(header: &str) -> String {
++    header.to_ascii_lowercase().replace('-', "_")
++}
++
++/// A header value: printable, no leading whitespace (the tab case is pinned), never the
++/// legacy `UNKNOWN` placeholder (the crate maps it to `None` by design).
++fn arb_value(tc: &TestCase) -> String {
++    let mut s = match n(tc, 0, 3) {
++        0 => String::new(),
++        1 => pick(tc, &WORDS).to_string(),
++        _ => format!("{} {}", pick(tc, &WORDS), pick(tc, &WORDS)),
++    };
++    if chance(tc, 6) {
++        s.push_str("  ");
++    }
++    s
++}
++
++#[derive(Debug, Clone)]
++struct Doc {
++    lines: Vec<(String, String)>,
++    body: Option<String>,
++    crlf: bool,
++}
++
++impl Doc {
++    fn render(&self) -> String {
++        let eol = if self.crlf { "\r\n" } else { "\n" };
++        let mut s = String::new();
++        for (k, v) in &self.lines {
++            s.push_str(&format!("{k}: {v}{eol}"));
++        }
++        if let Some(body) = &self.body {
++            s.push_str(eol);
++            s.push_str(&body.replace('\n', eol));
++        }
++        s
++    }
++}
++
++#[hegel::composite]
++fn arb_doc(tc: &TestCase) -> Doc {
++    let mut lines = vec![
++        ("Metadata-Version".to_string(), pick(tc, &METADATA_VERSIONS).to_string()),
++        ("Name".to_string(), pick(tc, &NAMES).to_string()),
++        ("Version".to_string(), pick(tc, &VERSIONS).to_string()),
++    ];
++    for (header, _) in SINGLE {
++        if chance(tc, 3) {
++            lines.push((header.to_string(), arb_value(tc)));
++        }
++    }
++    for (header, _, _) in MULTI {
++        for _ in 0..n(tc, 0, 3) {
++            lines.push((header.to_string(), arb_value(tc)));
++        }
++    }
++    if chance(tc, 3) {
++        let words: Vec<&str> = (0..n(tc, 1, 4)).map(|_| pick(tc, &["a", "b c", "build", "中文", ""])).collect();
++        lines.push(("Keywords".to_string(), words.join(pick(tc, &[",", ", ", " ,"]))));
++    }
++    let mut labels = Vec::new();
++    for _ in 0..n(tc, 0, 3) {
++        let label = pick(tc, &["Homepage", "Bug Tracker", "docs", "Source"]);
++        if labels.contains(&label) {
++            continue;
++        }
++        labels.push(label);
++        lines.push(("Project-URL".to_string(), format!("{label},{}https://example.com/{}", pick(tc, &["", " "]), n(tc, 0, 9))));
++    }
++    // Shuffle the optional headers a little: move a random one to the front.
++    if lines.len() > 3 && chance(tc, 2) {
++        let i = n(tc, 3, lines.len() - 1);
++        let l = lines.remove(i);
++        lines.insert(0, l);
++    }
++    let body = match n(tc, 0, 3) {
++        0 => {
++            lines.push(("Description".to_string(), arb_value(tc)));
++            None
++        }
++        1 => None,
++        _ => {
++            let mut b: Vec<String> = (0..n(tc, 1, 4)).map(|_| pick(tc, &["Lovely Spam", "", "  indented", "中文 段落", "Wonderful Spam!"]).to_string()).collect();
++            if b.iter().all(|l| l.trim().is_empty()) {
++                b.push("body".to_string());
++            }
++            let mut body = b.join("\n");
++            if chance(tc, 2) {
++                body.push('\n');
++            }
++            Some(body)
++        }
++    };
++    Doc { lines, body, crlf: chance(tc, 4) }
++}
++
++fn json_str(v: &Value) -> Option<String> {
++    v.as_str().map(str::to_string)
++}
++
++fn json_list(v: &Value) -> Vec<String> {
++    v.as_array().map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect()).unwrap_or_default()
++}
++
++// --------------------------------------------------------------------------- properties
++
++/// `Metadata::parse` reads every field like `packaging.metadata.parse_email`: single-use
++/// strings, multi-use lists (order kept), `Keywords` (a comma list for `packaging`), `Project-URL`
++/// (a label → URL map for `packaging`), and the `Description` from its header or from the body.
++#[hegel::test]
++fn metadata_parses_like_packaging(tc: TestCase) {
++    let doc = tc.draw(arb_doc().print_as_debug());
++    let text = doc.render();
++    let (raw, unparsed) = py_packaging(&text);
++    assert!(unparsed.is_empty(), "{text:?}: packaging leaves {unparsed:?} unparsed");
++    let m = Metadata::parse(text.as_bytes()).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(Some(&m.metadata_version), json_str(&raw["metadata_version"]).as_ref(), "{text:?}: metadata_version");
++    assert_eq!(Some(&m.name), json_str(&raw["name"]).as_ref(), "{text:?}: name");
++    assert_eq!(Some(&m.version), json_str(&raw["version"]).as_ref(), "{text:?}: version");
++    for (header, get) in SINGLE {
++        assert_eq!(get(&m).cloned(), json_str(&raw[raw_key(header)]), "{text:?}: {header}");
++    }
++    for (header, key, get) in MULTI {
++        assert_eq!(get(&m), &json_list(&raw[key]), "{text:?}: {header}");
++    }
++    let keywords: Option<Vec<String>> = m.keywords.as_ref().map(|k| k.split(',').map(|s| s.trim().to_string()).collect());
++    assert_eq!(keywords, raw.get("keywords").filter(|v| !v.is_null()).map(json_list), "{text:?}: keywords");
++    let urls: BTreeMap<String, String> = m
++        .project_urls
++        .iter()
++        .map(|u| {
++            let (label, url) = u.split_once(',').unwrap_or((u, ""));
++            (label.trim().to_string(), url.trim().to_string())
++        })
++        .collect();
++    let expected: BTreeMap<String, String> = raw
++        .get("project_urls")
++        .and_then(|v| v.as_object())
++        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect())
++        .unwrap_or_default();
++    assert_eq!(urls, expected, "{text:?}: project urls");
++    assert_eq!(m.description, json_str(&raw["description"]), "{text:?}: description");
++}
++
++/// RFC 2047 `Q` encoding of UTF-8 text (what distutils wrote for non-ASCII header values).
++fn encode_word(s: &str) -> String {
++    let mut out = String::from("=?utf-8?q?");
++    for b in s.bytes() {
++        if b.is_ascii_alphanumeric() {
++            out.push(b as char);
++        } else if b == b' ' {
++            out.push('_');
++        } else {
++            out.push_str(&format!("={b:02X}"));
++        }
++    }
++    out.push_str("?=");
++    out
++}
++
++/// Encoded words decode to the raw text in every field, single- and multi-use alike.
++#[hegel::test]
++fn encoded_words_decode_to_the_raw_text(tc: TestCase) {
++    let mut doc = tc.draw(arb_doc().print_as_debug());
++    doc.body = None;
++    for (_, v) in doc.lines.iter_mut() {
++        *v = v.trim_end().to_string(); // the RFC 2047 decoder drops trailing whitespace
++    }
++    let plain = Metadata::parse(doc.render().as_bytes()).unwrap();
++    let mut encoded_any = false;
++    for (k, v) in doc.lines.iter_mut() {
++        if !v.is_empty() && !matches!(k.as_str(), "Metadata-Version" | "Version" | "Keywords" | "Project-URL") && chance(&tc, 2) {
++            *v = encode_word(v);
++            encoded_any = true;
++        }
++    }
++    if !encoded_any {
++        return;
++    }
++    let text = doc.render();
++    let decoded = Metadata::parse(text.as_bytes()).unwrap_or_else(|e| panic!("{text:?}: {e}"));
++    assert_eq!(decoded, plain, "{text:?}");
++}
++
++// --------------------------------------------------------------------------- archives
++
++static COUNTER: AtomicUsize = AtomicUsize::new(0);
++
++fn scratch_dir() -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("pkginfo-hegel-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
++    std::fs::create_dir_all(&dir).unwrap();
++    dir
++}
++
++fn write_tar_gz(path: &Path, files: &[(String, String)]) {
++    let f = std::fs::File::create(path).unwrap();
++    let enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
++    let mut b = tar::Builder::new(enc);
++    for (p, data) in files {
++        let mut h = tar::Header::new_gnu();
++        h.set_size(data.len() as u64);
++        h.set_mode(0o644);
++        h.set_cksum();
++        b.append_data(&mut h, p, data.as_bytes()).unwrap();
++    }
++    b.into_inner().unwrap().finish().unwrap();
++}
++
++fn write_zip(path: &Path, files: &[(String, String)]) {
++    let f = std::fs::File::create(path).unwrap();
++    let mut z = zip::ZipWriter::new(f);
++    let opts = zip::write::SimpleFileOptions::default();
++    for (p, data) in files {
++        z.start_file(p, opts).unwrap();
++        z.write_all(data.as_bytes()).unwrap();
++    }
++    z.finish().unwrap();
++}
++
++#[derive(Debug, Clone, Copy, PartialEq)]
++enum Kind {
++    TarGz,
++    Zip,
++    Wheel,
++    Egg,
++}
++
++#[derive(Debug, Clone)]
++struct Archive {
++    kind: Kind,
++    name: String,
++    version: String,
++    py_tag: String,
++    metadata: String,
++    /// Other files, in archive order; `Some(text)` marks a decoy metadata file.
++    files: Vec<(String, String)>,
++}
++
++fn metadata_text(name: &str, version: &str, summary: &str) -> String {
++    format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\nSummary: {summary}\n\nDescription of {name}.\n")
++}
++
++/// A distribution archive in the layout its format prescribes, with other files around the
++/// metadata and, sometimes, a *nested* metadata file with different content placed after the
++/// real one (the order-dependent cases are pinned: python-pkginfo/1, /2).
++#[hegel::composite]
++fn arb_archive(tc: &TestCase) -> Archive {
++    let kind = pick(tc, &[Kind::TarGz, Kind::Zip, Kind::Wheel, Kind::Egg]);
++    let name = pick(tc, &NAMES).to_string();
++    let version = pick(tc, &VERSIONS).to_string();
++    let py_tag = pick(tc, &["py3", "py2.py3", "cp312", "pp39"]).to_string();
++    let metadata = metadata_text(&name, &version, pick(tc, &["real", "Lovely Spam", "中文"]));
++    let root = format!("{name}-{version}");
++    let decoy = metadata_text("vendored", "9.9", "decoy");
++    let mut files: Vec<(String, String)> = Vec::new();
++    match kind {
++        Kind::TarGz | Kind::Zip => {
++            if chance(tc, 2) {
++                files.push((format!("{root}/setup.py"), "from setuptools import setup".into()));
++            }
++            if chance(tc, 2) {
++                files.push((format!("{root}/{name}/__init__.py"), String::new()));
++            }
++            files.push((format!("{root}/PKG-INFO"), metadata.clone()));
++            if chance(tc, 2) {
++                files.push((format!("{root}/{name}.egg-info/PKG-INFO"), decoy.clone()));
++            }
++            if chance(tc, 3) {
++                files.push((format!("{root}/{name}/_vendor/other/PKG-INFO"), decoy.clone()));
++            }
++            if chance(tc, 2) {
++                files.push((format!("{root}/README.md"), "# readme".into()));
++            }
++        }
++        Kind::Wheel => {
++            if chance(tc, 2) {
++                files.push((format!("{name}/__init__.py"), String::new()));
++            }
++            if chance(tc, 3) {
++                files.push((format!("{name}/_vendor/other-1.0.dist-info/METADATA"), decoy.clone()));
++            }
++            files.push((format!("{root}.dist-info/METADATA"), metadata.clone()));
++            files.push((format!("{root}.dist-info/WHEEL"), "Wheel-Version: 1.0\n".into()));
++            if chance(tc, 2) {
++                files.push((format!("{root}.dist-info/RECORD"), String::new()));
++            }
++        }
++        Kind::Egg => {
++            files.push(("EGG-INFO/PKG-INFO".to_string(), metadata.clone()));
++            if chance(tc, 2) {
++                files.push(("EGG-INFO/top_level.txt".to_string(), format!("{name}\n")));
++            }
++            if chance(tc, 2) {
++                files.push((format!("{name}/__init__.py"), String::new()));
++            }
++        }
++    }
++    Archive { kind, name, version, py_tag, metadata, files }
++}
++
++fn write_archive(dir: &Path, a: &Archive) -> PathBuf {
++    let root = format!("{}-{}", a.name, a.version);
++    let path = match a.kind {
++        Kind::TarGz => dir.join(format!("{root}.tar.gz")),
++        Kind::Zip => dir.join(format!("{root}.zip")),
++        Kind::Wheel => dir.join(format!("{root}-{}-none-any.whl", a.py_tag)),
++        Kind::Egg => dir.join(format!("{root}-py3.9.egg")),
++    };
++    match a.kind {
++        Kind::TarGz => write_tar_gz(&path, &a.files),
++        _ => write_zip(&path, &a.files),
++    }
++    path
++}
++
++fn kind_name(k: Kind) -> &'static str {
++    match k {
++        Kind::TarGz | Kind::Zip => "sdist",
++        Kind::Wheel => "wheel",
++        Kind::Egg => "egg",
++    }
++}
++
++/// `Distribution::new` reads the metadata file Python `pkginfo` reads, reports the format, and
++/// takes the Python tag from the wheel filename (`source` for sdists).
++#[hegel::test]
++fn distributions_read_like_pkginfo(tc: TestCase) {
++    let a = tc.draw(arb_archive().print_as_debug());
++    let dir = scratch_dir();
++    let path = write_archive(&dir, &a);
++    let theirs = py_distribution(kind_name(a.kind), &path);
++    let ours = Distribution::new(&path);
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let theirs = theirs.unwrap_or_else(|e| panic!("{a:?}: pkginfo fails: {e}"));
++        let ours = ours.unwrap_or_else(|e| panic!("{a:?}: the crate fails: {e}"));
++        let m = ours.metadata();
++        assert_eq!(m.name, theirs["name"].as_str().unwrap(), "{a:?}: name");
++        assert_eq!(m.version, theirs["version"].as_str().unwrap(), "{a:?}: version");
++        assert_eq!(m.summary.as_deref(), theirs["summary"].as_str(), "{a:?}: summary");
++        assert_eq!(m.description.as_deref().map(str::trim), theirs["description"].as_str().map(str::trim), "{a:?}: description");
++        assert_eq!(m.name, a.name, "{a:?}: the real metadata file");
++        let expected_type = match a.kind {
++            Kind::TarGz | Kind::Zip => DistributionType::SDist,
++            Kind::Wheel => DistributionType::Wheel,
++            Kind::Egg => DistributionType::Egg,
++        };
++        assert_eq!(ours.r#type(), expected_type, "{a:?}: type");
++        let expected_py = match a.kind {
++            Kind::TarGz | Kind::Zip => "source".to_string(),
++            Kind::Wheel => a.py_tag.clone(),
++            Kind::Egg => "py3.9".to_string(),
++        };
++        assert_eq!(ours.python_version(), expected_py, "{a:?}: python_version");
++    }));
++    let _ = std::fs::remove_dir_all(&dir);
++    if let Err(e) = result {
++        std::panic::resume_unwind(e);
++    }
++}
++
++// --------------------------------------------------------------------------- pins
++
++/// Pinned (python-pkginfo/1): a `.tar.gz` sdist whose archive lists a nested `PKG-INFO` (a
++/// vendored package's, or the `.egg-info` copy) before the top-level one yields the nested
++/// file's metadata; Python `pkginfo` reads the shallowest `PKG-INFO`.
++#[hegel::test]
++fn sdist_tars_read_the_top_level_pkg_info(tc: TestCase) {
++    let name = pick(&tc, &NAMES).to_string();
++    let root = format!("{name}-1.0");
++    let real = metadata_text(&name, "1.0", "real");
++    let decoy = metadata_text("vendored", "9.9", "decoy");
++    let nested = pick(&tc, &[format!("{root}/{name}.egg-info/PKG-INFO"), format!("{root}/{name}/_vendor/other/PKG-INFO"), format!("{root}/src/PKG-INFO")]);
++    let mut files = vec![(nested, decoy)];
++    if chance(&tc, 2) {
++        files.push((format!("{root}/setup.py"), String::new()));
++    }
++    files.push((format!("{root}/PKG-INFO"), real));
++    let dir = scratch_dir();
++    let path = dir.join(format!("{root}.tar.gz"));
++    write_tar_gz(&path, &files);
++    let theirs = py_distribution("sdist", &path).unwrap();
++    let ours = Distribution::new(&path).map(|d| d.metadata().name.clone());
++    let _ = std::fs::remove_dir_all(&dir);
++    assert_eq!(theirs["name"].as_str(), Some(name.as_str()), "pkginfo");
++    assert_eq!(ours.unwrap(), name, "{files:?}");
++}
++
++/// Pinned (python-pkginfo/2): a `.zip` sdist with the top-level `PKG-INFO` and an
++/// `.egg-info/PKG-INFO` copy reads whichever the archive lists first; Python `pkginfo` reads the
++/// shallowest.
++#[hegel::test]
++fn sdist_zips_prefer_the_top_level_pkg_info_over_egg_info(tc: TestCase) {
++    let name = pick(&tc, &NAMES).to_string();
++    let root = format!("{name}-1.0");
++    let real = metadata_text(&name, "1.0", "real");
++    let decoy = metadata_text("vendored", "9.9", "decoy");
++    let mut files = vec![(format!("{root}/{name}.egg-info/PKG-INFO"), decoy)];
++    if chance(&tc, 2) {
++        files.push((format!("{root}/setup.py"), String::new()));
++    }
++    files.push((format!("{root}/PKG-INFO"), real));
++    let dir = scratch_dir();
++    let path = dir.join(format!("{root}.zip"));
++    write_zip(&path, &files);
++    let theirs = py_distribution("sdist", &path).unwrap();
++    let ours = Distribution::new(&path).map(|d| d.metadata().name.clone());
++    let _ = std::fs::remove_dir_all(&dir);
++    assert_eq!(theirs["name"].as_str(), Some(name.as_str()), "pkginfo");
++    assert_eq!(ours.unwrap(), name, "{files:?}");
++}
++
++/// Pinned (python-pkginfo/3): the wheel filename is
++/// `{name}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl`; with a build
++/// tag the crate reports `python_version()` as `any` instead of the Python tag.
++#[hegel::test]
++fn wheel_build_tags_do_not_hide_the_python_tag(tc: TestCase) {
++    let name = pick(&tc, &NAMES).to_string();
++    let py_tag = pick(&tc, &["py3", "py2.py3", "cp312"]);
++    let build = format!("{}{}", n(&tc, 1, 99), pick(&tc, &["", "abc", "_x"]));
++    let root = format!("{name}-1.0");
++    let files = vec![(format!("{root}.dist-info/METADATA"), metadata_text(&name, "1.0", "real")), (format!("{root}.dist-info/WHEEL"), "Wheel-Version: 1.0\n".into())];
++    let dir = scratch_dir();
++    let path = dir.join(format!("{root}-{build}-{py_tag}-none-any.whl"));
++    write_zip(&path, &files);
++    let ours = Distribution::new(&path).map(|d| d.python_version().to_string());
++    let _ = std::fs::remove_dir_all(&dir);
++    assert_eq!(ours.unwrap(), py_tag, "{path:?}");
++}
++
++/// Pinned (python-pkginfo/4): a tab between the colon and the value is folding whitespace, not
++/// part of the value (`email.parser` and Python `pkginfo` give `y` for `Author:\ty`); the crate
++/// keeps it for every field but `Metadata-Version`, `Name` and `Version`.
++#[hegel::test]
++fn header_values_do_not_keep_the_tab_after_the_colon(tc: TestCase) {
++    let (header, get) = pick(&tc, &SINGLE);
++    let value = pick(&tc, &["y", "Lovely Spam", "中文"]);
++    let sep = pick(&tc, &["\t", " \t", "\t ", "\t\t"]);
++    let text = format!("Metadata-Version: 2.1\nName: x\nVersion: 1.0\n{header}:{sep}{value}\n");
++    let theirs = py_pkginfo(&text);
++    assert_eq!(theirs[raw_key(header).replace("provides_extra", "provides_extras")].as_str(), Some(value), "{text:?}: pkginfo");
++    let (raw, _) = py_packaging(&text);
++    assert_eq!(raw[raw_key(header)].as_str(), Some(value), "{text:?}: packaging");
++    let m = Metadata::parse(text.as_bytes()).unwrap();
++    assert_eq!(get(&m).map(String::as_str), Some(value), "{text:?}");
++}
++
++/// Pinned (python-pkginfo/5): the legacy header form of `Description` indents continuation
++/// lines by eight spaces (distutils' `rfc822_escape`), which readers strip — Python `pkginfo`
++/// returns `line1\nline2`; the crate returns the indented text verbatim.
++#[hegel::test]
++fn description_header_continuation_lines_are_dedented(tc: TestCase) {
++    let lines: Vec<&str> = (0..n(&tc, 2, 4)).map(|_| pick(&tc, &["Lovely Spam", "Wonderful Spam!", "中文", "x"])).collect();
++    let text = format!("Metadata-Version: 2.1\nName: x\nVersion: 1.0\nDescription: {}\n", lines.join("\n        "));
++    let theirs = py_pkginfo(&text);
++    assert_eq!(theirs["description"].as_str(), Some(lines.join("\n").as_str()), "{text:?}: pkginfo");
++    let m = Metadata::parse(text.as_bytes()).unwrap();
++    assert_eq!(m.description.as_deref(), Some(lines.join("\n").as_str()), "{text:?}");
++}
++
++/// Pinned (python-pkginfo/6): a folded header (`Summary: s\n  t`) is unfolded to `s t` in the
++/// multi-use fields (`Classifier`, via mailparse's `get_value`) but kept with its newline and
++/// indentation in the single-use ones (raw bytes through the RFC 2047 decoder); Python
++/// `pkginfo` unfolds both.
++#[hegel::test]
++fn folded_headers_unfold_alike_in_single_and_multi_use_fields(tc: TestCase) {
++    let (header, get) = pick(&tc, &SINGLE);
++    let (a, b) = (pick(&tc, &["s", "Lovely", "中文"]), pick(&tc, &["t", "Spam", "文"]));
++    let indent = pick(&tc, &[" ", "  ", "\t"]);
++    let text = format!("Metadata-Version: 2.1\nName: x\nVersion: 1.0\n{header}: {a}\n{indent}{b}\nClassifier: {a}\n{indent}{b}\n");
++    let theirs = py_pkginfo(&text);
++    let expected = format!("{a} {b}");
++    assert_eq!(theirs["classifiers"][0].as_str(), Some(expected.as_str()), "{text:?}: pkginfo classifier");
++    assert_eq!(theirs[raw_key(header)].as_str(), Some(expected.as_str()), "{text:?}: pkginfo {header}");
++    let m = Metadata::parse(text.as_bytes()).unwrap();
++    assert_eq!(m.classifiers, vec![expected.clone()], "{text:?}: classifier");
++    assert_eq!(get(&m).map(String::as_str), Some(expected.as_str()), "{text:?}: {header}");
++}
