@@ -1,0 +1,1937 @@
+diff --git a/go.mod b/go.mod
+index 33e0f92..32569ba 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,13 @@
+ module github.com/cockroachdb/apd/v3
+ 
+-go 1.17
++go 1.26.0
+ 
+-require github.com/lib/pq v1.10.7
++require (
++	github.com/lib/pq v1.10.7
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..e5e2202
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1911 @@
++// Hegel property tests for apd (the Hegel zoo, https://github.com/hegeldev/hegel-zoo).
++//
++// Oracles: math/big for BigInt (apd's own testing/quick suite ported and widened to aliased
++// operands, more methods and mixed inline/heap sizes), and Python's decimal module — the
++// reference implementation of the same General Decimal Arithmetic specification apd
++// implements — for every Context operation, run as a child process with the same precision,
++// rounding, exponent range and no traps, comparing the result's exact representation and the
++// condition flags.  The Decimal-level helpers (formatting, conversions, Modf, Reduce,
++// Compose/Decompose, sql Scan/Value, text marshalling) are checked against small models and
++// round trips.
++package apd_test
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/gob"
++	"encoding/json"
++	"fmt"
++	"math"
++	"math/big"
++	"os"
++	"os/exec"
++	"reflect"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	. "github.com/cockroachdb/apd/v3"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------------------
++// Harness (the zoo's Go conventions, see targets/go/jsonparser).
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++// property runs fn as a Hegel property, turning a panic in the code under test into a
++// failure of the current test case (hegel-go re-raises panics after shrinking, which would
++// abort the test binary and hide every later test).  Hegel's own control-flow panics pass.
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int {
++	return int(hegel.Draw(tc, hegel.Integers[int64](int64(lo), int64(hi))))
++}
++func chance(tc hegel.TestCase, pct int) bool  { return n(tc, 1, 100) <= pct }
++func pick[T any](tc hegel.TestCase, xs []T) T { return xs[n(tc, 0, len(xs)-1)] }
++
++// ---------------------------------------------------------------------------------------
++// Generators.
++
++var interesting = []string{
++	"-9223372036854775809", "-9223372036854775808", "-9223372036854775807", "-2147483648",
++	"-32768", "-128", "-1", "0", "1", "127", "255", "32767", "65535", "2147483647",
++	"4294967295", "9223372036854775806", "9223372036854775807", "9223372036854775808",
++	"18446744073709551614", "18446744073709551615", "18446744073709551616",
++	"340282366920938463463374607431768211455", "340282366920938463463374607431768211456",
++	"-340282366920938463463374607431768211456",
++}
++
++// genDigits draws a decimal coefficient of 1..maxDigits digits with no leading zero
++// (except the single digit 0).
++func genDigits(tc hegel.TestCase, maxDigits int) string {
++	k := n(tc, 1, maxDigits)
++	var sb strings.Builder
++	sb.WriteByte(byte('1' + n(tc, 0, 8)))
++	for i := 1; i < k; i++ {
++		sb.WriteByte(byte('0' + n(tc, 0, 9)))
++	}
++	if chance(tc, 10) {
++		return "0"
++	}
++	return sb.String()
++}
++
++// genInt draws a signed integer as a decimal string: an interesting edge value, a small
++// number, or a random one of up to maxDigits digits.
++func genInt(tc hegel.TestCase, maxDigits int) string {
++	switch {
++	case chance(tc, 30):
++		return pick(tc, interesting)
++	case chance(tc, 30):
++		return strconv.Itoa(n(tc, -1000, 1000))
++	}
++	s := genDigits(tc, maxDigits)
++	if s != "0" && chance(tc, 50) {
++		s = "-" + s
++	}
++	return s
++}
++
++func toApd(s string) *BigInt {
++	z, ok := new(BigInt).SetString(s, 10)
++	if !ok {
++		panic("bad number " + s)
++	}
++	return z
++}
++
++func toMath(s string) *big.Int {
++	z, ok := new(big.Int).SetString(s, 10)
++	if !ok {
++		panic("bad number " + s)
++	}
++	return z
++}
++
++// call runs f and returns its result, or "panic: <message>" if it panicked.
++func call(f func() string) (s string) {
++	defer func() {
++		if r := recover(); r != nil {
++			s = fmt.Sprintf("panic: %v", r)
++		}
++	}()
++	return f()
++}
++
++// ---------------------------------------------------------------------------------------
++// BigInt against math/big.
++
++// bigOp is one method compared between apd.BigInt and big.Int.  The apd side receives
++// z, x, y (z is the receiver, possibly aliased with x or y); the math side receives the
++// same values as big.Ints.  Both return a string describing every output.
++type bigOp struct {
++	name string
++	apd  func(z, x, y *BigInt, k, m int) string
++	math func(z, x, y *big.Int, k, m int) string
++}
++
++func fmtWords(ws []big.Word) string { return fmt.Sprint(ws) }
++
++var bigOps = []bigOp{
++	{"Abs", func(z, x, y *BigInt, k, m int) string { return z.Abs(x).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Abs(x).String() }},
++	{"Neg", func(z, x, y *BigInt, k, m int) string { return z.Neg(x).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Neg(x).String() }},
++	{"Not", func(z, x, y *BigInt, k, m int) string { return z.Not(x).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Not(x).String() }},
++	{"Set", func(z, x, y *BigInt, k, m int) string { return z.Set(x).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Set(x).String() }},
++	{"Add", func(z, x, y *BigInt, k, m int) string { return z.Add(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Add(x, y).String() }},
++	{"Sub", func(z, x, y *BigInt, k, m int) string { return z.Sub(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Sub(x, y).String() }},
++	{"Mul", func(z, x, y *BigInt, k, m int) string { return z.Mul(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Mul(x, y).String() }},
++	{"And", func(z, x, y *BigInt, k, m int) string { return z.And(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.And(x, y).String() }},
++	{"AndNot", func(z, x, y *BigInt, k, m int) string { return z.AndNot(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.AndNot(x, y).String() }},
++	{"Or", func(z, x, y *BigInt, k, m int) string { return z.Or(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Or(x, y).String() }},
++	{"Xor", func(z, x, y *BigInt, k, m int) string { return z.Xor(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Xor(x, y).String() }},
++	{"Cmp", func(z, x, y *BigInt, k, m int) string { return strconv.Itoa(x.Cmp(y)) },
++		func(z, x, y *big.Int, k, m int) string { return strconv.Itoa(x.Cmp(y)) }},
++	{"CmpAbs", func(z, x, y *BigInt, k, m int) string { return strconv.Itoa(x.CmpAbs(y)) },
++		func(z, x, y *big.Int, k, m int) string { return strconv.Itoa(x.CmpAbs(y)) }},
++	{"Div", func(z, x, y *BigInt, k, m int) string { return z.Div(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Div(x, y).String() }},
++	{"Mod", func(z, x, y *BigInt, k, m int) string { return z.Mod(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Mod(x, y).String() }},
++	{"DivMod", func(z, x, y *BigInt, k, m int) string {
++		r := new(BigInt)
++		q, r2 := z.DivMod(x, y, r)
++		return q.String() + " " + r2.String() + " " + r.String()
++	}, func(z, x, y *big.Int, k, m int) string {
++		r := new(big.Int)
++		q, r2 := z.DivMod(x, y, r)
++		return q.String() + " " + r2.String() + " " + r.String()
++	}},
++	{"Quo", func(z, x, y *BigInt, k, m int) string { return z.Quo(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Quo(x, y).String() }},
++	{"Rem", func(z, x, y *BigInt, k, m int) string { return z.Rem(x, y).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Rem(x, y).String() }},
++	{"QuoRem", func(z, x, y *BigInt, k, m int) string {
++		r := new(BigInt)
++		q, r2 := z.QuoRem(x, y, r)
++		return q.String() + " " + r2.String() + " " + r.String()
++	}, func(z, x, y *big.Int, k, m int) string {
++		r := new(big.Int)
++		q, r2 := z.QuoRem(x, y, r)
++		return q.String() + " " + r2.String() + " " + r.String()
++	}},
++	{"GCD", func(z, x, y *BigInt, k, m int) string {
++		a, b := new(BigInt), new(BigInt)
++		if k%2 == 0 {
++			a, b = nil, nil
++		}
++		g := z.GCD(a, b, x, y)
++		return g.String() + " " + a.String() + " " + b.String()
++	}, func(z, x, y *big.Int, k, m int) string {
++		a, b := new(big.Int), new(big.Int)
++		if k%2 == 0 {
++			a, b = nil, nil
++		}
++		g := z.GCD(a, b, x, y)
++		return g.String() + " " + a.String() + " " + b.String()
++	}},
++	{"Exp", func(z, x, y *BigInt, k, m int) string {
++		e := NewBigInt(int64(k % 40))
++		var mod *BigInt
++		if m%2 == 0 {
++			mod = y
++		}
++		return z.Exp(x, e, mod).String()
++	}, func(z, x, y *big.Int, k, m int) string {
++		e := big.NewInt(int64(k % 40))
++		var mod *big.Int
++		if m%2 == 0 {
++			mod = y
++		}
++		return z.Exp(x, e, mod).String()
++	}},
++	{"ModInverse", func(z, x, y *BigInt, k, m int) string {
++		r := z.ModInverse(x, y)
++		if r == nil {
++			return "nil"
++		}
++		return r.String()
++	}, func(z, x, y *big.Int, k, m int) string {
++		r := z.ModInverse(x, y)
++		if r == nil {
++			return "nil"
++		}
++		return r.String()
++	}},
++	{"Sqrt", func(z, x, y *BigInt, k, m int) string { return z.Sqrt(x).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Sqrt(x).String() }},
++	{"Lsh", func(z, x, y *BigInt, k, m int) string { return z.Lsh(x, uint(k)).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Lsh(x, uint(k)).String() }},
++	{"Rsh", func(z, x, y *BigInt, k, m int) string { return z.Rsh(x, uint(k)).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Rsh(x, uint(k)).String() }},
++	{"Bit", func(z, x, y *BigInt, k, m int) string { return strconv.Itoa(int(x.Bit(k - m))) },
++		func(z, x, y *big.Int, k, m int) string { return strconv.Itoa(int(x.Bit(k - m))) }},
++	{"SetBit", func(z, x, y *BigInt, k, m int) string { return z.SetBit(x, k, uint(m%2)).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.SetBit(x, k, uint(m%2)).String() }},
++	{"BitLen", func(z, x, y *BigInt, k, m int) string { return strconv.Itoa(x.BitLen()) },
++		func(z, x, y *big.Int, k, m int) string { return strconv.Itoa(x.BitLen()) }},
++	{"TrailingZeroBits", func(z, x, y *BigInt, k, m int) string { return strconv.Itoa(int(x.TrailingZeroBits())) },
++		func(z, x, y *big.Int, k, m int) string { return strconv.Itoa(int(x.TrailingZeroBits())) }},
++	{"Sign", func(z, x, y *BigInt, k, m int) string { return strconv.Itoa(x.Sign()) },
++		func(z, x, y *big.Int, k, m int) string { return strconv.Itoa(x.Sign()) }},
++	{"Bits", func(z, x, y *BigInt, k, m int) string { return fmtWords(x.Bits()) },
++		func(z, x, y *big.Int, k, m int) string { return fmtWords(x.Bits()) }},
++	{"SetBits", func(z, x, y *BigInt, k, m int) string { return z.SetBits(x.Bits()).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.SetBits(x.Bits()).String() }},
++	{"Bytes", func(z, x, y *BigInt, k, m int) string { return fmt.Sprintf("%x", x.Bytes()) },
++		func(z, x, y *big.Int, k, m int) string { return fmt.Sprintf("%x", x.Bytes()) }},
++	{"SetBytes", func(z, x, y *BigInt, k, m int) string { return z.SetBytes(x.Bytes()).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.SetBytes(x.Bytes()).String() }},
++	{"FillBytes", func(z, x, y *BigInt, k, m int) string {
++		buf := make([]byte, len(x.Bytes())+k%3)
++		return fmt.Sprintf("%x", x.FillBytes(buf))
++	}, func(z, x, y *big.Int, k, m int) string {
++		buf := make([]byte, len(x.Bytes())+k%3)
++		return fmt.Sprintf("%x", x.FillBytes(buf))
++	}},
++	{"Text", func(z, x, y *BigInt, k, m int) string { return x.Text(2 + k%61) },
++		func(z, x, y *big.Int, k, m int) string { return x.Text(2 + k%61) }},
++	{"Append", func(z, x, y *BigInt, k, m int) string { return string(x.Append([]byte("n="), 2+k%61)) },
++		func(z, x, y *big.Int, k, m int) string { return string(x.Append([]byte("n="), 2+k%61)) }},
++	{"Format", func(z, x, y *BigInt, k, m int) string {
++		return fmt.Sprintf(formatVerbs[k%len(formatVerbs)], x)
++	}, func(z, x, y *big.Int, k, m int) string {
++		return fmt.Sprintf(formatVerbs[k%len(formatVerbs)], x)
++	}},
++	{"Int64", func(z, x, y *BigInt, k, m int) string {
++		return fmt.Sprint(x.IsInt64(), x.Int64(), x.IsUint64(), x.Uint64())
++	}, func(z, x, y *big.Int, k, m int) string {
++		return fmt.Sprint(x.IsInt64(), x.Int64(), x.IsUint64(), x.Uint64())
++	}},
++	{"SetInt64", func(z, x, y *BigInt, k, m int) string {
++		return z.SetInt64(int64(k)*int64(m)-x.Int64()).String() + " " + z.SetUint64(uint64(k)<<40).String()
++	}, func(z, x, y *big.Int, k, m int) string {
++		return z.SetInt64(int64(k)*int64(m)-x.Int64()).String() + " " + z.SetUint64(uint64(k)<<40).String()
++	}},
++	{"MarshalText", func(z, x, y *BigInt, k, m int) string {
++		t, err := x.MarshalText()
++		j, err2 := x.MarshalJSON()
++		return fmt.Sprint(string(t), err, string(j), err2)
++	}, func(z, x, y *big.Int, k, m int) string {
++		t, err := x.MarshalText()
++		j, err2 := x.MarshalJSON()
++		return fmt.Sprint(string(t), err, string(j), err2)
++	}},
++	{"UnmarshalText", func(z, x, y *BigInt, k, m int) string {
++		err := z.UnmarshalText([]byte(x.String()))
++		err2 := z.UnmarshalJSON([]byte(y.String()))
++		return fmt.Sprint(err, err2, z.String())
++	}, func(z, x, y *big.Int, k, m int) string {
++		err := z.UnmarshalText([]byte(x.String()))
++		err2 := z.UnmarshalJSON([]byte(y.String()))
++		return fmt.Sprint(err, err2, z.String())
++	}},
++	{"Gob", func(z, x, y *BigInt, k, m int) string {
++		b, err := x.GobEncode()
++		err2 := z.GobDecode(b)
++		return fmt.Sprint(err, err2, z.String())
++	}, func(z, x, y *big.Int, k, m int) string {
++		b, err := x.GobEncode()
++		err2 := z.GobDecode(b)
++		return fmt.Sprint(err, err2, z.String())
++	}},
++	{"Scan", func(z, x, y *BigInt, k, m int) string {
++		_, err := fmt.Sscan(x.String(), z)
++		return fmt.Sprint(err, z.String())
++	}, func(z, x, y *big.Int, k, m int) string {
++		_, err := fmt.Sscan(x.String(), z)
++		return fmt.Sprint(err, z.String())
++	}},
++	{"ProbablyPrime", func(z, x, y *BigInt, k, m int) string { return fmt.Sprint(x.ProbablyPrime(k % 5)) },
++		func(z, x, y *big.Int, k, m int) string { return fmt.Sprint(x.ProbablyPrime(k % 5)) }},
++	{"Binomial", func(z, x, y *BigInt, k, m int) string { return z.Binomial(int64(k), int64(m)).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.Binomial(int64(k), int64(m)).String() }},
++	{"MulRange", func(z, x, y *BigInt, k, m int) string { return z.MulRange(int64(m)-5, int64(k)-5).String() },
++		func(z, x, y *big.Int, k, m int) string { return z.MulRange(int64(m)-5, int64(k)-5).String() }},
++	{"MathBigInt", func(z, x, y *BigInt, k, m int) string {
++		return z.SetMathBigInt(x.MathBigInt()).String() + " " + x.MathBigInt().String()
++	}, func(z, x, y *big.Int, k, m int) string { return z.Set(x).String() + " " + x.String() }},
++}
++
++var formatVerbs = []string{"%d", "%x", "%X", "%o", "%b", "%s", "%v", "%#x", "%+d", "%08d", "%-8d|", "% d", "%#o", "%O", "%10x"}
++
++// The BigInt methods agree with math/big.Int — results, panics and the receiver's final
++// value — for every method, with the receiver aliased to an operand or not, over values
++// that are inline (small) or heap-backed (up to 60 digits).
++func TestHegelBigIntAgreesWithMathBig(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		op := pick(ht, bigOps)
++		zs, xs, ys := genInt(ht, 60), genInt(ht, 60), genInt(ht, 60)
++		k, m := n(ht, 0, 70), n(ht, 0, 70)
++		alias := n(ht, 0, 3) // 0: distinct, 1: z==x, 2: z==y, 3: x==y
++		note(ht, "op=%s z=%s x=%s y=%s k=%d m=%d alias=%d", op.name, zs, xs, ys, k, m, alias)
++
++		za, xa, ya := toApd(zs), toApd(xs), toApd(ys)
++		zb, xb, yb := toMath(zs), toMath(xs), toMath(ys)
++		switch alias {
++		case 1:
++			za, zb = xa, xb
++		case 2:
++			za, zb = ya, yb
++		case 3:
++			ya, yb = xa, xb
++		}
++		ra := call(func() string { return op.apd(za, xa, ya, k, m) })
++		rb := call(func() string { return op.math(zb, xb, yb, k, m) })
++		if ra != rb {
++			ht.Fatalf("%s: apd %q, math/big %q", op.name, ra, rb)
++		}
++		// The receiver and operands must end up the same too.
++		if za.String() != zb.String() || xa.String() != xb.String() || ya.String() != yb.String() {
++			ht.Fatalf("%s: after the call apd z=%s x=%s y=%s, math/big z=%s x=%s y=%s",
++				op.name, za, xa, ya, zb, xb, yb)
++		}
++		// And the apd value must round-trip through math/big.
++		if rt := new(BigInt).SetMathBigInt(za.MathBigInt()); rt.Cmp(za) != 0 {
++			ht.Fatalf("%s: round trip through big.Int changed %s into %s", op.name, za, rt)
++		}
++	})
++}
++
++// SetString on BigInt agrees with big.Int on arbitrary strings (accepted or not) in every
++// base, including base 0 with prefixes and underscores.
++func TestHegelBigIntSetStringAgreesWithMathBig(t *testing.T) {
++	alphabet := []rune("0123456789abcdefxyzXYZ_+- .oObB")
++	property(t, func(ht *hegel.T) {
++		var s string
++		if chance(ht, 50) {
++			s = genInt(ht, 40)
++			if chance(ht, 30) {
++				s = pick(ht, []string{"0x", "0X", "0b", "0o", "0", "+", "-", "-0x"}) + strings.TrimPrefix(s, "-")
++			}
++		} else {
++			k := n(ht, 0, 12)
++			rs := make([]rune, k)
++			for i := range rs {
++				rs[i] = pick(ht, alphabet)
++			}
++			s = string(rs)
++		}
++		base := pick(ht, []int{0, 2, 8, 10, 16, 36, 62})
++		note(ht, "s=%q base=%d", s, base)
++		za, oka := new(BigInt).SetString(s, base)
++		zb, okb := new(big.Int).SetString(s, base)
++		if oka != okb {
++			ht.Fatalf("SetString(%q, %d): apd ok=%v, math/big ok=%v", s, base, oka, okb)
++		}
++		if oka && za.String() != zb.String() {
++			ht.Fatalf("SetString(%q, %d): apd %s, math/big %s", s, base, za, zb)
++		}
++		if !oka && za != nil {
++			ht.Fatalf("SetString(%q, %d): apd returned %v with ok=false (math/big returns nil)", s, base, za)
++		}
++	})
++}
++
++// NumDigits counts the decimal digits of a BigInt's absolute value.
++func TestHegelNumDigitsCountsDigits(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genInt(ht, 80)
++		want := int64(len(strings.TrimPrefix(s, "-")))
++		got := NumDigits(toApd(s))
++		if got != want {
++			ht.Fatalf("NumDigits(%s) = %d, want %d", s, got, want)
++		}
++		if d := NewWithBigInt(toApd(strings.TrimPrefix(s, "-")), 0); d.NumDigits() != want {
++			ht.Fatalf("Decimal(%s).NumDigits() = %d, want %d", s, d.NumDigits(), want)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------------------
++// The Python oracle.
++
++const pyOracle = `
++import sys, json, decimal
++from decimal import Decimal, Context
++R = {r: getattr(decimal, r) for r in ["ROUND_DOWN","ROUND_HALF_UP","ROUND_HALF_EVEN","ROUND_CEILING","ROUND_FLOOR","ROUND_HALF_DOWN","ROUND_UP","ROUND_05UP"]}
++for line in sys.stdin:
++    q = json.loads(line)
++    ctx = Context(prec=q["prec"], rounding=R[q["rounding"]], Emin=q["emin"], Emax=q["emax"], capitals=1, clamp=0, traps=[], flags=[])
++    a = [Decimal(s) for s in q["args"]]
++    op = q["op"]; r = None; err = None
++    try:
++        if op == "add": r = ctx.add(a[0], a[1])
++        elif op == "subtract": r = ctx.subtract(a[0], a[1])
++        elif op == "multiply": r = ctx.multiply(a[0], a[1])
++        elif op == "divide": r = ctx.divide(a[0], a[1])
++        elif op == "divide_int": r = ctx.divide_int(a[0], a[1])
++        elif op == "remainder": r = ctx.remainder(a[0], a[1])
++        elif op == "abs": r = ctx.abs(a[0])
++        elif op == "minus": r = ctx.minus(a[0])
++        elif op == "plus": r = ctx.plus(a[0])
++        elif op == "compare": r = ctx.compare(a[0], a[1])
++        elif op == "compare_total": r = ctx.compare_total(a[0], a[1])
++        elif op == "quantize": r = ctx.quantize(a[0], Decimal((0, (1,), q["exp"])))
++        elif op == "reduce": r = ctx.normalize(a[0])
++        elif op == "round": r = ctx.create_decimal(a[0])
++        elif op == "to_integral_exact": r = ctx.to_integral_exact(a[0])
++        elif op == "to_integral_value": r = ctx.to_integral_value(a[0])
++        elif op == "floor": r = ctx.create_decimal(a[0].to_integral_value(rounding=decimal.ROUND_FLOOR, context=ctx))
++        elif op == "ceil": r = ctx.create_decimal(a[0].to_integral_value(rounding=decimal.ROUND_CEILING, context=ctx))
++        elif op == "sqrt": r = ctx.sqrt(a[0])
++        elif op == "exp": r = ctx.exp(a[0])
++        elif op == "ln": r = ctx.ln(a[0])
++        elif op == "log10": r = ctx.log10(a[0])
++        elif op == "power": r = ctx.power(a[0], a[1])
++        elif op == "to_sci": r = str(a[0])
++        elif op == "to_eng": r = a[0].to_eng_string()
++        else: err = "unknown op " + op
++    except Exception as e:
++        err = repr(e)
++    flags = sorted(k.__name__ for k, v in ctx.flags.items() if v and k.__name__ != "FloatOperation")
++    print(json.dumps({"result": None if r is None else str(r), "flags": flags, "error": err}), flush=True)
++`
++
++type pyReq struct {
++	Op       string   `json:"op"`
++	Args     []string `json:"args"`
++	Prec     int      `json:"prec"`
++	Rounding string   `json:"rounding"`
++	Emin     int      `json:"emin"`
++	Emax     int      `json:"emax"`
++	Exp      int      `json:"exp"`
++}
++
++type pyResp struct {
++	Result *string  `json:"result"`
++	Flags  []string `json:"flags"`
++	Error  *string  `json:"error"`
++}
++
++var (
++	pyOnce sync.Once
++	pyIn   *bufio.Writer
++	pyOut  *bufio.Reader
++	pyErr  error
++)
++
++func python() (*bufio.Writer, *bufio.Reader, error) {
++	pyOnce.Do(func() {
++		cmd := exec.Command("python3", "-c", pyOracle)
++		cmd.Stderr = os.Stderr
++		in, err := cmd.StdinPipe()
++		if err != nil {
++			pyErr = err
++			return
++		}
++		out, err := cmd.StdoutPipe()
++		if err != nil {
++			pyErr = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			pyErr = err
++			return
++		}
++		pyIn, pyOut = bufio.NewWriter(in), bufio.NewReader(out)
++	})
++	return pyIn, pyOut, pyErr
++}
++
++func ask(t *hegel.T, q pyReq) pyResp {
++	in, out, err := python()
++	if err != nil {
++		panic("python3 oracle: " + err.Error())
++	}
++	b, _ := json.Marshal(q)
++	in.Write(b)
++	in.WriteByte('\n')
++	if err := in.Flush(); err != nil {
++		panic("python3 oracle write: " + err.Error())
++	}
++	line, err := out.ReadBytes('\n')
++	if err != nil {
++		panic("python3 oracle read: " + err.Error())
++	}
++	var r pyResp
++	if err := json.Unmarshal(line, &r); err != nil {
++		panic("python3 oracle: bad reply " + string(line))
++	}
++	if r.Error != nil {
++		panic("python3 oracle: " + *r.Error)
++	}
++	return r
++}
++
++// ---------------------------------------------------------------------------------------
++// Decimal generators and the Context differential.
++
++var roundings = []struct {
++	apd Rounder
++	py  string
++}{
++	{RoundDown, "ROUND_DOWN"}, {RoundHalfUp, "ROUND_HALF_UP"}, {RoundHalfEven, "ROUND_HALF_EVEN"},
++	{RoundCeiling, "ROUND_CEILING"}, {RoundFloor, "ROUND_FLOOR"}, {RoundHalfDown, "ROUND_HALF_DOWN"},
++	{RoundUp, "ROUND_UP"}, {Round05Up, "ROUND_05UP"},
++}
++
++// genDecimal draws a finite decimal as "[-]coefficientE<exp>" with up to maxDigits
++// digits (trailing zeros included) and an exponent within ±expRange, or, with pct chance,
++// a special value.
++func genDecimal(tc hegel.TestCase, maxDigits, expRange, specialPct int) string {
++	if chance(tc, specialPct) {
++		return pick(tc, []string{"Infinity", "-Infinity", "NaN", "-NaN", "sNaN", "-sNaN"})
++	}
++	coeff := genDigits(tc, maxDigits)
++	if chance(tc, 25) {
++		coeff += strings.Repeat("0", n(tc, 1, 6))
++	}
++	exp := n(tc, -expRange, expRange)
++	if chance(tc, 30) {
++		exp = n(tc, -3, 3)
++	}
++	s := coeff + "E" + strconv.Itoa(exp)
++	if chance(tc, 45) {
++		s = "-" + s
++	}
++	return s
++}
++
++func parse(s string) *Decimal {
++	d, _, err := new(Decimal).SetString(s)
++	if err != nil {
++		panic("parse " + s + ": " + err.Error())
++	}
++	return d
++}
++
++// flagNames maps an apd Condition to Python's flag names (GDA's division-impossible and
++// division-undefined are sub-conditions of invalid-operation, which is the flag Python
++// records); the system-limit flags have no Python counterpart.
++func flagNames(c Condition) []string {
++	var out []string
++	if c.Inexact() {
++		out = append(out, "Inexact")
++	}
++	if c.Rounded() {
++		out = append(out, "Rounded")
++	}
++	if c.Subnormal() {
++		out = append(out, "Subnormal")
++	}
++	if c.Underflow() {
++		out = append(out, "Underflow")
++	}
++	if c.Overflow() {
++		out = append(out, "Overflow")
++	}
++	if c.Clamped() {
++		out = append(out, "Clamped")
++	}
++	if c.DivisionByZero() {
++		out = append(out, "DivisionByZero")
++	}
++	if c.InvalidOperation() || c.DivisionImpossible() || c.DivisionUndefined() {
++		out = append(out, "InvalidOperation")
++	}
++	return out
++}
++
++func sortedFlags(xs []string) string {
++	m := map[string]bool{}
++	for _, x := range xs {
++		m[x] = true
++	}
++	var out []string
++	for k := range m {
++		out = append(out, k)
++	}
++	// small slices: insertion sort
++	for i := 1; i < len(out); i++ {
++		for j := i; j > 0 && out[j] < out[j-1]; j-- {
++			out[j], out[j-1] = out[j-1], out[j]
++		}
++	}
++	return strings.Join(out, ",")
++}
++
++// ctxOp is one Context operation and its Python counterpart.
++type ctxOp struct {
++	name  string
++	arity int
++	py    string
++	run   func(c *Context, d, x, y *Decimal, exp int32) (Condition, error)
++}
++
++var ctxOps = []ctxOp{
++	{"Add", 2, "add", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Add(d, x, y) }},
++	{"Sub", 2, "subtract", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Sub(d, x, y) }},
++	{"Mul", 2, "multiply", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Mul(d, x, y) }},
++	{"Quo", 2, "divide", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Quo(d, x, y) }},
++	{"QuoInteger", 2, "divide_int", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.QuoInteger(d, x, y) }},
++	{"Rem", 2, "remainder", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Rem(d, x, y) }},
++	{"Abs", 1, "abs", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Abs(d, x) }},
++	{"Neg", 1, "minus", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Neg(d, x) }},
++	{"Cmp", 2, "compare", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Cmp(d, x, y) }},
++	{"Quantize", 1, "quantize", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Quantize(d, x, e) }},
++	{"Reduce", 1, "reduce", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) {
++		_, res, err := c.Reduce(d, x)
++		return res, err
++	}},
++	{"Round", 1, "round", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Round(d, x) }},
++	{"RoundToIntegralExact", 1, "to_integral_exact", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.RoundToIntegralExact(d, x) }},
++	{"RoundToIntegralValue", 1, "to_integral_value", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.RoundToIntegralValue(d, x) }},
++	{"Floor", 1, "floor", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Floor(d, x) }},
++	{"Ceil", 1, "ceil", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Ceil(d, x) }},
++	{"Sqrt", 1, "sqrt", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Sqrt(d, x) }},
++	{"Exp", 1, "exp", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Exp(d, x) }},
++	{"Ln", 1, "ln", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Ln(d, x) }},
++	{"Log10", 1, "log10", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Log10(d, x) }},
++	{"Pow", 2, "power", func(c *Context, d, x, y *Decimal, e int32) (Condition, error) { return c.Pow(d, x, y) }},
++}
++
++func opByName(name string) ctxOp {
++	for _, o := range ctxOps {
++		if o.name == name {
++			return o
++		}
++	}
++	panic(name)
++}
++
++// drawContext draws a Context (no traps) and the matching Python parameters.
++func drawContext(tc hegel.TestCase, minPrec, maxPrec int) (*Context, pyReq) {
++	prec := n(tc, minPrec, maxPrec)
++	if chance(tc, 20) {
++		prec = n(tc, minPrec, min(maxPrec, 5))
++	}
++	r := pick(tc, roundings)
++	emax := pick(tc, []int{6, 99, 999, 9999})
++	emin := -emax
++	if chance(tc, 30) {
++		emin = -pick(tc, []int{6, 99, 999, 9999})
++	}
++	c := &Context{Precision: uint32(prec), MaxExponent: int32(emax), MinExponent: int32(emin), Traps: 0, Rounding: r.apd}
++	return c, pyReq{Prec: prec, Rounding: r.py, Emin: emin, Emax: emax}
++}
++
++// ulpApart reports whether two finite decimals differ by exactly one unit in the last
++// place of the result (apd's own GDA harness allows 1 ulp for exp, ln, log10 and power).
++func ulpApart(a, b *Decimal) bool {
++	if a.Form != Finite || b.Form != Finite {
++		return false
++	}
++	var diff Decimal
++	c := &Context{Precision: 0, MaxExponent: MaxExponent, MinExponent: MinExponent}
++	if _, err := c.Sub(&diff, a, b); err != nil {
++		return false
++	}
++	if diff.Form != Finite || diff.Coeff.Cmp(NewBigInt(1)) != 0 {
++		return false
++	}
++	return diff.Exponent == a.Exponent || diff.Exponent == b.Exponent
++}
++
++// sameRepr reports whether apd's result and Python's have the same representation: form,
++// sign, coefficient and exponent (apd prints small zeros as 0.000 for PostgreSQL's sake,
++// so strings are not compared).
++func sameRepr(d *Decimal, py string) bool {
++	w, _, err := NewFromString(py)
++	if err != nil {
++		return false
++	}
++	if (d.Form == NaN || d.Form == NaNSignaling) && d.Form == w.Form {
++		return true // the sign of a NaN result is pinned separately (apd/11)
++	}
++	if d.Form == Finite && w.Form == Finite && d.Coeff.Sign() == 0 && w.Coeff.Sign() == 0 {
++		return d.Negative == w.Negative // zero exponents beyond the range are clamped by Python, not apd (not counted)
++	}
++	return d.CmpTotal(w) == 0 && d.Negative == w.Negative
++}
++
++// sameValue compares numerically only (same sign of zero), for the operations whose
++// result exponent is pinned as differing from GDA's ideal exponent (apd/9, apd/10).
++func sameValue(d *Decimal, py string) bool {
++	w, _, err := NewFromString(py)
++	if err != nil {
++		return false
++	}
++	if d.Form != Finite || w.Form != Finite {
++		return sameRepr(d, py)
++	}
++	return d.Cmp(w) == 0 && d.Negative == w.Negative
++}
++
++// adjusted returns the adjusted exponent of a finite decimal (exponent of its first digit).
++func adjusted(d *Decimal) int64 { return int64(d.Exponent) + d.NumDigits() - 1 }
++
++// pinned reports whether a case has one of the shapes pinned as an expected failure, so
++// that the general properties leave it out (each is asserted by its own test below).
++func pinned(op ctxOp, c *Context, x, y *Decimal, exp int32, want pyResp) bool {
++	flags := map[string]bool{}
++	for _, f := range want.Flags {
++		flags[f] = true
++	}
++	if flags["Overflow"] {
++		return true // apd/3: overflow ignores the rounding mode
++	}
++	if flags["Subnormal"] {
++		return true // apd/2: subnormal directed rounding of negative numbers
++	}
++	switch op.name {
++	case "Quantize", "RoundToIntegralExact", "RoundToIntegralValue":
++		target := int64(exp)
++		if op.name != "Quantize" {
++			target = 0
++		}
++		if x.Form == Finite && x.Coeff.Sign() != 0 && adjusted(x) < target {
++			return true // apd/1: a value below one unit rounds to zero in every mode
++		}
++		if op.name != "Quantize" && x.Form == Finite && x.Exponent > 0 {
++			return true // apd/9: the positive exponent is not kept
++		}
++		if op.name != "Quantize" && x.Form == Finite && x.Coeff.Sign() != 0 && adjusted(x) > int64(c.MaxExponent) {
++			return true // apd clamps every result to the exponent range; GDA's to-integral does not (not counted)
++		}
++		if op.name == "Quantize" && x.Form == Finite && exp > x.Exponent &&
++			x.NumDigits()-int64(exp-x.Exponent)-1 > int64(c.MaxExponent) {
++			return true // apd/17: a result with more than MaxExponent+1 digits is NaN when digits are discarded
++		}
++	case "Floor", "Ceil":
++		if x.Form != Finite {
++			return true // apd/4
++		}
++		if flags["Rounded"] {
++			return true // apd/8: the integral part is not rounded to the precision
++		}
++	case "Neg":
++		if c.Rounding == RoundFloor && x.Form == Finite && x.Coeff.Sign() == 0 {
++			return true // GDA's minus(0) is -0 under round-floor; apd's Neg flips the sign (not counted)
++		}
++	case "Exp":
++		if c.Precision <= 3 {
++			return true // apd/5
++		}
++		if x.Form == Finite {
++			var lim Decimal
++			lim.SetInt64(20000)
++			if new(Decimal).Abs(x).Cmp(&lim) > 0 {
++				return true // apd/6
++			}
++		}
++	case "Quo":
++		if want.Result != nil && flags["Inexact"] {
++			if w, _, err := NewFromString(*want.Result); err == nil && w.Form == Finite {
++				one := "1" + strings.Repeat("0", int(c.Precision)-1)
++				if w.Coeff.String() == one {
++					return true // apd/8: a rounding carry leaves precision+1 digits
++				}
++			}
++		}
++	case "Sqrt":
++		if x.Form == Finite && x.Coeff.Sign() == 0 {
++			return true // apd/9: exponent of the square root of zero
++		}
++	case "Reduce":
++		if flags["Inexact"] {
++			return true // apd/16: zeros produced by the rounding are not removed
++		}
++	case "Rem":
++		if y.Form == Infinite {
++			return true // apd/8: the dividend comes back unrounded
++		}
++	}
++	return false
++}
++
++// compareWithPython runs one Context operation in apd and in Python and returns a
++// description of any disagreement ("" if none).  Flags named in ignore are not compared.
++func compareWithPython(ht *hegel.T, c *Context, base pyReq, op ctxOp, xs, ys string, exp int32, alias bool, oneUlp bool, ignore ...string) string {
++	x, y := parse(xs), parse(ys)
++	d := new(Decimal)
++	if alias && op.name != "Floor" && op.name != "Ceil" { // apd/15: Floor/Ceil with an aliased result
++		d = x
++	}
++	args := []string{xs}
++	if op.arity == 2 {
++		args = append(args, ys)
++	}
++	q := base
++	q.Op, q.Args, q.Exp = op.py, args, int(exp)
++	want := ask(ht, q)
++	if want.Result == nil {
++		panic("python3 oracle returned no result")
++	}
++	ht.Assume(!pinned(op, c, x, y, exp, want))
++	cond, err := op.run(c, d, x, y, exp)
++	where := fmt.Sprintf("%s(%s, %s) [prec %d %s Emax %d Emin %d]", op.name, xs, ys, c.Precision, c.Rounding, c.MaxExponent, c.MinExponent)
++	if op.arity == 1 {
++		where = fmt.Sprintf("%s(%s) [prec %d %s Emax %d Emin %d]", op.name, xs, c.Precision, c.Rounding, c.MaxExponent, c.MinExponent)
++		if op.name == "Quantize" {
++			where = fmt.Sprintf("Quantize(%s, %d) [prec %d %s Emax %d Emin %d]", xs, exp, c.Precision, c.Rounding, c.MaxExponent, c.MinExponent)
++		}
++	}
++	if err != nil {
++		return fmt.Sprintf("%s: apd error %v (condition %s); Python gives %s flags %v", where, err, cond, *want.Result, want.Flags)
++	}
++	wantS := *want.Result
++	same := sameRepr(d, wantS)
++	switch op.name {
++	case "Quo", "Log10", "Sqrt", "Exp", "Ln", "Pow":
++		same = sameValue(d, wantS) // apd/9, apd/10: the representation is pinned separately
++	}
++	if !same {
++		if w, _, err := NewFromString(wantS); oneUlp && err == nil && ulpApart(d, w) {
++			note(ht, "%s: %s is within 1 ulp of Python's %s (tolerated)", op.name, d, wantS)
++		} else {
++			return fmt.Sprintf("%s: apd %s (condition %s), Python %s (flags %v)", where, d, cond, wantS, want.Flags)
++		}
++	}
++	// Rounded is never compared: apd's own GDA harness strips it ("TODO(mjibson): after
++	// upscaling, operations need to remove the 0s added"), and apd raises it on exact zero
++	// results where Python does not.
++	drop := map[string]bool{"Rounded": true}
++	if d.Form == Finite && d.Coeff.Sign() == 0 {
++		drop["Clamped"] = true // a zero's exponent beyond the range: apd and Python flag it differently
++	}
++	for _, f := range ignore {
++		drop[f] = true
++	}
++	filter := func(fs []string) []string {
++		var out []string
++		for _, f := range fs {
++			if !drop[f] {
++				out = append(out, f)
++			}
++		}
++		return out
++	}
++	gf, wf := sortedFlags(filter(flagNames(cond))), sortedFlags(filter(want.Flags))
++	if gf != wf {
++		return fmt.Sprintf("%s = %s: apd condition %s (compared as %q), Python flags %q", where, d, cond, gf, wf)
++	}
++	return ""
++}
++
++func check(ht *hegel.T, msg string) {
++	if msg != "" {
++		ht.Fatalf("%s", msg)
++	}
++}
++
++// Add, Sub, Mul, Abs, Neg, Cmp, Round and Reduce agree with Python's decimal on finite
++// and special operands of moderate exponent: the exact result representation and every
++// condition flag.
++func TestHegelArithmeticAgreesWithPythonDecimal(t *testing.T) {
++	ops := []string{"Add", "Sub", "Mul", "Abs", "Neg", "Cmp", "Round", "Reduce", "RoundToIntegralExact", "RoundToIntegralValue", "Floor", "Ceil"}
++	property(t, func(ht *hegel.T) {
++		c, base := drawContext(ht, 1, 40)
++		op := opByName(pick(ht, ops))
++		xs, ys := genDecimal(ht, 30, 60, 5), genDecimal(ht, 30, 60, 5)
++		note(ht, "%s x=%s y=%s prec=%d rounding=%s", op.name, xs, ys, c.Precision, c.Rounding)
++		check(ht, compareWithPython(ht, c, base, op, xs, ys, 0, chance(ht, 30), false))
++	})
++}
++
++// Quo, QuoInteger and Rem agree with Python's decimal, flags included.
++func TestHegelDivisionAgreesWithPythonDecimal(t *testing.T) {
++	ops := []string{"Quo", "QuoInteger", "Rem"}
++	property(t, func(ht *hegel.T) {
++		c, base := drawContext(ht, 1, 40)
++		op := opByName(pick(ht, ops))
++		xs, ys := genDecimal(ht, 25, 40, 5), genDecimal(ht, 25, 40, 5)
++		if chance(ht, 20) {
++			ys = pick(ht, []string{"0", "-0", "0E5", "1", "-1", "2", "3", "7", "1E-3"})
++		}
++		note(ht, "%s x=%s y=%s prec=%d rounding=%s", op.name, xs, ys, c.Precision, c.Rounding)
++		check(ht, compareWithPython(ht, c, base, op, xs, ys, 0, chance(ht, 30), false))
++	})
++}
++
++// Quantize agrees with Python's decimal for every target exponent, including ones the
++// precision cannot accommodate.
++func TestHegelQuantizeAgreesWithPythonDecimal(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, base := drawContext(ht, 1, 40)
++		xs := genDecimal(ht, 30, 60, 5)
++		exp := int32(n(ht, -70, 70))
++		note(ht, "Quantize x=%s exp=%d prec=%d rounding=%s", xs, exp, c.Precision, c.Rounding)
++		check(ht, compareWithPython(ht, c, base, opByName("Quantize"), xs, "0", exp, chance(ht, 30), false))
++	})
++}
++
++// Sqrt, Ln, Log10 and Pow agree with Python's decimal to within one unit in the last place
++// (apd's own GDA harness allows that for the transcendental functions; Exp is pinned as
++// apd/5); the flags other than Rounded and Inexact are compared exactly.
++func TestHegelFunctionsAgreeWithPythonDecimal(t *testing.T) {
++	ops := []string{"Sqrt", "Ln", "Log10", "Pow"}
++	property(t, func(ht *hegel.T) {
++		c, base := drawContext(ht, 1, 30)
++		op := opByName(pick(ht, ops))
++		xs := genDecimal(ht, 20, 12, 3)
++		ys := genDecimal(ht, 3, 2, 0)
++		if op.name == "Pow" && chance(ht, 50) {
++			ys = strconv.Itoa(n(ht, -30, 30))
++		}
++		if chance(ht, 40) {
++			xs = strings.TrimPrefix(xs, "-")
++		}
++		note(ht, "%s x=%s y=%s prec=%d rounding=%s", op.name, xs, ys, c.Precision, c.Rounding)
++		check(ht, compareWithPython(ht, c, base, op, xs, ys, 0, chance(ht, 30), true, "Rounded", "Inexact"))
++	})
++}
++
++// Near the exponent limits Add, Sub, Mul and Quo agree with Python's decimal on the
++// overflow, underflow, subnormal and clamped outcomes and flags.
++func TestHegelExponentLimitsAgreeWithPythonDecimal(t *testing.T) {
++	ops := []string{"Add", "Sub", "Mul", "Quo", "Round", "Quantize", "Reduce"}
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 12)
++		r := pick(ht, roundings)
++		emax := n(ht, 2, 30)
++		emin := -n(ht, 2, 30)
++		c := &Context{Precision: uint32(prec), MaxExponent: int32(emax), MinExponent: int32(emin), Rounding: r.apd}
++		base := pyReq{Prec: prec, Rounding: r.py, Emin: emin, Emax: emax}
++		op := opByName(pick(ht, ops))
++		gen := func() string {
++			coeff := genDigits(ht, prec+3)
++			if chance(ht, 25) {
++				coeff += strings.Repeat("0", n(ht, 1, 4))
++			}
++			e := n(ht, emin-prec-4, emax+4)
++			if chance(ht, 30) {
++				e = n(ht, -3, 3)
++			}
++			s := coeff + "E" + strconv.Itoa(e)
++			if chance(ht, 45) {
++				s = "-" + s
++			}
++			return s
++		}
++		xs, ys := gen(), gen()
++		exp := int32(n(ht, emin-prec-4, emax+4))
++		note(ht, "%s x=%s y=%s exp=%d prec=%d rounding=%s Emax=%d Emin=%d", op.name, xs, ys, exp, prec, r.apd, emax, emin)
++		check(ht, compareWithPython(ht, c, base, op, xs, ys, exp, chance(ht, 30), false))
++	})
++}
++
++// With Precision 0, Add, Sub, Mul, Abs, Neg and Reduce are exact: the result equals the
++// unrounded value Python computes with ample precision and no flags are raised.
++func TestHegelZeroPrecisionIsExact(t *testing.T) {
++	ops := []string{"Add", "Sub", "Mul", "Abs", "Neg", "Reduce", "Cmp"}
++	property(t, func(ht *hegel.T) {
++		r := pick(ht, roundings)
++		c := &Context{Precision: 0, MaxExponent: MaxExponent, MinExponent: MinExponent, Rounding: r.apd}
++		base := pyReq{Prec: 400, Rounding: r.py, Emin: -MaxExponent, Emax: MaxExponent}
++		op := opByName(pick(ht, ops))
++		xs, ys := genDecimal(ht, 40, 100, 5), genDecimal(ht, 40, 100, 5)
++		note(ht, "%s x=%s y=%s", op.name, xs, ys)
++		check(ht, compareWithPython(ht, c, base, op, xs, ys, 0, chance(ht, 30), false))
++	})
++}
++
++// Context.SetString rounds a parsed string exactly as Python's create_decimal, with the
++// same flags; the plain SetString keeps the exact representation, and String() round
++// trips through both parsers.
++func TestHegelSetStringAgreesWithPythonDecimal(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, base := drawContext(ht, 1, 40)
++		xs := genDecimal(ht, 40, 80, 5)
++		// Spell it in one of the ways both parsers accept.
++		spell := xs
++		if d := parse(xs); d.Form == Finite && chance(ht, 50) {
++			spell = pick(ht, []string{d.Text('e'), d.Text('E'), d.Text('f'), d.Text('g'), d.Text('G'), d.String()})
++		}
++		note(ht, "s=%q prec=%d rounding=%s", spell, c.Precision, c.Rounding)
++		q := base
++		q.Op, q.Args = "round", []string{spell}
++		want := ask(ht, q)
++		ht.Assume(!strings.Contains(strings.Join(want.Flags, ","), "Overflow"))  // apd/3
++		ht.Assume(!strings.Contains(strings.Join(want.Flags, ","), "Subnormal")) // apd/2
++		d, cond, err := c.NewFromString(spell)
++		if err != nil {
++			ht.Fatalf("NewFromString(%q): %v", spell, err)
++		}
++		if !sameRepr(d, *want.Result) {
++			ht.Fatalf("Context.NewFromString(%q) [prec %d %s] = %s, Python create_decimal %s", spell, c.Precision, c.Rounding, d, *want.Result)
++		}
++		noRounded := func(fs []string) (out []string) {
++			for _, f := range fs {
++				if f != "Rounded" {
++					out = append(out, f)
++				}
++			}
++			return
++		}
++		if gf, wf := sortedFlags(noRounded(flagNames(cond))), sortedFlags(noRounded(want.Flags)); gf != wf {
++			ht.Fatalf("Context.NewFromString(%q) [prec %d %s]: condition %s (%q), Python flags %q", spell, c.Precision, c.Rounding, cond, gf, wf)
++		}
++		// The exact parse and its string round trip.
++		e, cond, err := NewFromString(spell)
++		if err != nil || cond != 0 {
++			ht.Fatalf("NewFromString(%q): %v, condition %s", spell, err, cond)
++		}
++		q.Op, q.Args, q.Prec = "to_sci", []string{spell}, 400
++		if want := ask(ht, q); !sameRepr(e, *want.Result) {
++			ht.Fatalf("NewFromString(%q).String() = %s, Python str() %s", spell, e, *want.Result)
++		}
++		back, _, err := NewFromString(e.String())
++		if err != nil || back.CmpTotal(e) != 0 {
++			ht.Fatalf("String round trip of %q: %s -> %s (%v)", spell, e, back, err)
++		}
++	})
++}
++
++// CmpTotal agrees with Python's compare_total, and Cmp with compare (finite operands).
++func TestHegelCmpTotalAgreesWithPythonDecimal(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		xs, ys := genDecimal(ht, 20, 30, 10), genDecimal(ht, 20, 30, 10)
++		if chance(ht, 30) {
++			// Same value, different representation.
++			d := parse(xs)
++			if d.Form == Finite {
++				k := n(ht, 0, 5)
++				var e Decimal
++				e.Set(d)
++				e.Coeff.Mul(&e.Coeff, toApd("1"+strings.Repeat("0", k)))
++				e.Exponent -= int32(k)
++				ys = e.String()
++			}
++		}
++		x, y := parse(xs), parse(ys)
++		q := pyReq{Op: "compare_total", Args: []string{xs, ys}, Prec: 40, Rounding: "ROUND_HALF_EVEN", Emin: -999, Emax: 999}
++		want := ask(ht, q)
++		if got := strconv.Itoa(x.CmpTotal(y)); got != *want.Result {
++			ht.Fatalf("CmpTotal(%s, %s) = %s, Python compare_total %s", xs, ys, got, *want.Result)
++		}
++		if x.Form == Finite && y.Form == Finite {
++			q.Op = "compare"
++			want = ask(ht, q)
++			if got := strconv.Itoa(x.Cmp(y)); got != *want.Result {
++				ht.Fatalf("Cmp(%s, %s) = %s, Python compare %s", xs, ys, got, *want.Result)
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------------------
++// Decimal-level helpers against models.
++
++// model renders a finite decimal (coefficient digits, exponent, sign) the way the Text
++// documentation describes for 'e', 'E' and 'f'.
++func modelText(neg bool, digits string, exp int, format byte) string {
++	sign := ""
++	if neg {
++		sign = "-"
++	}
++	switch format {
++	case 'e', 'E':
++		adj := exp + len(digits) - 1
++		s := digits[:1]
++		if len(digits) > 1 {
++			s += "." + digits[1:]
++		}
++		es := strconv.Itoa(adj)
++		if adj < 0 {
++			es = strconv.Itoa(-adj)
++		}
++		if adj < 0 {
++			es = "-" + es
++		} else {
++			es = "+" + es
++		}
++		return sign + s + string(format) + es
++	case 'f':
++		if exp >= 0 {
++			return sign + digits + strings.Repeat("0", exp)
++		}
++		frac := -exp
++		if frac >= len(digits) {
++			return sign + "0." + strings.Repeat("0", frac-len(digits)) + digits
++		}
++		return sign + digits[:len(digits)-frac] + "." + digits[len(digits)-frac:]
++	}
++	panic("format")
++}
++
++// Text('e'), Text('E') and Text('f') render the exact coefficient and exponent (the
++// exponent with as many digits as it needs — the documented two-digit minimum is apd/13);
++// 'g'/'G' pick one of them; String() parses back to the same representation;
++// Append equals Text; fmt's %e/%f/%g/%v agree with Text and honour width and sign flags.
++func TestHegelTextFormatsAgreeWithTheModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		xs := genDecimal(ht, 25, 40, 0)
++		d := parse(xs)
++		neg := strings.HasPrefix(xs, "-")
++		digits := d.Coeff.String()
++		exp := int(d.Exponent)
++		note(ht, "x=%s digits=%s exp=%d", xs, digits, exp)
++		for _, f := range []byte{'e', 'E', 'f'} {
++			if got, want := d.Text(f), modelText(neg, digits, exp, f); got != want {
++				ht.Fatalf("Text(%q) of %s = %q, want %q", f, xs, got, want)
++			}
++			if got := string(d.Append([]byte("v="), f)); got != "v="+d.Text(f) {
++				ht.Fatalf("Append(%q) of %s = %q, Text gives %q", f, xs, got, d.Text(f))
++			}
++		}
++		for _, f := range []byte{'g', 'G'} {
++			got := d.Text(f)
++			e := d.Text(f - 'g' + 'e')
++			if got != e && got != d.Text('f') {
++				ht.Fatalf("Text(%q) of %s = %q, neither %q nor %q", f, xs, got, e, d.Text('f'))
++			}
++			back, _, err := NewFromString(got)
++			if err != nil || back.CmpTotal(d) != 0 {
++				ht.Fatalf("Text(%q) of %s = %q does not parse back to it: %s %v", f, xs, got, back, err)
++			}
++		}
++		if d.String() != d.Text('G') {
++			ht.Fatalf("String() of %s = %q, Text('G') = %q", xs, d.String(), d.Text('G'))
++		}
++		for _, verb := range []string{"%e", "%E", "%f", "%F", "%g", "%G", "%v", "%s"} {
++			f := verb[1]
++			switch f {
++			case 'F':
++				f = 'f'
++			case 'v', 's':
++				f = 'G'
++			}
++			if got, want := fmt.Sprintf(verb, d), d.Text(f); got != want {
++				ht.Fatalf("Sprintf(%q, %s) = %q, Text(%q) = %q", verb, xs, got, f, want)
++			}
++		}
++		// Width, '+' and '-' flags.
++		w := n(ht, 0, 40)
++		plain := d.Text('e')
++		if got := fmt.Sprintf("%*e", w, d); strings.TrimLeft(got, " ") != plain || len(got) != max(w, len(plain)) {
++			ht.Fatalf("Sprintf(%%%de, %s) = %q", w, xs, got)
++		}
++		if got := fmt.Sprintf("%-*e|", w, d); strings.TrimRight(got, " |") != plain || len(got) != max(w, len(plain))+1 {
++			ht.Fatalf("Sprintf(%%-%de, %s) = %q", w, xs, got)
++		}
++		if got := fmt.Sprintf("%+f", d); !neg && got != "+"+d.Text('f') || neg && got != d.Text('f') {
++			ht.Fatalf("Sprintf(%%+f, %s) = %q", xs, got)
++		}
++		if got := fmt.Sprintf("% f", d); !neg && got != " "+d.Text('f') || neg && got != d.Text('f') {
++			ht.Fatalf("Sprintf(%% f, %s) = %q", xs, got)
++		}
++		if got := fmt.Sprintf("%0*f", w, d); len(got) != max(w, len(d.Text('f'))) || strings.TrimLeft(strings.TrimPrefix(got, "-"), "0") != strings.TrimLeft(strings.TrimPrefix(d.Text('f'), "-"), "0") {
++			ht.Fatalf("Sprintf(%%0%df, %s) = %q, Text('f') = %q", w, xs, got, d.Text('f'))
++		}
++	})
++}
++
++// Float64 equals strconv.ParseFloat of the decimal's text; SetFloat64 holds the exact
++// binary value; Int64 is exact or an error; Scan/Value round trip through every supported
++// source type; MarshalText/UnmarshalText round trip.
++func TestHegelConversionsAgreeWithStrconv(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		xs := genDecimal(ht, 25, 330, 5)
++		d := parse(xs)
++		note(ht, "x=%s", xs)
++		// Float64.
++		f, err := d.Float64()
++		want, werr := strconv.ParseFloat(d.String(), 64)
++		if (err != nil) != (werr != nil) || (err == nil && !(f == want || math.IsNaN(f) && math.IsNaN(want))) {
++			ht.Fatalf("Float64 of %s = %v (%v); strconv.ParseFloat gives %v (%v)", xs, f, err, want, werr)
++		}
++		// Int64: exact integers in range only.
++		i, err := d.Int64()
++		var wantI *big.Int
++		if d.Form == Finite {
++			var r big.Rat
++			if _, ok := r.SetString(d.String()); ok && r.IsInt() && r.Num().IsInt64() {
++				wantI = r.Num()
++			}
++		}
++		if (wantI == nil) != (err != nil) || wantI != nil && i != wantI.Int64() {
++			ht.Fatalf("Int64 of %s = %d (%v); model %v", xs, i, err, wantI)
++		}
++		// MarshalText round trip.
++		text, err := d.MarshalText()
++		if err != nil {
++			ht.Fatalf("MarshalText of %s: %v", xs, err)
++		}
++		var back Decimal
++		if err := back.UnmarshalText(text); err != nil || back.CmpTotal(d) != 0 {
++			ht.Fatalf("UnmarshalText(%q) = %s (%v), want %s", text, &back, err, d)
++		}
++		// sql Scan from string, []byte and its own Value.
++		v, err := d.Value()
++		if err != nil {
++			ht.Fatalf("Value of %s: %v", xs, err)
++		}
++		for _, src := range []interface{}{d.String(), []byte(d.String()), v} {
++			var s Decimal
++			if err := s.Scan(src); err != nil || s.CmpTotal(d) != 0 {
++				ht.Fatalf("Scan(%#v) = %s (%v), want %s", src, &s, err, d)
++			}
++		}
++		// Scan from int64 and float64 sources.
++		k := int64(n(ht, -1<<40, 1<<40)) * int64(n(ht, 1, 1<<20))
++		var s Decimal
++		if err := s.Scan(k); err != nil || s.String() != strconv.FormatInt(k, 10) {
++			ht.Fatalf("Scan(int64 %d) = %s (%v)", k, &s, err)
++		}
++		if d.Form == Finite && err == nil {
++			if f, err := d.Float64(); err == nil && !math.IsInf(f, 0) {
++				var s Decimal
++				if err := s.Scan(f); err != nil {
++					ht.Fatalf("Scan(float64 %v): %v", f, err)
++				}
++				if g, _ := s.Float64(); g != f {
++					ht.Fatalf("Scan(float64 %v) = %s, whose Float64 is %v", f, &s, g)
++				}
++			}
++		}
++	})
++}
++
++// SetFloat64 sets the shortest decimal that converts back to the float, with its sign,
++// and Float64 inverts it.
++func TestHegelSetFloat64RoundTrips(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var f float64
++		switch n(ht, 0, 3) {
++		case 0:
++			f = math.Float64frombits(uint64(hegel.Draw(ht, hegel.Integers[int64](math.MinInt64, math.MaxInt64))))
++		case 1:
++			f = float64(n(ht, -1000000, 1000000)) / float64(n(ht, 1, 1000))
++		case 2:
++			f = pick(ht, []float64{0, math.Copysign(0, -1), 1, -1, 0.1, 1e-320, 5e-324, math.MaxFloat64, math.SmallestNonzeroFloat64, 1e22, 1e23, 123456789.125})
++		default:
++			f = math.Ldexp(float64(n(ht, -1<<30, 1<<30)), n(ht, -1074, 970))
++		}
++		if math.IsNaN(f) || math.IsInf(f, 0) {
++			ht.Assume(false)
++		}
++		note(ht, "f=%v bits=%x", f, math.Float64bits(f))
++		var d Decimal
++		if _, err := d.SetFloat64(f); err != nil {
++			ht.Fatalf("SetFloat64(%v): %v", f, err)
++		}
++		// The value is the shortest decimal that round-trips to f (the exact binary value the
++		// documentation promises is pinned as apd/14).
++		if want := strconv.FormatFloat(f, 'e', -1, 64); parse(want).Cmp(&d) != 0 {
++			ht.Fatalf("SetFloat64(%v) = %s, shortest representation %s", f, d.Text('e'), want)
++		}
++		if math.Signbit(f) != d.Negative && f != 0 {
++			ht.Fatalf("SetFloat64(%v): Negative=%v", f, d.Negative)
++		}
++		if back, err := d.Float64(); err != nil || back != f {
++			ht.Fatalf("SetFloat64(%v).Float64() = %v (%v)", f, back, err)
++		}
++	})
++}
++
++// Modf splits a decimal into integral and fractional parts that add back exactly, with
++// the documented signs and exponents; Reduce removes exactly the trailing zeros; Abs, Neg,
++// Sign and IsZero are consistent; Compose(Decompose) is the identity.
++func TestHegelDecimalHelpersAgreeWithTheModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		xs := genDecimal(ht, 30, 50, 5)
++		d := parse(xs)
++		note(ht, "x=%s", xs)
++		if d.Form == Finite {
++			var integ, frac Decimal
++			d.Modf(&integ, &frac)
++			var sum Decimal
++			c := &Context{Precision: 0, MaxExponent: MaxExponent, MinExponent: MinExponent}
++			if _, err := c.Add(&sum, &integ, &frac); err != nil {
++				ht.Fatalf("Modf(%s) parts %s + %s: %v", xs, &integ, &frac, err)
++			}
++			if sum.Cmp(d) != 0 {
++				ht.Fatalf("Modf(%s) = %s + %s = %s", xs, &integ, &frac, &sum)
++			}
++			if integ.Exponent < 0 || frac.Exponent > 0 {
++				ht.Fatalf("Modf(%s): integ exponent %d, frac exponent %d", xs, integ.Exponent, frac.Exponent)
++			}
++			if d.Sign() < 0 && (integ.Sign() > 0 || frac.Sign() > 0) || d.Sign() > 0 && (integ.Sign() < 0 || frac.Sign() < 0) {
++				ht.Fatalf("Modf(%s): signs %s %s", xs, &integ, &frac)
++			}
++			var fr big.Rat
++			fr.SetString(frac.Text('e'))
++			if fr.Cmp(big.NewRat(1, 1)) >= 0 || fr.Cmp(big.NewRat(-1, 1)) <= 0 {
++				ht.Fatalf("Modf(%s): fractional part %s not in (-1, 1)", xs, &frac)
++			}
++			// Modf with one nil argument.
++			var only Decimal
++			d.Modf(&only, nil)
++			if only.CmpTotal(&integ) != 0 {
++				ht.Fatalf("Modf(%s, nil) integ %s, both-arg call gave %s", xs, &only, &integ)
++			}
++			d.Modf(nil, &only)
++			if only.CmpTotal(&frac) != 0 {
++				ht.Fatalf("Modf(nil, %s) frac %s, both-arg call gave %s", xs, &only, &frac)
++			}
++
++			// Reduce.
++			var r Decimal
++			_, k := r.Reduce(d)
++			digits := d.Coeff.String()
++			wantK := len(digits) - len(strings.TrimRight(digits, "0"))
++			if digits == "0" {
++				wantK = 0
++			}
++			if k != wantK || r.Cmp(d) != 0 || (r.Coeff.Sign() != 0 && strings.HasSuffix(r.Coeff.String(), "0")) || (r.Negative != d.Negative && d.Coeff.Sign() != 0) {
++				ht.Fatalf("Reduce(%s) = %s removing %d zeros; want %d removed", xs, &r, k, wantK)
++			}
++		}
++		// Abs / Neg / Sign / IsZero.
++		var a, ng Decimal
++		a.Abs(d)
++		ng.Neg(d)
++		if a.Negative || (d.Form != NaN && d.Form != NaNSignaling && (a.Sign() < 0 || ng.Sign() != -d.Sign())) {
++			ht.Fatalf("Abs(%s) = %s, Neg = %s", xs, &a, &ng)
++		}
++		if d.IsZero() != (d.Form == Finite && d.Coeff.Sign() == 0) {
++			ht.Fatalf("IsZero(%s) = %v", xs, d.IsZero())
++		}
++		// Decompose / Compose (the form byte has no signaling NaN).
++		if d.Form == NaNSignaling {
++			return
++		}
++		form, negative, coeff, exp := d.Decompose(nil)
++		var back Decimal
++		if err := back.Compose(form, negative, coeff, exp); err != nil || back.CmpTotal(d) != 0 || back.Negative != d.Negative {
++			ht.Fatalf("Compose(Decompose(%s)) = %s (%v)", xs, &back, err)
++		}
++	})
++}
++
++// ErrDecimal computes what the Context computes, stops at the first error and reports it.
++func TestHegelErrDecimalMatchesContext(t *testing.T) {
++	ops := []string{"Add", "Sub", "Mul", "Quo", "QuoInteger", "Rem", "Abs", "Neg", "Sqrt", "Ln", "Exp", "Log10", "Pow", "Floor", "Ceil", "Round", "RoundToIntegralExact", "RoundToIntegralValue"}
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 20)
++		c := &Context{Precision: uint32(prec), MaxExponent: int32(n(ht, 5, 999)), MinExponent: -int32(n(ht, 5, 999)), Traps: DefaultTraps, Rounding: pick(ht, roundings).apd}
++		if chance(ht, 30) {
++			c.Traps |= Inexact
++		}
++		e := MakeErrDecimal(c)
++		steps := n(ht, 1, 6)
++		var firstErr error
++		var flags Condition
++		for i := 0; i < steps; i++ {
++			name := pick(ht, ops)
++			xs, ys := genDecimal(ht, 10, 8, 4), genDecimal(ht, 5, 3, 2)
++			x, y := parse(xs), parse(ys)
++			var want, got Decimal
++			var cond Condition
++			var err error
++			switch name {
++			case "Add":
++				cond, err = c.Add(&want, x, y)
++				e.Add(&got, x, y)
++			case "Sub":
++				cond, err = c.Sub(&want, x, y)
++				e.Sub(&got, x, y)
++			case "Mul":
++				cond, err = c.Mul(&want, x, y)
++				e.Mul(&got, x, y)
++			case "Quo":
++				cond, err = c.Quo(&want, x, y)
++				e.Quo(&got, x, y)
++			case "QuoInteger":
++				cond, err = c.QuoInteger(&want, x, y)
++				e.QuoInteger(&got, x, y)
++			case "Rem":
++				cond, err = c.Rem(&want, x, y)
++				e.Rem(&got, x, y)
++			case "Abs":
++				cond, err = c.Abs(&want, x)
++				e.Abs(&got, x)
++			case "Neg":
++				cond, err = c.Neg(&want, x)
++				e.Neg(&got, x)
++			case "Sqrt":
++				cond, err = c.Sqrt(&want, x)
++				e.Sqrt(&got, x)
++			case "Ln":
++				cond, err = c.Ln(&want, x)
++				e.Ln(&got, x)
++			case "Exp":
++				cond, err = c.Exp(&want, x)
++				e.Exp(&got, x)
++			case "Log10":
++				cond, err = c.Log10(&want, x)
++				e.Log10(&got, x)
++			case "Pow":
++				cond, err = c.Pow(&want, x, y)
++				e.Pow(&got, x, y)
++			case "Floor":
++				cond, err = c.Floor(&want, x)
++				e.Floor(&got, x)
++			case "Ceil":
++				cond, err = c.Ceil(&want, x)
++				e.Ceil(&got, x)
++			case "Round":
++				cond, err = c.Round(&want, x)
++				e.Round(&got, x)
++			case "RoundToIntegralExact":
++				cond, err = c.RoundToIntegralExact(&want, x)
++				e.RoundToIntegralExact(&got, x)
++			case "RoundToIntegralValue":
++				cond, err = c.RoundToIntegralValue(&want, x)
++				e.RoundToIntegralValue(&got, x)
++			}
++			if firstErr == nil {
++				flags |= cond
++				if err != nil {
++					firstErr = err
++				} else if got.CmpTotal(&want) != 0 {
++					ht.Fatalf("step %d %s(%s, %s): ErrDecimal %s, Context %s", i, name, xs, ys, &got, &want)
++				}
++			}
++		}
++		if (e.Err() == nil) != (firstErr == nil) || firstErr != nil && e.Err().Error() != firstErr.Error() {
++			ht.Fatalf("ErrDecimal.Err() = %v, Context's first error %v", e.Err(), firstErr)
++		}
++		if firstErr == nil && e.Flags != flags {
++			ht.Fatalf("ErrDecimal.Flags = %s, accumulated conditions %s", e.Flags, flags)
++		}
++	})
++}
++
++// gob-encoding a Decimal's coefficient (BigInt) and text-marshalling round trip through
++// the standard encoders.
++func TestHegelBigIntEncodingRoundTrips(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		xs := genInt(ht, 60)
++		x := toApd(xs)
++		var buf bytes.Buffer
++		if err := gob.NewEncoder(&buf).Encode(x); err != nil {
++			ht.Fatalf("gob encode %s: %v", xs, err)
++		}
++		var back BigInt
++		if err := gob.NewDecoder(&buf).Decode(&back); err != nil || back.Cmp(x) != 0 {
++			ht.Fatalf("gob round trip of %s: %s (%v)", xs, &back, err)
++		}
++		j, err := json.Marshal(x)
++		if err != nil || string(j) != xs {
++			ht.Fatalf("json.Marshal(%s) = %s (%v)", xs, j, err)
++		}
++		var jb BigInt
++		if err := json.Unmarshal(j, &jb); err != nil || jb.Cmp(x) != 0 {
++			ht.Fatalf("json round trip of %s: %s (%v)", xs, &jb, err)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------------------
++// Pinned bugs (expected failures; see bugs.toml).
++
++// wantDecimal fails unless d has exactly the representation want (sign, coefficient,
++// exponent, form).
++func wantDecimal(t *hegel.T, what string, d *Decimal, want string) {
++	w := parse(want)
++	if d.CmpTotal(w) != 0 || d.Negative != w.Negative {
++		t.Fatalf("%s = %s, want %s", what, d, want)
++	}
++}
++
++// apd/1: a value smaller than one unit of the target exponent rounds to zero under every
++// rounding mode; ceiling, floor (for negatives), up and 05up must produce one unit.
++func TestHegelQuantizeRoundsTinyValuesInTheRoundingDirection(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := &Context{Precision: 10, MaxExponent: 999, MinExponent: -999}
++		exp := int32(n(ht, -5, 5))
++		digits := genDigits(ht, 4)
++		ht.Assume(digits != "0")
++		// |x| < 10^exp: put the digits at least two places below the target exponent.
++		x := parse(digits + "E" + strconv.Itoa(int(exp)-len(digits)-n(ht, 1, 30)))
++		var d Decimal
++		c.Rounding = RoundUp
++		if _, err := c.Quantize(&d, x, exp); err != nil {
++			ht.Fatalf("Quantize: %v", err)
++		}
++		wantDecimal(ht, fmt.Sprintf("Quantize(%s, %d) with RoundUp", x, exp), &d, "1E"+strconv.Itoa(int(exp)))
++		c.Rounding = RoundCeiling
++		c.Quantize(&d, x, exp)
++		wantDecimal(ht, fmt.Sprintf("Quantize(%s, %d) with RoundCeiling", x, exp), &d, "1E"+strconv.Itoa(int(exp)))
++		c.Rounding = RoundFloor
++		neg := new(Decimal).Neg(x)
++		c.Quantize(&d, neg, exp)
++		wantDecimal(ht, fmt.Sprintf("Quantize(%s, %d) with RoundFloor", neg, exp), &d, "-1E"+strconv.Itoa(int(exp)))
++		if exp == 0 {
++			c.Rounding = RoundCeiling
++			c.RoundToIntegralValue(&d, x)
++			wantDecimal(ht, fmt.Sprintf("RoundToIntegralValue(%s) with RoundCeiling", x), &d, "1")
++			c.Rounding = RoundFloor
++			c.RoundToIntegralExact(&d, neg)
++			wantDecimal(ht, fmt.Sprintf("RoundToIntegralExact(%s) with RoundFloor", neg), &d, "-1")
++		}
++	})
++}
++
++// apd/2: in the subnormal range, RoundCeiling and RoundFloor act on negative numbers as if
++// they were positive (ceiling moves away from zero, floor towards it).
++func TestHegelSubnormalDirectedRoundingRespectsTheSign(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 5)
++		emin := -n(ht, 2, 9)
++		etiny := emin - prec + 1
++		c := &Context{Precision: uint32(prec), MaxExponent: 99, MinExponent: int32(emin)}
++		// A negative value strictly between two multiples of 10^etiny.
++		digits := genDigits(ht, 3)
++		ht.Assume(!strings.HasSuffix(digits, "0"))
++		x := parse("-" + digits + "E" + strconv.Itoa(etiny-len(digits)))
++		q := pyReq{Prec: prec, Rounding: "ROUND_CEILING", Emin: emin, Emax: 99, Op: "multiply", Args: []string{x.String(), "1"}}
++		wantCeil := *ask(ht, q).Result
++		q.Rounding = "ROUND_FLOOR"
++		wantFloor := *ask(ht, q).Result
++		var d Decimal
++		c.Rounding = RoundCeiling
++		if _, err := c.Mul(&d, x, New(1, 0)); err != nil {
++			ht.Fatalf("Mul: %v", err)
++		}
++		wantDecimal(ht, fmt.Sprintf("Mul(%s, 1) with RoundCeiling [prec %d Emin %d]", x, prec, emin), &d, wantCeil)
++		c.Rounding = RoundFloor
++		c.Mul(&d, x, New(1, 0))
++		wantDecimal(ht, fmt.Sprintf("Mul(%s, 1) with RoundFloor [prec %d Emin %d]", x, prec, emin), &d, wantFloor)
++	})
++}
++
++// apd/3: on overflow, RoundDown, Round05Up, RoundCeiling (negative results) and RoundFloor
++// (positive results) give the largest finite number, not infinity.
++func TestHegelOverflowRoundsToTheLargestFiniteNumber(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 8)
++		emax := n(ht, 1, 20)
++		c := &Context{Precision: uint32(prec), MaxExponent: int32(emax), MinExponent: -int32(emax)}
++		digits := genDigits(ht, prec)
++		ht.Assume(digits != "0")
++		x := parse(digits + "E" + strconv.Itoa(emax+n(ht, 1, 10)))
++		nines := strings.Repeat("9", prec) + "E" + strconv.Itoa(emax-prec+1)
++		var d Decimal
++		for _, r := range []Rounder{RoundDown, Round05Up, RoundFloor} {
++			c.Rounding = r
++			if _, err := c.Add(&d, x, New(0, 0)); err != nil {
++				ht.Fatalf("Add: %v", err)
++			}
++			wantDecimal(ht, fmt.Sprintf("Add(%s, 0) with %s [prec %d Emax %d]", x, r, prec, emax), &d, nines)
++		}
++		neg := new(Decimal).Neg(x)
++		for _, r := range []Rounder{RoundDown, Round05Up, RoundCeiling} {
++			c.Rounding = r
++			c.Add(&d, neg, New(0, 0))
++			wantDecimal(ht, fmt.Sprintf("Add(%s, 0) with %s [prec %d Emax %d]", neg, r, prec, emax), &d, "-"+nines)
++		}
++	})
++}
++
++// apd/4: Ceil and Floor of +Infinity return 0, of NaN return Infinity, and a signaling NaN
++// raises nothing.
++func TestHegelCeilAndFloorOfSpecialValues(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := &Context{Precision: uint32(n(ht, 1, 20)), MaxExponent: 999, MinExponent: -999, Rounding: pick(ht, roundings).apd}
++		var d Decimal
++		for _, s := range []string{"Infinity", "NaN", "-NaN"} {
++			x := parse(s)
++			c.Ceil(&d, x)
++			wantDecimal(ht, "Ceil("+s+")", &d, s)
++			c.Floor(&d, x)
++			wantDecimal(ht, "Floor("+s+")", &d, s)
++		}
++		cond, _ := c.Ceil(&d, parse("sNaN"))
++		if !cond.InvalidOperation() || d.Form != NaN {
++			ht.Fatalf("Ceil(sNaN) = %s, condition %s; want NaN with invalid operation", &d, cond)
++		}
++	})
++}
++
++// apd/5: Exp is not correctly rounded — far off at precision 1–3 for arguments with a
++// fractional part, and more than one ulp off at higher precisions.
++func TestHegelExpIsAccurateAtLowPrecision(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 12)
++		xs := strconv.Itoa(n(ht, 5, 80)) + "." + genDigits(ht, 8)
++		if chance(ht, 30) {
++			xs = "-" + xs
++		}
++		c := &Context{Precision: uint32(prec), MaxExponent: 9999, MinExponent: -9999, Rounding: RoundHalfEven}
++		q := pyReq{Prec: prec, Rounding: "ROUND_HALF_EVEN", Emin: -9999, Emax: 9999, Op: "exp", Args: []string{xs}}
++		want := *ask(ht, q).Result
++		var d Decimal
++		if _, err := c.Exp(&d, parse(xs)); err != nil {
++			ht.Fatalf("Exp: %v", err)
++		}
++		if !sameValue(&d, want) && !ulpApart(&d, parse(want)) {
++			ht.Fatalf("Exp(%s) at precision %d = %s, want %s (within 1 ulp)", xs, prec, &d, want)
++		}
++	})
++}
++
++// apd/6: Exp overflows or underflows for arguments beyond about ±23 000 although the result
++// (10^±10 000 and beyond) is within the context's exponent range.
++func TestHegelExpStaysFiniteWithinTheExponentRange(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		x := n(ht, 30000, 200000)
++		if chance(ht, 50) {
++			x = -x
++		}
++		c := &Context{Precision: 5, MaxExponent: 99999, MinExponent: -99999, Rounding: RoundHalfEven}
++		q := pyReq{Prec: 5, Rounding: "ROUND_HALF_EVEN", Emin: -99999, Emax: 99999, Op: "exp", Args: []string{strconv.Itoa(x)}}
++		want := *ask(ht, q).Result
++		var d Decimal
++		cond, err := c.Exp(&d, New(int64(x), 0))
++		if err != nil {
++			ht.Fatalf("Exp(%d): %v", x, err)
++		}
++		if !sameValue(&d, want) && !ulpApart(&d, parse(want)) {
++			ht.Fatalf("Exp(%d) [prec 5 Emax 99999] = %s (condition %s), want %s", x, &d, cond, want)
++		}
++	})
++}
++
++// apd/7: QuoInteger does not check its result against MaxExponent.
++func TestHegelQuoIntegerRespectsMaxExponent(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		emax := n(ht, 1, 10)
++		prec := n(ht, emax+3, 30)
++		c := &Context{Precision: uint32(prec), MaxExponent: int32(emax), MinExponent: -int32(emax)}
++		// x/y is an integer with more than emax+1 digits but at most prec.
++		digits := genDigits(ht, prec-emax-2)
++		ht.Assume(digits != "0")
++		q := parse(digits + strings.Repeat("0", emax+1))
++		y := parse(strconv.Itoa(n(ht, 1, 9)))
++		var x Decimal
++		(&Context{Precision: 60, MaxExponent: 999, MinExponent: -999}).Mul(&x, q, y)
++		var d Decimal
++		cond, err := c.QuoInteger(&d, &x, y)
++		if err == nil && !cond.Overflow() {
++			ht.Fatalf("QuoInteger(%s, %s) [prec %d Emax %d] = %s with condition %s: no overflow", &x, y, prec, emax, &d, cond)
++		}
++	})
++}
++
++// apd/8: results with more digits than the precision: when rounding a quotient carries
++// into a new digit, Quo keeps precision+1 digits (Quo(9.6, 1) at precision 1 is 10, not
++// 1E+1); Rem by an infinity returns the dividend unrounded, and Floor/Ceil never round the
++// integral part to the precision.
++func TestHegelResultsFitThePrecision(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 10)
++		c := &Context{Precision: uint32(prec), MaxExponent: 999, MinExponent: -999, Rounding: RoundHalfUp}
++		var d Decimal
++		if chance(ht, 40) {
++			x := parse(genDigits(ht, prec+n(ht, 1, 5)))
++			ht.Assume(x.NumDigits() > int64(prec))
++			if chance(ht, 50) {
++				if _, err := c.Rem(&d, x, parse("Infinity")); err != nil {
++					ht.Fatalf("Rem: %v", err)
++				}
++				if d.NumDigits() > int64(prec) {
++					ht.Fatalf("Rem(%s, Infinity) at precision %d = %s, which has %d digits", x, prec, &d, d.NumDigits())
++				}
++				return
++			}
++			if chance(ht, 50) {
++				x = parse(x.String() + "." + strconv.Itoa(n(ht, 1, 9)))
++			}
++			if _, err := c.Floor(&d, x); err != nil {
++				ht.Fatalf("Floor: %v", err)
++			}
++			if d.NumDigits() > int64(prec) {
++				ht.Fatalf("Floor(%s) at precision %d = %s, which has %d digits", x, prec, &d, d.NumDigits())
++			}
++			return
++		}
++		x := parse(strings.Repeat("9", prec) + "." + strconv.Itoa(n(ht, 5, 9)) + "E" + strconv.Itoa(n(ht, -5, 5)))
++		y := parse(pick(ht, []string{"1", "1.0", "10", "0.1", "-1"}))
++		if _, err := c.Quo(&d, x, y); err != nil {
++			ht.Fatalf("Quo: %v", err)
++		}
++		if d.NumDigits() > int64(prec) {
++			ht.Fatalf("Quo(%s, %s) at precision %d = %s, which has %d digits", x, y, prec, &d, d.NumDigits())
++		}
++	})
++}
++
++// apd/15: Floor and Ceil with the result aliased to the operand (documented as safe) lose
++// the step when the integral part is zero: c.Floor(x, x) of -0.01 is -0, not -1.
++func TestHegelFloorAndCeilWithAliasedOperand(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := &Context{Precision: uint32(n(ht, 1, 20)), MaxExponent: 999, MinExponent: -999, Rounding: pick(ht, roundings).apd}
++		digits := genDigits(ht, 6)
++		ht.Assume(digits != "0")
++		s := digits + "E" + strconv.Itoa(-len(digits)-n(ht, 0, 30))
++		var want Decimal
++		x := parse(s)
++		c.Ceil(&want, x)
++		c.Ceil(x, x)
++		wantDecimal(ht, fmt.Sprintf("Ceil(x, x) of %s", s), x, want.String())
++		neg := parse("-" + s)
++		c.Floor(&want, neg)
++		c.Floor(neg, neg)
++		wantDecimal(ht, fmt.Sprintf("Floor(x, x) of -%s", s), neg, want.String())
++	})
++}
++
++// apd/16: Reduce removes trailing zeros before rounding, so zeros the rounding produces
++// stay (Reduce(1001) at precision 2 is 1.0E+3, not 1E+3).
++func TestHegelReduceStripsZerosMadeByRounding(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 6)
++		c := &Context{Precision: uint32(prec), MaxExponent: 999, MinExponent: -999, Rounding: RoundHalfUp}
++		// prec nines then a digit >= 5: rounds up to 1 followed by zeros.
++		x := parse(strings.Repeat("9", prec) + strconv.Itoa(n(ht, 5, 9)) + "E" + strconv.Itoa(n(ht, -5, 5)))
++		var d Decimal
++		if _, _, err := c.Reduce(&d, x); err != nil {
++			ht.Fatalf("Reduce: %v", err)
++		}
++		if strings.HasSuffix(d.Coeff.String(), "0") {
++			ht.Fatalf("Reduce(%s) at precision %d = %s: trailing zero in the coefficient", x, prec, &d)
++		}
++	})
++}
++
++// apd/9: results carry exponents other than GDA's ideal exponent: an exact quotient keeps
++// trailing zeros (4.6000E+11 for 46E7/1E-3), the square root of a zero halves the exponent
++// towards zero instead of flooring it, and rounding to an integral value drops a positive
++// exponent (1E+2 becomes 100).
++func TestHegelResultsHaveTheIdealExponent(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := &Context{Precision: 20, MaxExponent: 999, MinExponent: -999}
++		var d Decimal
++		switch n(ht, 0, 2) {
++		case 0:
++			// Exact division: ideal exponent = exp(x) - exp(y).
++			k := n(ht, 1, 9)
++			ex, ey := n(ht, -5, 5), n(ht, -5, 5)
++			y := parse(strconv.Itoa(n(ht, 1, 9)) + "E" + strconv.Itoa(ey))
++			var x Decimal
++			c.Mul(&x, y, parse(strconv.Itoa(k)+"E"+strconv.Itoa(ex)))
++			c.Quo(&d, &x, y)
++			wantDecimal(ht, fmt.Sprintf("Quo(%s, %s)", &x, y), &d, strconv.Itoa(k)+"E"+strconv.Itoa(ex))
++		case 1:
++			e := n(ht, -9, 9)
++			c.Sqrt(&d, parse("0E"+strconv.Itoa(e)))
++			want := "0E" + strconv.Itoa(int(math.Floor(float64(e)/2)))
++			wantDecimal(ht, fmt.Sprintf("Sqrt(0E%d)", e), &d, want)
++		default:
++			s := genDigits(ht, 5) + "E" + strconv.Itoa(n(ht, 1, 6))
++			c.RoundToIntegralValue(&d, parse(s))
++			wantDecimal(ht, "RoundToIntegralValue("+s+")", &d, s)
++		}
++	})
++}
++
++// apd/17: Quantize returns NaN with InvalidOperation whenever it discards digits and the
++// result has more than MaxExponent+1 digits, whatever the precision and the result's
++// magnitude: Quantize(1.2345, -3) with MaxExponent 2 is NaN instead of 1.235 (the intermediate
++// rounding in quantize() runs at exponent 0 and trips the MaxExponent check).
++func TestHegelQuantizeAcceptsResultsWithMoreDigitsThanMaxExponent(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 3, 20)
++		emax := n(ht, 1, prec-2)
++		p := n(ht, emax+2, prec) // digits in the result: more than MaxExponent+1, within the precision
++		digits := genDigits(ht, p+1)
++		ht.Assume(len(digits) == p+1 && digits[0] != '0')
++		x := parse(digits[:1] + "." + digits[1:]) // p+1 digits, adjusted exponent 0
++		exp := int32(-(p - 1))
++		c := &Context{Precision: uint32(prec), MaxExponent: int32(emax), MinExponent: -999, Rounding: pick(ht, roundings).apd}
++		wide := c.WithPrecision(uint32(prec))
++		wide.MaxExponent = 999
++		var want Decimal
++		if _, err := wide.Quantize(&want, x, exp); err != nil {
++			ht.Fatalf("Quantize with MaxExponent 999: %v", err)
++		}
++		var d Decimal
++		cond, err := c.Quantize(&d, x, exp)
++		if err != nil {
++			ht.Fatalf("Quantize: %v", err)
++		}
++		if cond.InvalidOperation() || d.Form != Finite || d.CmpTotal(&want) != 0 {
++			ht.Fatalf("Quantize(%s, %d) [prec %d Emax %d %s] = %s with condition %s, want %s", x, exp, prec, emax, c.Rounding, &d, cond, &want)
++		}
++	})
++}
++
++// apd/10: Log10 of an exact power of ten is flagged inexact and padded with zeros.
++func TestHegelLog10OfPowersOfTenIsExact(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		e := n(ht, -30, 30)
++		c := &Context{Precision: uint32(n(ht, 3, 20)), MaxExponent: 999, MinExponent: -999}
++		var d Decimal
++		cond, err := c.Log10(&d, parse("1E"+strconv.Itoa(e)))
++		if err != nil {
++			ht.Fatalf("Log10: %v", err)
++		}
++		if cond.Inexact() || d.CmpTotal(New(int64(e), 0)) != 0 {
++			ht.Fatalf("Log10(1E%d) = %s with condition %s, want %d exact", e, &d, cond, e)
++		}
++	})
++}
++
++// apd/11: the NaN produced by an impossible integer division takes the dividend's sign.
++func TestHegelNaNResultsAreUnsigned(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 1, 5)
++		c := &Context{Precision: uint32(prec), MaxExponent: 999, MinExponent: -999}
++		x := parse("-" + genDigits(ht, 3) + "E" + strconv.Itoa(prec+n(ht, 1, 10)))
++		ht.Assume(x.Coeff.Sign() != 0)
++		var d Decimal
++		cond, _ := c.QuoInteger(&d, x, New(3, 0))
++		ht.Assume(cond.DivisionImpossible())
++		if d.Negative {
++			ht.Fatalf("QuoInteger(%s, 3) [prec %d] = %s, want NaN", x, prec, &d)
++		}
++	})
++}
++
++// apd/12: Decimal.Reduce drops the sign of a negative zero (Context.Reduce keeps it).
++func TestHegelReduceKeepsTheSignOfZero(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		x := parse("-0E" + strconv.Itoa(n(ht, -20, 20)))
++		var r Decimal
++		r.Reduce(x)
++		if !r.Negative {
++			ht.Fatalf("Reduce(%s) = %s, want -0", x, &r)
++		}
++	})
++}
++
++// apd/13: Text('e') is documented as "-d.dddde±dd" but writes the exponent with as few
++// digits as it needs ("1e+5").
++func TestHegelTextExponentHasTwoDigits(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		xs := genDecimal(ht, 8, 9, 0)
++		d := parse(xs)
++		got := d.Text('e')
++		i := strings.IndexAny(got, "e")
++		if i < 0 || len(got)-i-2 < 2 {
++			ht.Fatalf("Text('e') of %s = %q: exponent without two digits", xs, got)
++		}
++	})
++}
++
++// apd/14: SetFloat64 is documented to hold the exact value of the float; it holds the
++// shortest decimal that rounds to it.
++func TestHegelSetFloat64IsExact(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		f := math.Ldexp(float64(n(ht, 1, 1<<30)), n(ht, -1074, 900))
++		ht.Assume(f != 0 && !math.IsInf(f, 0))
++		var d Decimal
++		d.SetFloat64(f)
++		exact := new(big.Rat).SetFloat64(f)
++		got, _ := new(big.Rat).SetString(d.Text('e'))
++		if got == nil || got.Cmp(exact) != 0 {
++			ht.Fatalf("SetFloat64(%v) = %s, exact value %s", f, d.Text('e'), exact.FloatString(30))
++		}
++	})
++}
++
++func note(ht *hegel.T, format string, args ...interface{}) { ht.Note(fmt.Sprintf(format, args...)) }
