@@ -1,0 +1,974 @@
+diff --git a/go.mod b/go.mod
+index 8c95bf4..e0ec2dd 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/robfig/cron/v3
+ 
+-go 1.12
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..f06febf
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,952 @@
++// Hegel property tests for github.com/robfig/cron/v3: the spec parser against a bit-set model of
++// the documented grammar (all field layouts, TZ prefixes, descriptors), SpecSchedule.Next against
++// an independent calendar model that enumerates wall-clock times in the schedule's zone (so DST
++// gaps and repeats are handled by definition), Every/ConstantDelaySchedule, and the entry
++// bookkeeping of a Cron that is not running.
++package cron_test
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/robfig/cron/v3"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func wide(tc hegel.TestCase, lo, hi int64) int64 {
++	return hegel.Draw(tc, hegel.Integers[int64](lo, hi))
++}
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---- the grammar model ---------------------------------------------------------------------
++
++const starBit = 1 << 63
++
++// fieldKind describes one of the six positions: its bounds and names (value = min + index).
++type fieldKind struct {
++	label    string
++	min, max int
++	names    []string
++	allowQ   bool
++}
++
++var (
++	kindSecond = fieldKind{"second", 0, 59, nil, false}
++	kindMinute = fieldKind{"minute", 0, 59, nil, false}
++	kindHour   = fieldKind{"hour", 0, 23, nil, false}
++	kindDom    = fieldKind{"dom", 1, 31, nil, true}
++	kindMonth  = fieldKind{"month", 1, 12, []string{"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}, false}
++	kindDow    = fieldKind{"dow", 0, 6, []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}, true}
++	fieldKinds = []fieldKind{kindSecond, kindMinute, kindHour, kindDom, kindMonth, kindDow}
++)
++
++// rangeBits sets the bits lo, lo+step, ... up to hi.
++func rangeBits(lo, hi, step int) uint64 {
++	var bits uint64
++	for i := lo; i <= hi; i += step {
++		bits |= 1 << uint(i)
++	}
++	return bits
++}
++
++func allBits(k fieldKind) uint64 { return rangeBits(k.min, k.max, 1) | starBit }
++
++// defaultBits is what the parser fills in for a field the layout does not include.
++func defaultBits(i int) uint64 {
++	if i < 3 {
++		return 1 // "0"
++	}
++	return allBits(fieldKinds[i]) // "*"
++}
++
++// randomCase flips the case of each letter at random.
++func randomCase(tc hegel.TestCase, s string) string {
++	b := []byte(s)
++	for i, c := range b {
++		if chance(tc, 50) {
++			if 'a' <= c && c <= 'z' {
++				b[i] = c - 32
++			} else if 'A' <= c && c <= 'Z' {
++				b[i] = c + 32
++			}
++		}
++	}
++	return string(b)
++}
++
++// genValue draws one value of the field as text (number, zero-padded number, or name).
++func genValue(tc hegel.TestCase, k fieldKind, v int) string {
++	if k.names != nil && chance(tc, 50) {
++		return randomCase(tc, k.names[v-k.min])
++	}
++	if chance(tc, 10) {
++		return fmt.Sprintf("%02d", v)
++	}
++	return strconv.Itoa(v)
++}
++
++// genRange draws one comma-separated item of a field and its bits:
++//
++//   - | ? | N | N-M | */S | N/S | N-M/S
++func genRange(tc hegel.TestCase, k fieldKind) (string, uint64) {
++	step := 1
++	stepText := ""
++	if chance(tc, 35) {
++		step = n(tc, 1, k.max-k.min+3)
++		stepText = "/" + strconv.Itoa(step)
++	}
++	switch n(tc, 0, 2) {
++	case 0:
++		star := "*"
++		if k.allowQ && chance(tc, 30) {
++			star = "?"
++		}
++		bits := rangeBits(k.min, k.max, step)
++		if step == 1 {
++			bits |= starBit
++		}
++		return star + stepText, bits
++	case 1:
++		v := n(tc, k.min, k.max)
++		if stepText != "" {
++			return genValue(tc, k, v) + stepText, rangeBits(v, k.max, step)
++		}
++		return genValue(tc, k, v), 1 << uint(v)
++	default:
++		lo := n(tc, k.min, k.max)
++		hi := n(tc, lo, k.max)
++		return genValue(tc, k, lo) + "-" + genValue(tc, k, hi) + stepText, rangeBits(lo, hi, step)
++	}
++}
++
++// genField draws a whole field: one to three items joined by commas.
++func genField(tc hegel.TestCase, k fieldKind) (string, uint64) {
++	var parts []string
++	var bits uint64
++	for i, cnt := 0, n(tc, 1, 3); i < cnt; i++ {
++		text, b := genRange(tc, k)
++		parts = append(parts, text)
++		bits |= b
++	}
++	return strings.Join(parts, ","), bits
++}
++
++// layout is a parser configuration: which fields it reads, which one is optional.
++type layout struct {
++	name        string
++	parser      cron.Parser
++	fields      []int // indices into fieldKinds, in order
++	optional    int   // index of the optional field, or -1
++	descriptors bool
++}
++
++var layouts = []layout{
++	{"standard", cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor), []int{1, 2, 3, 4, 5}, -1, true},
++	{"seconds", cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor), []int{0, 1, 2, 3, 4, 5}, -1, true},
++	{"secondOptional", cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor), []int{0, 1, 2, 3, 4, 5}, 0, true},
++	{"dowOptional", cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.DowOptional), []int{1, 2, 3, 4, 5}, 5, false},
++	{"dateOnly", cron.NewParser(cron.Dom | cron.Month | cron.Dow), []int{3, 4, 5}, -1, false},
++	{"hourMinute", cron.NewParser(cron.Minute | cron.Hour), []int{1, 2}, -1, false},
++	{"descriptorsOnly", cron.NewParser(cron.Descriptor), nil, -1, true},
++}
++
++// zoneNames are the IANA zones used for TZ prefixes and schedules.  None of them has a
++// transition at midnight (see the README: cron/2).
++var zoneNames = []string{"UTC", "Asia/Tokyo", "Asia/Kolkata", "America/New_York", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Australia/Sydney", "Australia/Lord_Howe", "Pacific/Chatham"}
++
++func loadZone(name string) *time.Location {
++	loc, err := time.LoadLocation(name)
++	if err != nil {
++		panic(err)
++	}
++	return loc
++}
++
++// genBlank draws inter-field whitespace.
++func genBlank(tc hegel.TestCase) string {
++	return pick(tc, []string{" ", " ", " ", "  ", "\t", " \t "})
++}
++
++// specCase is a generated spec and what the parser should make of it.
++type specCase struct {
++	text     string
++	bits     [6]uint64
++	zone     string // "" for time.Local
++	every    time.Duration
++	isEvery  bool
++	describe string
++}
++
++// genSpec draws a valid spec for the layout.
++func genSpec(tc hegel.TestCase, lay layout) specCase {
++	var sc specCase
++	for i := range sc.bits {
++		sc.bits[i] = defaultBits(i)
++	}
++	prefix := ""
++	if chance(tc, 35) {
++		sc.zone = pick(tc, zoneNames)
++		// a single space: the prefix is cut at the first ' ' only (cron/5)
++		prefix = pick(tc, []string{"TZ=", "CRON_TZ="}) + sc.zone + " "
++	}
++	if lay.descriptors && (lay.fields == nil || chance(tc, 20)) {
++		if chance(tc, 40) {
++			d := pick(tc, []string{"1h30m", "90s", "2h", "1.5h", "500ms", "0s", "1h0m0s", "3600s", "1m1ms", "-1h", "2h45m30.5s"})
++			sc.text = prefix + "@every " + d
++			sc.isEvery = true
++			dur, _ := time.ParseDuration(d)
++			if dur < time.Second {
++				dur = time.Second
++			}
++			sc.every = dur - dur%time.Second
++			sc.describe = "@every"
++			return sc
++		}
++		name := pick(tc, []string{"@yearly", "@annually", "@monthly", "@weekly", "@daily", "@midnight", "@hourly"})
++		sc.text = prefix + name
++		sc.describe = name
++		sc.bits = [6]uint64{1, 1, 1, 1 << 1, 1 << 1, allBits(kindDow)}
++		switch name {
++		case "@monthly":
++			sc.bits[4] = allBits(kindMonth)
++		case "@weekly":
++			sc.bits[3], sc.bits[4], sc.bits[5] = allBits(kindDom), allBits(kindMonth), 1
++		case "@daily", "@midnight":
++			sc.bits[3], sc.bits[4] = allBits(kindDom), allBits(kindMonth)
++		case "@hourly":
++			sc.bits[2], sc.bits[3], sc.bits[4] = rangeBits(0, 23, 1)|starBit, allBits(kindDom), allBits(kindMonth)
++		}
++		return sc
++	}
++	omit := -1
++	if lay.optional >= 0 && chance(tc, 50) {
++		omit = lay.optional
++	}
++	var parts []string
++	for _, i := range lay.fields {
++		if i == omit {
++			continue
++		}
++		text, bits := genField(tc, fieldKinds[i])
++		parts = append(parts, text)
++		sc.bits[i] = bits
++	}
++	var sb strings.Builder
++	sb.WriteString(prefix)
++	if prefix == "" && chance(tc, 15) {
++		sb.WriteString(genBlank(tc))
++	}
++	for i, p := range parts {
++		if i > 0 {
++			sb.WriteString(genBlank(tc))
++		}
++		sb.WriteString(p)
++	}
++	if chance(tc, 15) {
++		sb.WriteString(genBlank(tc))
++	}
++	sc.text = sb.String()
++	sc.describe = lay.name
++	return sc
++}
++
++func bitsString(b uint64) string {
++	var xs []string
++	for i := 0; i < 63; i++ {
++		if b&(1<<uint(i)) != 0 {
++			xs = append(xs, strconv.Itoa(i))
++		}
++	}
++	s := strings.Join(xs, ",")
++	if b&starBit != 0 {
++		s += "+*"
++	}
++	return "{" + s + "}"
++}
++
++func TestHegelParserBuildsTheDocumentedBitSets(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		lay := pick(ht, layouts)
++		sc := genSpec(ht, lay)
++		note(ht, "%s parser, spec %q", lay.name, sc.text)
++		sched, err := lay.parser.Parse(sc.text)
++		if err != nil {
++			ht.Fatalf("Parse(%q) with the %s parser: %v", sc.text, lay.name, err)
++		}
++		if sc.isEvery {
++			cd, ok := sched.(cron.ConstantDelaySchedule)
++			if !ok || cd.Delay != sc.every {
++				ht.Fatalf("Parse(%q) = %#v, want a ConstantDelaySchedule with delay %v", sc.text, sched, sc.every)
++			}
++			return
++		}
++		ss, ok := sched.(*cron.SpecSchedule)
++		if !ok {
++			ht.Fatalf("Parse(%q) = %#v, want a *SpecSchedule", sc.text, sched)
++		}
++		got := [6]uint64{ss.Second, ss.Minute, ss.Hour, ss.Dom, ss.Month, ss.Dow}
++		for i := range got {
++			if got[i] != sc.bits[i] {
++				ht.Fatalf("Parse(%q): %s field is %s, want %s", sc.text, fieldKinds[i].label, bitsString(got[i]), bitsString(sc.bits[i]))
++			}
++		}
++		if sc.zone == "" {
++			if ss.Location != time.Local {
++				ht.Fatalf("Parse(%q): location %v, want time.Local", sc.text, ss.Location)
++			}
++		} else if ss.Location == nil || ss.Location.String() != sc.zone {
++			ht.Fatalf("Parse(%q): location %v, want %s", sc.text, ss.Location, sc.zone)
++		}
++	})
++}
++
++// genBadSpec draws a spec the parser must reject, and says why.
++func genBadSpec(tc hegel.TestCase, lay layout) (string, string) {
++	if lay.fields == nil || (lay.descriptors && chance(tc, 15)) {
++		switch n(tc, 0, 3) {
++		case 0:
++			return pick(tc, []string{"@Hourly", "@yearlyy", "@weekly ", "@Every 1h", "@every", "@every1h", "@every  1h", "@every 1x", "@every 1", "@"}), "unknown descriptor"
++		case 1:
++			return "", "empty spec"
++		case 2:
++			return "TZ=" + pick(tc, []string{"Mars/Olympus", "Nowhere", "UTC+1"}) + " @hourly", "unknown zone"
++		default:
++			return "@every " + pick(tc, []string{"", "h", "1.5", "1h30", "1 h", "--1h"}), "bad duration"
++		}
++	}
++	good := genSpec(tc, lay)
++	for good.describe == "@every" || strings.HasPrefix(good.describe, "@") {
++		good = genSpec(tc, lay)
++	}
++	fields := strings.Fields(good.text)
++	prefixLen := 0
++	if strings.Contains(fields[0], "=") {
++		prefixLen = 1
++	}
++	body := fields[prefixLen:]
++	// body has len(lay.fields) or len(lay.fields)-1 entries; map positions to kinds
++	present := lay.fields
++	if len(body) < len(lay.fields) {
++		present = nil
++		for _, i := range lay.fields {
++			if i != lay.optional {
++				present = append(present, i)
++			}
++		}
++	}
++	rebuild := func(b []string) string { return strings.Join(append(fields[:prefixLen:prefixLen], b...), " ") }
++	switch n(tc, 0, 9) {
++	case 0:
++		if lay.optional < 0 || len(body) == len(lay.fields) {
++			return rebuild(append(body, "1")), "too many fields"
++		}
++		return rebuild(append(append(body, "1"), "1")), "too many fields"
++	case 1:
++		if len(body) > 1 && (lay.optional < 0 || len(body) < len(lay.fields)) {
++			return rebuild(body[:len(body)-1]), "too few fields"
++		}
++		return rebuild(body[:0]), "too few fields"
++	case 2:
++		p := n(tc, 0, len(body)-1)
++		k := fieldKinds[present[p]]
++		body[p] = strconv.Itoa(k.max + n(tc, 1, 40))
++		return rebuild(body), "value above the maximum"
++	case 3:
++		p := n(tc, 0, len(body)-1)
++		k := fieldKinds[present[p]]
++		if k.min == 0 {
++			body[p] = "-1"
++			return rebuild(body), "negative value"
++		}
++		body[p] = "0"
++		return rebuild(body), "value below the minimum"
++	case 4:
++		p := n(tc, 0, len(body)-1)
++		k := fieldKinds[present[p]]
++		hi := n(tc, k.min+1, k.max)
++		lo := n(tc, k.min, hi-1)
++		body[p] = strconv.Itoa(hi) + "-" + strconv.Itoa(lo)
++		return rebuild(body), "reversed range"
++	case 5:
++		p := n(tc, 0, len(body)-1)
++		body[p] = pick(tc, []string{"*", "1", "1-2"}) + "/0"
++		return rebuild(body), "zero step"
++	case 6:
++		p := n(tc, 0, len(body)-1)
++		body[p] = pick(tc, []string{"1-2-3", "1/2/3", "*/1/1", "1-2-3/2"})
++		return rebuild(body), "too many hyphens or slashes"
++	case 7:
++		p := n(tc, 0, len(body)-1)
++		body[p] = pick(tc, []string{"sunday", "january", "foo", "MONDAY", "jan1", "x", "1x", "1.5", "1e1", "0x1", "١", "1-x", "x/2", "*/x", "*/", "/2", "-1-2"})
++		return rebuild(body), "not a number or name"
++	case 8:
++		return "TZ=" + pick(tc, []string{"Mars/Olympus", "Nowhere", "UTC+1", "utc"}) + " " + strings.Join(body, " "), "unknown zone"
++	default:
++		if lay.descriptors {
++			return rebuild(append(body[:0], pick(tc, []string{"@Hourly", "@yearlyy", "@every", "@every1h"}))), "unknown descriptor"
++		}
++		return rebuild(append(body[:0], pick(tc, []string{"@hourly", "@daily", "@every 1h"}))), "descriptor without the Descriptor option"
++	}
++}
++
++func TestHegelParserRejectsInvalidSpecs(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		lay := pick(ht, layouts)
++		text, why := genBadSpec(ht, lay)
++		note(ht, "%s parser, spec %q (%s)", lay.name, text, why)
++		sched, err := lay.parser.Parse(text)
++		if err == nil {
++			ht.Fatalf("Parse(%q) with the %s parser = %#v, but the spec has a %s", text, lay.name, sched, why)
++		}
++		if sched != nil {
++			ht.Fatalf("Parse(%q) returned both a schedule %#v and an error %v", text, sched, err)
++		}
++	})
++}
++
++// ---- the calendar model --------------------------------------------------------------------
++
++// setValues lists the values whose bits are set in [lo, hi].
++func setValues(bits uint64, lo, hi int) []int {
++	var xs []int
++	for i := lo; i <= hi; i++ {
++		if bits&(1<<uint(i)) != 0 {
++			xs = append(xs, i)
++		}
++	}
++	return xs
++}
++
++// wallInstants lists, in order, the instants whose wall clock in loc reads exactly
++// y-m-d h:mi:00 — none when a DST gap swallowed it, two when a fall-back repeated it.
++func wallInstants(y int, m time.Month, d, h, mi int, loc *time.Location) []time.Time {
++	base := time.Date(y, m, d, h, mi, 0, 0, loc)
++	var out []time.Time
++	for k := -6; k <= 6; k++ {
++		u := base.Add(time.Duration(k) * 30 * time.Minute)
++		uy, um, ud := u.Date()
++		if uy == y && um == m && ud == d && u.Hour() == h && u.Minute() == mi && u.Second() == 0 {
++			dup := false
++			for _, o := range out {
++				if o.Equal(u) {
++					dup = true
++				}
++			}
++			if !dup {
++				out = append(out, u)
++			}
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
++	return out
++}
++
++// dayMatches is the documented day rule: with a '*' (or '?') in either day field both must
++// match, otherwise either may.
++func dayMatches(s *cron.SpecSchedule, y int, m time.Month, d int) bool {
++	wd := time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Weekday()
++	domOK := s.Dom&(1<<uint(d)) != 0
++	dowOK := s.Dow&(1<<uint(wd)) != 0
++	if s.Dom&starBit != 0 || s.Dow&starBit != 0 {
++		return domOK && dowOK
++	}
++	return domOK || dowOK
++}
++
++// modelNext is the reference for SpecSchedule.Next: the earliest instant after t whose wall
++// clock in the schedule's zone matches every field, or the zero time when none falls within
++// five years of t.  It walks the calendar day by day; on the first day every matching wall
++// clock is tried (a repeated hour puts later instants at earlier wall clocks), afterwards the
++// first existing wall clock in field order is the answer.
++func modelNext(s *cron.SpecSchedule, t time.Time) time.Time {
++	loc := s.Location
++	if loc == time.Local {
++		// documented: a schedule without a zone is read in the zone of the time given
++		loc = t.Location()
++	}
++	start := t.In(loc).Add(time.Second - time.Duration(t.Nanosecond()))
++	yearLimit := start.Year() + 5
++	hours := setValues(s.Hour, 0, 23)
++	minutes := setValues(s.Minute, 0, 59)
++	seconds := setValues(s.Second, 0, 59)
++	y, m, d := start.Date()
++	for first := true; ; first = false {
++		if y > yearLimit {
++			return time.Time{}
++		}
++		if s.Month&(1<<uint(m)) != 0 && dayMatches(s, y, m, d) {
++			var best time.Time
++			for _, h := range hours {
++				for _, mi := range minutes {
++					for _, b := range wallInstants(y, m, d, h, mi, loc) {
++						for _, sec := range seconds {
++							u := b.Add(time.Duration(sec) * time.Second)
++							if first && u.Before(start) {
++								continue
++							}
++							if best.IsZero() || u.Before(best) {
++								best = u
++							}
++							break
++						}
++					}
++					if !first && !best.IsZero() {
++						return best.In(t.Location())
++					}
++				}
++			}
++			if !best.IsZero() {
++				return best.In(t.Location())
++			}
++		}
++		y, m, d = time.Date(y, m, d+1, 0, 0, 0, 0, time.UTC).Date()
++	}
++}
++
++// genBits draws a field's bit set directly: star, a value, a few values, a range, a stride.
++func genBits(tc hegel.TestCase, k fieldKind) uint64 {
++	switch n(tc, 0, 4) {
++	case 0:
++		return allBits(k)
++	case 1:
++		return 1 << uint(n(tc, k.min, k.max))
++	case 2:
++		var bits uint64
++		for i, cnt := 0, n(tc, 1, 4); i < cnt; i++ {
++			bits |= 1 << uint(n(tc, k.min, k.max))
++		}
++		return bits
++	case 3:
++		lo := n(tc, k.min, k.max)
++		return rangeBits(lo, n(tc, lo, k.max), 1)
++	default:
++		return rangeBits(k.min, k.max, n(tc, 2, k.max-k.min+1))
++	}
++}
++
++// genSchedule draws a SpecSchedule in the zone, either built directly or parsed from text
++// with a CRON_TZ prefix.
++func genSchedule(tc hegel.TestCase, zone string) (*cron.SpecSchedule, string) {
++	if chance(tc, 50) {
++		s := &cron.SpecSchedule{Location: loadZone(zone)}
++		s.Second = genBits(tc, kindSecond)
++		if chance(tc, 60) {
++			s.Second = 1
++		}
++		s.Minute = genBits(tc, kindMinute)
++		s.Hour = genBits(tc, kindHour)
++		s.Dom = genBits(tc, kindDom)
++		s.Month = genBits(tc, kindMonth)
++		s.Dow = genBits(tc, kindDow)
++		where := zone
++		if chance(tc, 20) {
++			s.Location, where = time.Local, "Local"
++		}
++		return s, fmt.Sprintf("bits s%s m%s h%s dom%s mon%s dow%s in %s", bitsString(s.Second), bitsString(s.Minute), bitsString(s.Hour), bitsString(s.Dom), bitsString(s.Month), bitsString(s.Dow), where)
++	}
++	lay := layouts[1]
++	var parts []string
++	for _, i := range lay.fields {
++		text, _ := genField(tc, fieldKinds[i])
++		parts = append(parts, text)
++	}
++	text := "CRON_TZ=" + zone + " " + strings.Join(parts, " ")
++	if chance(tc, 20) {
++		text = strings.Join(parts, " ") // no zone: read in the zone of the time given
++	}
++	sched, err := lay.parser.Parse(text)
++	if err != nil {
++		panic("generator: " + err.Error())
++	}
++	return sched.(*cron.SpecSchedule), text
++}
++
++// genTime draws an instant between 1995 and 2036, often near the DST months, expressed in a
++// random zone.
++func genTime(tc hegel.TestCase, zone string) time.Time {
++	var unix int64
++	if chance(tc, 40) {
++		loc := loadZone(zone)
++		month := time.Month(pick(tc, []int{3, 4, 9, 10, 11, 1, 12, 2}))
++		unix = time.Date(n(tc, 1995, 2035), month, n(tc, 1, 31), n(tc, 0, 4), n(tc, 0, 59), n(tc, 0, 59), 0, loc).Unix()
++		unix += int64(n(tc, -3, 3)) * 86400 * int64(n(tc, 0, 1))
++	} else {
++		unix = wide(tc, 788918400, 2082758400)
++	}
++	nanos := int64(0)
++	if chance(tc, 40) {
++		nanos = wide(tc, 0, 999999999)
++	}
++	in := zone
++	if chance(tc, 40) {
++		in = pick(tc, zoneNames)
++	}
++	return time.Unix(unix, nanos).In(loadZone(in))
++}
++
++func TestHegelNextFollowsTheCalendarModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		zone := pick(ht, zoneNames)
++		s, describe := genSchedule(ht, zone)
++		from := genTime(ht, zone)
++		want := modelNext(s, from)
++		got := s.Next(from)
++		note(ht, "%s in %s; Next(%v) = %v (model %v)", describe, zone, from, got, want)
++		if want.IsZero() {
++			if !got.IsZero() {
++				ht.Fatalf("Next(%v) of %s = %v, but nothing matches within five years", from, describe, got)
++			}
++			return
++		}
++		if !got.Equal(want) {
++			ht.Fatalf("Next(%v) of %s in %s = %v, want %v", from, describe, zone, got, want)
++		}
++		if got.Location() != from.Location() {
++			ht.Fatalf("Next(%v) came back in %v, want the argument's zone %v", from, got.Location(), from.Location())
++		}
++		// and once more from the result: strictly later, still matching
++		again := s.Next(got)
++		if !again.IsZero() && !again.After(got) {
++			ht.Fatalf("Next(Next(t)) = %v is not after Next(t) = %v", again, got)
++		}
++		if w := modelNext(s, got); !again.Equal(w) {
++			ht.Fatalf("Next(%v) of %s = %v, want %v", got, describe, again, w)
++		}
++	})
++}
++
++// ---- Every ---------------------------------------------------------------------------------
++
++func TestHegelEveryRoundsToWholeSeconds(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var d time.Duration
++		switch n(ht, 0, 2) {
++		case 0:
++			d = time.Duration(wide(ht, -2e9, 5e9))
++		case 1:
++			d = time.Duration(wide(ht, 0, 400*24)) * time.Hour
++		default:
++			d = time.Duration(wide(ht, 0, 1e12))
++		}
++		want := d
++		if want < time.Second {
++			want = time.Second
++		}
++		want -= want % time.Second
++		e := cron.Every(d)
++		note(ht, "Every(%v).Delay = %v", d, e.Delay)
++		if e.Delay != want {
++			ht.Fatalf("Every(%v).Delay = %v, want %v", d, e.Delay, want)
++		}
++		from := time.Unix(wide(ht, 0, 4e9), wide(ht, 0, 999999999)).In(loadZone(pick(ht, zoneNames)))
++		got := e.Next(from)
++		if wantNext := from.Truncate(time.Second).Add(want); !got.Equal(wantNext) || got.Nanosecond() != 0 {
++			ht.Fatalf("Every(%v).Next(%v) = %v, want %v", d, from, got, wantNext)
++		}
++		if text := d.String(); d > 0 {
++			sched, err := cron.ParseStandard("@every " + text)
++			if err != nil || sched != e {
++				ht.Fatalf("ParseStandard(%q) = %#v, %v; want %#v", "@every "+text, sched, err, e)
++			}
++		}
++	})
++}
++
++// ---- a Cron that is not running ------------------------------------------------------------
++
++type recordingLogger struct{ lines []string }
++
++func (l *recordingLogger) Info(msg string, kv ...interface{}) {
++	l.lines = append(l.lines, "info "+msg)
++}
++
++func (l *recordingLogger) Error(err error, msg string, kv ...interface{}) {
++	l.lines = append(l.lines, "error "+msg+": "+err.Error())
++}
++
++func TestHegelCronKeepsItsEntriesWhileStopped(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		zone := pick(ht, zoneNames)
++		loc := loadZone(zone)
++		withSeconds := chance(ht, 50)
++		opts := []cron.Option{cron.WithLocation(loc)}
++		lay := layouts[0]
++		if withSeconds {
++			opts = append(opts, cron.WithSeconds())
++			lay = layouts[1]
++		}
++		c := cron.New(opts...)
++		if c.Location() != loc {
++			ht.Fatalf("Location() = %v, want %v", c.Location(), zone)
++		}
++		type modelEntry struct {
++			id   cron.EntryID
++			spec string
++		}
++		var model []modelEntry
++		var nextID cron.EntryID
++		for step, steps := 0, n(ht, 0, 8); step < steps; step++ {
++			switch n(ht, 0, 4) {
++			case 0, 1:
++				sc := genSpec(ht, lay)
++				id, err := c.AddFunc(sc.text, func() {})
++				if err != nil {
++					ht.Fatalf("AddFunc(%q): %v", sc.text, err)
++				}
++				nextID++
++				if id != nextID {
++					ht.Fatalf("AddFunc(%q) = id %d, want %d", sc.text, id, nextID)
++				}
++				model = append(model, modelEntry{id, sc.text})
++			case 2:
++				bad, why := genBadSpec(ht, lay)
++				if id, err := c.AddFunc(bad, func() {}); err == nil || id != 0 {
++					ht.Fatalf("AddFunc(%q) = %d, %v; the spec has a %s", bad, id, err, why)
++				}
++			case 3:
++				d := time.Duration(n(ht, 1, 3600)) * time.Second
++				id := c.Schedule(cron.Every(d), cron.FuncJob(func() {}))
++				nextID++
++				if id != nextID {
++					ht.Fatalf("Schedule = id %d, want %d", id, nextID)
++				}
++				model = append(model, modelEntry{id, "@every " + d.String()})
++			default:
++				var id cron.EntryID
++				if len(model) > 0 && chance(ht, 70) {
++					id = model[n(ht, 0, len(model)-1)].id
++				} else {
++					id = cron.EntryID(n(ht, 0, 12))
++				}
++				c.Remove(id)
++				var kept []modelEntry
++				for _, e := range model {
++					if e.id != id {
++						kept = append(kept, e)
++					}
++				}
++				model = kept
++			}
++		}
++		entries := c.Entries()
++		note(ht, "%d entries, model %v", len(entries), model)
++		if len(entries) != len(model) {
++			ht.Fatalf("Entries() has %d entries, want %d (%v)", len(entries), len(model), model)
++		}
++		for i, e := range entries {
++			if e.ID != model[i].id || !e.Valid() {
++				ht.Fatalf("Entries()[%d].ID = %d, want %d", i, e.ID, model[i].id)
++			}
++			if !e.Next.IsZero() || !e.Prev.IsZero() {
++				ht.Fatalf("entry %d has Next %v / Prev %v before Start", e.ID, e.Next, e.Prev)
++			}
++			if e.Job == nil || e.WrappedJob == nil || e.Schedule == nil {
++				ht.Fatalf("entry %d is missing its job or schedule: %+v", e.ID, e)
++			}
++			if got := c.Entry(e.ID); got.ID != e.ID {
++				ht.Fatalf("Entry(%d) = %+v", e.ID, got)
++			}
++		}
++		for id := cron.EntryID(0); id <= nextID+1; id++ {
++			present := false
++			for _, e := range model {
++				present = present || e.id == id
++			}
++			if got := c.Entry(id); got.Valid() != present {
++				ht.Fatalf("Entry(%d).Valid() = %v, want %v", id, got.Valid(), present)
++			}
++		}
++	})
++}
++
++// TestHegelChainWrapsInOrder: NewChain(m1, m2, m3).Then(job) runs m1 outermost, and Recover
++// swallows a panic and logs it.
++func TestHegelChainWrapsInOrder(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var trace []string
++		count := n(ht, 0, 4)
++		var wrappers []cron.JobWrapper
++		for i := 0; i < count; i++ {
++			i := i
++			wrappers = append(wrappers, func(j cron.Job) cron.Job {
++				return cron.FuncJob(func() {
++					trace = append(trace, fmt.Sprintf("enter %d", i))
++					j.Run()
++					trace = append(trace, fmt.Sprintf("exit %d", i))
++				})
++			})
++		}
++		panics := chance(ht, 30)
++		logger := &recordingLogger{}
++		if panics {
++			wrappers = append([]cron.JobWrapper{cron.Recover(logger)}, wrappers...)
++		}
++		job := cron.NewChain(wrappers...).Then(cron.FuncJob(func() {
++			trace = append(trace, "job")
++			if panics {
++				panic("boom")
++			}
++		}))
++		job.Run()
++		var want []string
++		for i := 0; i < count; i++ {
++			want = append(want, fmt.Sprintf("enter %d", i))
++		}
++		want = append(want, "job")
++		if !panics {
++			for i := count - 1; i >= 0; i-- {
++				want = append(want, fmt.Sprintf("exit %d", i))
++			}
++		}
++		note(ht, "trace %v", trace)
++		if !reflect.DeepEqual(trace, want) {
++			ht.Fatalf("trace %v, want %v", trace, want)
++		}
++		if panics && (len(logger.lines) != 1 || !strings.HasPrefix(logger.lines[0], "error panic: boom")) {
++			ht.Fatalf("Recover logged %v", logger.lines)
++		}
++	})
++}
++
++// ---- pins ----------------------------------------------------------------------------------
++
++// cron/1: a spec that is only a time-zone prefix ("TZ=UTC", "CRON_TZ=Asia/Tokyo") makes
++// Parse slice with the index of a space that is not there and panic.
++func TestHegelPinBareTimeZonePrefixIsAnError(t *testing.T) {
++	for _, spec := range []string{"TZ=UTC", "CRON_TZ=Asia/Tokyo", "TZ=", "CRON_TZ=Nowhere"} {
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					t.Errorf("ParseStandard(%q) panicked: %v", spec, r)
++				}
++			}()
++			if sched, err := cron.ParseStandard(spec); err == nil {
++				t.Errorf("ParseStandard(%q) = %#v, want an error", spec, sched)
++			}
++		}()
++	}
++}
++
++// cron/5: the zone prefix is cut at the first space, so "TZ=UTC<tab>0 0 * * *" fails with
++// "provided bad location UTC\t0", although every other field separator may be any blank.
++func TestHegelPinTimeZonePrefixEndsAtAnyBlank(t *testing.T) {
++	for _, spec := range []string{"TZ=UTC\t0 0 * * *", "CRON_TZ=Asia/Tokyo\t@hourly", "TZ=UTC\t \t0 0 * * *"} {
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					t.Errorf("ParseStandard(%q) panicked: %v", spec, r)
++				}
++			}()
++			sched, err := cron.ParseStandard(spec)
++			if err != nil {
++				t.Errorf("ParseStandard(%q): %v", spec, err)
++				return
++			}
++			if ss, ok := sched.(*cron.SpecSchedule); ok && ss.Location.String() != strings.Split(strings.SplitN(spec, "=", 2)[1], "\t")[0] {
++				t.Errorf("ParseStandard(%q) chose location %v", spec, ss.Location)
++			}
++		}()
++	}
++}
++
++// cron/2: when the schedule's day begins with a DST gap (midnight does not exist: Asia/Beirut,
++// America/Havana, America/Santiago, America/Asuncion, historically America/Sao_Paulo), Next
++// steps onto the day, lands at 01:00, "corrects" back to 23:00 of the day before, and then
++// skips the whole day: the 03:00 run on 31 March 2024 in Beirut is reported for 31 May.
++func TestHegelPinNextDoesNotSkipDaysWhoseMidnightDoesNotExist(t *testing.T) {
++	p := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
++	cases := []struct{ zone, spec, from, want string }{
++		{"Asia/Beirut", "0 0 3 31 * *", "2024-03-30T22:00:00", "2024-03-31T03:00:00+03:00"},
++		{"Asia/Beirut", "0 0 * 31 3 *", "2024-03-30T22:00:00", "2024-03-31T01:00:00+03:00"},
++		{"Asia/Beirut", "0 30 12 * * 0", "2024-03-25T00:00:00", "2024-03-31T12:30:00+03:00"},
++		{"America/Havana", "0 0 12 10 3 *", "2024-03-09T20:00:00", "2024-03-10T12:00:00-04:00"},
++		{"America/Santiago", "0 0 9 * 9 *", "2024-09-07T12:00:00", "2024-09-08T09:00:00-03:00"},
++	}
++	for _, c := range cases {
++		loc := loadZone(c.zone)
++		sched, err := p.Parse(c.spec)
++		if err != nil {
++			t.Fatal(err)
++		}
++		from, err := time.ParseInLocation("2006-01-02T15:04:05", c.from, loc)
++		if err != nil {
++			t.Fatal(err)
++		}
++		want, err := time.Parse(time.RFC3339, c.want)
++		if err != nil {
++			t.Fatal(err)
++		}
++		got := sched.Next(from)
++		if model := modelNext(sched.(*cron.SpecSchedule), from); !model.Equal(want) {
++			t.Fatalf("the model disagrees with the pin for %s %q: %v", c.zone, c.spec, model)
++		}
++		if !got.Equal(want) {
++			t.Errorf("%s: Next(%v) of %q = %v, want %v", c.zone, from, c.spec, got, want.In(loc))
++		}
++	}
++}
++
++// cron/3: "*-5" and "?-5/2" parse as "*" and "*/2": whatever follows a star in a range is
++// ignored.
++func TestHegelPinStarWithARangeIsRejected(t *testing.T) {
++	for _, spec := range []string{"*-5 * * * *", "?-5/2 * * * *", "0 0 *-x * *", "0 0 * * ?-"} {
++		if sched, err := cron.ParseStandard(spec); err == nil {
++			ss := sched.(*cron.SpecSchedule)
++			t.Errorf("ParseStandard(%q) accepted the spec as minute %s dom %s dow %s", spec, bitsString(ss.Minute), bitsString(ss.Dom), bitsString(ss.Dow))
++		}
++	}
++}
++
++// cron/4: a field made only of commas (",", ",,") parses to an empty set with a nil error,
++// and the resulting schedule never fires (Next returns the zero time forever).
++func TestHegelPinEmptyFieldIsRejected(t *testing.T) {
++	for _, spec := range []string{", * * * *", "0 ,, * * *", "0 0 * , *"} {
++		sched, err := cron.ParseStandard(spec)
++		if err == nil {
++			next := sched.Next(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
++			t.Errorf("ParseStandard(%q) = %#v, nil; Next from 2024 is %v", spec, sched, next)
++		}
++	}
++}
