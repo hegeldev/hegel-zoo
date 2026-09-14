@@ -665,3 +665,1013 @@ index 0000000..bb30889
 +    s.write(&mut out).unwrap();
 +    assert_eq!(String::from_utf8_lossy(&out), "# a comment\nfoo.patch -p1\n");
 +}
+diff --git a/tests/hegel_edit.rs b/tests/hegel_edit.rs
+new file mode 100644
+index 0000000..d8426da
+--- /dev/null
++++ b/tests/hegel_edit.rs
+@@ -0,0 +1,1004 @@
++//! Hegel property tests for patchkit's lossless `edit` module: the rowan CST of unified,
++//! context, normal and ed diffs (`edit::parse`), its incremental `reparse`, and the
++//! `edit::series` editor for quilt series files.
++//!
++//! References: **GNU diff** writes every patch (`diff -u`, `diff -c`, `diff`, `diff -e`);
++//! the crate's own `unified` parser (byte-exact against diff, see tests/hegel.rs) is the
++//! oracle for the unified CST's paths, ranges and lines; the shapes of the other formats
++//! are read back with a small line classifier; the crate's own contract for `reparse` is
++//! "the same green tree as a full parse" (its reparse_tests); **quilt** (`quilt series`)
++//! and the lossy `quilt::Series` read the series files the editor writes.
++
++use hegel::generators;
++use hegel::Generator;
++use patchkit::edit::lex::SyntaxKind;
++use patchkit::edit::series::{self as eseries, find_patch_by_name, SeriesFile};
++use patchkit::edit::{self, DiffFormat, HunkRange};
++use patchkit::quilt::{Series, SeriesEntry};
++use patchkit::unified::{splitlines, UnifiedPatch};
++use rowan::ast::AstNode;
++use rowan::{TextRange, TextSize};
++use std::fmt::Debug;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Scratch files and GNU diff
++// ---------------------------------------------------------------------------
++
++fn scratch() -> PathBuf {
++    static N: AtomicUsize = AtomicUsize::new(0);
++    let dir = std::env::temp_dir().join(format!("hegel-zoo-patchkit-edit-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
++    std::fs::create_dir_all(&dir).unwrap();
++    dir
++}
++
++fn write(dir: &Path, name: &str, data: &[u8]) -> PathBuf {
++    let p = dir.join(name);
++    if let Some(parent) = p.parent() {
++        std::fs::create_dir_all(parent).unwrap();
++    }
++    std::fs::write(&p, data).unwrap();
++    p
++}
++
++/// `diff <args> orig mod` in `dir` (exit 0 or 1), as text.
++fn diff_with(dir: &Path, args: &[&str], orig: &[u8], modified: &[u8]) -> String {
++    write(dir, "orig", orig);
++    write(dir, "mod", modified);
++    let out = Command::new("diff").current_dir(dir).args(args).args(["orig", "mod"]).output().unwrap();
++    assert!(out.status.code() == Some(0) || out.status.code() == Some(1), "diff {args:?}: {}", String::from_utf8_lossy(&out.stderr));
++    String::from_utf8(out.stdout).unwrap()
++}
++
++fn has(tool: &str) -> bool {
++    Command::new(tool).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
++}
++
++/// The patch names `quilt series` lists for a series file.
++fn quilt_series(dir: &Path, text: &str) -> Vec<String> {
++    write(dir, "patches/series", text.as_bytes());
++    let out = Command::new("quilt").current_dir(dir).args(["--quiltrc", "-", "series"]).output().unwrap();
++    assert!(out.status.success(), "quilt series: {}", String::from_utf8_lossy(&out.stderr));
++    String::from_utf8(out.stdout).unwrap().lines().map(|l| l.to_string()).collect()
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++/// Line contents. Lines beginning with `--`/`++` are left out on purpose: a *deleted*
++/// `-- x` line is `--- x` in a unified diff, which the CST takes for a file header
++/// (pinned separately in `deleted_dash_dash_lines_stay_in_the_hunk`). A line that is
++/// exactly `.` is left out too: `diff -e` encodes it with an `s/.//` command, which is
++/// beyond a syntax tree.
++const WORDS: &[&str] = &["a", "b", "c", "d", "x y", "", "\t", "  two", "-x", "+plus", "@@ -1 +1 @@", "\\ backslash", "1a", "2c3", "*** x", "..", "< y", "> z", "!bang", "#h", "3,4d5"];
++
++/// A file of 0–8 lines, sometimes without a final newline.
++#[derive(Debug, Clone)]
++struct GenFile {
++    lines: Vec<String>,
++    final_newline: bool,
++}
++
++impl GenFile {
++    fn bytes(&self) -> Vec<u8> {
++        let mut s = String::new();
++        for l in &self.lines {
++            s.push_str(l);
++            s.push('\n');
++        }
++        if !self.final_newline && s.ends_with('\n') {
++            s.pop();
++        }
++        s.into_bytes()
++    }
++}
++
++#[hegel::composite]
++fn arb_file(tc: &hegel::TestCase, max_lines: i64) -> GenFile {
++    let n = tc.draw(int!(0, max_lines)) as usize;
++    let lines = (0..n).map(|_| pick(tc, WORDS).to_string()).collect();
++    GenFile { lines, final_newline: tc.draw(int!(0, 3)) != 0 }
++}
++
++/// 1–3 line edits of a file (insert, delete, replace).
++fn arb_edits(tc: &hegel::TestCase, file: &GenFile) -> GenFile {
++    let mut lines = file.lines.clone();
++    let n = tc.draw(int!(1, 3));
++    for _ in 0..n {
++        match tc.draw(int!(0, 2)) {
++            0 => {
++                let at = tc.draw(int!(0, lines.len() as i64)) as usize;
++                lines.insert(at, pick(tc, WORDS).to_string());
++            }
++            1 if !lines.is_empty() => {
++                let at = tc.draw(int!(0, lines.len() as i64 - 1)) as usize;
++                lines.remove(at);
++            }
++            _ if !lines.is_empty() => {
++                let at = tc.draw(int!(0, lines.len() as i64 - 1)) as usize;
++                lines[at] = pick(tc, WORDS).to_string();
++            }
++            _ => {}
++        }
++    }
++    GenFile { lines, final_newline: tc.draw(int!(0, 3)) != 0 }
++}
++
++fn text_of<N: AstNode>(node: &N) -> String {
++    node.syntax().to_string()
++}
++
++fn child_kinds<N: AstNode<Language = edit::Lang>>(node: &N) -> Vec<SyntaxKind> {
++    node.syntax().children().map(|c| c.kind()).collect()
++}
++
++fn range_of<N: AstNode<Language = edit::Lang>>(node: &N) -> Option<(Option<u32>, Option<u32>)> {
++    node.syntax().children().find_map(HunkRange::cast).map(|r| (r.start(), r.count()))
++}
++
++// ---------------------------------------------------------------------------
++// Unified diffs: the CST against the `unified` parser
++// ---------------------------------------------------------------------------
++
++/// (kind char, content without its newline, had a newline)
++type Line = (u8, String, bool);
++
++fn unified_model(text: &str) -> (String, String, Vec<(usize, usize, usize, usize, Vec<Line>)>) {
++    let p = UnifiedPatch::parse_patch(splitlines(text.as_bytes())).unwrap_or_else(|e| panic!("unified parse of {text:?}: {e}"));
++    let hunks = p
++        .hunks
++        .iter()
++        .map(|h| {
++            let lines = h
++                .lines
++                .iter()
++                .map(|l| {
++                    let c = l.contents();
++                    let nl = c.ends_with(b"\n");
++                    let body = if nl { &c[..c.len() - 1] } else { c };
++                    (l.char(), String::from_utf8(body.to_vec()).unwrap(), nl)
++                })
++                .collect();
++            (h.orig_pos, h.orig_range, h.mod_pos, h.mod_range, lines)
++        })
++        .collect();
++    (String::from_utf8(p.orig_name.clone()).unwrap(), String::from_utf8(p.mod_name.clone()).unwrap(), hunks)
++}
++
++fn cst_lines(hunk: &edit::Hunk) -> Vec<Line> {
++    let mut out: Vec<Line> = Vec::new();
++    for line in hunk.lines() {
++        if line.is_no_newline() {
++            let last = out.last_mut().expect("no-newline marker after a line");
++            last.2 = false;
++            continue;
++        }
++        let c = match line.syntax().kind() {
++            SyntaxKind::CONTEXT_LINE => b' ',
++            SyntaxKind::ADD_LINE => b'+',
++            SyntaxKind::DELETE_LINE => b'-',
++            k => panic!("unexpected hunk line kind {k:?}"),
++        };
++        out.push((c, line.text().unwrap_or_default(), true));
++    }
++    out
++}
++
++/// Check the CST of a unified diff against the `unified` parser's reading of it.
++fn check_unified_cst(text: &str) {
++    let parsed = edit::parse(text);
++    assert!(parsed.ok(), "errors {:?} for {text:?}", parsed.errors());
++    let tree = parsed.tree();
++    assert_eq!(text_of(&tree), text, "text identity");
++    if text.is_empty() {
++        assert_eq!(tree.detect_format(), None);
++        return;
++    }
++    assert_eq!(tree.detect_format(), Some(DiffFormat::Unified));
++    let (orig_name, mod_name, hunks) = unified_model(text);
++    let files: Vec<_> = tree.patch_files().collect();
++    assert_eq!(files.len(), 1, "one file in {text:?}");
++    assert_eq!(files[0].old_path().as_deref(), Some(orig_name.as_str()), "old path");
++    assert_eq!(files[0].new_path().as_deref(), Some(mod_name.as_str()), "new path");
++    let cst_hunks: Vec<_> = files[0].hunks().collect();
++    assert_eq!(cst_hunks.len(), hunks.len(), "hunk count in {text:?}");
++    for (h, (orig_pos, orig_range, mod_pos, mod_range, lines)) in cst_hunks.iter().zip(&hunks) {
++        let header = h.header().expect("hunk header");
++        let old = header.old_range().expect("old range");
++        let new = header.new_range().expect("new range");
++        assert_eq!(old.start(), Some(*orig_pos as u32), "old start");
++        assert_eq!(old.count().unwrap_or(1), *orig_range as u32, "old count");
++        assert_eq!(new.start(), Some(*mod_pos as u32), "new start");
++        assert_eq!(new.count().unwrap_or(1), *mod_range as u32, "new count");
++        assert_eq!(cst_lines(h), *lines, "hunk lines in {text:?}");
++        assert_eq!(header.check_counts(h), vec![], "check_counts on diff output");
++        let stats = h.stats();
++        assert_eq!(stats.context as usize, lines.iter().filter(|l| l.0 == b' ').count());
++        assert_eq!(stats.additions as usize, lines.iter().filter(|l| l.0 == b'+').count());
++        assert_eq!(stats.deletions as usize, lines.iter().filter(|l| l.0 == b'-').count());
++    }
++}
++
++#[hegel::test]
++fn unified_cst_agrees_with_the_unified_parser(tc: hegel::TestCase) {
++    let dir = scratch();
++    let orig = tc.draw(arb_file(8).print_as_debug());
++    let modified = arb_edits(&tc, &orig);
++    let labels = tc.draw(int!(0, 1)) == 1;
++    let args: &[&str] = if labels { &["-u", "--label", "a/file", "--label", "b/file"] } else { &["-u"] };
++    let text = diff_with(&dir, args, &orig.bytes(), &modified.bytes());
++    check_unified_cst(&text);
++    std::fs::remove_dir_all(&dir).ok();
++}
++
++/// Diff output has nothing to fix: `fix_counts` must return false and leave the text alone.
++#[hegel::test]
++fn fix_counts_leaves_diff_output_alone(tc: hegel::TestCase) {
++    // The fixed shape first: a one-line hunk, whose counts diff leaves implicit.
++    let fixed = "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n";
++    let tree = edit::parse(fixed).tree();
++    let hunk = tree.patch_files().next().unwrap().hunks().next().unwrap();
++    assert_eq!(hunk.header().unwrap().check_counts(&hunk), vec![]);
++    assert!(!hunk.fix_counts(), "fix_counts changed a correct header");
++    assert_eq!(text_of(&tree), fixed);
++
++    let dir = scratch();
++    let orig = tc.draw(arb_file(6).print_as_debug());
++    let modified = arb_edits(&tc, &orig);
++    let text = diff_with(&dir, &["-u"], &orig.bytes(), &modified.bytes());
++    let tree = edit::parse(&text).tree();
++    for file in tree.patch_files() {
++        for hunk in file.hunks() {
++            assert!(!hunk.fix_counts(), "fix_counts changed a correct header in {text:?}");
++        }
++    }
++    assert_eq!(text_of(&tree), text);
++    std::fs::remove_dir_all(&dir).ok();
++}
++
++// ---------------------------------------------------------------------------
++// Context diffs (diff -c): structure against a line classifier
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq)]
++struct CSection {
++    range: (u32, Option<u32>),
++    kinds: Vec<SyntaxKind>,
++}
++
++/// Read a context diff by its line shapes: per hunk, the old and new sections' ranges and
++/// line kinds (`  ` context, `! ` change, `+ ` add, `- ` delete, `\ ` marker).
++fn context_model(text: &str) -> Vec<(CSection, CSection)> {
++    let mut hunks = Vec::new();
++    let mut lines = text.lines().peekable();
++    let parse_range = |s: &str| -> (u32, Option<u32>) {
++        let mut it = s.split(',');
++        let a = it.next().unwrap().trim().parse().unwrap();
++        (a, it.next().map(|b| b.trim().parse().unwrap()))
++    };
++    let kind_of = |l: &str| match l.as_bytes().first() {
++        Some(b' ') => SyntaxKind::CONTEXT_LINE,
++        Some(b'!') => SyntaxKind::CONTEXT_CHANGE_LINE,
++        Some(b'+') => SyntaxKind::ADD_LINE,
++        Some(b'-') => SyntaxKind::DELETE_LINE,
++        Some(b'\\') => SyntaxKind::NO_NEWLINE_LINE,
++        _ => panic!("unexpected context body line {l:?}"),
++    };
++    while let Some(line) = lines.next() {
++        if !line.starts_with("***************") {
++            continue;
++        }
++        let old_hdr = lines.next().unwrap();
++        let old_range = parse_range(old_hdr.strip_prefix("*** ").unwrap().strip_suffix(" ****").unwrap());
++        let mut old_kinds = Vec::new();
++        while let Some(l) = lines.peek() {
++            if l.starts_with("--- ") && l.ends_with(" ----") {
++                break;
++            }
++            old_kinds.push(kind_of(l));
++            lines.next();
++        }
++        let new_hdr = lines.next().unwrap();
++        let new_range = parse_range(new_hdr.strip_prefix("--- ").unwrap().strip_suffix(" ----").unwrap());
++        let mut new_kinds = Vec::new();
++        while let Some(l) = lines.peek() {
++            if l.starts_with("***************") {
++                break;
++            }
++            new_kinds.push(kind_of(l));
++            lines.next();
++        }
++        hunks.push((CSection { range: old_range, kinds: old_kinds }, CSection { range: new_range, kinds: new_kinds }));
++    }
++    hunks
++}
++
++#[hegel::test]
++fn context_diff_output_parses_structurally(tc: hegel::TestCase) {
++    let dir = scratch();
++    let orig = tc.draw(arb_file(8).print_as_debug());
++    let modified = arb_edits(&tc, &orig);
++    let text = diff_with(&dir, &["-c"], &orig.bytes(), &modified.bytes());
++    std::fs::remove_dir_all(&dir).ok();
++    let parsed = edit::parse(&text);
++    assert!(parsed.ok(), "errors {:?}", parsed.errors());
++    let tree = parsed.tree();
++    assert_eq!(text_of(&tree), text, "text identity");
++    if text.is_empty() {
++        return;
++    }
++    assert_eq!(tree.detect_format(), Some(DiffFormat::Context));
++    let files: Vec<_> = tree.context_diff_files().collect();
++    assert_eq!(files.len(), 1, "one context file in {text:?}");
++    assert_eq!(files[0].old_file().and_then(|f| f.path()).map(|t| t.text().to_string()).as_deref(), Some("orig"));
++    assert_eq!(files[0].new_file().and_then(|f| f.path()).map(|t| t.text().to_string()).as_deref(), Some("mod"));
++    let model = context_model(&text);
++    let hunks: Vec<_> = files[0].hunks().collect();
++    assert_eq!(hunks.len(), model.len(), "hunk count in {text:?}");
++    for (h, (old, new)) in hunks.iter().zip(&model) {
++        assert!(h.header().is_some(), "hunk header");
++        let os = h.old_section().expect("old section");
++        let ns = h.new_section().expect("new section");
++        assert_eq!(range_of(&os), Some((Some(old.range.0), old.range.1)), "old range in {text:?}");
++        assert_eq!(range_of(&ns), Some((Some(new.range.0), new.range.1)), "new range in {text:?}");
++        let kinds = |s: Vec<SyntaxKind>| s.into_iter().filter(|k| *k != SyntaxKind::HUNK_RANGE).collect::<Vec<_>>();
++        assert_eq!(kinds(child_kinds(&os)), old.kinds, "old section lines in {text:?}");
++        assert_eq!(kinds(child_kinds(&ns)), new.kinds, "new section lines in {text:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Normal diffs: structure against a line classifier
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq)]
++struct NHunk {
++    command: String,
++    old: Vec<String>,
++    new: Vec<String>,
++}
++
++fn is_normal_command(l: &str) -> bool {
++    let b = l.as_bytes();
++    !b.is_empty() && b[0].is_ascii_digit() && l.contains(|c| c == 'a' || c == 'c' || c == 'd') && l.chars().all(|c| c.is_ascii_digit() || c == ',' || c == 'a' || c == 'c' || c == 'd')
++}
++
++fn normal_model(text: &str) -> Vec<NHunk> {
++    let mut out: Vec<NHunk> = Vec::new();
++    for l in text.lines() {
++        if is_normal_command(l) {
++            out.push(NHunk { command: l.to_string(), old: vec![], new: vec![] });
++        } else if let Some(h) = out.last_mut() {
++            if l.starts_with('<') {
++                h.old.push(l.to_string());
++            } else if l.starts_with('>') {
++                h.new.push(l.to_string());
++            } else {
++                assert!(l == "---" || l.starts_with('\\'), "unexpected normal line {l:?}");
++            }
++        }
++    }
++    out
++}
++
++fn check_normal_cst(text: &str) {
++    let parsed = edit::parse(text);
++    assert!(parsed.ok(), "errors {:?}", parsed.errors());
++    let tree = parsed.tree();
++    assert_eq!(text_of(&tree), text, "text identity");
++    if text.is_empty() {
++        return;
++    }
++    assert_eq!(tree.detect_format(), Some(DiffFormat::Normal), "format of {text:?}");
++    assert_eq!(tree.patch_files().count(), 0, "no unified file in {text:?}");
++    let model = normal_model(text);
++    let hunks: Vec<_> = tree.normal_hunks().collect();
++    assert_eq!(hunks.len(), model.len(), "hunk count in {text:?}");
++    for (h, m) in hunks.iter().zip(&model) {
++        assert_eq!(text_of(&h.command().expect("command")).trim_end(), m.command, "command in {text:?}");
++        let old: Vec<String> = h.old_lines().map(|s| s.syntax().children().map(|c| c.to_string().trim_end_matches('\n').to_string()).collect()).unwrap_or_default();
++        let new: Vec<String> = h.new_lines().map(|s| s.syntax().children().map(|c| c.to_string().trim_end_matches('\n').to_string()).collect()).unwrap_or_default();
++        assert_eq!(old, m.old, "old lines in {text:?}");
++        assert_eq!(new, m.new, "new lines in {text:?}");
++    }
++}
++
++/// Files with final newlines: a `\ No newline at end of file` marker on the old side of a
++/// `c` hunk breaks the CST (pinned in `normal_diff_no_newline_markers_stay_in_the_hunk`).
++#[hegel::test]
++fn normal_diff_output_parses_structurally(tc: hegel::TestCase) {
++    let dir = scratch();
++    let orig = GenFile { final_newline: true, ..tc.draw(arb_file(8).print_as_debug()) };
++    let modified = GenFile { final_newline: true, ..arb_edits(&tc, &orig) };
++    let text = diff_with(&dir, &[], &orig.bytes(), &modified.bytes());
++    std::fs::remove_dir_all(&dir).ok();
++    check_normal_cst(&text);
++}
++
++// ---------------------------------------------------------------------------
++// Ed scripts (diff -e): structure against a line classifier
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq)]
++struct ECmd {
++    letter: char,
++    numbers: (Option<u32>, Option<u32>),
++    content: Vec<String>,
++}
++
++fn ed_model(text: &str) -> Vec<ECmd> {
++    let mut out: Vec<ECmd> = Vec::new();
++    let mut lines = text.lines();
++    while let Some(l) = lines.next() {
++        let letter = l.chars().last().unwrap();
++        assert!(matches!(letter, 'a' | 'c' | 'd'), "unexpected ed line {l:?}");
++        let nums = &l[..l.len() - 1];
++        let mut it = nums.split(',');
++        let a = it.next().unwrap().parse().ok();
++        let b = it.next().map(|b| b.parse().unwrap());
++        let mut content = Vec::new();
++        if letter != 'd' {
++            for c in lines.by_ref() {
++                if c == "." {
++                    break;
++                }
++                content.push(c.to_string());
++            }
++        }
++        out.push(ECmd { letter, numbers: (a, b), content });
++    }
++    out
++}
++
++#[hegel::test]
++fn ed_script_output_parses_structurally(tc: hegel::TestCase) {
++    let dir = scratch();
++    let orig = tc.draw(arb_file(8).print_as_debug());
++    let modified = arb_edits(&tc, &orig);
++    // GNU diff -e refuses files without a final newline ("\ No newline" has no ed form).
++    let orig = GenFile { final_newline: true, ..orig };
++    let modified = GenFile { final_newline: true, ..modified };
++    let text = diff_with(&dir, &["-e"], &orig.bytes(), &modified.bytes());
++    std::fs::remove_dir_all(&dir).ok();
++    let parsed = edit::parse(&text);
++    assert!(parsed.ok(), "errors {:?}", parsed.errors());
++    let tree = parsed.tree();
++    assert_eq!(text_of(&tree), text, "text identity");
++    if text.is_empty() {
++        return;
++    }
++    assert_eq!(tree.detect_format(), Some(DiffFormat::Ed), "format of {text:?}");
++    let model = ed_model(&text);
++    let cmds: Vec<_> = tree.ed_commands().collect();
++    assert_eq!(cmds.len(), model.len(), "command count in {text:?}");
++    for (c, m) in cmds.iter().zip(&model) {
++        let got = if let Some(a) = c.as_add() {
++            ECmd { letter: 'a', numbers: a.line_numbers(), content: a.content_lines().map(|l| l.text().unwrap_or_default()).collect() }
++        } else if let Some(d) = c.as_delete() {
++            ECmd { letter: 'd', numbers: d.line_numbers(), content: vec![] }
++        } else if let Some(ch) = c.as_change() {
++            ECmd { letter: 'c', numbers: ch.line_numbers(), content: ch.content_lines().map(|l| l.text().unwrap_or_default()).collect() }
++        } else {
++            panic!("ed command of no kind: {:?}", text_of(c));
++        };
++        assert_eq!(got, *m, "command in {text:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Incremental reparse: the crate's contract is "the same tree as a full parse"
++// ---------------------------------------------------------------------------
++
++const JUNK: &[&str] = &["diff -ruN a/one b/one\n", "Only in a: x\n", "index 1234abc..5678def 100644\n", "\n", "Binary files a/x and b/x differ\n", "hello world\n"];
++const FRAGS: &[&str] = &["", " ", "\n", "-", "+", "@", "@@ -1 +1 @@\n", "--- a\n+++ b\n", "x", "1a\n", "1", "***", "<", "."];
++
++/// A patch text: 1–3 diff outputs of random formats with junk lines around them.
++fn arb_patch_text(tc: &hegel::TestCase, dir: &Path) -> String {
++    let mut text = String::new();
++    let n = tc.draw(int!(1, 3));
++    for _ in 0..n {
++        if tc.draw(int!(0, 2)) == 0 {
++            text.push_str(pick(tc, JUNK));
++        }
++        let orig = tc.draw(arb_file(5).print_as_debug());
++        let modified = arb_edits(tc, &orig);
++        let args: &[&str] = match tc.draw(int!(0, 4)) {
++            0 => &["-u"],
++            1 => &["-u", "--label", "a/file", "--label", "b/file"],
++            2 => &["-c"],
++            3 => &[],
++            _ => &["-e"],
++        };
++        let (o, m) = if args == ["-e"] { (GenFile { final_newline: true, ..orig }, GenFile { final_newline: true, ..modified }) } else { (orig, modified) };
++        text.push_str(&diff_with(dir, args, &o.bytes(), &m.bytes()));
++    }
++    if tc.draw(int!(0, 2)) == 0 {
++        text.push_str(pick(tc, JUNK));
++    }
++    text
++}
++
++/// A random replacement of a random byte range (ASCII text, so every index is a boundary).
++fn arb_edit(tc: &hegel::TestCase, text: &str) -> (String, TextRange) {
++    let len = text.len() as i64;
++    let start = tc.draw(int!(0, len)) as usize;
++    let end = tc.draw(int!(start as i64, len)) as usize;
++    let rep = pick(tc, FRAGS);
++    let mut new_text = String::with_capacity(text.len() + rep.len());
++    new_text.push_str(&text[..start]);
++    new_text.push_str(rep);
++    new_text.push_str(&text[end..]);
++    let range = TextRange::new(TextSize::from(start as u32), TextSize::from((start + rep.len()) as u32));
++    (new_text, range)
++}
++
++fn check_reparse<T: AstNode>(old: &str, new_text: &str, range: TextRange, parse: fn(&str) -> edit::Parse<T>) {
++    let incremental = parse(old).reparse(new_text, range, parse);
++    let full = parse(new_text);
++    assert_eq!(incremental.tree().syntax().to_string(), new_text, "reparse text identity for {old:?} -> {new_text:?}");
++    if incremental.green() != full.green() {
++        panic!(
++            "incremental reparse of {old:?} with {range:?} -> {new_text:?} differs from a full parse:\nincremental:\n{:#?}\nfull:\n{:#?}",
++            incremental.syntax_node(),
++            full.syntax_node()
++        );
++    }
++}
++
++/// The crate's own contract (its reparse_tests): an incremental reparse gives the same
++/// green tree as a full parse. `reparse` cuts its slice at the boundaries of the root's
++/// children, and a root child can be a single token of a line (a junk line of a patch, a
++/// blank line of a series), so the slice can end in the middle of a line.
++#[hegel::test]
++fn patch_reparse_matches_a_full_parse(tc: hegel::TestCase) {
++    // Fixed shapes first: an ed command inserted before a git-style header line, and an
++    // edit inside an `index` line.
++    let old = "diff -ruN a/one b/one\n";
++    check_reparse(old, "1a\ndiff -ruN a/one b/one\n", TextRange::new(TextSize::from(0), TextSize::from(3)), edit::parse);
++    let old = "diff --git a/f b/f\nindex 1234abc..5678def 100644\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n";
++    let at = old.find("bc..").unwrap() as u32;
++    check_reparse(old, &old.replacen("bc..", "bd..", 1), TextRange::new(TextSize::from(at), TextSize::from(at + 2)), edit::parse);
++
++    let dir = scratch();
++    let text = arb_patch_text(&tc, &dir);
++    std::fs::remove_dir_all(&dir).ok();
++    let (new_text, range) = arb_edit(&tc, &text);
++    check_reparse(&text, &new_text, range, edit::parse);
++}
++
++// ---------------------------------------------------------------------------
++// Series files: the lossless CST against quilt and the lossy `Series`
++// ---------------------------------------------------------------------------
++
++const PNAMES: &[&str] = &["a.patch", "b.patch", "fix-1.diff", "dir/c.patch", "0001-x.patch", "z"];
++const OPTS: &[&str] = &["-p0", "-p1", "-p2", "--reverse", "-R"];
++const CTEXT: &[&str] = &["", " fix", "\tnote", "  Security fixes  ", "x -p1"];
++
++#[derive(Debug, Clone)]
++enum SLine {
++    Patch { indent: String, name: String, seps: Vec<String>, opts: Vec<String>, trailing: Option<String> },
++    Comment(String),
++    Blank(String),
++}
++
++impl SLine {
++    fn render(&self) -> String {
++        match self {
++            SLine::Patch { indent, name, seps, opts, trailing } => {
++                let mut s = format!("{indent}{name}");
++                for (sep, opt) in seps.iter().zip(opts) {
++                    s.push_str(sep);
++                    s.push_str(opt);
++                }
++                if let Some(t) = trailing {
++                    s.push_str(" # ");
++                    s.push_str(t);
++                }
++                s
++            }
++            SLine::Comment(t) => format!("#{t}"),
++            SLine::Blank(b) => b.clone(),
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++enum ME {
++    P(String, Vec<String>),
++    C(String),
++}
++
++fn model_of(lines: &[SLine]) -> Vec<ME> {
++    lines
++        .iter()
++        .filter_map(|l| match l {
++            SLine::Patch { name, opts, .. } => Some(ME::P(name.clone(), opts.clone())),
++            SLine::Comment(t) => Some(ME::C(t.trim_start_matches([' ', '\t']).to_string())),
++            SLine::Blank(_) => None,
++        })
++        .collect()
++}
++
++fn patches(m: &[ME]) -> Vec<(String, Vec<String>)> {
++    m.iter().filter_map(|e| if let ME::P(n, o) = e { Some((n.clone(), o.clone())) } else { None }).collect()
++}
++
++fn comments(m: &[ME]) -> Vec<String> {
++    m.iter().filter_map(|e| if let ME::C(t) = e { Some(t.clone()) } else { None }).collect()
++}
++
++/// `simple`: no indentation, no trailing comments, only empty blank lines, a final newline
++/// (the shapes the editor's index arithmetic and `push` are defined on).
++fn arb_series(tc: &hegel::TestCase, simple: bool) -> (Vec<SLine>, String) {
++    let n = tc.draw(int!(0, 6)) as usize;
++    let mut lines = Vec::new();
++    for _ in 0..n {
++        let l = match tc.draw(int!(0, 5)) {
++            0 => SLine::Comment(pick(tc, CTEXT).to_string()),
++            1 => SLine::Blank(if simple { String::new() } else { pick(tc, &["", "  ", "\t"]).to_string() }),
++            _ => {
++                let k = tc.draw(int!(0, 2)) as usize;
++                SLine::Patch {
++                    indent: if simple { String::new() } else { pick(tc, &["", "  ", "\t"]).to_string() },
++                    name: pick(tc, PNAMES).to_string(),
++                    seps: (0..k).map(|_| pick(tc, &[" ", "\t", "  "]).to_string()).collect(),
++                    opts: (0..k).map(|_| pick(tc, OPTS).to_string()).collect(),
++                    trailing: if !simple && tc.draw(int!(0, 3)) == 0 { Some(pick(tc, &["x", "-p9", "note here"]).to_string()) } else { None },
++                }
++            }
++        };
++        lines.push(l);
++    }
++    let mut text = lines.iter().map(|l| l.render() + "\n").collect::<String>();
++    // A whitespace-only last line without a newline is a parse error (pinned in
++    // `whitespace_only_last_line_is_not_an_error`), so the newline stays in that case.
++    let ws_last = matches!(lines.last(), Some(SLine::Blank(b)) if !b.is_empty());
++    if !simple && !ws_last && tc.draw(int!(0, 3)) == 0 && text.ends_with('\n') {
++        text.pop();
++    }
++    (lines, text)
++}
++
++fn cst_patches(s: &SeriesFile) -> Vec<(String, Vec<String>)> {
++    s.patch_entries().map(|p| (p.name().unwrap_or_default(), p.option_strings())).collect()
++}
++
++fn cst_comments(s: &SeriesFile) -> Vec<String> {
++    s.comment_lines().map(|c| c.text()).collect()
++}
++
++#[hegel::test]
++fn series_cst_reads_like_quilt(tc: hegel::TestCase) {
++    let (lines, text) = arb_series(&tc, false);
++    let model = model_of(&lines);
++    let parsed = eseries::parse(&text);
++    assert!(parsed.ok(), "errors {:?} for {text:?}", parsed.errors());
++    let tree = parsed.quilt_tree();
++    assert_eq!(text_of(&tree), text, "text identity");
++    assert!(tree.errors().is_empty(), "tree errors for {text:?}");
++    assert_eq!(cst_patches(&tree), patches(&model), "patches of {text:?}");
++    assert_eq!(cst_comments(&tree), comments(&model), "comments of {text:?}");
++    assert_eq!(tree.len(), patches(&model).len());
++    // The lossy reader agrees on the names (its options keep trailing comments: pinned).
++    let lossy = Series::read(text.as_bytes()).unwrap();
++    assert_eq!(lossy.patches().map(|s| s.to_string()).collect::<Vec<_>>(), patches(&model).into_iter().map(|p| p.0).collect::<Vec<_>>(), "lossy names of {text:?}");
++    if has("quilt") {
++        let dir = scratch();
++        assert_eq!(quilt_series(&dir, &text), patches(&model).into_iter().map(|p| p.0).collect::<Vec<_>>(), "quilt names of {text:?}");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++}
++
++/// Same contract for series files (see `patch_reparse_matches_a_full_parse`).
++#[hegel::test]
++fn series_reparse_matches_a_full_parse(tc: hegel::TestCase) {
++    // Fixed shapes first: joining a patch line with a following whitespace-only line, and
++    // deleting across two comment lines into one.
++    check_reparse("a.patch\n  \nb.patch\n", "a.patch  \nb.patch\n", TextRange::new(TextSize::from(7), TextSize::from(7)), eseries::parse);
++    check_reparse("#\n#\n  \n", "#  \n", TextRange::new(TextSize::from(1), TextSize::from(1)), eseries::parse);
++
++    let (_, text) = arb_series(&tc, false);
++    let rep = pick(&tc, &["", " ", "\n", "#", "# c\n", "-p1", " -p1", "new.patch\n", "x", "\t"]);
++    let len = text.len() as i64;
++    let start = tc.draw(int!(0, len)) as usize;
++    let end = tc.draw(int!(start as i64, len)) as usize;
++    let new_text = format!("{}{}{}", &text[..start], rep, &text[end..]);
++    let range = TextRange::new(TextSize::from(start as u32), TextSize::from((start + rep.len()) as u32));
++    check_reparse(&text, &new_text, range, eseries::parse);
++}
++
++// ---------------------------------------------------------------------------
++// The series editor against a list model
++// ---------------------------------------------------------------------------
++
++/// Insert `e` before the `idx`-th patch of the model (at the end when there is none).
++fn model_insert(m: &mut Vec<ME>, idx: usize, e: ME) {
++    let pos = m.iter().enumerate().filter(|(_, x)| matches!(x, ME::P(..))).nth(idx).map(|(i, _)| i).unwrap_or(m.len());
++    m.insert(pos, e);
++}
++
++fn model_find(m: &[ME], name: &str) -> Option<usize> {
++    m.iter().position(|e| matches!(e, ME::P(n, _) if n == name))
++}
++
++fn check_series_state(tree: &SeriesFile, model: &[ME], what: &str) {
++    let text = text_of(tree);
++    assert_eq!(cst_patches(tree), patches(model), "live patches after {what}: {text:?}");
++    assert_eq!(cst_comments(tree), comments(model), "live comments after {what}: {text:?}");
++    assert_eq!(tree.len(), patches(model).len(), "len after {what}");
++    assert_eq!(tree.is_empty(), patches(model).is_empty());
++    let again = eseries::parse(&text);
++    assert!(again.ok(), "re-parse errors {:?} after {what}: {text:?}", again.errors());
++    let again = again.quilt_tree();
++    assert_eq!(cst_patches(&again), patches(model), "re-parsed patches after {what}: {text:?}");
++    assert_eq!(cst_comments(&again), comments(model), "re-parsed comments after {what}: {text:?}");
++    for (name, _) in patches(model) {
++        assert!(tree.contains(&name), "contains {name} after {what}");
++        assert_eq!(tree.position(&name), patches(model).iter().position(|p| p.0 == name), "position of {name} after {what}");
++    }
++}
++
++#[hegel::test]
++fn series_editor_matches_a_list_model(tc: hegel::TestCase) {
++    let (lines, text) = arb_series(&tc, true);
++    let mut model = model_of(&lines);
++    let mut tree = eseries::parse(&text).quilt_tree_mut();
++    check_series_state(&tree, &model, "parse");
++    let names = |tc: &hegel::TestCase, m: &[ME]| -> String {
++        let mut pool: Vec<String> = PNAMES.iter().map(|s| s.to_string()).collect();
++        pool.extend(patches(m).into_iter().map(|p| p.0));
++        pick(tc, &pool)
++    };
++    let opts = |tc: &hegel::TestCase| -> Vec<String> {
++        let k = tc.draw(int!(0, 2)) as usize;
++        (0..k).map(|_| pick(tc, OPTS).to_string()).collect()
++    };
++    let n = tc.draw(int!(1, 6));
++    for _ in 0..n {
++        let np = patches(&model).len() as i64;
++        let what: String;
++        match tc.draw(int!(0, 11)) {
++            0 => {
++                let (name, o) = (names(&tc, &model), opts(&tc));
++                what = format!("push({name:?}, {o:?})");
++                tree.push(&name, o.iter());
++                model.push(ME::P(name, o));
++            }
++            1 => {
++                let (name, o) = (names(&tc, &model), opts(&tc));
++                what = format!("prepend({name:?}, {o:?})");
++                tree.prepend(&name, o.iter());
++                model_insert(&mut model, 0, ME::P(name, o));
++            }
++            2 => {
++                let (name, o) = (names(&tc, &model), opts(&tc));
++                let idx = tc.draw(int!(0, np + 1)) as usize;
++                what = format!("insert({idx}, {name:?}, {o:?})");
++                tree.insert(idx, &name, o.iter());
++                model_insert(&mut model, idx, ME::P(name, o));
++            }
++            3 => {
++                let name = names(&tc, &model);
++                what = format!("remove({name:?})");
++                let found = model_find(&model, &name);
++                assert_eq!(tree.remove(&name), found.is_some(), "{what}");
++                if let Some(i) = found {
++                    model.remove(i);
++                }
++            }
++            4 => {
++                let (name, o) = (names(&tc, &model), opts(&tc));
++                what = format!("set_options({name:?}, {o:?})");
++                let found = model_find(&model, &name);
++                assert_eq!(tree.set_options(&name, o.iter()), found.is_some(), "{what}");
++                if let Some(i) = found {
++                    model[i] = ME::P(name, o);
++                }
++            }
++            5 => {
++                let t = pick(&tc, &["", "fix", "Security fixes"]).to_string();
++                what = format!("add_comment({t:?})");
++                tree.add_comment(&t);
++                model.push(ME::C(t));
++            }
++            6 => {
++                let (old, new) = (names(&tc, &model), names(&tc, &model));
++                what = format!("rename({old:?}, {new:?})");
++                let found = model_find(&model, &old);
++                assert_eq!(tree.rename(&old, &new), found.is_some(), "{what}");
++                if let Some(i) = found {
++                    if let ME::P(n, _) = &mut model[i] {
++                        *n = new;
++                    }
++                }
++            }
++            7 => {
++                let name = names(&tc, &model);
++                let idx = tc.draw(int!(0, np + 1)) as usize;
++                what = format!("move_to({name:?}, {idx})");
++                let found = model_find(&model, &name);
++                assert_eq!(tree.move_to(&name, idx), found.is_some(), "{what}");
++                if let Some(i) = found {
++                    let e = model.remove(i);
++                    model_insert(&mut model, idx, e);
++                }
++            }
++            8 => {
++                let t = pick(&tc, &["", "fix", "Security fixes"]).to_string();
++                let idx = tc.draw(int!(0, model.len() as i64 + 1)) as usize;
++                what = format!("insert_comment({idx}, {t:?})");
++                tree.insert_comment(idx, &t);
++                let pos = idx.min(model.len());
++                model.insert(pos, ME::C(t));
++            }
++            9 => {
++                what = "clear()".to_string();
++                tree.clear();
++                model.retain(|e| matches!(e, ME::C(_)));
++            }
++            10 => {
++                what = "update_all(-p1 where the name has an 'a')".to_string();
++                tree.update_all(|name, _| if name.contains('a') { Some(vec!["-p1".to_string()]) } else { None });
++                for e in model.iter_mut() {
++                    if let ME::P(n, o) = e {
++                        if n.contains('a') {
++                            *o = vec!["-p1".to_string()];
++                        }
++                    }
++                }
++            }
++            _ => {
++                // (`reorder` is not exercised here: it panics on any series of two or more
++                // patches — pinned in `reorder_reorders`.)
++                let (old, new) = (names(&tc, &model), names(&tc, &model));
++                what = format!("set_name({old:?} -> {new:?})");
++                if let Some(p) = find_patch_by_name(&tree, &old) {
++                    p.set_name(&new);
++                    let i = model_find(&model, &old).unwrap();
++                    if let ME::P(n, _) = &mut model[i] {
++                        *n = new;
++                    }
++                }
++            }
++        }
++        check_series_state(&tree, &model, &what);
++    }
++    if has("quilt") {
++        let dir = scratch();
++        assert_eq!(quilt_series(&dir, &text_of(&tree)), patches(&model).into_iter().map(|p| p.0).collect::<Vec<_>>(), "quilt reads the edited series");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pinned bugs
++// ---------------------------------------------------------------------------
++
++/// A deleted `-- x` line is `--- x` in the patch; GNU patch counts lines from the hunk
++/// header, the `unified` parser too, but the CST takes it for the next file header.
++#[hegel::test]
++fn deleted_dash_dash_lines_stay_in_the_hunk(tc: hegel::TestCase) {
++    check_unified_cst("--- a/file\n+++ b/file\n@@ -1,3 +1,2 @@\n x\n--- sql comment\n y\n");
++    let dir = scratch();
++    let mut orig = tc.draw(arb_file(5).print_as_debug());
++    let at = tc.draw(int!(0, orig.lines.len() as i64)) as usize;
++    orig.lines.insert(at, pick(&tc, &["-- sql comment", "--", "---", "-- a -- b"]).to_string());
++    let mut modified = orig.clone();
++    modified.lines.remove(at);
++    let text = diff_with(&dir, &["-u", "--label", "a/file", "--label", "b/file"], &orig.bytes(), &modified.bytes());
++    std::fs::remove_dir_all(&dir).ok();
++    check_unified_cst(&text);
++}
++
++/// GNU diff quotes a file name with spaces (`--- "sp ace"\t…`); the `unified` parser keeps
++/// the quoted name, the CST's path token stops at the first space.
++#[test]
++fn quoted_paths_with_spaces_are_kept() {
++    let dir = scratch();
++    write(&dir, "sp ace", b"p q\n");
++    write(&dir, "c", b"p\n");
++    let out = Command::new("diff").current_dir(&dir).args(["-u", "sp ace", "c"]).output().unwrap();
++    std::fs::remove_dir_all(&dir).ok();
++    let text = String::from_utf8(out.stdout).unwrap();
++    assert!(text.starts_with("--- \"sp ace\"\t"), "diff quotes the name: {text:?}");
++    let (orig_name, _, _) = unified_model(&text);
++    assert_eq!(orig_name, "\"sp ace\"");
++    let tree = edit::parse(&text).tree();
++    let file = tree.patch_files().next().unwrap();
++    assert_eq!(file.old_path().as_deref(), Some("\"sp ace\""), "CST old path of {text:?}");
++}
++
++/// `-p1` (the default strip level, and by far the most common option) on a plain patch name
++/// warns "Invalid strip level": the check compares the level with the number of `/` in the
++/// *series entry*, but `-pN` strips components from the paths inside the patch.
++#[test]
++fn strip_level_options_do_not_warn() {
++    for text in ["a.patch -p1\n", "0001-fix.patch -p1\n", "a.patch -p2\n"] {
++        let parsed = eseries::parse(text);
++        assert!(parsed.ok());
++        assert_eq!(parsed.warnings(), &[] as &[String], "warnings for {text:?}");
++    }
++}
++
++/// quilt strips `[ \t]+#.*` from a series line before reading its options; the lossy
++/// `Series::read` keeps the comment words as options.
++#[test]
++fn lossy_series_drops_trailing_comments() {
++    let s = Series::read("a.patch -p1 # applied upstream\n".as_bytes()).unwrap();
++    let entries: Vec<_> = s.iter().collect();
++    assert_eq!(entries, vec![&SeriesEntry::Patch { name: "a.patch".to_string(), options: vec!["-p1".to_string()] }]);
++}
++
++/// Appending to a series file whose last line has no newline glues the new entry onto it.
++#[test]
++fn pushing_onto_a_series_without_a_final_newline() {
++    let mut tree = eseries::parse("a.patch").quilt_tree_mut();
++    tree.push("b.patch", std::iter::empty::<&str>());
++    let text = text_of(&tree);
++    let again = eseries::parse(&text).quilt_tree();
++    assert_eq!(cst_patches(&again), vec![("a.patch".to_string(), vec![]), ("b.patch".to_string(), vec![])], "text {text:?}");
++    let mut tree = eseries::parse("a.patch").quilt_tree_mut();
++    tree.add_comment("note");
++    let text = text_of(&tree);
++    assert_eq!(cst_comments(&eseries::parse(&text).quilt_tree()), vec!["note".to_string()], "text {text:?}");
++}
++
++/// `reorder` panics (a rowan "range end index out of range") on any series of two or more
++/// patches, whatever the order — even the current one; and by construction it would drop
++/// comments and blank lines ("skip this complex case" in the source).
++#[test]
++fn reorder_reorders() {
++    let mut tree = eseries::parse("a.patch\nb.patch -p1\n").quilt_tree_mut();
++    assert!(tree.reorder(&["b.patch".to_string(), "a.patch".to_string()]));
++    assert_eq!(cst_patches(&tree), vec![("b.patch".to_string(), vec!["-p1".to_string()]), ("a.patch".to_string(), vec![])]);
++    let text = "# first\na.patch\n\nb.patch -p1\n# last\n";
++    let mut tree = eseries::parse(text).quilt_tree_mut();
++    assert!(tree.reorder(&["b.patch".to_string(), "a.patch".to_string()]));
++    assert_eq!(cst_patches(&tree), vec![("b.patch".to_string(), vec!["-p1".to_string()]), ("a.patch".to_string(), vec![])]);
++    assert_eq!(cst_comments(&tree), vec!["first".to_string(), "last".to_string()], "text {:?}", text_of(&tree));
++    assert!(text_of(&tree).contains("\n\n"), "blank line kept: {:?}", text_of(&tree));
++}
++
++/// A whitespace-only last line without a final newline is an "Expected patch name or
++/// comment" error (with the newline it is a blank line; quilt ignores it either way).
++#[test]
++fn whitespace_only_last_line_is_not_an_error() {
++    for text in ["  ", "\t", "a.patch\n  "] {
++        let parsed = eseries::parse(text);
++        assert!(parsed.ok(), "errors {:?} for {text:?}", parsed.errors());
++        assert_eq!(text_of(&parsed.quilt_tree()), text);
++    }
++}
++
++/// A `\ No newline at end of file` marker on the old side of a normal `c` hunk ends the
++/// hunk; the `---` separator that follows is then read as a unified file header.
++#[hegel::test]
++fn normal_diff_no_newline_markers_stay_in_the_hunk(tc: hegel::TestCase) {
++    check_normal_cst("1c1\n< a\n\\ No newline at end of file\n---\n> b\n");
++    let dir = scratch();
++    let mut orig = tc.draw(arb_file(6).print_as_debug());
++    if orig.lines.is_empty() {
++        orig.lines.push("a".to_string());
++    }
++    orig.final_newline = false;
++    let mut modified = orig.clone();
++    let last = modified.lines.len() - 1;
++    modified.lines[last] = format!("{}!", modified.lines[last]);
++    modified.final_newline = tc.draw(int!(0, 1)) == 1;
++    let text = diff_with(&dir, &[], &orig.bytes(), &modified.bytes());
++    std::fs::remove_dir_all(&dir).ok();
++    check_normal_cst(&text);
++}
