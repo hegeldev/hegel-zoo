@@ -59,15 +59,16 @@ property (/6, /7), `0.`-mantissa literals with exponents above 38 and out-of-ran
 (/8, /9), the `Decode` call after the last value of a stream (/10), a scalar Marshaler output and
 RawMessages without `<`, `>`, `&` (/14), `\b`/`\f` and invalid UTF-8 on the encode side (/15,
 /16), mutations inside a multi-byte character (/20), `\u` escapes in struct texts (/30), a bare
-`null` RawMessage (/24), negative numbers with leading zeros in the `Valid` property (/31). All six
-pass at 1000 cases × 10 (about 3 s); the 31 pinned differences are expected failures. `JSONITER_COLLECT=1` makes the properties record
+`null` RawMessage (/24), negative numbers with leading zeros and inserted tabs in the `Valid`
+property (/31, /32), a surrogate pair right after a lone surrogate escape (/21). All six pass at
+1000 cases × 10 (about 3 s); the 32 pinned differences are expected failures. `JSONITER_COLLECT=1` makes the properties record
 mismatches instead of failing and print them shortest-first — that is how the list below was
 built, one collect run per generator change.
 
 The run command carries `-vet=off`: Go 1.27's vet (run by `go test`) rejects a non-constant
 format string in upstream's `example_test.go`, so the package would not build otherwise.
 
-## Bugs (31; details in bugs.toml)
+## Bugs (32; details in bugs.toml)
 
 | id | summary | severity |
 |----|---------|----------|
@@ -102,6 +103,7 @@ format string in upstream's `example_test.go`, so the package would not build ot
 | json-iterator/29 | Invalid quoted strings are accepted into `json.Number` | low |
 | json-iterator/30 | `,string` numbers and integer map keys are read without unescaping | low |
 | json-iterator/31 | `Valid` accepts `-00`, `-01`, `-.5` inside containers | low |
+| json-iterator/32 | Raw control characters in a string pass once the string holds an escape | medium |
 
 How they were found: the go-json harness (`targets/go/go-json`) was re-targeted in one step and
 run in collect mode; the first run's mismatches, sorted shortest-first, pointed at /1, /3, /5,
@@ -109,8 +111,9 @@ run in collect mode; the first run's mismatches, sorted shortest-first, pointed 
 same shapes (indent strings, top-level literals, `null` into every field kind, type errors on a
 prefilled struct, NUL bytes, invalid UTF-8 and surrogates, unsupported types, `,string` and
 `Number` inputs) added the rest; /8 came out of the second collect run as `[0.25E+56]` and was
-bisected over exponents to the float32 boundary; /11 fell out of the probe for /24; /31 was the
-last property failure standing (`[-00]`) once everything else was guarded.
+bisected over exponents to the float32 boundary; /11 fell out of the probe for /24; /31 and /32 were the
+last property failures standing (`[-00]`, a tab inside an escaped string) once everything else
+was guarded — the 1000-case runs kept finding one more shape after each collect run said zero.
 
 ## Not bugs (documented, ambiguous between the two encoding/json generations, or design)
 
