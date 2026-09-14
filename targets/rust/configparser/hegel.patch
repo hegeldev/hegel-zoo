@@ -1,0 +1,514 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 38e8a28..ccbb37f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,3 +27,6 @@ serde = ["dep:serde", "indexmap/serde"]
+ [dev-dependencies]
+ tokio = { version = "^1.53", features = ["fs", "macros", "rt-multi-thread"] }
+ serde_json = { version = "^1.0" }
++
++[dev-dependencies.hegeltest]
++version = "0.44.1"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..c5de509
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,497 @@
++//! Hegel property tests for `configparser`.
++//!
++//! The crate is "inspired by Python's `configparser`" and documents its own syntax (sections,
++//! `=`/`:` delimiters, `;`/`#` comments, inline comments, case-insensitive names, valueless
++//! keys, indented continuation lines).  Where that syntax and Python's coincide, Python is the
++//! oracle: one `python3` child holds a `ConfigParser` configured to the crate's defaults
++//! (`inline_comment_prefixes=(';', '#')`, `allow_no_value`, `strict=False`, no interpolation,
++//! `empty_lines_in_values`) and the generated text keeps to the intersection of the two grammars
++//! (no padding inside `[ ]`, inline comments preceded by whitespace, no continuation line that
++//! starts with `[`, no lowercase `default` section).  The rest — the write/read round trip the
++//! rustdoc calls "always safe", the map editing API, the typed getters — is checked against small
++//! models of the documentation.
++
++use std::collections::HashMap;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++use configparser::ini::{Ini, IniDefault, WriteOptions};
++use hegel::{generators, TestCase};
++
++type Map = HashMap<String, HashMap<String, Option<String>>>;
++
++// ---------------------------------------------------------------- generators
++
++fn n(tc: &mut TestCase, lo: i64, hi: i64) -> i64 {
++    tc.draw(generators::integers().min_value(lo).max_value(hi))
++}
++
++fn chance(tc: &mut TestCase, pct: i64) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++fn pick<T: Clone>(tc: &mut TestCase, xs: &[T]) -> T {
++    xs[n(tc, 0, xs.len() as i64 - 1) as usize].clone()
++}
++
++/// Section names both sides read the same way: no padding, no comment symbol, nothing that
++/// casefolds to `default` except Python's own `DEFAULT`.
++const SECTIONS: &[&str] = &["a", "b", "sec", "DEFAULT", "Mixed", "x.y", "a b", "c]d", "1"];
++/// Keys: no leading `[` (a header attempt for the crate, a key for Python), no delimiter, no
++/// comment symbol.
++const KEYS: &[&str] = &["k", "key", "K2", "k.x", "a b", "c]d", "\u{e9}", "z"];
++/// Values: no comment symbol (inline comments are generated separately).
++const VALUES: &[&str] = &["v", "", "a b", "x=y", "1", "True", "[v]", "\u{e9}", "a:b", "0.5", "yes"];
++/// Continuation text: values that do not start with `[` (the crate ends a value at a header,
++/// Python continues it).
++const CONT: &[&str] = &["v", "a b", "x=y", "1", "\u{e9}", "a:b", "c]d", "k"];
++const INLINE: &[&str] = &[" ;c", "\t#c", " # c ;d", "  ; x = y"];
++const DELIMS: &[&str] = &["=", " = ", ":", " : ", "= ", " :"];
++
++fn indent(tc: &mut TestCase, lo: i64, hi: i64) -> String {
++    (0..n(tc, lo, hi)).map(|_| pick(tc, &[' ', ' ', '\t'])).collect()
++}
++
++/// One ini line in the common grammar.
++fn arb_line(tc: &mut TestCase) -> String {
++    let mut line = String::new();
++    match n(tc, 0, 9) {
++        0 | 1 => {
++            // never indented: Python takes an indented header after a key as a continuation
++            // line, the crate documents that "a section header ends the value"
++            line.push('[');
++            line.push_str(pick(tc, SECTIONS));
++            line.push(']');
++            if chance(tc, 20) {
++                line.push_str(pick(tc, INLINE));
++            }
++        }
++        2..=5 => {
++            line.push_str(&indent(tc, 0, 3));
++            line.push_str(pick(tc, KEYS));
++            if chance(tc, 80) {
++                line.push_str(pick(tc, DELIMS));
++                line.push_str(pick(tc, VALUES));
++            }
++            if chance(tc, 25) {
++                line.push_str(pick(tc, INLINE));
++            }
++        }
++        6 | 7 => {
++            line.push_str(&indent(tc, 1, 8));
++            line.push_str(pick(tc, CONT));
++            if chance(tc, 25) {
++                line.push_str(pick(tc, INLINE));
++            }
++        }
++        8 => {
++            line.push_str(&indent(tc, 0, 3));
++            line.push_str(pick(tc, &[";c", "#c", ";", "# k = v", "; [s]"]));
++        }
++        _ => {
++            line.push_str(&indent(tc, 0, 2));
++        }
++    }
++    line
++}
++
++fn arb_text(tc: &mut TestCase) -> String {
++    let lines = n(tc, 0, 8);
++    let mut text = String::new();
++    for _ in 0..lines {
++        text.push_str(&arb_line(tc));
++        text.push('\n');
++    }
++    if chance(tc, 30) {
++        text.pop();
++    }
++    text
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|x| format!("{:02x}", x)).collect()
++}
++
++fn unhex(s: &str) -> String {
++    let bytes: Vec<u8> =
++        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++// ---------------------------------------------------------------- the Python oracle
++
++struct Proc {
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++    _child: Child,
++}
++
++const PY_SERVER: &str = r#"
++import sys, configparser
++def dec(h): return bytes.fromhex(h).decode()
++def enc(s): return s.encode().hex()
++for line in sys.stdin:
++    text = dec(line.strip())
++    p = configparser.ConfigParser(inline_comment_prefixes=(';', '#'), allow_no_value=True,
++                                  strict=False, interpolation=None, empty_lines_in_values=True)
++    try:
++        # sectionless keys are the crate's default section: Python's DEFAULT
++        p.read_string('[DEFAULT]\n' + text)
++    except AttributeError:
++        # Python 3.12: a continuation line after a valueless key ('NoneType' has no 'append');
++        # 3.13 raises MultilineContinuationError.  A Python bug, not a verdict.
++        print('pybug', flush=True)
++        continue
++    except configparser.Error:
++        print('err', flush=True)
++        continue
++    out = ['ok']
++    # the crate lowercases section names (case-insensitive by default); Python keeps them
++    for name, d in [('default', p._defaults)] + [(s.lower(), d) for s, d in p._sections.items()]:
++        out.append('s:' + enc(name))
++        for k, v in d.items():
++            out.append('k:' + enc(k) + '=' + ('_' if v is None else enc(v)))
++    print(' '.join(out), flush=True)
++"#;
++
++fn py() -> &'static Mutex<Proc> {
++    static PY: OnceLock<Mutex<Proc>> = OnceLock::new();
++    PY.get_or_init(|| {
++        let mut child = Command::new("python3")
++            .args(["-u", "-c", PY_SERVER])
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .spawn()
++            .expect("python3 is needed as the oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Proc { stdin, stdout, _child: child })
++    })
++}
++
++enum Py {
++    Ok(Map),
++    Err,
++    PyBug,
++}
++
++fn python(text: &str) -> Py {
++    let mut py = py().lock().unwrap();
++    py.stdin.write_all(format!("{}\n", hex(text)).as_bytes()).unwrap();
++    let mut reply = String::new();
++    py.stdout.read_line(&mut reply).unwrap();
++    let mut tokens = reply.trim_end_matches('\n').split(' ');
++    match tokens.next().unwrap() {
++        "err" => Py::Err,
++        "pybug" => Py::PyBug,
++        _ => {
++            let mut map: Map = HashMap::new();
++            let mut current = String::new();
++            for tok in tokens {
++                if let Some(name) = tok.strip_prefix("s:") {
++                    current = unhex(name);
++                    assert!(
++                        map.insert(current.clone(), HashMap::new()).is_none(),
++                        "two Python sections read as {:?}: the generator must not produce that",
++                        current
++                    );
++                } else {
++                    let (k, v) = tok.strip_prefix("k:").unwrap().split_once('=').unwrap();
++                    let value = if v == "_" { None } else { Some(unhex(v)) };
++                    map.get_mut(&current).unwrap().insert(unhex(k), value);
++                }
++            }
++            Py::Ok(map)
++        }
++    }
++}
++
++fn multiline_ini() -> Ini {
++    let mut ini = Ini::new();
++    ini.set_multiline(true);
++    ini
++}
++
++// ---------------------------------------------------------------- properties: parsing
++
++/// On the common grammar, `read` gives Python's sections, keys and values (sections lowercased,
++/// as the crate documents; sectionless keys are the default section = Python's `DEFAULT`).
++#[hegel::test]
++fn parsing_agrees_with_python(mut tc: TestCase) {
++    let text = arb_text(&mut tc);
++    let mut ini = multiline_ini();
++    let ours = ini.read(text.clone());
++    match python(&text) {
++        Py::PyBug => {}
++        Py::Err => assert!(ours.is_err(), "text {:?}: Python rejects, crate gives {:?}", text, ours),
++        Py::Ok(mut expected) => {
++            let mut ours = ours.unwrap_or_else(|e| panic!("text {:?}: Python accepts, crate: {}", text, e));
++            // the crate creates its default section lazily; Python's DEFAULT always exists
++            let defaults = expected.remove("default").unwrap();
++            let our_defaults = ours.remove("default").unwrap_or_default();
++            assert_eq!(our_defaults, defaults, "text {:?}: default section", text);
++            assert_eq!(ours, expected, "text {:?}", text);
++        }
++    }
++}
++
++/// shlex-style contract of the parser's own knobs, against the parse of the same text: the
++/// `str`/stream/append entry points agree, `get_map`/`get_map_ref`/`sections` mirror the map, and
++/// `read_and_append` is a section-wise merge.
++#[hegel::test]
++fn entry_points_agree_and_append_merges(mut tc: TestCase) {
++    let text = arb_text(&mut tc);
++    let text2 = arb_text(&mut tc);
++    let mut ini = multiline_ini();
++    let Ok(map) = ini.read(text.clone()) else { return };
++    assert_eq!(&map, ini.get_map_ref());
++    assert_eq!(ini.get_map(), if map.is_empty() { None } else { Some(map.clone()) });
++    let mut sections = ini.sections();
++    sections.sort();
++    let mut keys: Vec<String> = map.keys().cloned().collect();
++    keys.sort();
++    assert_eq!(sections, keys);
++    let mut streamed = multiline_ini();
++    assert_eq!(streamed.load_from_stream(text.as_bytes()), Ok(map.clone()));
++
++    let mut other = multiline_ini();
++    let Ok(map2) = other.read(text2.clone()) else { return };
++    let merged = ini.read_and_append(text2.clone()).unwrap();
++    let mut expected = map.clone();
++    for (section, entries) in map2 {
++        expected.entry(section).or_default().extend(entries);
++    }
++    assert_eq!(merged, expected, "read_and_append of {:?} onto {:?}", text2, text);
++    assert_eq!(&merged, ini.get_map_ref());
++}
++
++// ---------------------------------------------------------------- properties: writing
++
++fn arb_write_options(tc: &mut TestCase) -> WriteOptions {
++    WriteOptions::new_with_params(chance(tc, 50), n(tc, 1, 6) as usize, n(tc, 0, 2) as usize)
++}
++
++/// "This is always safe since the configuration is validated during parsing": a parsed
++/// configuration, written with any `WriteOptions` (indentation ≥ 1), reads back to the same map,
++/// with multiline on or off.
++#[hegel::test]
++fn parsed_config_writes_and_reads_back(mut tc: TestCase) {
++    let text = arb_text(&mut tc);
++    let multiline = chance(&mut tc, 60);
++    let mut ini = Ini::new();
++    ini.set_multiline(multiline);
++    let Ok(mut map) = ini.read(text.clone()) else { return };
++    let opts = arb_write_options(&mut tc);
++    let written = ini.pretty_writes(&opts);
++    let mut again = Ini::new();
++    again.set_multiline(multiline);
++    let reread = again.read(written.clone());
++    // the default section is written without a header, so an empty one has no representation
++    if map.get("default").is_some_and(|d| d.is_empty()) {
++        map.remove("default");
++    }
++    assert_eq!(reread, Ok(map), "text {:?} written as {:?} (multiline {}, {:?})", text, written, multiline, opts);
++    if opts == WriteOptions::default() {
++        assert_eq!(written, ini.writes());
++    }
++}
++
++/// configparser/4: `multiline_line_indentation = 0` writes continuation lines flush left, which
++/// read back as keys.
++#[hegel::test]
++fn zero_indentation_output_reads_back(mut tc: TestCase) {
++    let mut ini = multiline_ini();
++    let key = pick(&mut tc, &["k", "key"]);
++    let text = format!("[s]\n{}=a\n  {}\n", key, pick(&mut tc, CONT));
++    let map = ini.read(text.clone()).unwrap();
++    let opts = WriteOptions::new_with_params(chance(&mut tc, 50), 0, n(&mut tc, 0, 1) as usize);
++    let written = ini.pretty_writes(&opts);
++    let mut again = multiline_ini();
++    assert_eq!(again.read(written.clone()), Ok(map), "text {:?} written as {:?}", text, written);
++}
++
++/// configparser/3: values put in with `set` are written verbatim, so a value whose line starts
++/// with `[` or a comment symbol, a key containing a delimiter, or padding around a value do not
++/// read back.
++#[hegel::test]
++fn set_values_write_and_read_back(mut tc: TestCase) {
++    let mut ini = multiline_ini();
++    let key = pick(&mut tc, &["k", "a=b", "c:d", " padded "]);
++    let value = match n(&mut tc, 0, 3) {
++        0 => format!("a\n{}", pick(&mut tc, &["[b]", ";c", "#c", "x ;c"])),
++        1 => pick(&mut tc, &[" v", "v ", "v ;c", "v #c"]).to_string(),
++        2 => format!("v\n"),
++        _ => "plain".to_string(),
++    };
++    ini.set("s", &key, Some(value.clone()));
++    let written = ini.writes();
++    let mut again = multiline_ini();
++    let reread = again.read(written.clone());
++    assert_eq!(
++        reread.as_ref().map(|m| m.get("s").and_then(|s| s.get(key.trim().to_lowercase().as_str())).cloned()),
++        Ok(Some(Some(value.clone()))),
++        "set({:?}, {:?}) written as {:?} read back as {:?}",
++        key, value, written, reread
++    );
++}
++
++// ---------------------------------------------------------------- properties: the map API
++
++/// `set`/`setstr`/`get`/`remove_key`/`remove_section`/`clear`/`sections` against a `HashMap`
++/// model with the documented casefolding (lowercase unless `new_cs`).
++#[hegel::test]
++fn map_edits_follow_a_model(mut tc: TestCase) {
++    let cs = chance(&mut tc, 30);
++    let mut ini = if cs { Ini::new_cs() } else { Ini::new() };
++    let mut model: Map = HashMap::new();
++    let fold = |s: &str| if cs { s.to_string() } else { s.to_lowercase() };
++    for _ in 0..n(&mut tc, 0, 12) {
++        let section = pick(&mut tc, &["A", "a", "b", "Sec"]);
++        let key = pick(&mut tc, &["K", "k", "x", "Y"]);
++        match n(&mut tc, 0, 6) {
++            0 | 1 => {
++                let value = if chance(&mut tc, 70) { Some(pick(&mut tc, VALUES).to_string()) } else { None };
++                let previous = if chance(&mut tc, 50) {
++                    ini.set(section, key, value.clone())
++                } else {
++                    ini.setstr(section, key, value.as_deref())
++                };
++                let expected = model.entry(fold(section)).or_default().insert(fold(key), value);
++                assert_eq!(previous, expected, "set returns the previous value");
++            }
++            2 => {
++                let got = ini.remove_key(section, key);
++                let expected = model.get_mut(&fold(section)).and_then(|s| s.remove(&fold(key)));
++                assert_eq!(got, expected);
++            }
++            3 => {
++                let got = ini.remove_section(section);
++                assert_eq!(got, model.remove(&fold(section)));
++            }
++            4 => {
++                if chance(&mut tc, 20) {
++                    ini.clear();
++                    model.clear();
++                }
++            }
++            _ => {
++                let got = ini.get(section, key);
++                let expected = model.get(&fold(section)).and_then(|s| s.get(&fold(key))).cloned().flatten();
++                assert_eq!(got, expected, "get({:?}, {:?})", section, key);
++            }
++        }
++        assert_eq!(ini.get_map_ref(), &model);
++    }
++}
++
++/// `getint`/`getuint`/`getfloat`/`getbool`/`getboolcoerce` are `str::parse` on the stored value
++/// (the documented spellings for `getboolcoerce`), `Ok(None)` for a missing key, and with
++/// `cascade_defaults` the default section's value stands in for a missing one.
++#[hegel::test]
++fn typed_getters_follow_the_docs(mut tc: TestCase) {
++    let cascade = chance(&mut tc, 50);
++    let mut ini = Ini::new();
++    ini.set_cascade_defaults(cascade);
++    let values = ["1", "-7", "18446744073709551615", "3.5", "x", "True", "FALSE", "yes", "N", "on", "0", "", "1e3"];
++    let in_section = if chance(&mut tc, 60) { Some(pick(&mut tc, &values).to_string()) } else { None };
++    let in_default = if chance(&mut tc, 60) { Some(pick(&mut tc, &values).to_string()) } else { None };
++    if let Some(v) = &in_section {
++        ini.set("s", "k", Some(v.clone()));
++    } else if chance(&mut tc, 50) {
++        ini.set("s", "k", None);
++    }
++    if let Some(v) = &in_default {
++        ini.set("default", "k", Some(v.clone()));
++    }
++    let effective = in_section.clone().or(if cascade { in_default.clone() } else { None });
++    assert_eq!(ini.get("s", "k"), effective);
++    let e = effective.as_deref();
++    assert_eq!(ini.getint("s", "k").ok(), e.map_or(Some(None), |v| v.parse::<i64>().ok().map(Some)));
++    assert_eq!(ini.getuint("s", "k").ok(), e.map_or(Some(None), |v| v.parse::<u64>().ok().map(Some)));
++    assert_eq!(ini.getfloat("s", "k").ok(), e.map_or(Some(None), |v| v.parse::<f64>().ok().map(Some)));
++    let strict = e.map_or(Some(None), |v| match v.to_ascii_lowercase().as_str() {
++        "true" => Some(Some(true)),
++        "false" => Some(Some(false)),
++        _ => None,
++    });
++    assert_eq!(ini.getbool("s", "k").ok(), strict);
++    let coerce = e.map_or(Some(None), |v| match v.to_lowercase().as_str() {
++        "true" | "yes" | "t" | "y" | "on" | "1" => Some(Some(true)),
++        "false" | "no" | "f" | "n" | "off" | "0" => Some(Some(false)),
++        _ => None,
++    });
++    assert_eq!(ini.getboolcoerce("s", "k").ok(), coerce);
++}
++
++// ---------------------------------------------------------------- pinned
++
++/// configparser/1: the default section name is stored as given while headers are casefolded, so
++/// with `set_default_section("Top")` the sectionless keys land under `Top`, a `[Top]` header
++/// under `top`, and `get("Top", key)` (which casefolds) finds neither the former nor cascades.
++#[hegel::test]
++fn default_section_name_is_casefolded_like_headers(mut tc: TestCase) {
++    let name = pick(&mut tc, &["Top", "DEFAULT", "Main", "sEc"]);
++    let mut ini = Ini::new();
++    ini.set_default_section(name);
++    let mut text = format!("k=v\n");
++    let with_header = chance(&mut tc, 50);
++    if with_header {
++        text.push_str(&format!("[{}]\nx=y\n", name));
++    }
++    let map = ini.read(text.clone()).unwrap();
++    assert_eq!(ini.get(name, "k"), Some("v".to_string()), "text {:?} with default section {:?}: map {:?}", text, name, map);
++    assert_eq!(ini.get(&name.to_lowercase(), "k"), Some("v".to_string()));
++    assert_eq!(map.len(), 1, "one section, not a casefolded and a raw copy: {:?}", map);
++}
++
++/// configparser/2: with inline comment symbols distinct from the line comment symbols, a line
++/// that is only an inline comment becomes a key named `""` — a key the parser refuses elsewhere
++/// ("Key cannot be empty") and one `writes()` cannot represent.
++#[hegel::test]
++fn inline_comment_only_line_is_a_comment(mut tc: TestCase) {
++    let sym = pick(&mut tc, &['!', '%', '@']);
++    let mut ini = Ini::new();
++    ini.set_inline_comment_symbols(Some(&[sym]));
++    let text = format!("[s]\nk=v\n{}{}\n", indent(&mut tc, 0, 2), format!("{} only a comment", sym));
++    let map = ini.read(text.clone()).unwrap();
++    assert_eq!(map["s"].len(), 1, "text {:?}: {:?}", text, map);
++    assert!(!map["s"].contains_key(""));
++}
++
++// ---------------------------------------------------------------- the documentation
++
++#[hegel::test]
++fn doc_examples(_tc: TestCase) {
++    let mut config = Ini::new();
++    let map = config.read("[2000s]\n    2020 = bad".to_string()).unwrap();
++    assert_eq!(map["2000s"]["2020"].clone().unwrap(), "bad");
++    config.read_and_append("[2000s]\n2020 = terrible\n2023 = better".to_string()).unwrap();
++    assert_eq!(config.get("2000s", "2020").unwrap(), "terrible");
++    assert_eq!(config.get("2000s", "2023").unwrap(), "better");
++    let default = IniDefault::default();
++    assert_eq!(default.default_section, "default");
++    assert_eq!(default.comment_symbols, vec![';', '#']);
++    assert_eq!(default.delimiters, vec!['=', ':']);
++    assert!(!default.case_sensitive && !default.multiline && default.enable_inline_comments && !default.cascade_defaults);
++    let mut config = Ini::new();
++    config.load("tests/test.ini").unwrap();
++    assert_eq!(config.get("TOPSECRET", "KFC").unwrap(), "the secret herb is orega-");
++    assert_eq!(config.get("topsecret", "Empty string").unwrap(), "");
++    assert_eq!(config.get("topsecret", "None string"), None);
++    assert_eq!(config.get("spacing", "indented").unwrap(), "indented");
++    assert_eq!(config.getuint("values", "Uint").unwrap().unwrap(), 31415);
++    assert_eq!(config.getint("values", "Int").unwrap().unwrap(), -31415);
++    assert_eq!(config.getfloat("values", "Float").unwrap().unwrap(), 3.1415);
++    assert!(config.getbool("values", "Bool").unwrap().unwrap());
++    assert!(!config.getboolcoerce("values", "Boolcoerce").unwrap().unwrap());
++    let mut config = Ini::new();
++    config.set_cascade_defaults(true);
++    config.load("tests/test_cascade_defaults.ini").unwrap();
++    assert_eq!(config.get("mysection", "fallback_key"), Some(String::from("fallback value")));
++    let mut config = Ini::new();
++    config.read("[topsecrets]\nValueless key".to_string()).unwrap();
++    config.get_mut_map().get_mut("topsecrets").unwrap().insert(String::from("nuclear launch codes"), None);
++    assert_eq!(config.get("topsecrets", "nuclear launch codes"), None);
++    assert_eq!(WriteOptions::new_with_params(true, 2, 1).multiline_line_indentation, 2);
++}
