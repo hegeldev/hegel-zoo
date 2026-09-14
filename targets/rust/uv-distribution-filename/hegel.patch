@@ -1,0 +1,781 @@
+diff --git a/crates/uv-distribution-filename/Cargo.toml b/crates/uv-distribution-filename/Cargo.toml
+index 7f06a5e..cbc4d82 100644
+--- a/crates/uv-distribution-filename/Cargo.toml
++++ b/crates/uv-distribution-filename/Cargo.toml
+@@ -30,3 +30,5 @@ thiserror = { workspace = true }
+ 
+ [dev-dependencies]
+ insta = { workspace = true }
++hegeltest = "0.44.1"
++serde_json = { workspace = true }
+diff --git a/crates/uv-distribution-filename/tests/hegel.rs b/crates/uv-distribution-filename/tests/hegel.rs
+new file mode 100644
+index 0000000..fd4c89d
+--- /dev/null
++++ b/crates/uv-distribution-filename/tests/hegel.rs
+@@ -0,0 +1,765 @@
++//! Hegel properties for `uv-distribution-filename`.
++//!
++//! Oracle, in one persistent Python child (the first of `python3`, `/usr/bin/python3` that
++//! imports it): PyPA's `packaging` — `packaging.utils.parse_wheel_filename`,
++//! `parse_sdist_filename`, `canonicalize_name` and `packaging.version.Version` — the reference
++//! reading of the wheel filename convention (binary distribution format specification, PEP 425
++//! compressed tag sets), the sdist filename convention (PEP 625) and PEP 440/503 normalisation.
++//! Alongside: the crate's own `Display` must re-parse to the same value, and be the identity on
++//! canonical filenames; the recognised tags of a filename are exactly the atoms its tag types
++//! parse; the sdist parsers with and without a package-name hint agree; the extension table.
++#![allow(clippy::all, dead_code)]
++use hegel::{generators, Generator, HealthCheck, TestCase};
++use serde_json::Value;
++use std::collections::BTreeSet;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++use uv_distribution_filename::{
++    DistExtension, DistFilename, EggInfoFilename, LegacySourceDistExtension, SourceDistExtension,
++    SourceDistFilename, WheelFilename,
++};
++use uv_normalize::PackageName;
++use uv_platform_tags::{AbiTag, LanguageTag, PlatformTag};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + std::fmt::Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn chance(tc: &TestCase, one_in: usize) -> bool {
++    n(tc, 0, one_in - 1) == 0
++}
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys, json
++from packaging.utils import parse_wheel_filename, parse_sdist_filename, canonicalize_name
++from packaging.version import Version
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++def enc(s):
++    return s.encode('utf-8').hex()
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'W':
++            try:
++                name, version, build, tags = parse_wheel_filename(args[0])
++                out = {'ok': True, 'name': name, 'version': str(version),
++                       'build': [str(build[0]), build[1]] if build else None,
++                       'tags': sorted([t.interpreter, t.abi, t.platform] for t in tags)}
++            except Exception as e:
++                out = {'ok': False, 'error': type(e).__name__ + ': ' + str(e)}
++        elif cmd == 'S':
++            try:
++                name, version = parse_sdist_filename(args[0])
++                out = {'ok': True, 'name': name, 'version': str(version)}
++            except Exception as e:
++                out = {'ok': False, 'error': type(e).__name__ + ': ' + str(e)}
++        elif cmd == 'V':
++            try:
++                out = {'ok': True, 'str': str(Version(args[0]))}
++            except Exception as e:
++                out = {'ok': False, 'error': type(e).__name__ + ': ' + str(e)}
++        elif cmd == 'N':
++            out = {'ok': True, 'name': canonicalize_name(args[0])}
++        else:
++            out = {'ok': False, 'error': 'bad command ' + cmd}
++        res = ['ok', json.dumps(out)]
++    except Exception as e:
++        res = ['err', type(e).__name__ + ': ' + str(e)]
++    print(' '.join([res[0]] + [enc(x) for x in res[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn python() -> &'static str {
++    static PY: OnceLock<&'static str> = OnceLock::new();
++    PY.get_or_init(|| {
++        for py in ["python3", "/usr/bin/python3"] {
++            let ok = Command::new(py)
++                .args(["-c", "import packaging.utils, packaging.tags, packaging.version"])
++                .stderr(Stdio::null())
++                .status()
++                .map(|s| s.success())
++                .unwrap_or(false);
++            if ok {
++                return py;
++            }
++        }
++        panic!("no python3 with packaging")
++    })
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let mut child = Command::new(python())
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the python oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++fn ask(cmd: &str, args: &[&str]) -> Value {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).unwrap();
++    let mut reply = String::new();
++    o.stdout.read_line(&mut reply).unwrap();
++    let mut parts = reply.trim_end().split(' ');
++    let status = parts.next().unwrap().to_string();
++    let fields: Vec<String> = parts.map(unhex).collect();
++    assert_eq!(status, "ok", "oracle failed on {cmd} {args:?}: {fields:?}");
++    serde_json::from_str(&fields[0]).unwrap()
++}
++
++/// `packaging.utils.parse_wheel_filename`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PyWheel {
++    name: String,
++    version: String,
++    /// `(leading digits, rest)`, the digits as text (Python ints are unbounded).
++    build: Option<(String, String)>,
++    /// Every `(interpreter, abi, platform)` of the compressed tag set, sorted.
++    tags: Vec<(String, String, String)>,
++}
++
++impl PyWheel {
++    fn atoms(&self, i: usize) -> BTreeSet<String> {
++        self.tags.iter().map(|t| [&t.0, &t.1, &t.2][i].clone()).collect()
++    }
++}
++
++fn py_wheel(filename: &str) -> Result<PyWheel, String> {
++    let v = ask("W", &[filename]);
++    if !v["ok"].as_bool().unwrap() {
++        return Err(v["error"].as_str().unwrap().to_string());
++    }
++    let s = |x: &Value| x.as_str().unwrap().to_string();
++    Ok(PyWheel {
++        name: s(&v["name"]),
++        version: s(&v["version"]),
++        build: v["build"].as_array().map(|b| (s(&b[0]), s(&b[1]))),
++        tags: v["tags"].as_array().unwrap().iter().map(|t| (s(&t[0]), s(&t[1]), s(&t[2]))).collect(),
++    })
++}
++
++/// `packaging.utils.parse_sdist_filename`: `(normalised name, version)`.
++fn py_sdist(filename: &str) -> Result<(String, String), String> {
++    let v = ask("S", &[filename]);
++    if !v["ok"].as_bool().unwrap() {
++        return Err(v["error"].as_str().unwrap().to_string());
++    }
++    Ok((v["name"].as_str().unwrap().to_string(), v["version"].as_str().unwrap().to_string()))
++}
++
++/// `str(packaging.version.Version(v))`, `None` when it does not parse.
++fn py_version(v: &str) -> Option<String> {
++    let r = ask("V", &[v]);
++    r["ok"].as_bool().unwrap().then(|| r["str"].as_str().unwrap().to_string())
++}
++
++/// `packaging.utils.canonicalize_name`.
++fn py_canonical(name: &str) -> String {
++    ask("N", &[name])["name"].as_str().unwrap().to_string()
++}
++
++// --------------------------------------------------------------------------- generators
++
++const NAMES: [&str; 14] = [
++    "foo", "Foo", "foo_bar", "foo.bar", "Foo_Bar", "foo123", "a", "oslo.concurrency", "django_allauth",
++    "zope.interface", "PyYAML", "foo_bar_baz", "numpy", "x9",
++];
++
++/// A project name as spelled in a filename: letters, digits, `.` and `_` (a `-` would split the
++/// filename), starting and ending with a letter or digit, no runs of separators (the wheel
++/// specification says runs should be replaced by a single `_`; see `README.md` for the run case).
++#[hegel::composite]
++fn arb_name(tc: &TestCase) -> String {
++    if chance(tc, 2) {
++        return pick(tc, &NAMES).to_string();
++    }
++    const ALNUM: [char; 10] = ['a', 'b', 'z', 'A', 'Z', 'f', '0', '1', '9', 'x'];
++    let len = n(tc, 1, 8);
++    let mut out = String::new();
++    let mut last_sep = true;
++    for i in 0..len {
++        let last = i + 1 == len;
++        if !last_sep && !last && chance(tc, 4) {
++            out.push(pick(tc, &['.', '_']));
++            last_sep = true;
++        } else {
++            out.push(pick(tc, &ALNUM));
++            last_sep = false;
++        }
++    }
++    out
++}
++
++/// A PEP 440 version in any of the spellings the normalisation section allows (no `-`, which a
++/// filename cannot carry), sometimes with a `v` prefix or leading zeros.
++#[hegel::composite]
++fn arb_version(tc: &TestCase) -> String {
++    let mut v = String::new();
++    if chance(tc, 6) {
++        v.push('v');
++    }
++    if chance(tc, 6) {
++        v.push_str(&format!("{}!", n(tc, 0, 3)));
++    }
++    let parts = n(tc, 1, 4);
++    for i in 0..parts {
++        if i > 0 {
++            v.push('.');
++        }
++        if chance(tc, 8) {
++            v.push_str(&format!("0{}", n(tc, 0, 9)));
++        } else {
++            v.push_str(&n(tc, 0, 2026).to_string());
++        }
++    }
++    let sep = |tc: &TestCase| pick(tc, &["", ".", "_"]);
++    if chance(tc, 3) {
++        v.push_str(&sep(tc));
++        v.push_str(pick(tc, &["a", "b", "rc", "c", "alpha", "beta", "pre", "preview", "RC", "A"]));
++        if chance(tc, 4) {
++            v.push_str(&sep(tc));
++        }
++        if !chance(tc, 4) {
++            v.push_str(&n(tc, 0, 99).to_string());
++        }
++    }
++    if chance(tc, 3) {
++        v.push_str(&sep(tc));
++        v.push_str(pick(tc, &["post", "rev", "r", "POST"]));
++        if !chance(tc, 4) {
++            v.push_str(&n(tc, 0, 99).to_string());
++        }
++    }
++    if chance(tc, 3) {
++        v.push_str(&sep(tc));
++        v.push_str(pick(tc, &["dev", "DEV"]));
++        if !chance(tc, 4) {
++            v.push_str(&n(tc, 0, 99).to_string());
++        }
++    }
++    if chance(tc, 4) {
++        v.push('+');
++        let segs = n(tc, 1, 3);
++        for i in 0..segs {
++            if i > 0 {
++                v.push(pick(tc, &['.', '_']));
++            }
++            v.push_str(pick(tc, &["local", "ubuntu1", "abc", "ABC", "1", "20240101", "g1a2b3c"]));
++        }
++    }
++    v
++}
++
++/// A build tag: leading digits, then letters, digits, `_` and `.` (the character set the crate
++/// admits; `packaging` admits anything after the digits).
++#[hegel::composite]
++fn arb_build_tag(tc: &TestCase) -> String {
++    let mut b = n(tc, 0, 999_999_999_999).to_string();
++    if chance(tc, 3) {
++        b.push_str(pick(tc, &["abc", ".editable", "_x", "a1", "Zz", "1.2"]));
++    }
++    b
++}
++
++const PYTHON_TAGS: [&str; 16] = [
++    "py2", "py3", "py27", "py38", "py310", "py313", "cp39", "cp310", "cp313", "cp314", "cp3", "pp39", "pp310",
++    "graalpy310", "pyston38", "none",
++];
++const UNKNOWN_PYTHON_TAGS: [&str; 7] = ["ip27", "jy27", "cpython3", "py3x", "foo", "x1", "pypy39"];
++const ABI_TAGS: [&str; 14] = [
++    "none", "abi3", "abi3t", "cp39", "cp313t", "cp37m", "cp27mu", "cp314td", "cp27dmu", "pypy39_pp73", "pypy_73",
++    "graalpy240_310_native", "pyston_23_x86_64_linux_gnu", "cp310d",
++];
++const UNKNOWN_ABI_TAGS: [&str; 6] = ["foo", "cp39x", "abi4", "cp39mm", "pypy39", "cp3"];
++const PLATFORM_TAGS: [&str; 26] = [
++    "any", "win32", "win_amd64", "win_arm64", "win_ia64", "linux_x86_64", "linux_i686", "linux_armv7l",
++    "linux_aarch64", "manylinux1_x86_64", "manylinux2010_i686", "manylinux2014_aarch64", "manylinux_2_17_x86_64",
++    "manylinux_2_28_ppc64le", "manylinux_2_5_x86_64", "musllinux_1_2_x86_64", "macosx_10_9_x86_64",
++    "macosx_11_0_arm64", "macosx_10_9_universal2", "android_21_arm64_v8a", "ios_13_0_arm64_iphoneos",
++    "freebsd_13_x86_64", "solaris_2_11_sun4v_64bit", "pyodide_2024_0_wasm32", "pyemscripten_3_1_wasm32",
++    "linux_riscv64",
++];
++const UNKNOWN_PLATFORM_TAGS: [&str; 7] = [
++    "foo_bar", "linux_unknown", "manylinux_2_17_unknown", "manylinux_65536_0_x86_64", "macosx_10_9", "win64",
++    "manylinux_2_x86_64",
++];
++
++/// A compressed tag set: 1–3 distinct atoms, known ones spelled canonically, sometimes an
++/// unknown one (the crate keeps unknown tags in the text and drops them from the typed lists).
++#[hegel::composite]
++fn arb_tag_set(tc: &TestCase, known: &'static [&'static str], unknown: &'static [&'static str]) -> Vec<String> {
++    let count = if chance(tc, 3) { n(tc, 2, 3) } else { 1 };
++    let mut atoms: Vec<String> = Vec::new();
++    while atoms.len() < count {
++        let atom = if chance(tc, 5) { pick(tc, unknown) } else { pick(tc, known) };
++        if !atoms.iter().any(|a| a == atom) {
++            atoms.push(atom.to_string());
++        }
++    }
++    atoms
++}
++
++#[derive(Debug, Clone)]
++struct Wheel {
++    name: String,
++    version: String,
++    build: Option<String>,
++    python: Vec<String>,
++    abi: Vec<String>,
++    platform: Vec<String>,
++}
++
++impl Wheel {
++    fn filename(&self) -> String {
++        let mut f = format!("{}-{}", self.name, self.version);
++        if let Some(b) = &self.build {
++            f.push('-');
++            f.push_str(b);
++        }
++        format!("{f}-{}-{}-{}.whl", self.python.join("."), self.abi.join("."), self.platform.join("."))
++    }
++}
++
++#[hegel::composite]
++fn arb_wheel(tc: &TestCase) -> Wheel {
++    Wheel {
++        name: tc.draw(arb_name()),
++        version: tc.draw(arb_version()),
++        build: chance(tc, 4).then(|| tc.draw(arb_build_tag())),
++        python: tc.draw(arb_tag_set(&PYTHON_TAGS, &UNKNOWN_PYTHON_TAGS)),
++        abi: tc.draw(arb_tag_set(&ABI_TAGS, &UNKNOWN_ABI_TAGS)),
++        platform: tc.draw(arb_tag_set(&PLATFORM_TAGS, &UNKNOWN_PLATFORM_TAGS)),
++    }
++}
++
++// --------------------------------------------------------------------------- helpers
++
++fn strings<T: ToString>(items: &[T]) -> Vec<String> {
++    items.iter().map(|t| t.to_string()).collect()
++}
++
++/// The atoms of a compressed tag set component that the crate's tag type parses, spelled as
++/// the crate spells them.
++fn recognised<T: FromStr + ToString>(atoms: &BTreeSet<String>) -> BTreeSet<String> {
++    atoms.iter().filter_map(|a| T::from_str(a).ok().map(|t| t.to_string())).collect()
++}
++
++/// The name of a wheel/sdist filename as `packaging` normalises it.
++fn dist_info(name: &str) -> String {
++    py_canonical(name).replace('-', "_")
++}
++
++/// `(int, rest)` of a build tag as `packaging` splits it.
++fn split_build(tag: &str) -> (String, String) {
++    let digits = tag.bytes().take_while(|b| b.is_ascii_digit()).count();
++    (tag[..digits].trim_start_matches('0').to_string(), tag[digits..].to_string())
++}
++
++// --------------------------------------------------------------------------- properties: wheels
++
++/// Wheel filenames built from the convention's grammar parse to what `packaging` reads: same
++/// normalised name, same version (as `str(Version)`), same build tag, and the crate's recognised
++/// Python/ABI/platform tags are exactly the atoms of the compressed tag set its tag types parse.
++#[hegel::test(suppress_health_check = [HealthCheck::LargeInitialTestCase])]
++fn wheel_filenames_parse_like_packaging(tc: TestCase) {
++    let w = tc.draw(arb_wheel().print_as_debug());
++    let filename = w.filename();
++    let py = py_wheel(&filename).unwrap_or_else(|e| panic!("packaging rejected {filename}: {e}"));
++    let uv = WheelFilename::from_str(&filename).unwrap_or_else(|e| panic!("uv rejected {filename}: {e}"));
++    assert_eq!(uv.name.to_string(), py.name, "name of {filename}");
++    assert_eq!(uv.version.to_string(), py.version, "version of {filename}");
++    assert_eq!(
++        uv.build_tag().map(|b| b.to_string()),
++        py.build.as_ref().map(|(d, r)| format!("{}{r}", if d.is_empty() { "0" } else { d })),
++        "build tag of {filename}"
++    );
++    let want_python = recognised::<LanguageTag>(&py.atoms(0));
++    let want_abi = recognised::<AbiTag>(&py.atoms(1));
++    let want_platform = recognised::<PlatformTag>(&py.atoms(2));
++    let got_python: BTreeSet<String> = strings(uv.python_tags()).into_iter().collect();
++    let got_abi: BTreeSet<String> = strings(uv.abi_tags()).into_iter().collect();
++    let got_platform: BTreeSet<String> = strings(uv.platform_tags()).into_iter().collect();
++    assert_eq!(got_python, want_python, "python tags of {filename}");
++    assert_eq!(got_abi, want_abi, "abi tags of {filename}");
++    assert_eq!(got_platform, want_platform, "platform tags of {filename}");
++    // The recognised tags keep the order of the compressed tag set.
++    assert_eq!(strings(uv.python_tags()), w.python.iter().filter(|a| LanguageTag::from_str(a).is_ok()).cloned().collect::<Vec<_>>());
++    assert_eq!(strings(uv.platform_tags()), w.platform.iter().filter(|a| PlatformTag::from_str(a).is_ok()).cloned().collect::<Vec<_>>());
++}
++
++/// `Display` re-parses to the same value, and is the identity on a canonical filename (escaped
++/// normalised name, normalised version; the tags are kept as written).
++#[hegel::test(suppress_health_check = [HealthCheck::LargeInitialTestCase])]
++fn wheel_display_round_trips(tc: TestCase) {
++    let w = tc.draw(arb_wheel().print_as_debug());
++    let filename = w.filename();
++    let uv = WheelFilename::from_str(&filename).unwrap_or_else(|e| panic!("uv rejected {filename}: {e}"));
++    let shown = uv.to_string();
++    let again = WheelFilename::from_str(&shown).unwrap_or_else(|e| panic!("{filename} displayed as {shown}, which does not parse: {e}"));
++    assert_eq!(again, uv, "{filename} displayed as {shown} parses differently");
++    assert_eq!(again.to_string(), shown);
++    assert_eq!(uv.stem(), shown.strip_suffix(".whl").unwrap());
++    let canonical = w.name == dist_info(&w.name) && py_version(&w.version).as_deref() == Some(w.version.as_str());
++    if canonical {
++        assert_eq!(shown, filename, "a canonical filename is displayed as itself");
++    } else {
++        let mut expected = format!("{}-{}", dist_info(&w.name), py_version(&w.version).unwrap());
++        expected.push('-');
++        expected.push_str(filename.split_once(&format!("{}-{}-", w.name, w.version)).unwrap().1);
++        assert_eq!(shown, expected, "display normalises only the name and the version");
++    }
++    // serde: a string both ways.
++    let json = serde_json::to_string(&uv).unwrap();
++    assert_eq!(json, serde_json::to_string(&shown).unwrap());
++    assert_eq!(serde_json::from_str::<WheelFilename>(&json).unwrap(), uv);
++    // The stem parser agrees with the filename parser.
++    assert_eq!(WheelFilename::from_stem(&uv.stem()).unwrap(), uv);
++}
++
++/// Every single-character edit of a valid wheel filename is judged alike by the crate and by
++/// `packaging`, except where one of them is documented as the lenient one (see `README.md`).
++#[hegel::test(suppress_health_check = [HealthCheck::LargeInitialTestCase])]
++fn wheel_mutants_are_judged_alike(tc: TestCase) {
++    let w = tc.draw(arb_wheel().print_as_debug());
++    let original = w.filename();
++    const CHARS: [char; 14] = ['-', '.', '_', 'a', 'Z', '0', '9', 'p', 'y', 'c', 'w', 'h', 'l', 'x'];
++    let mut chars: Vec<char> = original.chars().collect();
++    let at = n(&tc, 0, chars.len() - 1);
++    match n(&tc, 0, 2) {
++        0 => {
++            chars.remove(at);
++        }
++        1 => chars.insert(at, pick(&tc, &CHARS)),
++        _ => chars[at] = pick(&tc, &CHARS),
++    }
++    let mutant: String = chars.into_iter().collect();
++    if mutant == original {
++        return;
++    }
++    let uv = WheelFilename::from_str(&mutant);
++    let py = py_wheel(&mutant);
++    let stem = mutant.strip_suffix(".whl").unwrap_or(&mutant);
++    let parts: Vec<&str> = stem.split('-').collect();
++    let name = parts.first().copied().unwrap_or("");
++    let tags: Vec<&str> = if parts.len() >= 5 { parts[parts.len() - 3..].to_vec() } else { vec![] };
++    let atoms: Vec<&str> = tags.iter().flat_map(|t| t.split('.')).collect();
++    // Shapes pinned separately (bugs 1 and 2): a `+` never reaches a tag from the mutation pool;
++    // an empty atom at the end of a component is bug 2.
++    if tags.iter().any(|t| t.ends_with('.')) {
++        return;
++    }
++    match (&uv, &py) {
++        (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
++        (Ok(_), Err(e)) => {
++            // The crate is documented lenient on: runs of separators in the name (`foo__bar`),
++            // unknown tags (kept in the text, dropped from the typed lists; `packaging` insists an
++            // interpreter atom is an identifier).
++            let lenient_name = name.contains("__");
++            let lenient_interpreter = parts.len() >= 5
++                && tags[0].split('.').any(|a| a.starts_with(|c: char| c.is_ascii_digit()));
++            assert!(lenient_name || lenient_interpreter, "uv accepts {mutant} (from {original}), packaging: {e}");
++        }
++        (Err(e), Ok(_)) => {
++            // The crate is documented strict on: tag atoms outside `[A-Za-z0-9_]`, build tags
++            // outside `[A-Za-z0-9_.]`, names that start or end with a separator or are not
++            // ASCII letters, digits, `-`, `_`, `.`.
++            let strict_atoms = atoms.iter().any(|a| !a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
++            let strict_build = parts.len() == 6 && !parts[2].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
++            let strict_name = name.starts_with(['.', '_']) || name.ends_with(['.', '_']) || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
++            let version_differs = parts.len() >= 5 && py_version(parts[1]).is_some() && uv_pep440::Version::from_str(parts[1]).is_err();
++            assert!(
++                strict_atoms || strict_build || strict_name,
++                "packaging accepts {mutant} (from {original}), uv: {e}{}",
++                if version_differs { " (the version parsers disagree)" } else { "" }
++            );
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- properties: sdists
++
++const EXTENSIONS: [(&str, SourceDistExtension); 12] = [
++    ("tar.gz", SourceDistExtension::TarGz),
++    ("zip", SourceDistExtension::Legacy(LegacySourceDistExtension::Zip)),
++    ("tar", SourceDistExtension::Legacy(LegacySourceDistExtension::Tar)),
++    ("tar.bz2", SourceDistExtension::Legacy(LegacySourceDistExtension::TarBz2)),
++    ("tar.lz", SourceDistExtension::Legacy(LegacySourceDistExtension::TarLz)),
++    ("tar.lzma", SourceDistExtension::Legacy(LegacySourceDistExtension::TarLzma)),
++    ("tar.xz", SourceDistExtension::Legacy(LegacySourceDistExtension::TarXz)),
++    ("tar.zst", SourceDistExtension::Legacy(LegacySourceDistExtension::TarZst)),
++    ("tbz", SourceDistExtension::Legacy(LegacySourceDistExtension::Tbz)),
++    ("tgz", SourceDistExtension::Legacy(LegacySourceDistExtension::Tgz)),
++    ("tlz", SourceDistExtension::Legacy(LegacySourceDistExtension::Tlz)),
++    ("txz", SourceDistExtension::Legacy(LegacySourceDistExtension::Txz)),
++];
++
++/// `{name}-{version}.{ext}` parses like `packaging` for the PEP 625 extensions (`.tar.gz`,
++/// `.zip`), and like its own `.tar.gz` twin for the legacy ones; the parser with a package-name
++/// hint agrees with the one without; `Display` is the escaped normalised name, the normalised
++/// version and the extension, and re-parses to the same value.
++#[hegel::test]
++fn sdist_filenames_parse_like_packaging(tc: TestCase) {
++    let name = tc.draw(arb_name().print_as_debug());
++    let version = tc.draw(arb_version().print_as_debug());
++    let (ext, expected_ext) = pick(&tc, &EXTENSIONS);
++    let filename = format!("{name}-{version}.{ext}");
++    let twin = format!("{name}-{version}.tar.gz");
++    let py = py_sdist(&twin).unwrap_or_else(|e| panic!("packaging rejected {twin}: {e}"));
++    let uv = SourceDistFilename::parsed_normalized_filename(&filename).unwrap_or_else(|e| panic!("uv rejected {filename}: {e}"));
++    assert_eq!(uv.name.to_string(), py.0, "name of {filename}");
++    assert_eq!(uv.version.to_string(), py.1, "version of {filename}");
++    assert_eq!(uv.extension, expected_ext);
++    if ext == "zip" {
++        assert_eq!(py_sdist(&filename).unwrap(), py);
++    }
++    let shown = uv.to_string();
++    assert_eq!(shown, format!("{}-{}.{ext}", dist_info(&name), py.1));
++    assert_eq!(SourceDistFilename::parsed_normalized_filename(&shown).unwrap(), uv);
++    // With the package name known.
++    let package = PackageName::from_str(&py.0).unwrap();
++    let hinted = DistFilename::try_from_filename_with_reason(&filename, &package)
++        .unwrap_or_else(|e| panic!("uv rejected {filename} with hint {package}: {e}"));
++    assert_eq!(hinted, DistFilename::SourceDistFilename(uv.clone()));
++    assert_eq!(DistFilename::try_from_normalized_filename(&filename), Some(hinted.clone()));
++    assert_eq!(hinted.filetype(), "sdist");
++    assert_eq!(hinted.to_string(), shown);
++    assert_eq!(SourceDistFilename::parse(&filename, expected_ext, &package).unwrap(), uv);
++    // The same components as a wheel give the same name and version.
++    let wheel = WheelFilename::from_str(&format!("{name}-{version}-py3-none-any.whl")).unwrap();
++    assert_eq!((wheel.name, wheel.version), (uv.name, uv.version));
++}
++
++/// A filename that is not `{name}-{version}.{ext}` is rejected by both: no separator, an empty
++/// name, a version that is not PEP 440, an extension outside the list.
++#[hegel::test]
++fn malformed_sdist_filenames_are_rejected_alike(tc: TestCase) {
++    let name = tc.draw(arb_name().print_as_debug());
++    let version = tc.draw(arb_version().print_as_debug());
++    let filename = match n(&tc, 0, 3) {
++        0 => format!("{name}.{}", pick(&tc, &["tar.gz", "zip"])),
++        1 => format!("-{version}.{}", pick(&tc, &["tar.gz", "zip"])),
++        2 => format!(
++            "{name}-{}.{}",
++            pick(&tc, &["x.y.z", "1.0.", "1..0", "1.0+", "a1", "1.0.post.x", "1.0dev1dev1", "1.0!1", ""]),
++            pick(&tc, &["tar.gz", "zip"])
++        ),
++        _ => format!("{name}-{version}.{}", pick(&tc, &["gz", "tar.gz.asc", "egg", "exe", "rar", "tar.gz2", "TAR.GZ", "Zip", "tar.GZ"])),
++    };
++    let uv = SourceDistFilename::parsed_normalized_filename(&filename);
++    let py = py_sdist(&filename);
++    assert!(uv.is_err(), "uv accepted {filename}: {}", uv.unwrap());
++    assert!(py.is_err(), "packaging accepted {filename}: {:?}", py.unwrap());
++    assert!(DistFilename::try_from_normalized_filename(&filename).is_none());
++}
++
++/// `DistExtension::from_path` knows exactly the documented extensions.
++#[hegel::test]
++fn extensions_follow_the_documented_list(tc: TestCase) {
++    let stem = format!("{}-{}", tc.draw(arb_name().print_as_debug()), tc.draw(arb_version().print_as_debug()));
++    if chance(&tc, 3) {
++        let (ext, expected) = pick(&tc, &EXTENSIONS);
++        let path = format!("{stem}.{ext}");
++        assert_eq!(DistExtension::from_path(&path).unwrap(), DistExtension::Source(expected), "{path}");
++        assert_eq!(SourceDistExtension::from_path(&path).unwrap(), expected, "{path}");
++        assert_eq!(expected.to_string(), ext);
++        assert_eq!(expected.is_pep625_compliant(), ext == "tar.gz" || ext == "zip");
++    } else if chance(&tc, 2) {
++        let path = format!("{stem}.whl");
++        assert_eq!(DistExtension::from_path(&path).unwrap(), DistExtension::Wheel);
++        assert!(SourceDistExtension::from_path(&path).is_err());
++    } else {
++        let ext = pick(&tc, &["gz", "bz2", "xz", "zst", "lz", "lzma", "tar.gz.asc", "egg", "exe", "msi", "tar.gz2", "rar", "7z", "", "targz"]);
++        let path = if ext.is_empty() { stem.clone() } else { format!("{stem}.{ext}") };
++        assert!(DistExtension::from_path(&path).is_err(), "{path} is not a distribution");
++    }
++}
++
++// --------------------------------------------------------------------------- properties: eggs
++
++/// `.egg-info` filenames (`name[-version[-pyX.Y[-platform]]]`) give the normalised name and the
++/// normalised version.
++#[hegel::test]
++fn egg_info_filenames_give_name_and_version(tc: TestCase) {
++    let name = tc.draw(arb_name().print_as_debug());
++    let version = chance(&tc, 4).then(|| tc.draw(arb_version().print_as_debug()));
++    let mut stem = name.clone();
++    if let Some(v) = &version {
++        stem.push('-');
++        stem.push_str(v);
++        if chance(&tc, 2) {
++            stem.push_str(pick(&tc, &["-py3.12", "-py2.7", "-py3.9"]));
++            if chance(&tc, 2) {
++                stem.push_str(pick(&tc, &["-linux-x86_64", "-darwin", "-win32", "-macosx-10.9-x86_64"]));
++            }
++        }
++    }
++    let filename = format!("{stem}.egg-info");
++    let egg = EggInfoFilename::from_str(&filename).unwrap_or_else(|e| panic!("uv rejected {filename}: {e}"));
++    assert_eq!(egg.name.to_string(), py_canonical(&name));
++    assert_eq!(egg.version.map(|v| v.to_string()), version.as_deref().map(|v| py_version(v).unwrap()));
++    assert!(EggInfoFilename::from_str(&stem).is_err(), "{stem} has no .egg-info suffix");
++}
++
++// --------------------------------------------------------------------------- pins
++
++/// Bug 1: the single-tag fast path parses the numbers of a tag with `str::parse`, which takes a
++/// leading `+`, and never checks the characters the compressed-tag path rejects: `py3+9`,
++/// `cp3+9`, `manylinux_+2_17_x86_64` are accepted (and displayed as `py39`, `cp39`,
++/// `manylinux_2_17_x86_64`). `packaging` rejects `py3+9` (not an identifier); the crate rejects
++/// the same atoms as soon as a second atom is present.
++#[hegel::test]
++fn fast_path_tags_take_no_plus_sign(tc: TestCase) {
++    let minor = n(&tc, 0, 15);
++    let tagged = match n(&tc, 0, 3) {
++        0 => format!("foo-1.0-py3+{minor}-none-any.whl"),
++        1 => format!("foo-1.0-cp3+{minor}-none-any.whl"),
++        2 => format!("foo-1.0-py3-none-manylinux_+2_{minor}_x86_64.whl"),
++        _ => format!("foo-1.0-py3-none-macosx_10_+{minor}_x86_64.whl"),
++    };
++    let compressed = tagged.replace("-none-any", ".py2-none-any").replace("-py3-none-m", "-py3.py2-none-m");
++    assert!(WheelFilename::from_str(&compressed).is_err(), "{compressed} is rejected on the compressed-tag path");
++    assert!(
++        WheelFilename::from_str(&tagged).is_err(),
++        "{tagged} is accepted on the single-tag path, as {}",
++        WheelFilename::from_str(&tagged).unwrap()
++    );
++}
++
++/// Bug 2: a trailing `.` in a tag component is ignored (`py3.`, `none.`): the splitter yields no
++/// empty atom at the end, while `..` and a leading `.` are rejected as empty atoms and `packaging`
++/// rejects all of them ("has an empty component").
++#[hegel::test(suppress_health_check = [HealthCheck::LargeInitialTestCase])]
++fn trailing_dot_in_a_tag_component_is_an_empty_atom(tc: TestCase) {
++    let w = tc.draw(arb_wheel().print_as_debug());
++    let mut w = w;
++    w.build = None;
++    match n(&tc, 0, 2) {
++        0 => w.python.last_mut().unwrap().push('.'),
++        1 => w.abi.last_mut().unwrap().push('.'),
++        _ => w.platform.last_mut().unwrap().push('.'),
++    }
++    let filename = w.filename();
++    assert!(py_wheel(&filename).is_err());
++    assert!(WheelFilename::from_str(&filename).is_err(), "{filename} is accepted");
++}
++
++/// Bug 3: leading zeros in the numbers of a single tag are dropped by `Display`: `py307`
++/// becomes `py37`, `cp309` becomes `cp39`, `manylinux_02_17_x86_64` becomes
++/// `manylinux_2_17_x86_64` — the parsed filename is displayed as a different filename
++/// (`packaging` keeps the tag text).
++#[hegel::test]
++fn tag_numbers_keep_their_spelling(tc: TestCase) {
++    let tags = match n(&tc, 0, 2) {
++        0 => format!("py30{}-none-any", n(&tc, 0, 9)),
++        1 => format!("cp30{0}-cp30{0}-linux_x86_64", n(&tc, 0, 9)),
++        _ => format!("py3-none-manylinux_0{}_17_x86_64", n(&tc, 1, 9)),
++    };
++    let filename = format!("foo-1.0-{tags}.whl");
++    let py = py_wheel(&filename).unwrap();
++    assert_eq!(py.tags.len(), 1);
++    let uv = WheelFilename::from_str(&filename).unwrap();
++    assert_eq!(uv.to_string(), filename);
++}
++
++/// Bug 4: a build tag whose leading digits do not fit a `u64` is rejected ("number too large to
++/// fit in target type"); the specification sorts the digits "as an int" and `packaging` takes
++/// them unbounded.
++#[hegel::test]
++fn build_tag_digits_are_unbounded(tc: TestCase) {
++    let digits: String = (0..n(&tc, 20, 30)).map(|i| if i == 0 { '9' } else { pick(&tc, &['0', '5', '9']) }).collect();
++    let filename = format!("foo-1.0-{digits}-py3-none-any.whl");
++    let py = py_wheel(&filename).unwrap();
++    assert_eq!(py.build.as_ref().unwrap().0, digits);
++    let uv = WheelFilename::from_str(&filename).unwrap_or_else(|e| panic!("{filename}: {e}"));
++    assert_eq!(uv.build_tag().unwrap().to_string(), digits);
++}
++
++/// Bug 5: with a package-name hint, an sdist whose name has a run of separators
++/// (`foo__bar-1.0.tar.gz`, `foo..bar-1.0.tar.gz` for `foo-bar`) is rejected ("Name doesn't
++/// start with package name"): the hint is matched byte by byte at the hint's length. The parser
++/// without a hint, the wheel parser with the same hint, and `packaging` all read `foo-bar`.
++#[hegel::test]
++fn hinted_sdist_names_match_by_normalisation(tc: TestCase) {
++    let run: String = (0..n(&tc, 2, 3)).map(|_| pick(&tc, &['_', '.', '-'])).collect();
++    let (ext, _) = pick(&tc, &EXTENSIONS);
++    let version = tc.draw(arb_version().print_as_debug());
++    let filename = format!("foo{run}bar-{version}.{ext}");
++    let package = PackageName::from_str("foo-bar").unwrap();
++    let plain = SourceDistFilename::parsed_normalized_filename(&filename).unwrap();
++    assert_eq!(plain.name, package);
++    if ext == "tar.gz" || ext == "zip" {
++        assert_eq!(py_sdist(&filename).unwrap().0, "foo-bar");
++    }
++    assert!(DistFilename::try_from_filename_with_reason(&format!("foo{run}bar-{version}-py3-none-any.whl"), &package).is_ok());
++    let hinted = DistFilename::try_from_filename_with_reason(&filename, &package);
++    assert_eq!(hinted.map_err(|e| e.to_string()), Ok(DistFilename::SourceDistFilename(plain)));
++}
++
++/// Bug 6: extension matching is case-insensitive for the `tar` of `.tar.gz` and case-sensitive
++/// for everything else: `a-1.0.TAR.gz` is an sdist (displayed as `a-1.0.tar.gz`), `a-1.0.tar.GZ`
++/// and `a-1.0.Zip` are not. The conventions and `packaging` are case-sensitive throughout.
++#[hegel::test]
++fn extension_case_is_treated_alike(tc: TestCase) {
++    let name = tc.draw(arb_name().print_as_debug());
++    let version = tc.draw(arb_version().print_as_debug());
++    let tar = pick(&tc, &["TAR", "Tar", "tAr"]);
++    let ext = pick(&tc, &["gz", "bz2", "xz", "zst", "lz", "lzma"]);
++    let upper = format!("{name}-{version}.{tar}.{ext}");
++    let mixed = format!("{name}-{version}.tar.{}", ext.to_uppercase());
++    assert!(SourceDistExtension::from_path(&mixed).is_err());
++    assert!(py_sdist(&upper).is_err());
++    assert!(
++        SourceDistExtension::from_path(&upper).is_err(),
++        "{upper} is read as {:?}",
++        SourceDistExtension::from_path(&upper).unwrap()
++    );
++}
