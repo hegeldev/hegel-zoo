@@ -66,3 +66,4 @@ crate's `RequirementsTxt`.
   de-duplicates.
 - `VerbatimUrl`'s `Display` masks credentials; the properties compare
   `displayable_with_credentials`.
+- 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 4 bug(s) still reproduce. 55 tests pass.

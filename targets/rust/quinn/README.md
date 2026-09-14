@@ -45,3 +45,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped fec2f8960df4 → 621e38abbccd (2026-09-10, "proto: reject transport parameters with a mismatched length"; 0.12.0); 1 bug(s) still reproduce. 332 tests pass.
 - 2026-09-14: base bumped 621e38abbccd → a28cf43a1711 (2026-09-14, "build(deps): bump rustls from 0.23.43 to 0.23.44"; 0.12.0); 1 bug(s) still reproduce. 332 tests pass.
+- 2026-09-14: base bumped a28cf43a1711 → 769ef759a35d (2026-09-14, "build(deps): bump aws-lc-rs from 1.18.0 to 1.18.1"; 0.12.0); 1 bug(s) still reproduce. 332 tests pass.

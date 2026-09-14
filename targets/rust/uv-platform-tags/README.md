@@ -84,3 +84,4 @@ produces.
 ## History
 
 - 2026-09-14: created at c0df400 (0.0.80); 4 bugs.
+- 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 4 bug(s) still reproduce. 58 tests pass.

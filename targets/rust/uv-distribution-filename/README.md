@@ -90,3 +90,4 @@ trailing `.` in a tag component (bug 2), known tags spelled canonically (bug 3),
 ## History
 
 - 2026-09-14: created at c0df400 (0.0.80); 6 bugs.
+- 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 6 bug(s) still reproduce. 55 tests pass.

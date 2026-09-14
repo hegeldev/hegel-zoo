@@ -61,3 +61,4 @@ candidates). Four `pep440_rs` pins hold here as regular properties, since the fo
 ## History
 
 - 2026-09-14: created at c0df400 (0.0.80); 5 bugs (inherited from pep440_rs).
+- 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 5 bug(s) still reproduce. 83 tests pass.
