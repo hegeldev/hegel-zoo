@@ -44,3 +44,4 @@
 - 2026-09-13: base bumped e4c4fa43d29d → c5257f0540b9 (2026-09-13, "fix: preserve computed projections in unions_to_filter (#25074)"; 55.0.0); 1 bug(s) still reproduce. 623 tests pass.
 - 2026-09-13: base bumped c5257f0540b9 → f2b2ffd400cc (2026-09-13, "chore: update version 55.1.0 (#25070) (#25200)"; 55.1.0); 1 bug(s) still reproduce. 623 tests pass.
 - 2026-09-13: base bumped f2b2ffd400cc → 15f32dd7ac75 (2026-09-13, "Reduce binary size of `ScalarUDFImpl` default impls (#24966)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-14: base bumped 15f32dd7ac75 → 38d58ed09db2 (2026-09-14, "fix(physical-plan): honor distinct soft limits in SingleHashAggregateStream (#25158)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
