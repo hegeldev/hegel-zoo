@@ -1,0 +1,1677 @@
+diff --git a/go.mod b/go.mod
+index c57612d..fbbd80d 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/itchyny/gojq
+ 
+-go 1.24.0
++go 1.26.0
+ 
+ require (
+ 	github.com/google/go-cmp v0.7.0
+@@ -8,10 +8,12 @@ require (
+ 	github.com/itchyny/timefmt-go v0.1.8
+ 	github.com/mattn/go-isatty v0.0.20
+ 	github.com/mattn/go-runewidth v0.0.19
++	hegel.dev/go/hegel v0.6.33
+ )
+ 
+ require (
+ 	github.com/clipperhouse/stringish v0.1.1 // indirect
+ 	github.com/clipperhouse/uax29/v2 v2.3.0 // indirect
+-	golang.org/x/sys v0.38.0 // indirect
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
+ )
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..bde88fe
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1645 @@
++package gojq_test
++
++// Hegel property tests for gojq (github.com/itchyny/gojq), written for the Hegel zoo.
++//
++// Oracle: jq 1.8.2 (the reference implementation gojq follows), driven as a child process per
++// case; plus gojq against itself (Query.String round trips, Compare laws, Marshal read-back)
++// and encoding/json for the JSON layer. The jq binary is looked up in HEGEL_JQ, then
++// ~/.cache/hegel-zoo/jq-1.8.2/jq (the target's [run] setup downloads the static release binary
++// there and checks its sha256), then `jq` on PATH if it is a 1.8.x.
++//
++// Programs are drawn from a grammar of jq constructs whose semantics gojq's README does not
++// declare different from jq: no object-key order dependence before an iteration (inputs are
++// generated with sorted keys, object-building operations are only used as the final stage),
++// no string indexing with .[n], no number→string conversion of computed numbers (jq and gojq
++// format large/small floats differently by design), no big integers (gojq keeps them exact,
++// jq rounds to doubles), no time-zone or sub-second time functions. Outputs are compared as
++// canonical trees with numbers compared by value.
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"math"
++	"math/big"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++	"unicode/utf8"
++
++	. "github.com/itchyny/gojq"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// disagree fails the test case; with GOJQ_COLLECT set it prints the disagreement and carries
++// on instead (a triage mode for surveying many disagreements in one run).
++var collect = os.Getenv("GOJQ_COLLECT") != ""
++
++func disagree(ht *hegel.T, format string, args ...any) {
++	if collect {
++		fmt.Printf("MISMATCH "+format+"\n", args...)
++		return
++	}
++	ht.Fatalf(format, args...)
++}
++
++// --------------------------------------------------------------------------- jq oracle
++
++var jqPath = findJQ()
++
++func findJQ() string {
++	if p := os.Getenv("HEGEL_JQ"); p != "" {
++		return p
++	}
++	if home, err := os.UserHomeDir(); err == nil {
++		p := filepath.Join(home, ".cache", "hegel-zoo", "jq-1.8.2", "jq")
++		if _, err := os.Stat(p); err == nil {
++			return p
++		}
++	}
++	if p, err := exec.LookPath("jq"); err == nil {
++		out, _ := exec.Command(p, "--version").Output()
++		if strings.HasPrefix(strings.TrimSpace(string(out)), "jq-1.8") {
++			return p
++		}
++	}
++	return ""
++}
++
++func needJQ(t *testing.T) {
++	if jqPath == "" {
++		t.Fatalf("jq 1.8 not found: set HEGEL_JQ or run the target's setup step")
++	}
++}
++
++// A run's outcome, from either implementation: the outputs emitted before the end or the
++// error, and how it ended.
++type outcome struct {
++	outs   []string // canonical forms
++	status string   // "ok", "error" (runtime), "compile", "timeout"
++	detail string
++}
++
++func (o outcome) String() string {
++	return fmt.Sprintf("%s %v %s", o.status, o.outs, o.detail)
++}
++
++const runTimeout = 5 * time.Second
++
++func runJQ(prog, input string, vars map[string]string) (outcome, time.Duration) {
++	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
++	defer cancel()
++	args := []string{"-c"}
++	for _, k := range sortedKeys(vars) {
++		args = append(args, "--argjson", k, vars[k])
++	}
++	args = append(args, prog)
++	cmd := exec.CommandContext(ctx, jqPath, args...)
++	cmd.Env = append(os.Environ(), "TZ=UTC")
++	cmd.Stdin = strings.NewReader(input)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	start := time.Now()
++	err := cmd.Run()
++	took := time.Since(start)
++	o := outcome{detail: strings.TrimSpace(stderr.String())}
++	if ctx.Err() != nil {
++		o.status = "timeout"
++		return o, took
++	}
++	for _, line := range strings.Split(stdout.String(), "\n") {
++		if line == "" {
++			continue
++		}
++		c, ok := canonJSON(line)
++		if !ok {
++			c = "UNPARSABLE:" + line
++		}
++		o.outs = append(o.outs, c)
++	}
++	switch {
++	case err == nil:
++		o.status = "ok"
++	case cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 3:
++		o.status = "compile"
++	case cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 5:
++		o.status = "error"
++	default:
++		o.status = fmt.Sprintf("exit%d", cmd.ProcessState.ExitCode())
++	}
++	return o, took
++}
++
++func runGojq(prog string, input any, vars map[string]any) (outcome, time.Duration) {
++	q, err := Parse(prog)
++	if err != nil {
++		return outcome{status: "compile", detail: err.Error()}, 0
++	}
++	var opts []CompilerOption
++	var names []string
++	var values []any
++	for _, k := range sortedKeys(vars) {
++		names = append(names, "$"+k)
++		values = append(values, vars[k])
++	}
++	if len(names) > 0 {
++		opts = append(opts, WithVariables(names))
++	}
++	code, err := Compile(q, opts...)
++	if err != nil {
++		return outcome{status: "compile", detail: err.Error()}, 0
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
++	defer cancel()
++	start := time.Now()
++	iter := code.RunWithContext(ctx, input, values...)
++	o := outcome{status: "ok"}
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		if e, isErr := v.(error); isErr {
++			if ctx.Err() != nil {
++				o.status = "timeout"
++			} else {
++				o.status = "error"
++			}
++			o.detail = e.Error()
++			break
++		}
++		o.outs = append(o.outs, canon(v))
++	}
++	return o, time.Since(start)
++}
++
++func sortedKeys[V any](m map[string]V) []string {
++	ks := make([]string, 0, len(m))
++	for k := range m {
++		ks = append(ks, k)
++	}
++	sort.Strings(ks)
++	return ks
++}
++
++// --------------------------------------------------------------------------- canonical forms
++
++// canon renders a JSON value as a canonical string: sorted keys, numbers by float64 value
++// (so int/float64/json.Number/*big.Int spellings agree, and -0 is 0), strings quoted with
++// strconv so that invalid UTF-8 is visible.
++func canon(v any) string {
++	var sb strings.Builder
++	canonTo(&sb, v)
++	return sb.String()
++}
++
++func canonTo(sb *strings.Builder, v any) {
++	switch x := v.(type) {
++	case nil:
++		sb.WriteString("null")
++	case bool:
++		sb.WriteString(strconv.FormatBool(x))
++	case int:
++		canonFloat(sb, float64(x))
++	case int64:
++		canonFloat(sb, float64(x))
++	case float64:
++		canonFloat(sb, x)
++	case *big.Int:
++		f, _ := new(big.Float).SetInt(x).Float64()
++		canonFloat(sb, f)
++	case json.Number:
++		f, err := strconv.ParseFloat(x.String(), 64)
++		if err != nil && !strings.Contains(err.Error(), "range") {
++			sb.WriteString("NUM(" + x.String() + ")")
++			return
++		}
++		canonFloat(sb, f)
++	case string:
++		sb.WriteString(strconv.Quote(x))
++	case []any:
++		sb.WriteByte('[')
++		for i, e := range x {
++			if i > 0 {
++				sb.WriteByte(',')
++			}
++			canonTo(sb, e)
++		}
++		sb.WriteByte(']')
++	case map[string]any:
++		sb.WriteByte('{')
++		for i, k := range sortedKeys(x) {
++			if i > 0 {
++				sb.WriteByte(',')
++			}
++			sb.WriteString(strconv.Quote(k))
++			sb.WriteByte(':')
++			canonTo(sb, x[k])
++		}
++		sb.WriteByte('}')
++	default:
++		sb.WriteString(fmt.Sprintf("UNKNOWN(%T:%v)", v, v))
++	}
++}
++
++func canonFloat(sb *strings.Builder, f float64) {
++	if f == 0 {
++		f = 0 // drop the sign of -0
++	}
++	if math.IsNaN(f) {
++		sb.WriteString("null")
++		return
++	}
++	sb.WriteString(strconv.FormatFloat(f, 'g', -1, 64))
++}
++
++func canonJSON(text string) (string, bool) {
++	dec := json.NewDecoder(strings.NewReader(text))
++	dec.UseNumber()
++	var v any
++	if err := dec.Decode(&v); err != nil {
++		return "", false
++	}
++	return canon(v), true
++}
++
++// --------------------------------------------------------------------------- input values
++
++// Generated inputs are canonical JSON: sorted distinct keys, integers |n| <= 10^6, decimals
++// with 1..3 fractional digits and |x| < 10^6 (their shortest round-trip form is the literal
++// itself, so jq's literal preservation and gojq's agree), valid UTF-8 strings.
++
++var keyPool = []string{"a", "b", "c", "k", "x", "y", "id", "name", "n", "s", "A", "_", "a b", "é", "1", "key"}
++
++var strPieces = []string{"", "a", "b", "abc", "x", "y", "A", "Z", "0", "1", "12", " ", "  ", ",", ".", ":", ";", "-", "_", "/", "\\", "\"", "'", "<", ">", "&", "=", "+", "?", "#", "%", "~", "[", "]", "{", "}", "(", ")", "*", "|", "\t", "\n", "é", "日本", "🎉", "ß", "İ", "\u007f", "\u0080", "\u2028", "null", "true", "1e3", "1.5", "-0"}
++
++func genString(tc hegel.TestCase) string {
++	k := n(tc, 0, 4)
++	var sb strings.Builder
++	for i := 0; i < k; i++ {
++		sb.WriteString(pick(tc, strPieces))
++	}
++	return sb.String()
++}
++
++func genInt(tc hegel.TestCase) int {
++	if chance(tc, 40) {
++		return n(tc, -5, 10)
++	}
++	return n(tc, -1000000, 1000000)
++}
++
++func genDecimal(tc hegel.TestCase) float64 {
++	digits := n(tc, 1, 3)
++	m := n(tc, 1, 999999)
++	for m%10 == 0 {
++		m++
++	}
++	if chance(tc, 30) {
++		m = -m
++	}
++	f, _ := strconv.ParseFloat(fmt.Sprintf("%de-%d", m, digits), 64)
++	return f
++}
++
++func genScalar(tc hegel.TestCase) any {
++	switch n(tc, 0, 9) {
++	case 0:
++		return nil
++	case 1:
++		return true
++	case 2:
++		return false
++	case 3, 4, 5:
++		return genInt(tc)
++	case 6:
++		return genDecimal(tc)
++	default:
++		return genString(tc)
++	}
++}
++
++func genValue(tc hegel.TestCase, depth int) any {
++	if depth <= 0 || chance(tc, 45) {
++		return genScalar(tc)
++	}
++	if chance(tc, 50) {
++		k := n(tc, 0, 4)
++		arr := make([]any, k)
++		for i := range arr {
++			arr[i] = genValue(tc, depth-1)
++		}
++		return arr
++	}
++	k := n(tc, 0, 4)
++	m := map[string]any{}
++	for i := 0; i < k; i++ {
++		key := pick(tc, keyPool)
++		if chance(tc, 15) {
++			key = genString(tc)
++		}
++		m[key] = genValue(tc, depth-1)
++	}
++	return m
++}
++
++// render writes v as canonical JSON text (the form jq and gojq both read back literally).
++func render(v any) string {
++	var sb strings.Builder
++	renderTo(&sb, v)
++	return sb.String()
++}
++
++func renderTo(sb *strings.Builder, v any) {
++	switch x := v.(type) {
++	case nil:
++		sb.WriteString("null")
++	case bool:
++		sb.WriteString(strconv.FormatBool(x))
++	case int:
++		sb.WriteString(strconv.Itoa(x))
++	case float64:
++		sb.WriteString(strconv.FormatFloat(x, 'f', -1, 64))
++	case string:
++		writeJSONString(sb, x)
++	case []any:
++		sb.WriteByte('[')
++		for i, e := range x {
++			if i > 0 {
++				sb.WriteByte(',')
++			}
++			renderTo(sb, e)
++		}
++		sb.WriteByte(']')
++	case map[string]any:
++		sb.WriteByte('{')
++		for i, k := range sortedKeys(x) {
++			if i > 0 {
++				sb.WriteByte(',')
++			}
++			writeJSONString(sb, k)
++			sb.WriteByte(':')
++			renderTo(sb, x[k])
++		}
++		sb.WriteByte('}')
++	default:
++		panic(fmt.Sprintf("render: %T", v))
++	}
++}
++
++// writeJSONString escapes the way jq -c does: \", \\, \n \t \r \b \f, other controls as \u00XX,
++// everything else raw.
++func writeJSONString(sb *strings.Builder, s string) {
++	sb.WriteByte('"')
++	for _, r := range s {
++		switch r {
++		case '"':
++			sb.WriteString(`\"`)
++		case '\\':
++			sb.WriteString(`\\`)
++		case '\n':
++			sb.WriteString(`\n`)
++		case '\t':
++			sb.WriteString(`\t`)
++		case '\r':
++			sb.WriteString(`\r`)
++		case '\b':
++			sb.WriteString(`\b`)
++		case '\f':
++			sb.WriteString(`\f`)
++		default:
++			if r < 0x20 || r == 0x7f {
++				fmt.Fprintf(sb, `\u%04x`, r)
++			} else {
++				sb.WriteRune(r)
++			}
++		}
++	}
++	sb.WriteByte('"')
++}
++
++// asNumbers re-decodes canonical text the way the gojq CLI feeds the library: json.Number for
++// every number (the library accepts int/float64 too — gojq's own decoding is exercised by
++// passing the rendered text through encoding/json with UseNumber).
++func asNumbers(text string) any {
++	dec := json.NewDecoder(strings.NewReader(text))
++	dec.UseNumber()
++	var v any
++	if err := dec.Decode(&v); err != nil {
++		panic(err)
++	}
++	return v
++}
++
++// --------------------------------------------------------------------------- program grammar
++
++type prog struct {
++	tc    hegel.TestCase
++	vars  []string // variables in scope, without $
++	funcs []string // zero-arity functions in scope
++	depth int
++}
++
++func (p *prog) sub() *prog {
++	return &prog{tc: p.tc, vars: p.vars, funcs: p.funcs, depth: p.depth - 1}
++}
++
++func (p *prog) withVar(v string) *prog {
++	q := p.sub()
++	q.vars = append(append([]string{}, p.vars...), v)
++	return q
++}
++
++func (p *prog) withFunc(f string) *prog {
++	q := p.sub()
++	q.funcs = append(append([]string{}, p.funcs...), f)
++	return q
++}
++
++func (p *prog) ch(pct int) bool    { return chance(p.tc, pct) }
++func (p *prog) rng(lo, hi int) int { return n(p.tc, lo, hi) }
++
++func jqString(s string) string {
++	var sb strings.Builder
++	sb.WriteByte('"')
++	for _, r := range s {
++		switch r {
++		case '"':
++			sb.WriteString(`\"`)
++		case '\\':
++			sb.WriteString(`\\`)
++		case '\n':
++			sb.WriteString(`\n`)
++		case '\t':
++			sb.WriteString(`\t`)
++		case '\r':
++			sb.WriteString(`\r`)
++		default:
++			if r < 0x20 || r == 0x7f {
++				fmt.Fprintf(&sb, `\u%04x`, r)
++			} else {
++				sb.WriteRune(r)
++			}
++		}
++	}
++	sb.WriteByte('"')
++	return sb.String()
++}
++
++func (p *prog) key() string {
++	k := pick(p.tc, keyPool)
++	if isIdent(k) && p.ch(70) {
++		return "." + k
++	}
++	return "." + jqString(k)
++}
++
++func isIdent(s string) bool {
++	if s == "" {
++		return false
++	}
++	for i, r := range s {
++		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (i > 0 && r >= '0' && r <= '9')) {
++			return false
++		}
++	}
++	return true
++}
++
++// literal draws a JSON literal in jq syntax (canonical numbers, so the two literal-preserving
++// implementations print it the same way).
++func (p *prog) literal() string {
++	switch p.rng(0, 9) {
++	case 0:
++		return "null"
++	case 1:
++		return "true"
++	case 2:
++		return "false"
++	case 3, 4:
++		return strconv.Itoa(genInt(p.tc))
++	case 5:
++		return strconv.FormatFloat(genDecimal(p.tc), 'f', -1, 64)
++	case 6, 7:
++		return jqString(genString(p.tc))
++	case 8:
++		return "[" + p.literal() + "]"
++	default:
++		if p.ch(50) {
++			return "[]"
++		}
++		return "{}"
++	}
++}
++
++func (p *prog) smallInt() string { return strconv.Itoa(p.rng(-3, 6)) }
++
++// notString guards an expression against string inputs: gojq indexes strings with .[n]
++// (a documented difference from jq, which errors), so numeric indexing is only exercised on
++// other types.
++const notString = `select(type != "string")`
++
++func (p *prog) index() string { return "(" + notString + " | .[" + p.smallInt() + "])" }
++
++// Time functions are only fed whole epoch seconds for years 1000..9999: glibc's %Y prints
++// years below 1000 unpadded ("1-02-28") where gojq pads to four digits, jq's broken-down-time
++// normalisation differs from Go's for out-of-range fields, and gojq keeps fractional seconds
++// to the nanosecond (a documented difference).
++// -1 and -2 are left out too: jq's mktime takes timegm's -1 and -2 for its own error
++// sentinels ("invalid gmtime representation" for `-1 | gmtime | mktime`, "mktime not
++// supported on this platform" for -2), a jq bug.
++const epochGuard = `numbers | select(. > -30610224000 and . < 253402300799 and (. < -2 or . >= 0)) | floor`
++
++var timeFuncs = []string{
++	epochGuard + " | todate", epochGuard + " | todateiso8601", epochGuard + " | gmtime",
++	epochGuard + " | gmtime | mktime", epochGuard + " | gmtime | todate",
++	epochGuard + " | strftime(\"%Y-%m-%dT%H:%M:%SZ\")", epochGuard + " | strftime(\"%A %B %d %j %e %u %w %s %H %M %S %y\")",
++	epochGuard + " | todate | fromdateiso8601", epochGuard + " | todate | fromdate",
++	epochGuard + " | todate | strptime(\"%Y-%m-%dT%H:%M:%SZ\")", epochGuard + " | todate | strptime(\"%Y-%m-%dT%H:%M:%SZ\") | mktime",
++	epochGuard + " | gmtime | .[0:6]", epochGuard + " | floor | todate",
++}
++
++// pathExpr draws a path expression (valid on the left of an assignment).
++func (p *prog) pathExpr() string {
++	if p.depth <= 0 {
++		switch p.rng(0, 3) {
++		case 0:
++			return "."
++		case 1, 2:
++			return p.key()
++		default:
++			return p.index()
++		}
++	}
++	q := p.sub()
++	switch p.rng(0, 13) {
++	case 0:
++		return "."
++	case 1, 2:
++		return p.key()
++	case 3:
++		return p.key() + "?"
++	case 4:
++		return q.pathExpr() + p.key()
++	case 5:
++		return p.index()
++	case 6:
++		return q.pathExpr() + "[" + p.smallInt() + ":" + p.smallInt() + "]"
++	case 7:
++		return q.pathExpr() + "[]"
++	case 8:
++		return q.pathExpr() + "[]?"
++	case 9:
++		return q.pathExpr() + " | " + q.pathExpr()
++	case 10:
++		return q.pathExpr() + " | select(" + q.cond() + ")"
++	case 11:
++		return "if " + q.cond() + " then " + q.pathExpr() + " else " + q.pathExpr() + " end"
++	case 12:
++		return q.pathExpr() + " // " + q.pathExpr()
++	default:
++		return "getpath([" + jqString(pick(p.tc, keyPool)) + "])"
++	}
++}
++
++// cond draws a boolean-ish expression.
++func (p *prog) cond() string {
++	q := p.sub()
++	switch p.rng(0, 9) {
++	case 0:
++		return q.expr() + " " + pick(p.tc, []string{"==", "!=", "<", "<=", ">", ">="}) + " " + q.expr()
++	case 1:
++		return q.expr() + " and " + q.expr()
++	case 2:
++		return q.expr() + " or " + q.expr()
++	case 3:
++		return q.expr() + " | not"
++	case 4:
++		return "type == " + jqString(pick(p.tc, []string{"null", "boolean", "number", "string", "array", "object"}))
++	case 5:
++		return "has(" + q.expr() + ")"
++	case 6:
++		return q.expr()
++	case 7:
++		return "(" + q.expr() + " | length) > " + p.smallInt()
++	case 8:
++		return "isempty(" + q.expr() + ")"
++	default:
++		return "any(" + q.expr() + "; " + q.cond() + ")"
++	}
++}
++
++// Regexes that can match the empty string are left out: jq 1.8.2 reports duplicate empty
++// matches on multibyte strings ("é" | [match(""; "g") | .offset] → [0,1,1]), a jq bug.
++var simpleRegexes = []string{"a", "b", "ab", "a+", "ab*", "a|b", ".", "..", "^a", "b$", "(a)(b)?", "(?<x>a+)", "[ab]", "[^a]", "a.c", "(a|b)+", "x", "[0-9]+", "é", "日", "(?<n>.)(?<m>.)"}
++
++func (p *prog) regexArgs() string {
++	re := jqString(pick(p.tc, simpleRegexes))
++	if p.ch(40) {
++		// only the flags gojq's README does not exclude (it lists "some flags" among the
++		// regular-expression engine differences; x, n, s, l and p are rejected)
++		return re + "; " + jqString(pick(p.tc, []string{"g", "i", "gi", ""}))
++	}
++	return re
++}
++
++// strExpr draws an expression whose value is a string whenever it succeeds.
++func (p *prog) strExpr() string {
++	q := p.sub()
++	if p.depth <= 0 {
++		return jqString(genString(p.tc))
++	}
++	switch p.rng(0, 11) {
++	case 0, 1:
++		return jqString(genString(p.tc))
++	case 2:
++		return "(" + q.expr() + " | strings)"
++	case 3:
++		return "(" + q.strExpr() + " + " + q.strExpr() + ")"
++	case 4:
++		return "(" + q.strExpr() + " | ascii_downcase)"
++	case 5:
++		return "(" + q.strExpr() + " | ascii_upcase)"
++	case 6:
++		return "(" + q.strExpr() + " | ltrimstr(" + jqString(pick(p.tc, strPieces)) + "))"
++	case 7:
++		return "(" + q.strExpr() + " | rtrimstr(" + jqString(pick(p.tc, strPieces)) + "))"
++	case 8:
++		return "\"" + strings.Trim(jqString(genString(p.tc)), "\"") + "\\(" + q.strExpr() + ")" + strings.Trim(jqString(genString(p.tc)), "\"") + "\""
++	case 9:
++		return "(" + q.strExpr() + " | " + pick(p.tc, []string{"@base64", "@base32", "@uri", "@html", "@sh", "@json", "@text", "tojson", "tostring", "@base64 | @base64d", "@base32 | @base32d"}) + ")"
++	case 10:
++		return "(" + q.strExpr() + " | sub(" + q.subArgs() + "))"
++	default:
++		return "(" + q.strExpr() + " | gsub(" + q.subArgs() + "))"
++	}
++}
++
++// subArgs draws `re; replacement[; flags]` for sub/gsub (the flags come third there).
++func (p *prog) subArgs() string {
++	re := jqString(pick(p.tc, simpleRegexes))
++	repl := p.strExpr()
++	if p.ch(40) {
++		return re + "; " + repl + "; " + jqString(pick(p.tc, []string{"g", "i", "gi", ""}))
++	}
++	return re + "; " + repl
++}
++
++var zeroArity = []string{
++	"length", "utf8bytelength", "not", "keys", "values", "nulls", "booleans", "numbers", "strings",
++	"arrays", "objects", "iterables", "scalars", "type", "add", "any", "all", "flatten", "range(3)",
++	"floor", "ceil", "round", "sqrt", "fabs", "abs", "trunc", "nearbyint", "rint", "significand", "logb",
++	"exp2", "exp10", "log2", "log10", "tostring | tonumber", "arrays | reverse", "sort", "unique", "min", "max",
++	"to_entries", "from_entries", "paths", "leaf_paths", "tostream", "fromstream(tostream)", "explode",
++	"implode", "ascii_downcase", "ascii_upcase", "recurse", "..", "env | type", "input_line_number",
++	"arrays | select(all(.[]; type == \"array\")) | transpose", notString + " | first", notString + " | last", "isempty(.[]?)", "toarray", "trim", "ltrim", "rtrim", "infinite",
++	"nan | isnan", "isinfinite", "isnormal", "splits(\"a\")", "tojson | fromjson", "@json | fromjson",
++	"getpath([])", "path(..)", "[paths]", "[..]", "[.[]?]", "keys_unsorted", "halt", "now | type", "date",
++	"ascii", "@base32d", "@base64d", "input", "debug", "stderr", "input_filename", "$__loc__", "builtins | length",
++	"have_decnum", "have_literal_numbers", "get_search_list", "splits(\"\")", "combinations", "getpath([\"a\"])",
++	"error", "empty", "halt_error", "tojson", "tostring", "@text", "@csv", "@tsv", "@sh", "@html", "@uri", "@base64", "@base32",
++}
++
++// Functions whose semantics gojq's README declares different, or which depend on the
++// environment or on I/O: never drawn.
++var excluded = map[string]bool{
++	"keys_unsorted": true, "input_line_number": true, "$__loc__": true, "get_search_list": true,
++	"env | type": true, "input": true, "debug": true, "stderr": true, "input_filename": true,
++	"halt": true, "halt_error": true, "now | type": true, "builtins | length": true, "ascii": true,
++	"@base32d": true, "@base64d": true, "have_decnum": true, "have_literal_numbers": true, "date": true,
++	"leaf_paths": true, "infinite": true, "nan | isnan": true, "toarray": true,
++	// pinned separately
++	"abs": true,
++	// number → string conversions of computed numbers are drawn only under `strings |` guards
++	"tojson": true, "tostring": true, "@text": true, "@csv": true, "@tsv": true, "@sh": true,
++	"@html": true, "@uri": true, "@base64": true, "@base32": true, "tojson | fromjson": true,
++	"@json | fromjson": true, "tostring | tonumber": true, "combinations": true, "splits(\"\")": true,
++	"error": true, "empty": true,
++}
++
++func (p *prog) zeroArity() string {
++	if p.ch(8) {
++		return pick(p.tc, timeFuncs)
++	}
++	for {
++		f := pick(p.tc, zeroArity)
++		if !excluded[f] {
++			return f
++		}
++	}
++}
++
++func (p *prog) oneArity() string {
++	q := p.sub()
++	switch p.rng(0, 39) {
++	case 0:
++		return "map(" + q.expr() + ")"
++	case 1:
++		return "map_values(" + q.expr() + ")"
++	case 2:
++		return "select(" + q.cond() + ")"
++	case 3:
++		return "sort_by(" + q.expr() + ")"
++	case 4:
++		return "group_by(" + q.expr() + ")"
++	case 5:
++		return "unique_by(" + q.expr() + ")"
++	case 6:
++		return "min_by(" + q.expr() + ")"
++	case 7:
++		return "max_by(" + q.expr() + ")"
++	case 8:
++		return "has(" + q.expr() + ")"
++	case 9:
++		return "contains(" + q.expr() + ")"
++	case 10:
++		return "inside(" + q.expr() + ")"
++	case 11:
++		// jq's _indices returns null for object and (most) null inputs where gojq raises a
++		// type error, and errors for null | indices(null) where gojq returns null
++		return `select(type == "array" or type == "string") | indices(` + q.expr() + ")"
++	case 12:
++		return `select(type == "array" or type == "string") | index(` + q.expr() + ")"
++	case 13:
++		return `select(type == "array" or type == "string") | rindex(` + q.expr() + ")"
++	case 14:
++		return "flatten(" + strconv.Itoa(p.rng(0, 3)) + ")"
++	case 15:
++		return "first(" + q.expr() + ")"
++	case 16:
++		return "last(" + q.expr() + ")"
++	case 17:
++		return "any(" + q.cond() + ")"
++	case 18:
++		return "all(" + q.cond() + ")"
++	case 19:
++		return "recurse(" + pick(p.tc, []string{".[]?", ".[]?", "if type == \"number\" and . < 3 then . + 1 else empty end", ".a?", "arrays | .[0]?"}) + ")"
++	case 20:
++		return "walk(" + q.expr() + ")"
++	case 21:
++		return "paths(" + q.cond() + ")"
++	case 22:
++		return notString + " | getpath([" + q.pathLits() + "])"
++	case 23:
++		return "startswith(" + q.strExpr() + ")"
++	case 24:
++		return "endswith(" + q.strExpr() + ")"
++	case 25:
++		return "split(" + q.strExpr() + ")"
++	case 26:
++		return "split(" + q.regexArgs() + ")"
++	case 27:
++		return "test(" + q.regexArgs() + ")"
++	case 28:
++		return "[match(" + q.regexArgs() + ")]"
++	case 29:
++		return "[capture(" + q.regexArgs() + ")]"
++	case 30:
++		return "[scan(" + q.regexArgs() + ")]"
++	case 31:
++		return "[splits(" + q.regexArgs() + ")]"
++	case 32:
++		return "pow(.; " + p.smallInt() + ")"
++	case 33:
++		return "ltrimstr(" + q.strExpr() + ")"
++	case 34:
++		return "rtrimstr(" + q.strExpr() + ")"
++	case 35:
++		return "add(" + q.expr() + ")"
++	case 36:
++		return "isempty(" + q.expr() + ")"
++	case 37:
++		return "IN(" + q.expr() + ")"
++	case 38:
++		return "path(" + q.pathExpr() + ")"
++	default:
++		return "[.[]? | strings] | join(" + q.strExpr() + ")"
++	}
++}
++
++func (p *prog) pathLits1() string {
++	s := p.pathLits()
++	if s == "" {
++		return jqString(pick(p.tc, keyPool))
++	}
++	return s
++}
++
++func (p *prog) pathLits() string {
++	k := p.rng(0, 3)
++	parts := make([]string, k)
++	for i := range parts {
++		if p.ch(60) {
++			parts[i] = jqString(pick(p.tc, keyPool))
++		} else {
++			parts[i] = p.smallInt()
++		}
++	}
++	return strings.Join(parts, ", ")
++}
++
++func (p *prog) atom() string {
++	switch p.rng(0, 9) {
++	case 0, 1:
++		return "."
++	case 2, 3:
++		return p.literal()
++	case 4:
++		return p.key()
++	case 5:
++		return "$v"
++	case 6:
++		if len(p.vars) > 0 {
++			return "$" + pick(p.tc, p.vars)
++		}
++		return p.literal()
++	case 7:
++		if len(p.funcs) > 0 {
++			return pick(p.tc, p.funcs)
++		}
++		return "."
++	case 8:
++		return p.zeroArity()
++	default:
++		return p.index()
++	}
++}
++
++// expr draws a general expression.
++func (p *prog) expr() string {
++	if p.depth <= 0 {
++		return p.atom()
++	}
++	q := p.sub()
++	switch p.rng(0, 34) {
++	case 0, 1:
++		return p.atom()
++	case 2:
++		return q.expr() + " | " + q.expr()
++	case 3:
++		return q.expr() + ", " + q.expr()
++	case 4:
++		return "(" + q.expr() + ")"
++	case 5, 6:
++		op := pick(p.tc, []string{"+", "-", "*", "/", "%"})
++		if op == "*" {
++			// a string times a large number, repeated, would exhaust memory in both
++			return q.expr() + " * (" + q.expr() + ` | if type == "number" then select(fabs <= 20) else . end)`
++		}
++		return q.expr() + " " + op + " " + q.expr()
++	case 7:
++		return q.cond()
++	case 8:
++		return q.expr() + " // " + q.expr()
++	case 9:
++		// parenthesised: jq's `X[Y]?` only guards the indexing itself (an error raised by
++		// X or Y still propagates) while gojq's covers the whole term, as `try` would
++		return "(" + q.expr() + ")?"
++	case 10:
++		s := "if " + q.cond() + " then " + q.expr()
++		if p.ch(30) {
++			s += " elif " + q.cond() + " then " + q.expr()
++		}
++		if p.ch(70) {
++			s += " else " + q.expr()
++		}
++		return s + " end"
++	case 11:
++		if p.ch(50) {
++			return "try " + q.expr()
++		}
++		// error messages differ by design, so a caught string is replaced before the
++		// catch body sees it (error values of other types are compared as they are)
++		return "try " + q.expr() + ` catch (if type == "string" then "E" else . end | ` + q.expr() + ")"
++	case 12:
++		v := pick(p.tc, []string{"x", "y", "acc", "item"})
++		r := q.withVar(v)
++		// `[upd] | .[-1]` makes an empty update null in both (last(empty) is empty in both,
++		// so it would not do), keeping gojq/3 (reduce keeps the previous state on an empty
++		// update) out of the general property
++		// first(...): with a multi-output init jq evaluates the source on null from the
++		// second init value on (`[reduce .[] as $x (0, 100; . + $x)]` on [1,2] is [3,100]
++		// in jq 1.8.2, [3,103] in gojq), a jq bug
++		return "reduce " + q.gen() + " as $" + v + " (first(" + q.expr() + "); [" + r.expr() + "] | .[-1])"
++	case 13:
++		v := pick(p.tc, []string{"x", "y", "item"})
++		r := q.withVar(v)
++		s := "foreach " + q.gen() + " as $" + v + " (first(" + q.expr() + "); " + r.expr()
++		if p.ch(50) {
++			s += "; " + r.expr()
++		}
++		return s + ")"
++	// bindings, label and def are Exp-level in jq's grammar (not Terms), so they are
++	// parenthesised to be usable as operands
++	case 14:
++		v := pick(p.tc, []string{"x", "y", "z"})
++		r := q.withVar(v)
++		return "(" + q.expr() + " as $" + v + " | " + r.expr() + ")"
++	case 15:
++		a, b := "p", "q"
++		r := q.withVar(a).withVar(b)
++		switch p.rng(0, 2) {
++		case 0:
++			return "(" + q.expr() + " as [$" + a + ", $" + b + "] | " + r.expr() + ")"
++		case 1:
++			return "(" + q.expr() + " as {" + strings.TrimPrefix(p.key(), ".") + ": $" + a + ", $" + b + "} | " + r.expr() + ")"
++		default:
++			// `?//` is only generated at the top level (see program): jq's `?//` catches
++			// `break`, so inside limit/first/isempty/any/all bodies it re-runs the body
++			// with the next alternative and duplicates outputs
++			return "(" + q.expr() + " as [$" + a + "] | " + q.withVar(a).expr() + ")"
++		}
++	case 16:
++		return "(label $out | " + q.gen() + " | if " + q.cond() + " then ., break $out else . end)"
++	// function names carry the nesting depth so that a nested def never shadows and calls
++	// itself (an infinite recursion in both implementations)
++	case 17:
++		f := pick(p.tc, []string{"f", "g", "h"}) + strconv.Itoa(p.depth)
++		r := q.withFunc(f)
++		return "(def " + f + ": " + q.expr() + "; " + r.expr() + ")"
++	case 18:
++		f := pick(p.tc, []string{"f", "g"}) + strconv.Itoa(p.depth)
++		r := q.withFunc(f + "(" + q.expr() + ")")
++		return "(def " + f + "(fn): " + q.withFunc("fn").expr() + "; " + r.expr() + ")"
++	case 19:
++		f := pick(p.tc, []string{"f", "g"}) + strconv.Itoa(p.depth)
++		r := q.withFunc(f + "(" + q.expr() + ")")
++		return "(def " + f + "($a): " + q.withVar("a").expr() + "; " + r.expr() + ")"
++	case 20, 21:
++		return q.expr() + " | " + q.oneArity()
++	case 22:
++		return q.expr() + " | " + q.zeroArity()
++	case 23:
++		return "[" + q.expr() + "]"
++	case 24:
++		return "[]"
++	case 25:
++		return q.object()
++	case 26:
++		return q.strExpr()
++	case 27:
++		return "limit(" + strconv.Itoa(p.rng(0, 4)) + "; " + q.gen() + ")"
++	case 28:
++		return "[" + pick(p.tc, []string{"range(" + strconv.Itoa(p.rng(0, 5)) + ")", "range(" + p.smallInt() + "; " + p.smallInt() + ")", "range(" + p.smallInt() + "; " + p.smallInt() + "; " + pick(p.tc, []string{"1", "2", "-1", "0.5"}) + ")"}) + "]"
++	case 29:
++		// repeat(empty) never terminates in either implementation
++		return "[limit(" + strconv.Itoa(p.rng(0, 5)) + "; repeat((" + q.expr() + ") // 0))]"
++	case 30:
++		return "[.[]? | numbers] | " + pick(p.tc, []string{"until(length > 3; . + [0])", "[while(length < 4; . + [0]) | length]", "until(length == 0; .[1:])"})
++	case 31:
++		// the index is kept non-array: `null | .[[1]]` errors in jq (indices on null) but
++		// `null | .["a"]` and `null | .[0]` are null, and gojq returns null for all three
++		return "(" + q.expr() + " | " + notString + `)[` + q.expr() + ` | select(type != "array")]`
++	case 32:
++		// parenthesised: an unparenthesised negative literal before a suffix is gojq/1
++		return "(" + q.expr() + ")[" + p.smallInt() + ":" + p.smallInt() + "]"
++	case 33:
++		return "error(" + q.expr() + ")"
++	default:
++		return q.pathExpr()
++	}
++}
++
++// gen draws a generator (a stream-producing expression) for reduce/foreach/limit/label.
++func (p *prog) gen() string {
++	q := p.sub()
++	switch p.rng(0, 6) {
++	case 0, 1:
++		return ".[]?"
++	case 2:
++		return "range(" + strconv.Itoa(p.rng(0, 5)) + ")"
++	case 3:
++		return "(" + q.expr() + ", " + q.expr() + ")"
++	case 4:
++		return "..[]?"
++	case 5:
++		return "recurse(.[]?)"
++	default:
++		return q.expr()
++	}
++}
++
++// object draws an object construction whose keys are in sorted order (so jq's insertion order
++// is the sorted order gojq uses).
++func (p *prog) object() string {
++	q := p.sub()
++	k := p.rng(0, 3)
++	keys := map[string]bool{}
++	for len(keys) < k {
++		keys[pick(p.tc, keyPool)] = true
++	}
++	var parts []string
++	for _, key := range sortedKeys(keys) {
++		kk := jqString(key)
++		if isIdent(key) && p.ch(70) {
++			kk = key
++		}
++		switch p.rng(0, 4) {
++		case 0:
++			if isIdent(key) {
++				parts = append(parts, key)
++			} else {
++				parts = append(parts, kk+": ."+kk)
++			}
++		case 1:
++			parts = append(parts, kk+": "+q.expr())
++		case 2:
++			if len(q.vars) > 0 && isIdent(key) {
++				parts = append(parts, "$"+pick(p.tc, q.vars)+" as $"+key+" | {"+"$"+key+"}")
++				return "(" + parts[len(parts)-1] + ")"
++			}
++			parts = append(parts, kk+": "+q.literal())
++		default:
++			parts = append(parts, kk+": "+q.strExpr())
++		}
++	}
++	return "{" + strings.Join(parts, ", ") + "}"
++}
++
++// sink draws a final stage that may build objects in any key order (compared structurally).
++func (p *prog) sink() string {
++	q := p.sub()
++	switch p.rng(0, 12) {
++	// right-hand sides are parenthesised: `.b = [] | to_entries` is `(.b = []) | to_entries`,
++	// which would expose the key order of the freshly built object
++	case 0:
++		return q.pathExpr() + " |= (" + q.expr() + ")"
++	case 1:
++		return q.pathExpr() + " = (" + q.expr() + ")"
++	case 2:
++		return q.pathExpr() + " " + pick(p.tc, []string{"+=", "-=", "*=", "/=", "%=", "//="}) + " (" + q.expr() + ")"
++	case 3:
++		return "del(" + q.pathExpr() + ")"
++	case 4:
++		return "setpath([" + q.pathLits() + "]; " + q.expr() + ")"
++	case 5:
++		// no root path: jq returns null as soon as the shortest path is [] without
++		// validating the others, gojq validates every path first
++		return "delpaths([[" + q.pathLits1() + "], [" + q.pathLits1() + "]])"
++	case 6:
++		return ". + " + q.object()
++	case 7:
++		return q.object() + " + ."
++	case 8:
++		return ". * " + q.object()
++	case 9:
++		return "with_entries(" + q.expr() + ")"
++	case 10:
++		return "to_entries | from_entries"
++	case 11:
++		return "pick(" + q.pathExpr() + ")"
++	default:
++		return "[paths] | . as $ps | " + q.expr() + " | " + notString + " | [getpath($ps[]?)]"
++	}
++}
++
++func (p *prog) program() string {
++	var s string
++	if p.ch(8) {
++		// destructuring alternatives, outside any label (jq's `?//` catches `break`)
++		s = p.expr() + " as [$p] ?// {a: $p} ?// $p | " + p.withVar("p").expr()
++	} else {
++		s = p.expr()
++	}
++	if p.ch(35) {
++		s += " | " + p.sink()
++	}
++	return s
++}
++
++// --------------------------------------------------------------------------- comparison
++
++// numbersOutOfRange says whether either side produced a number outside the range where jq's
++// doubles and gojq's exact integers agree (|x| >= 2^53); such cases are skipped.
++func numbersOutOfRange(o outcome) bool {
++	for _, s := range o.outs {
++		if strings.Contains(s, "e+") {
++			return true
++		}
++	}
++	return false
++}
++
++func sameOutcome(a, b outcome) bool {
++	if a.status != b.status {
++		return false
++	}
++	if len(a.outs) != len(b.outs) {
++		return false
++	}
++	for i := range a.outs {
++		if a.outs[i] != b.outs[i] && !closeNumbers(a.outs[i], b.outs[i]) {
++			return false
++		}
++	}
++	return true
++}
++
++// closeNumbers accepts two canonical scalars that are floats within 4 ulps (libm differences
++// in transcendental functions), and arrays/objects whose only differences are such floats.
++func closeNumbers(a, b string) bool {
++	ta, tb := tokens(a), tokens(b)
++	if len(ta) != len(tb) {
++		return false
++	}
++	for i := range ta {
++		if ta[i] == tb[i] {
++			continue
++		}
++		fa, ea := strconv.ParseFloat(ta[i], 64)
++		fb, eb := strconv.ParseFloat(tb[i], 64)
++		if ea != nil || eb != nil {
++			return false
++		}
++		if math.Abs(fa-fb) > 4*math.Max(ulp(fa), ulp(fb)) {
++			return false
++		}
++	}
++	return true
++}
++
++func ulp(f float64) float64 { return math.Nextafter(math.Abs(f), math.Inf(1)) - math.Abs(f) }
++
++func tokens(s string) []string {
++	var out []string
++	var cur strings.Builder
++	inStr := false
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if inStr {
++			cur.WriteByte(c)
++			if c == '\\' && i+1 < len(s) {
++				i++
++				cur.WriteByte(s[i])
++			} else if c == '"' {
++				inStr = false
++				out = append(out, cur.String())
++				cur.Reset()
++			}
++			continue
++		}
++		switch c {
++		case '"':
++			inStr = true
++			cur.WriteByte(c)
++		case '[', ']', '{', '}', ',', ':':
++			if cur.Len() > 0 {
++				out = append(out, cur.String())
++				cur.Reset()
++			}
++			out = append(out, string(c))
++		default:
++			cur.WriteByte(c)
++		}
++	}
++	if cur.Len() > 0 {
++		out = append(out, cur.String())
++	}
++	return out
++}
++
++// --------------------------------------------------------------------------- properties
++
++func drawCase(tc hegel.TestCase) (progText string, input any, inputText string, varv any, varText string) {
++	input = genValue(tc, 3)
++	inputText = render(input)
++	varv = genValue(tc, 2)
++	varText = render(varv)
++	p := &prog{tc: tc, depth: n(tc, 1, 4)}
++	progText = p.program()
++	return
++}
++
++// runBoth runs a program on both implementations with the same input and variable; gojq gets
++// the input either as encoding/json's int/float64 values or as json.Number (the CLI's form).
++func runBoth(ht *hegel.T, progText, inputText, varText string, numbers bool) (outcome, outcome, bool) {
++	var gin, gvar any
++	if numbers {
++		gin, gvar = asNumbers(inputText), asNumbers(varText)
++	} else {
++		var err error
++		if err = json.Unmarshal([]byte(inputText), &gin); err != nil {
++			ht.Fatalf("bad input %q: %v", inputText, err)
++		}
++		if err = json.Unmarshal([]byte(varText), &gvar); err != nil {
++			ht.Fatalf("bad var %q: %v", varText, err)
++		}
++	}
++	g, gt := runGojq(progText, gin, map[string]any{"v": gvar})
++	j, jt := runJQ(progText, inputText, map[string]string{"v": varText})
++	if collect && (gt > time.Second || jt > time.Second) {
++		fmt.Printf("SLOW gojq %v jq %v: %s ⟵ %s\n", gt, jt, progText, inputText)
++	}
++	if j.status == "timeout" || (g.status == "timeout" && jt > 2*time.Second) {
++		note(ht, "skipped: timeout (gojq %v, jq %v)", gt, jt)
++		return g, j, false
++	}
++	if numbersOutOfRange(g) || numbersOutOfRange(j) {
++		note(ht, "skipped: numbers beyond 2^53")
++		return g, j, false
++	}
++	return g, j, true
++}
++
++// TestHegelProgramsAgreeWithJq: a generated program on a generated input produces the same
++// outputs and the same kind of ending (values / runtime error / compile error) in gojq and jq.
++func TestHegelProgramsAgreeWithJq(t *testing.T) {
++	needJQ(t)
++	property(t, func(ht *hegel.T) {
++		progText, _, inputText, _, varText := drawCase(ht)
++		numbers := chance(ht, 50)
++		note(ht, "program: %s\ninput: %s\n$v: %s\nnumbers=%v", progText, inputText, varText, numbers)
++		if collect {
++			fmt.Printf("CASE %s ⟵ %s\n", progText, inputText)
++		}
++		g, j, ok := runBoth(ht, progText, inputText, varText, numbers)
++		if !ok {
++			return
++		}
++		if collect {
++			d := ""
++			if g.status != "ok" {
++				d = g.detail
++			}
++			fmt.Printf("STATUS %s %d %s\n", g.status, len(g.outs), d)
++		}
++		if !sameOutcome(g, j) {
++			disagree(ht, "gojq and jq disagree\n  program: %s\n  input:   %s\n  $v:      %s\n  gojq: %s\n  jq:   %s", progText, inputText, varText, g, j)
++		}
++	})
++}
++
++// TestHegelPrintedProgramsParseAndRunTheSame: Query.String() of a parsed program is accepted
++// by gojq and by jq, prints the same again, and runs to the same outcome as the original text.
++func TestHegelPrintedProgramsParseAndRunTheSame(t *testing.T) {
++	needJQ(t)
++	property(t, func(ht *hegel.T) {
++		progText, _, inputText, _, varText := drawCase(ht)
++		q, err := Parse(progText)
++		if err != nil {
++			note(ht, "program does not parse (checked by the differential): %v", err)
++			return
++		}
++		printed := q.String()
++		note(ht, "program: %s\nprinted: %s\ninput: %s", progText, printed, inputText)
++		q2, err := Parse(printed)
++		if err != nil {
++			ht.Fatalf("Query.String() output does not parse\n  original: %s\n  printed:  %s\n  error: %v", progText, printed, err)
++		}
++		if p2 := q2.String(); p2 != printed {
++			ht.Fatalf("Query.String() is not a fixpoint\n  original: %s\n  printed:  %s\n  again:    %s", progText, printed, p2)
++		}
++		gin := asNumbers(inputText)
++		gvar := asNumbers(varText)
++		g1, t1 := runGojq(progText, gin, map[string]any{"v": gvar})
++		g2, _ := runGojq(printed, gin, map[string]any{"v": gvar})
++		if collect && t1 > time.Second {
++			fmt.Printf("SLOW gojq %v: %s ⟵ %s ($v %s)\n", t1, progText, inputText, varText)
++		}
++		if g1.status == "timeout" || g2.status == "timeout" {
++			return
++		}
++		if !sameOutcome(g1, g2) {
++			ht.Fatalf("printed program runs differently in gojq\n  original: %s → %s\n  printed:  %s → %s\n  input: %s", progText, g1, printed, g2, inputText)
++		}
++		j1, t1 := runJQ(progText, inputText, map[string]string{"v": varText})
++		j2, t2 := runJQ(printed, inputText, map[string]string{"v": varText})
++		if j1.status == "timeout" || j2.status == "timeout" || t1 > 5*time.Second || t2 > 5*time.Second {
++			return
++		}
++		if j2.status == "compile" && j1.status != "compile" {
++			ht.Fatalf("jq rejects gojq's printed form of a program jq accepted\n  original: %s\n  printed:  %s\n  jq: %s", progText, printed, j2.detail)
++		}
++	})
++}
++
++// TestHegelMarshalMatchesJqCompactOutput: gojq.Marshal of a decoded value is byte for byte
++// what jq -c prints for the same text, and decodes back to the value.
++func TestHegelMarshalMatchesJqCompactOutput(t *testing.T) {
++	needJQ(t)
++	property(t, func(ht *hegel.T) {
++		v := genValue(ht, 4)
++		text := render(v)
++		note(ht, "text: %s", text)
++		for _, form := range []string{"numbers", "values"} {
++			var in any
++			if form == "numbers" {
++				in = asNumbers(text)
++			} else {
++				if err := json.Unmarshal([]byte(text), &in); err != nil {
++					ht.Fatalf("bad text: %v", err)
++				}
++			}
++			b, err := Marshal(in)
++			if err != nil {
++				ht.Fatalf("Marshal(%s): %v", form, err)
++			}
++			j, _ := runJQ(".", text, nil)
++			if j.status != "ok" || len(j.outs) != 1 {
++				ht.Fatalf("jq -c . failed on %s: %s", text, j)
++			}
++			// jq's raw line, not the canonical form
++			ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
++			cmd := exec.CommandContext(ctx, jqPath, "-c", ".")
++			cmd.Stdin = strings.NewReader(text)
++			raw, err := cmd.Output()
++			cancel()
++			if err != nil {
++				ht.Fatalf("jq: %v", err)
++			}
++			rawLine := strings.TrimSuffix(string(raw), "\n")
++			if string(b) != rawLine {
++				ht.Fatalf("Marshal (%s form) differs from jq -c\n  text:    %s\n  Marshal: %s\n  jq -c:   %s", form, text, b, rawLine)
++			}
++			back, ok := canonJSON(string(b))
++			if !ok || back != canon(in) {
++				ht.Fatalf("Marshal output does not read back (%s form)\n  Marshal: %s\n  canon in: %s\n  canon back: %s", form, b, canon(in), back)
++			}
++		}
++	})
++}
++
++// TestHegelCompareIsATotalOrderAgreeingWithJq: Compare is antisymmetric and transitive over
++// generated values (in int/float64 and json.Number spellings), equal spellings of a number
++// compare equal, and its order is jq's sort order.
++func TestHegelCompareIsATotalOrderAgreeingWithJq(t *testing.T) {
++	needJQ(t)
++	property(t, func(ht *hegel.T) {
++		k := n(ht, 2, 6)
++		vals := make([]any, k)
++		texts := make([]string, k)
++		for i := range vals {
++			vals[i] = genValue(ht, 2)
++			texts[i] = render(vals[i])
++		}
++		note(ht, "values: %s", strings.Join(texts, " "))
++		// spellings
++		alt := make([]any, k)
++		for i := range vals {
++			if chance(ht, 50) {
++				alt[i] = asNumbers(texts[i])
++			} else {
++				alt[i] = vals[i]
++			}
++		}
++		for i := range vals {
++			if c := Compare(vals[i], alt[i]); c != 0 {
++				ht.Fatalf("Compare(%s, same value as %T) = %d", texts[i], alt[i], c)
++			}
++			for j := range vals {
++				a, b := Compare(alt[i], alt[j]), Compare(alt[j], alt[i])
++				if a != -b {
++					ht.Fatalf("Compare not antisymmetric: Compare(%s, %s) = %d, reversed %d", texts[i], texts[j], a, b)
++				}
++				for l := range vals {
++					if Compare(alt[i], alt[j]) <= 0 && Compare(alt[j], alt[l]) <= 0 && Compare(alt[i], alt[l]) > 0 {
++						ht.Fatalf("Compare not transitive on %s, %s, %s", texts[i], texts[j], texts[l])
++					}
++				}
++			}
++		}
++		sorted := append([]any{}, alt...)
++		sort.SliceStable(sorted, func(i, j int) bool { return Compare(sorted[i], sorted[j]) < 0 })
++		j, _ := runJQ("sort", "["+strings.Join(texts, ",")+"]", nil)
++		if j.status != "ok" || len(j.outs) != 1 {
++			ht.Fatalf("jq sort failed: %s", j)
++		}
++		if got := canon(sorted); got != j.outs[0] {
++			ht.Fatalf("Compare order differs from jq's sort\n  values: %s\n  gojq:   %s\n  jq:     %s", strings.Join(texts, " "), got, j.outs[0])
++		}
++	})
++}
++
++// TestHegelStringFormatsAgreeWithJq: the @formats, tostring/tojson and string functions on
++// generated (literal, canonical) values agree with jq, including numbers, which both print
++// as the literal text for canonical literals.
++const computedGuard = `numbers | . * 3 / 7 | select(fabs >= 0.0001 and fabs < 1e16)`
++
++func TestHegelStringFormatsAgreeWithJq(t *testing.T) {
++	needJQ(t)
++	formats := []string{
++		"tostring", "tojson", "@text", "@json", "@html", "@uri", "@base64", "@base64 | @base64d", "@base32", "@base32 | @base32d", "@sh",
++		"[.] | @csv", "[.] | @tsv", "[.[]?] | @csv", "[.[]?] | @tsv", "[.[]?] | @sh", "\"<\\(.)>\"", "@json \"v=\\(.)\"", "@html \"v=\\(.)\"",
++		"@uri \"v=\\(.)\"", "@sh \"v=\\(.)\"", "@base64 \"v=\\(.)\"", "@csv \"v=\\([.])\"", "@tsv \"v=\\([.])\"", "tojson | fromjson",
++		"tostring | length", "tojson | utf8bytelength", "tojson | explode | implode", "tostring | ascii_downcase", "tostring | ascii_upcase",
++		"tostring | split(\"\")", "tostring | [splits(\"[,:]\")]", "tostring | test(\"^[0-9]\")", "tostring | ltrimstr(\"-\")", "tostring | tonumber?",
++		"[.[]? | tostring] | join(\"|\")", "[.[]?] | join(\",\")?", "tostring | trim", "tostring | .[1:3]", "tostring | indices(\"a\")",
++		"tostring | gsub(\"\"; \"-\")", "tostring | [match(\"\"; \"g\") | .offset]", "tostring | sub(\"(?<x>.)\"; \"[\\(.x)]\")", "tostring | ascii",
++		"tostring | @base32d", "tojson | @sh", "tojson | @uri | @base64", "[tostring, tojson] | @csv", "[tostring, tojson] | @tsv",
++		// computed floats print the same in both within [1e-4, 1e16): both use the shortest
++		// round-trip digits; outside, jq switches to exponent notation earlier than gojq
++		computedGuard + " | tostring", computedGuard + " | tojson", computedGuard + " | [.] | @csv", computedGuard + " | @sh",
++		computedGuard + " | \"\\(.)\"", computedGuard + " | @text", computedGuard + " | tostring | tonumber",
++		"[.[]? | numbers] | map(. * 3 / 7) | map(select(fabs >= 0.0001 and fabs < 1e16)) | map(tostring)",
++	}
++	property(t, func(ht *hegel.T) {
++		v := genValue(ht, 3)
++		text := render(v)
++		f := pick(ht, formats)
++		note(ht, "input: %s\nformat: %s", text, f)
++		if strings.Contains(f, `""`) && !isASCII(text) {
++			return // jq's duplicate empty matches on multibyte strings, see simpleRegexes
++		}
++		numbers := chance(ht, 50)
++		g, j, ok := runBoth(ht, f, text, "null", numbers)
++		if !ok {
++			return
++		}
++		if !sameOutcome(g, j) {
++			disagree(ht, "gojq and jq disagree on %s\n  input: %s\n  gojq: %s\n  jq:   %s", f, text, g, j)
++		}
++	})
++}
++
++// --------------------------------------------------------------------------- pinned bugs
++
++// TestHegelSuffixesAfterANegativeNumberLiteralApply: in jq `-1[0]` is `-(1[0])` and errors
++// ("Cannot index number with number"), as does `(-1)[0]`; gojq's parser drops the suffix after
++// a negative literal and returns -1 — so `1 - -1[0]` is 2 and `-1475[4:1]` is -1475.
++func TestHegelSuffixesAfterANegativeNumberLiteralApply(t *testing.T) {
++	needJQ(t)
++	for _, progText := range []string{"-1[0]", "-1475[4:1]", "1 - -1[0]", "-1 .a", "-1.5[0]", "[-1[0]]"} {
++		g, _ := runGojq(progText, nil, nil)
++		j, _ := runJQ(progText, "null", nil)
++		if !sameOutcome(g, j) {
++			t.Errorf("%s: gojq %s, jq %s", progText, g, j)
++		}
++	}
++}
++
++// TestHegelNegativeFractionalSliceBoundsCountFromTheEnd: jq resolves a slice bound by adding
++// the length to a negative bound and then rounding (start down, end up), so `.[-0.5:]` of
++// [1,2,3] is [3] and `.[-1.5:]` is [2,3]; gojq truncates the bound to an integer first, so
++// -0.5 becomes 0 (the whole array) and -1.5 becomes -1 ([3]) — for strings, assignments and
++// del through such slices as well.
++func TestHegelNegativeFractionalSliceBoundsCountFromTheEnd(t *testing.T) {
++	needJQ(t)
++	for _, c := range [][2]string{
++		{".[-0.5:]", "[1,2,3]"}, {".[-1.5:]", "[1,2,3]"}, {".[:-0.5]", "[1,2,3]"}, {".[-2.5:-0.5]", "[1,2,3]"},
++		{".[-0.5:]", `"abc"`}, {".[-1.5:]", `"abc"`}, {".[-0.5:] = [\"x\"]", "[1,2,3]"}, {"del(.[-0.5:])", "[1,2,3]"},
++	} {
++		g, _ := runGojq(c[0], asNumbers(c[1]), nil)
++		j, _ := runJQ(c[0], c[1], nil)
++		if !sameOutcome(g, j) {
++			t.Errorf("%s | %s: gojq %s, jq %s", c[1], c[0], g, j)
++		}
++	}
++}
++
++// TestHegelTimeFunctionsRejectNaNAndInfinity: jq's todate/gmtime error ("error converting
++// number of seconds since epoch to datetime") for NaN, ±infinity and values beyond the
++// representable range, and mktime errors for NaN fields; gojq converts them to int64 and
++// returns the same garbage date for all of them (292277026304-08-26T15:42:51Z) or a garbage
++// epoch (9223372028578089000 for a NaN seconds field).
++func TestHegelTimeFunctionsRejectNaNAndInfinity(t *testing.T) {
++	needJQ(t)
++	for _, progText := range []string{"nan | todate", "infinite | todate", "1e400 | gmtime", "-1e400 | todate", "nan | gmtime",
++		"[nan,0,1,0,0,0,0,0] | mktime", "[2000,0,1,0,0,nan,0,0] | mktime"} {
++		g, _ := runGojq(progText, nil, nil)
++		j, _ := runJQ(progText, "null", nil)
++		if !sameOutcome(g, j) {
++			t.Errorf("%s: gojq %s, jq %s", progText, g, j)
++		}
++	}
++}
++
++// TestHegelReduceWithAnEmptyUpdateBecomesNull: in jq, when the update of a reduce produces
++// no output the accumulator becomes null (`reduce range(3) as $x (0; empty)` → null, and
++// `reduce range(3) as $x (10; if $x == 1 then empty else . + $x end)` → 2, since null + 2 is
++// 2); gojq keeps the previous state instead (0 and 12).
++func TestHegelReduceWithAnEmptyUpdateBecomesNull(t *testing.T) {
++	needJQ(t)
++	for _, progText := range []string{
++		"reduce range(3) as $x (0; empty)",
++		"reduce range(3) as $x (10; if $x == 1 then empty else . + $x end)",
++		"reduce (1, 2) as $x ([]; if $x == 2 then empty else . + [$x] end)",
++	} {
++		g, _ := runGojq(progText, nil, nil)
++		j, _ := runJQ(progText, "null", nil)
++		if !sameOutcome(g, j) {
++			t.Errorf("%s: gojq %s, jq %s", progText, g, j)
++		}
++	}
++}
++
++// TestHegelGlobalMatchesIncludeAnEmptyMatchAfterANonEmptyOne: jq (Oniguruma, like Perl and
++// Python) reports an empty match right after a non-empty one — `"aaa" | [match("a*"; "g") |
++// .offset]` is [0, 3] and `gsub("a*"; "-")` gives "--"; gojq follows Go's regexp, which skips
++// an empty match abutting the previous match: [0] and "-".
++func TestHegelGlobalMatchesIncludeAnEmptyMatchAfterANonEmptyOne(t *testing.T) {
++	needJQ(t)
++	for _, c := range [][2]string{
++		{`[match("a*"; "g") | .offset]`, `"aaa"`}, {`gsub("a*"; "-")`, `"aaa"`}, {`gsub("b*"; "-")`, `"abba"`},
++		{`[match("x?"; "g") | .offset]`, `"xa"`}, {`[splits("a*")]`, `"baab"`},
++	} {
++		g, _ := runGojq(c[0], asNumbers(c[1]), nil)
++		j, _ := runJQ(c[0], c[1], nil)
++		if !sameOutcome(g, j) {
++			t.Errorf("%s | %s: gojq %s, jq %s", c[1], c[0], g, j)
++		}
++	}
++}
++
++// TestHegelAbsLeavesNonNumbersUnchanged: jq defines abs as `if . < 0 then -. else . end`
++// (the manual's own words), so strings, arrays and objects — which sort above numbers — come
++// out unchanged; gojq raises "abs cannot be applied to" for them.
++func TestHegelAbsLeavesNonNumbersUnchanged(t *testing.T) {
++	needJQ(t)
++	for _, text := range []string{`"a"`, `"-3"`, `[]`, `[1,-2]`, `{}`, `{"a":-1}`} {
++		g, _ := runGojq("abs", asNumbers(text), nil)
++		j, _ := runJQ("abs", text, nil)
++		if !sameOutcome(g, j) {
++			t.Errorf("%s | abs: gojq %s, jq %s", text, g, j)
++		}
++	}
++}
++
++// TestHegelGammaIsTheLogGammaFunction: jq's gamma is the C library's gamma(), which is
++// lgamma (the log-gamma function) on every libc jq builds against, so in jq `gamma == lgamma`
++// for every input; gojq's gamma computes the gamma function itself (10 | gamma → 362880
++// instead of 12.80).
++func TestHegelGammaIsTheLogGammaFunction(t *testing.T) {
++	needJQ(t)
++	for _, text := range []string{"0.5", "1", "2", "3.5", "10", "-1.5"} {
++		g, _ := runGojq("[gamma, lgamma] | .[0] - .[1] | fabs < 1e-9", asNumbers(text), nil)
++		j, _ := runJQ("[gamma, lgamma] | .[0] - .[1] | fabs < 1e-9", text, nil)
++		if !sameOutcome(g, j) || len(g.outs) != 1 || g.outs[0] != "true" {
++			gv, _ := runGojq("[gamma, lgamma]", asNumbers(text), nil)
++			jv, _ := runJQ("[gamma, lgamma]", text, nil)
++			t.Errorf("%s | [gamma, lgamma]: gojq %s, jq %s", text, gv, jv)
++		}
++	}
++}
++
++// --------------------------------------------------------------------------- helpers
++
++func mustRun(t *testing.T, progText string, input any) []any {
++	t.Helper()
++	q, err := Parse(progText)
++	if err != nil {
++		t.Fatalf("parse %q: %v", progText, err)
++	}
++	iter := q.Run(input)
++	var outs []any
++	for {
++		v, ok := iter.Next()
++		if !ok {
++			break
++		}
++		outs = append(outs, v)
++	}
++	return outs
++}
++
++func isASCII(s string) bool {
++	for i := 0; i < len(s); i++ {
++		if s[i] >= utf8.RuneSelf {
++			return false
++		}
++	}
++	return true
++}
