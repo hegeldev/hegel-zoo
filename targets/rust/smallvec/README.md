@@ -29,3 +29,4 @@
   hegeltest's `serde_json` in scope the element type of the empty array is ambiguous (E0282/E0283).
 - 2026-09-13: base bumped bc8a854926a8 → 053f1a7b71b4 (2026-09-11, "refactor: create `src/iterators/` folder and move `rayon.rs` (closes #598) (#600)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass. Upstream moved its unit tests from `src/tests.rs` to `tests/main.rs` (and dropped the `assert_eq!(x, [])` sites the zoo had to disambiguate), so the hegel module now lives at the end of `tests/main.rs` as an integration test (`smallvec::` paths instead of `crate::`/`alloc::`).
 - 2026-09-14: base bumped 053f1a7b71b4 → aefeac3d090a (2026-09-14, "refactor: remove deprecated usage in bench (#611)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass.
+- 2026-09-14: base bumped aefeac3d090a → ed4b23aa0191 (2026-09-14, "fix: overflow on length on not-64-bit (#616)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass.

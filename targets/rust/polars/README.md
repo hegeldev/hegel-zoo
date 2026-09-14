@@ -31,3 +31,4 @@
 - 2026-09-14: base bumped effe7e05942f → abba65f36c11 (2026-09-14, "fix: Don't panic on an empty or null quantile expression input (#29240)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-14: base bumped abba65f36c11 → efbfd1f38072 (2026-09-14, "chore: More obvious `MapChunked` storage handling (#29248)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-14: base bumped efbfd1f38072 → 85ee8753973a (2026-09-14, "perf: Don't clone the full frame per arm in when/then/otherwise (#29258)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-14: base bumped 85ee8753973a → 7d80fdf9bb7b (2026-09-14, "fix(python): Fix comparison expression method comment (#29257)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
