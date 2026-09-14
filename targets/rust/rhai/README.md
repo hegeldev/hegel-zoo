@@ -46,3 +46,4 @@
 - 2026-09-13: base bumped 950b724b8f1d → 4d9e4d80809f (2026-09-09, "Merge pull request #1162 from rhaiscript/vm-refine-switch-stmt"; 1.26.0); 0 bug(s) still reproduce. 389 tests pass.
 - 2026-09-13: base bumped 4d9e4d80809f → ef2092d49523 (2026-09-13, "Move Ident out of AST."; 1.26.0); 0 bug(s) still reproduce. 389 tests pass.
 - 2026-09-13: base bumped ef2092d49523 → 74bf227ff4c9 (2026-09-14, "Merge pull request #1164 from rhaiscript/vm-revise-walk-property"; 1.26.0); 0 bug(s) still reproduce. 389 tests pass.
+- 2026-09-14: base bumped 74bf227ff4c9 → d8bff1070ee8 (2026-09-14, "Merge pull request #1163 from rhaiscript/vm-speed-up-chaining-assign"; 1.26.0); 0 bug(s) still reproduce. 389 tests pass.
