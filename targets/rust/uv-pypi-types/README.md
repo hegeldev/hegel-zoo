@@ -70,3 +70,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - Extras are compared as sets (uv keeps a `[a,a]` list; packaging de-duplicates).
 - A `Metadata-Version` like `02.2` or `2.10` is accepted by `parse_pkg_info`.
 - 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
+- 2026-09-14: base bumped 83d556d712c7 → c40e652bc385 (2026-09-14, "Exclude backports-zstd from the Sentry PGO corpus (#21678)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.

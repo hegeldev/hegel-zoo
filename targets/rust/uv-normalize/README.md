@@ -66,3 +66,4 @@ does for pip.
 - `DefaultExtras`/`DefaultGroups` accept only the exact string `"all"` (not `"ALL"`), as uv's
   documentation spells it.
 - 2026-09-14: base bumped c0df400a4cf4 → 83d556d712c7 (2026-09-14, "Scope required-environment checks to the current fork (#21672)"; 0.0.80); 2 bug(s) still reproduce. 12 tests pass.
+- 2026-09-14: base bumped 83d556d712c7 → c40e652bc385 (2026-09-14, "Exclude backports-zstd from the Sentry PGO corpus (#21678)"; 0.0.80); 2 bug(s) still reproduce. 12 tests pass.
