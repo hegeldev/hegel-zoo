@@ -1,0 +1,861 @@
+diff --git a/dep3/Cargo.toml b/dep3/Cargo.toml
+index fe312dc..84b37a8 100644
+--- a/dep3/Cargo.toml
++++ b/dep3/Cargo.toml
+@@ -23,3 +23,7 @@ patchkit = ["dep:patchkit"]
+ 
+ [badges]
+ maintenance = { status = "actively-maintained" }
++
++[dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = "1"
+diff --git a/dep3/examples/read-dep3.rs b/dep3/examples/read-dep3.rs
+deleted file mode 100644
+index a169c47..0000000
+--- a/dep3/examples/read-dep3.rs
++++ /dev/null
+@@ -1,28 +0,0 @@
+-use dep3::lossy::PatchHeader;
+-use std::str::FromStr;
+-
+-pub const TEXT: &str = r#"From: John Doe <john.doe@example>
+-Date: Mon, 1 Jan 2000 00:00:00 +0000
+-Subject: [PATCH] fix a bug
+-Bug-Debian: https://bugs.debian.org/123456
+-Bug: https://bugzilla.example.com/bug.cgi?id=123456
+-Forwarded: not-needed
+-"#;
+-
+-pub fn main() {
+-    let patch_header = match PatchHeader::from_str(TEXT) {
+-        Ok(header) => header,
+-        Err(e) => {
+-            eprintln!("Failed to parse patch header: {}", e);
+-            std::process::exit(1);
+-        }
+-    };
+-
+-    if let Some(description) = &patch_header.description {
+-        println!("Description: {}", description);
+-    }
+-
+-    if let Some(bug_debian) = &patch_header.bug_debian {
+-        println!("Debian Bugs: {}", bug_debian);
+-    }
+-}
+diff --git a/dep3/tests/hegel.rs b/dep3/tests/hegel.rs
+new file mode 100644
+index 0000000..f138946
+--- /dev/null
++++ b/dep3/tests/hegel.rs
+@@ -0,0 +1,809 @@
++//! Hegel property tests for dep3, against the DEP-3 specification
++//! (<https://dep-team.pages.debian.net/deps/dep3/>) as a generated model, dpkg's
++//! deb822 reader (`Dpkg::Control::HashCore`, a persistent Perl child) for the
++//! raw field values of the header paragraph, and the crate's two layers
++//! (`lossless::PatchHeader` over deb822-lossless, `lossy::PatchHeader` over
++//! deb822-fast) against each other.
++
++use dep3::{lossless, lossy, AppliedUpstream, Forwarded, Origin, OriginCategory};
++use hegel::generators;
++use hegel::Generator;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Oracle: dpkg's deb822 reader
++// ---------------------------------------------------------------------------
++
++const PERL_SCRIPT: &str = r#"
++use strict; use warnings;
++use Dpkg::Control::HashCore;
++use JSON::PP;
++$| = 1;
++my $json = JSON::PP->new->canonical;
++while (my $line = <STDIN>) {
++    chomp $line;
++    my ($cmd, @args) = split / /, $line;
++    my @a = map { pack('H*', $_) } @args;
++    if ($cmd eq 'P') {
++        my ($text) = @a;
++        my @paras;
++        my $err;
++        eval {
++            open my $fh, '<', \$text or die;
++            while (1) {
++                my $h = Dpkg::Control::HashCore->new;
++                my $n = $h->parse($fh, 'x');
++                last unless $n;
++                my @fields;
++                foreach my $k (keys %$h) { push @fields, [$k, $h->{$k}]; }
++                push @paras, \@fields;
++            }
++        };
++        if ($@) { $err = "$@"; }
++        print $json->encode({ paras => \@paras, err => $err }), "\n";
++    } else {
++        print "{}\n";
++    }
++}
++"#;
++
++struct Child2 {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++fn spawn(program: &str, args: &[&str]) -> Child2 {
++    let mut child = Command::new(program)
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .spawn()
++        .unwrap_or_else(|e| panic!("cannot start {program}: {e}"));
++    let stdin = child.stdin.take().unwrap();
++    let stdout = BufReader::new(child.stdout.take().unwrap());
++    Child2 { _child: child, stdin, stdout }
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn ask(c: &mut Child2, cmd: &str, args: &[&str]) -> serde_json::Value {
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    writeln!(c.stdin, "{line}").unwrap();
++    c.stdin.flush().unwrap();
++    let mut reply = String::new();
++    c.stdout.read_line(&mut reply).unwrap();
++    assert!(!reply.is_empty(), "{cmd}: oracle child died");
++    serde_json::from_str(&reply).unwrap_or_else(|e| panic!("bad oracle reply {reply:?}: {e}"))
++}
++
++fn perl() -> &'static Mutex<Child2> {
++    static P: OnceLock<Mutex<Child2>> = OnceLock::new();
++    P.get_or_init(|| Mutex::new(spawn("perl", &["-e", PERL_SCRIPT])))
++}
++
++/// dpkg's reading of `text`: paragraphs of (key, value); Err when dpkg dies
++/// (duplicate fields, syntax errors).
++fn dpkg_read(text: &str) -> Result<Vec<Vec<(String, String)>>, String> {
++    let mut c = perl().lock().unwrap_or_else(|e| e.into_inner());
++    let v = ask(&mut c, "P", &[text]);
++    if let Some(e) = v["err"].as_str() {
++        return Err(e.to_string());
++    }
++    Ok(v["paras"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|p| {
++            p.as_array()
++                .unwrap()
++                .iter()
++                .map(|f| (f[0].as_str().unwrap().to_string(), f[1].as_str().unwrap().to_string()))
++                .collect()
++        })
++        .collect())
++}
++
++// ---------------------------------------------------------------------------
++// Model and generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++const PEOPLE: &[&str] = &["John Doe <john@example.com>", "A. Maintainer <am@debian.org>", "x <x@y>"];
++const URLS: &[&str] = &[
++    "https://bugs.debian.org/510219",
++    "http://bugs.debian.org/265678",
++    "https://github.com/foo/bar/issues/2764",
++    "http://lists.example.com/oct-2006/1234.html",
++    "https://launchpad.net/bugs/12345",
++];
++const COMMITS: &[&str] = &["d33286c", "bdb56bacdeadbeef", "1"];
++// No word starts with `#`: an indented `#` line is deb822-lossless/4 (a
++// continuation line lexed as a comment), inherited here and not re-recorded.
++const WORDS: &[&str] = &["Fix", "widget", "frobnication", "speeds", "on", "mips/mipsel", "(etch)", "bug#42", "a:b", "---", "diff"];
++
++#[derive(Debug, Clone, PartialEq)]
++struct Header {
++    /// `Subject` (git style) or `Description`.
++    subject_style: bool,
++    synopsis: String,
++    /// Long description lines; an empty string is a blank line (` .` in deb822).
++    long: Vec<String>,
++    origin: Option<(Option<OriginCategory>, Origin)>,
++    forwarded: Option<Forwarded>,
++    /// `Author` (or `From` when subject_style) values, in order.
++    authors: Vec<String>,
++    reviewed_by: Vec<String>,
++    /// (vendor, url) — vendor `None` is a bare `Bug`.
++    bugs: Vec<(Option<String>, String)>,
++    last_update: Option<chrono::NaiveDate>,
++    applied_upstream: Option<AppliedUpstream>,
++    /// Field order as rendered: indices into the field list built by `fields()`.
++    order: Vec<usize>,
++    /// What follows the header: nothing, or a diff body starting with one of the markers.
++    body: Option<String>,
++    trailing_newline: bool,
++}
++
++impl Header {
++    fn description_key(&self) -> &'static str {
++        if self.subject_style {
++            "Subject"
++        } else {
++            "Description"
++        }
++    }
++    fn author_key(&self) -> &'static str {
++        if self.subject_style {
++            "From"
++        } else {
++            "Author"
++        }
++    }
++
++    /// The header's fields as (key, raw deb822 value) in generation order.
++    fn fields(&self) -> Vec<(String, String)> {
++        let mut f = Vec::new();
++        let mut desc = self.synopsis.clone();
++        for l in &self.long {
++            desc.push('\n');
++            desc.push_str(if l.is_empty() { "." } else { l });
++        }
++        f.push((self.description_key().to_string(), desc));
++        if let Some((c, o)) = &self.origin {
++            f.push(("Origin".into(), format_origin(c, o)));
++        }
++        if let Some(fw) = &self.forwarded {
++            f.push(("Forwarded".into(), fw.to_string()));
++        }
++        for a in &self.authors {
++            f.push((self.author_key().to_string(), a.clone()));
++        }
++        for r in &self.reviewed_by {
++            f.push(("Reviewed-by".into(), r.clone()));
++        }
++        for (v, u) in &self.bugs {
++            let k = match v {
++                Some(v) => format!("Bug-{v}"),
++                None => "Bug".into(),
++            };
++            f.push((k, u.clone()));
++        }
++        if let Some(d) = &self.last_update {
++            f.push(("Last-Update".into(), d.format("%Y-%m-%d").to_string()));
++        }
++        if let Some(a) = &self.applied_upstream {
++            f.push(("Applied-Upstream".into(), a.to_string()));
++        }
++        f
++    }
++
++    fn ordered_fields(&self) -> Vec<(String, String)> {
++        let f = self.fields();
++        self.order.iter().map(|&i| f[i].clone()).collect()
++    }
++
++    fn header_text(&self) -> String {
++        let mut s = String::new();
++        for (k, v) in self.ordered_fields() {
++            s.push_str(&k);
++            s.push(':');
++            let mut lines = v.split('\n');
++            let first = lines.next().unwrap();
++            if !first.is_empty() {
++                s.push(' ');
++                s.push_str(first);
++            }
++            s.push('\n');
++            for l in lines {
++                s.push(' ');
++                s.push_str(l);
++                s.push('\n');
++            }
++        }
++        s
++    }
++
++    fn text(&self) -> String {
++        let mut s = self.header_text();
++        match &self.body {
++            Some(b) => s.push_str(b),
++            None => {
++                if !self.trailing_newline {
++                    s.pop();
++                }
++            }
++        }
++        s
++    }
++
++    fn has_duplicate_keys(&self) -> bool {
++        let f = self.fields();
++        let mut keys: Vec<String> = f.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
++        let n = keys.len();
++        keys.sort();
++        keys.dedup();
++        keys.len() != n
++    }
++
++    /// Values of the fields named `key` (case-insensitively), in rendered order.
++    fn values_of(&self, key: &str) -> Vec<String> {
++        self.ordered_fields().into_iter().filter(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v).collect()
++    }
++
++    /// The bug fields in rendered order.
++    fn ordered_bugs(&self) -> Vec<(Option<String>, String)> {
++        self.ordered_fields()
++            .into_iter()
++            .filter_map(|(k, v)| {
++                if k == "Bug" {
++                    Some((None, v))
++                } else {
++                    k.strip_prefix("Bug-").map(|vendor| (Some(vendor.to_string()), v))
++                }
++            })
++            .collect()
++    }
++
++    /// Lossy's `description`: the raw value with `.` marker lines kept.
++    fn lossy_description(&self) -> String {
++        self.fields()[0].1.clone()
++    }
++
++    /// The decoded long description (`.` → blank line), None when absent.
++    fn long_description(&self) -> Option<String> {
++        if self.long.is_empty() {
++            None
++        } else {
++            Some(self.long.join("\n"))
++        }
++    }
++}
++
++fn format_origin(c: &Option<OriginCategory>, o: &Origin) -> String {
++    let mut s = String::new();
++    if let Some(c) = c {
++        s.push_str(&c.to_string());
++        s.push_str(", ");
++    }
++    s.push_str(&o.to_string());
++    s
++}
++
++fn arb_words(tc: &hegel::TestCase, min: i64, max: i64) -> String {
++    let n = tc.draw(int!(min, max)) as usize;
++    (0..n).map(|_| pick(tc, WORDS).to_string()).collect::<Vec<_>>().join(" ")
++}
++
++fn arb_ref(tc: &hegel::TestCase) -> String {
++    if tc.draw(generators::booleans()) {
++        pick(tc, URLS).to_string()
++    } else {
++        format!("commit:{}", pick(tc, COMMITS))
++    }
++}
++
++fn arb_origin(tc: &hegel::TestCase) -> (Option<OriginCategory>, Origin) {
++    let cat = match tc.draw(int!(0, 4)) {
++        0 => None,
++        1 => Some(OriginCategory::Backport),
++        2 => Some(OriginCategory::Vendor),
++        3 => Some(OriginCategory::Upstream),
++        _ => Some(OriginCategory::Other),
++    };
++    // A category alone (`Origin: vendor`) is pinned separately.
++    let r = arb_ref(tc);
++    (cat, Origin::from_str(&r).unwrap())
++}
++
++fn arb_forwarded(tc: &hegel::TestCase) -> Forwarded {
++    match tc.draw(int!(0, 3)) {
++        0 => Forwarded::No,
++        1 => Forwarded::NotNeeded,
++        2 => Forwarded::Yes("yes".into()),
++        _ => Forwarded::Yes(pick(tc, URLS).to_string().into()),
++    }
++}
++
++fn arb_applied(tc: &hegel::TestCase) -> AppliedUpstream {
++    match tc.draw(int!(0, 2)) {
++        0 => AppliedUpstream::Commit(pick(tc, COMMITS).to_string().into()),
++        1 => AppliedUpstream::Other(pick(tc, URLS).to_string().into()),
++        _ => AppliedUpstream::Other(format!("1.{}, {}", tc.draw(int!(0, 9)), pick(tc, URLS)).into()),
++    }
++}
++
++fn arb_date(tc: &hegel::TestCase) -> chrono::NaiveDate {
++    chrono::NaiveDate::from_ymd_opt(tc.draw(int!(1990, 2030)) as i32, tc.draw(int!(1, 12)) as u32, tc.draw(int!(1, 28)) as u32)
++        .unwrap()
++}
++
++#[hegel::composite]
++fn arb_header(tc: &hegel::TestCase) -> Header {
++    let subject_style = tc.draw(generators::booleans());
++    let synopsis = arb_words(tc, 1, 4);
++    // Long description: only with `Description` (DEP-3: with `Subject` the
++    // long description lives outside the fields — pinned).
++    let long: Vec<String> = if !subject_style && tc.draw(generators::booleans()) {
++        let n = tc.draw(int!(1, 4)) as usize;
++        let mut v: Vec<String> = (0..n)
++            .map(|_| if tc.draw(int!(0, 3)) == 0 { String::new() } else { arb_words(tc, 1, 5) })
++            .collect();
++        // A blank marker first or last is a deb822/dpkg corner (dpkg drops a
++        // trailing empty line); keep the ends non-blank.
++        if v[0].is_empty() {
++            v[0] = "text".into();
++        }
++        if v[n - 1].is_empty() {
++            v[n - 1] = "end".into();
++        }
++        v
++    } else {
++        Vec::new()
++    };
++    let origin = if tc.draw(generators::booleans()) { Some(arb_origin(tc)) } else { None };
++    let forwarded = if tc.draw(generators::booleans()) { Some(arb_forwarded(tc)) } else { None };
++    let n_auth = tc.draw(int!(0, 2)) as usize;
++    let authors: Vec<String> = (0..n_auth).map(|_| pick(tc, PEOPLE).to_string()).collect();
++    let n_rev = tc.draw(int!(0, 2)) as usize;
++    let reviewed_by: Vec<String> = (0..n_rev).map(|_| pick(tc, PEOPLE).to_string()).collect();
++    let n_bugs = tc.draw(int!(0, 3)) as usize;
++    let bugs: Vec<(Option<String>, String)> = (0..n_bugs)
++        .map(|_| {
++            let vendor = match tc.draw(int!(0, 3)) {
++                0 => None,
++                1 | 2 => Some("Debian".to_string()),
++                _ => Some("Ubuntu".to_string()),
++            };
++            (vendor, pick(tc, URLS).to_string())
++        })
++        .collect();
++    let last_update = if tc.draw(generators::booleans()) { Some(arb_date(tc)) } else { None };
++    let applied_upstream = if tc.draw(generators::booleans()) { Some(arb_applied(tc)) } else { None };
++    let mut h = Header {
++        subject_style,
++        synopsis,
++        long,
++        origin,
++        forwarded,
++        authors,
++        reviewed_by,
++        bugs,
++        last_update,
++        applied_upstream,
++        order: Vec::new(),
++        body: None,
++        trailing_newline: true,
++    };
++    // A random permutation of the fields (a Fisher–Yates with drawn indices).
++    let n = h.fields().len();
++    let mut idx: Vec<usize> = (0..n).collect();
++    let mut order = Vec::new();
++    while !idx.is_empty() {
++        let i = tc.draw(int!(0, idx.len() as i64 - 1)) as usize;
++        order.push(idx.remove(i));
++    }
++    h.order = order;
++    h.body = match tc.draw(int!(0, 3)) {
++        0 => None,
++        1 => Some("---\n zim/plugins/quicknote.py | 4 ++++\n 1 file changed, 4 insertions(+)\n\ndiff --git a/x b/x\n".into()),
++        2 => Some(format!("diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1 +1 @@\n-x\n+y{}", if tc.draw(generators::booleans()) { "\n" } else { "" })),
++        _ => Some("Index: foo\n===================================================================\n--- foo\n+++ foo\n".into()),
++    };
++    h.trailing_newline = tc.draw(generators::booleans());
++    h
++}
++
++fn norm_key(k: &str) -> String {
++    k.to_ascii_lowercase()
++}
++
++// ---------------------------------------------------------------------------
++// Parsing: lossless against the model and dpkg
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn lossless_headers_are_read_like_the_model_and_dpkg(tc: hegel::TestCase) {
++    let h = tc.draw(arb_header().print_as_debug());
++    let text = h.text();
++    let header_text = if h.body.is_some() || h.trailing_newline { h.header_text() } else { let mut t = h.header_text(); t.pop(); t };
++
++    // header_end: the first `---` / `diff ` / `Index:` line.
++    let end = dep3::header_end(&text);
++    assert_eq!(end, header_text.len(), "header_end");
++    assert_eq!(&text[..end], header_text);
++
++    let (p, end2) = lossless::PatchHeader::parse_relaxed(&text).expect("parse_relaxed");
++    assert_eq!(end2, end);
++    let p2 = lossless::PatchHeader::from_str(&header_text).expect("from_str of the header");
++    assert_eq!(p.to_string(), p2.to_string());
++    assert_eq!(p.to_string(), header_text, "lossless text");
++
++    // Raw fields: the paragraph is the model's, in order.
++    let raw: Vec<(String, String)> = p.as_deb822().items().collect();
++    let expected: Vec<(String, String)> = h.ordered_fields();
++    assert_eq!(raw, expected, "raw fields");
++
++    // dpkg reads the same values (it dies on duplicate fields; it unescapes
++    // ` .` to an empty line).
++    if !h.has_duplicate_keys() {
++        let d = dpkg_read(&header_text).expect("dpkg reads a valid header");
++        assert_eq!(d.len(), 1, "one paragraph for dpkg");
++        let mut ours: Vec<(String, String)> = expected
++            .iter()
++            .map(|(k, v)| (norm_key(k), v.split('\n').map(|l| if l == "." { "" } else { l }).collect::<Vec<_>>().join("\n")))
++            .collect();
++        let mut theirs: Vec<(String, String)> = d[0].iter().map(|(k, v)| (norm_key(k), v.clone())).collect();
++        ours.sort();
++        theirs.sort();
++        assert_eq!(theirs, ours, "dpkg's fields");
++    }
++
++    // Typed getters follow the model.
++    assert_eq!(p.description(), Some(h.synopsis.clone()), "description");
++    let authors = h.values_of(h.author_key());
++    assert_eq!(p.author(), authors.first().cloned(), "author");
++    assert_eq!(p.origin(), h.origin, "origin");
++    assert_eq!(p.forwarded(), h.forwarded, "forwarded");
++    assert_eq!(p.reviewed_by(), h.values_of("Reviewed-by"), "reviewed_by");
++    assert_eq!(p.last_update(), h.last_update, "last_update");
++    assert_eq!(p.applied_upstream(), h.applied_upstream, "applied_upstream");
++    let bugs: Vec<(Option<String>, String)> = p.bugs().collect();
++    let h_bugs = h.ordered_bugs();
++    assert_eq!(bugs, h_bugs, "bugs");
++    let debian: Vec<String> = h_bugs.iter().filter(|(v, _)| v.as_deref() == Some("Debian")).map(|(_, u)| u.clone()).collect();
++    assert_eq!(p.vendor_bugs("Debian").collect::<Vec<_>>(), debian, "vendor_bugs");
++    let ids: Vec<u32> = h_bugs
++        .iter()
++        .filter(|(v, _)| v.as_deref().map_or(true, |v| v.eq_ignore_ascii_case("debian")))
++        .filter_map(|(_, u)| dep3::parse_debian_bug_id(u))
++        .collect();
++    assert_eq!(p.debian_bug_ids().collect::<Vec<_>>(), ids, "debian_bug_ids");
++    // The long description, when there is one (its shape without one is pinned).
++    if let Some(long) = h.long_description() {
++        let got = p.long_description().expect("a long description");
++        let decoded = got.split('\n').map(|l| if l == "." { "" } else { l }).collect::<Vec<_>>().join("\n");
++        assert_eq!(decoded, long, "long_description (decoded)");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Parsing: lossy against the model, and the two layers against each other
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn lossy_headers_are_read_like_the_model(tc: hegel::TestCase) {
++    let h = tc.draw(arb_header().print_as_debug());
++    let text = h.text();
++    let end = dep3::header_end(&text);
++    let l = lossy::PatchHeader::from_str(&text[..end]).expect("lossy parse");
++    assert_eq!(l.description, Some(h.lossy_description()), "description");
++    assert_eq!(l.synopsis(), Some(h.synopsis.as_str()), "synopsis");
++    assert_eq!(l.long_description(), h.long_description(), "long_description");
++    let authors = h.values_of(h.author_key());
++    assert_eq!(l.author, authors.first().cloned(), "author");
++    assert_eq!(l.origin, h.origin, "origin");
++    assert_eq!(l.forwarded, h.forwarded, "forwarded");
++    assert_eq!(l.reviewed_by, h.values_of("Reviewed-by").first().cloned(), "reviewed_by");
++    assert_eq!(l.last_update, h.last_update, "last_update");
++    assert_eq!(l.applied_upstream, h.applied_upstream, "applied_upstream");
++    let h_bugs = h.ordered_bugs();
++    let first_debian = h_bugs.iter().find(|(v, _)| v.as_deref() == Some("Debian")).map(|(_, u)| url::Url::parse(u).unwrap());
++    assert_eq!(l.bug_debian, first_debian, "bug_debian");
++    assert_eq!(l.vendor_bugs("Debian"), first_debian.as_ref().map(|u| u.as_str()), "vendor_bugs");
++    let first_bare = h_bugs.iter().find(|(v, _)| v.is_none()).map(|(_, u)| url::Url::parse(u).unwrap());
++    assert_eq!(l.bug, first_bare, "bug");
++
++    // Display round trip: the struct survives its own rendering (the fields the
++    // struct can hold; repeated and vendor bugs are pinned).
++    let shown = l.to_string();
++    let again = lossy::PatchHeader::from_str(&shown).expect("lossy re-parse of Display");
++    assert_eq!(again, l, "lossy Display round trip");
++
++    // The lossless layer agrees.
++    let (p, _) = lossless::PatchHeader::parse_relaxed(&text).unwrap();
++    assert_eq!(p.description().as_deref(), l.synopsis(), "layers: synopsis");
++    assert_eq!(p.author(), l.author, "layers: author");
++    let _ = &authors;
++    assert_eq!(p.origin(), l.origin, "layers: origin");
++    assert_eq!(p.forwarded(), l.forwarded, "layers: forwarded");
++    assert_eq!(p.last_update(), l.last_update, "layers: last_update");
++    assert_eq!(p.applied_upstream(), l.applied_upstream, "layers: applied_upstream");
++    assert_eq!(p.reviewed_by().first().cloned(), l.reviewed_by, "layers: first reviewer");
++}
++
++// ---------------------------------------------------------------------------
++// Field types
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn field_types_round_trip_through_display(tc: hegel::TestCase) {
++    let fw = arb_forwarded(&tc);
++    assert_eq!(Forwarded::from_str(&fw.to_string()), Ok(fw.clone()));
++    let (c, o) = arb_origin(&tc);
++    assert_eq!(Origin::from_str(&o.to_string()), Ok(o.clone()));
++    if let Some(c) = c {
++        assert_eq!(OriginCategory::from_str(&c.to_string()), Ok(c));
++    }
++    let a = arb_applied(&tc);
++    assert_eq!(AppliedUpstream::from_str(&a.to_string()), Ok(a));
++    // An Origin with a category reads back through the header.
++    let mut p = lossless::PatchHeader::new();
++    p.set_origin(c, o.clone());
++    let again = lossless::PatchHeader::from_str(&p.to_string()).unwrap();
++    assert_eq!(again.origin(), Some((c, o)));
++    // Bug ids.
++    let n = tc.draw(int!(0, 9_999_999)) as u32;
++    for form in [format!("{n}"), format!("#{n}"), format!("https://bugs.debian.org/{n}"), format!("http://bugs.debian.org/{n}"), format!("  {n} ")] {
++        assert_eq!(dep3::parse_debian_bug_id(&form), Some(n), "{form:?}");
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Building and editing
++// ---------------------------------------------------------------------------
++
++/// Build a header from scratch with the setters; every getter and the re-parse
++/// of the text agree with the model. Setters on fields that already exist are
++/// pinned separately.
++#[hegel::test]
++fn built_headers_are_read_back(tc: hegel::TestCase) {
++    let h = tc.draw(arb_header().print_as_debug());
++    let mut p = lossless::PatchHeader::new();
++    // Blank lines in the long description are pinned (`set_description` marker).
++    let long: Vec<String> = h.long.iter().filter(|l| !l.is_empty()).cloned().collect();
++    let with_long = !long.is_empty() && tc.draw(generators::booleans());
++    if with_long {
++        p.set_description(&format!("{}\n{}", h.synopsis, long.join("\n")));
++    } else {
++        p.set_description(&h.synopsis);
++    }
++    if let Some((c, o)) = &h.origin {
++        p.set_origin(*c, o.clone());
++    }
++    if let Some(f) = &h.forwarded {
++        p.set_forwarded(f.clone());
++    }
++    if let Some(a) = h.authors.first() {
++        p.set_author(a);
++    }
++    if let Some(d) = h.last_update {
++        p.set_last_update(d);
++    }
++    if let Some(a) = &h.applied_upstream {
++        p.set_applied_upstream(a.clone());
++    }
++    // One bug per key (setters on an existing key are pinned).
++    let mut seen = std::collections::HashSet::new();
++    let mut bugs = Vec::new();
++    for (v, u) in &h.bugs {
++        if seen.insert(v.clone()) {
++            match v {
++                Some(v) => p.set_vendor_bug(v, u),
++                None => p.set_upstream_bug(u),
++            }
++            bugs.push((v.clone(), u.clone()));
++        }
++    }
++    let text = p.to_string();
++    let again = lossless::PatchHeader::from_str(&text).expect("built text parses");
++    for q in [&p, &again] {
++        assert_eq!(q.description(), Some(h.synopsis.clone()), "description");
++        if with_long {
++            assert_eq!(q.long_description(), Some(long.join("\n")), "long_description");
++        }
++        assert_eq!(q.origin(), h.origin, "origin");
++        assert_eq!(q.forwarded(), h.forwarded, "forwarded");
++        assert_eq!(q.author(), h.authors.first().cloned(), "author");
++        assert_eq!(q.last_update(), h.last_update, "last_update");
++        assert_eq!(q.applied_upstream(), h.applied_upstream, "applied_upstream");
++        let mut got: Vec<(Option<String>, String)> = q.bugs().collect();
++        let mut want = bugs.clone();
++        got.sort();
++        want.sort();
++        assert_eq!(got, want, "bugs");
++    }
++    // dpkg reads the built text.
++    let d = dpkg_read(&text).expect("dpkg reads the built header");
++    assert_eq!(d.len(), 1);
++    // The lossy layer reads it too and agrees on the typed fields.
++    let l = lossy::PatchHeader::from_str(&text).expect("lossy reads the built header");
++    assert_eq!(l.synopsis(), Some(h.synopsis.as_str()));
++    assert_eq!(l.origin, h.origin);
++    assert_eq!(l.forwarded, h.forwarded);
++    assert_eq!(l.author, h.authors.first().cloned());
++    assert_eq!(l.last_update, h.last_update);
++    assert_eq!(l.applied_upstream, h.applied_upstream);
++}
++
++fn set_or_insert(p: &mut lossless::PatchHeader, key: &str, value: &str) {
++    if p.as_deb822().contains_key(key) {
++        p.as_deb822_mut().set(key, value);
++    } else {
++        p.as_deb822_mut().insert(key, value);
++    }
++}
++
++/// Editing a parsed header through the deb822 paragraph keeps the getters and
++/// the text in step.
++#[hegel::test]
++fn paragraph_edits_are_seen_by_the_getters(tc: hegel::TestCase) {
++    let h = tc.draw(arb_header().print_as_debug());
++    if h.body.is_none() && !h.trailing_newline {
++        // Inserting after an unterminated last line glues the lines:
++        // deb822-lossless/9, inherited and not re-recorded.
++        return;
++    }
++    let (mut p, _) = lossless::PatchHeader::parse_relaxed(&h.text()).unwrap();
++    let fw = arb_forwarded(&tc);
++    set_or_insert(&mut p, "Forwarded", &fw.to_string());
++    assert_eq!(p.forwarded(), Some(fw.clone()));
++    let d = arb_date(&tc);
++    set_or_insert(&mut p, "Last-Update", &d.format("%Y-%m-%d").to_string());
++    assert_eq!(p.last_update(), Some(d));
++    p.as_deb822_mut().remove("Origin");
++    assert_eq!(p.origin(), None);
++    let again = lossless::PatchHeader::from_str(&p.to_string()).unwrap();
++    assert_eq!(again.forwarded(), Some(fw));
++    assert_eq!(again.last_update(), Some(d));
++    assert_eq!(again.origin(), None);
++    assert_eq!(again.description(), Some(h.synopsis.clone()));
++    assert_eq!(again.to_string(), p.to_string());
++}
++
++// ---------------------------------------------------------------------------
++// Pins
++// ---------------------------------------------------------------------------
++
++/// DEP-3's first sample: a `git format-patch` file. The header ends at the
++/// first empty line, the commit body follows, then the pseudo-header, then `---`.
++const GIT_SAMPLE: &str = "From d33286c75b623cfb249c627b0c348be62e6377c9 Mon Sep 17 00:00:00 2001
++From: Jaap Karssenberg <jaap.karssenberg@gmail.com>
++Date: Tue, 11 Feb 2025 21:28:17 +0100
++Subject: [PATCH] Fixup focus of quicknote plugin
++
++Fixes #2764
++
++Origin: upstream, https://github.com/zim-desktop-wiki/zim-desktop-wiki/commit/d33286c75b623cfb249c627b0c348be62e6377c9.patch
++Bug: https://github.com/zim-desktop-wiki/zim-desktop-wiki/issues/2764
++Bug-Debian: https://bugs.debian.org/1110423
++----
++ zim/plugins/quicknote.py | 4 ++++
++ 1 file changed, 4 insertions(+)
++";
++
++#[test]
++fn a_git_format_patch_header_is_read() {
++    let (p, _) = lossless::PatchHeader::parse_relaxed(GIT_SAMPLE).expect("DEP-3's own sample parses");
++    assert_eq!(p.description(), Some("[PATCH] Fixup focus of quicknote plugin".to_string()));
++    assert_eq!(p.author(), Some("Jaap Karssenberg <jaap.karssenberg@gmail.com>".to_string()));
++    assert_eq!(p.vendor_bugs("Debian").collect::<Vec<_>>(), vec!["https://bugs.debian.org/1110423".to_string()]);
++}
++
++#[test]
++fn a_pseudo_header_after_the_body_is_read() {
++    // Without the mbox `From ` line: the commit body and the pseudo-header.
++    let text = "From: A <a@example.com>\nSubject: fix\n\nSome explanation.\n\nOrigin: vendor, https://bugs.debian.org/1\nForwarded: not-needed\n---\n a | 1\n";
++    let (p, _) = lossless::PatchHeader::parse_relaxed(text).expect("parses");
++    assert_eq!(p.forwarded(), Some(Forwarded::NotNeeded), "the pseudo-header's fields are read: {}", p.to_string());
++    assert!(p.origin().is_some());
++    let end = dep3::header_end(text);
++    let l = lossy::PatchHeader::from_str(&text[..end]).expect("lossy parses");
++    assert_eq!(l.forwarded, Some(Forwarded::NotNeeded));
++}
++
++#[test]
++fn a_second_paragraph_is_not_silently_dropped() {
++    // Even in deb822 form: a blank line followed by more fields.
++    let text = "Description: fix\n\nForwarded: no\n";
++    let (p, _) = lossless::PatchHeader::parse_relaxed(text).unwrap();
++    assert_eq!(p.forwarded(), Some(Forwarded::No), "{}", p.to_string());
++}
++
++#[test]
++fn setters_replace_an_existing_field() {
++    let mut p = lossless::PatchHeader::from_str("From: A <a@x>\nSubject: s\nForwarded: no\nLast-Update: 2020-01-01\n").unwrap();
++    p.set_author("B <b@x>");
++    assert_eq!(p.author(), Some("B <b@x>".to_string()), "{}", p.to_string());
++    p.set_forwarded(Forwarded::NotNeeded);
++    assert_eq!(p.forwarded(), Some(Forwarded::NotNeeded), "{}", p.to_string());
++    let d = chrono::NaiveDate::from_ymd_opt(2021, 2, 3).unwrap();
++    p.set_last_update(d);
++    assert_eq!(p.last_update(), Some(d), "{}", p.to_string());
++    assert_eq!(p.as_deb822().get_all("Forwarded").count(), 1, "one Forwarded field: {}", p.to_string());
++}
++
++#[test]
++fn set_description_works_without_a_long_description() {
++    for text in ["Subject: old\nFrom: A <a@x>\n", "Description: old\n"] {
++        let mut p = lossless::PatchHeader::from_str(text).unwrap();
++        p.set_description("new");
++        assert_eq!(p.description(), Some("new".to_string()));
++        let again = lossless::PatchHeader::from_str(&p.to_string()).unwrap();
++        assert_eq!(again.description(), Some("new".to_string()));
++    }
++}
++
++#[test]
++fn a_set_description_reads_the_same_live_and_after_a_reparse() {
++    // The encoded ` .` marker is indented once more by `insert`, so the live
++    // tree reads ` .` where the re-parsed text reads `.`.
++    let mut p = lossless::PatchHeader::new();
++    p.set_description("Fix frobnication\n\nDetails follow.");
++    let text = p.to_string();
++    let again = lossless::PatchHeader::from_str(&text).unwrap();
++    assert_eq!(p.long_description(), again.long_description(), "{text:?}");
++    assert_eq!(p.as_deb822().get("Description"), again.as_deb822().get("Description"), "{text:?}");
++}
++
++#[test]
++fn the_layers_agree_on_the_long_description() {
++    for (text, want) in [
++        ("Description: fix\n", None),
++        ("Description: fix\n long\n .\n more\n", Some("long\n\nmore".to_string())),
++    ] {
++        let p = lossless::PatchHeader::from_str(text).unwrap();
++        let l = lossy::PatchHeader::from_str(text).unwrap();
++        assert_eq!(l.long_description(), want);
++        assert_eq!(p.long_description(), want, "{text:?}");
++    }
++}
++
++#[test]
++fn acked_by_counts_as_a_review() {
++    let text = "Description: fix\nAcked-by: T <t@x>\n";
++    let p = lossless::PatchHeader::from_str(text).unwrap();
++    assert_eq!(p.reviewed_by(), vec!["T <t@x>".to_string()]);
++    let l = lossy::PatchHeader::from_str(text).unwrap();
++    assert_eq!(l.reviewed_by, Some("T <t@x>".to_string()));
++}
++
++#[test]
++fn the_lossy_header_keeps_repeated_and_vendor_bug_fields() {
++    let text = "Description: fix\nBug-Debian: https://bugs.debian.org/1\nBug-Debian: https://bugs.debian.org/2\nBug-Ubuntu: https://launchpad.net/bugs/3\nReviewed-by: R <r@x>\nReviewed-by: S <s@x>\n";
++    let l = lossy::PatchHeader::from_str(text).unwrap();
++    let shown = l.to_string();
++    let p = lossless::PatchHeader::from_str(&shown).unwrap();
++    assert_eq!(p.bugs().count(), 3, "{shown:?}");
++    assert_eq!(p.reviewed_by().len(), 2, "{shown:?}");
++}
