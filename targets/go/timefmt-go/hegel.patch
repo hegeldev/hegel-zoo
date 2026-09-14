@@ -1,0 +1,761 @@
+diff --git a/go.mod b/go.mod
+index 72cc4de..1c47ec6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/itchyny/timefmt-go
+ 
+-go 1.24
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..eb09233
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,739 @@
++// Hegel property tests for github.com/itchyny/timefmt-go, with glibc's strftime/strptime
++// (reached through Python's ctypes, one child process held open) as the oracle, plus a few
++// models for the GNU-date extensions glibc 2.39 lacks (`%:z`, `%::z`, `%:::z`) and Python's
++// `%f`, and Format/Parse round trips.
++package timefmt_test
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"reflect"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	. "github.com/itchyny/timefmt-go"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---- the oracle: glibc through ctypes ------------------------------------------------------
++
++const glibcScript = `
++import sys, json, ctypes, ctypes.util, os
++os.environ['TZ'] = 'UTC'
++libc = ctypes.CDLL(ctypes.util.find_library('c'))
++libc.tzset()
++class TM(ctypes.Structure):
++    _fields_ = [('tm_sec', ctypes.c_int), ('tm_min', ctypes.c_int), ('tm_hour', ctypes.c_int),
++                ('tm_mday', ctypes.c_int), ('tm_mon', ctypes.c_int), ('tm_year', ctypes.c_int),
++                ('tm_wday', ctypes.c_int), ('tm_yday', ctypes.c_int), ('tm_isdst', ctypes.c_int),
++                ('tm_gmtoff', ctypes.c_long), ('tm_zone', ctypes.c_char_p)]
++libc.strftime.restype = ctypes.c_size_t
++libc.strftime.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.POINTER(TM)]
++libc.strptime.restype = ctypes.c_void_p
++libc.strptime.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(TM)]
++def fields(tm):
++    return {'year': tm.tm_year + 1900, 'mon': tm.tm_mon + 1, 'mday': tm.tm_mday, 'hour': tm.tm_hour,
++            'min': tm.tm_min, 'sec': tm.tm_sec, 'wday': tm.tm_wday, 'yday': tm.tm_yday, 'gmtoff': tm.tm_gmtoff}
++for line in sys.stdin:
++    req = json.loads(line)
++    if req['op'] == 'strftime':
++        t = req['tm']
++        tm = TM(t['sec'], t['min'], t['hour'], t['mday'], t['mon'] - 1, t['year'] - 1900,
++                t['wday'], t['yday'], 0, t['gmtoff'], t['zone'].encode())
++        buf = ctypes.create_string_buffer(16384)
++        k = libc.strftime(buf, 16384, req['fmt'].encode(), ctypes.byref(tm))
++        res = {'out': buf.raw[:k].decode('utf-8', 'replace')}
++    else:
++        tm = TM(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, None)
++        src = req['src'].encode()
++        srcbuf = ctypes.create_string_buffer(src)
++        ret = libc.strptime(ctypes.addressof(srcbuf), req['fmt'].encode(), ctypes.byref(tm))
++        if ret is None:
++            res = {'ok': False}
++        else:
++            res = {'ok': True, 'rest': len(src) - (ret - ctypes.addressof(srcbuf)), 'tm': fields(tm)}
++    sys.stdout.write(json.dumps(res) + '\n')
++    sys.stdout.flush()
++`
++
++type tmFields struct {
++	Year   int    `json:"year"`
++	Mon    int    `json:"mon"`
++	Mday   int    `json:"mday"`
++	Hour   int    `json:"hour"`
++	Min    int    `json:"min"`
++	Sec    int    `json:"sec"`
++	Wday   int    `json:"wday"`
++	Yday   int    `json:"yday"`
++	Gmtoff int    `json:"gmtoff"`
++	Zone   string `json:"zone"`
++}
++
++func tmOf(t time.Time) tmFields {
++	year, mon, day := t.Date()
++	h, m, s := t.Clock()
++	name, off := t.Zone()
++	return tmFields{year, int(mon), day, h, m, s, int(t.Weekday()), t.YearDay() - 1, off, name}
++}
++
++type glibc struct {
++	mu  sync.Mutex
++	cmd *exec.Cmd
++	in  *bufio.Writer
++	out *bufio.Scanner
++}
++
++var (
++	glibcOnce  sync.Once
++	glibcChild *glibc
++	glibcErr   error
++)
++
++func oracle(t *testing.T) *glibc {
++	glibcOnce.Do(func() {
++		cmd := exec.Command("python3", "-c", glibcScript)
++		cmd.Stderr = os.Stderr
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			glibcErr = err
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			glibcErr = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			glibcErr = err
++			return
++		}
++		sc := bufio.NewScanner(stdout)
++		sc.Buffer(make([]byte, 1<<16), 1<<22)
++		glibcChild = &glibc{cmd: cmd, in: bufio.NewWriter(stdin), out: sc}
++	})
++	if glibcErr != nil {
++		t.Fatalf("cannot start the glibc oracle: %v", glibcErr)
++	}
++	return glibcChild
++}
++
++func (g *glibc) call(req any, res any) error {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	b, err := json.Marshal(req)
++	if err != nil {
++		return err
++	}
++	if _, err := g.in.Write(append(b, '\n')); err != nil {
++		return err
++	}
++	if err := g.in.Flush(); err != nil {
++		return err
++	}
++	if !g.out.Scan() {
++		return fmt.Errorf("oracle died: %v", g.out.Err())
++	}
++	return json.Unmarshal(g.out.Bytes(), res)
++}
++
++func (g *glibc) strftime(t time.Time, format string) (string, error) {
++	var res struct {
++		Out string `json:"out"`
++	}
++	err := g.call(map[string]any{"op": "strftime", "fmt": format, "tm": tmOf(t)}, &res)
++	return res.Out, err
++}
++
++type strptimeResult struct {
++	OK   bool     `json:"ok"`
++	Rest int      `json:"rest"`
++	TM   tmFields `json:"tm"`
++}
++
++func (g *glibc) strptime(source, format string) (strptimeResult, error) {
++	var res strptimeResult
++	err := g.call(map[string]any{"op": "strptime", "src": source, "fmt": format}, &res)
++	return res, err
++}
++
++// ---- generators ----------------------------------------------------------------------------
++
++type zone struct {
++	name string
++	off  int
++}
++
++// Named fixed zones (glibc prints tm_zone for %Z and tm_gmtoff for %z; an empty name makes
++// glibc fall back to the TZ name where timefmt prints the offset, so names are never empty).
++var zones = []zone{
++	{"UTC", 0}, {"GMT", 0}, {"JST", 9 * 3600}, {"EST", -5 * 3600}, {"NPT", 5*3600 + 45*60},
++	{"HAST", -(10*3600 + 30*60)}, {"ABC", 3723}, {"XYZ", -(9*3600 + 62)}, {"LMT", -37*60 - 24},
++	{"ACWST", 8*3600 + 45*60}, {"NST", -(3*3600 + 30*60)}, {"Q", 3600},
++}
++
++func genZone(tc hegel.TestCase) *time.Location {
++	z := pick(tc, zones)
++	if z.name == "UTC" && z.off == 0 && chance(tc, 50) {
++		return time.UTC
++	}
++	return time.FixedZone(z.name, z.off)
++}
++
++// genTime draws a time in loc with the year in [ylo, yhi]; nanoseconds are 0, whole
++// microseconds or arbitrary.
++func genTime(tc hegel.TestCase, ylo, yhi int, loc *time.Location) time.Time {
++	var year, month, day int
++	switch pick(tc, []string{"any", "any", "yearend", "leap", "fixed"}) {
++	case "yearend":
++		year = n(tc, ylo, yhi)
++		if chance(tc, 50) {
++			month, day = 12, n(tc, 26, 31)
++		} else {
++			month, day = 1, n(tc, 1, 7)
++		}
++	case "leap":
++		year = 4 * n(tc, (ylo+3)/4, yhi/4)
++		month, day = 2, n(tc, 27, 29)
++		if chance(tc, 30) {
++			month, day = 3, 1
++		}
++	case "fixed":
++		year, month, day = pick(tc, []int{ylo, yhi, 1970, 2000, 1900, 2038, 1999, 2020}), pick(tc, []int{1, 6, 12}), pick(tc, []int{1, 15, 28, 31})
++		if year < ylo || year > yhi {
++			year = ylo
++		}
++	default:
++		year, month, day = n(tc, ylo, yhi), n(tc, 1, 12), n(tc, 1, 31)
++	}
++	h, m, s := n(tc, 0, 23), n(tc, 0, 59), n(tc, 0, 59)
++	if chance(tc, 20) {
++		h = pick(tc, []int{0, 11, 12, 13, 23})
++	}
++	ns := 0
++	switch n(tc, 1, 3) {
++	case 1:
++		ns = n(tc, 0, 999999) * 1000
++	case 2:
++		ns = n(tc, 0, 999999999)
++	}
++	t := time.Date(year, time.Month(month), day, h, m, s, ns, loc)
++	if t.Year() > yhi { // day overflow past December
++		t = t.AddDate(0, 0, -7)
++	}
++	return t
++}
++
++// Directives glibc 2.39 and timefmt share when printing (no %f, %v, %+, %:z; %E/%O modifiers
++// are glibc's, timefmt prints them literally).
++var sharedFormatDirectives = []byte("YyCGgmBbhAawuVUWedjkHlIpMSsZztn%cDxTXRrFP")
++
++// Unknown directives: both print them literally, padded to the width (no lowercase letters:
++// glibc upper-cases the unknown letter under ^).
++var unknownDirectives = []byte("Q!.[]")
++
++var literalRunes = []rune("abcxyz XYZ -_/:.,;'()[] éü日")
++
++// genDirective builds one %-sequence. glibc's %z treats width strangely and ignores ^/# on
++// %P, so those combinations stay out.
++func genDirective(tc hegel.TestCase, directives []byte) string {
++	var sb strings.Builder
++	sb.WriteByte('%')
++	d := pick(tc, directives)
++	flags := ""
++	width := ""
++	if d != 'z' && chance(tc, 40) {
++		flags = pick(tc, []string{"-", "_", "0", "^", "#", "-", "_", "^#", "0^", "_#", "-^", "00", "--"})
++		if d == 'P' {
++			flags = pick(tc, []string{"-", "_", "0"})
++		}
++		if d == 'Z' {
++			flags = pick(tc, []string{"^", "#", "^#"})
++		}
++	}
++	// `-` with a width below the directive's default width is timefmt-go/1.
++	minusSmall := strings.Contains(flags, "-") && !strings.Contains(flags, "_") && !strings.Contains(flags, "0")
++	// No width on the composites (%c %D %x %T %X %R %r %F): timefmt drops it by design
++	// (asserted by its own tests) where glibc pads the whole expansion (except %c).
++	if d != 'z' && d != 'Z' && !strings.ContainsRune("cDxTXRrF", rune(d)) && chance(tc, 35) {
++		switch n(tc, 1, 10) {
++		case 1:
++			width = strconv.Itoa(n(tc, 100, 1024))
++		case 2:
++			width = "0" + strconv.Itoa(n(tc, 1, 9))
++		default:
++			width = strconv.Itoa(n(tc, 1, 12))
++		}
++		if minusSmall && len(width) == 1 && width < "4" {
++			width = "4"
++		}
++	}
++	sb.WriteString(flags)
++	sb.WriteString(width)
++	sb.WriteByte(d)
++	return sb.String()
++}
++
++func genLiteral(tc hegel.TestCase) string {
++	var sb strings.Builder
++	for i, k := 0, n(tc, 1, 4); i < k; i++ {
++		sb.WriteRune(pick(tc, literalRunes))
++	}
++	return sb.String()
++}
++
++// genFormat builds a strftime format from shared directives, unknown directives and literal
++// text, sometimes ending in an unfinished sequence.
++func genFormat(tc hegel.TestCase) string {
++	var sb strings.Builder
++	for i, k := 0, n(tc, 0, 7); i < k; i++ {
++		switch n(tc, 1, 10) {
++		case 1, 2, 3:
++			sb.WriteString(genLiteral(tc))
++		case 4:
++			sb.WriteString(genDirective(tc, unknownDirectives))
++		default:
++			sb.WriteString(genDirective(tc, sharedFormatDirectives))
++		}
++	}
++	if chance(tc, 10) {
++		sb.WriteString(pick(tc, []string{"%", "%5", "%-", "%_3", "%0", "%^", "%#", "%12"}))
++	}
++	return sb.String()
++}
++
++// ---- properties: formatting ---------------------------------------------------------------
++
++// TestHegelFormatAgreesWithGlibc: on the directives both know (every strftime directive but
++// %f/%v/%+ and the colon forms of %z, with the -, _, 0, ^, # flags and widths up to 1024,
++// unknown directives and unfinished sequences), Format prints what glibc's strftime prints for
++// the same broken-down time, for years 1000–9999 in any fixed zone; AppendFormat appends the
++// same text to a non-empty buffer.
++func TestHegelFormatAgreesWithGlibc(t *testing.T) {
++	g := oracle(t)
++	property(t, func(ht *hegel.T) {
++		tm := genTime(ht, 1000, 9999, genZone(ht))
++		format := genFormat(ht)
++		if strings.Contains(format, "s") {
++			// glibc's %s runs mktime on the broken-down fields in TZ (UTC here) and ignores
++			// tm_gmtoff, and zero-pads a negative value in front of its sign (`%020s` →
++			// `00000000-30610224000`), so %s is compared on UTC times from 1970 on.
++			tm = tm.UTC()
++			if tm.Year() < 1970 {
++				tm = tm.AddDate(1970-tm.Year()+n(ht, 0, 60), 0, 0)
++			}
++		}
++		note(ht, "time %s (%s) format %q", tm.Format(time.RFC3339Nano), tm.Location(), format)
++		want, err := g.strftime(tm, format)
++		if err != nil {
++			ht.Fatalf("oracle: %v", err)
++		}
++		got := Format(tm, format)
++		if got != want {
++			ht.Fatalf("Format(%s, %q) = %q, glibc gives %q", tm.Format(time.RFC3339), format, got, want)
++		}
++		prefix := []byte(genLiteral(ht))
++		if app := AppendFormat(append([]byte{}, prefix...), tm, format); string(app) != string(prefix)+got {
++			ht.Fatalf("AppendFormat(%q, …) = %q, want %q", prefix, app, string(prefix)+got)
++		}
++	})
++}
++
++// colonOffset is the model of the GNU date extensions %:z, %::z and %:::z.
++func colonOffset(off, colons int) string {
++	sign := "+"
++	if off < 0 {
++		sign, off = "-", -off
++	}
++	h, m, s := off/3600, off/60%60, off%60
++	switch colons {
++	case 1:
++		return fmt.Sprintf("%s%02d:%02d", sign, h, m)
++	case 2:
++		return fmt.Sprintf("%s%02d:%02d:%02d", sign, h, m, s)
++	default:
++		out := fmt.Sprintf("%s%02d", sign, h)
++		if m != 0 || s != 0 {
++			out += fmt.Sprintf(":%02d", m)
++		}
++		if s != 0 {
++			out += fmt.Sprintf(":%02d", s)
++		}
++		return out
++	}
++}
++
++// TestHegelExtensionsMatchTheirModels: %:z, %::z, %:::z follow GNU date's rules (hh:mm,
++// hh:mm:ss, and the shortest of hh / hh:mm / hh:mm:ss that loses nothing), %::::z is printed
++// literally, %f is the six-digit microsecond, %v is %e-%b-%Y and %+ is %a %b %e %H:%M:%S %Z %Y,
++// and the composites %c %D %x %T %X %R %r %F expand as documented.
++func TestHegelExtensionsMatchTheirModels(t *testing.T) {
++	composites := map[string]string{
++		"%c": "%a %b %e %H:%M:%S %Y", "%D": "%m/%d/%y", "%x": "%m/%d/%y", "%T": "%H:%M:%S",
++		"%X": "%H:%M:%S", "%R": "%H:%M", "%r": "%I:%M:%S %p", "%F": "%Y-%m-%d",
++		"%v": "%e-%b-%Y", "%+": "%a %b %e %H:%M:%S %Z %Y",
++	}
++	keys := make([]string, 0, len(composites))
++	for k := range composites {
++		keys = append(keys, k)
++	}
++	property(t, func(ht *hegel.T) {
++		tm := genTime(ht, 0, 9999, genZone(ht))
++		_, off := tm.Zone()
++		note(ht, "time %s (%s)", tm.Format(time.RFC3339Nano), tm.Location())
++		for colons := 1; colons <= 3; colons++ {
++			format := "%" + strings.Repeat(":", colons) + "z"
++			if got, want := Format(tm, format), colonOffset(off, colons); got != want {
++				ht.Fatalf("Format(%s, %q) = %q, want %q", tm.Format(time.RFC3339), format, got, want)
++			}
++		}
++		if got := Format(tm, "%::::z"); got != "%::::z" {
++			ht.Fatalf("Format(…, %%::::z) = %q, want the literal text", got)
++		}
++		if got, want := Format(tm, "%f"), fmt.Sprintf("%06d", tm.Nanosecond()/1000); got != want {
++			ht.Fatalf("Format(%s, %%f) = %q, want %q", tm.Format(time.RFC3339Nano), got, want)
++		}
++		k := pick(ht, keys)
++		if got, want := Format(tm, k), Format(tm, composites[k]); got != want {
++			ht.Fatalf("Format(%s, %q) = %q, but %q gives %q", tm.Format(time.RFC3339), k, got, composites[k], want)
++		}
++	})
++}
++
++// ---- properties: parsing -------------------------------------------------------------------
++
++// Directives glibc's strptime and timefmt's Parse share on sources produced by Format (no
++// %G/%V/%g — glibc parses but ignores them; no %Z — glibc skips any word; no %P, %f, %:z;
++// %p only next to a 12-hour hour and %U/%W only with a weekday — glibc lets a lone %p or
++// week number do nothing, timefmt applies them to the defaults, as its tests assert).
++var sharedParseDirectives = []string{"%Y", "%y", "%C%y", "%m", "%B", "%b", "%h", "%d", "%e", "%Y %j", "%j/%Y", "%H", "%k", "%M", "%S", "%I %p", "%l %p", "%I%p", "%a", "%A", "%w", "%u", "%U %a", "%W %a", "%a %U", "%U %w", "%W %u", "%s", "%z", "%c", "%D", "%x", "%T", "%X", "%R", "%r", "%F", "%n", "%t", "%%"}
++
++var parseSeparators = []string{" ", "-", "/", ":", ".", ", ", "T", " at ", "_", "|"}
++
++func isNumericByte(b byte) bool {
++	return strings.IndexByte("YyCmdejHkMSIlwuUWsDxTXRFrc", b) >= 0
++}
++
++// startsNumeric/endsNumeric say whether a pool entry begins/ends with a directive that reads
++// digits (glibc reads them bounded-greedily, timefmt fixed-width — adjacent digit runs would
++// split differently).
++func startsNumeric(d string) bool { return isNumericByte(d[1]) }
++func endsNumeric(d string) bool   { return isNumericByte(d[len(d)-1]) }
++
++// Week formats for the glibc differential: a week number is only combined with a year and a
++// weekday (glibc mixes %U/%W with %d/%m/%j in its own way).
++var weekFormats = []string{"%Y %U %a", "%a %U %Y", "%Y-W%W-%u", "%W %a", "%U %w %Y", "%Y %W %A", "%A/%U/%Y", "%Y %U %a %H:%M"}
++
++// genParseFormat joins directives from the pool with separators, never putting two numeric
++// directives back to back and never putting anything blank after %n/%t.
++func genParseFormat(tc hegel.TestCase, pool []string) string {
++	var sb strings.Builder
++	prevNumeric := false
++	for i, k := 0, n(tc, 1, 5); i < k; i++ {
++		d := pick(tc, pool)
++		prev := sb.String()
++		afterBlank := strings.HasSuffix(prev, "%n") || strings.HasSuffix(prev, "%t")
++		if i > 0 && (prevNumeric && startsNumeric(d) || afterBlank || chance(tc, 70)) {
++			sep := pick(tc, parseSeparators)
++			if sep == "T" && (strings.HasSuffix(prev, "%a") || strings.HasSuffix(prev, "%A")) {
++				sep = " "
++			}
++			if afterBlank {
++				// %n/%t swallow every blank in timefmt, and glibc's literal blank then matches
++				// nothing; keep a non-blank separator after them.
++				sep = "-"
++			}
++			sb.WriteString(sep)
++		}
++		sb.WriteString(d)
++		prevNumeric = endsNumeric(d)
++	}
++	format := sb.String()
++	if strings.Contains(format, "%U") || strings.Contains(format, "%W") {
++		format = pick(tc, weekFormats)
++	}
++	if strings.Contains(format, "%j") && strings.ContainsAny(strings.ReplaceAll(format, "%j", ""), "demBbhDFxcs") {
++		// %j next to a month or day directive is timefmt-go/2 (the ordinal is ignored).
++		format = pick(tc, []string{"%Y %j", "%j/%Y", "%Y-%j %H:%M", "%j %Y %a"})
++	}
++	if strings.Contains(format, "%s") {
++		// glibc applies %p's PM on top of the hour %s already set (12 PM + %s → hour 24), so
++		// a Unix time is combined with nothing that re-reads a field.
++		format = pick(tc, []string{"%s", "%s %z", "x%sy", "%s %a", "%A %s", "%s %n%%"})
++	}
++	if strings.Contains(format, "%C") {
++		// A century next to a second year directive is contradictory input (glibc combines
++		// them as (century-19)*100 + year%100 on the already-set year; timefmt keeps %Y).
++		format = pick(tc, centuryFormats)
++	}
++	return format
++}
++
++var centuryFormats = []string{"%C%y-%m-%d", "%C%y", "%d/%m/%C%y", "%C%y %H:%M", "%C %y", "%C-%m", "%C%y %j"}
++
++// TestHegelParseAgreesWithGlibc: for a time formatted by Format with a format from the shared
++// pool, Parse and glibc's strptime accept the same sources and read the same broken-down time
++// (year, month, day, clock, weekday, and the offset when %z is present), including the dates
++// glibc derives from %j or from %U/%W with a weekday.
++func TestHegelParseAgreesWithGlibc(t *testing.T) {
++	g := oracle(t)
++	property(t, func(ht *hegel.T) {
++		// Years from 1: glibc's day_of_the_week truncates the leap correction toward zero
++		// and gets year 0 wrong when it derives a date from a week number.
++		tm := genTime(ht, 1, 9999, genZone(ht))
++		format := genParseFormat(ht, sharedParseDirectives)
++		if strings.ContainsAny(format, "yDx") && !strings.Contains(format, "%C") {
++			// Two-digit years read as 1969–2068.
++			tm = time.Date(1969+n(ht, 0, 99), tm.Month(), tm.Day(), tm.Hour(), tm.Minute(), tm.Second(), 0, tm.Location())
++		}
++		if strings.Contains(format, "%s") {
++			// glibc's %s takes no sign (timefmt reads negative Unix times) and converts in
++			// TZ=UTC, so Unix times are compared on UTC times from 1970 on.
++			tm = tm.UTC()
++			if tm.Year() < 1970 {
++				tm = tm.AddDate(1970-tm.Year()+n(ht, 0, 60), 0, 0)
++			}
++		}
++		for (strings.Contains(format, "%U") && Format(tm, "%U") == "00") || (strings.Contains(format, "%W") && Format(tm, "%W") == "00") {
++			// glibc's week arithmetic gives negative days for week 0; timefmt's week 0 is
++			// checked by the round trip.
++			tm = tm.AddDate(0, 0, 7)
++		}
++		source := Format(tm, format)
++		note(ht, "time %s format %q source %q", tm.Format(time.RFC3339), format, source)
++		want, err := g.strptime(source, format)
++		if err != nil {
++			ht.Fatalf("oracle: %v", err)
++		}
++		got, gotErr := Parse(source, format)
++		if !want.OK || want.Rest != 0 {
++			if gotErr == nil {
++				ht.Fatalf("Parse(%q, %q) = %s, glibc rejects the source (ok %v, %d bytes left)", source, format, got, want.OK, want.Rest)
++			}
++			return
++		}
++		if gotErr != nil {
++			ht.Fatalf("Parse(%q, %q) = %v, glibc accepts it (%+v)", source, format, gotErr, want.TM)
++		}
++		gotTM := tmOf(got)
++		hasZ := strings.Contains(format, "%z")
++		// glibc leaves the fields it derives from a week number un-normalised (December 32nd,
++		// or month -1 / day -1 for week 0), but its tm_yday is right, so the date is rebuilt
++		// from year and yday. tm_wday is not compared: a weekday without a date sets glibc's
++		// tm_wday but cannot move timefmt's time.Time; with %U/%W it determines the date,
++		// which is compared.
++		w := want.TM
++		wantTM := tmOf(time.Date(w.Year, time.January, 1+w.Yday, w.Hour, w.Min, w.Sec, 0, time.UTC))
++		mismatch := gotTM.Year != wantTM.Year || gotTM.Mon != wantTM.Mon || gotTM.Mday != wantTM.Mday ||
++			gotTM.Hour != wantTM.Hour || gotTM.Min != wantTM.Min || gotTM.Sec != wantTM.Sec ||
++			(hasZ && gotTM.Gmtoff != w.Gmtoff)
++		if mismatch {
++			ht.Fatalf("Parse(%q, %q) = %s → %+v, glibc reads %+v", source, format, got.Format(time.RFC3339), gotTM, want.TM)
++		}
++	})
++}
++
++// A date part, a time part and a zone part that together determine the time.
++var dateParts = []string{"%Y-%m-%d", "%Y/%m/%d", "%F", "%Y %j", "%G-W%V-%u", "%G %V %a", "%G %V %A", "%Y %U %w", "%Y %W %a", "%Y %U %A", "%C%y%m%d", "%Y%m%d", "%d %B %Y", "%e %b %Y", "%m/%d/%Y", "%A, %d %b %Y", "%Y-%j", "%D", "%x", "%y-%m-%d", "%s", "%c"}
++var timeParts = []string{"%H:%M:%S", "%T", "%X", "%I:%M:%S %p", "%l:%M:%S %P", "%r", "%H:%M", "%R", "%k:%M:%S", "%H%M%S", "%I%M%S%p", "", "%H:%M:%S.%f", "%T.%f", "%H:%M:%S%f"}
++var zoneParts = []string{"", "%z", "%:z", "%::z", "%:::z", "%z", ""}
++
++// TestHegelParseInvertsFormat: Parse(Format(t, f), f) gives back t for every format that
++// carries a complete date (calendar, ordinal, ISO week, Sunday/Monday week or Unix time), a
++// clock (with or without seconds, 12- or 24-hour) and possibly a zone offset and microseconds,
++// up to what the format keeps: seconds and sub-second digits it lacks are zero, the location
++// is UTC unless the format has %z, and %z rounds the offset down to the minute.
++func TestHegelParseInvertsFormat(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		date, clock, zon := pick(ht, dateParts), pick(ht, timeParts), pick(ht, zoneParts)
++		if strings.Contains(date, "%c") {
++			clock = ""
++		}
++		loc := genZone(ht)
++		ylo, yhi := 0, 9999
++		if strings.ContainsAny(date, "yDx") && !strings.Contains(date, "%C") {
++			ylo, yhi = 1969, 2068 // two-digit years (%y, %D, %x)
++		}
++		tm := genTime(ht, ylo, yhi, loc)
++		if date == "%s" {
++			tm = tm.UTC()
++		}
++		sep := pick(ht, []string{" ", "T", " / ", "  "})
++		format := date
++		if clock != "" {
++			format += sep + clock
++		}
++		if zon != "" {
++			format += pick(ht, []string{" ", ""}) + zon
++		}
++		source := Format(tm, format)
++		note(ht, "time %s (%s) format %q source %q", tm.Format(time.RFC3339Nano), tm.Location(), format, source)
++
++		// The expected time: t truncated to what the format carries.
++		y, mo, d := tm.Date()
++		h, mi, s := tm.Clock()
++		ns := 0
++		if strings.Contains(clock, "%f") {
++			ns = tm.Nanosecond() / 1000 * 1000
++		}
++		if clock == "" && !strings.Contains(date, "%c") && date != "%s" {
++			h, mi, s = 0, 0, 0
++		} else if !strings.Contains(clock, "%S") && !strings.Contains(clock, "%T") && !strings.Contains(clock, "%X") && !strings.Contains(clock, "%r") && clock != "" {
++			s = 0
++		}
++		_, off := tm.Zone()
++		wantLoc := time.UTC
++		switch zon {
++		case "%z", "%:z":
++			off = off / 60 * 60
++			if off < 0 && tm.Location() != time.UTC {
++				// -09:01:02 prints as -0901: the truncation is toward zero on the magnitude.
++				_, o := tm.Zone()
++				off = -(-o / 60 * 60)
++			}
++			wantLoc = time.FixedZone("", off)
++		case "%::z", "%:::z":
++			wantLoc = time.FixedZone("", off)
++		}
++		var want time.Time
++		if date == "%s" {
++			want = time.Unix(tm.Unix(), int64(ns)).In(wantLoc)
++		} else {
++			want = time.Date(y, mo, d, h, mi, s, ns, wantLoc)
++		}
++		got, err := Parse(source, format)
++		if err != nil {
++			ht.Fatalf("Parse(%q, %q) = %v, want %s", source, format, err, want.Format(time.RFC3339Nano))
++		}
++		_, gotOff := got.Zone()
++		_, wantOff := want.Zone()
++		if !got.Equal(want) || gotOff != wantOff {
++			ht.Fatalf("Parse(%q, %q) = %s (offset %d), want %s (offset %d)", source, format, got.Format(time.RFC3339Nano), gotOff, want.Format(time.RFC3339Nano), wantOff)
++		}
++	})
++}
++
++// ---- pinned bugs ---------------------------------------------------------------------------
++
++// timefmt-go/1: `-` followed by a width smaller than the directive's default width pads with
++// spaces to the default (`%-1m` → " 7") where the flag asks for no padding (glibc: "7").
++func TestHegelMinusFlagWithSmallWidthDoesNotPad(t *testing.T) {
++	tm := time.Date(2020, time.July, 4, 9, 7, 5, 0, time.UTC)
++	cases := [][2]string{{"%-1m", "7"}, {"%-1H", "9"}, {"%-1S", "5"}, {"%-1d", "4"}, {"%-1M", "7"}, {"%-1I", "9"}}
++	property(t, func(ht *hegel.T) {
++		c := pick(ht, cases)
++		if got := Format(tm, c[0]); got != c[1] {
++			ht.Fatalf("Format(%s, %q) = %q, want %q", tm.Format(time.RFC3339), c[0], got, c[1])
++		}
++	})
++}
++
++// timefmt-go/2: %j is ignored as soon as a month or day directive is present, so consistent
++// input such as "29 2020 060" with "%d %Y %j" gives January 29th instead of February 29th
++// (glibc and Python derive the month and day from the ordinal).
++func TestHegelOrdinalDayWinsOverPartialDates(t *testing.T) {
++	cases := [][3]string{
++		{"29 2020 060", "%d %Y %j", "2020-02-29"},
++		{"01 0001 032", "%d %Y %j", "0001-02-01"},
++		{"02 2021 040", "%m %Y %j", "2021-02-09"},
++		{"2021-100 10", "%Y-%j %d", "2021-04-10"},
++	}
++	property(t, func(ht *hegel.T) {
++		c := pick(ht, cases)
++		got, err := Parse(c[0], c[1])
++		if err != nil {
++			ht.Fatalf("Parse(%q, %q) = %v, want %s", c[0], c[1], err, c[2])
++		}
++		if d := got.Format("2006-01-02"); d != c[2] {
++			ht.Fatalf("Parse(%q, %q) = %s, want %s", c[0], c[1], d, c[2])
++		}
++	})
++}
++
++// Out-of-range replacements for numeric directives: the parser documents these ranges.
++var outOfRange = map[string][]string{
++	"%m": {"00", "13", "99"}, "%d": {"00", "32", "40"}, "%e": {"00", "32", " 0"}, "%j": {"000", "367", "400"},
++	"%H": {"24", "25", "99"}, "%k": {"24", "99"}, "%M": {"60", "61", "99"}, "%S": {"61", "62", "99"},
++	"%I": {"00", "13", "99"}, "%l": {"00", "13", " 0"}, "%w": {"7", "8", "9"}, "%u": {"0", "8", "9"},
++	"%V": {"00", "54", "99"}, "%U": {"54", "99"}, "%W": {"54", "99"}, "%Y": {"10000", "-10000"}, "%C": {"-1"},
++	"%z": {"+24:00", "+2400", "+09:60", "+0960", "0900", "+9"}, "%p": {"XM", "A"}, "%b": {"Foo", "Ju"}, "%a": {"Xyz", "Mo"},
++}
++
++// TestHegelParseRejectsOutOfRangeFields: a directive fed a value outside its documented range
++// (month 13, day 32, hour 24, minute 60, second 61, yday 367, week 54, weekday 7 or 0/8 for
++// %u, offset +24:00, unknown names) makes Parse fail, whatever surrounds it.
++func TestHegelParseRejectsOutOfRangeFields(t *testing.T) {
++	keys := make([]string, 0, len(outOfRange))
++	for k := range outOfRange {
++		keys = append(keys, k)
++	}
++	property(t, func(ht *hegel.T) {
++		d := pick(ht, keys)
++		bad := pick(ht, outOfRange[d])
++		tm := genTime(ht, 1000, 9999, genZone(ht))
++		prefixF, suffixF := "", ""
++		if chance(ht, 60) {
++			prefixF = pick(ht, []string{"%Y-%m-%d ", "%H:%M ", "x", "%a, ", "%j/"})
++			if strings.Contains(prefixF, d) || (d == "%m" || d == "%d") && strings.Contains(prefixF, "%Y-%m-%d") || d == "%H" && strings.Contains(prefixF, "%H:%M") {
++				prefixF = "x"
++			}
++		}
++		if chance(ht, 60) {
++			suffixF = pick(ht, []string{" %H:%M:%S", "Z", " %Y", "/%b"})
++			if d == "%Y" && suffixF == " %Y" || strings.HasPrefix(d, "%H") && strings.Contains(suffixF, "%H") {
++				suffixF = "Z"
++			}
++		}
++		if d == "%Y" || d == "%G" {
++			prefixF = strings.ReplaceAll(prefixF, "%Y-%m-%d ", "%m-%d ")
++		}
++		format := prefixF + d + suffixF
++		source := Format(tm, prefixF) + bad + Format(tm, suffixF)
++		note(ht, "format %q source %q", format, source)
++		if got, err := Parse(source, format); err == nil {
++			ht.Fatalf("Parse(%q, %q) = %s, want an error (%s out of range)", source, format, got.Format(time.RFC3339), d)
++		}
++	})
++}
