@@ -1,0 +1,1399 @@
+diff --git a/go.mod b/go.mod
+index 2d915a4..80bfe91 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/bmatcuk/doublestar/v4
+ 
+-go 1.16
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..48e5da5
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1377 @@
++package doublestar_test
++
++// Hegel property tests for github.com/bmatcuk/doublestar/v4.
++//
++// Three oracles. (1) The standard library: Match is documented as a drop-in
++// replacement for path.Match, PathMatch for filepath.Match and Glob for
++// io/fs.Glob, so on the syntax they share (no alternatives, no `**` segment,
++// classes as path.Match accepts them) they must agree, match and error alike.
++// (2) A reference matcher written from the documented grammar: alternatives
++// are expanded, the pattern and the name are split on `/`, a `**` segment
++// matches zero or more name segments (and a pattern ending in `/**` or `/**/`
++// matches the directory itself), every other segment is matched by a
++// path.Match-style single-segment matcher with doublestar's class rules
++// (`!` or `^` negation, a `-` at either end of a class is literal). (3) bash
++// with globstar on a fixed directory tree, an independent check of the model
++// for Glob, with and without dotglob (WithNoHidden).
++//
++// Set DOUBLESTAR_COLLECT=1 to record mismatches instead of failing and print
++// them (shortest first) at the end of each test.
++
++import (
++	"fmt"
++	"io/fs"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode/utf8"
++
++	"github.com/bmatcuk/doublestar/v4"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Harness helpers.
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("DOUBLESTAR_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---------------------------------------------------------------------------
++// The reference matcher.
++
++var errBad = fmt.Errorf("bad pattern")
++
++// expandAlts returns every pattern obtained by choosing one alternative in
++// each {…} group (nested groups included); ok is false for an unclosed `{`.
++// An unmatched `}` is a literal, as Match treats it.
++func expandAlts(p string) ([]string, bool) {
++	for i := 0; i < len(p); i++ {
++		switch p[i] {
++		case '\\':
++			i++
++		case '{':
++			depth, start := 1, i+1
++			var alts []string
++			for j := i + 1; j < len(p); j++ {
++				switch p[j] {
++				case '\\':
++					j++
++				case '{':
++					depth++
++				case '}':
++					depth--
++					if depth == 0 {
++						alts = append(alts, p[start:j])
++						var out []string
++						for _, a := range alts {
++							sub, ok := expandAlts(p[:i] + a + p[j+1:])
++							if !ok {
++								return nil, false
++							}
++							out = append(out, sub...)
++						}
++						return out, true
++					}
++				case ',':
++					if depth == 1 {
++						alts = append(alts, p[start:j])
++						start = j + 1
++					}
++				}
++			}
++			return nil, false
++		}
++	}
++	return []string{p}, true
++}
++
++// matchSeg matches one path segment against one pattern segment (no `/`).
++func matchSeg(pat, name string) (bool, error) {
++	for len(pat) > 0 {
++		switch pat[0] {
++		case '*':
++			for len(pat) > 0 && pat[0] == '*' {
++				pat = pat[1:]
++			}
++			if len(pat) == 0 {
++				return true, nil
++			}
++			// try every split of the remaining name
++			for i := 0; i <= len(name); i++ {
++				if i > 0 && !utf8.RuneStart(name[i-1]) {
++					continue
++				}
++				ok, err := matchSeg(pat, name[i:])
++				if err != nil {
++					return false, err
++				}
++				if ok {
++					return true, nil
++				}
++			}
++			return false, nil
++		case '?':
++			if len(name) == 0 {
++				return false, validRest(pat)
++			}
++			_, sz := utf8.DecodeRuneInString(name)
++			pat, name = pat[1:], name[sz:]
++		case '[':
++			if len(name) == 0 {
++				return false, validRest(pat)
++			}
++			ok, rest, err := matchClass(pat, name)
++			if err != nil {
++				return false, err
++			}
++			if !ok {
++				return false, validRest(rest)
++			}
++			_, sz := utf8.DecodeRuneInString(name)
++			pat, name = rest, name[sz:]
++		case '\\':
++			if len(pat) == 1 {
++				return false, errBad
++			}
++			r, sz := utf8.DecodeRuneInString(pat[1:])
++			nr, nsz := utf8.DecodeRuneInString(name)
++			if len(name) == 0 || r != nr {
++				return false, validRest(pat[1+sz:])
++			}
++			pat, name = pat[1+sz:], name[nsz:]
++		default:
++			r, sz := utf8.DecodeRuneInString(pat)
++			nr, nsz := utf8.DecodeRuneInString(name)
++			if len(name) == 0 || r != nr {
++				return false, validRest(pat[sz:])
++			}
++			pat, name = pat[sz:], name[nsz:]
++		}
++	}
++	return len(name) == 0, nil
++}
++
++// validRest reports errBad if the unmatched remainder of a segment pattern is
++// malformed (an unclosed or empty class, a trailing backslash), nil otherwise.
++func validRest(pat string) error {
++	for len(pat) > 0 {
++		switch pat[0] {
++		case '\\':
++			if len(pat) == 1 {
++				return errBad
++			}
++			_, sz := utf8.DecodeRuneInString(pat[1:])
++			pat = pat[1+sz:]
++		case '[':
++			_, rest, err := matchClass(pat, "\x00")
++			if err != nil {
++				return err
++			}
++			pat = rest
++		default:
++			_, sz := utf8.DecodeRuneInString(pat)
++			pat = pat[sz:]
++		}
++	}
++	return nil
++}
++
++// matchClass parses the class at the start of pat and reports whether the
++// first rune of name is in it, returning the pattern after the class.
++func matchClass(pat, name string) (bool, string, error) {
++	p := pat[1:]
++	negate := false
++	if len(p) > 0 && (p[0] == '!' || p[0] == '^') {
++		negate = true
++		p = p[1:]
++	}
++	if len(p) == 0 || p[0] == ']' {
++		return false, "", errBad
++	}
++	var nr rune = -1
++	if len(name) > 0 {
++		nr, _ = utf8.DecodeRuneInString(name)
++	}
++	matched := false
++	item := func() (rune, bool) {
++		if len(p) == 0 {
++			return 0, false
++		}
++		if p[0] == '\\' {
++			if len(p) == 1 {
++				return 0, false
++			}
++			r, sz := utf8.DecodeRuneInString(p[1:])
++			p = p[1+sz:]
++			return r, true
++		}
++		r, sz := utf8.DecodeRuneInString(p)
++		p = p[sz:]
++		return r, true
++	}
++	for len(p) > 0 && p[0] != ']' {
++		lo, ok := item()
++		if !ok {
++			return false, "", errBad
++		}
++		if len(p) >= 2 && p[0] == '-' && p[1] != ']' {
++			p = p[1:]
++			hi, ok := item()
++			if !ok {
++				return false, "", errBad
++			}
++			if lo <= nr && nr <= hi {
++				matched = true
++			}
++			continue
++		}
++		if nr == lo {
++			matched = true
++		}
++	}
++	if len(p) == 0 {
++		return false, "", errBad
++	}
++	return matched != negate, p[1:], nil
++}
++
++// validSegs reports errBad if any of the segments is malformed; Match
++// validates the whole remaining pattern once matching has failed.
++func validSegs(segs []string) error {
++	for _, s := range segs {
++		if err := validRest(s); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// matchPath matches name segments against pattern segments; self allows a
++// final `**` (or `**/`) to match the name itself as "the directory".
++func matchPath(pat, name []string, self bool) (bool, error) {
++	if len(pat) == 0 {
++		return len(name) == 0, nil
++	}
++	if pat[0] == "**" {
++		final := len(pat) == 1 || (len(pat) == 2 && pat[1] == "")
++		if len(name) == 0 {
++			if final {
++				return self, nil
++			}
++			return matchPath(pat[1:], name, self)
++		}
++		k := 0
++		if final && !self {
++			k = 1 // a file needs at least one segment under the prefix
++		}
++		for ; k <= len(name); k++ {
++			ok, err := matchPath(pat[1:], name[k:], self)
++			if err != nil || ok {
++				return ok, err
++			}
++		}
++		return false, validSegs(pat[1:])
++	}
++	if len(name) == 0 {
++		return false, validSegs(pat)
++	}
++	ok, err := matchSeg(pat[0], name[0])
++	if err != nil {
++		return false, err
++	}
++	if !ok {
++		return false, validSegs(pat[1:])
++	}
++	return matchPath(pat[1:], name[1:], self)
++}
++
++// modelMatch is the reference for Match.
++func modelMatch(pattern, name string) (bool, error) { return modelMatchSelf(pattern, name, true) }
++
++func modelMatchSelf(pattern, name string, self bool) (bool, error) {
++	alts, ok := expandAlts(pattern)
++	if !ok {
++		return false, errBad
++	}
++	nameSegs := strings.Split(name, "/")
++	for _, a := range alts {
++		ok, err := matchPath(strings.Split(a, "/"), nameSegs, self)
++		if err != nil {
++			return false, err
++		}
++		if ok {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// modelValid is the reference for ValidatePattern: every alternative must be
++// well formed, whether or not it would ever match.
++func modelValid(pattern string) bool {
++	alts, ok := expandAlts(pattern)
++	if !ok {
++		return false
++	}
++	for _, a := range alts {
++		for _, seg := range strings.Split(a, "/") {
++			if validRest(seg) != nil {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++// ---------------------------------------------------------------------------
++// Generators.
++
++var alphabet = []string{"a", "b", "c", "1", ".", "-", "_"}
++
++// pattern is a generated pattern with the facts the oracles need.
++type pattern struct {
++	text      string
++	standard  bool // path.Match-compatible: no alternatives, no `**` segment, no `!` or edge `-` in classes
++	bashSafe  bool // brace groups have two or more alternatives
++	consecDS  bool // two `**` segments in a row (pinned, doublestar/1, doublestar/2)
++	unmatched bool // an unmatched `}` (pinned, doublestar/3)
++	lazyAlt   bool // an alternative that is malformed on its own (pinned, doublestar/4)
++	escPlain  bool // a backslash before a non-meta character (Glob is pinned, doublestar/6)
++	emptyAlt  bool // an empty alternative (Glob is pinned, doublestar/7)
++	starTail  bool // a final `**` segment after a segment containing `*` (pinned, doublestar/1)
++	altDS     bool // an alternative beginning with `**` (pinned, doublestar/10)
++	nestedAlt bool // a group inside a group (Glob is pinned, doublestar/12)
++}
++
++// finishFlags computes the flags that depend on the whole text.
++func (p *pattern) finishFlags() {
++	p.unmatched = hasUnmatchedClose(p.text)
++	alts, ok := expandAlts(p.text)
++	if ok && len(alts) > 1 {
++		valid, invalid := 0, 0
++		for _, a := range alts {
++			if modelValid(a) {
++				valid++
++			} else {
++				invalid++
++			}
++		}
++		p.lazyAlt = valid > 0 && invalid > 0
++	}
++	if ok {
++		for _, a := range alts {
++			segs := strings.Split(strings.TrimSuffix(a, "/"), "/")
++			if len(segs) >= 2 && segs[len(segs)-1] == "**" && strings.Contains(segs[len(segs)-2], "*") {
++				p.starTail = true
++			}
++		}
++	}
++	// an alternative that begins with `**`
++	for i := 0; i+2 < len(p.text); i++ {
++		if p.text[i] == '\\' {
++			i++
++			continue
++		}
++		if (p.text[i] == '{' || p.text[i] == ',') && p.text[i+1] == '*' && p.text[i+2] == '*' {
++			p.altDS = true
++		}
++	}
++}
++
++func genLiteral(tc hegel.TestCase, lo, hi int) string {
++	var sb strings.Builder
++	for k := n(tc, lo, hi); k > 0; k-- {
++		sb.WriteString(pick(tc, alphabet))
++	}
++	return sb.String()
++}
++
++// genClass draws a character class; nonstd is set when path.Match would
++// refuse it (`!` negation or a `-` at either end).
++func genClass(tc hegel.TestCase) (text string, nonstd bool) {
++	var sb strings.Builder
++	sb.WriteByte('[')
++	switch n(tc, 0, 5) {
++	case 0:
++		sb.WriteByte('^')
++	case 1:
++		sb.WriteByte('!')
++		nonstd = true
++	}
++	items := n(tc, 1, 3)
++	for i := 0; i < items; i++ {
++		switch n(tc, 0, 4) {
++		case 0:
++			// `-` is never a range endpoint: `[--b]`-style classes are read
++			// differently by every implementation (path.Match refuses them).
++			lo, hi := pick(tc, []string{"a", "b", "0", "."}), pick(tc, []string{"c", "z", "9", "b"})
++			if lo > hi {
++				lo, hi = hi, lo
++			}
++			sb.WriteString(lo + "-" + hi)
++		case 1:
++			if i == 0 || i == items-1 {
++				sb.WriteByte('-')
++				nonstd = true
++			} else {
++				sb.WriteString(pick(tc, alphabet[:4]))
++			}
++		case 2:
++			sb.WriteString(`\` + pick(tc, []string{"]", "a", "-", "*", "["}))
++		default:
++			sb.WriteString(pick(tc, alphabet[:5]))
++		}
++	}
++	sb.WriteByte(']')
++	return sb.String(), nonstd
++}
++
++// genSegment draws one pattern segment.
++func genSegment(tc hegel.TestCase, depth int, p *pattern) string {
++	switch n(tc, 0, 11) {
++	case 0:
++		return "*"
++	case 1:
++		return "**"
++	case 2:
++		return genLiteral(tc, 0, 2) + "*" + genLiteral(tc, 0, 2)
++	case 3:
++		return "?" + genLiteral(tc, 0, 2)
++	case 4:
++		c, nonstd := genClass(tc)
++		if nonstd {
++			p.standard = false
++		}
++		return genLiteral(tc, 0, 1) + c + genLiteral(tc, 0, 1)
++	case 5:
++		e := pick(tc, []string{"*", "?", "[", "a", ".", "{", "}", "]"})
++		if e == "a" || e == "." {
++			p.escPlain = true
++		}
++		return `\` + e + genLiteral(tc, 0, 2)
++	case 6, 7:
++		if depth < 2 {
++			p.standard = false
++			if depth > 0 {
++				p.nestedAlt = true
++			}
++			k := n(tc, 1, 3)
++			if k == 1 {
++				p.bashSafe = false
++			}
++			alts := make([]string, k)
++			for i := range alts {
++				if !chance(tc, 15) {
++					alts[i] = genSegment(tc, depth+1, p)
++				}
++				if alts[i] == "" {
++					p.emptyAlt = true
++				}
++			}
++			return genLiteral(tc, 0, 1) + "{" + strings.Join(alts, ",") + "}" + genLiteral(tc, 0, 1)
++		}
++		return genLiteral(tc, 1, 3)
++	case 8:
++		return genLiteral(tc, 1, 2) + "**"
++	default:
++		return genLiteral(tc, 0, 3)
++	}
++}
++
++// genPattern draws a pattern of one to four segments.
++func genPattern(tc hegel.TestCase) pattern {
++	p := pattern{standard: true, bashSafe: true}
++	k := n(tc, 1, 4)
++	segs := make([]string, k)
++	for i := range segs {
++		segs[i] = genSegment(tc, 0, &p)
++		if segs[i] == "**" {
++			p.standard = false
++			if i > 0 && segs[i-1] == "**" {
++				p.consecDS = true
++			}
++		}
++	}
++	p.text = strings.Join(segs, "/")
++	if chance(tc, 8) {
++		p.text = "/" + p.text
++	}
++	if chance(tc, 8) {
++		p.text += "/"
++	}
++	// Occasionally damage the pattern.
++	if chance(tc, 10) {
++		p.standard = false
++		p.bashSafe = false
++		switch n(tc, 0, 4) {
++		case 0:
++			p.text += `\`
++		case 1:
++			p.text += "["
++		case 2:
++			p.text += "{"
++		case 3:
++			p.text += "}"
++		default:
++			p.text = "[]" + p.text
++		}
++	}
++	p.finishFlags()
++	return p
++}
++
++// hasUnmatchedClose reports an unescaped `}` with no open group.
++func hasUnmatchedClose(p string) bool {
++	depth := 0
++	for i := 0; i < len(p); i++ {
++		switch p[i] {
++		case '\\':
++			i++
++		case '{':
++			depth++
++		case '}':
++			if depth == 0 {
++				return true
++			}
++			depth--
++		}
++	}
++	return false
++}
++
++// genName draws a name: a tree path (perhaps decorated), or random segments.
++func genName(tc hegel.TestCase) string {
++	if chance(tc, 50) {
++		s := pick(tc, treePaths)
++		switch n(tc, 0, 9) {
++		case 0:
++			s = "/" + s
++		case 1:
++			s += "/"
++		case 2:
++			s = strings.Replace(s, "/", "//", 1)
++		}
++		return s
++	}
++	k := n(tc, 0, 4)
++	segs := make([]string, k)
++	for i := range segs {
++		segs[i] = genLiteral(tc, 0, 3)
++	}
++	return strings.Join(segs, "/")
++}
++
++// ---------------------------------------------------------------------------
++// The fixed tree.
++
++var treeFiles = []string{
++	"a/e", "a/a", "a/b/c/f", "a/b/c/c", "a/b/c/.k", "a/b/d.txt", "a/.h/x", "a/.g",
++	"f", ".i", "b/a", "b/-", "b/_1", "a-1/a", "ab/ba", "c.1/a.b", "-/a", "1/2/3/4", "_/.",
++}
++
++var (
++	treeOnce  sync.Once
++	treeDir   string
++	treeFS    fs.FS
++	treePaths []string // every file and directory, "." included
++	treeDirs  = map[string]bool{}
++)
++
++func buildTree() {
++	treeOnce.Do(func() {
++		dir, err := os.MkdirTemp("", "doublestar-hegel-")
++		if err != nil {
++			panic(err)
++		}
++		treeDir = dir
++		seen := map[string]bool{".": true}
++		treeDirs["."] = true
++		for _, f := range treeFiles {
++			if strings.HasSuffix(f, "/.") {
++				// "_/." is the directory "_" alone
++				d := strings.TrimSuffix(f, "/.")
++				if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
++					panic(err)
++				}
++				for p := d; p != "."; p = path.Dir(p) {
++					seen[p] = true
++					treeDirs[p] = true
++				}
++				continue
++			}
++			if err := os.MkdirAll(filepath.Join(dir, path.Dir(f)), 0o755); err != nil {
++				panic(err)
++			}
++			if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
++				panic(err)
++			}
++			seen[f] = true
++			for p := path.Dir(f); p != "."; p = path.Dir(p) {
++				seen[p] = true
++				treeDirs[p] = true
++			}
++		}
++		for p := range seen {
++			treePaths = append(treePaths, p)
++		}
++		sort.Strings(treePaths)
++		treeFS = os.DirFS(dir)
++	})
++}
++
++func init() { buildTree() }
++
++// modelGlob lists the tree entries the pattern matches: the model applied to
++// every path; a trailing slash restricts to directories; results are
++// reported without the slash. The root "." is listed only for a bare `**`
++// (zero directories), as an alternative or alone.
++func modelGlob(pattern string, filesOnly bool) ([]string, error) {
++	dirsOnly := strings.HasSuffix(pattern, "/") && pattern != "/"
++	pat := strings.TrimSuffix(pattern, "/")
++	var out []string
++	for _, p := range treePaths {
++		if dirsOnly && !treeDirs[p] {
++			continue
++		}
++		if filesOnly && treeDirs[p] {
++			continue
++		}
++		if p == "." {
++			if filesOnly {
++				continue
++			}
++			alts, _ := expandAlts(pat)
++			for _, a := range alts {
++				if a == "**" {
++					out = append(out, ".")
++					break
++				}
++			}
++			continue
++		}
++		ok, err := modelMatchSelf(pat, p, treeDirs[p])
++		if err != nil {
++			return nil, err
++		}
++		if ok {
++			out = append(out, p)
++		}
++	}
++	return out, nil
++}
++
++func sortedSet(xs []string) ([]string, []string) {
++	set := map[string]int{}
++	for _, x := range xs {
++		set[strings.TrimSuffix(x, "/")]++
++	}
++	var out, dups []string
++	for k, c := range set {
++		out = append(out, k)
++		if c > 1 {
++			dups = append(dups, k)
++		}
++	}
++	sort.Strings(out)
++	sort.Strings(dups)
++	return out, dups
++}
++
++// bashGlob runs the pattern through bash with globstar (and dotglob unless
++// hidden is set) in the tree, keeping only names that exist.
++func bashGlob(pattern string, hidden bool) ([]string, error) {
++	opts := "globstar nullglob"
++	if !hidden {
++		opts += " dotglob"
++	}
++	script := fmt.Sprintf(`shopt -s %s; cd "$1" || exit 9; for f in %s; do printf '%%s\n' "$f"; done`, opts, pattern)
++	cmd := exec.Command("bash", "-c", script, "_", treeDir)
++	cmd.Env = append(os.Environ(), "LC_ALL=C")
++	outb, err := cmd.Output()
++	if err != nil {
++		return nil, fmt.Errorf("bash: %v", err)
++	}
++	var out []string
++	for _, line := range strings.Split(strings.TrimRight(string(outb), "\n"), "\n") {
++		if line == "" {
++			continue
++		}
++		clean := strings.TrimSuffix(line, "/")
++		if _, err := os.Lstat(filepath.Join(treeDir, clean)); err != nil {
++			continue // a brace alternative bash left unexpanded
++		}
++		out = append(out, clean)
++	}
++	return out, nil
++}
++
++// globbable reports whether Glob-style oracles apply: no leading slash and
++// no `.`/`..` segments (io/fs.Glob and doublestar.Glob document these as
++// matching nothing), in every alternative, and a non-empty pattern.
++func globbable(p string) bool {
++	alts, ok := expandAlts(p)
++	if !ok {
++		return false
++	}
++	for _, a := range alts {
++		if a == "" || strings.HasPrefix(a, "/") {
++			return false
++		}
++		for _, s := range strings.Split(strings.TrimSuffix(a, "/"), "/") {
++			if s == "." || s == ".." || s == `\.` {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++// endsInDoublestar reports whether some alternative ends in a `**` segment.
++func endsInDoublestar(p string) bool {
++	alts, _ := expandAlts(p)
++	for _, a := range alts {
++		segs := strings.Split(strings.TrimSuffix(a, "/"), "/")
++		if segs[len(segs)-1] == "**" {
++			return true
++		}
++	}
++	return false
++}
++
++// classVsSlash reports the pinned shape doublestar/11: a class that can
++// match `/` (negated, or with a range spanning 0x2F) and a name containing a
++// separator.
++func classVsSlash(p, name string) bool {
++	if !strings.Contains(name, "/") {
++		return false
++	}
++	for i := 0; i < len(p); i++ {
++		switch p[i] {
++		case '\\':
++			i++
++		case '[':
++			j := i + 1
++			if j < len(p) && (p[j] == '!' || p[j] == '^') {
++				return true
++			}
++			var last byte
++			for ; j < len(p) && p[j] != ']'; j++ {
++				if p[j] == '\\' {
++					j++
++					if j < len(p) {
++						last = p[j]
++					}
++					continue
++				}
++				if p[j] == '-' && last != 0 && j+1 < len(p) && p[j+1] != ']' {
++					hi := p[j+1]
++					if hi == '\\' && j+2 < len(p) {
++						hi = p[j+2]
++					}
++					if last <= '/' && '/' <= hi {
++						return true
++					}
++					j++
++					last = 0
++					continue
++				}
++				last = p[j]
++			}
++			i = j
++		}
++	}
++	return false
++}
++
++// globPatternOK is the shared filter of the Glob properties: the pattern
++// must be globbable, valid, free of empty segments (`//` is no path in
++// io/fs terms and matches nothing) and free of the pinned shapes.
++func globPatternOK(p pattern) bool {
++	return globbable(p.text) && !strings.Contains(p.text, "//") && !p.consecDS && !p.unmatched && !p.lazyAlt &&
++		!p.escPlain && !p.emptyAlt && !p.starTail && !p.altDS && !p.nestedAlt && modelValid(p.text)
++}
++
++// ---------------------------------------------------------------------------
++// Property: on the shared syntax, Match agrees with path.Match.
++
++func TestHegelMatchAgreesWithPathMatch(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		for tries := 0; tries < 20 && !p.standard; tries++ {
++			p = genPattern(ht)
++		}
++		if !p.standard {
++			p = pattern{text: genLiteral(ht, 0, 3) + "*", standard: true}
++		}
++		name := genName(ht)
++		if classVsSlash(p.text, name) {
++			name = strings.ReplaceAll(name, "/", "")
++		}
++		if strings.Contains(p.text, "**") && (name == "" || strings.HasSuffix(name, "/") || strings.HasSuffix(p.text, "/")) {
++			return // doublestar/1: `-**/` matches `-`
++		}
++		note(ht, "Match(%q, %q)", p.text, name)
++		got, gerr := doublestar.Match(p.text, name)
++		want, werr := path.Match(p.text, name)
++		if got != want || (gerr != nil) != (werr != nil) {
++			fail(ht, "Match(%q, %q) = %v, %v; path.Match = %v, %v", p.text, name, got, gerr, want, werr)
++		}
++		got2, gerr2 := doublestar.PathMatch(p.text, name)
++		want2, werr2 := filepath.Match(p.text, name)
++		if got2 != want2 || (gerr2 != nil) != (werr2 != nil) {
++			fail(ht, "PathMatch(%q, %q) = %v, %v; filepath.Match = %v, %v", p.text, name, got2, gerr2, want2, werr2)
++		}
++		if gerr == nil && doublestar.MatchUnvalidated(p.text, name) != got {
++			fail(ht, "MatchUnvalidated(%q, %q) = %v, Match = %v", p.text, name, !got, got)
++		}
++		if doublestar.ValidatePattern(p.text) != (werr == nil) {
++			fail(ht, "ValidatePattern(%q) = %v, path.Match error = %v", p.text, !(werr == nil), werr)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Property: on the full syntax, Match follows the documented grammar.
++
++func TestHegelMatchFollowsTheGrammar(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		skip := func() bool { return p.consecDS || p.lazyAlt || p.unmatched || p.starTail || p.altDS }
++		for tries := 0; tries < 20 && skip(); tries++ {
++			p = genPattern(ht)
++		}
++		if skip() {
++			return
++		}
++		name := genName(ht)
++		if classVsSlash(p.text, name) {
++			name = strings.ReplaceAll(name, "/", "")
++		}
++		// The rest of a `**` pattern after an empty or slash-terminated
++		// name is recognised only in fixed shapes (doublestar/1).
++		if strings.Contains(p.text, "**") && (name == "" || strings.HasSuffix(name, "/") || strings.HasSuffix(p.text, "/")) {
++			return
++		}
++		note(ht, "Match(%q, %q)", p.text, name)
++		got, gerr := doublestar.Match(p.text, name)
++		want, werr := modelMatch(p.text, name)
++		if got != want || (gerr != nil) != (werr != nil) {
++			fail(ht, "Match(%q, %q) = %v, %v; model = %v, %v", p.text, name, got, gerr, want, werr)
++		}
++		if gerr == nil && doublestar.MatchUnvalidated(p.text, name) != got {
++			fail(ht, "MatchUnvalidated(%q, %q) = %v, Match = %v", p.text, name, !got, got)
++		}
++		if !p.unmatched && doublestar.ValidatePattern(p.text) != modelValid(p.text) {
++			fail(ht, "ValidatePattern(%q) = %v, model = %v", p.text, !modelValid(p.text), modelValid(p.text))
++		}
++		if p2, p3 := doublestar.PathMatch, doublestar.PathMatchUnvalidated; true {
++			got3, gerr3 := p2(p.text, name)
++			if got3 != got || (gerr3 != nil) != (gerr != nil) {
++				fail(ht, "PathMatch(%q, %q) = %v, %v; Match = %v, %v", p.text, name, got3, gerr3, got, gerr)
++			}
++			if gerr == nil && p3(p.text, name) != got {
++				fail(ht, "PathMatchUnvalidated(%q, %q) disagrees with Match", p.text, name)
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Property: Glob lists exactly the tree entries Match accepts.
++
++func TestHegelGlobListsWhatMatchAccepts(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		for tries := 0; tries < 20 && !globPatternOK(p); tries++ {
++			p = genPattern(ht)
++		}
++		if !globPatternOK(p) {
++			return
++		}
++		// Trailing slashes on a pattern without meta characters are pinned
++		// (doublestar/5); trailing slashes with meta characters are checked.
++		if strings.HasSuffix(p.text, "/") && !strings.ContainsAny(p.text, `*?[{\`) {
++			p.text = strings.TrimSuffix(p.text, "/")
++		}
++		filesOnly := chance(ht, 25)
++		var opts []doublestar.GlobOption
++		if filesOnly {
++			opts = append(opts, doublestar.WithFilesOnly())
++		}
++		note(ht, "Glob(%q) filesOnly=%v", p.text, filesOnly)
++		got, err := doublestar.Glob(treeFS, p.text, opts...)
++		if err != nil {
++			fail(ht, "Glob(%q): %v", p.text, err)
++			return
++		}
++		gotSet, dups := sortedSet(got)
++		want, _ := modelGlob(p.text, filesOnly)
++		wantSet, _ := sortedSet(want)
++		if !reflect.DeepEqual(gotSet, wantSet) {
++			fail(ht, "Glob(%q, filesOnly=%v) = %q\n  want %q", p.text, filesOnly, got, wantSet)
++		}
++		// Duplicates are pinned (doublestar/2) for patterns with two `**`
++		// segments or with alternatives; the rest must be duplicate-free.
++		if len(dups) > 0 && strings.Count(p.text, "**") <= 1 && !strings.Contains(p.text, "{") {
++			fail(ht, "Glob(%q) returned duplicates %q in %q", p.text, dups, got)
++		}
++		// GlobWalk visits the same names.
++		var walked []string
++		if err := doublestar.GlobWalk(treeFS, p.text, func(path string, d fs.DirEntry) error {
++			walked = append(walked, path)
++			return nil
++		}, opts...); err != nil {
++			fail(ht, "GlobWalk(%q): %v", p.text, err)
++		}
++		walkedSet, _ := sortedSet(walked)
++		if !reflect.DeepEqual(walkedSet, gotSet) {
++			fail(ht, "GlobWalk(%q) = %q, Glob = %q", p.text, walked, got)
++		}
++		// FilepathGlob on the real directory is Glob joined with the base
++		// (it cleans the pattern, so trailing slashes are pinned, doublestar/8).
++		if !strings.HasSuffix(p.text, "/") {
++			fp, err := doublestar.FilepathGlob(filepath.Join(treeDir, p.text), opts...)
++			if err != nil {
++				fail(ht, "FilepathGlob(%q): %v", p.text, err)
++			}
++			var rel []string
++			for _, m := range fp {
++				r, _ := filepath.Rel(treeDir, m)
++				rel = append(rel, filepath.ToSlash(r))
++			}
++			relSet, _ := sortedSet(rel)
++			if !reflect.DeepEqual(relSet, gotSet) {
++				fail(ht, "FilepathGlob(dir/%q) = %q, Glob = %q", p.text, rel, got)
++			}
++		}
++		// Match agrees with membership (patterns without a trailing slash).
++		if !strings.HasSuffix(p.text, "/") && !filesOnly {
++			for _, tp := range treePaths {
++				if tp == "." {
++					continue // listed only for a bare `**`
++				}
++				if !treeDirs[tp] && endsInDoublestar(p.text) {
++					continue // a final `**` matches "the directory itself" only for directories
++				}
++				if classVsSlash(p.text, tp) {
++					continue // doublestar/11
++				}
++				m, _ := doublestar.Match(p.text, tp)
++				in := sort.SearchStrings(gotSet, tp) < len(gotSet) && gotSet[sort.SearchStrings(gotSet, tp)] == tp
++				if m != in {
++					fail(ht, "Match(%q, %q) = %v but Glob(%q) = %q", p.text, tp, m, p.text, got)
++				}
++			}
++		}
++		// On the shared syntax, io/fs.Glob agrees.
++		if p.standard && !strings.HasSuffix(p.text, "/") && !filesOnly {
++			std, err := fs.Glob(treeFS, p.text)
++			if err != nil {
++				fail(ht, "fs.Glob(%q): %v", p.text, err)
++			}
++			stdSet, _ := sortedSet(std)
++			if !reflect.DeepEqual(stdSet, gotSet) {
++				fail(ht, "Glob(%q) = %q, fs.Glob = %q", p.text, got, std)
++			}
++		}
++		// Case-insensitivity only adds matches.
++		ci, err := doublestar.Glob(treeFS, p.text, append(opts, doublestar.WithCaseInsensitive())...)
++		if err != nil {
++			fail(ht, "Glob(%q, CaseInsensitive): %v", p.text, err)
++		}
++		ciSet, _ := sortedSet(ci)
++		for _, g := range gotSet {
++			if i := sort.SearchStrings(ciSet, g); i >= len(ciSet) || ciSet[i] != g {
++				fail(ht, "Glob(%q, CaseInsensitive) = %q lacks %q from Glob", p.text, ci, g)
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Property: Glob agrees with bash's globstar.
++
++func TestHegelGlobAgreesWithBash(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		for tries := 0; tries < 20 && (!globPatternOK(p) || !p.bashSafe); tries++ {
++			p = genPattern(ht)
++		}
++		if !globPatternOK(p) || !p.bashSafe {
++			return
++		}
++		if strings.HasSuffix(p.text, "/") && !strings.ContainsAny(p.text, `*?[{\`) {
++			p.text = strings.TrimSuffix(p.text, "/")
++		}
++		hidden := chance(ht, 30)
++		var opts []doublestar.GlobOption
++		if hidden {
++			// A class at the start of a segment matching a leading dot is
++			// pinned (doublestar/9).
++			alts, _ := expandAlts(p.text)
++			for _, a := range alts {
++				for _, s := range strings.Split(a, "/") {
++					if strings.HasPrefix(s, "[") {
++						hidden = false
++					}
++				}
++			}
++		}
++		if hidden {
++			opts = append(opts, doublestar.WithNoHidden())
++		}
++		note(ht, "Glob(%q) noHidden=%v vs bash", p.text, hidden)
++		got, err := doublestar.Glob(treeFS, p.text, opts...)
++		if err != nil {
++			fail(ht, "Glob(%q): %v", p.text, err)
++			return
++		}
++		gotSet, _ := sortedSet(got)
++		// bash never lists the root itself.
++		if i := sort.SearchStrings(gotSet, "."); i < len(gotSet) && gotSet[i] == "." {
++			gotSet = append(gotSet[:i], gotSet[i+1:]...)
++		}
++		want, err := bashGlob(p.text, hidden)
++		if err != nil {
++			fail(ht, "bash on %q: %v", p.text, err)
++			return
++		}
++		wantSet, _ := sortedSet(want)
++		if !reflect.DeepEqual(gotSet, wantSet) {
++			fail(ht, "Glob(%q, noHidden=%v) = %q\n  bash %q", p.text, hidden, gotSet, wantSet)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Property: SplitPattern splits before the first meta character.
++
++func TestHegelSplitPatternRoundTrips(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		// A base of one to three literal segments (meta characters
++		// escaped), then a pattern.
++		k := n(ht, 0, 3)
++		var base []string
++		for i := 0; i < k; i++ {
++			seg := genLiteral(ht, 1, 3)
++			if chance(ht, 20) {
++				seg += `\*`
++			}
++			base = append(base, seg)
++		}
++		p := genPattern(ht)
++		for tries := 0; tries < 20 && (!strings.ContainsAny(p.text, `*?[{`) || strings.HasPrefix(p.text, "/")); tries++ {
++			p = genPattern(ht)
++		}
++		if !strings.ContainsAny(p.text, `*?[{`) || strings.HasPrefix(p.text, "/") {
++			return
++		}
++		// The pattern's own first segment must contain a meta character,
++		// else the split point moves into it.
++		first := strings.SplitN(p.text, "/", 2)[0]
++		if !strings.ContainsAny(strings.ReplaceAll(first, `\`, ""), `*?[{`) || strings.ContainsAny(first, `\`) {
++			return
++		}
++		full := p.text
++		if k > 0 {
++			full = strings.Join(base, "/") + "/" + p.text
++		}
++		note(ht, "SplitPattern(%q)", full)
++		gotBase, gotPat := doublestar.SplitPattern(full)
++		wantBase := "."
++		if k > 0 {
++			wantBase = strings.ReplaceAll(strings.Join(base, "/"), `\*`, "*")
++		}
++		if gotBase != wantBase || gotPat != p.text {
++			fail(ht, "SplitPattern(%q) = %q, %q; want %q, %q", full, gotBase, gotPat, wantBase, p.text)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Pins: one test per recorded bug, each failing while the bug is present.
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// pinTree builds a small directory tree for the pins and returns its path
++// and an fs.FS over it.
++func pinTree(t *testing.T, files ...string) (string, fs.FS) {
++	t.Helper()
++	dir := t.TempDir()
++	for _, f := range files {
++		if strings.HasSuffix(f, "/") {
++			if err := os.MkdirAll(filepath.Join(dir, f), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			continue
++		}
++		if err := os.MkdirAll(filepath.Join(dir, path.Dir(f)), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return dir, os.DirFS(dir)
++}
++
++func expectMatch(t *testing.T, pattern, name string, want bool) {
++	t.Helper()
++	got, err := doublestar.Match(pattern, name)
++	if err != nil || got != want {
++		t.Errorf("Match(%q, %q) = %v, %v; want %v, nil", pattern, name, got, err, want)
++	}
++}
++
++func expectGlob(t *testing.T, fsys fs.FS, pattern string, want []string, opts ...doublestar.GlobOption) {
++	t.Helper()
++	got, err := doublestar.Glob(fsys, pattern, opts...)
++	if err != nil {
++		t.Errorf("Glob(%q): %v", pattern, err)
++		return
++	}
++	sort.Strings(got)
++	sort.Strings(want)
++	if len(want) == 0 {
++		want = nil
++	}
++	if len(got) == 0 {
++		got = nil
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("Glob(%q) = %q, want %q", pattern, got, want)
++	}
++}
++
++// doublestar/1: once the name is exhausted, the rest of the pattern is
++// recognised as matching nothing more only in a handful of fixed shapes, so
++// `a/**/**` and `a*/**` do not match `a` although `a/**` and `*/**` do.
++func TestHegelPinConsecutiveDoublestarZeroDirs(t *testing.T) {
++	defer guard(t)
++	expectMatch(t, "a/**", "a", true)
++	expectMatch(t, "*/**", "a", true)
++	expectMatch(t, "a/**/**", "a", true)
++	expectMatch(t, "a*/**", "a", true)
++	expectMatch(t, "**", "", true)
++	expectMatch(t, "**/**", "", true)
++}
++
++// doublestar/2: Glob lists a name once per way the pattern can match it —
++// two `**` segments (`a/**/**`, `**/?/**`) or overlapping alternatives
++// (`{?,*}`) produce duplicates.
++func TestHegelPinGlobDuplicatesWithConsecutiveDoublestar(t *testing.T) {
++	defer guard(t)
++	_, fsys := pinTree(t, "a/b/c", "a/d", "f")
++	for _, p := range []string{"a/**/**", "**/?/**", "{f,?}"} {
++		got, err := doublestar.Glob(fsys, p)
++		if err != nil {
++			t.Fatal(err)
++		}
++		seen := map[string]bool{}
++		for _, g := range got {
++			if seen[g] {
++				t.Errorf("Glob(%q) lists %q more than once: %q", p, g, got)
++				break
++			}
++			seen[g] = true
++		}
++	}
++}
++
++// doublestar/3: an unmatched `}` is a literal when Match consumes it, an
++// error when Match validates it after a mismatch, and ValidatePattern and
++// Glob refuse it.
++func TestHegelPinUnmatchedCloseBrace(t *testing.T) {
++	defer guard(t)
++	expectMatch(t, "a}", "a}", true)
++	expectMatch(t, "a}", "b", false)
++	if !doublestar.ValidatePattern("a}") {
++		t.Errorf("ValidatePattern(%q) = false, but Match accepts the pattern", "a}")
++	}
++	_, fsys := pinTree(t, "a}")
++	expectGlob(t, fsys, "a}", []string{"a}"})
++}
++
++// doublestar/4: whether a malformed alternative is reported depends on the
++// name: Match("{a,[}", "a") succeeds, Match("{a,[}", "b") is ErrBadPattern.
++func TestHegelPinAlternativeValidationDependsOnTheName(t *testing.T) {
++	defer guard(t)
++	_, err1 := doublestar.Match("{a,[}", "a")
++	_, err2 := doublestar.Match("{a,[}", "b")
++	if (err1 == nil) != (err2 == nil) {
++		t.Errorf("Match(%q, %q) error = %v but Match(%q, %q) error = %v", "{a,[}", "a", err1, "{a,[}", "b", err2)
++	}
++}
++
++// doublestar/5: Glob with a trailing slash on a literal pattern returns a
++// regular file, and keeps the slash in the result.
++func TestHegelPinGlobTrailingSlashOnLiteral(t *testing.T) {
++	defer guard(t)
++	_, fsys := pinTree(t, "f", "a/")
++	expectGlob(t, fsys, "f/", nil)
++	expectGlob(t, fsys, "a/", []string{"a"})
++}
++
++// doublestar/6: Glob does not find files when the pattern escapes a
++// character that is not a meta character, although Match accepts it.
++func TestHegelPinGlobEscapedPlainCharacter(t *testing.T) {
++	defer guard(t)
++	_, fsys := pinTree(t, "f", "a/e", ".i")
++	expectMatch(t, `\f`, "f", true)
++	expectGlob(t, fsys, `\f`, []string{"f"})
++	expectGlob(t, fsys, `a/\e`, []string{"a/e"})
++	expectGlob(t, fsys, `\.i`, []string{".i"})
++}
++
++// doublestar/7: Glob drops an empty alternative — the README's own
++// `some{thing,}` lists "something" but not "some".
++func TestHegelPinGlobEmptyAlternative(t *testing.T) {
++	defer guard(t)
++	_, fsys := pinTree(t, "some", "something", "f")
++	expectMatch(t, "some{thing,}", "some", true)
++	expectGlob(t, fsys, "some{thing,}", []string{"some", "something"})
++	expectGlob(t, fsys, "{,something}", []string{"something"})
++	expectGlob(t, fsys, "{f,}", []string{"f"})
++}
++
++// doublestar/8: FilepathGlob cleans the pattern, so a trailing slash no
++// longer restricts to directories: `dir/*/` returns regular files, where
++// filepath.Glob returns nothing and Glob returns directories only.
++func TestHegelPinFilepathGlobTrailingSlash(t *testing.T) {
++	defer guard(t)
++	dir, _ := pinTree(t, "f", "a/")
++	got, err := doublestar.FilepathGlob(filepath.Join(dir, "*") + "/")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, g := range got {
++		if filepath.Base(g) == "f" {
++			t.Errorf("FilepathGlob(%q) = %q includes the regular file f", "dir/*/", got)
++		}
++	}
++}
++
++// doublestar/9: with WithNoHidden a character class at the start of a
++// segment matches a leading dot, which shells never allow.
++func TestHegelPinNoHiddenClassMatchesDotfile(t *testing.T) {
++	defer guard(t)
++	_, fsys := pinTree(t, ".i", "ai")
++	expectGlob(t, fsys, "?i", []string{"ai"}, doublestar.WithNoHidden())
++	expectGlob(t, fsys, "[.a]i", []string{"ai"}, doublestar.WithNoHidden())
++	expectGlob(t, fsys, "[!b]i", []string{"ai"}, doublestar.WithNoHidden())
++}
++
++// doublestar/10: a `**` at the start of an alternative is treated as a
++// segment-start doublestar even in the middle of a segment, so `b{**}`
++// matches `b/-` although `b**` does not, and Glob("b{**}") lists nothing.
++func TestHegelPinAlternativeLeadingDoublestar(t *testing.T) {
++	defer guard(t)
++	expectMatch(t, "b**", "b/-", false)
++	expectMatch(t, "b{**}", "b/-", false)
++	expectMatch(t, "b{**,x}", "b/-", false)
++}
++
++// doublestar/11: a character class matches the path separator — a negated
++// class always, a range spanning 0x2F (`[.-c]`) too — so `a[!1]b` and
++// `a[.-c]a` match `a/b` and `a/a` (path.Match: false; the doc says a class
++// matches a single non-path-separator character).
++func TestHegelPinNegatedClassMatchesSeparator(t *testing.T) {
++	defer guard(t)
++	expectMatch(t, "a[!1]b", "a/b", false)
++	expectMatch(t, "a[^1]b", "a/b", false)
++	expectMatch(t, "a[.-c]a", "a/a", false)
++	expectMatch(t, "[!a]", "/", false)
++}
++
++// doublestar/12: a group nested inside a group makes Glob descend one level
++// too far: with 1/2/3/4 and a/b/c/f present, Glob("*/{{*}}/*") lists
++// 1/2/3/4 (four segments for a three-segment pattern) where Glob("*/{*}/*"),
++// Glob("*/*/*") and Match do not.
++func TestHegelPinGlobNestedAlternativesDescendTooFar(t *testing.T) {
++	defer guard(t)
++	_, fsys := pinTree(t, "a/b/c/f", "a/x", "a/b/d", "f", "1/2/3/4")
++	expectMatch(t, "*/{{*}}/*", "1/2/3/4", false)
++	expectGlob(t, fsys, "*/{*}/*", []string{"1/2/3", "a/b/c", "a/b/d"})
++	expectGlob(t, fsys, "*/{{*}}/*", []string{"1/2/3", "a/b/c", "a/b/d"})
++}
