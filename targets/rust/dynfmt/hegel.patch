@@ -1,0 +1,518 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index df25847..b741da9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,3 +28,12 @@ default = ["json"]
+ json = ["serde_json"]
+ python = ["regex"]
+ curly = ["regex"]
++
++[dev-dependencies.hegeltest]
++version = "0.44.1"
++
++[dev-dependencies.serde]
++version = "1"
++
++[dev-dependencies.serde_json]
++version = "1"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..a32e381
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,495 @@
++//! Hegel property tests for dynfmt's `PythonFormat` and `SimpleCurlyFormat`.
++//!
++//! `PythonFormat` is documented as "the `printf`-like format that python 2 used for formatting
++//! strings" — key, flags, width, precision, length modifier, conversion type, "for the full
++//! specification, please refer to the Python string formatting docs".  The oracle is Python
++//! itself: a `python3` child process held open for the whole test run answers `fmt % args` for
++//! the same format string and the same arguments (integers, strings, a list or a mapping).  Where
++//! the crate documents a Rust choice instead (`%s` is `Display`, `%r` is JSON, arguments are Rust
++//! values), the differential keeps to what both define.  `SimpleCurlyFormat` is checked against
++//! the three-line contract in its rustdoc.
++
++use std::collections::HashMap;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++use dynfmt::{Error, Format, Position, PythonFormat, SimpleCurlyFormat};
++use hegel::{generators, TestCase};
++use serde::ser::{Serialize, SerializeMap, Serializer};
++
++// ---------------------------------------------------------------- generators
++
++fn n(tc: &mut TestCase, lo: i64, hi: i64) -> i64 {
++    tc.draw(generators::integers().min_value(lo).max_value(hi))
++}
++
++fn chance(tc: &mut TestCase, pct: i64) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++fn pick<T: Clone>(tc: &mut TestCase, xs: &[T]) -> T {
++    xs[n(tc, 0, xs.len() as i64 - 1) as usize].clone()
++}
++
++/// Text characters: anything but `%` (and braces, for the curly format).
++const TEXT: &[char] = &[
++    'a', 'b', 'z', 'A', 'Z', '0', '9', ' ', ' ', ',', '.', ':', '-', '_', '/', '\\', '!', '#',
++    '$', '&', '*', '+', '=', '<', '>', '|', '~', '\'', '"', '@', '(', ')', '\t', '\n', 'é', 'ß',
++    'Ж', '日', '€', '😀', '\u{0}',
++];
++
++fn arb_text(tc: &mut TestCase, max: i64) -> String {
++    let len = n(tc, 0, max);
++    (0..len).map(|_| pick(tc, TEXT)).collect()
++}
++
++fn arb_key(tc: &mut TestCase) -> String {
++    let first = pick(tc, &['a', 'k', 'x', '_', 'é']);
++    let rest: String = (0..n(tc, 0, 4)).map(|_| pick(tc, &['a', 'b', '1', '_', '9', 'ü'])).collect();
++    format!("{}{}", first, rest)
++}
++
++/// An argument value: a Rust value that is also a Python value with the same `%d`/`%s` text.
++#[derive(Clone, Debug, PartialEq)]
++enum Val {
++    Int(i64),
++    Float(f64),
++    Str(String),
++}
++
++impl Serialize for Val {
++    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
++        match self {
++            Val::Int(i) => s.serialize_i64(*i),
++            Val::Float(x) => s.serialize_f64(*x),
++            Val::Str(t) => s.serialize_str(t),
++        }
++    }
++}
++
++/// Positional or named arguments, as Python sees them (a tuple or a dict).
++#[derive(Clone, Debug)]
++enum Args {
++    List(Vec<Val>),
++    Map(Vec<(String, Val)>),
++}
++
++impl Serialize for Args {
++    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
++        match self {
++            Args::List(v) => v.serialize(s),
++            Args::Map(m) => {
++                let mut map = s.serialize_map(Some(m.len()))?;
++                for (k, v) in m {
++                    map.serialize_entry(k, v)?;
++                }
++                map.end()
++            }
++        }
++    }
++}
++
++fn arb_int(tc: &mut TestCase) -> i64 {
++    match n(tc, 0, 3) {
++        0 => n(tc, 0, 9),
++        1 => n(tc, -1000, 1000),
++        2 => pick(tc, &[0, 1, -1, 255, 256, 65535, 1 << 31, i64::MAX, i64::MIN, -(1 << 40)]),
++        _ => n(tc, i64::MIN, i64::MAX),
++    }
++}
++
++fn arb_str(tc: &mut TestCase) -> String {
++    if chance(tc, 20) {
++        pick(tc, &["%", "%s", "%%", "%d", "{}", "{0}", ""]).to_string()
++    } else {
++        arb_text(tc, 6)
++    }
++}
++
++// ---------------------------------------------------------------- the Python oracle
++
++struct Py {
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++    _child: Child,
++}
++
++const PY_SERVER: &str = r#"
++import sys, json
++for line in sys.stdin:
++    fmt, args = json.loads(line)
++    try:
++        out = fmt % (tuple(args) if isinstance(args, list) else args)
++        r = ["ok", out]
++    except Exception as e:
++        r = ["err", type(e).__name__ + ": " + str(e)]
++    print(json.dumps(r), flush=True)
++"#;
++
++fn py() -> &'static Mutex<Py> {
++    static PY: OnceLock<Mutex<Py>> = OnceLock::new();
++    PY.get_or_init(|| {
++        let mut child = Command::new("python3")
++            .args(["-u", "-c", PY_SERVER])
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .spawn()
++            .expect("python3 is needed as the oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Py { stdin, stdout, _child: child })
++    })
++}
++
++/// `fmt % args` in Python: the text, or the exception.
++fn python(fmt: &str, args: &Args) -> Result<String, String> {
++    let mut py = py().lock().unwrap();
++    let mut line = serde_json::to_string(&(fmt, args)).unwrap();
++    line.push('\n');
++    py.stdin.write_all(line.as_bytes()).unwrap();
++    let mut reply = String::new();
++    py.stdout.read_line(&mut reply).unwrap();
++    let (tag, text): (String, String) = serde_json::from_str(&reply).expect("python reply");
++    if tag == "ok" {
++        Ok(text)
++    } else {
++        Err(text)
++    }
++}
++
++/// dynfmt's answer for the same call.
++fn dyn_python(fmt: &str, args: &Args) -> Result<String, String> {
++    let r = match args {
++        Args::List(v) => PythonFormat.format(fmt, v),
++        Args::Map(m) => {
++            let map: HashMap<String, Val> = m.iter().cloned().collect();
++            PythonFormat.format(fmt, map).map(|s| s.into_owned().into())
++        }
++    };
++    r.map(|s| s.into_owned()).map_err(|e| e.to_string())
++}
++
++/// Both sides must agree: the same text, or both an error.
++fn same_as_python(fmt: &str, args: &Args) {
++    let want = python(fmt, args);
++    let got = dyn_python(fmt, args);
++    match (&want, &got) {
++        (Ok(a), Ok(b)) if a == b => {}
++        (Err(_), Err(_)) => {}
++        _ => panic!("{:?} % {:?}\n python: {:?}\n dynfmt: {:?}", fmt, args, want, got),
++    }
++}
++
++// ---------------------------------------------------------------- general properties
++
++/// One or more `%` specs whose meaning both sides define — `%[#][-][key](d|i|u|o|x|X|s|c|%)`
++/// with an optional `h`/`l`/`L` modifier, integers (non-negative for the radix forms) and
++/// strings, positional or named — print as Python prints them, with the text around them
++/// copied verbatim.  Widths, precisions, `+`/` `/`0` flags and floats are pinned separately.
++#[hegel::test]
++fn specs_format_like_python(mut tc: TestCase) {
++    let named = chance(&mut tc, 30);
++    let count = n(&mut tc, 1, 5);
++    let mut fmt = arb_text(&mut tc, 5);
++    let mut list = Vec::new();
++    let mut map: Vec<(String, Val)> = Vec::new();
++    for _ in 0..count {
++        let ty = pick(&mut tc, &["d", "i", "u", "o", "x", "X", "s", "s", "c", "%"]);
++        let val = match ty {
++            "o" | "x" | "X" => Val::Int(n(&mut tc, 0, i64::MAX)),
++            "d" | "i" | "u" => Val::Int(arb_int(&mut tc)),
++            "c" => Val::Str(pick(&mut tc, TEXT).to_string()),
++            "%" => Val::Int(0),
++            _ => {
++                if chance(&mut tc, 30) {
++                    Val::Int(arb_int(&mut tc))
++                } else {
++                    Val::Str(arb_str(&mut tc))
++                }
++            }
++        };
++        let mut spec = String::from("%");
++        if ty != "%" && named {
++            let key = loop {
++                let k = arb_key(&mut tc);
++                if !map.iter().any(|(m, _)| *m == k) {
++                    break k;
++                }
++            };
++            spec.push_str(&format!("({})", key));
++            map.push((key, val.clone()));
++        } else if ty != "%" {
++            list.push(val.clone());
++        }
++        // Python 3 refuses flags and modifiers on `%%`.
++        if ty != "%" {
++            if chance(&mut tc, 20) && ty != "X" {
++                spec.push('#');
++            }
++            if chance(&mut tc, 20) {
++                spec.push('-');
++            }
++            if chance(&mut tc, 15) {
++                spec.push_str(pick(&mut tc, &["h", "l", "L"]));
++            }
++        }
++        spec.push_str(ty);
++        fmt.push_str(&spec);
++        // Text starting with a digit right after a spec is the pinned dynfmt/4 shape.
++        let text = arb_text(&mut tc, 5);
++        fmt.push_str(text.trim_start_matches(|c: char| c.is_ascii_digit() || c == '*'));
++    }
++    let args = if named { Args::Map(map) } else { Args::List(list) };
++    same_as_python(&fmt, &args);
++}
++
++/// The argument protocol: too few positional arguments is `MissingArg` at the first index
++/// beyond the list, a key on a list is `MapRequired`, `%s` on a map is `ListRequired`, and
++/// `format_into` writes the same bytes as `format`.  A string without specs is returned
++/// borrowed.
++#[hegel::test]
++fn argument_errors_and_format_into(mut tc: TestCase) {
++    let k = n(&mut tc, 1, 4) as usize;
++    let have = n(&mut tc, 0, k as i64 - 1) as usize;
++    let fmt = "%s,".repeat(k);
++    let args: Vec<Val> = (0..have).map(|_| Val::Int(arb_int(&mut tc))).collect();
++    match PythonFormat.format(&fmt, &args) {
++        Err(Error::MissingArg(Position::Index(i))) => assert_eq!(i, have),
++        other => panic!("{:?} with {} args: {:?}", fmt, have, other),
++    }
++    let key = arb_key(&mut tc);
++    assert!(matches!(PythonFormat.format(&format!("%({})s", key), &args), Err(Error::MapRequired)));
++    let map: HashMap<String, Val> = [(key.clone(), Val::Int(1))].into_iter().collect();
++    assert!(matches!(PythonFormat.format("%s", &map), Err(Error::ListRequired)));
++    assert!(matches!(
++        PythonFormat.format(&format!("%(nope_{})s", key), &map),
++        Err(Error::MissingArg(Position::Key(_)))
++    ));
++
++    let full: Vec<Val> = (0..k).map(|_| Val::Str(arb_str(&mut tc))).collect();
++    let text = PythonFormat.format(&fmt, &full).unwrap();
++    let mut buf = Vec::new();
++    PythonFormat.format_into(&mut buf, &fmt, &full).unwrap();
++    assert_eq!(buf, text.as_bytes());
++
++    let plain = arb_text(&mut tc, 8);
++    let out = PythonFormat.format(&plain, &full).unwrap();
++    assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "{:?}", plain);
++    assert_eq!(out, plain);
++}
++
++/// `SimpleCurlyFormat`: `{}` is the next positional argument, `{0}` the argument at that index,
++/// `{name}` the named one; each argument is formatted in display mode; the auto counter goes
++/// on after an explicit index.
++#[hegel::test]
++fn curly_format_follows_its_contract(mut tc: TestCase) {
++    let text = |tc: &mut TestCase| -> String {
++        arb_text(tc, 5).chars().filter(|c| !matches!(c, '{' | '}')).collect()
++    };
++    let named = chance(&mut tc, 30);
++    let count = n(&mut tc, 1, 5) as usize;
++    let values: Vec<Val> = (0..count)
++        .map(|_| if chance(&mut tc, 50) { Val::Int(arb_int(&mut tc)) } else { Val::Str(arb_str(&mut tc)) })
++        .collect();
++    let display = |v: &Val| match v {
++        Val::Int(i) => i.to_string(),
++        Val::Float(x) => x.to_string(),
++        Val::Str(s) => s.clone(),
++    };
++    let mut fmt = text(&mut tc);
++    let mut want = fmt.clone();
++    if named {
++        let keys: Vec<String> = {
++            let mut ks: Vec<String> = Vec::new();
++            while ks.len() < count {
++                let k = arb_key(&mut tc);
++                if !ks.contains(&k) {
++                    ks.push(k);
++                }
++            }
++            ks
++        };
++        for _ in 0..n(&mut tc, 1, 6) {
++            let i = n(&mut tc, 0, count as i64 - 1) as usize;
++            fmt.push_str(&format!("{{{}}}", keys[i]));
++            want.push_str(&display(&values[i]));
++            let t = text(&mut tc);
++            fmt.push_str(&t);
++            want.push_str(&t);
++        }
++        let map: HashMap<String, Val> = keys.iter().cloned().zip(values.iter().cloned()).collect();
++        assert_eq!(SimpleCurlyFormat.format(&fmt, &map).unwrap(), want, "{:?}", fmt);
++    } else {
++        let mut auto = 0;
++        for _ in 0..n(&mut tc, 1, 6) {
++            if chance(&mut tc, 50) && auto < count {
++                fmt.push_str("{}");
++                want.push_str(&display(&values[auto]));
++                auto += 1;
++            } else {
++                let i = n(&mut tc, 0, count as i64 - 1) as usize;
++                fmt.push_str(&format!("{{{}}}", i));
++                want.push_str(&display(&values[i]));
++            }
++            let t = text(&mut tc);
++            fmt.push_str(&t);
++            want.push_str(&t);
++        }
++        assert_eq!(SimpleCurlyFormat.format(&fmt, &values).unwrap(), want, "{:?}", fmt);
++    }
++}
++
++/// The rustdoc examples of both formats.
++#[hegel::test]
++fn doc_examples(_tc: TestCase) {
++    assert_eq!(PythonFormat.format("hello, %s", &["world"]).unwrap(), "hello, world");
++    assert_eq!(SimpleCurlyFormat.format("hello, {}", &["world"]).unwrap(), "hello, world");
++    assert_eq!(PythonFormat.format("hello, %#x!", &[42]).unwrap(), "hello, 0x2a!");
++    let mut buffer = Vec::new();
++    dynfmt::NoopFormat.format_into(&mut buffer, "hello, world", &["unused"]).unwrap();
++    assert_eq!(b"hello, world", buffer.as_slice());
++}
++
++// ---------------------------------------------------------------- pinned bugs
++
++fn width_flags(tc: &mut TestCase) -> String {
++    let mut s = String::new();
++    for f in ["-", "0", "+"] {
++        if chance(tc, 40) {
++            s.push_str(f);
++        }
++    }
++    s
++}
++
++/// dynfmt/1: the minimum field width and the `-`, `0` and `+` flags are parsed into the
++/// `ArgumentSpec` and never applied: `%5d` of 3 is `3`, `%-5s`, `%05d`, `%+d` likewise.
++#[hegel::test]
++fn width_and_flags_are_applied(mut tc: TestCase) {
++    let ty = pick(&mut tc, &["d", "s", "x", "o"]);
++    let val = match ty {
++        "s" => Val::Str(arb_text(&mut tc, 4)),
++        "d" => Val::Int(n(&mut tc, -999, 999)),
++        _ => Val::Int(n(&mut tc, 0, 9999)),
++    };
++    let fmt = format!("%{}{}{}", width_flags(&mut tc), n(&mut tc, 1, 12), ty);
++    same_as_python(&fmt, &Args::List(vec![val]));
++}
++
++/// dynfmt/2: the precision is parsed and never applied — `%.3d` of 5 is `5` (Python `005`),
++/// `%.2s` of `hello` is `hello`, `%.2f` of 3.14159 is `3.14159`; and the float conversions
++/// have no default precision either: `%f` of 1.0 is `1` (Python `1.000000`), `%g` of 1e20 is
++/// the 21-digit integer (Python `1e+20`).
++#[hegel::test]
++fn precision_is_applied(mut tc: TestCase) {
++    let (fmt, val) = match n(&mut tc, 0, 3) {
++        0 => (format!("%.{}d", n(&mut tc, 0, 8)), Val::Int(n(&mut tc, -999, 9999))),
++        1 => (format!("%.{}s", n(&mut tc, 0, 6)), Val::Str(arb_text(&mut tc, 8))),
++        2 => (
++            format!("%{}.{}f", pick(&mut tc, &["", "", "+", "-9", "012"]), n(&mut tc, 0, 6)),
++            Val::Float(n(&mut tc, -99999, 99999) as f64 / 100.0),
++        ),
++        _ => (
++            format!("%{}", pick(&mut tc, &["f", "F", "g", "G"])),
++            Val::Float(pick(&mut tc, &[1.0, 0.5, -2.25, 1e20, 1e-7, 123456789.0, 0.1 + 0.2])),
++        ),
++    };
++    same_as_python(&fmt, &Args::List(vec![val]));
++}
++
++/// dynfmt/3: `*` as width or precision must take the size from the next argument and format
++/// the one after it; dynfmt ignores the size and formats the size argument itself — `%*d`
++/// with (5, 42) is `5`, and every later argument is shifted by one.
++#[hegel::test]
++fn star_consumes_an_argument(mut tc: TestCase) {
++    let w = n(&mut tc, 0, 9);
++    let v = arb_int(&mut tc);
++    let (fmt, args) = if chance(&mut tc, 50) {
++        ("%*d|%d".to_string(), vec![Val::Int(w), Val::Int(v), Val::Int(7)])
++    } else {
++        ("%.*s|%s".to_string(), vec![Val::Int(w), Val::Str(arb_text(&mut tc, 8)), Val::Str("end".into())])
++    };
++    same_as_python(&fmt, &Args::List(args));
++}
++
++/// dynfmt/4: the precision is matched by `.(?P<precision>\*|\d+)` with an unescaped `.`, so any
++/// character followed by digits and a conversion is swallowed into the spec: `%d5d` of 3 is
++/// `3` where Python prints `35d`, `%5x3d` of 255 is `255` where Python prints `   ff3d`, and
++/// `%%0%%` is `%%` where Python prints `%0%` (`%%5d` even consumes an argument).
++#[hegel::test]
++fn precision_needs_a_dot(mut tc: TestCase) {
++    let ty = pick(&mut tc, &["d", "s", "x", "%"]);
++    let v = match ty {
++        "s" => Val::Str(arb_text(&mut tc, 3)),
++        _ => Val::Int(n(&mut tc, 0, 999)),
++    };
++    // `%d` + `d5d`: one spec for Python, the rest is text; `%%` + `%5d`: two specs.
++    let (sep, tail) = if ty == "%" {
++        ('%', pick(&mut tc, &["d", "s"]))
++    } else {
++        (pick(&mut tc, &['d', 'x', 's', 'a', 'z', '_', '-', '#', '*']), pick(&mut tc, &["d", "s", "%%"]))
++    };
++    let size = if ty != "%" && chance(&mut tc, 20) { "*".to_string() } else { n(&mut tc, 0, 99).to_string() };
++    let fmt = format!("%{}{}{}{}", ty, sep, size, tail);
++    same_as_python(&fmt, &Args::List(vec![v]));
++}
++
++/// dynfmt/5: the space flag is not recognised — in the `(?x)` regex the space in `[\#0\- +]`
++/// is insignificant whitespace — so `% d` does not parse as a spec at all and is printed
++/// literally: `% d` of 3 is `% d` (Python ` 3`).
++#[hegel::test]
++fn space_flag_is_recognised(mut tc: TestCase) {
++    let fmt = format!("%{} {}d", pick(&mut tc, &["", "-", "#"]), pick(&mut tc, &["", "5", "+"]));
++    same_as_python(&fmt, &Args::List(vec![Val::Int(n(&mut tc, -99, 999))]));
++}
++
++/// dynfmt/6: `%x`, `%X` and `%o` of a negative integer print Rust's two's complement of the
++/// concrete integer type (`ffffffffffffff01` for -255i64) where Python prints `-ff`.
++#[hegel::test]
++fn negative_radix_forms_have_a_sign(mut tc: TestCase) {
++    let fmt = format!("%{}{}", pick(&mut tc, &["", "#"]), pick(&mut tc, &["x", "o"]));
++    same_as_python(&fmt, &Args::List(vec![Val::Int(n(&mut tc, i64::MIN, -1))]));
++}
++
++/// dynfmt/7: `%c` of an integer prints the number, not the character with that code point.
++#[hegel::test]
++fn char_conversion_of_an_integer(mut tc: TestCase) {
++    let code = if chance(&mut tc, 70) { n(&mut tc, 32, 126) } else { n(&mut tc, 160, 0xD7FF) };
++    same_as_python("%c", &Args::List(vec![Val::Int(code)]));
++}
++
++/// dynfmt/8: `%d`/`%i`/`%u` print any argument's `Display`: a float keeps its fraction (`%d` of
++/// 3.7 is `3.7`, Python `3`), a string is printed as it is where Python raises `TypeError`.
++#[hegel::test]
++fn integer_conversions_take_integers(mut tc: TestCase) {
++    let ty = pick(&mut tc, &["d", "i", "u", "x"]);
++    let val = if chance(&mut tc, 50) {
++        Val::Float(n(&mut tc, -9999, 9999) as f64 / 10.0)
++    } else {
++        Val::Str(arb_text(&mut tc, 4))
++    };
++    if ty == "x" && matches!(val, Val::Float(_)) {
++        return; // both refuse a float for %x
++    }
++    same_as_python(&format!("%{}", ty), &Args::List(vec![val]));
++}
++
++/// dynfmt/9: an unknown conversion character or an incomplete spec (`%z`, a trailing `%`) is
++/// copied to the output as text; Python raises `ValueError`, and the crate's own
++/// `Error::BadFormat` is never produced.
++#[hegel::test]
++fn unknown_conversions_are_errors(mut tc: TestCase) {
++    let fmt = match n(&mut tc, 0, 2) {
++        0 => format!("%{}", pick(&mut tc, &['z', 'q', 'y', 'é', 'D', 'S', '!'])),
++        1 => format!("{}%", arb_text(&mut tc, 4)),
++        _ => format!("%{}%s", pick(&mut tc, &["5.", ".", "-."])),
++    };
++    same_as_python(&fmt, &Args::List(vec![Val::Int(1)]));
++}
++
++/// dynfmt/10: `%#X` prints the prefix in lower case, `0xFF`; Python (and C) print `0XFF`.
++#[hegel::test]
++fn alternate_upper_hex_prefix_is_upper(mut tc: TestCase) {
++    same_as_python("%#X", &Args::List(vec![Val::Int(n(&mut tc, 0, i64::MAX))]));
++}
