@@ -1,0 +1,710 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 0fcffbd..74bd7ea 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,3 +17,9 @@ itertools = { version = "0.15.0", default-features = false }
+ [features]
+ default = ["std"]
+ std = []
++
++[dev-dependencies.hegeltest]
++version = "0.44.1"
++
++[dev-dependencies.libc]
++version = "0.2"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..3af04a8
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,690 @@
++//! Hegel properties for printf-compat: glibc's `snprintf` is the oracle.
++//!
++//! The crate is driven exactly as its own `tests/tests.rs` drives it — a variadic Rust function
++//! hands the `VaList` to `printf_compat::format`, once through `output::fmt_write` and once
++//! through `output::io_write` — and glibc's `snprintf` receives the very same arguments.  The
++//! two writers must agree with each other (the upstream tests assert that), the returned byte
++//! count must be the output's length, and the output must be glibc's, except for the deviations
++//! `output::fmt_write` documents: precision on integers (issue #50), `%g`/`%a` aliased to `%f`,
++//! `0x` before uppercase hex and `0o` before octal, UTF-8 only.  Everything else that differs is
++//! a bug (bugs.toml); the general generators avoid the pinned shapes and each pinned property
++//! names its bug.
++#![allow(improper_ctypes_definitions)]
++
++use core::ffi::{c_char, c_int};
++use hegel::{generators, TestCase};
++use std::ffi::CString;
++use std::fmt;
++use std::io;
++use std::panic::{catch_unwind, AssertUnwindSafe};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo as i64).max_value($hi as i64)
++    };
++}
++
++fn n(tc: &mut TestCase, lo: i64, hi: i64) -> i64 {
++    tc.draw(int!(lo, hi))
++}
++
++fn pick<T: Copy>(tc: &mut TestCase, xs: &[T]) -> T {
++    xs[n(tc, 0, xs.len() as i64 - 1) as usize]
++}
++
++fn chance(tc: &mut TestCase, pct: i64) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++// --------------------------------------------------------------------------- driving the crate
++
++/// Output longer than this is refused by the writers (a runaway padding loop becomes an error
++/// instead of an out-of-memory).
++const LIMIT: usize = 1 << 17;
++
++struct Bounded(String);
++impl fmt::Write for Bounded {
++    fn write_str(&mut self, s: &str) -> fmt::Result {
++        if self.0.len() + s.len() > LIMIT {
++            return Err(fmt::Error);
++        }
++        self.0.push_str(s);
++        Ok(())
++    }
++}
++
++struct BoundedIo(Vec<u8>);
++impl io::Write for BoundedIo {
++    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
++        if self.0.len() + b.len() > LIMIT {
++            return Err(io::Error::other("bound"));
++        }
++        self.0.extend_from_slice(b);
++        Ok(b.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++/// What one call to the crate produced: the bytes, or why not.
++type Produced = Result<Vec<u8>, String>;
++
++#[derive(Debug)]
++struct Out {
++    fmt: Produced,
++    io: Produced,
++}
++
++fn judge(r: std::thread::Result<c_int>, bytes: Vec<u8>) -> Produced {
++    match r {
++        Ok(k) if k >= 0 && k as usize == bytes.len() => Ok(bytes),
++        Ok(k) if k >= 0 => Err(format!("returned {k} for {} bytes of output", bytes.len())),
++        Ok(k) => Err(format!("returned {k}")),
++        Err(_) => Err("panicked".into()),
++    }
++}
++
++/// The crate, through both writers.
++unsafe extern "C" fn crate_fmt(fmt: *const c_char, args: ...) -> Box<Out> {
++    let mut s = Bounded(String::new());
++    let a1 = args.clone();
++    let r1 = catch_unwind(AssertUnwindSafe(|| unsafe {
++        printf_compat::format(fmt, a1, printf_compat::output::fmt_write(&mut s))
++    }));
++    let mut v = BoundedIo(Vec::new());
++    let r2 = catch_unwind(AssertUnwindSafe(|| unsafe {
++        printf_compat::format(fmt, args, printf_compat::output::io_write(&mut v))
++    }));
++    Box::new(Out { fmt: judge(r1, s.0.into_bytes()), io: judge(r2, v.0) })
++}
++
++/// glibc and the crate, given the same variadic arguments.
++macro_rules! both {
++    ($fmt:expr $(, $a:expr)*) => {{
++        let cfmt = CString::new($fmt).unwrap();
++        let mut buf = vec![0u8; 2 * LIMIT];
++        let k = unsafe { libc::snprintf(buf.as_mut_ptr() as *mut c_char, buf.len(), cfmt.as_ptr() $(, $a)*) };
++        let c: Produced = if k >= 0 && (k as usize) < buf.len() {
++            buf.truncate(k as usize);
++            Ok(buf)
++        } else {
++            Err(format!("returned {k}"))
++        };
++        let r = unsafe { *crate_fmt(cfmt.as_ptr() $(, $a)*) };
++        (c, r)
++    }};
++}
++
++/// An argument as C sees it.
++#[derive(Clone, Debug)]
++enum CArg {
++    /// `int` (also what `hh` and `h` conversions read, and `%c`)
++    I(c_int),
++    /// `long` / `long long` / `ptrdiff_t`
++    L(i64),
++    /// `unsigned long` / `unsigned long long` / `size_t`
++    UL(u64),
++    /// `double`
++    F(f64),
++    /// `char *`
++    S(String),
++    /// a pointer value (`%s` of null prints `(null)`; `%p`)
++    P(usize),
++}
++
++/// Run one conversion with up to two `*` arguments before the value.
++fn run(fmt: &str, stars: &[c_int], arg: &CArg) -> (Produced, Out) {
++    let s;
++    let ptr = |a: &CArg| -> *const c_char {
++        match a {
++            CArg::P(p) => *p as *const c_char,
++            _ => unreachable!(),
++        }
++    };
++    match (stars, arg) {
++        ([], CArg::I(v)) => both!(fmt, *v),
++        ([], CArg::L(v)) => both!(fmt, *v),
++        ([], CArg::UL(v)) => both!(fmt, *v),
++        ([], CArg::F(v)) => both!(fmt, *v),
++        ([], CArg::S(v)) => {
++            s = CString::new(v.as_str()).unwrap();
++            both!(fmt, s.as_ptr())
++        }
++        ([], CArg::P(_)) => both!(fmt, ptr(arg)),
++        ([a], CArg::I(v)) => both!(fmt, *a, *v),
++        ([a], CArg::L(v)) => both!(fmt, *a, *v),
++        ([a], CArg::UL(v)) => both!(fmt, *a, *v),
++        ([a], CArg::F(v)) => both!(fmt, *a, *v),
++        ([a], CArg::S(v)) => {
++            s = CString::new(v.as_str()).unwrap();
++            both!(fmt, *a, s.as_ptr())
++        }
++        ([a], CArg::P(_)) => both!(fmt, *a, ptr(arg)),
++        ([a, b], CArg::I(v)) => both!(fmt, *a, *b, *v),
++        ([a, b], CArg::L(v)) => both!(fmt, *a, *b, *v),
++        ([a, b], CArg::UL(v)) => both!(fmt, *a, *b, *v),
++        ([a, b], CArg::F(v)) => both!(fmt, *a, *b, *v),
++        ([a, b], CArg::S(v)) => {
++            s = CString::new(v.as_str()).unwrap();
++            both!(fmt, *a, *b, s.as_ptr())
++        }
++        ([a, b], CArg::P(_)) => both!(fmt, *a, *b, ptr(arg)),
++        _ => unreachable!(),
++    }
++}
++
++/// Run a format string whose conversions all take `int` arguments.
++fn run_ints(fmt: &str, args: &[c_int]) -> (Produced, Out) {
++    match args {
++        [] => both!(fmt),
++        [a] => both!(fmt, *a),
++        [a, b] => both!(fmt, *a, *b),
++        [a, b, c] => both!(fmt, *a, *b, *c),
++        [a, b, c, d] => both!(fmt, *a, *b, *c, *d),
++        [a, b, c, d, e] => both!(fmt, *a, *b, *c, *d, *e),
++        _ => unreachable!(),
++    }
++}
++
++fn text(p: &Produced) -> String {
++    match p {
++        Ok(b) => format!("{:?}", String::from_utf8_lossy(b)),
++        Err(e) => e.clone(),
++    }
++}
++
++/// Both writers produce glibc's bytes and report their length.
++fn same_as_libc(what: &str, (c, r): (Produced, Out)) {
++    let expected = c.unwrap_or_else(|e| panic!("snprintf {what}: {e}"));
++    assert!(
++        r.fmt.as_ref() == Ok(&expected),
++        "{what}: fmt_write {} but glibc {}",
++        text(&r.fmt),
++        text(&Ok(expected.clone()))
++    );
++    assert!(
++        r.io.as_ref() == Ok(&expected),
++        "{what}: io_write {} but glibc {}",
++        text(&r.io),
++        text(&Ok(expected))
++    );
++}
++
++fn check(fmt: &str, stars: &[c_int], arg: &CArg) {
++    same_as_libc(&format!("{fmt:?} {stars:?} {arg:?}"), run(fmt, stars, arg));
++}
++
++// --------------------------------------------------------------------------- generators
++
++#[derive(Clone, Debug, Default)]
++struct Spec {
++    left: bool,
++    plus: bool,
++    space: bool,
++    zero: bool,
++    alt: bool,
++    /// a literal width, or `Some(None)` for `*`
++    width: Option<Option<i32>>,
++    /// a literal precision, or `Some(None)` for `*`
++    precision: Option<Option<i32>>,
++    length: &'static str,
++    conv: char,
++    /// the `*` values, width first
++    stars: Vec<c_int>,
++}
++
++impl Spec {
++    fn render(&self) -> String {
++        let mut s = String::from("%");
++        if self.left {
++            s.push('-');
++        }
++        if self.plus {
++            s.push('+');
++        }
++        if self.space {
++            s.push(' ');
++        }
++        if self.zero {
++            s.push('0');
++        }
++        if self.alt {
++            s.push('#');
++        }
++        match self.width {
++            Some(Some(w)) => s.push_str(&w.to_string()),
++            Some(None) => s.push('*'),
++            None => {}
++        }
++        match self.precision {
++            Some(Some(p)) => s.push_str(&format!(".{p}")),
++            Some(None) => s.push_str(".*"),
++            None => {}
++        }
++        s.push_str(self.length);
++        s.push(self.conv);
++        s
++    }
++
++    /// The width that will apply (0 when none).
++    fn effective_width(&self) -> i32 {
++        match self.width {
++            Some(Some(w)) => w,
++            Some(None) => self.stars[0],
++            None => 0,
++        }
++    }
++}
++
++fn arb_flags(tc: &mut TestCase, spec: &mut Spec) {
++    spec.left = chance(tc, 30);
++    spec.plus = chance(tc, 30);
++    spec.space = chance(tc, 30);
++    spec.zero = chance(tc, 30);
++}
++
++/// A width of 0..=hi, literal or `*`, or none.
++fn arb_width(tc: &mut TestCase, spec: &mut Spec, hi: i64) {
++    match n(tc, 0, 2) {
++        0 => spec.width = None,
++        1 => spec.width = Some(Some(n(tc, 0, hi) as i32)),
++        _ => {
++            spec.width = Some(None);
++            spec.stars.push(n(tc, 0, hi) as c_int);
++        }
++    }
++}
++
++/// A precision of 0..=hi, literal or `*`, or none.
++fn arb_precision(tc: &mut TestCase, spec: &mut Spec, hi: i64) {
++    match n(tc, 0, 2) {
++        0 => spec.precision = None,
++        1 => spec.precision = Some(Some(n(tc, 0, hi) as i32)),
++        _ => {
++            spec.precision = Some(None);
++            spec.stars.push(n(tc, 0, hi) as c_int);
++        }
++    }
++}
++
++fn arb_c_int(tc: &mut TestCase) -> c_int {
++    match n(tc, 0, 3) {
++        0 => n(tc, -300, 300) as c_int,
++        1 => pick(tc, &[0, 1, -1, 127, 128, 255, 256, 32767, 65535, 65536, c_int::MAX, c_int::MIN]),
++        _ => n(tc, c_int::MIN as i64, c_int::MAX as i64) as c_int,
++    }
++}
++
++fn arb_i64(tc: &mut TestCase) -> i64 {
++    match n(tc, 0, 3) {
++        0 => n(tc, -300, 300),
++        1 => pick(tc, &[0, 1, -1, i32::MAX as i64, i32::MIN as i64, i64::MAX, i64::MIN]),
++        _ => n(tc, i64::MIN, i64::MAX),
++    }
++}
++
++fn arb_u64(tc: &mut TestCase) -> u64 {
++    match n(tc, 0, 3) {
++        0 => n(tc, 0, 300) as u64,
++        1 => pick(tc, &[0, 1, u32::MAX as u64, i64::MAX as u64, u64::MAX]),
++        _ => (n(tc, i64::MIN, i64::MAX)) as u64,
++    }
++}
++
++/// A finite double: sign × m × 10^e, plus the zeros and a few extremes.
++fn arb_finite(tc: &mut TestCase) -> f64 {
++    match n(tc, 0, 9) {
++        0 => pick(tc, &[0.0, -0.0]),
++        1 => pick(tc, &[1e300, -1e300, 5e-324, f64::MAX, f64::MIN_POSITIVE, 1e-300]),
++        _ => {
++            let m = n(tc, 0, 999_999) as f64;
++            let e = n(tc, -25, 25) as i32;
++            let v = m * 10f64.powi(e);
++            if chance(tc, 40) { -v } else { v }
++        }
++    }
++}
++
++fn arb_ascii(tc: &mut TestCase, max_len: i64) -> String {
++    let len = n(tc, 0, max_len);
++    (0..len).map(|_| n(tc, 0x20, 0x7e) as u8 as char).collect()
++}
++
++/// The pinned shape of printf-compat/2: `-` with the space flag and no width.
++fn is_left_space_without_width(spec: &Spec) -> bool {
++    spec.left && spec.space && spec.effective_width() == 0
++}
++
++// --------------------------------------------------------------------------- general properties
++
++/// `d i u x X o` with every length modifier, every flag and any width print as glibc prints
++/// them.  Precision is left out (documented: ignored for integers, issue #50); `#` only goes
++/// with `x` of a non-zero value (`0X`/`0` prefixes are documented deviations, zero is pinned).
++#[hegel::test]
++fn integers_match_libc(mut tc: TestCase) {
++    let mut spec = Spec::default();
++    spec.conv = pick(&mut tc, &['d', 'i', 'u', 'x', 'X', 'o']);
++    let signed = matches!(spec.conv, 'd' | 'i');
++    spec.length = pick(&mut tc, &["", "", "hh", "h", "l", "ll", "z", "t"]);
++    arb_flags(&mut tc, &mut spec);
++    arb_width(&mut tc, &mut spec, 30);
++    let arg = match spec.length {
++        "" | "hh" | "h" => CArg::I(arb_c_int(&mut tc)),
++        _ if signed => CArg::L(arb_i64(&mut tc)),
++        _ => CArg::UL(arb_u64(&mut tc)),
++    };
++    if spec.conv == 'x' && chance(&mut tc, 30) {
++        spec.alt = true;
++        let nonzero = match (&arg, spec.length) {
++            (CArg::I(v), "") => *v != 0,
++            (CArg::UL(v), _) => *v != 0,
++            _ => false,
++        };
++        tc.assume(nonzero);
++    }
++    tc.assume(!(signed && is_left_space_without_width(&spec)));
++    check(&spec.render(), &spec.stars, &arg);
++}
++
++/// `f`/`F` of finite doubles with every flag, width and precision print as glibc prints them
++/// (both round the exact binary value).  `#` is pinned (printf-compat/7); `e`/`E` are pinned
++/// (printf-compat/1); `g`/`a` are documented aliases of `f`.
++#[hegel::test]
++fn floats_match_libc(mut tc: TestCase) {
++    let mut spec = Spec::default();
++    spec.conv = pick(&mut tc, &['f', 'F']);
++    arb_flags(&mut tc, &mut spec);
++    arb_width(&mut tc, &mut spec, 30);
++    arb_precision(&mut tc, &mut spec, 20);
++    let v = arb_finite(&mut tc);
++    tc.assume(!is_left_space_without_width(&spec));
++    check(&spec.render(), &spec.stars, &CArg::F(v));
++}
++
++/// `%s` of ASCII strings (and of a null pointer, `(null)`), `%c` of ASCII, and `%p` of non-null
++/// pointers, with width, precision and `-`, print as glibc prints them.
++#[hegel::test]
++fn strings_chars_and_pointers_match_libc(mut tc: TestCase) {
++    let mut spec = Spec::default();
++    spec.left = chance(&mut tc, 40);
++    arb_width(&mut tc, &mut spec, 20);
++    let arg = match n(&mut tc, 0, 3) {
++        0 | 1 => {
++            spec.conv = 's';
++            arb_precision(&mut tc, &mut spec, 15);
++            if chance(&mut tc, 15) {
++                // glibc prints nothing for a null with a precision under 6 (musl and the crate
++                // truncate "(null)"): implementation-defined, not compared
++                let precision = match spec.precision {
++                    Some(Some(p)) => Some(p),
++                    Some(None) => spec.stars.last().copied(),
++                    None => None,
++                };
++                tc.assume(precision.is_none_or(|p| p >= 6));
++                CArg::P(0)
++            } else {
++                CArg::S(arb_ascii(&mut tc, 12))
++            }
++        }
++        2 => {
++            spec.conv = 'c';
++            CArg::I(n(&mut tc, 1, 127) as c_int)
++        }
++        _ => {
++            spec.conv = 'p';
++            CArg::P(n(&mut tc, 1, i64::MAX) as usize)
++        }
++    };
++    check(&spec.render(), &spec.stars, &arg);
++}
++
++/// A format string of several `int` conversions, `*` widths, `%%` and verbatim text is the
++/// concatenation of its pieces, as glibc prints it, through both writers, with the byte count.
++#[hegel::test]
++fn format_strings_compose(mut tc: TestCase) {
++    let mut fmt = String::new();
++    let mut args: Vec<c_int> = Vec::new();
++    let pieces = n(&mut tc, 0, 6);
++    for _ in 0..pieces {
++        match n(&mut tc, 0, 3) {
++            0 => fmt.push_str("%%"),
++            1 => fmt.push_str(&arb_ascii(&mut tc, 6).replace('%', "x")),
++            _ => {
++                if args.len() >= 4 {
++                    continue;
++                }
++                let mut spec = Spec::default();
++                spec.conv = pick(&mut tc, &['d', 'i', 'u', 'x', 'X', 'o', 'c']);
++                if spec.conv != 'c' {
++                    arb_flags(&mut tc, &mut spec);
++                }
++                arb_width(&mut tc, &mut spec, 12);
++                if is_left_space_without_width(&spec) {
++                    spec.space = false;
++                }
++                if spec.conv == 'c' {
++                    spec.left = chance(&mut tc, 40);
++                }
++                let value = if spec.conv == 'c' { n(&mut tc, 1, 127) as c_int } else { arb_c_int(&mut tc) };
++                fmt.push_str(&spec.render());
++                args.extend(spec.stars.iter());
++                args.push(value);
++            }
++        }
++    }
++    same_as_libc(&format!("{fmt:?} {args:?}"), run_ints(&fmt, &args));
++}
++
++/// The upstream examples (tests/tests.rs) still hold.
++#[hegel::test]
++fn doc_examples(_tc: TestCase) {
++    check("% 0*i", &[17], &CArg::I(23125));
++    check("%- 010i", &[], &CArg::I(23125));
++    check("%+ 4i", &[], &CArg::I(23125));
++    check("%#- 010x", &[], &CArg::I(23125));
++    check("%.*f", &[3], &CArg::F(1234.0));
++    check("%10.4s", &[], &CArg::S("world".into()));
++    check("%s", &[], &CArg::P(0));
++    check("%hhi", &[], &CArg::I(-125));
++    check("%zi", &[], &CArg::UL(211_126_823_125));
++    same_as_libc("%%%% def", run_ints("abc %%%% def", &[]));
++    same_as_libc("%d%%", run_ints("%d%%", &[5]));
++}
++
++// --------------------------------------------------------------------------- pinned bugs
++
++/// printf-compat/1: `%e` prints the exponent as C does — a sign and at least two digits
++/// (`1.234000e+03`), not Rust's `1.234000e3`.
++#[hegel::test]
++fn e_exponent_has_a_sign_and_two_digits(mut tc: TestCase) {
++    let mut spec = Spec::default();
++    spec.conv = pick(&mut tc, &['e', 'E']);
++    arb_flags(&mut tc, &mut spec);
++    arb_width(&mut tc, &mut spec, 30);
++    arb_precision(&mut tc, &mut spec, 15);
++    let v = arb_finite(&mut tc);
++    tc.assume(!is_left_space_without_width(&spec));
++    check(&spec.render(), &spec.stars, &CArg::F(v));
++}
++
++/// printf-compat/2: `-` together with the space flag and no width (`%- d`, `%- f`) formats
++/// the number instead of panicking.
++#[hegel::test]
++fn left_adjust_with_space_and_no_width_formats(mut tc: TestCase) {
++    let mut spec = Spec { left: true, space: true, ..Spec::default() };
++    spec.zero = chance(&mut tc, 30);
++    if chance(&mut tc, 30) {
++        spec.width = Some(None);
++        spec.stars.push(0);
++    }
++    let arg = if chance(&mut tc, 50) {
++        spec.conv = 'd';
++        CArg::I(n(&mut tc, 0, 1000) as c_int)
++    } else {
++        spec.conv = 'f';
++        CArg::F(n(&mut tc, 0, 1000) as f64 / 8.0)
++    };
++    check(&spec.render(), &spec.stars, &arg);
++}
++
++/// printf-compat/3: a negative `*` width means left adjustment with its magnitude, as in C.
++#[hegel::test]
++fn negative_star_width_means_left_adjustment(mut tc: TestCase) {
++    let mut spec = Spec { width: Some(None), ..Spec::default() };
++    spec.stars.push(-n(&mut tc, 1, 30) as c_int);
++    spec.zero = chance(&mut tc, 30);
++    let arg = match n(&mut tc, 0, 3) {
++        0 => {
++            spec.conv = 'd';
++            CArg::I(arb_c_int(&mut tc))
++        }
++        1 => {
++            spec.conv = 'f';
++            CArg::F(arb_finite(&mut tc))
++        }
++        2 => {
++            spec.conv = 's';
++            CArg::S(arb_ascii(&mut tc, 8))
++        }
++        _ => {
++            spec.conv = 'c';
++            CArg::I(n(&mut tc, 1, 127) as c_int)
++        }
++    };
++    check(&spec.render(), &spec.stars, &arg);
++}
++
++/// printf-compat/4: widths and precisions above 65535 pad, as in C, instead of panicking.
++#[hegel::test]
++fn widths_above_u16_format(mut tc: TestCase) {
++    let big = n(&mut tc, 65536, 100_000) as i32;
++    match n(&mut tc, 0, 3) {
++        0 => check(&format!("%{big}d"), &[], &CArg::I(arb_c_int(&mut tc))),
++        1 => check("%*d", &[big], &CArg::I(arb_c_int(&mut tc))),
++        2 => check(&format!("%.{big}f"), &[], &CArg::F(n(&mut tc, 0, 1000) as f64 / 8.0)),
++        _ => check(&format!("%{big}s"), &[], &CArg::S(arb_ascii(&mut tc, 8))),
++    }
++}
++
++/// printf-compat/5: a width whose digits overflow `int` is an error (glibc returns -1), not a
++/// panic.
++#[hegel::test]
++fn width_digits_overflow_is_an_error(mut tc: TestCase) {
++    let digits = n(&mut tc, 10, 14);
++    let mut width = String::new();
++    width.push(pick(&mut tc, &['3', '5', '9']));
++    for _ in 1..digits {
++        width.push(n(&mut tc, b'0' as i64, b'9' as i64) as u8 as char);
++    }
++    let fmt = format!("%{width}d");
++    let (c, r) = run(&fmt, &[], &CArg::I(1));
++    assert!(c.is_err(), "glibc printed {fmt:?}");
++    assert_eq!(r.fmt, Err("returned -1".to_string()), "{fmt:?}: fmt_write");
++    assert_eq!(r.io, Err("returned -1".to_string()), "{fmt:?}: io_write");
++}
++
++/// printf-compat/6: infinities and NaNs print as glibc prints them — `nan`/`inf`, uppercase for
++/// `F`/`E`, the sign of a NaN, and space padding even with the `0` flag.
++#[hegel::test]
++fn non_finite_floats_match_libc(mut tc: TestCase) {
++    let mut spec = Spec::default();
++    spec.conv = pick(&mut tc, &['f', 'F', 'e', 'E']);
++    arb_flags(&mut tc, &mut spec);
++    arb_width(&mut tc, &mut spec, 12);
++    arb_precision(&mut tc, &mut spec, 6);
++    let v = pick(&mut tc, &[f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -f64::NAN]);
++    tc.assume(!is_left_space_without_width(&spec));
++    check(&spec.render(), &spec.stars, &CArg::F(v));
++}
++
++/// printf-compat/7: `#` keeps the decimal point of a float with precision 0 (`%#.0f` of 3 is
++/// `3.`), as the `Flags` documentation says.
++#[hegel::test]
++fn alternate_form_applies_to_floats(mut tc: TestCase) {
++    let mut spec = Spec { alt: true, precision: Some(Some(0)), ..Spec::default() };
++    spec.conv = pick(&mut tc, &['f', 'F']);
++    spec.left = chance(&mut tc, 30);
++    spec.plus = chance(&mut tc, 30);
++    arb_width(&mut tc, &mut spec, 12);
++    let v = n(&mut tc, -1000, 1000) as f64 + pick(&mut tc, &[0.0, 0.25, 0.5]);
++    check(&spec.render(), &spec.stars, &CArg::F(v));
++}
++
++/// printf-compat/8: `#` prepends nothing to a zero (`%#x` of 0 is `0`, not `0x0`).
++#[hegel::test]
++fn alternate_form_of_zero_has_no_prefix(mut tc: TestCase) {
++    let mut spec = Spec { alt: true, conv: 'x', ..Spec::default() };
++    spec.left = chance(&mut tc, 30);
++    spec.zero = chance(&mut tc, 30);
++    arb_width(&mut tc, &mut spec, 12);
++    let arg = if chance(&mut tc, 50) {
++        CArg::I(0)
++    } else {
++        spec.length = pick(&mut tc, &["l", "ll", "z"]);
++        CArg::UL(0)
++    };
++    check(&spec.render(), &spec.stars, &arg);
++}
++
++/// printf-compat/9: the width and precision of `%s` count bytes, as in C (and as `io_write`
++/// already does), not characters — `%5s` of `é` is three spaces and `é`.
++#[hegel::test]
++fn string_width_counts_bytes(mut tc: TestCase) {
++    let chars = ['é', 'ü', 'ñ', 'ß', 'ø', 'æ'];
++    let len = n(&mut tc, 1, 5);
++    let s: String = (0..len).map(|_| pick(&mut tc, &chars)).collect();
++    let mut spec = Spec { conv: 's', ..Spec::default() };
++    spec.left = chance(&mut tc, 40);
++    arb_width(&mut tc, &mut spec, 14);
++    if chance(&mut tc, 40) {
++        // precision at a character boundary: every character here is two bytes
++        spec.precision = Some(Some(2 * n(&mut tc, 0, 5) as i32));
++    }
++    check(&spec.render(), &spec.stars, &CArg::S(s));
++}
++
++/// printf-compat/10: `%p` of a null pointer prints `(nil)`, as glibc does.
++#[hegel::test]
++fn null_pointer_prints_nil(mut tc: TestCase) {
++    let mut spec = Spec { conv: 'p', ..Spec::default() };
++    spec.left = chance(&mut tc, 40);
++    arb_width(&mut tc, &mut spec, 12);
++    check(&spec.render(), &spec.stars, &CArg::P(0));
++}
++
++/// printf-compat/11: a negative `*` precision is taken as if the precision were omitted, as
++/// in C, instead of panicking.
++#[hegel::test]
++fn negative_star_precision_means_omitted(mut tc: TestCase) {
++    let mut spec = Spec { precision: Some(None), ..Spec::default() };
++    spec.stars.push(-n(&mut tc, 1, 30) as c_int);
++    let arg = match n(&mut tc, 0, 2) {
++        0 => {
++            spec.conv = 'd';
++            CArg::I(arb_c_int(&mut tc))
++        }
++        1 => {
++            spec.conv = 'f';
++            CArg::F(arb_finite(&mut tc))
++        }
++        _ => {
++            spec.conv = 's';
++            CArg::S(arb_ascii(&mut tc, 8))
++        }
++    };
++    check(&spec.render(), &spec.stars, &arg);
++}
++
++/// printf-compat/12: `%c` of a byte above 127 writes that one byte through `io_write` (which
++/// documents non-UTF-8 support), as C does, not two bytes of UTF-8.
++#[hegel::test]
++fn char_conversion_writes_one_byte(mut tc: TestCase) {
++    let byte = n(&mut tc, 0x80, 0xff) as c_int;
++    let mut spec = Spec { conv: 'c', ..Spec::default() };
++    spec.left = chance(&mut tc, 40);
++    arb_width(&mut tc, &mut spec, 6);
++    let (c, r) = run(&spec.render(), &spec.stars, &CArg::I(byte));
++    let expected = c.unwrap();
++    assert!(r.io.as_ref() == Ok(&expected), "%c of {byte:#x}: io_write {} but glibc {:?}", text(&r.io), expected);
++}
