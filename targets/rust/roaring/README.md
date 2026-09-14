@@ -45,3 +45,4 @@ fuzz target for that); performance claims.
   `SetOp` enum derives `hegel::PrettyPrintable`; `stateful::run(m, tc)` became
   `stateful::machine(m).run(tc)`.
 - 2026-09-13: base bumped 83caaca2ec5e → 0ce3fc8b55b1 (2026-08-12, "Merge pull request #364 from RoaringBitmap/upgrade-dependencies-bump-version"; 0.11.5); fixed upstream: roaring/1 (interval_store.rs boundary comparisons; both deterministic pins pass, and the model-based property is no longer an expected failure). 520 tests pass.
+- 2026-09-14: base bumped 0ce3fc8b55b1 → 0439d576fb3d (2026-09-14, "Merge pull request #367 from Liblor/serialize-bulk-copy"; 0.11.5); 0 bug(s) still reproduce. 523 tests pass.
