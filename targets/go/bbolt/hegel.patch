@@ -1,0 +1,881 @@
+diff --git a/go.mod b/go.mod
+index 1c4b600..4d0377f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -11,15 +11,18 @@ require (
+ 	go.etcd.io/gofail v0.2.0
+ 	golang.org/x/sync v0.23.0
+ 	golang.org/x/sys v0.47.0
++	hegel.dev/go/hegel v0.6.33
+ )
+ 
+ require (
+ 	github.com/aclements/go-moremath v0.0.0-20210112150236-f10218a38794 // indirect
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
+ 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+ 	go.yaml.in/yaml/v3 v3.0.5 // indirect
+-	golang.org/x/mod v0.27.0 // indirect
++	golang.org/x/mod v0.36.0 // indirect
+ 	golang.org/x/perf v0.0.0-20250813145418-2f7363a06fe1 // indirect
+-	golang.org/x/tools v0.36.0 // indirect
++	golang.org/x/telemetry v0.0.0-20260508192327-42602be52be6 // indirect
++	golang.org/x/tools v0.45.0 // indirect
+ )
+ 
+ tool (
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..cd5f645
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,850 @@
++// Hegel property tests for go.etcd.io/bbolt: a random sequence of transactions (puts, deletes,
++// nested buckets, moves, sequences, rollbacks, reopen) against an in-memory model of the key
++// space, with the cursor, ForEach, Stats, Compact and tx.Check() as the observers.
++package bbolt_test
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++
++	bolt "go.etcd.io/bbolt"
++	berrors "go.etcd.io/bbolt/errors"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---- the model -----------------------------------------------------------------------------
++
++// mbucket models a bucket: values, nested buckets and the sequence counter.
++type mbucket struct {
++	kv  map[string][]byte
++	sub map[string]*mbucket
++	seq uint64
++}
++
++func newMB() *mbucket { return &mbucket{kv: map[string][]byte{}, sub: map[string]*mbucket{}} }
++
++func (m *mbucket) clone() *mbucket {
++	c := &mbucket{kv: make(map[string][]byte, len(m.kv)), sub: make(map[string]*mbucket, len(m.sub)), seq: m.seq}
++	for k, v := range m.kv {
++		c.kv[k] = append([]byte(nil), v...)
++	}
++	for k, s := range m.sub {
++		c.sub[k] = s.clone()
++	}
++	return c
++}
++
++// keys returns every entry name (values and buckets) in order.
++func (m *mbucket) keys() []string {
++	ks := make([]string, 0, len(m.kv)+len(m.sub))
++	for k := range m.kv {
++		ks = append(ks, k)
++	}
++	for k := range m.sub {
++		ks = append(ks, k)
++	}
++	sort.Strings(ks)
++	return ks
++}
++
++// entries counts keys and bucket entries recursively (Stats().KeyN) and buckets inclusive
++// (Stats().BucketN).
++func (m *mbucket) entries() (keyN, bucketN int) {
++	keyN, bucketN = len(m.kv)+len(m.sub), 1
++	for _, s := range m.sub {
++		k, b := s.entries()
++		keyN += k
++		bucketN += b
++	}
++	return
++}
++
++// dump renders the bucket tree as text, for messages and for Compact comparisons.
++func (m *mbucket) dump(prefix string, sb *strings.Builder) {
++	for _, k := range m.keys() {
++		if s, ok := m.sub[k]; ok {
++			fmt.Fprintf(sb, "%s%q/ seq=%d\n", prefix, k, s.seq)
++			s.dump(prefix+"  ", sb)
++		} else {
++			fmt.Fprintf(sb, "%s%q=%q\n", prefix, k, m.kv[k])
++		}
++	}
++}
++
++// hegelDumpBucket renders a real bucket the same way.
++func hegelDumpBucket(b *bolt.Bucket, prefix string, sb *strings.Builder) {
++	c := b.Cursor()
++	for k, v := c.First(); k != nil; k, v = c.Next() {
++		if v == nil {
++			if s := b.Bucket(k); s != nil {
++				fmt.Fprintf(sb, "%s%q/ seq=%d\n", prefix, k, s.Sequence())
++				hegelDumpBucket(s, prefix+"  ", sb)
++				continue
++			}
++		}
++		fmt.Fprintf(sb, "%s%q=%q\n", prefix, k, v)
++	}
++}
++
++func dumpTx(tx *bolt.Tx) string {
++	var sb strings.Builder
++	tx.ForEach(func(name []byte, b *bolt.Bucket) error {
++		fmt.Fprintf(&sb, "%q/ seq=%d\n", name, b.Sequence())
++		hegelDumpBucket(b, "  ", &sb)
++		return nil
++	})
++	return sb.String()
++}
++
++func dumpModel(root *mbucket) string {
++	var sb strings.Builder
++	root.dump("", &sb)
++	return sb.String()
++}
++
++// ---- generators ----------------------------------------------------------------------------
++
++func genKey(tc hegel.TestCase) []byte {
++	switch n(tc, 1, 20) {
++	case 1:
++		return bytes.Repeat([]byte{byte('a' + n(tc, 0, 5))}, n(tc, 100, 2000))
++	case 2:
++		return []byte{byte(n(tc, 0, 255))}
++	default:
++		var sb strings.Builder
++		for i, k := 0, n(tc, 1, 3); i < k; i++ {
++			sb.WriteByte("abcxyz09"[n(tc, 0, 7)])
++		}
++		return []byte(sb.String())
++	}
++}
++
++func genValue(tc hegel.TestCase) []byte {
++	switch n(tc, 1, 20) {
++	case 1:
++		return bytes.Repeat([]byte{byte(n(tc, 0, 255))}, n(tc, 1000, 20000))
++	case 2:
++		return []byte{}
++	default:
++		b := make([]byte, n(tc, 0, 12))
++		for i := range b {
++			b[i] = byte(n(tc, 0, 255))
++		}
++		return b
++	}
++}
++
++// path picks an existing bucket by walking the model; it returns the model bucket, the real
++// one (nil for the root, whose operations go through tx) and the path for messages.
++func hegelPickBucket(tc hegel.TestCase, tx *bolt.Tx, root *mbucket) (*mbucket, *bolt.Bucket, string) {
++	m, path := root, ""
++	var b *bolt.Bucket
++	for len(m.sub) > 0 && chance(tc, 70) {
++		name := pick(tc, sortedNames(m.sub))
++		if b == nil {
++			b = tx.Bucket([]byte(name))
++		} else {
++			b = b.Bucket([]byte(name))
++		}
++		m = m.sub[name]
++		path += "/" + name
++	}
++	return m, b, path
++}
++
++func sortedNames(m map[string]*mbucket) []string {
++	ks := make([]string, 0, len(m))
++	for k := range m {
++		ks = append(ks, k)
++	}
++	sort.Strings(ks)
++	return ks
++}
++
++// pickName picks an existing entry name most of the time, a fresh key otherwise.
++func pickName(tc hegel.TestCase, m *mbucket) []byte {
++	if ks := m.keys(); len(ks) > 0 && chance(tc, 60) {
++		return []byte(pick(tc, ks))
++	}
++	return genKey(tc)
++}
++
++// ---- checks --------------------------------------------------------------------------------
++
++// compareBucket checks a real bucket against its model: Get, the cursor both ways, Seek at
++// every model key and at random keys, ForEach, Stats, the sequence.
++func compareBucket(ht *hegel.T, tc hegel.TestCase, b *bolt.Bucket, m *mbucket, path string, readOnly bool) {
++	want := m.keys()
++	// Forward and backward walks.
++	var fwd, bwd []string
++	c := b.Cursor()
++	for k, v := c.First(); k != nil; k, v = c.Next() {
++		fwd = append(fwd, string(k))
++		checkEntry(ht, m, path, k, v)
++	}
++	for k, v := c.Last(); k != nil; k, v = c.Prev() {
++		bwd = append(bwd, string(k))
++		checkEntry(ht, m, path, k, v)
++	}
++	if !sameStrings(fwd, want) {
++		ht.Fatalf("%s: cursor forward %q, model %q", path, fwd, want)
++	}
++	for i, j := 0, len(bwd)-1; i < j; i, j = i+1, j-1 {
++		bwd[i], bwd[j] = bwd[j], bwd[i]
++	}
++	if !sameStrings(bwd, want) {
++		ht.Fatalf("%s: cursor backward %q, model %q", path, bwd, want)
++	}
++	// Get of every model key and of a few others.
++	for _, k := range want {
++		checkEntry(ht, m, path, []byte(k), b.Get([]byte(k)))
++	}
++	for i := 0; i < 3; i++ {
++		k := genKey(tc)
++		checkEntry(ht, m, path, k, b.Get(k))
++		// Seek: the smallest key >= k.
++		sk, sv := c.Seek(k)
++		var wantSeek string
++		found := false
++		for _, mk := range want {
++			if mk >= string(k) {
++				wantSeek, found = mk, true
++				break
++			}
++		}
++		if found != (sk != nil) || found && string(sk) != wantSeek {
++			ht.Fatalf("%s: Seek(%q) = %q, model %q (%v)", path, k, sk, wantSeek, found)
++		}
++		if found {
++			checkEntry(ht, m, path, sk, sv)
++		}
++	}
++	// ForEach.
++	var fe []string
++	b.ForEach(func(k, v []byte) error {
++		fe = append(fe, string(k))
++		checkEntry(ht, m, path, k, v)
++		return nil
++	})
++	if !sameStrings(fe, want) {
++		ht.Fatalf("%s: ForEach %q, model %q", path, fe, want)
++	}
++	// Bucket() of every entry.
++	for _, k := range want {
++		_, isSub := m.sub[k]
++		if (b.Bucket([]byte(k)) != nil) != isSub {
++			ht.Fatalf("%s: Bucket(%q) present %v, model bucket %v", path, k, b.Bucket([]byte(k)) != nil, isSub)
++		}
++	}
++	if b.Sequence() != m.seq {
++		ht.Fatalf("%s: Sequence() = %d, model %d", path, b.Sequence(), m.seq)
++	}
++	if readOnly {
++		st := b.Stats()
++		keyN, bucketN := m.entries()
++		if st.KeyN != keyN || st.BucketN != bucketN {
++			ht.Fatalf("%s: Stats KeyN %d BucketN %d, model %d %d", path, st.KeyN, st.BucketN, keyN, bucketN)
++		}
++	}
++	for _, k := range sortedNames(m.sub) {
++		compareBucket(ht, tc, b.Bucket([]byte(k)), m.sub[k], path+"/"+k, readOnly)
++	}
++}
++
++func sameStrings(a, b []string) bool {
++	return len(a) == len(b) && (len(a) == 0 || reflect.DeepEqual(a, b))
++}
++
++func checkEntry(ht *hegel.T, m *mbucket, path string, k, v []byte) {
++	if _, ok := m.sub[string(k)]; ok {
++		if v != nil {
++			ht.Fatalf("%s: bucket entry %q has value %q", path, k, v)
++		}
++		return
++	}
++	want, ok := m.kv[string(k)]
++	if !ok {
++		if v != nil {
++			ht.Fatalf("%s: %q = %q, not in the model", path, k, v)
++		}
++		return
++	}
++	if v == nil || !bytes.Equal(v, want) {
++		ht.Fatalf("%s: %q = %q (nil %v), model %q", path, k, v, v == nil, want)
++	}
++}
++
++func compareTx(ht *hegel.T, tc hegel.TestCase, tx *bolt.Tx, root *mbucket, readOnly bool) {
++	var names []string
++	tx.ForEach(func(name []byte, b *bolt.Bucket) error {
++		names = append(names, string(name))
++		return nil
++	})
++	if !sameStrings(names, sortedNames(root.sub)) {
++		ht.Fatalf("top-level buckets %q, model %q", names, sortedNames(root.sub))
++	}
++	for _, k := range names {
++		compareBucket(ht, tc, tx.Bucket([]byte(k)), root.sub[k], "/"+k, readOnly)
++	}
++	for i := 0; i < 2; i++ {
++		if k := genKey(tc); (tx.Bucket(k) != nil) != (root.sub[string(k)] != nil) {
++			ht.Fatalf("tx.Bucket(%q) present %v, model %v", k, tx.Bucket(k) != nil, root.sub[string(k)] != nil)
++		}
++	}
++}
++
++func checkIntegrity(ht *hegel.T, db *bolt.DB, what string) {
++	var errs []string
++	db.View(func(tx *bolt.Tx) error {
++		for e := range tx.Check() {
++			errs = append(errs, e.Error())
++		}
++		return nil
++	})
++	if len(errs) > 0 {
++		ht.Fatalf("tx.Check() after %s: %s", what, strings.Join(errs, "; "))
++	}
++}
++
++func openDB(t testing.TB, dir string, id int) *bolt.DB {
++	db, err := bolt.Open(filepath.Join(dir, fmt.Sprintf("db%d.bolt", id)), 0o600, &bolt.Options{NoSync: true})
++	if err != nil {
++		t.Fatalf("Open: %v", err)
++	}
++	return db
++}
++
++// ---- operations ----------------------------------------------------------------------------
++
++var errRollback = errors.New("roll back on purpose")
++
++// isDescendant reports whether dst is m or lies inside m.
++func isDescendant(m, dst *mbucket) bool {
++	if m == dst {
++		return true
++	}
++	for _, s := range m.sub {
++		if isDescendant(s, dst) {
++			return true
++		}
++	}
++	return false
++}
++
++// step performs one random operation inside a writable transaction, applying it to the model
++// and checking the immediate result. touched records buckets modified in this transaction
++// (bbolt/1: a moved bucket must not have been changed earlier in the same transaction).
++func step(ht *hegel.T, tc hegel.TestCase, tx *bolt.Tx, root *mbucket, touched map[*mbucket]bool) {
++	m, b, path := hegelPickBucket(tc, tx, root)
++	put := func(k, v []byte) error {
++		if b == nil {
++			return berrors.ErrIncompatibleValue // stands for "not possible at the root"
++		}
++		return b.Put(k, v)
++	}
++	switch op := n(tc, 1, 14); {
++	case op <= 4 && b != nil: // Put
++		k, v := pickName(tc, m), genValue(tc)
++		err := put(k, v)
++		if _, isSub := m.sub[string(k)]; isSub {
++			if !errors.Is(err, berrors.ErrIncompatibleValue) {
++				ht.Fatalf("%s: Put on bucket entry %q: %v", path, k, err)
++			}
++			return
++		}
++		if err != nil {
++			ht.Fatalf("%s: Put(%q, %d bytes): %v", path, k, len(v), err)
++		}
++		m.kv[string(k)] = append([]byte(nil), v...)
++		touched[m] = true
++		if got := b.Get(k); !bytes.Equal(got, v) || got == nil {
++			ht.Fatalf("%s: Get after Put(%q) = %q, want %q", path, k, got, v)
++		}
++	case op == 5 && b != nil: // Delete
++		k := pickName(tc, m)
++		err := b.Delete(k)
++		if _, isSub := m.sub[string(k)]; isSub {
++			if !errors.Is(err, berrors.ErrIncompatibleValue) {
++				ht.Fatalf("%s: Delete of bucket entry %q: %v", path, k, err)
++			}
++			return
++		}
++		if err != nil {
++			ht.Fatalf("%s: Delete(%q): %v", path, k, err)
++		}
++		delete(m.kv, string(k))
++		touched[m] = true
++		if got := b.Get(k); got != nil {
++			ht.Fatalf("%s: Get after Delete(%q) = %q", path, k, got)
++		}
++	case op == 6 || op == 7: // CreateBucket / CreateBucketIfNotExists
++		k := pickName(tc, m)
++		if len(m.sub) > 2 && chance(tc, 50) {
++			k = genKey(tc)
++		}
++		create := func() (*bolt.Bucket, error) {
++			switch {
++			case b == nil && op == 6:
++				return tx.CreateBucket(k)
++			case b == nil:
++				return tx.CreateBucketIfNotExists(k)
++			case op == 6:
++				return b.CreateBucket(k)
++			default:
++				return b.CreateBucketIfNotExists(k)
++			}
++		}
++		nb, err := create()
++		_, isSub := m.sub[string(k)]
++		_, isKey := m.kv[string(k)]
++		switch {
++		case isKey:
++			if !errors.Is(err, berrors.ErrIncompatibleValue) {
++				ht.Fatalf("%s: CreateBucket(%q) over a key: %v", path, k, err)
++			}
++		case isSub && op == 6:
++			if !errors.Is(err, berrors.ErrBucketExists) {
++				ht.Fatalf("%s: CreateBucket(%q) twice: %v", path, k, err)
++			}
++		case isSub:
++			if err != nil || nb == nil {
++				ht.Fatalf("%s: CreateBucketIfNotExists(%q) existing: %v", path, k, err)
++			}
++		default:
++			if err != nil || nb == nil {
++				ht.Fatalf("%s: CreateBucket(%q): %v", path, k, err)
++			}
++			m.sub[string(k)] = newMB()
++			touched[m] = true
++			if b != nil && b.Get(k) != nil {
++				ht.Fatalf("%s: Get(%q) of a new bucket is not nil", path, k)
++			}
++		}
++	case op == 8: // DeleteBucket
++		k := pickName(tc, m)
++		var err error
++		if b == nil {
++			err = tx.DeleteBucket(k)
++		} else {
++			err = b.DeleteBucket(k)
++		}
++		_, isSub := m.sub[string(k)]
++		_, isKey := m.kv[string(k)]
++		switch {
++		case isSub:
++			if err != nil {
++				ht.Fatalf("%s: DeleteBucket(%q): %v", path, k, err)
++			}
++			delete(m.sub, string(k))
++			touched[m] = true
++		case isKey:
++			if !errors.Is(err, berrors.ErrIncompatibleValue) {
++				ht.Fatalf("%s: DeleteBucket(%q) of a key: %v", path, k, err)
++			}
++		default:
++			if !errors.Is(err, berrors.ErrBucketNotFound) {
++				ht.Fatalf("%s: DeleteBucket(%q) missing: %v", path, k, err)
++			}
++		}
++	case op == 9 && b != nil: // sequences
++		if chance(tc, 50) {
++			v := uint64(n(tc, 0, 1<<30))
++			if err := b.SetSequence(v); err != nil {
++				ht.Fatalf("%s: SetSequence: %v", path, err)
++			}
++			m.seq = v
++		} else {
++			got, err := b.NextSequence()
++			if err != nil || got != m.seq+1 {
++				ht.Fatalf("%s: NextSequence = %d, %v; model %d", path, got, err, m.seq+1)
++			}
++			m.seq++
++		}
++		touched[m] = true
++	case op == 10: // MoveBucket (legal cases only; the illegal ones are bbolt/2)
++		names := sortedNames(m.sub)
++		if len(names) == 0 {
++			return
++		}
++		k := pick(tc, names)
++		moved := m.sub[k]
++		if touched[moved] || anyTouched(moved, touched) {
++			return
++		}
++		dm, db, dpath := hegelPickBucket(tc, tx, root)
++		if isDescendant(moved, dm) || dm == m {
++			return
++		}
++		if _, clash := dm.kv[k]; clash {
++			return
++		}
++		if _, clash := dm.sub[k]; clash {
++			return
++		}
++		var err error
++		switch {
++		case b == nil:
++			err = tx.MoveBucket([]byte(k), nil, db)
++		case db == nil:
++			err = tx.MoveBucket([]byte(k), b, nil)
++		default:
++			err = b.MoveBucket([]byte(k), db)
++		}
++		if err != nil {
++			ht.Fatalf("MoveBucket(%q) from %s to %s: %v", k, path, dpath, err)
++		}
++		delete(m.sub, k)
++		dm.sub[k] = moved
++		touched[m], touched[dm] = true, true
++	case op == 11: // errors on blank names and a read-only-style misuse
++		if b != nil {
++			if err := b.Put(nil, []byte("x")); !errors.Is(err, berrors.ErrKeyRequired) {
++				ht.Fatalf("%s: Put(nil): %v", path, err)
++			}
++			if err := b.Put(make([]byte, bolt.MaxKeySize+1), nil); !errors.Is(err, berrors.ErrKeyTooLarge) {
++				ht.Fatalf("%s: Put(too large key): %v", path, err)
++			}
++		}
++		var err error
++		if b == nil {
++			_, err = tx.CreateBucket(nil)
++		} else {
++			_, err = b.CreateBucket([]byte{})
++		}
++		if !errors.Is(err, berrors.ErrBucketNameRequired) {
++			ht.Fatalf("%s: CreateBucket(blank): %v", path, err)
++		}
++	case op == 12 && b != nil: // cursor deletes of a random subset
++		c := b.Cursor()
++		var del []string
++		for k, _ := c.First(); k != nil; k, _ = c.Next() {
++			if _, isSub := m.sub[string(k)]; isSub {
++				if err := c.Delete(); !errors.Is(err, berrors.ErrIncompatibleValue) {
++					ht.Fatalf("%s: Cursor.Delete on bucket %q: %v", path, k, err)
++				}
++				continue
++			}
++			if chance(tc, 40) {
++				if err := c.Delete(); err != nil {
++					ht.Fatalf("%s: Cursor.Delete(%q): %v", path, k, err)
++				}
++				del = append(del, string(k))
++			}
++		}
++		for _, k := range del {
++			delete(m.kv, k)
++		}
++		if len(del) > 0 {
++			touched[m] = true
++		}
++	default: // read back in the middle of the transaction
++		if b != nil {
++			compareBucket(ht, tc, b, m, path, false)
++		}
++	}
++}
++
++func anyTouched(m *mbucket, touched map[*mbucket]bool) bool {
++	if touched[m] {
++		return true
++	}
++	for _, s := range m.sub {
++		if anyTouched(s, touched) {
++			return true
++		}
++	}
++	return false
++}
++
++// hegelRun drives a database through random transactions against the model and returns the model.
++func hegelRun(ht *hegel.T, t testing.TB, dir string, db **bolt.DB, id int, txs int) *mbucket {
++	root := newMB()
++	for i := 0; i < txs; i++ {
++		before := root.clone()
++		touched := map[*mbucket]bool{}
++		rollback := chance(ht, 15)
++		err := (*db).Update(func(tx *bolt.Tx) error {
++			for j, k := 0, n(ht, 1, 6); j < k; j++ {
++				step(ht, ht, tx, root, touched)
++			}
++			compareTx(ht, ht, tx, root, false)
++			if rollback {
++				return errRollback
++			}
++			return nil
++		})
++		if rollback {
++			if !errors.Is(err, errRollback) {
++				ht.Fatalf("Update returning an error: %v", err)
++			}
++			root = before
++		} else if err != nil {
++			ht.Fatalf("Update: %v", err)
++		}
++		checkIntegrity(ht, *db, fmt.Sprintf("transaction %d", i))
++		if chance(ht, 15) {
++			path := (*db).Path()
++			if err := (*db).Close(); err != nil {
++				ht.Fatalf("Close: %v", err)
++			}
++			var err error
++			*db, err = bolt.Open(path, 0o600, &bolt.Options{NoSync: true})
++			if err != nil {
++				ht.Fatalf("reopen: %v", err)
++			}
++		}
++		(*db).View(func(tx *bolt.Tx) error {
++			compareTx(ht, ht, tx, root, true)
++			return nil
++		})
++	}
++	return root
++}
++
++// TestHegelDatabaseFollowsTheModel: puts, deletes, nested buckets (create, delete, move),
++// sequences, cursor deletes, rollbacks and reopens against the model; after every commit
++// tx.Check() is clean and a read-only transaction sees exactly the model (cursor both ways,
++// Get, Seek, ForEach, Bucket, Sequence, Stats).
++func TestHegelDatabaseFollowsTheModel(t *testing.T) {
++	dir := t.TempDir()
++	id := 0
++	property(t, func(ht *hegel.T) {
++		id++
++		db := openDB(t, dir, id)
++		defer func() {
++			db.Close()
++			os.Remove(db.Path())
++		}()
++		root := hegelRun(ht, t, dir, &db, id, n(ht, 1, 8))
++		note(ht, "final model:\n%s", dumpModel(root))
++		// Read-only transactions refuse writes.
++		db.View(func(tx *bolt.Tx) error {
++			if _, err := tx.CreateBucket([]byte("ro")); !errors.Is(err, berrors.ErrTxNotWritable) {
++				ht.Fatalf("CreateBucket in View: %v", err)
++			}
++			for _, name := range sortedNames(root.sub) {
++				b := tx.Bucket([]byte(name))
++				if err := b.Put([]byte("k"), nil); !errors.Is(err, berrors.ErrTxNotWritable) {
++					ht.Fatalf("Put in View: %v", err)
++				}
++				if err := b.Delete([]byte("k")); !errors.Is(err, berrors.ErrTxNotWritable) {
++					ht.Fatalf("Delete in View: %v", err)
++				}
++				if _, err := b.NextSequence(); !errors.Is(err, berrors.ErrTxNotWritable) {
++					ht.Fatalf("NextSequence in View: %v", err)
++				}
++				if err := tx.DeleteBucket([]byte(name)); !errors.Is(err, berrors.ErrTxNotWritable) {
++					ht.Fatalf("DeleteBucket in View: %v", err)
++				}
++			}
++			return nil
++		})
++	})
++}
++
++// TestHegelCompactAndCopyPreserveContents: after random transactions, bolt.Compact into a
++// fresh file and tx.WriteTo into another give databases with exactly the model's contents
++// (and clean tx.Check()).
++func TestHegelCompactAndCopyPreserveContents(t *testing.T) {
++	dir := t.TempDir()
++	id := 0
++	property(t, func(ht *hegel.T) {
++		id += 2
++		db := openDB(t, dir, id)
++		defer func() {
++			db.Close()
++			os.Remove(db.Path())
++		}()
++		root := hegelRun(ht, t, dir, &db, id, n(ht, 1, 5))
++		want := dumpModel(root)
++		note(ht, "model:\n%s", want)
++
++		dst := openDB(t, dir, id+1)
++		defer func() {
++			dst.Close()
++			os.Remove(dst.Path())
++		}()
++		if err := bolt.Compact(dst, db, int64(n(ht, 0, 1<<20))); err != nil {
++			ht.Fatalf("Compact: %v", err)
++		}
++		checkIntegrity(ht, dst, "Compact")
++		dst.View(func(tx *bolt.Tx) error {
++			if got := dumpTx(tx); got != want {
++				ht.Fatalf("Compact gave\n%s\nwant\n%s", got, want)
++			}
++			return nil
++		})
++
++		copyPath := filepath.Join(dir, fmt.Sprintf("copy%d.bolt", id))
++		if err := db.View(func(tx *bolt.Tx) error { return tx.CopyFile(copyPath, 0o600) }); err != nil {
++			ht.Fatalf("CopyFile: %v", err)
++		}
++		cp, err := bolt.Open(copyPath, 0o600, &bolt.Options{NoSync: true, ReadOnly: true})
++		if err != nil {
++			ht.Fatalf("Open(copy): %v", err)
++		}
++		defer func() {
++			cp.Close()
++			os.Remove(copyPath)
++		}()
++		checkIntegrity(ht, cp, "CopyFile")
++		cp.View(func(tx *bolt.Tx) error {
++			if got := dumpTx(tx); got != want {
++				ht.Fatalf("CopyFile gave\n%s\nwant\n%s", got, want)
++			}
++			return nil
++		})
++	})
++}
++
++// ---- pinned bugs ---------------------------------------------------------------------------
++
++// bbolt/1: MoveBucket copies the sub-bucket's header from the parent page and drops the
++// bucket from the parent's in-memory children, so changes made to the sub-bucket earlier in
++// the same transaction (Put, Delete, nested CreateBucket) are lost after the move.
++func TestHegelMoveBucketKeepsChangesMadeInTheSameTransaction(t *testing.T) {
++	dir := t.TempDir()
++	id := 0
++	property(t, func(ht *hegel.T) {
++		id++
++		db := openDB(t, dir, id)
++		defer db.Close()
++		preexisting := chance(ht, 50)
++		if preexisting {
++			if err := db.Update(func(tx *bolt.Tx) error {
++				a, _ := tx.CreateBucket([]byte("a"))
++				sub, err := a.CreateBucket([]byte("sub"))
++				if err != nil {
++					return err
++				}
++				tx.CreateBucket([]byte("dst"))
++				return sub.Put([]byte("old"), []byte("1"))
++			}); err != nil {
++				ht.Fatalf("setup: %v", err)
++			}
++		}
++		err := db.Update(func(tx *bolt.Tx) error {
++			a, _ := tx.CreateBucketIfNotExists([]byte("a"))
++			dst, _ := tx.CreateBucketIfNotExists([]byte("dst"))
++			sub, err := a.CreateBucketIfNotExists([]byte("sub"))
++			if err != nil {
++				return err
++			}
++			if err := sub.Put([]byte("new"), []byte("2")); err != nil {
++				return err
++			}
++			return a.MoveBucket([]byte("sub"), dst)
++		})
++		if err != nil {
++			ht.Fatalf("Update: %v", err)
++		}
++		db.View(func(tx *bolt.Tx) error {
++			sub := tx.Bucket([]byte("dst")).Bucket([]byte("sub"))
++			if sub == nil {
++				ht.Fatalf("dst/sub missing after the move")
++			}
++			if got := sub.Get([]byte("new")); !bytes.Equal(got, []byte("2")) {
++				ht.Fatalf("dst/sub/new = %q after MoveBucket (pre-existing bucket: %v), want \"2\"", got, preexisting)
++			}
++			return nil
++		})
++	})
++}
++
++// bbolt/2: MoveBucket into the moved bucket itself or into one of its descendants succeeds
++// and the bucket vanishes; with a descendant target tx.Check() then reports unreachable pages.
++func TestHegelMoveBucketRefusesCycles(t *testing.T) {
++	dir := t.TempDir()
++	id := 0
++	property(t, func(ht *hegel.T) {
++		id++
++		db := openDB(t, dir, id)
++		defer db.Close()
++		intoSelf := chance(ht, 50)
++		if err := db.Update(func(tx *bolt.Tx) error {
++			a, _ := tx.CreateBucket([]byte("a"))
++			b, err := a.CreateBucket([]byte("b"))
++			if err != nil {
++				return err
++			}
++			b.Put([]byte("k"), []byte("v"))
++			return a.Put([]byte("x"), []byte("y"))
++		}); err != nil {
++			ht.Fatalf("setup: %v", err)
++		}
++		err := db.Update(func(tx *bolt.Tx) error {
++			a := tx.Bucket([]byte("a"))
++			dst := a
++			if !intoSelf {
++				dst = a.Bucket([]byte("b"))
++			}
++			return tx.MoveBucket([]byte("a"), nil, dst)
++		})
++		if err == nil {
++			var errs []string
++			db.View(func(tx *bolt.Tx) error {
++				for e := range tx.Check() {
++					errs = append(errs, e.Error())
++				}
++				return nil
++			})
++			ht.Fatalf("MoveBucket of \"a\" into %s succeeded; buckets now %q; tx.Check(): %v", map[bool]string{true: "itself", false: "its child a/b"}[intoSelf], topLevel(db), errs)
++		}
++	})
++}
++
++func topLevel(db *bolt.DB) []string {
++	var names []string
++	db.View(func(tx *bolt.Tx) error {
++		return tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
++			names = append(names, string(name))
++			return nil
++		})
++	})
++	return names
++}
