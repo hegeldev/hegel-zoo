@@ -50,7 +50,7 @@ stdin/stdout (hex-encoded, space-separated fields, one request per line, behind 
   back — uv handles locals before resolution), and the release-only conversion against
   `contains` on release-only specifiers and candidates.
 
-## Bugs (10, all zoo-original)
+## Bugs (11, all zoo-original)
 
 `packaging` 26.3 disagrees with the crate in ten places; four of them are already fixed in uv's
 fork, none in the published crate. See `bugs.toml`.
@@ -65,6 +65,10 @@ fork, none in the published crate. See `bugs.toml`.
   (`with_min` sorts below the whole release). (Fixed in uv.)
 - **pep440_rs/10** (low) — the range of `>1.0.post0` starts at `1.0.post1` and skips
   `1.0.post1.dev0`. (Fixed in uv.)
+- **pep440_rs/11** (medium) — `===foobar`, `===1.0-custom`, `===1.0.*` are rejected: the
+  operand of arbitrary equality is parsed as a PEP 440 version, where the spec (and
+  `packaging`) take any string. Found through pep508_rs/3, pinned here at the root
+  (2026-09-14).
 - **pep440_rs/3** (low) — the range conversions overflow on `u64::MAX` numbers.
 - **pep440_rs/4** (low) — `VersionSpecifiers::from_str(">=1.0,")` fails; `packaging` skips
   blank items.
