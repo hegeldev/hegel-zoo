@@ -1,0 +1,667 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7d176a8..ddf6e92 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,3 +19,4 @@ rowan = "0.16"
+ 
+ [dev-dependencies]
+ tempfile = "3"
++hegeltest = "0.44.1"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..bb30889
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,652 @@
++//! Hegel property tests for patchkit.
++//!
++//! References: **GNU diff** (`diff -u`, `diff -ruN`, and its normal format) writes the
++//! patches the parsers read, **GNU patch** (`patch -F<fuzz> -f -o out`) is the reference
++//! for exact and fuzzy application (success, patched content, per-hunk offset and fuzz,
++//! what is left on disk after a partial failure), **patchutils' `lsdiff`** for the file
++//! names of a multi-file patch, **quilt** (`quilt series`) for series files, and
++//! **coreutils `date`** for patch timestamps.
++
++use hegel::generators;
++use hegel::Generator;
++use patchkit::apply::ApplyOptions;
++use patchkit::ed::EdPatch;
++use patchkit::quilt::{Series, SeriesEntry};
++use patchkit::timestamp::{format_patch_date, parse_patch_date, FormatPatchDateError};
++use patchkit::unified::{splitlines, HunkLine, PlainOrBinaryPatch, UnifiedPatch};
++use patchkit::ContentPatch;
++use std::fmt::Debug;
++use std::io::Write;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++// ---------------------------------------------------------------------------
++// Scratch files and the external tools
++// ---------------------------------------------------------------------------
++
++/// A fresh scratch directory per call (one per test case; removed by the caller).
++fn scratch() -> PathBuf {
++    static N: AtomicUsize = AtomicUsize::new(0);
++    let dir = std::env::temp_dir().join(format!("hegel-zoo-patchkit-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
++    std::fs::create_dir_all(&dir).unwrap();
++    dir
++}
++
++fn write(dir: &Path, name: &str, data: &[u8]) -> PathBuf {
++    let p = dir.join(name);
++    if let Some(parent) = p.parent() {
++        std::fs::create_dir_all(parent).unwrap();
++    }
++    std::fs::write(&p, data).unwrap();
++    p
++}
++
++/// `diff -u` of two files; with `labels`, the names are `a/file` and `b/file` (no timestamps).
++fn diff_u(dir: &Path, orig: &[u8], modified: &[u8], labels: bool) -> Vec<u8> {
++    write(dir, "orig", orig);
++    write(dir, "mod", modified);
++    let mut cmd = Command::new("diff");
++    cmd.current_dir(dir).arg("-u");
++    if labels {
++        cmd.args(["--label", "a/file", "--label", "b/file"]);
++    }
++    let out = cmd.args(["orig", "mod"]).output().unwrap();
++    assert!(out.status.code() == Some(0) || out.status.code() == Some(1), "diff -u: {}", String::from_utf8_lossy(&out.stderr));
++    out.stdout
++}
++
++/// `diff` (normal format) of two files.
++fn diff_normal(dir: &Path, orig: &[u8], modified: &[u8]) -> Vec<u8> {
++    write(dir, "orig", orig);
++    write(dir, "mod", modified);
++    let out = Command::new("diff").current_dir(dir).args(["orig", "mod"]).output().unwrap();
++    assert!(out.status.code() == Some(0) || out.status.code() == Some(1), "diff: {}", String::from_utf8_lossy(&out.stderr));
++    out.stdout
++}
++
++/// What GNU patch did with a patch.
++#[derive(Debug, Clone, PartialEq)]
++struct GnuPatch {
++    /// Exit status: 0 all hunks applied, 1 some failed.
++    code: i32,
++    /// The output file (what patch left on disk).
++    output: Vec<u8>,
++    /// Per hunk (index, offset, fuzz), `None` for a failed hunk.
++    hunks: Vec<Option<(isize, usize)>>,
++}
++
++/// Run `patch -f -F<fuzz> -o out -r rej in < patch` and read its report.
++fn gnu_patch(dir: &Path, input: &[u8], patch: &[u8], fuzz: usize) -> GnuPatch {
++    let inp = write(dir, "in", input);
++    let outp = dir.join("out");
++    let rej = dir.join("rej");
++    let _ = std::fs::remove_file(&outp);
++    let mut child = Command::new("patch")
++        .current_dir(dir)
++        .arg("-f")
++        .arg("--no-backup-if-mismatch")
++        .arg(format!("-F{fuzz}"))
++        .arg("-o")
++        .arg(&outp)
++        .arg("-r")
++        .arg(&rej)
++        .arg(&inp)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    child.stdin.take().unwrap().write_all(patch).unwrap();
++    let out = child.wait_with_output().unwrap();
++    let code = out.status.code().unwrap_or(2);
++    assert!(code < 2, "patch failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
++    let output = std::fs::read(&outp).unwrap_or_default();
++    // "Hunk #2 succeeded at 5 with fuzz 1 (offset 2 lines)." / "Hunk #1 FAILED at 1."
++    let text = String::from_utf8_lossy(&out.stdout).to_string();
++    let n_hunks = patch.split(|&b| b == b'\n').filter(|l| l.starts_with(b"@@ ")).count();
++    let mut hunks = vec![Some((0isize, 0usize)); n_hunks];
++    for line in text.lines() {
++        let Some(rest) = line.strip_prefix("Hunk #") else { continue };
++        let (idx, rest) = rest.split_once(' ').unwrap();
++        let idx: usize = idx.parse().unwrap();
++        if rest.starts_with("FAILED") {
++            hunks[idx - 1] = None;
++        } else {
++            let mut fuzz = 0;
++            let mut offset = 0isize;
++            if let Some((_, f)) = rest.split_once("with fuzz ") {
++                fuzz = f.split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap();
++            }
++            if let Some((_, o)) = rest.split_once("(offset ") {
++                offset = o.split(' ').next().unwrap().parse().unwrap();
++            }
++            hunks[idx - 1] = Some((offset, fuzz));
++        }
++    }
++    GnuPatch { code, output, hunks }
++}
++
++fn has(tool: &str) -> bool {
++    Command::new(tool).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
++}
++
++// ---------------------------------------------------------------------------
++// Generators
++// ---------------------------------------------------------------------------
++
++fn pick<T: Clone + Send + Sync + Debug + 'static>(tc: &hegel::TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++const WORDS: &[&str] = &["a", "b", "c", "d", "x y", "", "\t", "--- not a header", "+plus", "@@ -1 +1 @@", "\\ backslash"];
++
++fn arb_line(tc: &hegel::TestCase) -> Vec<u8> {
++    format!("{}\n", pick(tc, WORDS)).into_bytes()
++}
++
++/// A file of 0–10 lines, sometimes without a final newline.
++#[derive(Debug, Clone)]
++struct GenFile {
++    lines: Vec<Vec<u8>>,
++    final_newline: bool,
++}
++
++impl GenFile {
++    fn bytes(&self) -> Vec<u8> {
++        let mut b = self.lines.concat();
++        if !self.final_newline && b.ends_with(b"\n") {
++            b.pop();
++        }
++        b
++    }
++}
++
++#[hegel::composite]
++fn arb_file(tc: &hegel::TestCase, max_lines: i64) -> GenFile {
++    let n = tc.draw(int!(0, max_lines)) as usize;
++    let lines = (0..n).map(|_| arb_line(tc)).collect();
++    GenFile { lines, final_newline: tc.draw(int!(0, 3)) != 0 }
++}
++
++/// 1–3 line edits of a file (insert, delete, replace).
++fn arb_edits(tc: &hegel::TestCase, file: &GenFile) -> GenFile {
++    let mut lines = file.lines.clone();
++    let n = tc.draw(int!(1, 3));
++    for _ in 0..n {
++        match tc.draw(int!(0, 2)) {
++            0 => {
++                let at = tc.draw(int!(0, lines.len() as i64)) as usize;
++                lines.insert(at, arb_line(tc));
++            }
++            1 if !lines.is_empty() => {
++                let at = tc.draw(int!(0, lines.len() as i64 - 1)) as usize;
++                lines.remove(at);
++            }
++            _ if !lines.is_empty() => {
++                let at = tc.draw(int!(0, lines.len() as i64 - 1)) as usize;
++                lines[at] = arb_line(tc);
++            }
++            _ => {}
++        }
++    }
++    GenFile { lines, final_newline: tc.draw(int!(0, 3)) != 0 }
++}
++
++// ---------------------------------------------------------------------------
++// Unified diffs: parse, print, apply exactly
++// ---------------------------------------------------------------------------
++
++fn parse_unified(text: &[u8]) -> UnifiedPatch {
++    UnifiedPatch::parse_patch(splitlines(text)).unwrap_or_else(|e| panic!("parse_patch of {:?}: {e}", String::from_utf8_lossy(text)))
++}
++
++#[hegel::test]
++fn diff_u_output_parses_prints_and_applies(tc: hegel::TestCase) {
++    let orig = tc.draw(arb_file(10).print_as_debug());
++    let modified = arb_edits(&tc, &orig);
++    let (o, m) = (orig.bytes(), modified.bytes());
++    let dir = scratch();
++    let text = diff_u(&dir, &o, &m, true);
++    if o == m {
++        assert!(text.is_empty());
++        std::fs::remove_dir_all(&dir).unwrap();
++        return;
++    }
++    let p = parse_unified(&text);
++    assert_eq!(p.orig_name, b"a/file");
++    assert_eq!(p.mod_name, b"b/file");
++    assert_eq!(p.orig_ts, None);
++    assert_eq!(p.mod_ts, None);
++    // The serialisation is GNU diff's text, and parses back to the same patch.
++    assert_eq!(String::from_utf8_lossy(&p.as_bytes()), String::from_utf8_lossy(&text), "as_bytes");
++    assert_eq!(parse_unified(&p.as_bytes()), p);
++    // Hunk headers agree with their bodies.
++    for h in &p.hunks {
++        let orig_side = h.lines.iter().filter(|l| matches!(l, HunkLine::ContextLine(_) | HunkLine::RemoveLine(_))).count();
++        let mod_side = h.lines.iter().filter(|l| matches!(l, HunkLine::ContextLine(_) | HunkLine::InsertLine(_))).count();
++        assert_eq!((h.orig_range, h.mod_range), (orig_side, mod_side), "ranges of {:?}", String::from_utf8_lossy(&h.get_header()));
++        assert_eq!(h.tail, None);
++    }
++    // Exact application in both directions.
++    assert_eq!(String::from_utf8_lossy(&p.apply_exact(&o).unwrap()), String::from_utf8_lossy(&m), "apply_exact");
++    assert_eq!(String::from_utf8_lossy(&p.reverse().apply_exact(&m).unwrap()), String::from_utf8_lossy(&o), "reverse().apply_exact");
++    assert_eq!(p.reverse().reverse(), p);
++    // Fuzzy application on the very file the patch was made from: every hunk at offset 0, fuzz 0.
++    let r = p.apply_fuzzy(&o, &ApplyOptions::default());
++    assert!(r.is_success(), "apply_fuzzy on the original: {:?}", r.hunks);
++    assert_eq!(r.patched.as_deref(), Some(m.as_slice()));
++    assert_eq!(r.partial.as_deref(), Some(m.as_slice()));
++    assert!(r.hunks.iter().all(|h| h.offset == 0 && h.fuzz == 0), "{:?}", r.hunks);
++    let d = p.dry_run(&o, &ApplyOptions::default());
++    assert!(d.is_success() == false && d.patched.is_none() && d.partial.is_none());
++    assert!(d.hunks.iter().all(|h| h.applied()));
++    // The multi-patch reader finds exactly this one patch.
++    let many = UnifiedPatch::parse_patches(splitlines(&text).map(|l| l.to_vec())).unwrap();
++    assert_eq!(many, vec![PlainOrBinaryPatch::Plain(p.clone())]);
++    let via_parse_patch = patchkit::unified::parse_patch(splitlines(&text)).unwrap();
++    assert_eq!(via_parse_patch, PlainOrBinaryPatch::Plain(p));
++    std::fs::remove_dir_all(&dir).unwrap();
++}
++
++/// GNU diff's default headers carry `name\tYYYY-MM-DD HH:MM:SS.NNNNNNNNN +ZZZZ` timestamps.
++#[hegel::test]
++fn diff_u_timestamps_are_split_off_and_parse(tc: hegel::TestCase) {
++    let orig = tc.draw(arb_file(6).print_as_debug());
++    let modified = arb_edits(&tc, &orig);
++    let (o, m) = (orig.bytes(), modified.bytes());
++    if o == m {
++        return;
++    }
++    let dir = scratch();
++    let text = diff_u(&dir, &o, &m, false);
++    let p = parse_unified(&text);
++    assert_eq!(p.orig_name, b"orig");
++    assert_eq!(p.mod_name, b"mod");
++    let header: Vec<&[u8]> = splitlines(&text).take(2).collect();
++    let ts_of = |line: &[u8]| line.split(|&b| b == b'\t').nth(1).unwrap().strip_suffix(b"\n").unwrap().to_vec();
++    assert_eq!(p.orig_ts.as_deref(), Some(ts_of(header[0]).as_slice()));
++    assert_eq!(p.mod_ts.as_deref(), Some(ts_of(header[1]).as_slice()));
++    assert_eq!(p.as_bytes(), text);
++    assert_eq!(p.apply_exact(&o).unwrap(), m);
++    // The timestamp diff writes is a patch date with nanoseconds; that it parses is pinned
++    // (`diff_timestamps_with_fractions_parse`), the shape is checked here.
++    let ts = String::from_utf8(p.orig_ts.clone().unwrap()).unwrap();
++    let re = regex::Regex::new(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{9} [+-]\d{4}$").unwrap();
++    assert!(re.is_match(&ts), "{ts:?}");
++    std::fs::remove_dir_all(&dir).unwrap();
++}
++
++// ---------------------------------------------------------------------------
++// Fuzzy application against GNU patch
++// ---------------------------------------------------------------------------
++
++/// Perturb a file: prepend/append/insert lines, change a line.
++fn perturb(tc: &hegel::TestCase, file: &GenFile) -> GenFile {
++    let mut lines = file.lines.clone();
++    let n = tc.draw(int!(1, 3));
++    for _ in 0..n {
++        match tc.draw(int!(0, 3)) {
++            0 => lines.insert(0, arb_line(tc)),
++            1 => lines.push(arb_line(tc)),
++            2 => {
++                let at = tc.draw(int!(0, lines.len() as i64)) as usize;
++                lines.insert(at, arb_line(tc));
++            }
++            _ if !lines.is_empty() => {
++                let at = tc.draw(int!(0, lines.len() as i64 - 1)) as usize;
++                lines[at] = arb_line(tc);
++            }
++            _ => {}
++        }
++    }
++    GenFile { lines, final_newline: true }
++}
++
++#[hegel::test]
++fn fuzzy_application_agrees_with_gnu_patch(tc: hegel::TestCase) {
++    let mut orig = tc.draw(arb_file(10).print_as_debug());
++    orig.final_newline = true;
++    let mut modified = arb_edits(&tc, &orig);
++    modified.final_newline = true;
++    let (o, m) = (orig.bytes(), modified.bytes());
++    if o == m {
++        return;
++    }
++    let target = perturb(&tc, &orig).bytes();
++    let fuzz = tc.draw(int!(0, 2)) as usize;
++    let dir = scratch();
++    let text = diff_u(&dir, &o, &m, true);
++    let p = parse_unified(&text);
++    let g = gnu_patch(&dir, &target, &text, fuzz);
++    let r = p.apply_fuzzy(&target, &ApplyOptions::with_fuzz(fuzz));
++    let show = || format!("patch:\n{}\ntarget:\n{}\nfuzz {fuzz}\npatch(1): {:?}\npatchkit: {:?}", String::from_utf8_lossy(&text), String::from_utf8_lossy(&target), g.hunks, r.hunks);
++    assert_eq!(r.is_success(), g.code == 0, "success: {}", show());
++    let mine: Vec<Option<(isize, usize)>> = r.hunks.iter().map(|h| h.applied().then_some((h.offset, h.fuzz))).collect();
++    assert_eq!(mine, g.hunks, "per-hunk outcome: {}", show());
++    if g.code == 0 {
++        assert_eq!(String::from_utf8_lossy(r.patched.as_deref().unwrap()), String::from_utf8_lossy(&g.output), "patched: {}", show());
++    }
++    assert_eq!(String::from_utf8_lossy(r.partial.as_deref().unwrap()), String::from_utf8_lossy(&g.output), "partial: {}", show());
++    let d = p.dry_run(&target, &ApplyOptions::with_fuzz(fuzz));
++    assert_eq!(d.hunks, r.hunks);
++    std::fs::remove_dir_all(&dir).unwrap();
++}
++
++// ---------------------------------------------------------------------------
++// Multi-file patches (diff -ruN)
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn recursive_diffs_are_split_per_file_and_apply(tc: hegel::TestCase) {
++    let n = tc.draw(int!(1, 3)) as usize;
++    let names = ["one.txt", "sub/two.c", "three"];
++    let mut files: Vec<(&str, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
++    for name in names.iter().take(n) {
++        let kind = tc.draw(int!(0, 3));
++        let f = tc.draw(arb_file(5).print_as_debug());
++        let (a, b) = match kind {
++            0 => (Some(f.bytes()), Some(arb_edits(&tc, &f).bytes())), // changed (maybe not)
++            1 => (None, Some(f.bytes())),                              // added
++            2 => (Some(f.bytes()), None),                              // removed
++            _ => (Some(f.bytes()), Some(f.bytes())),                   // unchanged
++        };
++        files.push((name, a, b));
++    }
++    let dir = scratch();
++    for (name, a, b) in &files {
++        if let Some(a) = a {
++            write(&dir, &format!("a/{name}"), a);
++        }
++        if let Some(b) = b {
++            write(&dir, &format!("b/{name}"), b);
++        }
++    }
++    std::fs::create_dir_all(dir.join("a")).unwrap();
++    std::fs::create_dir_all(dir.join("b")).unwrap();
++    let out = Command::new("diff").current_dir(&dir).args(["-ruN", "a", "b"]).output().unwrap();
++    assert!(out.status.code() == Some(0) || out.status.code() == Some(1));
++    let text = out.stdout;
++    let patches = UnifiedPatch::parse_patches(splitlines(&text).map(|l| l.to_vec())).unwrap_or_else(|e| panic!("parse_patches: {e}\n{}", String::from_utf8_lossy(&text)));
++    // `-N` treats an absent file as empty, so an empty added file is no change.
++    let changed: Vec<&(&str, Option<Vec<u8>>, Option<Vec<u8>>)> = files.iter().filter(|(_, a, b)| a.clone().unwrap_or_default() != b.clone().unwrap_or_default()).collect();
++    assert_eq!(patches.len(), changed.len(), "one patch per changed file:\n{}", String::from_utf8_lossy(&text));
++    let mut seen = Vec::new();
++    for p in &patches {
++        let PlainOrBinaryPatch::Plain(p) = p else { panic!("binary?") };
++        let name = String::from_utf8(p.orig_name.clone()).unwrap();
++        let name = name.strip_prefix("a/").unwrap().to_string();
++        assert_eq!(p.mod_name, format!("b/{name}").as_bytes());
++        let orig_path = String::from_utf8_lossy(&p.orig_name).to_string();
++        assert_eq!(patchkit::strip_prefix(Path::new(&orig_path), 1), Path::new(&name));
++        let (_, a, b) = files.iter().find(|(n, _, _)| *n == name).unwrap_or_else(|| panic!("unknown file {name}"));
++        let a = a.clone().unwrap_or_default();
++        let b = b.clone().unwrap_or_default();
++        assert_eq!(String::from_utf8_lossy(&p.apply_exact(&a).unwrap()), String::from_utf8_lossy(&b), "{name}");
++        seen.push(name);
++    }
++    if has("lsdiff") {
++        let ls = Command::new("lsdiff").current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
++        let mut ls = ls;
++        ls.stdin.take().unwrap().write_all(&text).unwrap();
++        let ls = ls.wait_with_output().unwrap();
++        // lsdiff prints whichever of the two names it considers best (`a/…` for a removed file).
++        let listed: Vec<String> = String::from_utf8_lossy(&ls.stdout).lines().map(|l| l.trim_start_matches("b/").trim_start_matches("a/").to_string()).collect();
++        assert_eq!(seen, listed, "lsdiff");
++    }
++    std::fs::remove_dir_all(&dir).unwrap();
++}
++
++// ---------------------------------------------------------------------------
++// Normal-format diffs (the `ed` module)
++// ---------------------------------------------------------------------------
++
++#[hegel::test]
++fn normal_diff_output_parses_and_applies(tc: hegel::TestCase) {
++    let mut orig = tc.draw(arb_file(6).print_as_debug());
++    orig.final_newline = true;
++    let mut modified = arb_edits(&tc, &orig);
++    modified.final_newline = true;
++    let (o, m) = (orig.bytes(), modified.bytes());
++    if o == m {
++        return;
++    }
++    let dir = scratch();
++    let text = diff_normal(&dir, &o, &m);
++    // GNU patch reads it back to the modified file.
++    let g = gnu_patch(&dir, &o, &text, 0);
++    assert_eq!(g.code, 0);
++    assert_eq!(g.output, m);
++    let p = EdPatch::parse_patch(&text).unwrap_or_else(|e| panic!("EdPatch::parse_patch rejects {:?} at {:?}", String::from_utf8_lossy(&text), String::from_utf8_lossy(&e)));
++    let applied = std::panic::catch_unwind(|| p.apply_exact(&o)).unwrap_or_else(|_| panic!("apply_exact panicked on {:?}", String::from_utf8_lossy(&text)));
++    assert_eq!(String::from_utf8_lossy(&applied.unwrap()), String::from_utf8_lossy(&m), "{:?}", String::from_utf8_lossy(&text));
++    std::fs::remove_dir_all(&dir).unwrap();
++}
++
++// ---------------------------------------------------------------------------
++// Quilt series files
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone)]
++enum GenSeriesLine {
++    Patch { name: String, options: Vec<String>, indent: bool },
++    Comment(String),
++    Blank,
++}
++
++#[hegel::composite]
++fn arb_series(tc: &hegel::TestCase) -> Vec<GenSeriesLine> {
++    let n = tc.draw(int!(0, 6)) as usize;
++    let mut used = Vec::new();
++    (0..n)
++        .map(|i| match tc.draw(int!(0, 5)) {
++            0 => GenSeriesLine::Comment(pick(tc, &["# leading comment", "#no-space", "# debian/patches", "#"]).to_string()),
++            1 => GenSeriesLine::Blank,
++            _ => {
++                let name = format!("{:04}-{}.{}", i, pick(tc, &["foo", "bar_baz", "fix.CVE-2026-1"]), pick(tc, &["patch", "diff"]));
++                used.push(name.clone());
++                let k = tc.draw(int!(0, 2)) as usize;
++                let options = (0..k).map(|_| pick(tc, &["-p1", "-p0", "-R", "-E"]).to_string()).collect();
++                GenSeriesLine::Patch { name, options, indent: tc.draw(int!(0, 3)) == 0 }
++            }
++        })
++        .collect()
++}
++
++fn series_text(lines: &[GenSeriesLine]) -> String {
++    let mut s = String::new();
++    for l in lines {
++        match l {
++            GenSeriesLine::Patch { name, options, indent } => {
++                if *indent {
++                    s.push_str("  ");
++                }
++                s.push_str(name);
++                for o in options {
++                    s.push(' ');
++                    s.push_str(o);
++                }
++                s.push('\n');
++            }
++            GenSeriesLine::Comment(c) => {
++                s.push_str(c);
++                s.push('\n');
++            }
++            GenSeriesLine::Blank => s.push('\n'),
++        }
++    }
++    s
++}
++
++#[hegel::test]
++fn series_files_are_read_like_quilt_and_round_trip(tc: hegel::TestCase) {
++    let g = tc.draw(arb_series().print_as_debug());
++    let text = series_text(&g);
++    let s = Series::read(text.as_bytes()).unwrap();
++    let patches: Vec<(String, Vec<String>)> = g.iter().filter_map(|l| if let GenSeriesLine::Patch { name, options, .. } = l { Some((name.clone(), options.clone())) } else { None }).collect();
++    let names: Vec<&str> = patches.iter().map(|(n, _)| n.as_str()).collect();
++    assert_eq!(s.patches().collect::<Vec<_>>(), names);
++    assert_eq!(s.len(), names.len());
++    assert_eq!(s.is_empty(), names.is_empty());
++    for (name, options) in &patches {
++        assert!(s.contains(name));
++        let entry = s.iter().find(|e| matches!(e, SeriesEntry::Patch { name: n, .. } if n == name)).unwrap();
++        assert_eq!(entry, &SeriesEntry::Patch { name: name.clone(), options: options.clone() });
++    }
++    let comments: Vec<&str> = g.iter().filter_map(|l| if let GenSeriesLine::Comment(c) = l { Some(c.as_str()) } else { None }).collect();
++    assert_eq!(s.iter().filter(|e| matches!(e, SeriesEntry::Comment(_))).count(), comments.len(), "comments kept");
++    // quilt lists the same patches.
++    if has("quilt") {
++        let dir = scratch();
++        write(&dir, "patches/series", text.as_bytes());
++        let out = Command::new("quilt").current_dir(&dir).args(["--quiltrc", "-", "series"]).output().unwrap();
++        let listed: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(|l| l.to_string()).collect();
++        assert_eq!(listed, names, "quilt series");
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++    // write() then read() gives the same series (comments are pinned: `series_comments_round_trip`).
++    if comments.is_empty() {
++        let mut written = Vec::new();
++        s.write(&mut written).unwrap();
++        let again = Series::read(written.as_slice()).unwrap();
++        assert_eq!(again, s, "round trip through write():\n{}", String::from_utf8_lossy(&written));
++    }
++    // remove() removes exactly that patch.
++    if let Some((name, _)) = patches.first() {
++        let mut s2 = s.clone();
++        s2.remove(name);
++        assert!(!s2.contains(name));
++        assert_eq!(s2.len(), s.len() - names.iter().filter(|n| *n == name).count());
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Timestamps
++// ---------------------------------------------------------------------------
++
++/// coreutils' wall-clock rendering of `secs` seen from `offset`, and the `+HHMM` zone.
++fn date_at(secs: i64, offset: i64) -> String {
++    let out = Command::new("date").env("TZ", "UTC").args(["-u", "-d", &format!("@{}", secs + offset), "+%Y-%m-%d %H:%M:%S"]).output().unwrap();
++    let wall = String::from_utf8(out.stdout).unwrap().trim().to_string();
++    let zone = format!("{}{:02}{:02}", if offset >= 0 { '+' } else { '-' }, offset.abs() / 3600, offset.abs() / 60 % 60);
++    format!("{wall} {zone}")
++}
++
++#[hegel::test]
++fn patch_dates_format_like_date(tc: hegel::TestCase) {
++    let secs = tc.draw(int!(0, 4_102_444_800)); // up to 2100
++    let offset = tc.draw(int!(-14 * 60, 14 * 60)) * 60;
++    let formatted = format_patch_date(secs, offset);
++    // The epoch is always given in UTC (documented); a pre-epoch wall-clock time is an error.
++    let eff = if secs == 0 { 0 } else { offset };
++    if secs + eff < 0 {
++        assert!(matches!(formatted, Err(FormatPatchDateError::NegativeTime(..))));
++        return;
++    }
++    let formatted = formatted.unwrap();
++    assert_eq!(formatted, date_at(secs, eff));
++    assert_eq!(parse_patch_date(&formatted).unwrap(), (secs, eff), "{formatted}");
++}
++
++#[hegel::test]
++fn patch_dates_parse_like_date(tc: hegel::TestCase) {
++    let secs = tc.draw(int!(0, 4_102_444_800));
++    let offset = tc.draw(int!(-14 * 60, 14 * 60)) * 60;
++    // Negative offsets with minutes (`-0330`, `-0030`) are pinned (`negative_offsets_with_minutes_parse`).
++    if secs + offset < 0 || (offset < 0 && offset % 3600 != 0) {
++        return;
++    }
++    let text = date_at(secs, offset);
++    assert_eq!(parse_patch_date(&text).unwrap(), (secs, offset), "{text}");
++    // Without the zone the error names the missing offset; garbage is an invalid date.
++    let (wall, _) = text.rsplit_once(' ').unwrap();
++    assert!(matches!(parse_patch_date(wall), Err(patchkit::timestamp::ParsePatchDateError::MissingTimezoneOffset(_))), "{wall}");
++    assert!(matches!(parse_patch_date(&format!("{wall} +2500")), Err(patchkit::timestamp::ParsePatchDateError::InvalidTimezoneOffset(_))));
++}
++
++// ---------------------------------------------------------------------------
++// Pins
++// ---------------------------------------------------------------------------
++
++/// The wall-clock part of a patch date is the time *at the offset* (bzr's `gmtime(secs + offset)`).
++#[test]
++fn format_patch_date_applies_the_offset() {
++    assert_eq!(format_patch_date(1546300800, 3600).unwrap(), "2019-01-01 01:00:00 +0100");
++    assert_eq!(format_patch_date(1546300800, -5 * 3600).unwrap(), "2018-12-31 19:00:00 -0500");
++    assert_eq!(parse_patch_date(&format_patch_date(1546300800, 3600).unwrap()).unwrap(), (1546300800, 3600));
++}
++
++/// `-0330` (Newfoundland) is three and a half hours *behind* UTC: the minutes carry the sign
++/// too, also when the hour field is `00`.
++#[test]
++fn negative_offsets_with_minutes_parse() {
++    assert_eq!(parse_patch_date("2019-01-01 00:00:00 -0330").unwrap(), (1546300800 + 3 * 3600 + 1800, -(3 * 3600 + 1800)));
++    assert_eq!(parse_patch_date("2019-01-01 00:00:00 -0030").unwrap(), (1546300800 + 1800, -1800));
++    assert_eq!(parse_patch_date("2019-01-01 00:00:00 +0330").unwrap(), (1546300800 - 3 * 3600 - 1800, 3 * 3600 + 1800));
++}
++
++/// GNU diff's default timestamps carry nanoseconds: `2026-09-14 01:54:15.100545957 +0000`.
++#[test]
++fn diff_timestamps_with_fractions_parse() {
++    let (secs, off) = parse_patch_date("2019-01-01 00:00:00.123456789 +0100").unwrap_or_else(|e| panic!("{e:?}"));
++    assert_eq!((secs, off), (1546300800 - 3600, 3600));
++}
++
++/// `diff` normal output uses `5a6,7` ranges and line numbers that differ on the two sides.
++#[test]
++fn normal_diff_ranges_parse_and_apply() {
++    let orig = b"a\nb\n";
++    let modified = b"a\nb\nc\nd\n";
++    let text = b"2a3,4\n> c\n> d\n";
++    let p = EdPatch::parse_patch(text).unwrap_or_else(|e| panic!("rejects {:?} at {:?}", String::from_utf8_lossy(text), String::from_utf8_lossy(&e)));
++    assert_eq!(p.apply_exact(orig).unwrap(), modified);
++}
++
++/// `Na M` adds after line N of the old file (`0a1` at the top); `Nd M` deletes line N; `Nc M`
++/// replaces it. The two numbers differ whenever earlier hunks changed the line count.
++#[test]
++fn normal_diff_single_line_hunks_apply_like_patch() {
++    let cases: &[(&[u8], &[u8], &[u8])] = &[
++        (b"0a1\n> a\n", b"b\n", b"a\nb\n"),
++        (b"1a2\n> b\n", b"a\nc\n", b"a\nb\nc\n"),
++        (b"2d1\n< b\n", b"a\nb\n", b"a\n"),
++        (b"1c1\n< a\n---\n> x\n", b"a\nb\n", b"x\nb\n"),
++        (b"1d0\n< a\n2a2\n> z\n", b"a\nb\nc\n", b"b\nz\nc\n"),
++    ];
++    let mut failures = Vec::new();
++    let dir = scratch();
++    for (text, orig, modified) in cases {
++        // GNU patch agrees with the expectation.
++        let g = gnu_patch(&dir, orig, text, 0);
++        assert_eq!((g.code, String::from_utf8_lossy(&g.output)), (0, String::from_utf8_lossy(modified)), "patch(1) on {:?}", String::from_utf8_lossy(text));
++        let p = match EdPatch::parse_patch(text) {
++            Ok(p) => p,
++            Err(e) => {
++                failures.push(format!("{:?}: parse rejects {:?}", String::from_utf8_lossy(text), String::from_utf8_lossy(&e)));
++                continue;
++            }
++        };
++        match std::panic::catch_unwind(|| p.apply_exact(orig)) {
++            Err(_) => failures.push(format!("{:?}: apply panics", String::from_utf8_lossy(text))),
++            Ok(Err(e)) => failures.push(format!("{:?}: apply fails: {e}", String::from_utf8_lossy(text))),
++            Ok(Ok(got)) if got != *modified => failures.push(format!("{:?}: applied {:?}, patch(1) gives {:?}", String::from_utf8_lossy(text), String::from_utf8_lossy(&got), String::from_utf8_lossy(modified))),
++            Ok(Ok(_)) => {}
++        }
++    }
++    assert!(failures.is_empty(), "{failures:#?}");
++}
++
++/// A comment line is written back as itself, not with a second `#`.
++#[test]
++fn series_comments_round_trip() {
++    let s = Series::read(&b"# a comment\nfoo.patch -p1\n"[..]).unwrap();
++    let mut out = Vec::new();
++    s.write(&mut out).unwrap();
++    assert_eq!(String::from_utf8_lossy(&out), "# a comment\nfoo.patch -p1\n");
++}
