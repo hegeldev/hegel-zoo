@@ -1,0 +1,1081 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 251aa19..f69130e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -36,6 +36,7 @@ version-ranges = "0.1.0"
+ 
+ [dev-dependencies]
+ insta = "1.41.0"
++hegeltest = "0.44.1"
+ serde_json = "1.0.116"
+ tracing-test = "0.2.5"
+ 
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..7074f50
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,1063 @@
++//! Hegel properties for `pep508_rs`, with `packaging` (the PyPA reference implementation of
++//! dependency specifiers and environment markers) as the oracle, driven as one persistent
++//! `python3` child: `packaging.requirements.Requirement` for the grammar and the parsed parts,
++//! `packaging.markers.Marker.evaluate` for marker semantics on random environments.
++//! The marker algebra (`negate`, `and`, `or`, `is_true`, `is_false`, `is_disjoint`, `Display`)
++//! is checked against the crate's own `evaluate` on sampled environments.
++
++use std::collections::BTreeSet;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++use hegel::{generators, Generator, TestCase};
++use pep508_rs::{
++    ExtraName, MarkerEnvironment, MarkerEnvironmentBuilder, MarkerTree, Requirement, VerbatimUrl,
++    VersionOrUrl,
++};
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys
++from packaging.requirements import Requirement, InvalidRequirement
++from packaging.markers import Marker, InvalidMarker, UndefinedComparison, UndefinedEnvironmentName
++from packaging.utils import canonicalize_name
++
++KEYS = ['implementation_name', 'implementation_version', 'os_name', 'platform_machine',
++        'platform_python_implementation', 'platform_release', 'platform_system',
++        'platform_version', 'python_full_version', 'python_version', 'sys_platform']
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'R':
++            r = Requirement(args[0])
++            extras = ','.join(sorted(canonicalize_name(e) for e in r.extras))
++            specs = ','.join(sorted(str(s) for s in r.specifier))
++            out = ['ok', canonicalize_name(r.name), extras, specs, r.url or '', str(r.marker) if r.marker is not None else '']
++        elif cmd == 'M':
++            env = dict(zip(KEYS, args[1:12]))
++            if len(args) > 12:
++                env['extra'] = args[12]
++            try:
++                out = ['ok', 'true' if Marker(args[0]).evaluate(env) else 'false']
++            except (UndefinedComparison, UndefinedEnvironmentName):
++                out = ['undef']
++        elif cmd == 'C':
++            out = ['ok', canonicalize_name(args[0])]
++        else:
++            out = ['bad', cmd]
++    except (InvalidRequirement, InvalidMarker):
++        out = ['err']
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
++        .collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let mut child = Command::new("python3")
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("python3 with the `packaging` module is needed as the PEP 508 oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle {
++            child,
++            stdin,
++            stdout,
++        })
++    })
++}
++
++/// Ask the oracle; returns the status (`ok`, `err`, `undef`) and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?}); is `packaging` installed for python3?");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(
++        matches!(status.as_str(), "ok" | "err" | "undef"),
++        "oracle said {reply:?} to {line:?}"
++    );
++    (status, it.map(unhex).collect())
++}
++
++/// A requirement as `packaging` sees it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct PyReq {
++    name: String,
++    extras: BTreeSet<String>,
++    specs: BTreeSet<String>,
++    url: String,
++    marker: String,
++}
++
++fn py_requirement(text: &str) -> Option<PyReq> {
++    let (status, f) = ask("R", &[text]);
++    if status != "ok" {
++        return None;
++    }
++    let set = |s: &str| -> BTreeSet<String> {
++        s.split(',')
++            .filter(|s| !s.is_empty())
++            .map(str::to_string)
++            .collect()
++    };
++    Some(PyReq {
++        name: f[0].clone(),
++        extras: set(&f[1]),
++        specs: set(&f[2]),
++        url: f[3].clone(),
++        marker: f[4].clone(),
++    })
++}
++
++/// `Marker(text).evaluate(env)`: `Ok(Some(b))`, `Ok(None)` when packaging raises an
++/// undefined-comparison error, `Err(())` when the marker does not parse.
++fn py_marker(text: &str, env: &Env, extra: Option<&str>) -> Result<Option<bool>, ()> {
++    let mut args: Vec<&str> = vec![text];
++    args.extend(env.values.iter().map(String::as_str));
++    if let Some(e) = extra {
++        args.push(e);
++    }
++    let (status, f) = ask("M", &args);
++    match status.as_str() {
++        "ok" => Ok(Some(f[0] == "true")),
++        "undef" => Ok(None),
++        _ => Err(()),
++    }
++}
++
++// --------------------------------------------------------------------------- helpers
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn chance(tc: &TestCase, k: usize) -> bool {
++    n(tc, 1, k) == 1
++}
++
++fn arb_chars(tc: &TestCase, alphabet: &str, lo: usize, hi: usize) -> String {
++    let chars: Vec<char> = alphabet.chars().collect();
++    (0..n(tc, lo, hi)).map(|_| pick(tc, &chars)).collect()
++}
++
++/// PEP 508 `wsp*`: spaces and tabs.
++fn ws(tc: &TestCase) -> String {
++    pick(tc, &["", "", " ", " ", "  ", "\t"]).to_string()
++}
++
++const ALNUM: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
++
++/// A PEP 508 name: alphanumerics with inner `.`, `-`, `_`, not archive-like.
++fn arb_name(tc: &TestCase) -> String {
++    let mut s = arb_chars(tc, ALNUM, 1, 1);
++    let inner = n(tc, 0, 6);
++    for _ in 0..inner {
++        s.push_str(pick(tc, &["a", "b", "z", "Q", "0", "7", ".", "-", "_"]));
++    }
++    if inner > 0 {
++        s.push_str(&arb_chars(tc, ALNUM, 1, 1));
++    }
++    // `foo.tar`, `foo.zip`, … are refused by the crate as unnamed archive requirements.
++    for ext in [".whl", ".tbz", ".txz", ".tlz", ".zip", ".tgz", ".tar", ".bz2", ".xz", ".lz", ".lzma", ".gz"] {
++        if s.to_lowercase().ends_with(ext) {
++            s.push('x');
++        }
++    }
++    s
++}
++
++/// PEP 503 normalisation, what `packaging.utils.canonicalize_name` does.
++fn canonical(name: &str) -> String {
++    let mut out = String::new();
++    let mut sep = false;
++    for c in name.chars() {
++        if matches!(c, '-' | '_' | '.') {
++            sep = true;
++        } else {
++            if sep && !out.is_empty() {
++                out.push('-');
++            }
++            sep = false;
++            out.push(c.to_ascii_lowercase());
++        }
++    }
++    out
++}
++
++/// A canonical PEP 440 version for specifiers: `N(.N){0,3}` with an occasional epoch,
++/// pre-, post- or dev-release; never a local segment (`==` with locals is its own topic).
++fn arb_version(tc: &TestCase, min_components: usize) -> String {
++    let k = n(tc, min_components.max(1), 4);
++    let mut s = String::new();
++    if chance(tc, 12) {
++        s.push_str(&format!("{}!", n(tc, 1, 2)));
++    }
++    for i in 0..k {
++        if i > 0 {
++            s.push('.');
++        }
++        s.push_str(&pick(tc, &[0, 1, 2, 3, 8, 10, 12, 2024]).to_string());
++    }
++    if chance(tc, 8) {
++        s.push_str(pick(tc, &["a1", "b2", "rc1", "rc10"]));
++    }
++    if chance(tc, 10) {
++        s.push_str(pick(tc, &[".post1", ".post0"]));
++    }
++    if chance(tc, 10) {
++        s.push_str(pick(tc, &[".dev0", ".dev3"]));
++    }
++    s
++}
++
++// --------------------------------------------------------------------------- environments
++
++const OS_NAMES: [&str; 3] = ["posix", "nt", "java"];
++const SYS_PLATFORMS: [&str; 6] = ["linux", "darwin", "win32", "linux2", "cygwin", "emscripten"];
++const SYSTEMS: [&str; 4] = ["Linux", "Darwin", "Windows", "FreeBSD"];
++const MACHINES: [&str; 6] = ["x86_64", "aarch64", "arm64", "AMD64", "i686", "ppc64le"];
++const IMPLEMENTATIONS: [&str; 3] = ["CPython", "PyPy", "Jython"];
++const IMPLEMENTATION_NAMES: [&str; 3] = ["cpython", "pypy", "ironpython"];
++const RELEASES: [&str; 6] = ["6.12.93", "5.15.0", "22.6.0", "10", "6.8.0", "24.1.0"];
++const PLATFORM_VERSIONS: [&str; 3] = ["#1 SMP", "Darwin Kernel Version 22.6.0", "10.0.19041"];
++
++/// A marker environment: the eleven values in `KEYS` order.
++#[derive(Clone, Debug)]
++struct Env {
++    values: Vec<String>,
++}
++
++impl Env {
++    fn marker_environment(&self) -> MarkerEnvironment {
++        MarkerEnvironment::try_from(MarkerEnvironmentBuilder {
++            implementation_name: &self.values[0],
++            implementation_version: &self.values[1],
++            os_name: &self.values[2],
++            platform_machine: &self.values[3],
++            platform_python_implementation: &self.values[4],
++            platform_release: &self.values[5],
++            platform_system: &self.values[6],
++            platform_version: &self.values[7],
++            python_full_version: &self.values[8],
++            python_version: &self.values[9],
++            sys_platform: &self.values[10],
++        })
++        .unwrap()
++    }
++}
++
++#[hegel::composite]
++fn arb_env(tc: &TestCase) -> Env {
++    // Final releases only: pre-release interpreters are pinned (pep508_rs/8).
++    let minor = n(tc, 6, 14);
++    let micro = n(tc, 0, 12);
++    let full = format!("3.{minor}.{micro}");
++    let values = vec![
++        pick(tc, &IMPLEMENTATION_NAMES).to_string(),
++        full.clone(),
++        pick(tc, &OS_NAMES).to_string(),
++        pick(tc, &MACHINES).to_string(),
++        pick(tc, &IMPLEMENTATIONS).to_string(),
++        pick(tc, &RELEASES).to_string(),
++        pick(tc, &SYSTEMS).to_string(),
++        pick(tc, &PLATFORM_VERSIONS).to_string(),
++        full,
++        format!("3.{minor}"),
++        pick(tc, &SYS_PLATFORMS).to_string(),
++    ];
++    Env { values }
++}
++
++const EXTRA_SPELLINGS: [&str; 8] = ["test", "Test", "dev", "all", "x_y", "x-y", "X.Y", "socks5"];
++
++fn arb_extra(tc: &TestCase) -> Option<String> {
++    if chance(tc, 3) {
++        None
++    } else {
++        Some(pick(tc, &EXTRA_SPELLINGS).to_string())
++    }
++}
++
++fn extras_of(extra: &Option<String>) -> Vec<ExtraName> {
++    extra
++        .iter()
++        .map(|e| ExtraName::from_str(e).unwrap())
++        .collect()
++}
++
++// --------------------------------------------------------------------------- markers
++
++const VERSION_KEYS: [&str; 3] = ["python_version", "python_full_version", "implementation_version"];
++const STRING_KEYS: [&str; 8] = [
++    "os_name",
++    "sys_platform",
++    "platform_system",
++    "platform_machine",
++    "platform_python_implementation",
++    "implementation_name",
++    "platform_version",
++    "platform_release",
++];
++const DEPRECATED_KEYS: [&str; 6] = [
++    "os.name",
++    "sys.platform",
++    "platform.version",
++    "platform.machine",
++    "platform.python_implementation",
++    "python_implementation",
++];
++const VERSION_OPS: [&str; 7] = ["==", "!=", "<", "<=", ">", ">=", "~="];
++const STRING_OPS: [&str; 4] = ["==", "!=", "in", "not in"];
++const ORDER_OPS: [&str; 4] = ["<", "<=", ">", ">="];
++const WORDS: [&str; 10] = ["linux", "lin", "win", "posix", "nt", "x86", "CPython", "Linux", "arm", "z"];
++
++fn quote(tc: &TestCase, s: &str) -> String {
++    let q = if chance(tc, 2) { '\'' } else { '"' };
++    format!("{q}{s}{q}")
++}
++
++/// A marker version literal: 2–3 components, occasionally a pre-release or `.*`.
++fn arb_marker_version(tc: &TestCase, allow_star: bool) -> String {
++    let mut s = format!("3.{}", n(tc, 5, 14));
++    if chance(tc, 3) {
++        s.push_str(&format!(".{}", n(tc, 0, 5)));
++    }
++    // No pre-, post- or dev-release segments: the crate documents dropping them from marker
++    // literals (`normalize_specifier` in `src/marker/algebra.rs`), a deliberate deviation.
++    if allow_star && chance(tc, 4) {
++        s.push_str(".*");
++    }
++    s
++}
++
++/// One well-formed marker expression, of a shape both implementations define alike.
++fn arb_marker_expr(tc: &TestCase) -> String {
++    let sp = |tc: &TestCase| pick(tc, &[" ", " ", " ", "  ", "\t"]).to_string();
++    match n(tc, 0, 9) {
++        0 | 1 | 2 => {
++            // version key <op> 'version'
++            let key = pick(tc, &VERSION_KEYS);
++            let op = pick(tc, &VERSION_OPS);
++            let star = matches!(op, "==" | "!=");
++            // (`~=` with a third component on python_version is pinned: pep508_rs/6, and a
++            // three-component wildcard on python_version as pep508_rs/4)
++            let version = if op == "~=" {
++                format!("3.{}", n(tc, 5, 14))
++            } else if star && key == "python_version" {
++                format!("3.{}.*", n(tc, 5, 14))
++            } else {
++                arb_marker_version(tc, star)
++            };
++            format!("{key}{}{op}{}{}", sp(tc), sp(tc), quote(tc, &version))
++        }
++        3 => {
++            // 'version' <op> version key (inverted)
++            let key = pick(tc, &VERSION_KEYS);
++            let op = pick(tc, &VERSION_OPS[..6]);
++            let version = arb_marker_version(tc, false);
++            format!("{}{}{op}{}{key}", quote(tc, &version), sp(tc), sp(tc))
++        }
++        4 | 5 => {
++            // string key ==/!=/in/not in 'word'
++            let key = pick(tc, &STRING_KEYS);
++            let op = pick(tc, &STRING_OPS);
++            let pool: Vec<&str> = match key {
++                "os_name" => OS_NAMES.to_vec(),
++                "sys_platform" => SYS_PLATFORMS.to_vec(),
++                "platform_system" => SYSTEMS.to_vec(),
++                "platform_machine" => MACHINES.to_vec(),
++                "platform_python_implementation" => IMPLEMENTATIONS.to_vec(),
++                "implementation_name" => IMPLEMENTATION_NAMES.to_vec(),
++                "platform_version" => PLATFORM_VERSIONS.to_vec(),
++                _ => RELEASES.to_vec(),
++            };
++            let value = if chance(tc, 3) {
++                pick(tc, &WORDS).to_string()
++            } else if matches!(op, "in" | "not in") && chance(tc, 2) {
++                format!("{} {}", pick(tc, &pool), pick(tc, &pool))
++            } else {
++                pick(tc, &pool).to_string()
++            };
++            format!("{key}{}{op}{}{}", sp(tc), sp(tc), quote(tc, &value))
++        }
++        6 => {
++            // 'word' ==/!=/in/not in string key (inverted; `in` is a substring test)
++            let key = pick(tc, &STRING_KEYS[..6]);
++            let op = pick(tc, &STRING_OPS);
++            let value = pick(tc, &WORDS);
++            format!("{}{}{op}{}{key}", quote(tc, value), sp(tc), sp(tc))
++        }
++        7 => {
++            // string key ==/!= a version-looking literal (`platform_release == '6.12.93'`);
++            // ordering operators on string keys are left out: packaging 26 answers `false`
++            // where PEP 508 says Python string comparison, and the one spec-defined case
++            // (both sides valid versions) is pinned as pep508_rs/1.
++            let op = pick(tc, &["==", "!="]);
++            let value = pick(tc, &RELEASES);
++            format!("platform_release{}{op}{}{}", sp(tc), sp(tc), quote(tc, value))
++        }
++        8 => {
++            // extra ==/!= 'name'
++            let op = pick(tc, &["==", "!="]);
++            format!("extra{}{op}{}{}", sp(tc), sp(tc), quote(tc, pick(tc, &EXTRA_SPELLINGS)))
++        }
++        _ => {
++            // a deprecated spelling of a string key
++            let key = pick(tc, &DEPRECATED_KEYS);
++            let op = pick(tc, &["==", "!="]);
++            let value = pick(tc, &["posix", "linux", "x86_64", "CPython", "#1 SMP", "nt"]);
++            format!("{key}{}{op}{}{}", sp(tc), sp(tc), quote(tc, value))
++        }
++    }
++}
++
++/// A marker: expressions joined by `and`/`or`, with parentheses, nesting depth ≤ 2.
++fn arb_marker(tc: &TestCase, depth: usize) -> String {
++    let count = n(tc, 1, 3);
++    let mut out = String::new();
++    for i in 0..count {
++        if i > 0 {
++            out.push_str(pick(tc, &[" and ", " or ", " and ", " or ", "  and  ", "\tor "]));
++        }
++        if depth > 0 && chance(tc, 3) {
++            out.push('(');
++            out.push_str(&ws(tc));
++            out.push_str(&arb_marker(tc, depth - 1));
++            out.push_str(&ws(tc));
++            out.push(')');
++        } else {
++            out.push_str(&arb_marker_expr(tc));
++        }
++    }
++    out
++}
++
++/// Evaluate with the crate.
++fn rs_marker(m: &MarkerTree, env: &Env, extra: &Option<String>) -> bool {
++    m.evaluate(&env.marker_environment(), &extras_of(extra))
++}
++
++/// Markers parse alike, evaluate alike on random environments, and the crate's `Display`
++/// re-parses (by the crate and by `packaging`) to the same truth values.
++#[hegel::test]
++fn markers_evaluate_like_packaging(tc: TestCase) {
++    let text = arb_marker(&tc, 2);
++    let env = tc.draw(arb_env().print_as_debug());
++    let extra = arb_extra(&tc);
++    let theirs = py_marker(&text, &env, extra.as_deref());
++    let ours = MarkerTree::from_str(&text);
++    match (&ours, &theirs) {
++        (Ok(_), Err(())) => panic!("{text:?}: pep508_rs accepts, packaging rejects"),
++        (Err(e), Ok(_)) => panic!("{text:?}: pep508_rs rejects ({e}), packaging accepts"),
++        (Err(_), Err(())) => return,
++        _ => {}
++    }
++    let tree = ours.unwrap();
++    let Some(expected) = theirs.unwrap() else {
++        return; // packaging raised UndefinedComparison: no defined answer
++    };
++    let got = rs_marker(&tree, &env, &extra);
++    assert_eq!(got, expected, "{text:?} in {env:?} extra {extra:?}");
++
++    // Display round trip (the rendering of an unsatisfiable tree is pinned: pep508_rs/2).
++    if let Some(shown) = tree.try_to_string() {
++        let again = MarkerTree::from_str(&shown)
++            .unwrap_or_else(|e| panic!("{shown:?} (Display of {text:?}) does not re-parse: {e}"));
++        let deprecated = DEPRECATED_KEYS.iter().any(|k| text.contains(k));
++        if !tree.is_false() && !deprecated {
++            // (deprecated key spellings are pinned: pep508_rs/5)
++            assert_eq!(again, tree, "{shown:?} re-parses to a different tree than {text:?}");
++        }
++        assert_eq!(rs_marker(&again, &env, &extra), expected, "{shown:?}");
++        match py_marker(&shown, &env, extra.as_deref()) {
++            Err(()) => panic!("packaging rejects the crate's Display {shown:?} of {text:?}"),
++            Ok(Some(py)) => assert_eq!(py, expected, "packaging on the crate's Display {shown:?} of {text:?}"),
++            Ok(None) => {}
++        }
++    } else {
++        assert!(tree.is_true(), "{text:?}: no contents but not TRUE");
++    }
++}
++
++/// The marker algebra agrees with evaluation: `negate`, `and`, `or`, `is_true`, `is_false`,
++/// `is_disjoint`, on sampled environments.
++#[hegel::test]
++fn marker_algebra_agrees_with_evaluation(tc: TestCase) {
++    let a_text = arb_marker(&tc, 1);
++    let b_text = arb_marker(&tc, 1);
++    let (Ok(a), Ok(b)) = (MarkerTree::from_str(&a_text), MarkerTree::from_str(&b_text)) else {
++        return;
++    };
++    let mut and = a.clone();
++    and.and(b.clone());
++    let mut or = a.clone();
++    or.or(b.clone());
++    let not_a = a.negate();
++    let disjoint = a.is_disjoint(&b);
++    for _ in 0..n(&tc, 1, 4) {
++        let env = tc.draw(arb_env().print_as_debug());
++        let extra = arb_extra(&tc);
++        let va = rs_marker(&a, &env, &extra);
++        let vb = rs_marker(&b, &env, &extra);
++        let ctx = format!("a = {a_text:?}, b = {b_text:?}, env {env:?}, extra {extra:?}");
++        assert_eq!(rs_marker(&not_a, &env, &extra), !va, "negate: {ctx}");
++        assert_eq!(rs_marker(&and, &env, &extra), va && vb, "and: {ctx}");
++        assert_eq!(rs_marker(&or, &env, &extra), va || vb, "or: {ctx}");
++        if a.is_true() {
++            assert!(va, "is_true but false: {ctx}");
++        }
++        if a.is_false() {
++            assert!(!va, "is_false but true: {ctx}");
++        }
++        if and.is_false() {
++            assert!(!(va && vb), "a.and(b).is_false() but both hold: {ctx}");
++        }
++        if disjoint {
++            assert!(!(va && vb), "is_disjoint but both hold: {ctx}");
++        }
++    }
++    // Idempotence and De Morgan on canonical trees.
++    let mut a_and_a = a.clone();
++    a_and_a.and(a.clone());
++    assert_eq!(a_and_a, a, "a and a: {a_text:?}");
++    let mut not_a_or_not_b = a.negate();
++    not_a_or_not_b.or(b.negate());
++    assert_eq!(not_a_or_not_b, and.negate(), "De Morgan: {a_text:?} / {b_text:?}");
++    assert_eq!(not_a.negate(), a, "double negation: {a_text:?}");
++}
++
++// --------------------------------------------------------------------------- requirements
++
++/// A specifier both implementations accept, canonical spelling.
++fn arb_specifier(tc: &TestCase) -> String {
++    let op = pick(tc, &["==", "!=", "<=", "<", ">=", ">", "~=", "==", ">=", "==="]);
++    match op {
++        // (`===` with an arbitrary string is pinned: pep508_rs/3)
++        "===" => format!("==={}", arb_version(tc, 1)),
++        "~=" => format!("~={}", arb_version(tc, 2)),
++        "==" | "!=" if chance(tc, 3) => {
++            // a wildcard: release segments only
++            let k = n(tc, 1, 3);
++            let release: Vec<String> = (0..k).map(|_| pick(tc, &[0, 1, 2, 10]).to_string()).collect();
++            format!("{op}{}.*", release.join("."))
++        }
++        _ => format!("{op}{}{}", ws(tc), arb_version(tc, 1)),
++    }
++}
++
++/// A requirement text from the PEP 508 grammar, with the parts it was built from.
++#[derive(Clone, Debug)]
++struct GenReq {
++    text: String,
++    name: String,
++    extras: Vec<String>,
++    specs: Vec<String>,
++    url: Option<String>,
++    marker: Option<String>,
++}
++
++#[hegel::composite]
++fn arb_requirement(tc: &TestCase) -> GenReq {
++    let name = arb_name(tc);
++    let mut text = format!("{}{name}", ws(tc));
++    let mut extras = vec![];
++    if chance(tc, 3) {
++        text.push_str(&ws(tc));
++        text.push('[');
++        text.push_str(&ws(tc));
++        for i in 0..n(tc, 0, 3) {
++            if i > 0 {
++                text.push_str(&ws(tc));
++                text.push(',');
++                text.push_str(&ws(tc));
++            }
++            let e = arb_name(tc);
++            text.push_str(&e);
++            extras.push(e);
++        }
++        text.push_str(&ws(tc));
++        text.push(']');
++    }
++    let mut specs = vec![];
++    let mut url = None;
++    match n(tc, 0, 3) {
++        0 => {}
++        1 => {
++            let u = format!(
++                "https://{}.org/{}{}",
++                arb_chars(tc, "abcdefghijklmnopqrstuvwxyz", 1, 6),
++                arb_chars(tc, "abcdefghijklmnopqrstuvwxyz0123456789/_-", 0, 10),
++                pick(tc, &["", "", ".whl", ".tar.gz", "#egg=x", "?x=1"])
++            );
++            text.push_str(&ws(tc));
++            text.push('@');
++            text.push_str(&ws(tc));
++            text.push_str(&u);
++            url = Some(u);
++        }
++        _ => {
++            let parens = chance(tc, 4);
++            text.push_str(&ws(tc));
++            if parens {
++                text.push('(');
++                text.push_str(&ws(tc));
++            }
++            for i in 0..n(tc, 1, 3) {
++                if i > 0 {
++                    text.push_str(&ws(tc));
++                    text.push(',');
++                    text.push_str(&ws(tc));
++                }
++                let mut s = arb_specifier(tc);
++                // packaging's tokenizer takes `===0,` as the arbitrary string: keep `===` alone.
++                if s.starts_with("===") && specs.len() + 1 < 3 {
++                    s = format!("=={}", &s[3..]);
++                }
++                text.push_str(&s);
++                specs.push(s);
++            }
++            if parens {
++                text.push_str(&ws(tc));
++                text.push(')');
++            }
++        }
++    }
++    let marker = if chance(tc, 2) {
++        // After a URL the semicolon needs whitespace before it.
++        let gap = if url.is_some() { " ".to_string() } else { ws(tc) };
++        text.push_str(&gap);
++        text.push(';');
++        text.push_str(&ws(tc));
++        let m = arb_marker(tc, 1);
++        text.push_str(&m);
++        Some(m)
++    } else {
++        None
++    };
++    text.push_str(&ws(tc));
++    GenReq {
++        text,
++        name,
++        extras,
++        specs,
++        url,
++        marker,
++    }
++}
++
++/// The crate's view of a requirement in `packaging`'s terms.
++fn rs_view(req: &Requirement) -> PyReq {
++    let specs = match &req.version_or_url {
++        Some(VersionOrUrl::VersionSpecifier(specs)) => specs
++            .iter()
++            .map(|s| s.to_string().replace([' ', '\t'], ""))
++            .collect(),
++        _ => BTreeSet::new(),
++    };
++    let url = match &req.version_or_url {
++        Some(VersionOrUrl::Url(u)) => u.to_string(),
++        _ => String::new(),
++    };
++    PyReq {
++        name: req.name.to_string(),
++        extras: req.extras.iter().map(ToString::to_string).collect(),
++        specs,
++        url,
++        marker: String::new(),
++    }
++}
++
++/// Requirements from the PEP 508 grammar parse alike: same canonical name, extras, specifier
++/// set and URL as `packaging`; the marker evaluates alike on random environments; the
++/// crate's `Display` re-parses to an equal requirement (for the crate and for `packaging`).
++#[hegel::test]
++fn requirements_parse_like_packaging(tc: TestCase) {
++    let g = tc.draw(arb_requirement().print_as_debug());
++    let text = &g.text;
++    let theirs = py_requirement(text);
++    let ours = Requirement::<VerbatimUrl>::from_str(text);
++    match (&ours, &theirs) {
++        (Ok(r), None) => panic!("{text:?}: pep508_rs accepts ({r}), packaging rejects"),
++        (Err(e), Some(_)) => panic!("{text:?}: pep508_rs rejects, packaging accepts:\n{e}"),
++        (Err(_), None) => return,
++        _ => {}
++    }
++    let req = ours.unwrap();
++    let py = theirs.unwrap();
++    let mut view = rs_view(&req);
++    view.marker = py.marker.clone();
++    assert_eq!(view, py, "{text:?}");
++    // Against the generator too.
++    assert_eq!(py.name, canonical(&g.name), "{text:?}: name");
++    assert_eq!(
++        py.extras,
++        g.extras.iter().map(|e| canonical(e)).collect::<BTreeSet<_>>(),
++        "{text:?}: extras"
++    );
++    assert_eq!(
++        py.specs,
++        g.specs.iter().map(|s| s.replace([' ', '\t'], "")).collect::<BTreeSet<_>>(),
++        "{text:?}: specifiers"
++    );
++    assert_eq!(py.url, g.url.clone().unwrap_or_default(), "{text:?}: url");
++    assert_eq!(py.marker.is_empty(), g.marker.is_none(), "{text:?}: marker presence");
++
++    // The marker means the same thing.
++    let env = tc.draw(arb_env().print_as_debug());
++    let extra = arb_extra(&tc);
++    if let Some(m) = &g.marker {
++        if let Ok(Some(expected)) = py_marker(m, &env, extra.as_deref()) {
++            assert_eq!(
++                req.evaluate_markers(&env.marker_environment(), &extras_of(&extra)),
++                expected,
++                "{text:?}: marker in {env:?} extra {extra:?}"
++            );
++        }
++    } else {
++        assert!(req.marker.is_true(), "{text:?}: no marker but not TRUE");
++    }
++
++    // Display round trip.
++    let shown = req.to_string();
++    let again = Requirement::<VerbatimUrl>::from_str(&shown)
++        .unwrap_or_else(|e| panic!("{shown:?} (Display of {text:?}) does not re-parse:\n{e}"));
++    let deprecated = DEPRECATED_KEYS.iter().any(|k| text.contains(k));
++    if req.marker.is_false() || deprecated {
++        // pinned: pep508_rs/2 (false markers) and pep508_rs/5 (deprecated spellings)
++        let mut again = again.clone();
++        again.marker = MarkerTree::FALSE;
++        let mut req = req.clone();
++        req.marker = MarkerTree::FALSE;
++        assert_eq!(again, req, "{shown:?} re-parses differently from {text:?}");
++    } else {
++        assert_eq!(again, req, "{shown:?} re-parses differently from {text:?}");
++    }
++    let py_again = py_requirement(&shown)
++        .unwrap_or_else(|| panic!("packaging rejects the crate's Display {shown:?} of {text:?}"));
++    let mut view = rs_view(&req);
++    view.marker = py_again.marker.clone();
++    assert_eq!(view, py_again, "packaging on the crate's Display {shown:?} of {text:?}");
++    if let Ok(Some(expected)) = py_marker(&py.marker, &env, extra.as_deref()) {
++        if !py_again.marker.is_empty() {
++            assert_eq!(
++                py_marker(&py_again.marker, &env, extra.as_deref()),
++                Ok(Some(expected)),
++                "{shown:?}: the re-rendered marker means something else than {text:?}"
++            );
++        }
++    }
++}
++
++/// Syntax agreement on near-miss texts: random mutations of a valid requirement are accepted
++/// by both or rejected by both.
++#[hegel::test]
++fn requirement_syntax_agrees_with_packaging(tc: TestCase) {
++    let g = tc.draw(arb_requirement().print_as_debug());
++    let mut text = g.text.clone();
++    let junk = [
++        " ", ",", ";", "[", "]", "(", ")", "@", "'", "\"", "=", "<", ">", "~", "!", ".", "-", "_",
++        "*", "and", "or", "in", "not", "x", "1", "python_version", "extra",
++    ];
++    for _ in 0..n(&tc, 1, 2) {
++        let pos = n(&tc, 0, text.chars().count());
++        let byte = text.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(text.len());
++        match n(&tc, 0, 2) {
++            0 => text.insert_str(byte, pick(&tc, &junk)),
++            1 => {
++                if byte < text.len() {
++                    let c = text[byte..].chars().next().unwrap();
++                    text.replace_range(byte..byte + c.len_utf8(), "");
++                }
++            }
++            _ => {
++                if byte < text.len() {
++                    let c = text[byte..].chars().next().unwrap();
++                    text.replace_range(byte..byte + c.len_utf8(), pick(&tc, &junk));
++                }
++            }
++        }
++    }
++    // Shapes where the reference is knowingly lenient or the crate knowingly stricter are
++    // outside the spec grammar; only compare texts the spec grammar clearly decides.
++    let theirs = py_requirement(&text);
++    let Ok(ours) = std::panic::catch_unwind(|| Requirement::<VerbatimUrl>::from_str(&text)) else {
++        // (an extra ending in `-`, `_` or `.` panics the parser: pinned as pep508_rs/7)
++        assert!(text.contains('['), "{text:?}: Requirement::from_str panicked");
++        return;
++    };
++    match (&ours, &theirs) {
++        (Ok(r), None) => {
++            // The crate accepts something packaging rejects: report unless it is a URL
++            // requirement (packaging treats any non-space run as a URL and is stricter
++            // about what follows).
++            if !matches!(r.version_or_url, Some(VersionOrUrl::Url(_))) && r.marker.is_true() {
++                panic!("{text:?}: pep508_rs accepts ({r}), packaging rejects");
++            }
++        }
++        (Err(e), Some(py)) => {
++            // packaging accepts a trailing comma, arbitrary URL-ish text and lenient
++            // markers with bogus comparisons; the crate's marker warnings are its documented
++            // leniency. Report only plain name/extras/version specifier texts.
++            let plain = py.url.is_empty() && py.marker.is_empty() && !text.contains(',');
++            if plain {
++                panic!("{text:?}: pep508_rs rejects, packaging accepts ({py:?}):\n{e}");
++            }
++        }
++        _ => {}
++    }
++}
++
++// --------------------------------------------------------------------------- pins
++
++fn env_with(release: &str, python: &str, full: &str) -> Env {
++    Env {
++        values: vec![
++            "cpython".into(),
++            full.into(),
++            "posix".into(),
++            "x86_64".into(),
++            "CPython".into(),
++            release.into(),
++            "Linux".into(),
++            "#1 SMP".into(),
++            full.into(),
++            python.into(),
++            "linux".into(),
++        ],
++    }
++}
++
++/// Pinned (pep508_rs/1): PEP 508 — "the <version_cmp> operators use the PEP 440 version
++/// comparison rules when those are defined (that is when both sides have a valid version
++/// specifier)" — so `platform_release < '6'` is false for release `22.6.0`; the crate compares
++/// string-keyed markers lexicographically (`"22.6.0" < "6"`).
++#[hegel::test]
++fn string_markers_compare_versions_like_pep_440(tc: TestCase) {
++    let env = env_with("22.6.0", "3.12", "3.12.3");
++    let m = MarkerTree::from_str("platform_release < '6'").unwrap();
++    assert_eq!(py_marker("platform_release < '6'", &env, None), Ok(Some(false)));
++    assert!(!rs_marker(&m, &env, &None), "platform_release < '6' with release 22.6.0");
++    let release = pick(&tc, &RELEASES);
++    let op = pick(&tc, &ORDER_OPS);
++    let value = pick(&tc, &["6", "6.5", "6.12", "6.12.93", "10", "22", "5.15", "24.1.0", "22.6.0"]);
++    let text = format!("platform_release {op} '{value}'");
++    let env = env_with(release, "3.12", "3.12.3");
++    if let Ok(Some(expected)) = py_marker(&text, &env, None) {
++        let m = MarkerTree::from_str(&text).unwrap();
++        assert_eq!(rs_marker(&m, &env, &None), expected, "{text:?} with release {release}");
++    }
++}
++
++/// Pinned (pep508_rs/2): an unsatisfiable marker displays as `python_version < '0'`, its own
++/// canonical spelling of `false`, but that text does not parse back to an unsatisfiable tree.
++#[test]
++fn false_markers_round_trip_through_display() {
++    let tree = MarkerTree::from_str("python_version < '3' and python_version >= '3'").unwrap();
++    assert!(tree.is_false(), "the conjunction should be recognised as false");
++    let shown = tree.try_to_string().unwrap();
++    assert_eq!(shown, "python_version < '0'");
++    let again = MarkerTree::from_str(&shown).unwrap();
++    assert!(again.is_false(), "{shown:?} re-parses to {:?}, not false", again.try_to_string());
++    assert_eq!(again, tree);
++}
++
++/// Pinned (pep508_rs/4): `python_version == '3.5.0.*'` holds for Python 3.5 under PEP 440
++/// (`3.5` zero-pads to `3.5.0`, and `packaging` agrees); the crate's tree for the wildcard is
++/// unsatisfiable (`false`).
++#[hegel::test]
++fn python_version_matches_three_component_wildcards(tc: TestCase) {
++    let env = env_with("6.12.93", "3.5", "3.5.2");
++    let text = "python_version == '3.5.0.*'";
++    assert_eq!(py_marker(text, &env, None), Ok(Some(true)));
++    let m = MarkerTree::from_str(text).unwrap();
++    assert!(!m.is_false(), "{text:?} is deemed unsatisfiable");
++    assert!(rs_marker(&m, &env, &None), "{text:?} for Python 3.5");
++    let minor = n(&tc, 5, 14);
++    let env = env_with("6.12.93", &format!("3.{minor}"), &format!("3.{minor}.{}", n(&tc, 0, 9)));
++    let op = pick(&tc, &["==", "!="]);
++    let text = format!("python_version {op} '3.{}.0.*'", n(&tc, 5, 14));
++    let expected = py_marker(&text, &env, None).unwrap().unwrap();
++    let m = MarkerTree::from_str(&text).unwrap();
++    assert_eq!(rs_marker(&m, &env, &None), expected, "{text:?} for Python 3.{minor} (tree {:?})", m.try_to_string());
++}
++
++/// Pinned (pep508_rs/3): PEP 440 arbitrary equality takes any string (`===foobar`), and
++/// `a===a` is a valid dependency specifier for `packaging`; the crate (through `pep440_rs`)
++/// insists on a version after `===`.
++#[hegel::test]
++fn arbitrary_equality_takes_any_string(tc: TestCase) {
++    assert!(py_requirement("a===a").is_some());
++    let req = Requirement::<VerbatimUrl>::from_str("a===a");
++    assert!(req.is_ok(), "`a===a` rejected:\n{}", req.unwrap_err());
++    let value = arb_chars(&tc, "abcdefghijklmnopqrstuvwxyz0123456789.-", 1, 6);
++    let text = format!("pkg==={value}");
++    if py_requirement(&text).is_some() {
++        let req = Requirement::<VerbatimUrl>::from_str(&text);
++        assert!(req.is_ok(), "{text:?} rejected:\n{}", req.unwrap_err());
++    }
++}
++
++/// Three-component versions without a wildcard compare with `python_version` under PEP 440
++/// (a check that pep508_rs/4 is about the wildcard only; `~=` is pinned as pep508_rs/6).
++#[hegel::test]
++fn python_version_compares_with_three_component_versions(tc: TestCase) {
++    let minor = n(&tc, 5, 14);
++    let env = env_with("6.12.93", &format!("3.{minor}"), &format!("3.{minor}.{}", n(&tc, 0, 9)));
++    let op = pick(&tc, &["==", "!=", "<", "<=", ">", ">="]);
++    let text = format!("python_version {op} '3.{}.{}'", n(&tc, 5, 14), n(&tc, 0, 2));
++    let expected = py_marker(&text, &env, None).unwrap().unwrap();
++    let m = MarkerTree::from_str(&text).unwrap();
++    assert_eq!(rs_marker(&m, &env, &None), expected, "{text:?} for Python 3.{minor} (tree {:?})", m.try_to_string());
++}
++
++/// Pinned (pep508_rs/5): `MarkerTree` is documented as canonical ("any two functionally
++/// equivalent markers will compare equally"), but the deprecated spellings (`os.name`,
++/// `sys.platform`, `platform.version`, `platform.machine`, `platform.python_implementation`,
++/// `python_implementation`) make distinct trees from their current spellings — and the
++/// crate's own `Display` of such a tree re-parses to a tree that is not equal to it.
++#[hegel::test]
++fn deprecated_marker_spellings_are_canonical(tc: TestCase) {
++    let old = MarkerTree::from_str("os.name == 'posix'").unwrap();
++    let new = MarkerTree::from_str("os_name == 'posix'").unwrap();
++    assert_eq!(old.try_to_string(), new.try_to_string());
++    assert_eq!(old, new, "os.name vs os_name");
++    let (dep, current) = pick(
++        &tc,
++        &[
++            ("os.name", "os_name"),
++            ("sys.platform", "sys_platform"),
++            ("platform.version", "platform_version"),
++            ("platform.machine", "platform_machine"),
++            ("platform.python_implementation", "platform_python_implementation"),
++            ("python_implementation", "platform_python_implementation"),
++        ],
++    );
++    let op = pick(&tc, &STRING_OPS);
++    let value = pick(&tc, &WORDS);
++    let a = MarkerTree::from_str(&format!("{dep} {op} '{value}'")).unwrap();
++    let b = MarkerTree::from_str(&format!("{current} {op} '{value}'")).unwrap();
++    assert_eq!(a, b, "{dep} vs {current}");
++    let shown = a.try_to_string().unwrap();
++    assert_eq!(MarkerTree::from_str(&shown).unwrap(), a, "Display {shown:?} of {dep} re-parses differently");
++}
++
++/// Pinned (pep508_rs/6): `python_version ~= '3.5.0'` means `>= 3.5.0, == 3.5.*` (PEP 440), so it
++/// is false for Python 3.6; the crate's tree is `python_full_version >= '3.5' and < '4'` — the
++/// compatible-release clause lost its last component.
++#[hegel::test]
++fn tilde_equal_on_python_version_keeps_its_last_component(tc: TestCase) {
++    let env = env_with("6.12.93", "3.6", "3.6.0");
++    let text = "python_version ~= '3.5.0'";
++    assert_eq!(py_marker(text, &env, None), Ok(Some(false)));
++    let m = MarkerTree::from_str(text).unwrap();
++    assert!(!rs_marker(&m, &env, &None), "{text:?} for Python 3.6 (tree {:?})", m.try_to_string());
++    let minor = n(&tc, 5, 14);
++    let env = env_with("6.12.93", &format!("3.{minor}"), &format!("3.{minor}.{}", n(&tc, 0, 9)));
++    let text = format!("python_version ~= '3.{}.{}'", n(&tc, 5, 14), n(&tc, 0, 2));
++    let expected = py_marker(&text, &env, None).unwrap().unwrap();
++    let m = MarkerTree::from_str(&text).unwrap();
++    assert_eq!(rs_marker(&m, &env, &None), expected, "{text:?} for Python 3.{minor} (tree {:?})", m.try_to_string());
++}
++
++/// Pinned (pep508_rs/7): an extra ending in `-`, `_` or `.` (`a[b.]`) is invalid for PEP 508
++/// and `packaging`; the crate's extras parser accepts the characters and then `expect`s the
++/// name to validate — `Requirement::from_str` panics instead of returning an error.
++#[hegel::test]
++fn extras_ending_in_a_separator_are_an_error_not_a_panic(tc: TestCase) {
++    assert!(py_requirement("a[b.]").is_none());
++    let parsed = std::panic::catch_unwind(|| Requirement::<VerbatimUrl>::from_str("a[b.]").is_err());
++    assert_eq!(parsed.ok(), Some(true), "`a[b.]`: panicked or accepted");
++    let sep = pick(&tc, &["-", "_", "."]);
++    let text = format!("{}[{}{}{sep}{}]", arb_name(&tc), ws(&tc), arb_name(&tc), ws(&tc));
++    assert!(py_requirement(&text).is_none(), "{text:?} accepted by packaging");
++    let parsed = std::panic::catch_unwind(|| Requirement::<VerbatimUrl>::from_str(&text).is_err());
++    assert_eq!(parsed.ok(), Some(true), "{text:?}: panicked or accepted");
++}
++
++
++/// Pinned (pep508_rs/8): on a pre-release interpreter (`python_full_version = 3.13.0rc1`,
++/// `python_version = 3.13`) the `python_version` markers must read the `X.Y` string — PEP 508
++/// defines `python_version` as `'.'.join(platform.python_version_tuple()[:2])`, and the crate's
++/// own algebra notes that "`python_version` cannot take on pre-release values". The crate
++/// lowers `python_version == '3.13'` to the release-only range `python_full_version == '3.13.*'`
++/// and then tests the environment's real `3.13.0rc1` against it — false; `python_version <
++/// '3.13'` is true. `packaging` agrees with the spec.
++#[hegel::test]
++fn python_version_markers_hold_on_pre_release_interpreters(tc: TestCase) {
++    let minor = n(&tc, 5, 14);
++    let suffix = pick(&tc, &["rc1", "a2", "b1", "rc3"]);
++    let python = format!("3.{minor}");
++    let env = env_with("6.12.93", &python, &format!("3.{minor}.0{suffix}"));
++    let cases = [
++        (format!("python_version == '{python}'"), true),
++        (format!("python_version >= '{python}'"), true),
++        (format!("python_version != '{python}'"), false),
++        (format!("python_version < '{python}'"), false),
++        (format!("python_version <= '3.{}'", minor - 1), false),
++        (format!("python_version > '3.{}'", minor - 1), true),
++    ];
++    for (text, expected) in cases {
++        assert_eq!(py_marker(&text, &env, None), Ok(Some(expected)), "{text:?} (packaging)");
++        let tree = MarkerTree::from_str(&text).unwrap();
++        assert_eq!(rs_marker(&tree, &env, &None), expected, "{text:?} in {env:?}");
++    }
++}
