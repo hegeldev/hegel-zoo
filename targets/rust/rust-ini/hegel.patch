@@ -1,0 +1,1118 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index f4bc494..ab5e134 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,3 +39,6 @@ case-insensitive = ["unicase"]
+ # [[A]]
+ # Key=value
+ brackets-in-section-names = []
++
++[dev-dependencies]
++hegeltest = "0.44.1"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..5c9ca3b
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,1101 @@
++//! Hegel properties for rust-ini (the `ini` crate), written in the zoo.
++//!
++//! Oracles: Python's own `configparser` (one child process, configured to the intersection of
++//! the two grammars: no interpolation, `strict=False`, `;`/`#` line comments only, no inline
++//! comments, values may not be missing, option names kept as written), the crate's own writer
++//! against its own reader (a written configuration must read back), the crate's rustdoc as the
++//! model for `EscapePolicy::should_escape`, `Properties` and `Ini`, and the documented
++//! examples.
++//!
++//! Known bugs are pinned as expected failures in `target.toml`.
++
++use std::{
++    io::{BufRead, BufReader, Write},
++    process::{Child, ChildStdin, Command, Stdio},
++    sync::{Mutex, OnceLock},
++};
++
++use hegel::{generators, TestCase};
++use ini::{EscapePolicy, Ini, LineSeparator, ParseOption, Properties, WriteOption};
++
++// ---------------------------------------------------------------------------------------------
++// Draw helpers
++
++fn n(tc: &mut TestCase, lo: i64, hi: i64) -> i64 {
++    tc.draw(generators::integers().min_value(lo).max_value(hi))
++}
++
++fn pick<T: Clone>(tc: &mut TestCase, xs: &[T]) -> T {
++    xs[n(tc, 0, xs.len() as i64 - 1) as usize].clone()
++}
++
++fn chance(tc: &mut TestCase, pct: i64) -> bool {
++    n(tc, 1, 100) <= pct
++}
++
++fn pick_chars(tc: &mut TestCase, alphabet: &[char], lo: i64, hi: i64) -> String {
++    let len = n(tc, lo, hi);
++    (0..len).map(|_| pick(tc, alphabet)).collect()
++}
++
++// ---------------------------------------------------------------------------------------------
++// Shapes
++
++/// Every section of an `Ini` in order, duplicates kept, with its properties in order.
++type Shape = Vec<(Option<String>, Vec<(String, String)>)>;
++
++fn shape(ini: &Ini) -> Shape {
++    ini.iter()
++        .map(|(s, p)| {
++            (
++                s.map(String::from),
++                p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
++            )
++        })
++        .collect()
++}
++
++/// Python's view: named sections in order of first appearance, keys in order of first
++/// appearance, the last value written wins (`strict=False`).
++type Doc = Vec<(String, Vec<(String, String)>)>;
++
++fn merge_into(doc: &mut Doc, sec: &str, k: &str, v: &str) {
++    let s = match doc.iter().position(|(s, _)| s == sec) {
++        Some(i) => i,
++        None => {
++            doc.push((sec.to_string(), Vec::new()));
++            doc.len() - 1
++        }
++    };
++    match doc[s].1.iter_mut().find(|(kk, _)| kk == k) {
++        Some(e) => e.1 = v.to_string(),
++        None => doc[s].1.push((k.to_string(), v.to_string())),
++    }
++}
++
++fn merged(ini: &Ini) -> Doc {
++    let mut doc = Doc::new();
++    for (s, p) in ini.iter() {
++        let Some(s) = s else { continue };
++        if !doc.iter().any(|(name, _)| name == s) {
++            doc.push((s.to_string(), Vec::new()));
++        }
++        for (k, v) in p.iter() {
++            merge_into(&mut doc, s, k, v);
++        }
++    }
++    doc
++}
++
++// ---------------------------------------------------------------------------------------------
++// Python's configparser, held open as a child
++
++const PY: &str = r#"
++import sys, configparser
++def run(t):
++    p = configparser.ConfigParser(interpolation=None, strict=False, comment_prefixes=(';', '#'),
++                                  inline_comment_prefixes=None, empty_lines_in_values=True,
++                                  allow_no_value=False, default_section='\0')
++    p.optionxform = str
++    p.read_string(t)
++    out = []
++    for s, d in p._sections.items():
++        out.append('s:' + s.encode().hex())
++        for k, v in d.items():
++            out.append('k:' + k.encode().hex() + '=' + v.encode().hex())
++    return 'ok ' + ' '.join(out)
++for line in sys.stdin:
++    try:
++        r = run(bytes.fromhex(line.strip()).decode())
++    except Exception as e:
++        r = 'err ' + type(e).__name__
++    print(r, flush=True)
++"#;
++
++struct Py {
++    _child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<std::process::ChildStdout>,
++}
++
++static PY_SERVER: OnceLock<Mutex<Py>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
++        .collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn python(text: &str) -> Result<Doc, String> {
++    let server = PY_SERVER.get_or_init(|| {
++        let mut child = Command::new("python3")
++            .args(["-c", PY])
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .spawn()
++            .expect("python3");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Py { _child: child, stdin, stdout })
++    });
++    let mut py = server.lock().unwrap();
++    writeln!(py.stdin, "{}", hex(text)).unwrap();
++    let mut line = String::new();
++    py.stdout.read_line(&mut line).unwrap();
++    let line = line.trim_end();
++    if let Some(rest) = line.strip_prefix("ok") {
++        let mut doc = Doc::new();
++        for tok in rest.split_whitespace() {
++            if let Some(s) = tok.strip_prefix("s:") {
++                doc.push((unhex(s), Vec::new()));
++            } else if let Some(kv) = tok.strip_prefix("k:") {
++                let (k, v) = kv.split_once('=').unwrap();
++                doc.last_mut().unwrap().1.push((unhex(k), unhex(v)));
++            } else {
++                panic!("{}", format!("bad token {tok:?} in {line:?}"));
++            }
++        }
++        Ok(doc)
++    } else {
++        Err(line.to_string())
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// The common grammar: text both parsers read the same way (each restriction is a documented
++// difference between the two, see README.md)
++
++// Section names: never `DEFAULT`, never containing `[`/`]` (Python takes the text up to the
++// last `]`, the crate up to the first), never padded (Python keeps the padding, the crate
++// trims), never followed by anything on the line (Python ignores it, the crate reads it as
++// the start of a key).
++const SECTIONS: &[&str] = &["s", "t", "Sec", "a b", "x.y", "1", "é", "a=b", "c;d", "k:v", "q\"q", "-", "树莓"];
++// Keys: never starting with `[`, `;`, `#` or whitespace; no delimiter, no backslash.
++const KEYS: &[&str] = &["k", "key", "Key", "a b", "k2", "x.y", "k-1", "树", "k;c", "k\"q", "k[1", "K"];
++// Values: anything but a trailing backslash (the crate joins the next line even with escapes
++// disabled — pinned separately).
++const VALUES: &[&str] = &[
++    "", "v", "hello world", "a=b", "x:y", ";c", "#c", "\"q\"", "'s' t", "[not a header]", "a\\tb", "C:\\dir",
++    "树莓", "1 2  3", "a]b", "=", "\\x41", "v;", "tab\tin",
++];
++// Continuation lines: never starting with a comment symbol (Python drops the line, the crate
++// keeps it), never ending with a backslash.
++const CONT: &[&str] = &["c", "more text", "x=y", "[t]", "a: b", "\"q\"", "树", "c]d", "k", "1 2"];
++const COMMENTS: &[&str] = &[";c", "# c", ";", "#", "; a = b", "#[s]"];
++const PAD: &[&str] = &["", " ", "  ", "\t"];
++
++fn indent(tc: &mut TestCase) -> String {
++    pick_chars(tc, &[' ', ' ', '\t'], 1, 4)
++}
++
++fn key_line(tc: &mut TestCase, lead: &str) -> String {
++    let (p1, p2, p3) = (pick(tc, PAD), pick(tc, PAD), pick(tc, PAD));
++    format!("{lead}{}{p1}{}{p2}{}{p3}", pick(tc, KEYS), pick(tc, &['=', ':']), pick(tc, VALUES))
++}
++
++#[derive(Clone, Copy, PartialEq)]
++enum St {
++    /// before the first header: Python needs one
++    Pre,
++    /// after a header (or a comment/blank after it): an indented line is a key for both
++    Header,
++    /// after a key or continuation line: an indented line continues the value in Python
++    /// (and in the crate when `enabled_indented_multiline_value` is on)
++    Key,
++    /// after a comment that follows a key: Python would still continue the value, the crate
++    /// has closed it — nothing indented but comments
++    Closed,
++}
++
++/// Returns the lines and whether any continuation line was generated.
++fn arb_lines(tc: &mut TestCase, multiline: bool) -> (Vec<String>, bool) {
++    let mut lines = Vec::new();
++    let mut st = St::Pre;
++    let mut has_cont = false;
++    // an indented comment right after a comment or blank line is rejected (pinned, rust-ini/9)
++    let mut after_comment_or_blank = true;
++    // Python continues a value only on a line indented deeper than the key's line
++    let mut key_indent = 0usize;
++    let count = n(tc, 0, 9);
++    for _ in 0..count {
++        let kind = n(tc, 0, 9);
++        let plain = lines.len();
++        match (st, kind) {
++            (_, 0..=1) => {
++                lines.push(format!("[{}]{}", pick(tc, SECTIONS), pick(tc, PAD)));
++                st = St::Header;
++            }
++            (St::Pre, 2..=4) => lines.push(pick(tc, COMMENTS).to_string()),
++            (St::Pre, _) => lines.push(pick(tc, PAD).to_string()),
++            (_, 2..=4) => {
++                lines.push(key_line(tc, ""));
++                key_indent = 0;
++                st = St::Key;
++            }
++            (St::Header, 5) => {
++                let lead = indent(tc);
++                key_indent = lead.len();
++                lines.push(key_line(tc, &lead));
++                st = St::Key;
++            }
++            (St::Key, 5..=7) if multiline => {
++                let mut lead = indent(tc);
++                while lead.len() <= key_indent {
++                    lead.push(' ');
++                }
++                lines.push(format!("{lead}{}{}", pick(tc, CONT), pick(tc, PAD)));
++                has_cont = true;
++            }
++            (_, 5..=6) => {
++                lines.push(pick(tc, PAD).to_string());
++            }
++            (St::Key, _) => {
++                lines.push(pick(tc, COMMENTS).to_string());
++                st = St::Closed;
++            }
++            (_, _) => {
++                let lead = if !after_comment_or_blank && chance(tc, 30) { indent(tc) } else { String::new() };
++                lines.push(format!("{lead}{}", pick(tc, COMMENTS)));
++            }
++        }
++        if let Some(last) = lines.get(plain) {
++            let t = last.trim_start();
++            after_comment_or_blank = t.is_empty() || t.starts_with([';', '#']);
++        }
++    }
++    (lines, has_cont)
++}
++
++fn join(tc: &mut TestCase, lines: &[String], crlf: bool) -> String {
++    let sep = if crlf { "\r\n" } else { "\n" };
++    let mut text = lines.join(sep);
++    if !lines.is_empty() && chance(tc, 70) {
++        text.push_str(sep);
++    }
++    text
++}
++
++fn common_options(multiline: bool) -> ParseOption {
++    ParseOption {
++        enabled_quote: false,
++        enabled_escape: false,
++        enabled_indented_multiline_value: multiline,
++        enabled_preserve_key_leading_whitespace: false,
++    }
++}
++
++/// The crate trims line feeds off both ends of a multiline value; Python keeps a leading one
++/// (`k=` followed by an indented line gives `"\nb"`). Documented by the crate's own example
++/// (`foo=` on the first line) — normalised here.
++fn normalise(mut doc: Doc) -> Doc {
++    for (_, props) in doc.iter_mut() {
++        for (_, v) in props.iter_mut() {
++            *v = v.trim_start_matches('\n').to_string();
++        }
++    }
++    doc
++}
++
++#[hegel::test]
++fn parsing_agrees_with_python(mut tc: TestCase) {
++    let multiline = chance(&mut tc, 60);
++    let (lines, has_cont) = arb_lines(&mut tc, multiline);
++    // CRLF with continuation lines is pinned (rust-ini/4)
++    let crlf = !has_cont && chance(&mut tc, 30);
++    let text = join(&mut tc, &lines, crlf);
++    let expected = python(&text).unwrap_or_else(|e| panic!("{}", format!("Python rejects {text:?}: {e}")));
++    let ini = Ini::load_from_str_opt(&text, common_options(multiline))
++        .unwrap_or_else(|e| panic!("{}", format!("crate rejects {text:?}: {e}")));
++    assert!(ini.general_section().is_empty(), "{text:?}: general section {:?}", shape(&ini));
++    assert_eq!(merged(&ini), normalise(expected), "{text:?}");
++}
++
++#[hegel::test]
++fn every_entry_point_parses_alike(mut tc: TestCase) {
++    let (lines, _) = arb_lines(&mut tc, false);
++    let crlf = chance(&mut tc, 30);
++    // no backslashes: the default options interpret escapes, and `\x41` at a line end is short
++    let text = join(&mut tc, &lines, crlf).replace('\\', "/");
++    let a = shape(&Ini::load_from_str(&text).unwrap());
++    let b = shape(&Ini::read_from(&mut text.as_bytes()).unwrap());
++    let c = shape(&Ini::load_from_str_opt(&text, ParseOption::default()).unwrap());
++    let d = shape(&Ini::read_from_opt(&mut text.as_bytes(), ParseOption::default()).unwrap());
++    assert_eq!(a, b, "{text:?}");
++    assert_eq!(a, c, "{text:?}");
++    assert_eq!(a, d, "{text:?}");
++    // a BOM is skipped
++    let e = shape(&Ini::load_from_str(&format!("\u{feff}{text}")).unwrap());
++    assert_eq!(a, e, "{text:?}");
++}
++
++#[hegel::test]
++fn crlf_and_lf_parse_alike(mut tc: TestCase) {
++    let (lines, _) = arb_lines(&mut tc, false);
++    let lf = join(&mut tc, &lines, false);
++    let crlf = lf.replace('\n', "\r\n");
++    let a = shape(&Ini::load_from_str_opt(&lf, common_options(false)).unwrap());
++    let b = shape(&Ini::load_from_str_opt(&crlf, common_options(false)).unwrap_or_else(|e| panic!("{}", format!("{crlf:?}: {e}"))));
++    assert_eq!(a, b, "{lf:?}");
++}
++
++/// Pinned: rust-ini/9 — an indented comment line directly after another comment line (or,
++/// with CRLF line endings, after a whitespace-only line) is rejected as an inline comment.
++#[hegel::test]
++fn indented_comment_lines_are_comments(mut tc: TestCase) {
++    let mut lines = Vec::new();
++    if chance(&mut tc, 60) {
++        lines.push(format!("[{}]", pick(&mut tc, SECTIONS)));
++    }
++    if chance(&mut tc, 50) {
++        lines.push(key_line(&mut tc, ""));
++    }
++    for _ in 0..n(&mut tc, 2, 4) {
++        let lead = if chance(&mut tc, 80) { indent(&mut tc) } else { String::new() };
++        let line = if chance(&mut tc, 20) { pick(&mut tc, PAD).to_string() } else { format!("{lead}{}", pick(&mut tc, COMMENTS)) };
++        lines.push(line);
++    }
++    // the last two lines are always an indented comment after a comment
++    lines.push(format!("{}{}", indent(&mut tc), pick(&mut tc, COMMENTS)));
++    lines.push(format!("{}{}", indent(&mut tc), pick(&mut tc, COMMENTS)));
++    let crlf = chance(&mut tc, 40);
++    let text = join(&mut tc, &lines, crlf);
++    let ini = Ini::load_from_str(&text).unwrap_or_else(|e| panic!("{}", format!("{text:?}: {e}")));
++    let keys: usize = shape(&ini).iter().map(|(_, p)| p.len()).sum();
++    let expected = usize::from(lines.iter().any(|l| l.contains(['=', ':']) && !l.trim_start().starts_with([';', '#', '['])));
++    assert_eq!(keys, expected, "{text:?} -> {:?}", shape(&ini));
++}
++
++/// Pinned: rust-ini/4 — with `enabled_indented_multiline_value`, a CRLF file gets an extra
++/// line feed for every continuation line.
++#[hegel::test]
++fn crlf_and_lf_parse_alike_with_multiline_values(mut tc: TestCase) {
++    let (lines, _) = arb_lines(&mut tc, true);
++    let lf = join(&mut tc, &lines, false);
++    let crlf = lf.replace('\n', "\r\n");
++    let a = shape(&Ini::load_from_str_opt(&lf, common_options(true)).unwrap());
++    let b = shape(&Ini::load_from_str_opt(&crlf, common_options(true)).unwrap());
++    assert_eq!(a, b, "{lf:?}");
++}
++
++// ---------------------------------------------------------------------------------------------
++// The writer against the reader
++
++const PLAIN: &[char] = &['a', 'b', 'Z', '0', '9', ' ', '_', '-', '.', 'é', '树', '!', '/', '~', '"', '\'', '(', ')'];
++const RESERVED: &[char] = &['=', ':', ';', '#'];
++const STRUCTURAL: &[char] = &['[', ']'];
++const CONTROL: &[char] = &['\\', '\n', '\t', '\r', '\0', '\x01', '\x1f', '\x7f', '\u{80}', '\u{ffff}'];
++const ASTRAL: &[char] = &['🐱', '\u{100000}', '𝄞'];
++
++fn escapes_reserved(p: EscapePolicy) -> bool {
++    matches!(
++        p,
++        EscapePolicy::Reserved | EscapePolicy::ReservedUnicode | EscapePolicy::ReservedUnicodeExtended | EscapePolicy::Everything
++    )
++}
++
++fn escapes_astral(p: EscapePolicy) -> bool {
++    matches!(
++        p,
++        EscapePolicy::BasicsUnicodeExtended | EscapePolicy::ReservedUnicodeExtended | EscapePolicy::Everything
++    )
++}
++
++const POLICIES: &[EscapePolicy] = &[
++    EscapePolicy::Nothing,
++    EscapePolicy::Basics,
++    EscapePolicy::BasicsUnicode,
++    EscapePolicy::BasicsUnicodeExtended,
++    EscapePolicy::Reserved,
++    EscapePolicy::ReservedUnicode,
++    EscapePolicy::ReservedUnicodeExtended,
++    EscapePolicy::Everything,
++];
++
++struct Written {
++    ini: Ini,
++    text: String,
++    read: ParseOption,
++    opt: WriteOption,
++}
++
++/// A random `Ini` written with random options, and the reader options that match. Names and
++/// values keep to what the documentation makes readable: no padding (trimmed on read), keys
++/// not empty and not starting with a comment symbol or `[`, delimiters in keys only under a
++/// `Reserved*` policy, no `[`/`]` in section names, values not starting with a quote
++/// (pinned, rust-ini/3), no `\f`/`\v` (pinned, rust-ini/1), astral characters only when
++/// the policy leaves them raw (pinned, rust-ini/2); with `indent_multiline_value` no line
++/// feeds in names (pinned, rust-ini/7), no whitespace or quotes around a value's line feeds
++/// and none at its ends, no CRLF (pinned, rust-ini/4).
++fn arb_written(tc: &mut TestCase) -> Written {
++    let policy = pick(tc, POLICIES);
++    let indent = chance(tc, 30);
++    let mut alphabet: Vec<char> = PLAIN.to_vec();
++    if policy != EscapePolicy::Nothing {
++        alphabet.extend_from_slice(CONTROL);
++    }
++    if !escapes_astral(policy) {
++        alphabet.extend_from_slice(ASTRAL);
++    }
++    let mut value_alphabet = alphabet.clone();
++    value_alphabet.extend_from_slice(RESERVED);
++    value_alphabet.extend_from_slice(STRUCTURAL);
++    let mut key_alphabet = alphabet.clone();
++    key_alphabet.extend_from_slice(STRUCTURAL);
++    if escapes_reserved(policy) {
++        key_alphabet.extend_from_slice(RESERVED);
++    }
++    let mut section_alphabet = alphabet;
++    section_alphabet.extend_from_slice(RESERVED);
++
++    let name_ok = |s: &str| s.trim() == s && (!indent || !s.contains('\n'));
++    let arb_section = |tc: &mut TestCase| -> String {
++        loop {
++            let s = pick_chars(tc, &section_alphabet, 0, 6);
++            if name_ok(&s) {
++                return s;
++            }
++        }
++    };
++    let arb_key = |tc: &mut TestCase| -> String {
++        loop {
++            let s = pick_chars(tc, &key_alphabet, 1, 6);
++            let first = s.chars().next().unwrap();
++            if name_ok(&s) && first != '[' && (escapes_reserved(policy) || !matches!(first, ';' | '#')) {
++                return s;
++            }
++        }
++    };
++    // whitespace of any kind at either end of a value — or, with indented multiline values,
++    // of any of its lines — is trimmed by the reader after unescaping (pinned, rust-ini/10)
++    let arb_value = |tc: &mut TestCase| -> String {
++        loop {
++            let s = pick_chars(tc, &value_alphabet, 0, 8);
++            let padded = |line: &str| line.starts_with(char::is_whitespace) || line.ends_with(char::is_whitespace);
++            if padded(&s) || s.starts_with(['"', '\'']) {
++                continue;
++            }
++            if indent && s.split('\n').any(|line| padded(line) || line.starts_with(['"', '\''])) {
++                continue;
++            }
++            return s;
++        }
++    };
++
++    let mut ini = Ini::new();
++    for _ in 0..n(tc, 0, 3) {
++        let (k, v) = (arb_key(tc), arb_value(tc));
++        ini.with_general_section().add(k, v);
++    }
++    for _ in 0..n(tc, 0, 4) {
++        let name = arb_section(tc);
++        let mut props = Properties::new();
++        for _ in 0..n(tc, 0, 4) {
++            let (k, v) = (arb_key(tc), arb_value(tc));
++            props.append(k, v);
++        }
++        match ini.entry(Some(name)) {
++            ini::SectionEntry::Vacant(e) => {
++                e.insert(props);
++            }
++            ini::SectionEntry::Occupied(mut e) => e.append(props),
++        }
++    }
++
++    let line_separator = if indent {
++        pick(tc, &[LineSeparator::SystemDefault, LineSeparator::CR])
++    } else {
++        pick(tc, &[LineSeparator::SystemDefault, LineSeparator::CR, LineSeparator::CRLF])
++    };
++    let opt = WriteOption {
++        escape_policy: policy,
++        line_separator,
++        kv_separator: pick(tc, &["=", ":", " = ", " : ", "\t=\t"]),
++        indent_multiline_value: indent,
++    };
++    let mut out = Vec::new();
++    ini.write_to_opt(&mut out, opt.clone()).unwrap();
++    let text = String::from_utf8(out).unwrap();
++    let read = ParseOption {
++        enabled_indented_multiline_value: indent,
++        ..ParseOption::default()
++    };
++    Written { ini, text, read, opt }
++}
++
++#[hegel::test]
++fn written_ini_reads_back(mut tc: TestCase) {
++    let Written { ini, text, read, .. } = arb_written(&mut tc);
++    let back = Ini::load_from_str_opt(&text, read).unwrap_or_else(|e| panic!("{}", format!("{:?} -> {:?}: {e}", shape(&ini), text)));
++    assert_eq!(shape(&ini), shape(&back), "{:?}", text);
++}
++
++#[hegel::test]
++fn write_to_file_and_load_from_file_agree_with_the_writer(mut tc: TestCase) {
++    let Written { ini, text, read, opt } = arb_written(&mut tc);
++    let dir = std::env::temp_dir().join(format!("hegel-rust-ini-{}-{}", std::process::id(), n(&mut tc, 0, i64::MAX)));
++    std::fs::create_dir_all(&dir).unwrap();
++    let path = dir.join("conf.ini");
++    ini.write_to_file_opt(&path, opt.clone()).unwrap();
++    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
++    let back = Ini::load_from_file_opt(&path, read).unwrap();
++    assert_eq!(shape(&ini), shape(&back), "{:?}", text);
++    // the policy-only and default entry points are the same writer and reader
++    ini.write_to_file_policy(&path, opt.escape_policy).unwrap();
++    let mut out = Vec::new();
++    ini.write_to_policy(&mut out, opt.escape_policy).unwrap();
++    assert_eq!(std::fs::read_to_string(&path).unwrap(), String::from_utf8(out).unwrap());
++    ini.write_to_file(&path).unwrap();
++    let mut out = Vec::new();
++    ini.write_to(&mut out).unwrap();
++    let default_text = String::from_utf8(out).unwrap();
++    assert_eq!(std::fs::read_to_string(&path).unwrap(), default_text);
++    let from_file = Ini::load_from_file(&path).map(|i| shape(&i)).map_err(|e| e.to_string());
++    let from_str = Ini::load_from_str(&default_text).map(|i| shape(&i)).map_err(|e| e.to_string());
++    assert_eq!(from_file, from_str);
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++/// Pinned: rust-ini/10 — the reader trims a value after unescaping it, so escaped whitespace
++/// at either end of a value (`\t`, `\r`, `\n`, `\x0020`) is written faithfully and lost on
++/// reading.
++#[hegel::test]
++fn escaped_whitespace_at_value_ends_reads_back(mut tc: TestCase) {
++    let policy = pick(&mut tc, &POLICIES[1..]);
++    let chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'' | ' ')).collect();
++    let ws = pick(&mut tc, &['\t', '\r', '\n', '\u{a0}', '\u{2003}']);
++    let mut value = pick_chars(&mut tc, &chars, 1, 4);
++    if chance(&mut tc, 50) {
++        value.insert(0, ws);
++    } else {
++        value.push(ws);
++    }
++    let mut ini = Ini::new();
++    ini.with_section(Some("s")).set("k", value.clone());
++    let mut out = Vec::new();
++    ini.write_to_policy(&mut out, policy).unwrap();
++    let text = String::from_utf8(out).unwrap();
++    let back = Ini::load_from_str(&text).unwrap_or_else(|e| panic!("{}", format!("{policy:?} wrote {text:?}: {e}")));
++    assert_eq!(back.get_from(Some("s"), "k"), Some(value.as_str()), "{policy:?} wrote {text:?}");
++}
++
++/// Pinned: rust-ini/1 — U+000C and U+000B are written as `\f` and `\v`, which the reader
++/// turns into the letters `f` and `v`.
++#[hegel::test]
++fn form_feed_and_vertical_tab_read_back(mut tc: TestCase) {
++    let policy = pick(&mut tc, &POLICIES[1..]);
++    let mut chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'' | ' ')).collect();
++    chars.extend_from_slice(&['\x0c', '\x0b']);
++    let mut value = pick_chars(&mut tc, &chars, 0, 5);
++    value.insert(n(&mut tc, 0, value.chars().count() as i64) as usize, pick(&mut tc, &['\x0c', '\x0b']));
++    let value: String = value.chars().collect();
++    let mut ini = Ini::new();
++    ini.with_section(Some("s")).set("k", value.clone());
++    let mut out = Vec::new();
++    ini.write_to_policy(&mut out, policy).unwrap();
++    let text = String::from_utf8(out).unwrap();
++    let back = Ini::load_from_str(&text).unwrap();
++    assert_eq!(back.get_from(Some("s"), "k"), Some(value.as_str()), "{policy:?} wrote {text:?}");
++}
++
++/// Pinned: rust-ini/2 — the `*Extended`/`Everything` policies write characters above U+FFFF
++/// as `\x` plus five or six hex digits; the reader takes exactly four.
++#[hegel::test]
++fn astral_characters_read_back_under_extended_policies(mut tc: TestCase) {
++    let policy = pick(
++        &mut tc,
++        &[EscapePolicy::BasicsUnicodeExtended, EscapePolicy::ReservedUnicodeExtended, EscapePolicy::Everything],
++    );
++    let mut chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'' | ' ')).collect();
++    chars.extend_from_slice(ASTRAL);
++    let mut value = pick_chars(&mut tc, &chars, 0, 5);
++    value.push(pick(&mut tc, ASTRAL));
++    let mut ini = Ini::new();
++    ini.with_section(Some("s")).set("k", value.clone());
++    let mut out = Vec::new();
++    ini.write_to_policy(&mut out, policy).unwrap();
++    let text = String::from_utf8(out).unwrap();
++    let back = Ini::load_from_str(&text).unwrap_or_else(|e| panic!("{}", format!("{policy:?} wrote {text:?}: {e}")));
++    assert_eq!(back.get_from(Some("s"), "k"), Some(value.as_str()), "{policy:?} wrote {text:?}");
++}
++
++/// Pinned: rust-ini/3 — no policy escapes a quote, so a value starting with `"` or `'` is
++/// written bare and read back (with the default `enabled_quote`) as a quoted value: the quote
++/// is lost, or the file is rejected when the quote is not closed.
++#[hegel::test]
++fn values_starting_with_a_quote_read_back(mut tc: TestCase) {
++    let policy = pick(&mut tc, POLICIES);
++    let chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'')).collect();
++    let quote = pick(&mut tc, &['"', '\'']);
++    let mut value = String::from(quote);
++    value.push_str(pick_chars(&mut tc, &chars, 0, 5).trim());
++    if chance(&mut tc, 50) {
++        value.push(quote);
++        value.push_str(pick_chars(&mut tc, &chars, 0, 3).trim_end());
++    }
++    let mut ini = Ini::new();
++    ini.with_section(Some("s")).set("k", value.clone());
++    let mut out = Vec::new();
++    ini.write_to_policy(&mut out, policy).unwrap();
++    let text = String::from_utf8(out).unwrap();
++    let back = Ini::load_from_str(&text).unwrap_or_else(|e| panic!("{}", format!("{policy:?} wrote {text:?}: {e}")));
++    assert_eq!(back.get_from(Some("s"), "k"), Some(value.as_str()), "{policy:?} wrote {text:?}");
++}
++
++/// Pinned: rust-ini/7 — `indent_multiline_value` indents the line feeds of section names and
++/// keys too, and the reader does not undo that.
++#[hegel::test]
++fn indented_multiline_writer_keeps_keys_and_sections(mut tc: TestCase) {
++    let chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'' | ' ')).collect();
++    let mut name = pick_chars(&mut tc, &chars, 1, 3);
++    name.push('\n');
++    name.push_str(&pick_chars(&mut tc, &chars, 1, 3));
++    let in_section = chance(&mut tc, 50);
++    let mut ini = Ini::new();
++    if in_section {
++        ini.with_section(Some(name.clone())).set("k", "v");
++    } else {
++        ini.with_section(Some("s")).set(name.clone(), "v");
++    }
++    let opt = WriteOption {
++        indent_multiline_value: true,
++        ..Default::default()
++    };
++    let mut out = Vec::new();
++    ini.write_to_opt(&mut out, opt).unwrap();
++    let text = String::from_utf8(out).unwrap();
++    let back = Ini::load_from_str_opt(&text, ParseOption { enabled_indented_multiline_value: true, ..Default::default() })
++        .unwrap_or_else(|e| panic!("{}", format!("{text:?}: {e}")));
++    assert_eq!(shape(&ini), shape(&back), "{text:?}");
++}
++
++// ---------------------------------------------------------------------------------------------
++// The reader against its documentation
++
++/// Pinned: rust-ini/5 — a line without a delimiter (or text after a header's `]`) is not an
++/// error: it is glued, line feed included, to the next line's key.
++#[hegel::test]
++fn lines_without_a_delimiter_do_not_swallow_the_next_line(mut tc: TestCase) {
++    let junk = pick(&mut tc, &["junk", "no delimiter here", "x", "树"]);
++    let sec = pick(&mut tc, SECTIONS);
++    let key = pick(&mut tc, KEYS);
++    let text = if chance(&mut tc, 50) {
++        format!("[{sec}]\n{junk}\n{key}=v\n")
++    } else {
++        format!("[{sec}] {junk}\n{key}=v\n")
++    };
++    match Ini::load_from_str(&text) {
++        Err(_) => {}
++        Ok(ini) => {
++            assert_eq!(ini.get_from(Some(sec), key), Some("v"), "{text:?} -> {:?}", shape(&ini));
++            assert!(shape(&ini).iter().all(|(_, p)| p.iter().all(|(k, _)| !k.contains('\n'))), "{text:?} -> {:?}", shape(&ini));
++        }
++    }
++}
++
++/// Pinned: rust-ini/6 — with `enabled_escape: false` a backslash at the end of a line still
++/// joins the next line onto the value (and a backslash before a delimiter in a key still hides
++/// the delimiter).
++#[hegel::test]
++fn escape_disabled_leaves_backslashes_alone(mut tc: TestCase) {
++    let chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'')).chain(['\\']).collect();
++    let mut value = pick_chars(&mut tc, &chars, 0, 6).trim().to_string();
++    value.push('\\');
++    let (key, second) = (pick(&mut tc, KEYS), pick(&mut tc, VALUES));
++    let text = format!("[s]\n{key}={value}\nj={second}\n");
++    let ini = Ini::load_from_str_opt(&text, common_options(false)).unwrap_or_else(|e| panic!("{}", format!("{text:?}: {e}")));
++    assert_eq!(ini.get_from(Some("s"), key), Some(value.as_str()), "{text:?}");
++    assert_eq!(ini.get_from(Some("s"), "j"), Some(second.trim()), "{text:?}");
++}
++
++#[hegel::test]
++fn quotes_and_escapes_follow_the_docs(mut tc: TestCase) {
++    let chars: Vec<char> = PLAIN.iter().copied().filter(|c| !matches!(c, '"' | '\'' | '\\')).collect();
++    let inner = pick_chars(&mut tc, &chars, 0, 6);
++    let tail = pick_chars(&mut tc, &chars, 0, 4).trim_end().to_string();
++    let quote = pick(&mut tc, &['"', '\'']);
++    // `Key2='Single Quote' with extra value` is `Single Quote with extra value`
++    let text = format!("[s]\nk={quote}{inner}{quote}{tail}\n");
++    let ini = Ini::load_from_str(&text).unwrap();
++    assert_eq!(ini.get_from(Some("s"), "k"), Some(format!("{inner}{tail}").as_str()), "{text:?}");
++    // with quoting disabled the quotes are part of the (trimmed) value
++    let ini = Ini::load_from_str_opt(&text, ParseOption { enabled_quote: false, ..Default::default() }).unwrap();
++    assert_eq!(ini.get_from(Some("s"), "k"), Some(format!("{quote}{inner}{quote}{tail}").as_str()), "{text:?}");
++
++    // escapes: `\W` is `W`, the named escapes, `\xHHHH`
++    let letters: Vec<char> = chars.iter().copied().filter(|c| !matches!(c, '0' | 'a' | 'b' | 't' | 'r' | 'n' | 'x' | 'f' | 'v')).collect();
++    let c = pick(&mut tc, &letters);
++    let code = n(&mut tc, 0x20, 0xffff);
++    let ch = match char::from_u32(code as u32) {
++        Some(ch) if !ch.is_whitespace() && !ch.is_control() && ch != '\\' => ch,
++        _ => 'A',
++    };
++    let text = format!("[s]\nk=a\\{c}b\\tc\\nd\\x{:04x}e\\\\f\n", ch as u32);
++    let ini = Ini::load_from_str(&text).unwrap_or_else(|e| panic!("{}", format!("{text:?}: {e}")));
++    assert_eq!(ini.get_from(Some("s"), "k"), Some(format!("a{c}b\tc\nd{ch}e\\f").as_str()), "{text:?}");
++    let ini = Ini::load_from_str_noescape(&text).unwrap();
++    assert_eq!(ini.get_from(Some("s"), "k"), Some(format!("a\\{c}b\\tc\\nd\\x{:04x}e\\\\f", ch as u32).as_str()), "{text:?}");
++}
++
++#[hegel::test]
++fn should_escape_follows_the_policy_docs(mut tc: TestCase) {
++    let policy = pick(&mut tc, POLICIES);
++    let c = match n(&mut tc, 0, 5) {
++        0 => char::from_u32(n(&mut tc, 0, 0x7f) as u32).unwrap(),
++        1 => pick(&mut tc, &['\\', ';', '#', '=', ':', '"', '\'', '[', ']', ' ']),
++        2 => char::from_u32(n(&mut tc, 0x80, 0xd7ff) as u32).unwrap(),
++        3 => char::from_u32(n(&mut tc, 0xe000, 0xffff) as u32).unwrap(),
++        _ => char::from_u32(n(&mut tc, 0x10000, 0x10ffff) as u32).unwrap(),
++    };
++    let basics = c == '\\' || c.is_ascii_control();
++    let reserved = matches!(c, ';' | '#' | '=' | ':');
++    let bmp = ('\u{80}'..='\u{ffff}').contains(&c);
++    let astral = c > '\u{ffff}';
++    let expected = match policy {
++        EscapePolicy::Nothing => false,
++        EscapePolicy::Basics => basics,
++        EscapePolicy::BasicsUnicode => basics || bmp,
++        EscapePolicy::BasicsUnicodeExtended => basics || bmp || astral,
++        EscapePolicy::Reserved => basics || reserved,
++        EscapePolicy::ReservedUnicode => basics || reserved || bmp,
++        EscapePolicy::ReservedUnicodeExtended | EscapePolicy::Everything => basics || reserved || bmp || astral,
++    };
++    assert_eq!(policy.should_escape(c), expected, "{policy:?} {c:?}");
++}
++
++// ---------------------------------------------------------------------------------------------
++// The maps against a model
++
++#[hegel::test]
++fn properties_follow_a_model(mut tc: TestCase) {
++    let mut props = Properties::new();
++    let mut model: Vec<(String, String)> = Vec::new();
++    for _ in 0..n(&mut tc, 0, 12) {
++        let k = pick(&mut tc, KEYS).to_string();
++        match n(&mut tc, 0, 4) {
++            0 => {
++                let v = pick(&mut tc, VALUES).to_string();
++                props.insert(k.clone(), v.clone());
++                // replace: the key keeps its place, all its values become this one
++                match model.iter().position(|(kk, _)| *kk == k) {
++                    Some(i) => {
++                        model.retain(|(kk, _)| *kk != k);
++                        let i = i.min(model.len());
++                        model.insert(i, (k, v));
++                    }
++                    None => model.push((k, v)),
++                }
++            }
++            1..=2 => {
++                let v = pick(&mut tc, VALUES).to_string();
++                props.append(k.clone(), v.clone());
++                model.push((k, v));
++            }
++            3 => {
++                let removed: Vec<String> = props.remove_all(&k).collect();
++                let expected: Vec<String> = model.iter().filter(|(kk, _)| *kk == k).map(|(_, v)| v.clone()).collect();
++                assert_eq!(removed, expected);
++                model.retain(|(kk, _)| *kk != k);
++            }
++            _ => {
++                let all: Vec<&str> = props.get_all(&k).collect();
++                let expected: Vec<&str> = model.iter().filter(|(kk, _)| *kk == k).map(|(_, v)| v.as_str()).collect();
++                assert_eq!(all, expected);
++                assert_eq!(props.get(&k), expected.first().copied());
++                assert_eq!(props.contains_key(&k), !expected.is_empty());
++            }
++        }
++        let mut keys: Vec<&str> = model.iter().map(|(k, _)| k.as_str()).collect();
++        keys.dedup();
++        keys.sort();
++        keys.dedup();
++        assert_eq!(props.len(), keys.len());
++        assert_eq!(props.is_empty(), model.is_empty());
++        let mut pairs: Vec<(String, String)> = props.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
++        pairs.sort();
++        let mut expected = model.clone();
++        expected.sort();
++        assert_eq!(pairs, expected);
++        for (k, _) in &model {
++            let all: Vec<&str> = props.get_all(k).collect();
++            let expected: Vec<&str> = model.iter().filter(|(kk, _)| kk == k).map(|(_, v)| v.as_str()).collect();
++            assert_eq!(all, expected);
++        }
++    }
++    let collected: Vec<(String, String)> = props.clone().into_iter().collect();
++    let borrowed: Vec<(String, String)> = (&props).into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
++    assert_eq!(collected, borrowed);
++    assert_eq!(collected.len(), model.len());
++}
++
++/// Pinned: rust-ini/8 — `Properties::remove`, `SectionSetter::delete` and `Ini::delete` are
++/// documented as removing the first value / entry / section with the name; they remove all of
++/// them (returning the first).
++#[hegel::test]
++fn remove_and_delete_take_only_the_first_entry(mut tc: TestCase) {
++    let count = n(&mut tc, 2, 4) as usize;
++    let key = pick(&mut tc, KEYS);
++    let values: Vec<String> = (0..count).map(|_| pick(&mut tc, VALUES).to_string()).collect();
++    match n(&mut tc, 0, 2) {
++        0 => {
++            let mut props = Properties::new();
++            for v in &values {
++                props.append(key, v.clone());
++            }
++            assert_eq!(props.remove(key), Some(values[0].clone()));
++            assert_eq!(props.get_all(key).collect::<Vec<_>>(), values[1..].iter().map(String::as_str).collect::<Vec<_>>());
++        }
++        1 => {
++            let mut ini = Ini::new();
++            for v in &values {
++                ini.with_section(Some("s")).add(key, v.clone());
++            }
++            ini.with_section(Some("s")).delete(&key);
++            assert_eq!(ini.section(Some("s")).unwrap().get_all(key).collect::<Vec<_>>(), values[1..].iter().map(String::as_str).collect::<Vec<_>>());
++        }
++        _ => {
++            let mut ini = Ini::new();
++            for v in &values {
++                let mut props = Properties::new();
++                props.insert(key, v.clone());
++                match ini.entry(Some("s".to_string())) {
++                    ini::SectionEntry::Vacant(e) => {
++                        e.insert(props);
++                    }
++                    ini::SectionEntry::Occupied(mut e) => e.append(props),
++                }
++            }
++            let first = ini.delete(Some("s")).expect("a section");
++            assert_eq!(first.get(key), Some(values[0].as_str()));
++            assert_eq!(ini.section_all(Some("s")).count(), count - 1);
++        }
++    }
++}
++
++type Model = Vec<(Option<String>, Vec<(String, String)>)>;
++
++fn model_section<'a>(model: &'a mut Model, name: &Option<String>) -> &'a mut Vec<(String, String)> {
++    if !model.iter().any(|(s, _)| s == name) {
++        model.push((name.clone(), Vec::new()));
++    }
++    &mut model.iter_mut().find(|(s, _)| s == name).unwrap().1
++}
++
++#[hegel::test]
++fn ini_api_follows_a_model(mut tc: TestCase) {
++    let mut ini = Ini::new();
++    let mut model: Model = vec![(None, Vec::new())];
++    for _ in 0..n(&mut tc, 0, 14) {
++        let name: Option<String> = if chance(&mut tc, 25) { None } else { Some(pick(&mut tc, SECTIONS).to_string()) };
++        let key = pick(&mut tc, KEYS).to_string();
++        let value = pick(&mut tc, VALUES).to_string();
++        match n(&mut tc, 0, 7) {
++            0 => {
++                ini.with_section(name.clone()).set(key.clone(), value.clone());
++                let props = model_section(&mut model, &name);
++                match props.iter().position(|(k, _)| *k == key) {
++                    Some(i) => {
++                        props.retain(|(k, _)| *k != key);
++                        let i = i.min(props.len());
++                        props.insert(i, (key, value));
++                    }
++                    None => props.push((key, value)),
++                }
++            }
++            1 => {
++                ini.set_to(name.clone(), key.clone(), value.clone());
++                let props = model_section(&mut model, &name);
++                match props.iter().position(|(k, _)| *k == key) {
++                    Some(i) => {
++                        props.retain(|(k, _)| *k != key);
++                        let i = i.min(props.len());
++                        props.insert(i, (key, value));
++                    }
++                    None => props.push((key, value)),
++                }
++            }
++            2 => {
++                ini.with_section(name.clone()).add(key.clone(), value.clone());
++                model_section(&mut model, &name).push((key, value));
++            }
++            3 => {
++                let expected = model
++                    .iter()
++                    .find(|(s, _)| *s == name)
++                    .and_then(|(_, p)| p.iter().find(|(k, _)| *k == key))
++                    .map(|(_, v)| v.clone());
++                let got = ini.delete_from(name.clone(), &key);
++                assert_eq!(got, expected);
++                if let Some((_, props)) = model.iter_mut().find(|(s, _)| *s == name) {
++                    props.retain(|(k, _)| *k != key);
++                }
++            }
++            4 => {
++                let expected = model.iter().find(|(s, _)| *s == name).map(|(_, p)| {
++                    let mut p = p.clone();
++                    p.sort();
++                    p
++                });
++                let got = ini.delete(name.clone()).map(|p| {
++                    let mut p: Vec<(String, String)> = p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
++                    p.sort();
++                    p
++                });
++                // compared as multisets: a replace does not keep the key's place among values
++                assert_eq!(got, expected);
++                model.retain(|(s, _)| *s != name);
++            }
++            5 => {
++                let expected = model
++                    .iter()
++                    .find(|(s, _)| *s == name)
++                    .and_then(|(_, p)| p.iter().find(|(k, _)| *k == key))
++                    .map(|(_, v)| v.as_str());
++                assert_eq!(ini.get_from(name.clone(), &key), expected);
++                assert_eq!(ini.get_from_or(name.clone(), &key, "dflt"), expected.unwrap_or("dflt"));
++                assert_eq!(ini.with_section(name.clone()).get(&key), expected);
++                assert_eq!(ini.section(name.clone()).is_some(), model.iter().any(|(s, _)| *s == name));
++                if name.is_none() && model.iter().any(|(s, _)| s.is_none()) {
++                    assert_eq!(ini.general_section().get(&key), expected);
++                }
++            }
++            6 => {
++                if let Some(v) = ini.get_from_mut(name.clone(), &key) {
++                    v.make_ascii_uppercase();
++                    let props = model_section(&mut model, &name);
++                    let (_, mv) = props.iter_mut().find(|(k, _)| *k == key).unwrap();
++                    mv.make_ascii_uppercase();
++                }
++            }
++            _ => {
++                if let Some(props) = ini.section_mut(name.clone()) {
++                    props.insert(key.clone(), value.clone());
++                    let mprops = model_section(&mut model, &name);
++                    match mprops.iter().position(|(k, _)| *k == key) {
++                        Some(i) => {
++                            mprops.retain(|(k, _)| *k != key);
++                            let i = i.min(mprops.len());
++                            mprops.insert(i, (key, value));
++                        }
++                        None => mprops.push((key, value)),
++                    }
++                }
++            }
++        }
++        let names: Vec<Option<String>> = ini.sections().map(|s| s.map(String::from)).collect();
++        let expected: Vec<Option<String>> = model.iter().map(|(s, _)| s.clone()).collect();
++        assert_eq!(names, expected);
++        assert_eq!(ini.len(), model.len());
++        assert_eq!(ini.is_empty(), model.is_empty());
++        // sections and their contents, compared as multisets of pairs (a replace keeps the
++        // key's place among keys but not necessarily among values)
++        let got = shape(&ini);
++        for ((gs, gp), (ms, mp)) in got.iter().zip(model.iter()) {
++            assert_eq!(gs, ms);
++            let mut gp = gp.clone();
++            let mut mp = mp.clone();
++            gp.sort();
++            mp.sort();
++            assert_eq!(gp, mp, "section {gs:?}");
++        }
++        for (s, mp) in &model {
++            let props = ini.section(s.clone()).unwrap();
++            let mut keys: Vec<&str> = mp.iter().map(|(k, _)| k.as_str()).collect();
++            keys.sort();
++            keys.dedup();
++            assert_eq!(props.len(), keys.len());
++            for k in keys {
++                let all: Vec<&str> = props.get_all(k).collect();
++                let expected: Vec<&str> = mp.iter().filter(|(kk, _)| kk == k).map(|(_, v)| v.as_str()).collect();
++                assert_eq!(all, expected, "section {s:?} key {k:?}");
++            }
++        }
++    }
++    ini.clear();
++    assert!(ini.is_empty());
++    assert_eq!(ini.len(), 0);
++}
++
++// ---------------------------------------------------------------------------------------------
++// Documentation
++
++#[hegel::test]
++fn doc_examples(_tc: TestCase) {
++    // crate docs / README
++    let mut conf = Ini::new();
++    conf.with_section(None::<String>).set("encoding", "utf-8");
++    conf.with_section(Some("User"))
++        .set("given_name", "Tommy")
++        .set("family_name", "Green")
++        .set("unicode", "Raspberry树莓");
++    conf.with_section(Some("Book")).set("name", "Rust cool");
++    let dir = std::env::temp_dir().join(format!("hegel-rust-ini-doc-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).unwrap();
++    let path = dir.join("conf.ini");
++    conf.write_to_file(&path).unwrap();
++    let back = Ini::load_from_file(&path).unwrap();
++    let _ = std::fs::remove_dir_all(&dir);
++    let section = back.section(Some("User")).unwrap();
++    assert_eq!(section.get("given_name"), Some("Tommy"));
++    assert_eq!(section.get("family_name"), Some("Green"));
++    assert_eq!(section.get("unicode"), Some("Raspberry树莓"));
++    assert_eq!(back.get_from(None::<String>, "encoding"), Some("utf-8"));
++    assert_eq!(back.sections().collect::<Vec<_>>(), vec![None, Some("User"), Some("Book")]);
++    let mut out = Vec::new();
++    conf.write_to(&mut out).unwrap();
++    assert_eq!(
++        String::from_utf8(out).unwrap(),
++        "encoding=utf-8\n\n[User]\ngiven_name=Tommy\nfamily_name=Green\nunicode=Raspberry树莓\n\n[Book]\nname=Rust cool\n"
++    );
++    let mut out = Vec::new();
++    conf.write_to_policy(&mut out, EscapePolicy::BasicsUnicode).unwrap();
++    assert!(String::from_utf8(out).unwrap().contains("unicode=Raspberry\\x6811\\x8393\n"));
++
++    // get_from / get_from_or
++    let ini = Ini::load_from_str("[sec]\nabc = def\n").unwrap();
++    assert_eq!(ini.get_from(Some("sec"), "abc"), Some("def"));
++    let ini = Ini::load_from_str("[sec]\n").unwrap();
++    assert_eq!(ini.get_from_or(Some("sec"), "key", "default"), "default");
++
++    // ParseOption docs
++    let ini = Ini::load_from_str("[Section]\nKey1=\"Quoted value\"\nKey2='Single Quote' with extra value\n").unwrap();
++    assert_eq!(ini.get_from(Some("Section"), "Key1"), Some("Quoted value"));
++    assert_eq!(ini.get_from(Some("Section"), "Key2"), Some("Single Quote with extra value"));
++    let ini = Ini::load_from_str("[Section]\nKey1=C:\\Windows\n").unwrap();
++    assert_eq!(ini.get_from(Some("Section"), "Key1"), Some("C:Windows"));
++    let ini = Ini::load_from_str_noescape("[Section]\nKey1=C:\\Windows\n").unwrap();
++    assert_eq!(ini.get_from(Some("Section"), "Key1"), Some("C:\\Windows"));
++    let ini = Ini::load_from_str_opt(
++        "[Section]\nfoo=\n  b\n  c\n",
++        ParseOption { enabled_indented_multiline_value: true, ..Default::default() },
++    )
++    .unwrap();
++    assert_eq!(ini.get_from(Some("Section"), "foo"), Some("b\nc"));
++    let ini = Ini::load_from_str_opt(
++        "[services my-services]\ndynamodb=\n  endpoint_url=http://localhost:8000\n",
++        ParseOption { enabled_preserve_key_leading_whitespace: true, ..Default::default() },
++    )
++    .unwrap();
++    assert_eq!(ini.get_from(Some("services my-services"), "  endpoint_url"), Some("http://localhost:8000"));
++    assert_eq!(ini.get_from(Some("services my-services"), "dynamodb"), Some(""));
++
++    // Ini::default has a general section; Index panics on a missing one
++    let ini = Ini::default();
++    assert!(ini.general_section().is_empty());
++    assert_eq!(ini.len(), 1);
++    assert!(std::panic::catch_unwind(|| Ini::new()["nope"].len()).is_err());
++    let mut ini = Ini::new();
++    ini.with_section(Some("s")).set("k", "v");
++    assert_eq!(&ini["s"]["k"], "v");
++    assert_eq!(ini[Some("s")].get("k"), Some("v"));
++
++    // LineSeparator
++    assert_eq!(LineSeparator::CR.as_str(), "\n");
++    assert_eq!(LineSeparator::CRLF.as_str(), "\r\n");
++    assert_eq!(LineSeparator::SystemDefault.to_string(), "\n");
++}
