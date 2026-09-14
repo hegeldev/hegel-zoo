@@ -1,16 +1,17 @@
 # Hegel zoo
 
-A collection of high-quality property-based tests for open-source projects, in every language
+A collection of (hopefully) high-quality property-based tests for open-source projects, in every language
 [Hegel](https://github.com/hegeldev) supports.
 
-The zoo grows out of [`DRMacIver/hegel-rust-oss-bug-finding`](https://github.com/DRMacIver/hegel-rust-oss-bug-finding),
-which did this for Rust alone: a set of open-source crates at pinned base commits, a patch adding
-Hegel tests to each, and a record of the bugs those tests found. The zoo extends that to all of
-Hegel's languages and treats the tests themselves, rather than the bugs, as the thing being built.
+These are fully LLM generated, and are primarily for our own evaluation of Hegel. Where possible,
+we report bugs upstream, but in order to be respectful of maintainer time we don't do that without
+a human review step to ensure the bug report is good and welcome, and the agent is working continuously
+to write new tests and find new bugs. As a result, there are likely a number of bugs here that have
+not yet been reported.
 
-It is worked on continuously by an agent, which adds tests for new repositories, records the bugs
-they find (tracked across versions of each repository), updates to new versions of Hegel and
-refactors, landing finished chunks on `main` as pull requests.
+If you find your project in the zoo and would like help getting the hegel tests integrated into it,
+or you would like our help triaging any bugs found in it, please get in touch and we'd be very happy
+to help you with any of this.
 
 ## Layout
 
@@ -21,36 +22,7 @@ Each **target** — one upstream project in one language — lives at `targets/<
 - `hegel.patch`: the tests, as a `git apply`-able diff against the base commit, plus the
   one-line dev-dependency on Hegel;
 - `README.md`: what is tested, with which oracles, and what deliberately is not;
-- `bugs.toml`: every bug the tests found, with its status and a per-version history.
+- `bugs.toml`: every bug the tests found, with its status and a per-version history. Note that these are not necessarily validated by a human yet, so we don't guarantee that any "bugs" listed there are genuinely bugs. However we've generally found the reliability of the agent reports pretty good so most of them probably are.
 
 `zoo.toml` pins the Hegel library version per language. `TROPHIES.md` is generated from all
 the `bugs.toml` files. `DESIGN.md` explains the choices.
-
-## Running
-
-`tools/zoo` (Python 3.11+, standard library only) does everything:
-
-```sh
-tools/zoo test rust/humantime      # clone upstream at the base commit, apply, run, judge
-tools/zoo test rust                # every Rust target
-tools/zoo check                    # static consistency of all targets
-tools/zoo apply rust/foo           # materialise work/rust/foo to edit tests in place …
-tools/zoo save rust/foo            # … and write the result back to hegel.patch
-tools/zoo drift rust               # which targets' base commit is behind upstream (ls-remote only)
-tools/zoo bump rust/foo            # rebase the patch onto upstream HEAD, run, record the outcome
-tools/zoo bump-hegel rust 0.45.0   # move a language to a new Hegel release
-tools/zoo report                   # regenerate TROPHIES.md
-```
-
-`zoo bump` is the zoo's long-running loop: it advances `[base]`, regenerates `hegel.patch`, appends
-a `[[bug.observed]]` row per bug (`reproduces` / `fixed` / `not-reproduced`) and a dated line to the
-target's README. It lands nothing when the patch conflicts, a test fails unexpectedly or a known
-bug stops reproducing — those need a look (`--accept-fixed` records a fix once confirmed).
-
-Upstream checkouts go under `work/` (gitignored). You need the language's toolchain
-(`cargo` for Rust, and so on) and network access for the first fetch of each target.
-
-## Status
-
-Layout settled (see `DESIGN.md`). Importing the predecessor's 162 Rust targets and porting
-them to the current hegeltest is in progress; other languages follow.
