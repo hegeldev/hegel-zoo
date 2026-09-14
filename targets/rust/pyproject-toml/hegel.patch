@@ -1,0 +1,873 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9875958..f477664 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -18,7 +18,7 @@ pep440_rs = { version = "0.7.2" }
+ pep508_rs = { version = "0.9.1" }
+ serde = { version = "1.0.214", features = ["derive"] }
+ thiserror = { version = "2.0.12" }
+-toml = { version = "0.9.4", default-features = false, features = ["parse", "serde", "std"] }
++toml = { version = "0.9.4", default-features = false, features = ["parse", "serde", "std", "display"] }
+ 
+ [features]
+ tracing = ["pep440_rs/tracing", "pep508_rs/tracing"]
+@@ -26,3 +26,5 @@ pep639-glob = ["glob"]
+ 
+ [dev-dependencies]
+ insta = "1.41.0"
++hegeltest = "0.44.1"
++serde_json = "1"
+diff --git a/tests/hegel.rs b/tests/hegel.rs
+new file mode 100644
+index 0000000..e5a5367
+--- /dev/null
++++ b/tests/hegel.rs
+@@ -0,0 +1,848 @@
++//! Hegel properties for `pyproject-toml`.
++//!
++//! Oracles, driven as one persistent Python child (the first of `python3`, `/usr/bin/python3`
++//! that imports them): `dependency_groups` (the PEP 735 reference implementation) for
++//! `[dependency-groups]` resolution, `tomllib` for the raw document, and `pyproject_metadata`
++//! for its PEP 639 `license-files` glob rejections. Alongside: a model of the PEP 639 restricted
++//! glob grammar written from the PEP's text, a model of the crate's own self-referencing
++//! `optional-dependencies` expansion, and the serde round trip through `toml`.
++#![allow(clippy::all, dead_code)]
++use hegel::{generators, Generator, TestCase};
++use pyproject_toml::{check_pep639_glob, parse_pep639_glob, License, PyProjectToml};
++use serde_json::Value;
++use std::collections::{BTreeMap, BTreeSet};
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + std::fmt::Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    tc.draw(generators::sampled_from(items.to_vec()).print_as_debug())
++}
++
++fn chance(tc: &TestCase, one_in: usize) -> bool {
++    n(tc, 0, one_in - 1) == 0
++}
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import sys, json, tomllib, pathlib, tempfile
++from dependency_groups import DependencyGroupResolver, CyclicDependencyError
++from packaging.requirements import InvalidRequirement
++from pyproject_metadata.pyproject import _get_files_from_globs
++from pyproject_metadata.errors import ErrorCollector
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def kind(e):
++    if isinstance(e, CyclicDependencyError):
++        return 'cycle'
++    if isinstance(e, LookupError):
++        return 'lookup'
++    if isinstance(e, InvalidRequirement):
++        return 'requirement'
++    return 'invalid'
++
++tmp = pathlib.Path(tempfile.mkdtemp())
++(tmp / 'LICENSE').write_text('x')
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'G':
++            table = tomllib.loads(args[0]).get('dependency-groups', {})
++            out = {'error': None, 'groups': {}}
++            try:
++                resolver = DependencyGroupResolver(table)
++            except Exception as e:
++                out['error'] = kind(e)
++            else:
++                for name in table:
++                    try:
++                        out['groups'][name] = [str(r) for r in resolver.resolve(name)]
++                    except Exception as e:
++                        out['groups'][name] = {'error': kind(e)}
++            res = ['ok', json.dumps(out)]
++        elif cmd == 'T':
++            res = ['ok', json.dumps(tomllib.loads(args[0]))]
++        elif cmd == 'L':
++            collector = ErrorCollector(collect_errors=True)
++            list(_get_files_from_globs(tmp, [args[0]], collector))
++            invalid = any('invalid' in str(e) for e in collector.errors)
++            res = ['ok', 'invalid' if invalid else 'valid']
++        else:
++            res = ['bad', cmd]
++    except Exception as e:
++        res = ['err', type(e).__name__]
++    print(' '.join([res[0]] + [enc(x) for x in res[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn python() -> &'static str {
++    static PY: OnceLock<&'static str> = OnceLock::new();
++    PY.get_or_init(|| {
++        for py in ["python3", "/usr/bin/python3"] {
++            let ok = Command::new(py)
++                .args(["-c", "import tomllib, dependency_groups, packaging, pyproject_metadata"])
++                .stderr(Stdio::null())
++                .status()
++                .map(|s| s.success())
++                .unwrap_or(false);
++            if ok {
++                return py;
++            }
++        }
++        panic!("no python3 with tomllib, dependency_groups, packaging and pyproject_metadata")
++    })
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let mut child = Command::new(python())
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the python oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle { child, stdin, stdout })
++    })
++}
++
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).unwrap();
++    let mut reply = String::new();
++    o.stdout.read_line(&mut reply).unwrap();
++    let mut parts = reply.trim_end().split(' ');
++    let status = parts.next().unwrap().to_string();
++    (status, parts.map(unhex).collect())
++}
++
++#[derive(Debug)]
++struct PyGroups {
++    /// A table-level error (duplicate normalised names).
++    error: Option<String>,
++    /// Per group: the resolved requirement strings, or the error kind.
++    groups: BTreeMap<String, Result<Vec<String>, String>>,
++}
++
++fn py_groups(toml_text: &str) -> PyGroups {
++    let (status, f) = ask("G", &[toml_text]);
++    assert_eq!(status, "ok", "oracle G failed: {f:?} on {toml_text:?}");
++    let v: Value = serde_json::from_str(&f[0]).unwrap();
++    let error = v["error"].as_str().map(str::to_string);
++    let mut groups = BTreeMap::new();
++    for (name, val) in v["groups"].as_object().unwrap() {
++        let r = match val {
++            Value::Array(items) => Ok(items.iter().map(|s| s.as_str().unwrap().to_string()).collect()),
++            Value::Object(o) => Err(o["error"].as_str().unwrap().to_string()),
++            _ => unreachable!(),
++        };
++        groups.insert(name.clone(), r);
++    }
++    PyGroups { error, groups }
++}
++
++fn py_toml(text: &str) -> Option<Value> {
++    let (status, f) = ask("T", &[text]);
++    (status == "ok").then(|| serde_json::from_str(&f[0]).unwrap())
++}
++
++/// `pyproject_metadata`'s verdict on a `license-files` glob (`true` = rejected as escaping
++/// the project directory).
++fn py_glob_rejected(glob: &str) -> bool {
++    let (status, f) = ask("L", &[glob]);
++    assert_eq!(status, "ok", "oracle L failed on {glob:?}: {f:?}");
++    f[0] == "invalid"
++}
++
++// --------------------------------------------------------------------------- helpers
++
++/// Requirement texts and the form both `packaging` and the crate render (up to whitespace and
++/// quote style).
++const REQUIREMENTS: [&str; 7] = ["x", "y>=1.0", "z[extra]==2.0", "w; os_name == 'nt'", "v~=1.4", "u[a,b]", "t!=3.*"];
++
++fn norm_req(s: &str) -> String {
++    s.chars().filter(|c| !c.is_whitespace()).map(|c| if c == '"' { '\'' } else { c }).collect()
++}
++
++fn norm_reqs(v: &[String]) -> Vec<String> {
++    v.iter().map(|s| norm_req(s)).collect()
++}
++
++fn rs_reqs(v: &[pep508_rs::Requirement]) -> Vec<String> {
++    v.iter().map(|r| norm_req(&r.to_string())).collect()
++}
++
++/// PEP 503/685 normalisation.
++fn normalize(name: &str) -> String {
++    let mut out = String::new();
++    let mut sep = false;
++    for c in name.chars() {
++        if matches!(c, '-' | '_' | '.') {
++            sep = true;
++        } else {
++            if sep && !out.is_empty() {
++                out.push('-');
++            }
++            sep = false;
++            out.push(c.to_ascii_lowercase());
++        }
++    }
++    out
++}
++
++/// A TOML key: bare when possible, otherwise quoted.
++fn toml_key(k: &str) -> String {
++    if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
++        k.to_string()
++    } else {
++        format!("\"{k}\"")
++    }
++}
++
++fn toml_str(s: &str) -> String {
++    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
++}
++
++const GROUP_WORDS: [&str; 8] = ["test", "dev", "docs", "lint", "typing", "ci", "all", "extra1"];
++
++/// A group/extra name in some spelling; `normalize` gives the comparison form.
++fn arb_name(tc: &TestCase) -> String {
++    let a = pick(tc, &GROUP_WORDS);
++    let mut name = if chance(tc, 2) {
++        a.to_string()
++    } else {
++        let b = pick(tc, &GROUP_WORDS);
++        let sep = pick(tc, &["-", "_", "."]);
++        format!("{a}{sep}{b}")
++    };
++    if chance(tc, 4) {
++        name = name.to_ascii_uppercase();
++    } else if chance(tc, 4) {
++        let mut c = name.chars();
++        name = c.next().unwrap().to_ascii_uppercase().to_string() + c.as_str();
++    }
++    name
++}
++
++/// Distinct names, distinct after normalisation too.
++fn arb_distinct_names(tc: &TestCase, lo: usize, hi: usize) -> Vec<String> {
++    let mut names: Vec<String> = Vec::new();
++    let mut seen = BTreeSet::new();
++    for _ in 0..n(tc, lo, hi) {
++        let name = arb_name(tc);
++        if seen.insert(normalize(&name)) {
++            names.push(name);
++        }
++    }
++    names
++}
++
++// --------------------------------------------------------------------------- PEP 735
++
++#[derive(Debug, Clone)]
++enum Item {
++    Req(&'static str),
++    Include(String),
++}
++
++fn render_items(items: &[Item]) -> String {
++    let parts: Vec<String> = items
++        .iter()
++        .map(|i| match i {
++            Item::Req(r) => toml_str(r),
++            Item::Include(g) => format!("{{include-group = {}}}", toml_str(g)),
++        })
++        .collect();
++    format!("[{}]", parts.join(", "))
++}
++
++/// A `[dependency-groups]` table whose includes name existing groups by their exact spelling
++/// (spelling differences are pinned: pyproject-toml/1) or a missing group, possibly forming
++/// cycles.
++#[hegel::composite]
++fn arb_dependency_groups(tc: &TestCase) -> Vec<(String, Vec<Item>)> {
++    let names = arb_distinct_names(tc, 1, 5);
++    let mut groups = Vec::new();
++    for name in &names {
++        let mut items = Vec::new();
++        for _ in 0..n(tc, 0, 4) {
++            if chance(tc, 3) {
++                let target = if chance(tc, 8) { "missing".to_string() } else { pick(tc, &names) };
++                items.push(Item::Include(target));
++            } else {
++                items.push(Item::Req(pick(tc, &REQUIREMENTS)));
++            }
++        }
++        groups.push((name.clone(), items));
++    }
++    groups
++}
++
++fn render_dependency_groups(groups: &[(String, Vec<Item>)]) -> String {
++    let mut s = String::from("[dependency-groups]\n");
++    for (name, items) in groups {
++        s.push_str(&format!("{} = {}\n", toml_key(name), render_items(items)));
++    }
++    s
++}
++
++/// The crate resolves `[dependency-groups]` like the PEP 735 reference implementation: the same
++/// requirement lists (order and duplicates kept), an error exactly when the reference reports
++/// one (cycle, missing group) for some group.
++#[hegel::test]
++fn dependency_groups_resolve_like_the_reference(tc: TestCase) {
++    let groups = tc.draw(arb_dependency_groups().print_as_debug());
++    let text = render_dependency_groups(&groups);
++    let theirs = py_groups(&text);
++    assert!(theirs.error.is_none(), "{text}: unexpected table-level error {:?}", theirs.error);
++    let doc = PyProjectToml::new(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
++    let ours = doc.resolve();
++    let failing: BTreeMap<&String, &String> = theirs.groups.iter().filter_map(|(k, v)| v.as_ref().err().map(|e| (k, e))).collect();
++    match ours {
++        Err(e) => {
++            assert!(!failing.is_empty(), "{text}: the crate fails ({e}), the reference resolves every group: {:?}", theirs.groups);
++            let msg = e.to_string();
++            let kinds: BTreeSet<&String> = failing.values().copied().collect();
++            if kinds.len() == 1 {
++                let kind = kinds.into_iter().next().unwrap();
++                let expected = match kind.as_str() {
++                    "cycle" => "Cycles are not supported",
++                    "lookup" => "Failed to find dependency group",
++                    other => panic!("{text}: unexpected reference error {other}"),
++                };
++                assert!(msg.contains(expected), "{text}: crate error {msg:?}, reference reports {kind}");
++            }
++        }
++        Ok(resolved) => {
++            assert!(failing.is_empty(), "{text}: the crate resolves, the reference fails: {failing:?}");
++            for (name, items) in &groups {
++                let expected = norm_reqs(theirs.groups[name].as_ref().unwrap());
++                let got = rs_reqs(&resolved.dependency_groups[name]);
++                assert_eq!(got, expected, "{text}: group {name}");
++                let _ = items;
++            }
++            assert_eq!(resolved.dependency_groups.len(), groups.len(), "{text}: resolved groups");
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- self references
++
++#[derive(Debug, Clone)]
++struct SelfDoc {
++    name: String,
++    extras: Vec<(String, Vec<Item>)>,
++    groups: Vec<(String, Vec<Item>)>,
++}
++
++/// A document whose optional dependencies and dependency groups refer back to the project's own
++/// extras (`spam[test]`); the project name is normalised and the extras are referred to in their
++/// declared spelling (both pinned: pyproject-toml/5, /6).
++#[hegel::composite]
++fn arb_self_doc(tc: &TestCase) -> SelfDoc {
++    let name = pick(tc, &["spam", "egg-salad", "lobster"]).to_string();
++    let extra_names: Vec<String> = arb_distinct_names(tc, 1, 4).into_iter().map(|s| normalize(&s)).collect();
++    let mut extras = Vec::new();
++    for extra in &extra_names {
++        let mut items = Vec::new();
++        for _ in 0..n(tc, 0, 3) {
++            if chance(tc, 3) {
++                let target = if chance(tc, 8) { "missing".to_string() } else { pick(tc, &extra_names) };
++                items.push(Item::Include(target));
++            } else {
++                items.push(Item::Req(pick(tc, &REQUIREMENTS)));
++            }
++        }
++        extras.push((extra.clone(), items));
++    }
++    let group_names = arb_distinct_names(tc, 0, 3);
++    let mut groups = Vec::new();
++    for group in &group_names {
++        let mut items = Vec::new();
++        for _ in 0..n(tc, 0, 3) {
++            if chance(tc, 2) {
++                items.push(Item::Include(pick(tc, &extra_names)));
++            } else {
++                items.push(Item::Req(pick(tc, &REQUIREMENTS)));
++            }
++        }
++        groups.push((group.clone(), items));
++    }
++    SelfDoc { name, extras, groups }
++}
++
++fn render_self_doc(d: &SelfDoc) -> String {
++    let mut s = format!("[project]\nname = {}\n\n[project.optional-dependencies]\n", toml_str(&d.name));
++    let self_ref = |g: &String| format!("{}[{}]", d.name, g);
++    for (extra, items) in &d.extras {
++        let parts: Vec<String> = items
++            .iter()
++            .map(|i| match i {
++                Item::Req(r) => toml_str(r),
++                Item::Include(g) => toml_str(&self_ref(g)),
++            })
++            .collect();
++        s.push_str(&format!("{} = [{}]\n", toml_key(extra), parts.join(", ")));
++    }
++    s.push_str("\n[dependency-groups]\n");
++    for (group, items) in &d.groups {
++        let parts: Vec<String> = items
++            .iter()
++            .map(|i| match i {
++                Item::Req(r) => toml_str(r),
++                Item::Include(g) => toml_str(&self_ref(g)),
++            })
++            .collect();
++        s.push_str(&format!("{} = [{}]\n", toml_key(group), parts.join(", ")));
++    }
++    s
++}
++
++/// The model of the crate's documented expansion: a self reference is replaced by the resolved
++/// requirements of the named extra; a missing extra or a cycle is an error.
++fn model_extra(d: &SelfDoc, extra: &str, stack: &mut Vec<String>) -> Result<Vec<String>, String> {
++    let Some((_, items)) = d.extras.iter().find(|(e, _)| e == extra) else {
++        return Err("missing".into());
++    };
++    if stack.iter().any(|s| s == extra) {
++        return Err("cycle".into());
++    }
++    stack.push(extra.to_string());
++    let mut out = Vec::new();
++    for item in items {
++        match item {
++            Item::Req(r) => out.push(norm_req(r)),
++            Item::Include(g) => out.extend(model_extra(d, g, stack)?),
++        }
++    }
++    stack.pop();
++    Ok(out)
++}
++
++#[hegel::test]
++fn self_referencing_extras_expand_like_the_model(tc: TestCase) {
++    let d = tc.draw(arb_self_doc().print_as_debug());
++    let text = render_self_doc(&d);
++    let doc = PyProjectToml::new(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
++    let mut expected_extras = Vec::new();
++    let mut error = false;
++    for (extra, _) in &d.extras {
++        match model_extra(&d, extra, &mut Vec::new()) {
++            Ok(v) => expected_extras.push((extra.clone(), v)),
++            Err(_) => error = true,
++        }
++    }
++    let mut expected_groups = Vec::new();
++    for (group, items) in &d.groups {
++        let mut out = Vec::new();
++        for item in items {
++            match item {
++                Item::Req(r) => out.push(norm_req(r)),
++                Item::Include(g) => match model_extra(&d, g, &mut Vec::new()) {
++                    Ok(v) => out.extend(v),
++                    Err(_) => error = true,
++                },
++            }
++        }
++        expected_groups.push((group.clone(), out));
++    }
++    match doc.resolve() {
++        Err(e) => assert!(error, "{text}: the crate fails ({e}), the model resolves"),
++        Ok(resolved) => {
++            assert!(!error, "{text}: the crate resolves, the model fails");
++            for (extra, expected) in &expected_extras {
++                assert_eq!(&rs_reqs(&resolved.optional_dependencies[extra]), expected, "{text}: extra {extra}");
++            }
++            assert_eq!(resolved.optional_dependencies.len(), d.extras.len(), "{text}: resolved extras {:?}", resolved.optional_dependencies.keys().collect::<Vec<_>>());
++            for (group, expected) in &expected_groups {
++                assert_eq!(&rs_reqs(&resolved.dependency_groups[group]), expected, "{text}: group {group}");
++            }
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- PEP 639 globs
++
++const LITERALS: [&str; 8] = ["LICENSE", "COPYING", "licenses", "NOTICE.txt", "third_party", "LICENSE-MIT", "src", "a1"];
++const RANGES: [&str; 7] = ["[CS]", "[a-z]", "[A-Z0-9]", "[a-]", "[-a]", "[._-]", "[Ll]"];
++/// Pieces that make a pattern invalid under PEP 639 (the crate's reading of `..` is "a
++/// component beginning with `..`"; a leading `/` is pinned separately: pyproject-toml/4).
++const BAD_PIECES: [&str; 12] = ["[!a]", "[a?]", "[*]", "LICEN!E", "@x", "a b", "**x", "x**", "***", "..x", "..", "a\\b"];
++
++/// One path component of a PEP 639 glob, with its validity under the PEP.
++fn arb_component(tc: &TestCase) -> (String, bool) {
++    match n(tc, 0, 6) {
++        0 => ("**".to_string(), true),
++        1 => (format!("{}*", pick(tc, &LITERALS)), true),
++        2 => (format!("*{}", pick(tc, &[".txt", ".md", "LICENSE"])), true),
++        3 => (pick(tc, &LITERALS).replace('E', "?"), true),
++        4 => (format!("{}{}{}", pick(tc, &["LICEN", "", "x"]), pick(tc, &RANGES), pick(tc, &["E", ".txt", ""])), true),
++        5 => (pick(tc, &BAD_PIECES).to_string(), false),
++        _ => (pick(tc, &LITERALS).to_string(), true),
++    }
++}
++
++/// A PEP 639 glob without a leading slash, and whether the PEP's rules accept it.
++fn arb_glob(tc: &TestCase) -> (String, bool) {
++    let mut parts = Vec::new();
++    let mut valid = true;
++    for _ in 0..n(tc, 1, 4) {
++        let (c, ok) = arb_component(tc);
++        valid &= ok;
++        parts.push(c);
++    }
++    (parts.join("/"), valid)
++}
++
++/// `parse_pep639_glob` accepts exactly the patterns the PEP 639 text allows.
++#[hegel::test]
++fn license_globs_validate_like_pep_639(tc: TestCase) {
++    let (glob, valid) = arb_glob(&tc);
++    let parsed = parse_pep639_glob(&glob);
++    assert_eq!(parsed.is_ok(), valid, "{glob:?}: {:?}", parsed.map(|p| p.to_string()).map_err(|e| e.to_string()));
++    if valid {
++        // Every accepted pattern stays within the project directory for `pyproject_metadata` too.
++        assert!(!py_glob_rejected(&glob), "{glob:?}: accepted by the crate, rejected by pyproject_metadata");
++    }
++}
++
++// --------------------------------------------------------------------------- the document
++
++const WORDS: [&str; 8] = ["Lovely Spam", "Wonderful Spam", "egg", "bacon", "sausage", "Lobster Thermidor", "tomatoes", "x"];
++const NAMES: [&str; 5] = ["spam", "egg-salad", "lobster-thermidor", "a1", "requests"];
++const VERSIONS: [&str; 5] = ["1.0", "2020.0.0", "0.1.0a1", "1.2.3.post1", "3!1.0.dev2"];
++const CONTENT_TYPES: [&str; 3] = ["text/plain", "text/markdown", "text/x-rst"];
++const SPDX: [&str; 3] = ["MIT", "MIT OR BSD-3-Clause", "MIT AND (Apache-2.0 OR BSD-2-Clause)"];
++const PEOPLE: [&str; 4] = ["Tzu-Ping Chung", "Brett Cannon", "Pradyun", "Émile"];
++const EMAILS: [&str; 3] = ["hi@pradyunsg.me", "brett@python.org", "x@example.com"];
++const CLASSIFIERS: [&str; 3] = ["Development Status :: 4 - Beta", "Programming Language :: Python", "License :: OSI Approved :: MIT License"];
++
++fn arb_person(tc: &TestCase) -> String {
++    match n(tc, 0, 2) {
++        0 => format!("{{name = {}}}", toml_str(pick(tc, &PEOPLE))),
++        1 => format!("{{email = {}}}", toml_str(pick(tc, &EMAILS))),
++        _ => format!("{{name = {}, email = {}}}", toml_str(pick(tc, &PEOPLE)), toml_str(pick(tc, &EMAILS))),
++    }
++}
++
++fn arb_list<F: Fn(&TestCase) -> String>(tc: &TestCase, lo: usize, hi: usize, f: F) -> String {
++    let items: Vec<String> = (0..n(tc, lo, hi)).map(|_| f(tc)).collect();
++    format!("[{}]", items.join(", "))
++}
++
++/// A full pyproject.toml from the `[project]`, `[build-system]` and `[dependency-groups]`
++/// grammars, with every value in the form the crate renders back identically (plain requirement
++/// names, normalised versions).
++#[hegel::composite]
++fn arb_document(tc: &TestCase) -> String {
++    let mut s = String::new();
++    if chance(tc, 2) {
++        s.push_str("[build-system]\n");
++        s.push_str(&format!("requires = {}\n", arb_list(tc, 0, 3, |tc| toml_str(pick(tc, &NAMES)))));
++        if chance(tc, 2) {
++            s.push_str(&format!("build-backend = {}\n", toml_str(pick(tc, &["maturin", "setuptools.build_meta", "hatchling.build"]))));
++        }
++        if chance(tc, 3) {
++            s.push_str(&format!("backend-path = {}\n", arb_list(tc, 0, 2, |tc| toml_str(pick(tc, &["build", ".", "tools/backend"])))));
++        }
++        s.push('\n');
++    }
++    let mut tables = Vec::new();
++    if !chance(tc, 6) {
++        s.push_str("[project]\n");
++        s.push_str(&format!("name = {}\n", toml_str(pick(tc, &NAMES))));
++        if chance(tc, 2) {
++            s.push_str(&format!("version = {}\n", toml_str(pick(tc, &VERSIONS))));
++        }
++        if chance(tc, 2) {
++            s.push_str(&format!("description = {}\n", toml_str(pick(tc, &WORDS))));
++        }
++        if chance(tc, 2) {
++            match n(tc, 0, 2) {
++                0 => s.push_str(&format!("readme = {}\n", toml_str(pick(tc, &["README.md", "README.rst", "README"])))),
++                1 => s.push_str(&format!("readme = {{file = {}, content-type = {}}}\n", toml_str("README.txt"), toml_str(pick(tc, &CONTENT_TYPES)))),
++                _ => s.push_str(&format!("readme = {{text = {}, content-type = {}}}\n", toml_str(pick(tc, &WORDS)), toml_str(pick(tc, &CONTENT_TYPES)))),
++            }
++        }
++        if chance(tc, 2) {
++            s.push_str(&format!("requires-python = {}\n", toml_str(pick(tc, &[">=3.8", ">=3.9,<4", "~=3.10"]))));
++        }
++        if chance(tc, 2) {
++            match n(tc, 0, 2) {
++                0 => s.push_str(&format!("license = {}\n", toml_str(pick(tc, &SPDX)))),
++                1 => s.push_str(&format!("license = {{file = {}}}\n", toml_str(pick(tc, &["LICENSE", "LICENSE.txt"])))),
++                _ => s.push_str(&format!("license = {{text = {}}}\n", toml_str(pick(tc, &WORDS)))),
++            }
++        }
++        if chance(tc, 3) {
++            s.push_str(&format!("license-files = {}\n", arb_list(tc, 0, 3, |tc| toml_str(&arb_glob(tc).0))));
++        }
++        if chance(tc, 2) {
++            s.push_str(&format!("authors = {}\n", arb_list(tc, 0, 3, arb_person)));
++        }
++        if chance(tc, 3) {
++            s.push_str(&format!("maintainers = {}\n", arb_list(tc, 0, 2, arb_person)));
++        }
++        if chance(tc, 2) {
++            s.push_str(&format!("keywords = {}\n", arb_list(tc, 0, 4, |tc| toml_str(pick(tc, &WORDS)))));
++        }
++        if chance(tc, 2) {
++            s.push_str(&format!("classifiers = {}\n", arb_list(tc, 0, 3, |tc| toml_str(pick(tc, &CLASSIFIERS)))));
++        }
++        if chance(tc, 2) {
++            s.push_str(&format!("dependencies = {}\n", arb_list(tc, 0, 4, |tc| toml_str(pick(tc, &NAMES)))));
++        }
++        if chance(tc, 3) {
++            s.push_str(&format!("dynamic = {}\n", arb_list(tc, 0, 3, |tc| toml_str(pick(tc, &["version", "description", "readme", "classifiers"])))));
++        }
++        if chance(tc, 2) {
++            let mut t = String::from("[project.urls]\n");
++            for k in arb_distinct_names(tc, 1, 3) {
++                t.push_str(&format!("{} = {}\n", toml_key(&k), toml_str(pick(tc, &["https://example.com", "readthedocs.org", "github.com/me/spam"]))));
++            }
++            tables.push(t);
++        }
++        if chance(tc, 3) {
++            let mut t = String::from("[project.scripts]\n");
++            for k in arb_distinct_names(tc, 1, 2) {
++                t.push_str(&format!("{} = {}\n", toml_key(&k), toml_str("spam:main_cli")));
++            }
++            tables.push(t);
++        }
++        if chance(tc, 4) {
++            let mut t = String::from("[project.gui-scripts]\n");
++            for k in arb_distinct_names(tc, 1, 2) {
++                t.push_str(&format!("{} = {}\n", toml_key(&k), toml_str("spam:main_gui")));
++            }
++            tables.push(t);
++        }
++        if chance(tc, 3) {
++            let group = pick(tc, &["spam.magical", "console_scripts_x", "pytest11"]);
++            let mut t = format!("[project.entry-points.{}]\n", toml_key(group));
++            for k in arb_distinct_names(tc, 1, 2) {
++                t.push_str(&format!("{} = {}\n", toml_key(&k), toml_str("spam:main_tomatoes")));
++            }
++            tables.push(t);
++        }
++        if chance(tc, 2) {
++            let mut t = String::from("[project.optional-dependencies]\n");
++            for k in arb_distinct_names(tc, 1, 3) {
++                t.push_str(&format!("{} = {}\n", toml_key(&k), arb_list(tc, 0, 3, |tc| toml_str(pick(tc, &NAMES)))));
++            }
++            tables.push(t);
++        }
++        s.push('\n');
++    }
++    for t in tables {
++        s.push_str(&t);
++        s.push('\n');
++    }
++    if chance(tc, 2) {
++        let groups: Vec<(String, Vec<Item>)> = arb_distinct_names(tc, 1, 3)
++            .into_iter()
++            .map(|g| {
++                let items = (0..n(tc, 0, 3))
++                    .map(|_| if chance(tc, 3) { Item::Include(pick(tc, &["test", "dev"]).to_string()) } else { Item::Req(pick(tc, &NAMES)) })
++                    .collect();
++                (g, items)
++            })
++            .collect();
++        s.push_str(&render_dependency_groups(&groups));
++    }
++    s
++}
++
++/// JSON without `null` members (serde renders absent `Option`s as `null`).
++fn strip_nulls(v: Value) -> Value {
++    match v {
++        Value::Object(m) => Value::Object(m.into_iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k, strip_nulls(v))).collect()),
++        Value::Array(a) => Value::Array(a.into_iter().map(strip_nulls).collect()),
++        other => other,
++    }
++}
++
++/// The parsed document holds exactly what `tomllib` reads (kebab-case keys, untagged tables,
++/// requirement and version strings), and the serde round trip through `toml` is the identity.
++#[hegel::test]
++fn documents_deserialize_field_by_field_and_round_trip(tc: TestCase) {
++    let text = tc.draw(arb_document());
++    let theirs = py_toml(&text).unwrap_or_else(|| panic!("tomllib rejects the generated document:\n{text}"));
++    let doc = PyProjectToml::new(&text).unwrap_or_else(|e| panic!("{text}\n{e}"));
++    let ours = strip_nulls(serde_json::to_value(&doc).unwrap());
++    assert_eq!(ours, theirs, "{text}");
++    let rendered = toml::to_string(&doc).unwrap_or_else(|e| panic!("{text}\nserialize: {e}"));
++    let back = PyProjectToml::new(&rendered).unwrap_or_else(|e| panic!("{text}\nre-parse of\n{rendered}\n{e}"));
++    assert_eq!(back, doc, "{text}\nrendered as\n{rendered}");
++}
++
++// --------------------------------------------------------------------------- pins
++
++/// Spellings of one name (PEP 735: names "must be normalized before comparisons").
++const SPELLINGS: [&str; 5] = ["test-group", "Test_Group", "TEST.GROUP", "test_group", "Test-Group"];
++
++/// Pinned (pyproject-toml/1): an `include-group` names its group in any spelling with the same
++/// normalised form; the crate looks the include up by its exact text.
++#[hegel::test]
++fn include_group_names_are_compared_normalized(tc: TestCase) {
++    let declared = pick(&tc, &SPELLINGS);
++    let mut included = pick(&tc, &SPELLINGS);
++    if included == declared {
++        included = if declared == "test-group" { "Test_Group" } else { "test-group" };
++    }
++    let text = format!("[dependency-groups]\n{} = [\"x\"]\nother = [{{include-group = {}}}]\n", toml_key(declared), toml_str(included));
++    let theirs = py_groups(&text);
++    assert_eq!(theirs.groups["other"], Ok(vec!["x".to_string()]), "{text}: reference");
++    let resolved = PyProjectToml::new(&text).unwrap().resolve().unwrap_or_else(|e| panic!("{text}: {e}"));
++    assert_eq!(rs_reqs(&resolved.dependency_groups["other"]), vec!["x".to_string()], "{text}");
++}
++
++/// Pinned (pyproject-toml/2): two groups whose names normalise alike are an error for the
++/// reference ("tools SHOULD emit an error"); the crate resolves them as distinct groups.
++#[hegel::test]
++fn duplicate_normalized_group_names_are_an_error(tc: TestCase) {
++    let a = pick(&tc, &SPELLINGS);
++    let mut b = pick(&tc, &SPELLINGS);
++    if a == b {
++        b = if a == "test-group" { "Test_Group" } else { "test-group" };
++    }
++    let text = format!("[dependency-groups]\n{} = [\"x\"]\n{} = [\"y\"]\n", toml_key(a), toml_key(b));
++    let theirs = py_groups(&text);
++    assert_eq!(theirs.error.as_deref(), Some("invalid"), "{text}: reference");
++    let doc = PyProjectToml::new(&text).unwrap();
++    assert!(doc.resolve().is_err(), "{text}: resolved without an error");
++}
++
++/// Pinned (pyproject-toml/3): a Dependency Group Include is "a table with exactly one key,
++/// `include-group`"; the crate accepts extra keys and ignores them.
++#[hegel::test]
++fn include_tables_have_exactly_one_key(tc: TestCase) {
++    let extra = pick(&tc, &["foo", "includes", "path", "include_group"]);
++    let value = pick(&tc, &["\"bar\"", "1", "true", "[]"]);
++    let text = format!("[dependency-groups]\na = [\"x\"]\nb = [{{include-group = \"a\", {extra} = {value}}}]\n");
++    let theirs = py_groups(&text);
++    assert_eq!(theirs.groups["b"], Err("invalid".to_string()), "{text}: reference");
++    let accepted = PyProjectToml::new(&text).map(|doc| doc.resolve().is_ok()).unwrap_or(false);
++    assert!(!accepted, "{text}: parsed and resolved without an error");
++}
++
++/// Pinned (pyproject-toml/4): PEP 639 — "the leading slash character MUST NOT be used";
++/// `check_pep639_glob` accepts `/LICENSE` (and `pyproject_metadata` rejects it).
++#[hegel::test]
++fn license_globs_reject_a_leading_slash(tc: TestCase) {
++    let mut glob = String::from("/");
++    loop {
++        let (g, valid) = arb_glob(&tc);
++        if valid {
++            glob.push_str(&g);
++            break;
++        }
++    }
++    assert!(py_glob_rejected(&glob), "{glob:?}: pyproject_metadata accepts");
++    assert!(check_pep639_glob(&glob).is_err(), "{glob:?}: accepted by check_pep639_glob");
++    assert!(parse_pep639_glob(&glob).is_err(), "{glob:?}: accepted by parse_pep639_glob");
++}
++
++/// Pinned (pyproject-toml/5): a self reference is recognised by comparing the requirement's
++/// (normalised) name with the project's raw name, so `name = "Spam_Egg"` never matches
++/// `spam-egg[x]` and the extra is left unexpanded.
++#[hegel::test]
++fn self_references_match_the_normalized_project_name(tc: TestCase) {
++    let name = pick(&tc, &["Spam_Egg", "spam.egg", "SPAM-EGG", "Spam-egg"]);
++    let reference = pick(&tc, &["spam-egg", "Spam_Egg", "spam.egg"]);
++    let text = format!("[project]\nname = {}\n[project.optional-dependencies]\nx = [\"a\"]\ndev = [{}]\n", toml_str(name), toml_str(&format!("{reference}[x]")));
++    let resolved = PyProjectToml::new(&text).unwrap().resolve().unwrap_or_else(|e| panic!("{text}: {e}"));
++    assert_eq!(rs_reqs(&resolved.optional_dependencies["dev"]), vec!["a".to_string()], "{text}");
++}
++
++/// Pinned (pyproject-toml/6): referring to an extra by another spelling adds a second entry for
++/// it to `ResolvedDependencies::optional_dependencies` (`Test_X` and `test-x`).
++#[hegel::test]
++fn resolved_extras_are_keyed_once(tc: TestCase) {
++    let declared = pick(&tc, &["Test_X", "test.x", "TEST-X"]);
++    let referenced = pick(&tc, &["test-x", "Test_X", "test_x"]);
++    if normalize(declared) != normalize(referenced) || declared == referenced {
++        return;
++    }
++    let text = format!("[project]\nname = \"spam\"\n[project.optional-dependencies]\n{} = [\"a\"]\ndev = [{}]\n", toml_key(declared), toml_str(&format!("spam[{referenced}]")));
++    let resolved = PyProjectToml::new(&text).unwrap().resolve().unwrap_or_else(|e| panic!("{text}: {e}"));
++    assert_eq!(rs_reqs(&resolved.optional_dependencies["dev"]), vec!["a".to_string()], "{text}");
++    let keys: Vec<&String> = resolved.optional_dependencies.keys().collect();
++    assert_eq!(keys.len(), 2, "{text}: resolved extras {keys:?}");
++}
++
++/// Pinned (pyproject-toml/7): `check_pep639_glob` is the documented validity check, but it
++/// accepts patterns `parse_pep639_glob` then rejects (`LICENSE**`, `LICEN[CE`, `[`).
++#[hegel::test]
++fn check_and_parse_agree_on_validity(tc: TestCase) {
++    let glob = match n(&tc, 0, 3) {
++        0 => format!("{}**", pick(&tc, &LITERALS)),
++        1 => format!("{}[{}", pick(&tc, &LITERALS), pick(&tc, &["CE", "", "a-z"])),
++        2 => format!("{}/{}", arb_glob(&tc).0, pick(&tc, &["x**", "[", "a[b"])),
++        _ => arb_glob(&tc).0,
++    };
++    let checked = check_pep639_glob(&glob).is_ok();
++    let parsed = parse_pep639_glob(&glob).is_ok();
++    assert_eq!(checked, parsed, "{glob:?}: check_pep639_glob {checked}, parse_pep639_glob {parsed}");
++}
++
++/// Pinned (pyproject-toml/8): the `license` table's `file` and `text` keys "are mutually
++/// exclusive, thus tools MUST raise an error if the metadata specifies both keys"; the crate
++/// parses `{text = …, file = …}` as `License::Text` and drops the file.
++#[hegel::test]
++fn license_tables_with_both_text_and_file_are_an_error(tc: TestCase) {
++    let (first, second) = if chance(&tc, 2) { ("text", "file") } else { ("file", "text") };
++    let text = format!("[project]\nname = \"spam\"\nlicense = {{{first} = {}, {second} = {}}}\n", toml_str(pick(&tc, &WORDS)), toml_str("LICENSE"));
++    match PyProjectToml::new(&text) {
++        Err(_) => {}
++        Ok(doc) => panic!("{text}: parsed as {:?}", doc.project.unwrap().license),
++    }
++}
++
++#[test]
++fn license_enum_is_used() {
++    // Keep the import meaningful for the pin above's error message.
++    let _ = License::Spdx("MIT".into());
++}
