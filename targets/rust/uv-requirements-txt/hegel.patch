@@ -1,0 +1,814 @@
+diff --git a/crates/uv-requirements-txt/Cargo.toml b/crates/uv-requirements-txt/Cargo.toml
+index bcdca37..3ec004c 100644
+--- a/crates/uv-requirements-txt/Cargo.toml
++++ b/crates/uv-requirements-txt/Cargo.toml
+@@ -50,3 +50,5 @@ regex = { workspace = true }
+ tempfile = { workspace = true }
+ test-case = { workspace = true }
+ tokio = { workspace = true }
++hegeltest = "0.44.1"
++serde_json = { workspace = true }
+diff --git a/crates/uv-requirements-txt/tests/hegel.rs b/crates/uv-requirements-txt/tests/hegel.rs
+new file mode 100644
+index 0000000..adb6305
+--- /dev/null
++++ b/crates/uv-requirements-txt/tests/hegel.rs
+@@ -0,0 +1,798 @@
++//! Hegel properties for `uv-requirements-txt` — uv's `requirements.txt` parser (`RequirementsTxt::
++//! parse`: requirements with `--hash` tails, `-r`/`-c` includes, `-e` editables, `--index-url`,
++//! `--extra-index-url`, `--find-links`, `--no-index`, `--require-hashes`, `--no-binary`,
++//! `--only-binary`, comments, line continuations, `${VAR}` expansion) — with **pip's own
++//! requirements-file parser** (`pip._internal.req.req_file`: `RequirementsFileParser`,
++//! `preprocess`, `get_line_parser`; the format's owner) as the oracle, driven as one persistent
++//! Python child over the same generated tree of files.
++
++use std::collections::BTreeSet;
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::path::{Path, PathBuf};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++
++use hegel::{generators, TestCase};
++use url::Url;
++use uv_configuration::{NoBinary, NoBuild};
++use uv_pep508::VersionOrUrl;
++use uv_requirements_txt::{RequirementsTxt, RequirementsTxtRequirement};
++
++/// The environment variable the generated files reference as `${HEGEL_ZOO_REQ_VAR}`.
++const ENV_VAR: &str = "HEGEL_ZOO_REQ_VAR";
++const ENV_VALUE: &str = "sub";
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import json
++import sys
++from packaging.requirements import Requirement, InvalidRequirement
++from packaging.utils import canonicalize_name
++from pip._internal.req.req_file import RequirementsFileParser, get_line_parser
++from pip._internal.network.session import PipSession
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++session = PipSession()
++
++def parse(root):
++    parser = RequirementsFileParser(session, get_line_parser(None))
++    records = []
++    for line in parser._parse_and_recurse(root, False):
++        opts = line.opts
++        rec = {'constraint': line.constraint, 'lineno': line.lineno, 'file': line.filename}
++        if line.is_requirement:
++            rec['kind'] = 'editable' if line.is_editable else 'req'
++            rec['text'] = line.requirement
++            if not line.is_editable:
++                try:
++                    req = Requirement(line.requirement)
++                except InvalidRequirement as e:
++                    raise ValueError(f"invalid requirement {line.requirement!r}: {e}")
++                rec['name'] = canonicalize_name(req.name)
++                rec['specs'] = sorted(str(s).replace(' ', '') for s in req.specifier)
++                rec['extras'] = sorted(canonicalize_name(e) for e in req.extras)
++                rec['marker'] = req.marker is not None
++                rec['url'] = req.url
++            hashes = opts.hashes or {}
++            rec['hashes'] = sorted(f"{algo}:{digest}" for algo, digests in hashes.items() for digest in digests)
++        else:
++            rec['kind'] = 'opt'
++            rec['index_url'] = opts.index_url
++            rec['extra_index_urls'] = list(opts.extra_index_urls or [])
++            rec['find_links'] = list(opts.find_links or [])
++            rec['no_index'] = bool(opts.no_index)
++            rec['require_hashes'] = bool(opts.require_hashes)
++            fc = opts.format_control
++            rec['no_binary'] = sorted(fc.no_binary)
++            rec['only_binary'] = sorted(fc.only_binary)
++            rec['pre'] = bool(opts.pre)
++            rec['trusted_hosts'] = list(opts.trusted_hosts or [])
++            rec['hashes'] = sorted(f"{a}:{d}" for a, ds in (opts.hashes or {}).items() for d in ds)
++        records.append(rec)
++    return records
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'F':
++            out = ['ok', json.dumps(parse(args[0]))]
++        else:
++            out = ['bad', cmd]
++    except Exception as e:
++        out = ['err', f"{type(e).__name__}: {e}"]
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++static ENV: OnceLock<()> = OnceLock::new();
++
++/// Set the environment variable the generated files reference, once, before any parse or the
++/// oracle's spawn (both read the process environment).
++fn setup_env() {
++    ENV.get_or_init(|| {
++        // SAFETY: called before any other thread of this test binary reads the environment
++        // (every property calls it first, and the oracle child is spawned afterwards).
++        #[allow(unsafe_code)]
++        unsafe {
++            std::env::set_var(ENV_VAR, ENV_VALUE);
++        }
++    });
++}
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
++        .collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        setup_env();
++        let python = ["python3", "/usr/bin/python3"]
++            .into_iter()
++            .find(|py| {
++                Command::new(py)
++                    .args(["-c", "import pip._internal.req.req_file, packaging.requirements"])
++                    .stdout(Stdio::null())
++                    .stderr(Stdio::null())
++                    .status()
++                    .is_ok_and(|s| s.success())
++            })
++            .expect("a python3 with `pip` and `packaging` is needed as the oracle");
++        let mut child = Command::new(python)
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the pip oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle {
++            child,
++            stdin,
++            stdout,
++        })
++    })
++}
++
++/// Ask the oracle: the status (`ok` or `err`) and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?})");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(matches!(status.as_str(), "ok" | "err"), "oracle said {reply:?} to {line:?}");
++    (status, it.filter(|s| !s.is_empty()).map(unhex).collect())
++}
++
++/// pip's parse of the tree rooted at `root`: the yielded lines as JSON records, or the error.
++fn pip_parse(root: &Path) -> Result<Vec<serde_json::Value>, String> {
++    let (status, fields) = ask("F", &[root.to_str().unwrap()]);
++    if status == "ok" {
++        Ok(serde_json::from_str(&fields[0]).expect("oracle JSON"))
++    } else {
++        Err(fields.join(" "))
++    }
++}
++
++// --------------------------------------------------------------------------- helpers
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    items[n(tc, 0, items.len() - 1)].clone()
++}
++
++fn chance(tc: &TestCase, pct: usize) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++fn uv_parse(root: &Path, working_dir: &Path) -> Result<RequirementsTxt, String> {
++    setup_env();
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .unwrap();
++    runtime
++        .block_on(RequirementsTxt::parse(root, working_dir))
++        .map_err(|e| format!("{e}"))
++}
++
++// --------------------------------------------------------------------------- the generated tree
++
++/// The files of a generated tree, relative to its root directory.
++struct World {
++    dir: tempfile::TempDir,
++    files: Vec<(PathBuf, String)>,
++}
++
++impl World {
++    fn root(&self) -> PathBuf {
++        self.dir.path().join("requirements.txt")
++    }
++
++    fn write(&self) {
++        let d = self.dir.path();
++        std::fs::create_dir_all(d.join("nested")).unwrap();
++        std::fs::create_dir_all(d.join("pkg")).unwrap();
++        std::fs::create_dir_all(d.join("wheels")).unwrap();
++        std::fs::write(
++            d.join("pkg/pyproject.toml"),
++            "[project]\nname = \"pkg\"\nversion = \"0.1\"\n",
++        )
++        .unwrap();
++        for (path, content) in &self.files {
++            std::fs::write(d.join(path), content).unwrap();
++        }
++    }
++}
++
++const NAMES: &[&str] = &["requests", "Flask", "numpy", "a-b_c.d", "Zope.Interface", "x1"];
++const EXTRAS: &[&str] = &["security", "Extra_2", "tests", "a.b"];
++const SPECS: &[&str] = &[">=2", "==1.0.*", "~=1.4", "<3,>=2.1", "!=0.9", ">=1.0a1", "===1.0"];
++const MARKERS: &[&str] = &[
++    "python_version >= '3.8'",
++    "sys_platform == \"linux\"",
++    "python_version < '3.12' and os_name == 'posix'",
++    "extra == 'x'",
++];
++const URLS: &[&str] = &[
++    "https://example.com/simple",
++    "https://user:pw@idx.example/simple/",
++    "https://${HEGEL_ZOO_REQ_VAR}.example/simple",
++    "https://x.example/s?q=1",
++    "http://localhost:8080/simple",
++];
++const HOSTS: &[&str] = &["example.com", "idx.example:8080"];
++const HEX: &[char] = &['0', '1', '9', 'a', 'b', 'f'];
++
++/// A `--hash` argument, `sha256:<digest>` style.
++fn arb_hash(tc: &TestCase) -> String {
++    let algo = pick(tc, &["sha256", "sha384", "sha512"]);
++    let digest: String = (0..n(tc, 4, 12)).map(|_| pick(tc, HEX)).collect();
++    format!("{algo}:{digest}")
++}
++
++/// `key value`, `key=value` or `key\t value`; long options may use `=`.
++fn opt(tc: &TestCase, key: &str, value: &str) -> String {
++    if key.starts_with("--") && chance(tc, 35) {
++        format!("{key}={value}")
++    } else {
++        let sep = pick(tc, &[" ", "  ", "\t"]);
++        format!("{key}{sep}{value}")
++    }
++}
++
++/// A shell-quoted spelling of `value` (pip runs option strings through `shlex`; uv unquotes).
++fn maybe_quote(tc: &TestCase, value: &str) -> String {
++    match n(tc, 0, 5) {
++        0 => format!("'{value}'"),
++        1 => format!("\"{value}\""),
++        _ => value.to_string(),
++    }
++}
++
++/// A trailing ` # comment` (comments need whitespace before the `#`).
++fn maybe_comment(tc: &TestCase) -> String {
++    if chance(tc, 20) {
++        format!("{}# {}", pick(tc, &[" ", "\t", "   "]), pick(tc, &["note", "pinned by x", "#!"]))
++    } else {
++        String::new()
++    }
++}
++
++/// A PEP 508 requirement line with an optional `--hash` tail (possibly on continuation lines).
++fn arb_requirement_line(tc: &TestCase, with_hashes: bool) -> String {
++    let mut s = pick(tc, NAMES).to_string();
++    if chance(tc, 30) {
++        let extras: Vec<&str> = (0..n(tc, 1, 2)).map(|_| pick(tc, EXTRAS)).collect();
++        s.push_str(&format!("[{}]", extras.join(",")));
++    }
++    if chance(tc, 60) {
++        if chance(tc, 30) {
++            s.push(' ');
++        }
++        s.push_str(pick(tc, SPECS));
++    }
++    if chance(tc, 30) {
++        s.push_str(&format!(" ; {}", pick(tc, MARKERS)));
++    }
++    if with_hashes && chance(tc, 45) {
++        for _ in 0..n(tc, 1, 3) {
++            if chance(tc, 50) {
++                s.push_str(" \\\n    ");
++            } else {
++                s.push(' ');
++            }
++            s.push_str(&opt(tc, "--hash", &arb_hash(tc)));
++        }
++    }
++    s.push_str(&maybe_comment(tc));
++    s
++}
++
++/// A line that is trivia to both parsers.
++fn arb_trivia(tc: &TestCase) -> String {
++    match n(tc, 0, 4) {
++        0 => String::new(),
++        1 => pick(tc, &[" ", "\t", "   "]).to_string(),
++        2 => format!("# {}", pick(tc, &["comment", "-r not-an-include.txt", "requests==1"])),
++        3 => format!("   # {}", pick(tc, &["indented", "x"])),
++        _ => "#".to_string(),
++    }
++}
++
++/// Options for a file: the flags that may appear anywhere, with `once`-per-world ones gated.
++struct Budget {
++    index_url: bool,
++    binary: bool,
++    editable: bool,
++}
++
++fn arb_option_line(tc: &TestCase, budget: &mut Budget, in_root: bool) -> Option<String> {
++    let line = match n(tc, 0, 9) {
++        0 if budget.index_url => {
++            budget.index_url = false;
++            let key = pick(tc, &["--index-url", "-i", "--index-url"]);
++            opt(tc, key, &maybe_quote(tc, pick(tc, URLS)))
++        }
++        1 => opt(tc, "--extra-index-url", &maybe_quote(tc, pick(tc, URLS))),
++        2 => {
++            let value = if in_root && chance(tc, 50) {
++                pick(tc, &["./wheels", "wheels"]).to_string()
++            } else {
++                pick(tc, URLS).to_string()
++            };
++            opt(tc, pick(tc, &["--find-links", "-f"]), &maybe_quote(tc, &value))
++        }
++        3 => "--no-index".to_string(),
++        4 => "--require-hashes".to_string(),
++        5 if budget.binary => {
++            budget.binary = false;
++            let key = pick(tc, &["--no-binary", "--only-binary"]);
++            let value = pick(tc, &[":all:", ":none:", "requests", "Flask", "a-b_c.d"]);
++            opt(tc, key, &maybe_quote(tc, value))
++        }
++        6 => "--pre".to_string(),
++        7 => opt(tc, "--trusted-host", pick(tc, HOSTS)),
++        8 if budget.editable && in_root => {
++            budget.editable = false;
++            let value = pick(tc, &["./pkg", "pkg"]);
++            opt(tc, pick(tc, &["-e", "--editable"]), value)
++        }
++        _ => return None,
++    };
++    Some(format!("{line}{}", maybe_comment(tc)))
++}
++
++/// Generate a world: `requirements.txt` at the root, possibly including `sub.txt` (which may
++/// include `nested/inner.txt`) and a `constraints.txt`.
++fn arb_world(tc: &TestCase) -> World {
++    let dir = tempfile::tempdir().unwrap();
++    let mut budget = Budget {
++        index_url: true,
++        binary: true,
++        editable: true,
++    };
++    let crlf_root = chance(tc, 20);
++    let include_sub = chance(tc, 55);
++    let include_inner = include_sub && chance(tc, 40);
++    let include_constraints = chance(tc, 40);
++
++    let mut files = Vec::new();
++    let mut lines: Vec<String> = Vec::new();
++    let leading_ws = |tc: &TestCase, line: String| -> String {
++        if chance(tc, 15) {
++            format!("{}{line}", pick(tc, &[" ", "\t"]))
++        } else {
++            line
++        }
++    };
++
++    // The nested file (no includes of its own).
++    if include_inner {
++        let mut inner = Vec::new();
++        for _ in 0..n(tc, 0, 3) {
++            inner.push(match n(tc, 0, 2) {
++                0 => arb_trivia(tc),
++                1 => arb_requirement_line(tc, true),
++                _ => arb_option_line(tc, &mut budget, false).unwrap_or_default(),
++            });
++        }
++        files.push((PathBuf::from("nested/inner.txt"), inner.join("\n") + "\n"));
++    }
++    if include_sub {
++        let mut sub = Vec::new();
++        for _ in 0..n(tc, 0, 4) {
++            sub.push(match n(tc, 0, 2) {
++                0 => arb_trivia(tc),
++                1 => arb_requirement_line(tc, true),
++                _ => arb_option_line(tc, &mut budget, false).unwrap_or_default(),
++            });
++        }
++        if include_inner {
++            let at = n(tc, 0, sub.len());
++            sub.insert(at, opt(tc, pick(tc, &["-r", "--requirement"]), "nested/inner.txt"));
++        }
++        let eol = if chance(tc, 20) { "\r\n" } else { "\n" };
++        files.push((PathBuf::from("sub.txt"), sub.join(eol) + eol));
++    }
++    if include_constraints {
++        let mut cons = Vec::new();
++        for _ in 0..n(tc, 0, 3) {
++            cons.push(match n(tc, 0, 2) {
++                0 => arb_trivia(tc),
++                _ => arb_requirement_line(tc, false),
++            });
++        }
++        files.push((PathBuf::from("constraints.txt"), cons.join("\n") + "\n"));
++    }
++
++    // The root file.
++    for _ in 0..n(tc, 0, 6) {
++        let line = match n(tc, 0, 3) {
++            0 => arb_trivia(tc),
++            1 | 2 => arb_requirement_line(tc, true),
++            _ => arb_option_line(tc, &mut budget, true).unwrap_or_default(),
++        };
++        lines.push(leading_ws(tc, line));
++    }
++    if include_sub {
++        let at = n(tc, 0, lines.len());
++        let name = match n(tc, 0, 3) {
++            0 => "${HEGEL_ZOO_REQ_VAR}.txt".to_string(),
++            1 => maybe_quote(tc, "sub.txt"),
++            _ => pick(tc, &["sub.txt", "./sub.txt"]).to_string(),
++        };
++        lines.insert(at, opt(tc, pick(tc, &["-r", "--requirement"]), &name));
++    }
++    if include_constraints {
++        let at = n(tc, 0, lines.len());
++        lines.insert(at, opt(tc, pick(tc, &["-c", "--constraint"]), "constraints.txt"));
++    }
++    let eol = if crlf_root { "\r\n" } else { "\n" };
++    let mut root = lines.join(eol);
++    if chance(tc, 80) {
++        root.push_str(eol);
++    }
++    files.push((PathBuf::from("requirements.txt"), root));
++
++    let world = World { dir, files };
++    world.write();
++    world
++}
++
++// --------------------------------------------------------------------------- the model
++
++#[derive(Debug, Default, PartialEq, Eq)]
++struct Model {
++    requirements: Vec<(String, Vec<String>, Vec<String>, bool, Vec<String>)>,
++    constraints: Vec<String>,
++    editables: Vec<String>,
++    index_url: Option<String>,
++    extra_index_urls: Vec<String>,
++    find_links: Vec<String>,
++    no_index: bool,
++    require_hashes: bool,
++    no_binary: BTreeSet<String>,
++    only_binary: BTreeSet<String>,
++}
++
++fn strs(v: &serde_json::Value) -> Vec<String> {
++    v.as_array()
++        .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
++        .unwrap_or_default()
++}
++
++/// Normalise a URL-ish value the way uv stores it: an existing path relative to the file's
++/// directory becomes a `file://` URL, anything else is parsed as a URL and re-serialised.
++fn url_text(value: &str, file: &Path) -> String {
++    let expanded = value.replace(&format!("${{{ENV_VAR}}}"), ENV_VALUE);
++    if let Ok(url) = Url::parse(&expanded) {
++        if !url.cannot_be_a_base() {
++            return url.to_string();
++        }
++    }
++    let dir = file.parent().unwrap();
++    let path = std::path::absolute(dir.join(&expanded)).unwrap();
++    Url::from_file_path(path).unwrap().to_string()
++}
++
++/// pip's line records folded the way uv flattens a tree.
++fn model_from_pip(records: &[serde_json::Value]) -> Model {
++    let mut m = Model::default();
++    for r in records {
++        let constraint = r["constraint"].as_bool().unwrap();
++        let file = PathBuf::from(r["file"].as_str().unwrap());
++        match r["kind"].as_str().unwrap() {
++            "req" => {
++                if constraint {
++                    m.constraints.push(r["name"].as_str().unwrap().to_string());
++                } else {
++                    m.requirements.push((
++                        r["name"].as_str().unwrap().to_string(),
++                        strs(&r["specs"]),
++                        strs(&r["extras"]),
++                        r["marker"].as_bool().unwrap(),
++                        strs(&r["hashes"]),
++                    ));
++                }
++            }
++            "editable" => m.editables.push(r["text"].as_str().unwrap().to_string()),
++            _ => {
++                if let Some(u) = r["index_url"].as_str() {
++                    m.index_url = Some(url_text(u, &file));
++                }
++                m.extra_index_urls
++                    .extend(strs(&r["extra_index_urls"]).iter().map(|u| url_text(u, &file)));
++                m.find_links
++                    .extend(strs(&r["find_links"]).iter().map(|u| url_text(u, &file)));
++                m.no_index |= r["no_index"].as_bool().unwrap();
++                m.require_hashes |= r["require_hashes"].as_bool().unwrap();
++                m.no_binary.extend(strs(&r["no_binary"]));
++                m.only_binary.extend(strs(&r["only_binary"]));
++            }
++        }
++    }
++    m
++}
++
++fn binary_set(value: &NoBinary) -> BTreeSet<String> {
++    match value {
++        NoBinary::None => BTreeSet::new(),
++        NoBinary::All => BTreeSet::from([":all:".to_string()]),
++        NoBinary::Packages(names) => names.iter().map(|n| n.to_string()).collect(),
++    }
++}
++
++fn build_set(value: &NoBuild) -> BTreeSet<String> {
++    match value {
++        NoBuild::None => BTreeSet::new(),
++        NoBuild::All => BTreeSet::from([":all:".to_string()]),
++        NoBuild::Packages(names) => names.iter().map(|n| n.to_string()).collect(),
++    }
++}
++
++fn model_from_uv(parsed: &RequirementsTxt) -> Model {
++    let mut m = Model::default();
++    for entry in &parsed.requirements {
++        match &entry.requirement {
++            RequirementsTxtRequirement::Named(r) => {
++                let specs = match &r.version_or_url {
++                    Some(VersionOrUrl::VersionSpecifier(vs)) => {
++                        let mut v: Vec<String> =
++                            vs.iter().map(|s| s.to_string().replace(' ', "")).collect();
++                        v.sort();
++                        v
++                    }
++                    Some(VersionOrUrl::Url(_)) => vec!["<url>".to_string()],
++                    None => Vec::new(),
++                };
++                // Extras are a set: packaging de-duplicates `[a,a]`, uv keeps the list.
++                let mut extras: Vec<String> = r.extras.iter().map(|e| e.to_string()).collect();
++                extras.sort();
++                extras.dedup();
++                let mut hashes = entry.hashes.clone();
++                hashes.sort();
++                m.requirements.push((
++                    r.name.to_string(),
++                    specs,
++                    extras,
++                    r.marker.contents().is_some(),
++                    hashes,
++                ));
++            }
++            RequirementsTxtRequirement::Unnamed(u) => {
++                m.requirements.push((
++                    format!("<unnamed {}>", u.url.verbatim),
++                    Vec::new(),
++                    Vec::new(),
++                    false,
++                    entry.hashes.clone(),
++                ));
++            }
++        }
++    }
++    m.constraints = parsed.constraints.iter().map(|c| c.name.to_string()).collect();
++    m.editables = parsed
++        .editables
++        .iter()
++        .map(|e| match &e.requirement {
++            RequirementsTxtRequirement::Unnamed(u) => {
++                u.url.verbatim.given().unwrap_or("<no given>").to_string()
++            }
++            RequirementsTxtRequirement::Named(r) => format!("<named {}>", r.name),
++        })
++        .collect();
++    // `Display` of a `VerbatimUrl` masks credentials; compare the real URL.
++    let full = |u: &uv_pep508::VerbatimUrl| u.displayable_with_credentials().to_string();
++    m.index_url = parsed.index_url.as_ref().map(full);
++    m.extra_index_urls = parsed.extra_index_urls.iter().map(full).collect();
++    m.find_links = parsed.find_links.iter().map(full).collect();
++    m.no_index = parsed.no_index;
++    m.require_hashes = parsed.require_hashes;
++    m.no_binary = binary_set(&parsed.no_binary);
++    m.only_binary = build_set(&parsed.only_binary);
++    m
++}
++
++fn show(world: &World) -> String {
++    world
++        .files
++        .iter()
++        .map(|(p, c)| format!("--- {}\n{c:?}", p.display()))
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++// --------------------------------------------------------------------------- properties
++
++/// A generated tree of requirements files parses to the same flattened content as pip's own
++/// parser yields for it: requirements (name, specifiers, extras, marker, hashes) in order,
++/// constraints, editables, index URLs, find-links, and the boolean and binary flags.
++#[hegel::test]
++fn trees_flatten_like_pip(tc: TestCase) {
++    let world = arb_world(&tc);
++    let root = world.root();
++    let pip = pip_parse(&root);
++    let uv = uv_parse(&root, world.dir.path());
++    match (pip, uv) {
++        (Ok(records), Ok(parsed)) => {
++            let expected = model_from_pip(&records);
++            let actual = model_from_uv(&parsed);
++            assert_eq!(actual, expected, "\n{}", show(&world));
++        }
++        (Err(e), Ok(parsed)) => panic!("pip fails ({e}) but uv parses {parsed:#?}\n{}", show(&world)),
++        (Ok(records), Err(e)) => panic!("uv fails ({e}) but pip yields {records:#?}\n{}", show(&world)),
++        (Err(_), Err(_)) => {}
++    }
++}
++
++/// Reparsing the same tree twice gives the same result; a parse of `sub.txt` alone gives the
++/// sub-tree's part of the flattened result.
++#[hegel::test]
++fn parsing_is_deterministic_and_compositional(tc: TestCase) {
++    let world = arb_world(&tc);
++    let root = world.root();
++    let first = uv_parse(&root, world.dir.path());
++    let second = uv_parse(&root, world.dir.path());
++    assert_eq!(first.is_ok(), second.is_ok(), "{}", show(&world));
++    if let (Ok(a), Ok(b)) = (&first, &second) {
++        assert_eq!(model_from_uv(a), model_from_uv(b), "{}", show(&world));
++    }
++    let sub = world.dir.path().join("sub.txt");
++    if sub.is_file() {
++        if let Ok(whole) = &first {
++            let part = uv_parse(&sub, world.dir.path()).unwrap_or_else(|e| panic!("{e}\n{}", show(&world)));
++            let whole = model_from_uv(whole);
++            let part = model_from_uv(&part);
++            for req in &part.requirements {
++                assert!(whole.requirements.contains(req), "{req:?} missing\n{}", show(&world));
++            }
++            for url in &part.extra_index_urls {
++                assert!(whole.extra_index_urls.contains(url), "{url} missing\n{}", show(&world));
++            }
++            assert!(!part.no_index || whole.no_index);
++            assert!(!part.require_hashes || whole.require_hashes);
++        }
++    }
++}
++
++/// Pinned: uv-requirements-txt/1 — a `#` inside an option's value ends the value (`is_terminal`
++/// treats `#` like a newline), where pip only starts a comment at a `#` preceded by whitespace:
++/// `--index-url https://h/simple#frag` loses the fragment, `-r sub#1.txt` reads `sub`.
++#[hegel::test]
++fn hash_in_option_values_is_not_a_comment(tc: TestCase) {
++    let world = World {
++        dir: tempfile::tempdir().unwrap(),
++        files: vec![
++            (PathBuf::from("sub#1.txt"), "flask\n".to_string()),
++            (PathBuf::from("sub.txt"), "requests\n".to_string()),
++        ],
++    };
++    world.write();
++    let d = world.dir.path();
++    let frag = pick(&tc, &["#frag", "#egg=x", "#1"]);
++    let line = match n(&tc, 0, 2) {
++        0 => opt(&tc, "--index-url", &format!("https://example.com/simple{frag}")),
++        1 => opt(&tc, "--find-links", &format!("https://example.com/links{frag}")),
++        _ => opt(&tc, pick(&tc, &["-r", "--requirement"]), "sub#1.txt"),
++    };
++    let root = d.join("requirements.txt");
++    std::fs::write(&root, format!("{line}\n")).unwrap();
++    let pip = pip_parse(&root).unwrap_or_else(|e| panic!("pip: {e}"));
++    let uv = uv_parse(&root, d).unwrap_or_else(|e| panic!("uv: {e} for {line:?}"));
++    assert_eq!(model_from_uv(&uv), model_from_pip(&pip), "{line:?}");
++}
++
++/// Pinned: uv-requirements-txt/2 — `--no-binary`/`--only-binary` take pip's comma-separated
++/// list (`--no-binary a,b`, `--only-binary :none:,a`); uv parses the whole value as one package
++/// name and fails.
++#[hegel::test]
++fn binary_options_take_comma_lists(tc: TestCase) {
++    let world = World {
++        dir: tempfile::tempdir().unwrap(),
++        files: vec![],
++    };
++    world.write();
++    let d = world.dir.path();
++    let key = pick(&tc, &["--no-binary", "--only-binary"]);
++    let items: Vec<&str> = (0..n(&tc, 2, 3))
++        .map(|_| pick(&tc, &["requests", "Flask", "a-b_c.d", ":none:"]))
++        .collect();
++    let line = opt(&tc, key, &items.join(","));
++    let root = d.join("requirements.txt");
++    std::fs::write(&root, format!("{line}\n")).unwrap();
++    let pip = pip_parse(&root).unwrap_or_else(|e| panic!("pip: {e}"));
++    let uv = uv_parse(&root, d).unwrap_or_else(|e| panic!("uv: {e} for {line:?}"));
++    assert_eq!(model_from_uv(&uv), model_from_pip(&pip), "{line:?}");
++}
++
++/// Pinned: uv-requirements-txt/3 — the documented grammar allows `wrappable_whitespaces`
++/// between an option and its value, and pip joins backslash-continued lines before parsing,
++/// but `parse_value` only eats plain whitespace: `--index-url \` + newline + URL fails.
++#[hegel::test]
++fn option_values_may_follow_a_line_continuation(tc: TestCase) {
++    let world = World {
++        dir: tempfile::tempdir().unwrap(),
++        files: vec![(PathBuf::from("sub.txt"), "requests\n".to_string())],
++    };
++    world.write();
++    let d = world.dir.path();
++    let indent = pick(&tc, &["", "  ", "\t"]);
++    let (key, value) = match n(&tc, 0, 3) {
++        0 => ("--index-url", "https://example.com/simple"),
++        1 => ("--extra-index-url", "https://x.example/s"),
++        2 => ("--find-links", "https://example.com/links"),
++        _ => ("-r", "sub.txt"),
++    };
++    let line = format!("{key} \\\n{indent}{value}");
++    let root = d.join("requirements.txt");
++    std::fs::write(&root, format!("{line}\n")).unwrap();
++    let pip = pip_parse(&root).unwrap_or_else(|e| panic!("pip: {e}"));
++    let uv = uv_parse(&root, d).unwrap_or_else(|e| panic!("uv: {e} for {line:?}"));
++    assert_eq!(model_from_uv(&uv), model_from_pip(&pip), "{line:?}");
++}
++
++/// Pinned: uv-requirements-txt/4 — the grammar documents `--hash` values as `name:digest`, and
++/// pip refuses a value without the colon; uv keeps any non-whitespace text as a hash.
++#[hegel::test]
++fn hash_values_have_the_documented_shape(tc: TestCase) {
++    let world = World {
++        dir: tempfile::tempdir().unwrap(),
++        files: vec![],
++    };
++    world.write();
++    let d = world.dir.path();
++    let digest: String = (0..n(&tc, 4, 12)).map(|_| pick(&tc, HEX)).collect();
++    let line = format!("{} {}", pick(&tc, NAMES), opt(&tc, "--hash", &digest));
++    let root = d.join("requirements.txt");
++    std::fs::write(&root, format!("{line}\n")).unwrap();
++    let pip = pip_parse(&root);
++    let uv = uv_parse(&root, d);
++    assert!(pip.is_err(), "pip accepted {line:?}: {pip:?}");
++    assert!(uv.is_err(), "pip refuses {line:?} but uv gives {uv:#?}");
++}
