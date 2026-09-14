@@ -1,0 +1,966 @@
+diff --git a/go.mod b/go.mod
+index e3020b0..4dc22d6 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,19 @@
+ module gopkg.in/ini.v1
+ 
+-go 1.13
++go 1.26.0
+ 
+-require github.com/stretchr/testify v1.11.1
++require (
++	github.com/stretchr/testify v1.11.1
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/davecgh/go-spew v1.1.1 // indirect
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	github.com/kr/pretty v0.3.1 // indirect
++	github.com/pmezard/go-difflib v1.0.0 // indirect
++	github.com/rogpeppe/go-internal v1.11.0 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
++	gopkg.in/yaml.v3 v3.0.1 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..9086055
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,934 @@
++// Hegel property tests for gopkg.in/ini.v1 (go-ini/ini): the parser against Python's
++// configparser on the grammar both read the same way, the writer against the reader, the
++// key helpers and %(name)s interpolation against models, and pinned bugs.
++package ini_test
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"regexp"
++	"runtime/debug"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	. "gopkg.in/ini.v1"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++func text(tc hegel.TestCase, alphabet string, lo, hi int) string {
++	rs := []rune(alphabet)
++	var sb strings.Builder
++	for i, k := 0, n(tc, lo, hi); i < k; i++ {
++		sb.WriteRune(rs[n(tc, 0, len(rs)-1)])
++	}
++	return sb.String()
++}
++
++// ---- the Python oracle ---------------------------------------------------------------------
++
++const pythonScript = `
++import sys, json, configparser
++for line in sys.stdin:
++    req = json.loads(line)
++    try:
++        cp = configparser.ConfigParser(
++            interpolation=None, strict=False, allow_no_value=False,
++            delimiters=('=', ':'), comment_prefixes=('#', ';'),
++            inline_comment_prefixes=(('#', ';') if req['inline'] else None),
++            empty_lines_in_values=True)
++        cp.optionxform = str.lower if req['lower'] else str
++        cp.read_string('[DEFAULT]\n' + req['text'])
++        secs = {'DEFAULT': dict(cp.defaults())}
++        for s, kv in cp._sections.items():
++            secs[s] = dict(kv)
++        out = {'ok': True, 'sections': secs}
++    except Exception as e:
++        out = {'ok': False, 'error': repr(e)}
++    sys.stdout.write(json.dumps(out) + '\n')
++    sys.stdout.flush()
++`
++
++type pyRequest struct {
++	Text   string `json:"text"`
++	Inline bool   `json:"inline"`
++	Lower  bool   `json:"lower"`
++}
++
++type pyResult struct {
++	OK       bool                         `json:"ok"`
++	Sections map[string]map[string]string `json:"sections"`
++	Error    string                       `json:"error"`
++}
++
++var python struct {
++	once sync.Once
++	mu   sync.Mutex
++	in   io.WriteCloser
++	out  *bufio.Reader
++	err  error
++}
++
++func pythonParse(t testing.TB, req pyRequest) pyResult {
++	python.once.Do(func() {
++		cmd := exec.Command("python3", "-c", pythonScript)
++		cmd.Stderr = os.Stderr
++		in, err := cmd.StdinPipe()
++		if err != nil {
++			python.err = err
++			return
++		}
++		out, err := cmd.StdoutPipe()
++		if err != nil {
++			python.err = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			python.err = err
++			return
++		}
++		python.in = in
++		python.out = bufio.NewReaderSize(out, 1<<20)
++	})
++	if python.err != nil {
++		t.Fatalf("starting python3: %v", python.err)
++	}
++	python.mu.Lock()
++	defer python.mu.Unlock()
++	b, _ := json.Marshal(req)
++	if _, err := python.in.Write(append(b, '\n')); err != nil {
++		t.Fatalf("writing to python3: %v", err)
++	}
++	line, err := python.out.ReadBytes('\n')
++	if err != nil {
++		t.Fatalf("reading from python3: %v", err)
++	}
++	var res pyResult
++	if err := json.Unmarshal(line, &res); err != nil {
++		t.Fatalf("python3 said %q: %v", line, err)
++	}
++	return res
++}
++
++// ---- the shared grammar --------------------------------------------------------------------
++
++type parseMode int
++
++const (
++	modeDefault parseMode = iota
++	modeSpaceBeforeComment
++	modeInsensitiveKeys
++	modeIgnoreInlineComment
++	modePythonMultiline
++)
++
++var modeNames = map[parseMode]string{modeDefault: "default", modeSpaceBeforeComment: "SpaceBeforeInlineComment", modeInsensitiveKeys: "InsensitiveKeys", modeIgnoreInlineComment: "IgnoreInlineComment", modePythonMultiline: "AllowPythonMultilineValues"}
++
++func (m parseMode) options() LoadOptions {
++	switch m {
++	case modeSpaceBeforeComment:
++		return LoadOptions{SpaceBeforeInlineComment: true}
++	case modeInsensitiveKeys:
++		return LoadOptions{InsensitiveKeys: true}
++	case modeIgnoreInlineComment:
++		return LoadOptions{IgnoreInlineComment: true}
++	case modePythonMultiline:
++		return LoadOptions{AllowPythonMultilineValues: true}
++	}
++	return LoadOptions{}
++}
++
++const (
++	nameChars  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
++	keyChars   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- \"`]%()"
++	valueChars = "abcdefghijklmnopqrstuvwxyz0123456789 ,.=:%()[]'\"`\\/!éÑ日本-_"
++)
++
++// genSectionName: letters, digits, . _ -, single inner spaces; never DEFAULT (which is a
++// header both sides accept but which the generator adds separately).
++func genSectionName(tc hegel.TestCase) string {
++	name := text(tc, nameChars, 1, 6)
++	if chance(tc, 20) {
++		name = name + " " + text(tc, nameChars, 1, 3)
++	}
++	if strings.EqualFold(name, "DEFAULT") {
++		name = "x" + name
++	}
++	return name
++}
++
++// genKeyName: never starting with a quote, backtick, [ # ; and never "-" (auto-increment);
++// no leading/trailing blanks (both sides trim).
++func genKeyName(tc hegel.TestCase) string {
++	for {
++		k := strings.TrimSpace(text(tc, keyChars, 1, 6))
++		if k == "" || k == "-" || strings.ContainsAny(k[:1], "\"`[#;") || strings.ContainsAny(k, "=:") {
++			continue
++		}
++		return k
++	}
++}
++
++// genValue draws a value both parsers read alike in the given mode: never starting with a
++// quote, backtick, # or ;, never ending with a backslash (go-ini's continuation), no tabs,
++// comment symbols only where the mode allows them.
++func genValue(tc hegel.TestCase, mode parseMode) string {
++	for {
++		v := strings.TrimSpace(text(tc, valueChars, 0, 12))
++		if v == "" {
++			return v
++		}
++		if strings.ContainsAny(v[:1], "'\"`#;") || strings.HasSuffix(v, `\`) || strings.Contains(v, "%(") {
++			continue
++		}
++		rs := []rune(v)
++		switch mode {
++		case modeIgnoreInlineComment:
++			if chance(tc, 30) {
++				i := n(tc, 1, len(rs))
++				v = string(rs[:i]) + pick(tc, []string{"#", ";", "#c", ";c"}) + string(rs[i:])
++			}
++		case modeSpaceBeforeComment:
++			// A comment symbol not preceded by a space is part of the value; at most one so
++			// that go-ini's "# before ;" preference (go-ini/7) cannot show.
++			if chance(tc, 30) {
++				i := n(tc, 1, len(rs))
++				if rs[i-1] != ' ' && (i == len(rs) || rs[i] != ' ') {
++					v = string(rs[:i]) + pick(tc, []string{"#", ";"}) + string(rs[i:])
++				}
++			}
++		}
++		return v
++	}
++}
++
++// genComment draws an inline comment (with the space both sides need) or nothing.
++func genInlineComment(tc hegel.TestCase, mode parseMode, value string) string {
++	if mode == modeIgnoreInlineComment || mode == modePythonMultiline || !chance(tc, 30) {
++		return ""
++	}
++	// With SpaceBeforeInlineComment go-ini looks for " #" inside the trimmed value, so a
++	// comment right after the delimiter is part of the value (go-ini/5): a value is needed.
++	if mode == modeSpaceBeforeComment && (strings.ContainsAny(value, "#;") || value == "") {
++		return ""
++	}
++	return " " + pick(tc, []string{"#", ";"}) + pick(tc, []string{"", " c", " x=y", " [z]"})
++}
++
++// genIni draws an INI text in the shared grammar for the mode and returns it.
++func genIni(tc hegel.TestCase, mode parseMode) string {
++	var sb strings.Builder
++	eol := "\n"
++	if mode != modePythonMultiline && chance(tc, 20) {
++		eol = "\r\n"
++	}
++	lines := n(tc, 0, 8)
++	for i := 0; i < lines; i++ {
++		switch n(tc, 1, 10) {
++		case 1, 2:
++			name := genSectionName(tc)
++			if chance(tc, 10) {
++				name = "DEFAULT"
++			}
++			sb.WriteString("[" + name + "]")
++			if chance(tc, 20) {
++				sb.WriteString(pick(tc, []string{" # c", " ; c", " junk", "#c"}))
++			}
++			sb.WriteString(eol)
++		case 3:
++			c := pick(tc, []string{"# comment", "; comment", "#", ";", "  # indented comment", "# k = v", "; [s]"})
++			if mode == modePythonMultiline {
++				c = strings.TrimSpace(c) // an indented comment is continuation text for go-ini
++			}
++			sb.WriteString(c + eol)
++		case 4:
++			// A whitespace-only line is blank for Python but a continuation line for go-ini's
++			// Python-style values, so in that mode blank lines are empty.
++			if mode == modePythonMultiline {
++				sb.WriteString(eol)
++			} else {
++				sb.WriteString(pick(tc, []string{"", " ", "   "}) + eol)
++			}
++		default:
++			key := genKeyName(tc)
++			value := genValue(tc, mode)
++			sb.WriteString(key + pick(tc, []string{"", " ", "  "}) + pick(tc, []string{"=", ":"}) + pick(tc, []string{"", " ", "  "}) + value)
++			sb.WriteString(genInlineComment(tc, mode, value))
++			sb.WriteString(eol)
++			if mode == modePythonMultiline && chance(tc, 50) {
++				for j, k := 0, n(tc, 1, 3); j < k; j++ {
++					cont := genValue(tc, modeDefault)
++					if cont == "" || strings.ContainsAny(cont, "#;") {
++						cont = "cont"
++					}
++					sb.WriteString(pick(tc, []string{" ", "  ", "\t", "    "}) + cont + eol)
++				}
++			}
++		}
++	}
++	s := sb.String()
++	if chance(tc, 20) {
++		s = strings.TrimSuffix(s, eol)
++	}
++	return s
++}
++
++// goSections reads a File back as name -> key -> value, in the shape the Python child returns.
++func goSections(f *File) map[string]map[string]string {
++	out := map[string]map[string]string{}
++	for _, s := range f.Sections() {
++		kv := map[string]string{}
++		for _, k := range s.Keys() {
++			kv[k.Name()] = k.Value()
++		}
++		out[s.Name()] = kv
++	}
++	return out
++}
++
++var continuationIndent = regexp.MustCompile(`\n[\t\f ]+`)
++
++// TestHegelParseAgreesWithPython: on INI text in the grammar both read alike, go-ini (default
++// options, SpaceBeforeInlineComment, InsensitiveKeys, IgnoreInlineComment or
++// AllowPythonMultilineValues) yields the same sections, keys and values as Python's
++// configparser (strict=False, no interpolation, matching inline-comment and option-casing
++// settings; sectionless keys are Python's DEFAULT section). go-ini keeps the indentation of
++// Python-style continuation lines (asserted upstream); it is stripped before comparing.
++func TestHegelParseAgreesWithPython(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		mode := parseMode(n(ht, 0, 4))
++		src := genIni(ht, mode)
++		note(ht, "mode %s, text %q", modeNames[mode], src)
++		want := pythonParse(t, pyRequest{Text: src, Inline: mode != modeIgnoreInlineComment, Lower: mode == modeInsensitiveKeys})
++		if !want.OK {
++			ht.Fatalf("python rejected the generated text: %s", want.Error)
++		}
++		f, err := LoadSources(mode.options(), []byte(src))
++		if err != nil {
++			ht.Fatalf("go-ini: %v; python: %v", err, want.Sections)
++		}
++		got := goSections(f)
++		if mode == modePythonMultiline {
++			for _, kv := range got {
++				for k, v := range kv {
++					kv[k] = continuationIndent.ReplaceAllString(v, "\n")
++				}
++			}
++		}
++		if !reflect.DeepEqual(got, want.Sections) {
++			ht.Fatalf("go-ini %v\npython %v", got, want.Sections)
++		}
++	})
++}
++
++// TestHegelEntryPointsAgree: the same text through []byte, a file, an io.Reader and an
++// io.ReadCloser, with or without a UTF-8 BOM, and two sources against their concatenation,
++// give the same sections; Empty() has just the default section.
++func TestHegelEntryPointsAgree(t *testing.T) {
++	dir := t.TempDir()
++	property(t, func(ht *hegel.T) {
++		src := genIni(ht, modeDefault)
++		note(ht, "text %q", src)
++		base, err := Load([]byte(src))
++		if err != nil {
++			ht.Fatalf("Load([]byte): %v", err)
++		}
++		want := goSections(base)
++		check := func(what string, f *File, err error) {
++			if err != nil {
++				ht.Fatalf("%s: %v", what, err)
++			}
++			if got := goSections(f); !reflect.DeepEqual(got, want) {
++				ht.Fatalf("%s: %v, want %v", what, got, want)
++			}
++			if !reflect.DeepEqual(f.SectionStrings(), base.SectionStrings()) {
++				ht.Fatalf("%s: section order %v, want %v", what, f.SectionStrings(), base.SectionStrings())
++			}
++		}
++		path := filepath.Join(dir, fmt.Sprintf("f%d.ini", n(ht, 0, 1<<30)))
++		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
++			ht.Fatalf("%v", err)
++		}
++		f, err := Load(path)
++		check("Load(file)", f, err)
++		f, err = Load(strings.NewReader(src))
++		check("Load(io.Reader)", f, err)
++		f, err = Load(io.NopCloser(bytes.NewReader([]byte(src))))
++		check("Load(io.ReadCloser)", f, err)
++		f, err = Load(append([]byte("\xef\xbb\xbf"), src...))
++		check("Load(BOM + text)", f, err)
++		f, err = LooseLoad([]byte(src), filepath.Join(dir, "missing.ini"))
++		check("LooseLoad(text, missing file)", f, err)
++
++		// Two sources are the concatenation (the first ends with a line break; every source
++		// starts in the default section, so the second opens with a header).
++		other := "[" + genSectionName(ht) + "]\n" + genIni(ht, modeDefault)
++		a := src
++		if a != "" && !strings.HasSuffix(a, "\n") {
++			a += "\n"
++		}
++		joined, err := Load([]byte(a + other))
++		if err != nil {
++			ht.Fatalf("Load(a+b): %v", err)
++		}
++		two, err := Load([]byte(a), []byte(other))
++		if err != nil {
++			ht.Fatalf("Load(a, b): %v", err)
++		}
++		if !reflect.DeepEqual(goSections(two), goSections(joined)) {
++			ht.Fatalf("Load(a, b) %v, Load(a+b) %v", goSections(two), goSections(joined))
++		}
++		three := Empty()
++		if err := three.Append([]byte(a)); err != nil {
++			ht.Fatalf("Append: %v", err)
++		}
++		if err := three.Append([]byte(other)); err != nil {
++			ht.Fatalf("Append: %v", err)
++		}
++		if !reflect.DeepEqual(goSections(three), goSections(joined)) {
++			ht.Fatalf("Empty().Append(a).Append(b) %v, Load(a+b) %v", goSections(three), goSections(joined))
++		}
++		if e := Empty(); len(e.Sections()) != 1 || e.Sections()[0].Name() != DefaultSection || len(e.Section("").Keys()) != 0 {
++			ht.Fatalf("Empty() = %v", e.SectionStrings())
++		}
++	})
++}
++
++// ---- the writer against the reader ---------------------------------------------------------
++
++const writerValueChars = "abc xyz019 #;=:%\"'`\\[]()\n\t日é"
++
++// genWriterValue draws a value the writer should be able to make readable. The shapes it
++// cannot (go-ini/2) are kept out: a leading quote, a trailing backslash or a padded value
++// with an inner quote, unless the value also has a line feed, a backtick or a comment
++// symbol (those forms are quoted robustly).
++func genWriterValue(tc hegel.TestCase) string {
++	for {
++		v := text(tc, writerValueChars, 0, 10)
++		if strings.Contains(v, "\r") {
++			continue
++		}
++		robust := strings.ContainsAny(v, "\n`") || strings.ContainsAny(v, "#;")
++		if v != "" && strings.ContainsAny(v[:1], "'\"") {
++			continue
++		}
++		if !robust && strings.HasSuffix(v, `\`) {
++			continue
++		}
++		if !robust && len(strings.TrimSpace(v)) != len(v) && strings.Contains(v, `"`) {
++			continue
++		}
++		return v
++	}
++}
++
++// genWriterKey draws a key the writer quotes correctly: not starting with # ; [, not "-",
++// no surrounding blanks or line breaks, and not both a backtick and a quote/delimiter
++// (go-ini/3).
++func genWriterKey(tc hegel.TestCase) string {
++	for {
++		k := text(tc, "abcXYZ019 _.-\"`=:%[]", 1, 6)
++		if strings.TrimSpace(k) != k || k == "-" || strings.ContainsAny(k[:1], "#;[") {
++			continue
++		}
++		if strings.Contains(k, "`") && strings.ContainsAny(k, "\"=:") {
++			continue
++		}
++		return k
++	}
++}
++
++// TestHegelWrittenFileReadsBack: a File built through the API (sections, keys, values from a
++// broad alphabet) written with WriteTo/WriteToIndent under every combination of PrettyFormat,
++// PrettyEqual, PrettySection and DefaultHeader reads back with Load to the same sections,
++// keys, values and order; SaveTo + Load(path) agrees.
++func TestHegelWrittenFileReadsBack(t *testing.T) {
++	dir := t.TempDir()
++	defer func(pf, pe, ps, dh bool) { PrettyFormat, PrettyEqual, PrettySection, DefaultHeader = pf, pe, ps, dh }(PrettyFormat, PrettyEqual, PrettySection, DefaultHeader)
++	property(t, func(ht *hegel.T) {
++		PrettyFormat, PrettyEqual, PrettySection, DefaultHeader = chance(ht, 50), chance(ht, 50), chance(ht, 50), chance(ht, 50)
++		f := Empty()
++		nsec := n(ht, 0, 3)
++		for i := 0; i < nsec; i++ {
++			name := text(ht, "abcXYZ019 _.-#;=[]`\"", 1, 6)
++			if strings.EqualFold(name, "DEFAULT") {
++				name = "x"
++			}
++			if _, err := f.NewSection(name); err != nil {
++				ht.Fatalf("NewSection(%q): %v", name, err)
++			}
++		}
++		for _, s := range f.Sections() {
++			for j, k := 0, n(ht, 0, 4); j < k; j++ {
++				if _, err := s.NewKey(genWriterKey(ht), genWriterValue(ht)); err != nil {
++					ht.Fatalf("NewKey: %v", err)
++				}
++			}
++		}
++		want := goSections(f)
++		indent := pick(ht, []string{"", "  ", "\t"})
++		var buf bytes.Buffer
++		if _, err := f.WriteToIndent(&buf, indent); err != nil {
++			ht.Fatalf("WriteToIndent: %v", err)
++		}
++		note(ht, "PrettyFormat %v PrettyEqual %v PrettySection %v DefaultHeader %v indent %q\nwrote %q", PrettyFormat, PrettyEqual, PrettySection, DefaultHeader, indent, buf.String())
++		g, err := Load(buf.Bytes())
++		if err != nil {
++			ht.Fatalf("reading back: %v", err)
++		}
++		if got := goSections(g); !reflect.DeepEqual(got, want) {
++			ht.Fatalf("read back %v, want %v", got, want)
++		}
++		if !reflect.DeepEqual(g.SectionStrings(), f.SectionStrings()) {
++			ht.Fatalf("read back sections %v, want %v", g.SectionStrings(), f.SectionStrings())
++		}
++		for _, s := range f.Sections() {
++			if got := g.Section(s.Name()).KeyStrings(); !reflect.DeepEqual(got, s.KeyStrings()) {
++				ht.Fatalf("read back keys of %q %v, want %v", s.Name(), got, s.KeyStrings())
++			}
++		}
++		path := filepath.Join(dir, fmt.Sprintf("w%d.ini", n(ht, 0, 1<<30)))
++		if err := f.SaveToIndent(path, indent); err != nil {
++			ht.Fatalf("SaveToIndent: %v", err)
++		}
++		saved, err := os.ReadFile(path)
++		if err != nil || !bytes.Equal(saved, buf.Bytes()) {
++			ht.Fatalf("SaveToIndent wrote %q, WriteToIndent %q (%v)", saved, buf.Bytes(), err)
++		}
++	})
++}
++
++// ---- key helpers ---------------------------------------------------------------------------
++
++// splitModel is Key.Strings as documented by the tests: the delimiter splits, "\<delim>" is a
++// literal delimiter, "\\" a backslash, any other backslash stays, parts are trimmed.
++func splitModel(s, delim string) []string {
++	if s == "" {
++		return []string{}
++	}
++	var parts []string
++	var cur strings.Builder
++	for i := 0; i < len(s); {
++		switch {
++		case s[i] == '\\' && i+1 < len(s) && strings.HasPrefix(s[i+1:], delim):
++			cur.WriteString(delim)
++			i += 1 + len(delim)
++		case s[i] == '\\' && i+1 < len(s) && s[i+1] == '\\':
++			cur.WriteByte('\\')
++			i += 2
++		case strings.HasPrefix(s[i:], delim):
++			parts = append(parts, strings.TrimSpace(cur.String()))
++			cur.Reset()
++			i += len(delim)
++		default:
++			cur.WriteByte(s[i])
++			i++
++		}
++	}
++	parts = append(parts, strings.TrimSpace(cur.String()))
++	return parts
++}
++
++var boolWords = map[string]bool{"1": true, "t": true, "T": true, "true": true, "TRUE": true, "True": true, "YES": true, "yes": true, "Yes": true, "y": true, "ON": true, "on": true, "On": true,
++	"0": false, "f": false, "F": false, "false": false, "FALSE": false, "False": false, "NO": false, "no": false, "No": false, "n": false, "OFF": false, "off": false, "Off": false}
++
++// TestHegelKeyHelpersFollowTheirDocs: Strings(delim) against the split model (values that
++// start or end with the delimiter or end with a backslash are go-ini/6), Bool against the
++// documented word list, Int/Int64/Uint64/Float64 against strconv, Ints/ValidInts/StrictInts
++// against the parts, MustInt/MustString defaults, In and RangeInt.
++func TestHegelKeyHelpersFollowTheirDocs(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		k := Empty().Section("").Key("k")
++		delim := pick(ht, []string{",", "::", "|"})
++		var v string
++		for {
++			v = text(ht, "ab 1\\,:|日", 0, 8)
++			if strings.HasPrefix(v, delim) || strings.HasSuffix(v, delim) || strings.HasSuffix(v, `\`) || strings.HasPrefix(strings.TrimSpace(v), delim) || strings.HasSuffix(strings.TrimSpace(v), delim) {
++				continue
++			}
++			if v == "" || !strings.Contains(v, "%") {
++				break
++			}
++		}
++		k.SetValue(v)
++		note(ht, "value %q delim %q", v, delim)
++		if got, want := k.Strings(delim), splitModel(v, delim); !reflect.DeepEqual(got, want) {
++			ht.Fatalf("Strings(%q) of %q = %q, want %q", delim, v, got, want)
++		}
++
++		word := pick(ht, []string{"1", "t", "yes", "On", "0", "F", "no", "Off", "TRUE", "false", "y", "n", "2", "yeah", "", "True ", "on\n", "nope", "ok"})
++		k.SetValue(word)
++		b, err := k.Bool()
++		want, ok := boolWords[word]
++		if ok != (err == nil) || (ok && b != want) {
++			ht.Fatalf("Bool() of %q = %v, %v; want %v (accepted %v)", word, b, err, want, ok)
++		}
++		if got := k.MustBool(true); got != (ok && want || !ok) {
++			ht.Fatalf("MustBool(true) of %q = %v", word, got)
++		}
++
++		num := pick(ht, []string{"0", "42", "-7", "9223372036854775807", "9223372036854775808", "18446744073709551615", "1e3", "3.5", "0x10", " 5", "5 ", "+5", "1_000", "", "abc", "-1", "٣"})
++		k.SetValue(num)
++		// The integer getters use base 0 (0x, 0o, 0b prefixes and underscores accepted).
++		if got, err := k.Int(); (err == nil) != (strconvErr(strconv.ParseInt(num, 0, 64)) == nil) || err == nil && int64(got) != must(strconv.ParseInt(num, 0, 64)) {
++			ht.Fatalf("Int() of %q = %d, %v", num, got, err)
++		}
++		if got, err := k.Int64(); (err == nil) != (strconvErr(strconv.ParseInt(num, 0, 64)) == nil) || err == nil && got != must(strconv.ParseInt(num, 0, 64)) {
++			ht.Fatalf("Int64() of %q = %d, %v", num, got, err)
++		}
++		if got, err := k.Uint64(); (err == nil) != (strconvErr(strconv.ParseUint(num, 0, 64)) == nil) || err == nil && got != must(strconv.ParseUint(num, 0, 64)) {
++			ht.Fatalf("Uint64() of %q = %d, %v", num, got, err)
++		}
++		if got, err := k.Float64(); (err == nil) != (strconvErr(strconv.ParseFloat(num, 64)) == nil) || err == nil && got != must(strconv.ParseFloat(num, 64)) {
++			ht.Fatalf("Float64() of %q = %v, %v", num, got, err)
++		}
++		if _, err := strconv.ParseInt(num, 0, 64); err != nil {
++			if got := k.MustInt(17); got != 17 {
++				ht.Fatalf("MustInt(17) of %q = %d", num, got)
++			}
++		}
++
++		// Lists of integers.
++		parts := make([]string, n(ht, 1, 4))
++		valid := []int{}
++		allValid := true
++		for i := range parts {
++			parts[i] = pick(ht, []string{"1", "22", "-3", "x", "4.5", "", "007"})
++			if parts[i] == "" && (i == 0 || i == len(parts)-1) {
++				parts[i] = "5" // an empty first/last part is Strings()' go-ini/6 shape
++			}
++			if v, err := strconv.Atoi(parts[i]); err == nil {
++				valid = append(valid, v)
++			} else {
++				allValid = false
++			}
++		}
++		list := strings.Join(parts, ",")
++		k.SetValue(list)
++		if got := k.ValidInts(","); !reflect.DeepEqual(got, valid) {
++			ht.Fatalf("ValidInts of %q = %v, want %v", list, got, valid)
++		}
++		strict, err := k.StrictInts(",")
++		if allValid && (err != nil || !reflect.DeepEqual(strict, valid)) || !allValid && err == nil {
++			ht.Fatalf("StrictInts of %q = %v, %v; want %v (all valid %v)", list, strict, err, valid, allValid)
++		}
++		if got := k.Ints(","); len(got) != len(k.Strings(",")) {
++			ht.Fatalf("Ints of %q = %v: %d entries for %d parts", list, got, len(got), len(k.Strings(",")))
++		}
++
++		// In and RangeInt.
++		x := n(ht, -5, 15)
++		k.SetValue(strconv.Itoa(x))
++		lo, hi := n(ht, -5, 15), n(ht, -5, 15)
++		if lo > hi {
++			lo, hi = hi, lo
++		}
++		wantRange := 99
++		if lo <= x && x <= hi {
++			wantRange = x
++		}
++		if got := k.RangeInt(99, lo, hi); got != wantRange {
++			ht.Fatalf("RangeInt(99, %d, %d) of %d = %d, want %d", lo, hi, x, got, wantRange)
++		}
++		cands := []string{strconv.Itoa(n(ht, -5, 15)), strconv.Itoa(n(ht, -5, 15))}
++		wantIn := "d"
++		for _, c := range cands {
++			if c == strconv.Itoa(x) {
++				wantIn = c
++			}
++		}
++		if got := k.In("d", cands); got != wantIn {
++			ht.Fatalf("In(d, %v) of %d = %q, want %q", cands, x, got, wantIn)
++		}
++	})
++}
++
++func strconvErr[T any](_ T, err error) error { return err }
++
++func must[T any](v T, _ error) T { return v }
++
++// ---- interpolation -------------------------------------------------------------------------
++
++var refPattern = regexp.MustCompile(`%\(([^)]+)\)s`)
++
++// interpolate is Key.String() as documented: the first %(name)s is looked up in the key's
++// section, then the default section; a missing name stops the substitution and the value is
++// returned as it stands; a found name is replaced (every occurrence) by its own String().
++func interpolate(secs map[string]map[string]string, section, val string, depth int) string {
++	for i := 0; i < 99; i++ {
++		m := refPattern.FindStringSubmatch(val)
++		if m == nil {
++			break
++		}
++		refSection := section
++		ref, ok := secs[section][m[1]]
++		if !ok {
++			refSection = DefaultSection
++			ref, ok = secs[DefaultSection][m[1]]
++		}
++		if !ok {
++			break
++		}
++		// The referenced key's own String() resolves in its own section; what it leaves
++		// unresolved is then retried here, in this key's section.
++		val = strings.ReplaceAll(val, m[0], interpolate(secs, refSection, ref, depth+1))
++	}
++	return val
++}
++
++// TestHegelInterpolationFollowsTheModel: acyclic %(name)s references across the default and
++// one named section resolve as the model says (String(), Validate, StringsWithShadows);
++// Value() stays raw.
++func TestHegelInterpolationFollowsTheModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		f := Empty()
++		secs := map[string]map[string]string{DefaultSection: {}, "s": {}}
++		f.NewSection("s")
++		names := []string{"a", "b", "c", "d", "e"}
++		// Keys are defined in order; a value may only reference names already defined (in either
++		// section), which keeps the graph acyclic.
++		var defined []string
++		for i := 0; i < n(ht, 1, 5); i++ {
++			sec := pick(ht, []string{DefaultSection, "s"})
++			name := names[i] // each name defined once, so the references form a DAG
++			var sb strings.Builder
++			for j, k := 0, n(ht, 0, 3); j < k; j++ {
++				switch {
++				case len(defined) > 0 && chance(ht, 60):
++					sb.WriteString("%(" + pick(ht, defined) + ")s")
++				case chance(ht, 15):
++					sb.WriteString("%(" + pick(ht, []string{"nope", "", "x y"}) + ")s")
++				default:
++					sb.WriteString(text(ht, "xyz%() ", 1, 3))
++				}
++			}
++			val := sb.String()
++			if strings.Contains(val, "%("+name+")s") {
++				val = strings.ReplaceAll(val, "%("+name+")s", "self") // never self-referential
++			}
++			f.Section(sec).Key(name).SetValue(val)
++			secs[sec][name] = val
++			defined = append(defined, name)
++		}
++		note(ht, "sections %v", secs)
++		for sec, kv := range secs {
++			for name, raw := range kv {
++				k := f.Section(sec).Key(name)
++				want := interpolate(secs, sec, raw, 0)
++				if got := k.String(); got != want {
++					ht.Fatalf("[%s] %s = %q: String() = %q, want %q", sec, name, raw, got, want)
++				}
++				if k.Value() != raw {
++					ht.Fatalf("[%s] %s: Value() = %q, want the raw %q", sec, name, k.Value(), raw)
++				}
++				if got := k.Validate(strings.ToUpper); got != strings.ToUpper(want) {
++					ht.Fatalf("[%s] %s: Validate(ToUpper) = %q", sec, name, got)
++				}
++			}
++		}
++	})
++}
++
++// ---- pinned bugs ---------------------------------------------------------------------------
++
++// go-ini/1: two keys whose values reference each other (%(a)s <-> %(b)s) make String()
++// recurse without bound: a fatal stack overflow, which no recover can catch. The check runs
++// the call in a child process (this same test binary with HEGEL_INI_LOOP=1).
++func TestHegelInterpolationCycleDoesNotCrash(t *testing.T) {
++	if os.Getenv("HEGEL_INI_LOOP") == "1" {
++		debug.SetMaxStack(16 << 20)
++		f := Empty()
++		s := f.Section("s")
++		s.Key("a").SetValue("%(b)s")
++		s.Key("b").SetValue("%(a)s")
++		fmt.Println(s.Key("a").String())
++		return
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		cmd := exec.Command(os.Args[0], "-test.run=^TestHegelInterpolationCycleDoesNotCrash$", "-test.count=1")
++		cmd.Env = append(os.Environ(), "HEGEL_INI_LOOP=1")
++		out, err := cmd.CombinedOutput()
++		if err != nil {
++			var lines []string
++			for _, l := range strings.Split(string(out), "\n") {
++				if strings.Contains(l, "fatal error") || strings.Contains(l, "stack exceeds") {
++					lines = append(lines, l)
++				}
++			}
++			ht.Fatalf("String() on a=%%(b)s, b=%%(a)s killed the process (%v): %s", err, strings.Join(lines, "; "))
++		}
++	}, hegel.WithTestCases(1))
++}
++
++// go-ini/2: values the writer leaves raw or wraps in plain double quotes do not read back: a
++// value that starts (and ends) with a quote loses its quotes, a trailing backslash becomes a
++// continuation, `"""` is an unterminated quote, a padded value containing a quote keeps the
++// added quotes.
++func TestHegelWrittenValuesReadBack(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		val := pick(ht, []string{"'abc'", `"abc"`, `abc\`, `\`, `"""`, ` x"`, `"a" "b"`, `''`})
++		f := Empty()
++		f.Section("s").Key("k").SetValue(val)
++		var buf bytes.Buffer
++		f.WriteTo(&buf)
++		g, err := Load(buf.Bytes())
++		if err != nil {
++			ht.Fatalf("value %q written as %q does not read back: %v", val, buf.String(), err)
++		}
++		if got := g.Section("s").Key("k").Value(); got != val {
++			ht.Fatalf("value %q written as %q reads back as %q", val, buf.String(), got)
++		}
++	})
++}
++
++// go-ini/3: keys that start with a comment symbol or "[", the key "-", keys with surrounding
++// blanks or a line feed, keys containing both a backtick and a quote or delimiter, and section
++// names containing a line feed are written in a form the reader does not accept.
++func TestHegelWrittenNamesReadBack(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		sec, key := "s", "k"
++		switch n(ht, 1, 2) {
++		case 1:
++			key = pick(ht, []string{"#k", ";k", "[k", "-", " k ", "k\nx", "a`b\"c", "a`b=c"})
++		default:
++			sec = pick(ht, []string{"a\nb", "a\rb"})
++		}
++		f := Empty()
++		if _, err := f.NewSection(sec); err != nil {
++			ht.Fatalf("NewSection(%q): %v", sec, err)
++		}
++		if _, err := f.Section(sec).NewKey(key, "v"); err != nil {
++			ht.Fatalf("NewKey(%q): %v", key, err)
++		}
++		var buf bytes.Buffer
++		f.WriteTo(&buf)
++		g, err := Load(buf.Bytes())
++		if err != nil {
++			ht.Fatalf("[%q] %q written as %q does not read back: %v", sec, key, buf.String(), err)
++		}
++		if !g.Section(sec).HasKey(key) || g.Section(sec).Key(key).Value() != "v" {
++			ht.Fatalf("[%q] %q written as %q reads back as sections %v", sec, key, buf.String(), goSections(g))
++		}
++	})
++}
++
++// go-ini/4: with AllowPythonMultilineValues, a first line in quotes ends the value before the
++// Python-style check, so the indented continuation is a "key-value delimiter not found" error
++// (Python: the value continues).
++func TestHegelPythonMultilineAfterQuotedFirstLine(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		src := pick(ht, []string{"k = 'a'\n  b\n", "k = \"a\"\n  b\n", "[s]\nk = 'a b'\n\tc\n\td\n"})
++		f, err := LoadSources(LoadOptions{AllowPythonMultilineValues: true}, []byte(src))
++		if err != nil {
++			ht.Fatalf("%q: %v", src, err)
++		}
++		if v := f.Section(f.SectionStrings()[len(f.SectionStrings())-1]).Key("k").Value(); !strings.Contains(v, "\n") {
++			ht.Fatalf("%q: value %q has no continuation", src, v)
++		}
++	})
++}
++
++// go-ini/5: SpaceBeforeInlineComment (documented after Python: a comment "preceded by a
++// whitespace character") recognises only a space inside the trimmed value, so "k = a<TAB># c"
++// and "k = # c" (the comment right after the delimiter) keep the comment.
++func TestHegelSpaceBeforeInlineCommentAcceptsTab(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		src := pick(ht, []string{"k = a\t# c\n", "k = a\t; c\n", "k = a b\t\t#c\n", "k = # c\n", "k= ; c\n"})
++		f, err := LoadSources(LoadOptions{SpaceBeforeInlineComment: true}, []byte(src))
++		if err != nil {
++			ht.Fatalf("%q: %v", src, err)
++		}
++		if v := f.Section("").Key("k").Value(); strings.ContainsAny(v, "#;") {
++			ht.Fatalf("%q: value %q keeps the comment", src, v)
++		}
++	})
++}
++
++// go-ini/6: Strings() drops an empty last element ("a," -> [a]) but keeps an empty first one
++// (",a" -> ["", a]), and drops a trailing backslash ("a\" -> [a]); "," alone is [""].
++func TestHegelStringsKeepsEmptyLastElement(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := pick(ht, []struct{ v, delim string }{{"a,", ","}, {",", ","}, {"a,b,", ","}, {"a::", "::"}, {`a\`, ","}})
++		k := Empty().Section("").Key("k")
++		k.SetValue(c.v)
++		got := k.Strings(c.delim)
++		if want := splitModel(c.v, c.delim); !reflect.DeepEqual(got, want) {
++			ht.Fatalf("Strings(%q) of %q = %q, want %q", c.delim, c.v, got, want)
++		}
++	})
++}
++
++// go-ini/7: with SpaceBeforeInlineComment, " ;" is only looked for when there is no " #" on
++// the line, so "a ;b #c" is "a ;b" (Python: "a").
++func TestHegelSpaceBeforeInlineCommentTakesTheFirstSymbol(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		src := pick(ht, []string{"k = a ;b #c\n", "k = a ; b # c\n", "k = x ;y z #\n"})
++		f, err := LoadSources(LoadOptions{SpaceBeforeInlineComment: true}, []byte(src))
++		if err != nil {
++			ht.Fatalf("%q: %v", src, err)
++		}
++		if v := f.Section("").Key("k").Value(); v != strings.TrimSpace(src[4:strings.Index(src, " ;")]) {
++			ht.Fatalf("%q: value %q, want the text before the first comment", src, v)
++		}
++	})
++}
++
++// go-ini/8: UnescapeValueCommentSymbols ("unescape \# and \; inside value") never sees the
++// escaped symbol: the inline comment is cut first, so "a\;b" is `a\`.
++func TestHegelUnescapeValueCommentSymbols(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := pick(ht, []struct{ src, want string }{{`k = a\;b`, "a;b"}, {`k = a\#b`, "a#b"}, {`k = \#x \; y`, "#x ; y"}})
++		f, err := LoadSources(LoadOptions{UnescapeValueCommentSymbols: true}, []byte(c.src+"\n"))
++		if err != nil {
++			ht.Fatalf("%q: %v", c.src, err)
++		}
++		if v := f.Section("").Key("k").Value(); v != c.want {
++			ht.Fatalf("%q: value %q, want %q", c.src, v, c.want)
++		}
++	})
++}
