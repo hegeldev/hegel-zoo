@@ -28,8 +28,8 @@ zoo at 0.9.2 (HEAD `b50980e`, 2026-02-02); tests in `tests/hegel.rs`.
   two-word lists, `'lin' in sys_platform`, `extra ==`/`!=` in mixed spellings, the deprecated
   key spellings — joined by `and`/`or` with parentheses, evaluated on a random environment
   with 0–1 extras: both implementations accept or reject alike and agree on the truth value;
-  the crate's `Display` re-parses (by the crate, to an equal tree; by `packaging`, to the same
-  truth value).
+  the crate's `Display` re-parses (by the crate, to an equivalent tree — structural equality is
+  bug 9; by `packaging`, to the same truth value).
 - **Marker algebra** (`marker_algebra_agrees_with_evaluation`): for two random markers,
   `negate`, `and`, `or` evaluate as ¬/∧/∨ on sampled environments; `is_true`, `is_false`,
   `is_disjoint` are never contradicted by an environment; `a ∧ a = a`, `¬¬a = a`, De Morgan on
@@ -37,7 +37,7 @@ zoo at 0.9.2 (HEAD `b50980e`, 2026-02-02); tests in `tests/hegel.rs`.
 - **Requirements** (`requirements_parse_like_packaging`): texts from the PEP 508 grammar —
   names, extras with whitespace, 1–3 version specifiers (optionally parenthesised) or a URL, an
   optional marker — parse alike: same canonical name, extras, specifier set, URL; the marker
-  evaluates alike; the crate's `Display` re-parses to an equal requirement for the crate and to
+  evaluates alike; the crate's `Display` re-parses to an equivalent requirement for the crate and to
   the same parts for `packaging`.
 - **Syntax near misses** (`requirement_syntax_agrees_with_packaging`): 1–2 random insertions,
   deletions or replacements in a valid requirement are accepted or rejected alike, for the
@@ -54,7 +54,7 @@ tree equality skipped for `false` trees and deprecated spellings (bugs 2, 5), ex
 in a separator (bug 7), environments are final releases (bug 8) and marker literals carry no
 pre-, post- or dev-release segment (the crate's documented deviation, below).
 
-## Bugs (8, all zoo-original, found 2026-09-14)
+## Bugs (9, all zoo-original, found 2026-09-14)
 
 - **pep508_rs/1** (medium) — string-keyed markers compare lexicographically even when both
   sides are valid versions: `platform_release < '6'` is true for release `22.6.0`; PEP 508 says
@@ -77,6 +77,10 @@ pre-, post- or dev-release segment (the crate's documented deviation, below).
   `python_version == '3.13'` is false and `python_version < '3.13'` true: the expression is
   lowered to a release-only `python_full_version` range and tested against the environment's
   real `3.13.0rc1`.
+- **pep508_rs/9** (medium) — `MarkerTree` is not canonical as documented: `X and ((X and A) or B)`
+  with `A`, `B` on one string key and `X` a string or `extra` variable leaves adjacent equal-child
+  edges unmerged, so two equivalent trees (same `evaluate`, same `Display`) are `!=` and hash
+  differently. Found in uv's fork first (uv-pep508/6).
 
 ## Not bugs
 
@@ -99,3 +103,4 @@ pre-, post- or dev-release segment (the crate's documented deviation, below).
 ## History
 
 - 2026-09-14: created at b50980e (0.9.2); 8 bugs.
+- 2026-09-14 (later): pep508_rs/9 (canonicity), re-found from uv-pep508/6; the round-trip properties compare markers by equivalence.
