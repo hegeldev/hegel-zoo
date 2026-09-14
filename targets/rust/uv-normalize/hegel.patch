@@ -1,0 +1,539 @@
+diff --git a/crates/uv-normalize/Cargo.toml b/crates/uv-normalize/Cargo.toml
+index f023350..f1310a1 100644
+--- a/crates/uv-normalize/Cargo.toml
++++ b/crates/uv-normalize/Cargo.toml
+@@ -22,5 +22,9 @@ rkyv = { workspace = true }
+ schemars = { workspace = true, optional = true }
+ serde = { workspace = true, features = ["derive"] }
+ 
++[dev-dependencies]
++hegeltest = "0.44.1"
++serde_json = { workspace = true }
++
+ [features]
+ schemars = ["dep:schemars", "uv-small-str/schemars"]
+diff --git a/crates/uv-normalize/tests/hegel.rs b/crates/uv-normalize/tests/hegel.rs
+new file mode 100644
+index 0000000..791130e
+--- /dev/null
++++ b/crates/uv-normalize/tests/hegel.rs
+@@ -0,0 +1,519 @@
++//! Hegel properties for `uv-normalize` — uv's validated, normalised names (`PackageName`,
++//! `ExtraName`, `GroupName`, the pip-compatible `PipGroupName`, the lenient `DistInfoName`,
++//! and the `DefaultExtras`/`DefaultGroups` serde shapes) — with PyPA's **`packaging.utils`**
++//! (`canonicalize_name`, `is_normalized_name`; the name-normalization specification's
++//! reference implementation) and **pip's `--group` callback** (`_handle_dependency_group`,
++//! reproduced verbatim over `pathlib.PurePath`) as the oracles, driven as one persistent
++//! Python child.
++
++use std::fmt::Debug;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::str::FromStr;
++use std::sync::{Mutex, OnceLock};
++
++use hegel::{generators, TestCase};
++use uv_normalize::{
++    DefaultExtras, DefaultGroups, DistInfoName, ExtraName, GroupName, PackageName, PipGroupName,
++};
++
++// --------------------------------------------------------------------------- the Python oracle
++
++const ORACLE_SCRIPT: &str = r#"
++import pathlib
++import sys
++from packaging.utils import canonicalize_name, is_normalized_name
++
++def dec(h):
++    return bytes.fromhex(h).decode('utf-8')
++
++def enc(s):
++    return s.encode('utf-8').hex()
++
++def pip_group(value):
++    # pip/_internal/cli/cmdoptions.py::_handle_dependency_group (pip >= 25.1), verbatim logic.
++    path, sep, groupname = value.rpartition(":")
++    if not sep:
++        path = "pyproject.toml"
++    else:
++        # check for 'pyproject.toml' filenames using pathlib
++        if pathlib.PurePath(path).name != "pyproject.toml":
++            raise ValueError("group paths use 'pyproject.toml' filenames")
++    return path, ('1' if sep else '0'), groupname
++
++for line in sys.stdin:
++    parts = line.rstrip('\n').split(' ')
++    cmd, args = parts[0], [dec(p) for p in parts[1:]]
++    try:
++        if cmd == 'C':
++            out = ['ok', canonicalize_name(args[0], validate=True)]
++        elif cmd == 'D':
++            out = ['ok', canonicalize_name(args[0])]
++        elif cmd == 'N':
++            out = ['ok', 'true' if is_normalized_name(args[0]) else 'false']
++        elif cmd == 'G':
++            path, had_path, groupname = pip_group(args[0])
++            # pip hands the name to `dependency_groups`, which normalises it per PEP 735.
++            out = ['ok', path, had_path, canonicalize_name(groupname, validate=True)]
++        else:
++            out = ['bad', cmd]
++    except Exception as e:
++        out = ['err', f"{type(e).__name__}: {e}"]
++    print(' '.join([out[0]] + [enc(x) for x in out[1:]]), flush=True)
++"#;
++
++struct Oracle {
++    child: Child,
++    stdin: ChildStdin,
++    stdout: BufReader<ChildStdout>,
++}
++
++static ORACLE: OnceLock<Mutex<Oracle>> = OnceLock::new();
++
++fn hex(s: &str) -> String {
++    s.bytes().map(|b| format!("{b:02x}")).collect()
++}
++
++fn unhex(h: &str) -> String {
++    let bytes: Vec<u8> = (0..h.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
++        .collect();
++    String::from_utf8(bytes).unwrap()
++}
++
++fn oracle() -> &'static Mutex<Oracle> {
++    ORACLE.get_or_init(|| {
++        let python = ["python3", "/usr/bin/python3"]
++            .into_iter()
++            .find(|py| {
++                Command::new(py)
++                    .args(["-c", "import packaging.utils"])
++                    .stdout(Stdio::null())
++                    .stderr(Stdio::null())
++                    .status()
++                    .is_ok_and(|s| s.success())
++            })
++            .expect("a python3 with the `packaging` module is needed as the oracle");
++        let mut child = Command::new(python)
++            .arg("-u")
++            .arg("-c")
++            .arg(ORACLE_SCRIPT)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .expect("spawn the packaging oracle");
++        let stdin = child.stdin.take().unwrap();
++        let stdout = BufReader::new(child.stdout.take().unwrap());
++        Mutex::new(Oracle {
++            child,
++            stdin,
++            stdout,
++        })
++    })
++}
++
++/// Ask the oracle: the status (`ok` or `err`) and the decoded fields.
++fn ask(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
++    let mut o = oracle().lock().unwrap();
++    let mut line = cmd.to_string();
++    for a in args {
++        line.push(' ');
++        line.push_str(&hex(a));
++    }
++    line.push('\n');
++    o.stdin.write_all(line.as_bytes()).expect("oracle stdin");
++    let mut reply = String::new();
++    let n = o.stdout.read_line(&mut reply).expect("oracle stdout");
++    if n == 0 {
++        let status = o.child.try_wait().ok().flatten();
++        panic!("the Python oracle exited ({status:?})");
++    }
++    let mut it = reply.trim_end_matches(['\n', '\r']).split(' ');
++    let status = it.next().unwrap().to_string();
++    assert!(matches!(status.as_str(), "ok" | "err"), "oracle said {reply:?} to {line:?}");
++    (status, it.filter(|s| !s.is_empty()).map(unhex).collect())
++}
++
++/// `packaging.utils.canonicalize_name(name, validate=True)`: `Some(normalized)` or `None` when
++/// the name is invalid.
++fn canonical(name: &str) -> Option<String> {
++    let (status, fields) = ask("C", &[name]);
++    (status == "ok").then(|| fields.into_iter().next().unwrap_or_default())
++}
++
++/// `packaging.utils.canonicalize_name(name)` without validation (never fails).
++fn canonical_lenient(name: &str) -> String {
++    let (status, fields) = ask("D", &[name]);
++    assert_eq!(status, "ok", "D {name:?}: {fields:?}");
++    fields.into_iter().next().unwrap_or_default()
++}
++
++fn is_normalized_name(name: &str) -> bool {
++    let (status, fields) = ask("N", &[name]);
++    assert_eq!(status, "ok", "N {name:?}: {fields:?}");
++    fields[0] == "true"
++}
++
++/// pip's `--group` parse: `Some((path, had_explicit_path, normalized_name))` or `None`.
++fn pip_group(value: &str) -> Option<(String, bool, String)> {
++    let (status, fields) = ask("G", &[value]);
++    (status == "ok").then(|| {
++        let mut it = fields.into_iter();
++        let path = it.next().unwrap_or_default();
++        let had_path = it.next().unwrap_or_default() == "1";
++        let name = it.next().unwrap_or_default();
++        (path, had_path, name)
++    })
++}
++
++// --------------------------------------------------------------------------- helpers
++
++macro_rules! int {
++    ($lo:expr, $hi:expr) => {
++        generators::integers().min_value($lo).max_value($hi)
++    };
++}
++
++fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
++    tc.draw(int!(lo as i64, hi as i64)) as usize
++}
++
++fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
++    items[n(tc, 0, items.len() - 1)].clone()
++}
++
++/// True with probability `pct` percent.
++fn chance(tc: &TestCase, pct: usize) -> bool {
++    n(tc, 0, 99) < pct
++}
++
++const LETTERS: &[char] = &[
++    'a', 'b', 'c', 'x', 'y', 'z', 'A', 'B', 'C', 'X', 'Y', 'Z', 'd', 'D', 'r', 'R', 'q',
++];
++const DIGITS: &[char] = &['0', '1', '2', '7', '9'];
++const SEPARATORS: &[char] = &['-', '_', '.'];
++/// ASCII outside the name alphabet.
++const OTHER_ASCII: &[char] = &[' ', '!', ':', '/', '@', '+', '~', '\\', '\t', ','];
++/// Non-ASCII: letters with case, the case-folding quirks (`K` Kelvin sign, `ſ` long s,
++/// `ı` dotless i, whose upper/lower forms are ASCII), and a two-byte lowercase letter.
++const NON_ASCII: &[char] = &['é', 'Ä', 'ä', '\u{212A}', 'ſ', 'ı', 'α', 'Ω', 'ß'];
++
++/// A name-alphabet character (letters, digits and separators), weighted toward letters.
++fn name_char(tc: &TestCase) -> char {
++    match n(tc, 0, 9) {
++        0..=5 => pick(tc, LETTERS),
++        6..=7 => pick(tc, DIGITS),
++        _ => pick(tc, SEPARATORS),
++    }
++}
++
++/// A string over the name alphabet, optionally salted with other ASCII and non-ASCII
++/// characters (both of which make the name invalid).
++fn arb_name(tc: &TestCase, allow_other_ascii: bool, allow_non_ascii: bool) -> String {
++    let len = n(tc, 0, 12);
++    (0..len)
++        .map(|_| {
++            if allow_other_ascii && chance(tc, 6) {
++                pick(tc, OTHER_ASCII)
++            } else if allow_non_ascii && chance(tc, 6) {
++                pick(tc, NON_ASCII)
++            } else {
++                name_char(tc)
++            }
++        })
++        .collect()
++}
++
++/// A name the crate and packaging both accept: alternating runs of alphanumerics and separators,
++/// starting and ending with an alphanumeric.
++fn arb_valid_name(tc: &TestCase) -> String {
++    let mut s = String::new();
++    let runs = n(tc, 1, 4);
++    for i in 0..runs {
++        if i > 0 {
++            for _ in 0..n(tc, 1, 3) {
++                s.push(pick(tc, SEPARATORS));
++            }
++        }
++        for _ in 0..n(tc, 1, 4) {
++            s.push(if chance(tc, 75) {
++                pick(tc, LETTERS)
++            } else {
++                pick(tc, DIGITS)
++            });
++        }
++    }
++    s
++}
++
++fn json_round_trip<T>(value: &T) -> (String, T)
++where
++    T: serde::Serialize + serde::de::DeserializeOwned,
++{
++    let json = serde_json::to_string(value).expect("serialize");
++    let back: T = serde_json::from_str(&json).expect("deserialize what we serialized");
++    (json, back)
++}
++
++// --------------------------------------------------------------------------- names vs packaging
++
++/// `PackageName`, `ExtraName` and `GroupName` all implement the name-normalization
++/// specification: they accept exactly what `canonicalize_name(validate=True)` accepts and
++/// normalise to the same text; the result is normalised, stable, and its own `Display`.
++#[hegel::test]
++fn names_normalize_like_packaging(tc: TestCase) {
++    let text = arb_name(&tc, true, true);
++    let expected = canonical(&text);
++    let package = PackageName::from_str(&text);
++    let extra = ExtraName::from_str(&text);
++    let group = GroupName::from_str(&text);
++    let owned = PackageName::from_owned(text.clone());
++    match &expected {
++        None => {
++            assert!(package.is_err(), "{text:?}: packaging rejects, crate gives {package:?}");
++            assert!(extra.is_err(), "{text:?}: packaging rejects, crate gives {extra:?}");
++            assert!(group.is_err(), "{text:?}: packaging rejects, crate gives {group:?}");
++            assert!(owned.is_err(), "{text:?}: packaging rejects, from_owned gives {owned:?}");
++        }
++        Some(normalized) => {
++            let package = package.unwrap_or_else(|e| panic!("{text:?}: {e} (packaging: {normalized:?})"));
++            let extra = extra.unwrap_or_else(|e| panic!("{text:?}: {e} (packaging: {normalized:?})"));
++            let group = group.unwrap_or_else(|e| panic!("{text:?}: {e} (packaging: {normalized:?})"));
++            assert_eq!(package.as_str(), normalized, "PackageName of {text:?}");
++            assert_eq!(extra.as_str(), normalized, "ExtraName of {text:?}");
++            assert_eq!(group.as_str(), normalized, "GroupName of {text:?}");
++            assert_eq!(owned.unwrap(), package, "from_owned of {text:?}");
++            assert_eq!(&package.to_string(), normalized);
++            assert_eq!(package.as_ref(), normalized);
++            assert!(is_normalized_name(package.as_str()), "{normalized:?} not normalised");
++            assert_eq!(PackageName::from_str(package.as_str()).unwrap(), package, "stable");
++            assert_eq!(ExtraName::from_str(extra.as_str()).unwrap(), extra, "stable");
++            assert_eq!(GroupName::from_str(group.as_str()).unwrap(), group, "stable");
++        }
++    }
++}
++
++/// Two spellings name the same package exactly when packaging normalises them alike, and the
++/// derived order follows the normalised text.
++#[hegel::test]
++fn equality_is_equality_of_normal_forms(tc: TestCase) {
++    let a = arb_valid_name(&tc);
++    let b = if chance(&tc, 50) {
++        // A re-spelling of `a`: case flips and separator swaps.
++        a.chars()
++            .map(|c| {
++                if SEPARATORS.contains(&c) && chance(&tc, 50) {
++                    pick(&tc, SEPARATORS)
++                } else if c.is_ascii_alphabetic() && chance(&tc, 50) {
++                    if c.is_ascii_uppercase() {
++                        c.to_ascii_lowercase()
++                    } else {
++                        c.to_ascii_uppercase()
++                    }
++                } else {
++                    c
++                }
++            })
++            .collect()
++    } else {
++        arb_valid_name(&tc)
++    };
++    let (pa, pb) = (PackageName::from_str(&a).unwrap(), PackageName::from_str(&b).unwrap());
++    let (ca, cb) = (canonical(&a).unwrap(), canonical(&b).unwrap());
++    assert_eq!(pa == pb, ca == cb, "{a:?} vs {b:?}: crate {pa} / {pb}, packaging {ca} / {cb}");
++    assert_eq!(pa.cmp(&pb), ca.cmp(&cb), "{a:?} vs {b:?}");
++    let (ea, eb) = (ExtraName::from_str(&a).unwrap(), ExtraName::from_str(&b).unwrap());
++    assert_eq!(ea == eb, ca == cb, "extras {a:?} vs {b:?}");
++    let (ga, gb) = (GroupName::from_str(&a).unwrap(), GroupName::from_str(&b).unwrap());
++    assert_eq!(ga == gb, ca == cb, "groups {a:?} vs {b:?}");
++}
++
++/// Names serialise as their normalised text and deserialise (normalising) from any spelling.
++#[hegel::test]
++fn names_round_trip_through_serde(tc: TestCase) {
++    let text = arb_valid_name(&tc);
++    let normalized = canonical(&text).unwrap();
++    let quoted = serde_json::to_string(&text).unwrap();
++    let package: PackageName = serde_json::from_str(&quoted).unwrap();
++    assert_eq!(package.as_str(), normalized, "deserialising {text:?}");
++    let extra: ExtraName = serde_json::from_str(&quoted).unwrap();
++    assert_eq!(extra.as_str(), normalized);
++    let group: GroupName = serde_json::from_str(&quoted).unwrap();
++    assert_eq!(group.as_str(), normalized);
++    let (json, back) = json_round_trip(&package);
++    assert_eq!(json, serde_json::to_string(&normalized).unwrap());
++    assert_eq!(back, package);
++    let (json, back) = json_round_trip(&extra);
++    assert_eq!(json, serde_json::to_string(&normalized).unwrap());
++    assert_eq!(back, extra);
++    let (json, back) = json_round_trip(&group);
++    assert_eq!(json, serde_json::to_string(&normalized).unwrap());
++    assert_eq!(back, group);
++    // Deserialising from an owned string (`visit_string`) agrees with the borrowed path.
++    let owned: PackageName = serde_json::from_value(serde_json::Value::String(text.clone())).unwrap();
++    assert_eq!(owned, package);
++    // An invalid spelling is a deserialisation error, not a panic.
++    let bad = format!("{text}-");
++    assert!(serde_json::from_str::<PackageName>(&serde_json::to_string(&bad).unwrap()).is_err());
++}
++
++// --------------------------------------------------------------------------- dist-info names
++
++/// `PackageName::as_dist_info_name` is the recording-installed-packages spelling: the normalised
++/// name with `-` escaped as `_`; the lenient `DistInfoName` maps it back to the package name.
++#[hegel::test]
++fn dist_info_spelling_escapes_dashes(tc: TestCase) {
++    let text = arb_valid_name(&tc);
++    let package = PackageName::from_str(&text).unwrap();
++    let dist = package.as_dist_info_name();
++    assert_eq!(dist, package.as_str().replace('-', "_"), "{text:?}");
++    assert!(!dist.contains('-'));
++    assert_eq!(DistInfoName::new(&dist).as_ref(), package.as_str(), "{text:?} via {dist:?}");
++    assert_eq!(PackageName::from_str(&dist).unwrap(), package);
++}
++
++/// `DistInfoName` is `canonicalize_name` without validation: any ASCII text, lowercased with runs
++/// of `-`/`_`/`.` collapsed to one `-`, leading/trailing separators kept.
++#[hegel::test]
++fn dist_info_names_normalize_like_packaging(tc: TestCase) {
++    let text = arb_name(&tc, true, false);
++    let dist = DistInfoName::new(&text);
++    let expected = canonical_lenient(&text);
++    assert_eq!(dist.as_ref(), expected, "DistInfoName::new({text:?})");
++    assert_eq!(dist.to_string(), expected);
++    assert_eq!(DistInfoName::new(dist.as_ref()), dist, "stable");
++}
++
++/// Pinned: uv-normalize/1 — `DistInfoName` works on bytes: when a non-ASCII name needs any
++/// normalisation, each UTF-8 byte is pushed as a Latin-1 character (`Ä_x` → `Ã\u{84}-x`), and
++/// non-ASCII uppercase is never lowercased (`Ä` stays `Ä`; `canonicalize_name` gives `ä`).
++#[hegel::test]
++fn dist_info_names_handle_non_ascii_like_packaging(tc: TestCase) {
++    let mut text = arb_name(&tc, true, false);
++    let at = n(&tc, 0, text.chars().count());
++    let (head, tail) = text
++        .char_indices()
++        .nth(at)
++        .map_or((text.as_str(), ""), |(i, _)| text.split_at(i));
++    text = format!("{head}{}{tail}", pick(&tc, NON_ASCII));
++    let dist = DistInfoName::new(&text);
++    let expected = canonical_lenient(&text);
++    assert_eq!(dist.as_ref(), expected, "DistInfoName::new({text:?})");
++}
++
++// --------------------------------------------------------------------------- pip group names
++
++const GROUP_PATHS: &[&str] = &[
++    "pyproject.toml",
++    "x/pyproject.toml",
++    "./pyproject.toml",
++    "../up/pyproject.toml",
++    "/abs/dir/pyproject.toml",
++    "a:b/pyproject.toml",
++    "with space/pyproject.toml",
++    "dir/other.toml",
++    "dir/PYPROJECT.TOML",
++    "pyproject.tomlx",
++    "pyproject",
++    "",
++    "C:",
++];
++
++/// `PipGroupName` parses `[path:]group` like pip's `--group`: split on the last `:`, the path
++/// (if any) must be a `pyproject.toml` file, the name is normalised; `Display` round-trips.
++#[hegel::test]
++fn pip_group_names_parse_like_pip(tc: TestCase) {
++    let name = if chance(&tc, 85) {
++        arb_valid_name(&tc)
++    } else {
++        arb_name(&tc, true, true)
++    };
++    let text = if chance(&tc, 70) {
++        let path = pick(&tc, GROUP_PATHS);
++        format!("{path}:{name}")
++    } else {
++        name.clone()
++    };
++    let parsed = PipGroupName::from_str(&text);
++    match pip_group(&text) {
++        None => assert!(parsed.is_err(), "{text:?}: pip rejects, crate gives {parsed:?}"),
++        Some((path, had_path, normalized)) => {
++            let parsed = parsed.unwrap_or_else(|e| panic!("{text:?}: {e} (pip: {path:?}, {normalized:?})"));
++            assert_eq!(parsed.name.as_str(), normalized, "{text:?}");
++            let expected_path = had_path.then(|| std::path::PathBuf::from(&path));
++            assert_eq!(parsed.path, expected_path, "{text:?}");
++            let shown = parsed.to_string();
++            let again = PipGroupName::from_str(&shown).unwrap_or_else(|e| panic!("{shown:?}: {e}"));
++            assert_eq!(again, parsed, "Display round trip of {text:?} via {shown:?}");
++            let (json, back) = json_round_trip(&parsed);
++            assert_eq!(json, serde_json::to_string(&shown).unwrap());
++            assert_eq!(back, parsed);
++        }
++    }
++}
++
++/// Pinned: uv-normalize/2 — the path check is `ends_with("pyproject.toml")`, so any file whose
++/// name merely ends in those characters (`notpyproject.toml`, `x-pyproject.toml`) is accepted
++/// where pip (`PurePath(path).name != "pyproject.toml"`) refuses it.
++#[hegel::test]
++fn pip_group_paths_are_checked_by_file_name(tc: TestCase) {
++    let prefix: String = (0..n(&tc, 1, 4)).map(|_| name_char(&tc)).collect();
++    let dir = if chance(&tc, 50) { "" } else { "dir/" };
++    let name = arb_valid_name(&tc);
++    let text = format!("{dir}{prefix}pyproject.toml:{name}");
++    let parsed = PipGroupName::from_str(&text);
++    match pip_group(&text) {
++        None => assert!(parsed.is_err(), "{text:?}: pip rejects, crate gives {parsed:?}"),
++        Some(_) => assert!(parsed.is_ok(), "{text:?}: pip accepts, crate gives {parsed:?}"),
++    }
++}
++
++// --------------------------------------------------------------------------- default lists
++
++/// `DefaultExtras`/`DefaultGroups` serialise as `"all"` or a list of normalised names and
++/// deserialise from either shape, normalising the names; any other string is an error.
++#[hegel::test]
++fn default_lists_round_trip_through_serde(tc: TestCase) {
++    let spellings: Vec<String> = (0..n(&tc, 0, 4)).map(|_| arb_valid_name(&tc)).collect();
++    let normalized: Vec<String> = spellings.iter().map(|s| canonical(s).unwrap()).collect();
++    let raw_list = serde_json::to_string(&spellings).unwrap();
++    let all = chance(&tc, 25);
++    let extras = if all {
++        DefaultExtras::All
++    } else {
++        DefaultExtras::List(spellings.iter().map(|s| ExtraName::from_str(s).unwrap()).collect())
++    };
++    let groups = if all {
++        DefaultGroups::All
++    } else {
++        DefaultGroups::List(spellings.iter().map(|s| GroupName::from_str(s).unwrap()).collect())
++    };
++    let expected_json = if all {
++        "\"all\"".to_string()
++    } else {
++        serde_json::to_string(&normalized).unwrap()
++    };
++    let (json, back) = json_round_trip(&extras);
++    assert_eq!(json, expected_json);
++    assert_eq!(back, extras);
++    let (json, back) = json_round_trip(&groups);
++    assert_eq!(json, expected_json);
++    assert_eq!(back, groups);
++    if !all {
++        let from_raw: DefaultExtras = serde_json::from_str(&raw_list).unwrap();
++        assert_eq!(from_raw, extras, "deserialising {raw_list}");
++        let from_raw: DefaultGroups = serde_json::from_str(&raw_list).unwrap();
++        assert_eq!(from_raw, groups, "deserialising {raw_list}");
++    }
++    assert_eq!(serde_json::from_str::<DefaultExtras>("\"all\"").unwrap(), DefaultExtras::All);
++    assert_eq!(serde_json::from_str::<DefaultGroups>("\"all\"").unwrap(), DefaultGroups::All);
++    let other = serde_json::to_string(&arb_name(&tc, true, false)).unwrap();
++    if other != "\"all\"" {
++        assert!(serde_json::from_str::<DefaultExtras>(&other).is_err(), "{other}");
++        assert!(serde_json::from_str::<DefaultGroups>(&other).is_err(), "{other}");
++    }
++    assert_eq!(DefaultExtras::default(), DefaultExtras::List(Vec::new()));
++    assert_eq!(DefaultGroups::default(), DefaultGroups::List(Vec::new()));
++}
