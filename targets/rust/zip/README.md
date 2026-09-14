@@ -31,3 +31,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 1058f8062102 → 6fff6209289b (2026-09-11, "feat: add comment and test for ZipStreamReader and symlinks (#985)"; 9.0.0-pre3); 0 bug(s) still reproduce; add/add conflicts in tests/end_to_end.rs resolved by keeping both sides. 272 tests pass.
 - 2026-09-14: base bumped 6fff6209289b → 5a4f79868cd6 (2026-09-14, "fix: copy extra fields in raw_copy_file (#955) (#982)"; 9.0.0-pre3); 0 bug(s) still reproduce. 273 tests pass.
+- 2026-09-14: base bumped 5a4f79868cd6 → a543a1fc8f3f (2026-09-14, "fix: Symlink with very large declared size could lead to out-of-memory panic (#984)"; 9.0.0-pre3); 0 bug(s) still reproduce. 277 tests pass.
