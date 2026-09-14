@@ -47,3 +47,4 @@
 - 2026-09-13: base bumped 899eed622bfe → 13b84490ea05 (2026-09-13, "fix: replication: refresh clock on partial success"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
 - 2026-09-13: base bumped 13b84490ea05 → 15699abf73ca (2026-09-13, "test: openraft: extend watch progress send interval"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
 - 2026-09-14: base bumped 15699abf73ca → 260f170e6d59 (2026-09-14, "docs: errors: clarify ForwardToLeader retry semantics"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
+- 2026-09-14: base bumped 260f170e6d59 → cad2925616f1 (2026-09-14, "chore: build: check isolated feature builds"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
