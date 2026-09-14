@@ -49,3 +49,4 @@
 - 2026-09-14: base bumped 74bf227ff4c9 → d8bff1070ee8 (2026-09-14, "Merge pull request #1163 from rhaiscript/vm-speed-up-chaining-assign"; 1.26.0); 0 bug(s) still reproduce. 389 tests pass.
 - 2026-09-14: base bumped d8bff1070ee8 → 470610f692b7 (2026-09-14, "Merge branch 'fix'"; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
 - 2026-09-14: base bumped 470610f692b7 → eee50e8f15be (2026-09-14, "Merge pull request #1169 from rhaiscript/vm-optimize-loops"; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
+- 2026-09-14: base bumped eee50e8f15be → 9ff002f33f6f (2026-09-14, "Fix bug in loop lowering."; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
