@@ -12,7 +12,9 @@ queries, identities), `lossy::control`, the typed values in `fields` (`Priority`
 `Vcs`); and, in `tests/hegel_files.rs`, the upload-side files: `lossless::changes::Changes`
 (`.changes`), `lossless::buildinfo::Buildinfo` (`.buildinfo`, getters and setters), the checksum
 entry types (`Md5Checksum`, `Sha1Checksum`, `Sha256Checksum`, `Sha512Checksum`, `changes::File`)
-and `pgp::strip_pgp_signature`. Written in the zoo at 0.3.14 (debian-parsers commit `4dc04da`,
+and `pgp::strip_pgp_signature`; and, in `tests/hegel_apt.rs`, the apt index stanzas:
+`lossless::apt::{Package, Source, Release}` (Packages, Sources, Release/InRelease) and their
+`lossy::apt` derive twins. Written in the zoo at 0.3.14 (debian-parsers commit `4dc04da`,
 2026-09-05). The crate is a workspace member: `subdir = "debian-control"`.
 
 ## The oracles
@@ -42,9 +44,22 @@ and `pgp::strip_pgp_signature`. Written in the zoo at 0.3.14 (debian-parsers com
   generated once per test process, on a fixed pool of payloads), and the layout `dpkg-genchanges`
   and `dpkg-genbuildinfo` write (probed on a real build) as the generated model.
 
-`[run] setup` checks that `Dpkg::Deps`, `Dpkg::Control::Info`, `Dpkg::Control` and
-`Dpkg::Control::FieldsCore` load, that `gpg` is present, and warns when python-debian is missing
-(the relations property then returns early; `hegel_files.rs` needs it).
+- **dpkg's `Dpkg::Control` with an index type** (`CTRL_INDEX_PKG`, `CTRL_INDEX_SRC`,
+  `CTRL_REPO_RELEASE`; a Perl child in `hegel_apt.rs`): the fields dpkg reads from a Packages,
+  Sources or Release stanza (dpkg canonicalises the case of names it knows — `MD5sum`,
+  `Description-Md5` — so names are compared case-insensitively).
+- **python-debian's `Packages`/`Sources`/`Release`** (raw values; the typed `Files`/`Checksums-*`,
+  `MD5Sum`/`SHA1`/`SHA256`/`SHA512` entry lists) and **apt's date parser** (`apt_pkg.str_to_time`,
+  what apt accepts in `Date:`/`Valid-Until:`), one Python child; the layout `dpkg-scanpackages`,
+  `dpkg-scansources` and apt-ftparchive write as the generated model; and, when the machine has
+  them, the **real Packages and InRelease files under `/var/lib/apt/lists`** (Packages decompressed
+  with `/usr/lib/apt/apt-helper cat-file`, up to 4000 stanzas; InRelease through
+  `strip_pgp_signature`) as a corpus — the two corpus properties return early where there are none.
+
+`[run] setup` checks that `Dpkg::Deps`, `Dpkg::Control::Info`, `Dpkg::Control`,
+`Dpkg::Control::Types` and `Dpkg::Control::FieldsCore` load, that `gpg` is present, and warns when
+python-debian/python-apt are missing (the relations property then returns early; `hegel_files.rs`
+and `hegel_apt.rs` need them).
 
 ## Properties
 
@@ -119,7 +134,45 @@ Upload-side files (`tests/hegel_files.rs`):
 - **Checksum entries** (`checksum_entries_round_trip`): the four checksum types and
   `changes::File` survive `Display` → `FromStr`, accept extra whitespace and reject missing parts.
 
-## Bugs (34, all zoo-original)
+apt index files (`tests/hegel_apt.rs`; stanzas laid out as dpkg-scanpackages / dpkg-scansources /
+apt-ftparchive write them, list fields one entry per continuation line, checksum lines with or
+without apt's size padding, `.` blank lines in descriptions):
+
+- **Packages** (`packages_stanzas_are_read_like_python_debian_and_dpkg`): the lossless text is
+  the identity and every `Package` getter (name, version, sizes, maintainer, architecture, the nine
+  relation fields, section, priority, description, homepage, source, checksums, `Description-md5`,
+  `Tag`/`Task`, `Multi-Arch`) follows the model; the lossy struct follows the model and its
+  `Display` re-parses to an equal value (with `Source:` without a version — pinned); python-debian
+  reads the same raw fields; dpkg reads the same fields as a `CTRL_INDEX_PKG` stanza.
+- **Sources** (`sources_stanzas_are_read_like_python_debian_and_dpkg`): likewise for `Source`
+  (`binary()` entries, uploaders, `Vcs-*`, build relations, `Package-List`, `Directory`, `Files`
+  and the three `Checksums-*` lists), the lossy struct (round trip with one binary and ≤1 trigger —
+  pinned), python-debian's entry lists and dpkg's `CTRL_INDEX_SRC`.
+- **Release** (`release_files_are_read_like_python_debian_apt_and_dpkg`): likewise for `Release`
+  (`Date`/`Valid-Until` as the epoch seconds apt reads, with `+0000` dates — `UTC` is pinned;
+  `NotAutomatic`/`ButAutomaticUpgrades`/`Acquire-By-Hash`, architectures, components, changelogs,
+  the four checksum lists), the lossy struct and its round trip, python-debian's lists and dpkg's
+  `CTRL_REPO_RELEASE`.
+- **Corpus** (`real_packages_stanzas_are_read_by_both_layers`,
+  `real_release_files_are_read_by_both_layers`): a random real stanza / InRelease payload prints
+  back verbatim, the lossless getters agree with python-debian and the lossy struct with the
+  lossless getters, the lossy `Display` round-trips (Packages without a source version), dpkg sees
+  as many fields as python-debian, apt reads the `Date`.
+
+## Bugs (39, all zoo-original)
+
+apt index files (found 2026-09-14):
+
+- **debian-control/35** (high) — `Release::date()`/`valid_until()` panic on every real Release
+  file: chrono's RFC 2822 parser rejects the `UTC` zone name (and apt's space-padded hour).
+- **debian-control/36** (medium) — `no_support_for_architecture_all()` reads
+  `No-Support-For-Architecture-All: yes`; the field is `No-Support-for-Architecture-all: Packages`.
+- **debian-control/37** (medium) — lossy `Package` `Display` writes `Source: name (= version)`,
+  which the re-parse drops.
+- **debian-control/38** (medium) — lossy `Source` `Display` joins `Binary`/`Testsuite-Triggers`
+  with spaces; they read back as one entry.
+- **debian-control/39** (medium) — the lossless `apt` getters panic on malformed values (`Version:
+  1_2`, `Size: big`, `Homepage: not a url`, `Multi-Arch: maybe`, two-part checksum lines).
 
 Upload-side files (found 2026-09-14):
 
@@ -232,3 +285,15 @@ its own pinned test asserting dpkg's behaviour.
   `Build-Tainted-By`, unquoted `Environment` values, signed texts without a trailing blank line.
   gpg signs a fixed pool of six payloads once per process (an ephemeral ed25519 key in a temporary
   `GNUPGHOME`) so the property costs no signing per case.
+- apt index files: the lossless `apt` types have no `Display` either (read through `syntax()`);
+  `Package::tags(&self, field)` takes the field name (`tags("Tag")`) and `Source::binary()` returns
+  the comma list as `Relations` — odd APIs, not bugs. chrono rejects a date whose weekday is wrong
+  (`ParseError(Impossible)`) where apt ignores the weekday; RFC 5322 requires it to match, so the
+  model uses correct weekdays and this is not recorded. `url::Url` normalises `Homepage`
+  (`http://www.libreoffice.org` gains a `/`); the corpus property compares normalised forms. A
+  paragraph ends at the first blank line, so an InRelease payload with two blank lines before the
+  signature (Tailscale's) is compared with trailing newlines trimmed. The lossy `Release`/`Source`
+  `Display` puts the first checksum entry on the key line after two spaces and double-indents the
+  rest; it parses back, cosmetic. The general generators avoid the pinned shapes: `+0000` dates,
+  `Source:` without a version, the lossy `Source` round trip only with one binary and ≤1 trigger,
+  well-formed values.
