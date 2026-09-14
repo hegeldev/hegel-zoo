@@ -1,0 +1,1194 @@
+diff --git a/go.mod b/go.mod
+index 6db5223..728dbb8 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/gobwas/glob
+ 
+-go 1.24.0
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..34deb34
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1172 @@
++package glob_test
++
++import (
++	"bufio"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode/utf8"
++
++	"github.com/gobwas/glob"
++	"hegel.dev/go/hegel"
++)
++
++// Property-based tests for gobwas/glob. The oracles: path.Match/filepath.Match
++// on the shared syntax with '/' as the separator; a reference matcher written
++// from the grammar in glob.Compile's documentation (with the lexer's
++// tie-breaks: a class is either one range or one set, `!` negates only as the
++// first class character, `}` and `,` are literal outside a group); bash 5.2
++// with extglob on ASCII patterns without separators. Collect mode
++// (GLOB_COLLECT=1) prints every disagreement instead of failing.
++
++// ---------------------------------------------------------------------------
++// Harness helpers.
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("GLOB_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---------------------------------------------------------------- the model
++
++const (
++	kLit = iota
++	kAny
++	kSuper
++	kSingle
++	kClass
++	kGroup
++)
++
++type node struct {
++	kind    int
++	r       rune     // kLit
++	neg     bool     // kClass
++	isRange bool     // kClass
++	lo, hi  rune     // kClass range
++	set     []rune   // kClass set
++	alts    [][]node // kGroup
++}
++
++var errModel = errors.New("bad pattern")
++
++// parseModel parses a pattern by the documented grammar.
++func parseModel(p string) ([]node, error) {
++	if !utf8.ValidString(p) {
++		return nil, errModel
++	}
++	rs := []rune(p)
++	nodes, i, err := parseSeq(rs, 0, 0)
++	if err != nil {
++		return nil, err
++	}
++	if i != len(rs) {
++		return nil, errModel
++	}
++	return nodes, nil
++}
++
++func parseSeq(rs []rune, i, depth int) ([]node, int, error) {
++	out := []node{}
++	for i < len(rs) {
++		r := rs[i]
++		switch {
++		case r == '\\':
++			if i+1 >= len(rs) {
++				return nil, i, errModel
++			}
++			out = append(out, node{kind: kLit, r: rs[i+1]})
++			i += 2
++		case r == '*':
++			if i+1 < len(rs) && rs[i+1] == '*' {
++				out = append(out, node{kind: kSuper})
++				i += 2
++			} else {
++				out = append(out, node{kind: kAny})
++				i++
++			}
++		case r == '?':
++			out = append(out, node{kind: kSingle})
++			i++
++		case r == '[':
++			c, j, err := parseClass(rs, i)
++			if err != nil {
++				return nil, j, err
++			}
++			out = append(out, c)
++			i = j
++		case r == '{':
++			var alts [][]node
++			i++
++			for {
++				alt, j, err := parseSeq(rs, i, depth+1)
++				if err != nil {
++					return nil, j, err
++				}
++				alts = append(alts, alt)
++				if j >= len(rs) {
++					return nil, j, errModel // unclosed `{`
++				}
++				i = j + 1
++				if rs[j] == '}' {
++					break
++				}
++			}
++			out = append(out, node{kind: kGroup, alts: alts})
++		case depth > 0 && (r == '}' || r == ','):
++			return out, i, nil
++		default:
++			out = append(out, node{kind: kLit, r: r})
++			i++
++		}
++	}
++	return out, i, nil
++}
++
++// parseClass parses the class rs[i:] opens with `[`: an optional `!`, then
++// either `lo-hi]` (the first character taken verbatim, even a backslash) or a
++// non-empty set of characters up to `]` with `\c` escapes.
++func parseClass(rs []rune, i int) (node, int, error) {
++	j := i + 1
++	c := node{kind: kClass}
++	if j < len(rs) && rs[j] == '!' {
++		c.neg = true
++		j++
++	}
++	if j >= len(rs) {
++		return c, j, errModel
++	}
++	if j+1 < len(rs) && rs[j+1] == '-' {
++		if j+3 >= len(rs) || rs[j+3] != ']' {
++			return c, j, errModel
++		}
++		c.isRange, c.lo, c.hi = true, rs[j], rs[j+2]
++		if c.hi < c.lo {
++			return c, j, errModel
++		}
++		return c, j + 4, nil
++	}
++	for j < len(rs) {
++		r := rs[j]
++		switch r {
++		case '\\':
++			if j+1 >= len(rs) {
++				return c, j, errModel
++			}
++			c.set = append(c.set, rs[j+1])
++			j += 2
++		case ']':
++			if len(c.set) == 0 {
++				return c, j, errModel
++			}
++			return c, j + 1, nil
++		default:
++			c.set = append(c.set, r)
++			j++
++		}
++	}
++	return c, j, errModel
++}
++
++func classHas(c node, r rune) bool {
++	in := false
++	if c.isRange {
++		in = c.lo <= r && r <= c.hi
++	} else {
++		for _, x := range c.set {
++			if x == r {
++				in = true
++				break
++			}
++		}
++	}
++	return in != c.neg
++}
++
++// expand turns the groups into a set of flat sequences (the cartesian
++// product of the alternatives).
++func expand(nodes []node) [][]node {
++	seqs := [][]node{{}}
++	for _, nd := range nodes {
++		if nd.kind != kGroup {
++			for i := range seqs {
++				seqs[i] = append(seqs[i], nd)
++			}
++			continue
++		}
++		var next [][]node
++		for _, alt := range nd.alts {
++			for _, sub := range expand(alt) {
++				for _, s := range seqs {
++					next = append(next, append(append([]node{}, s...), sub...))
++				}
++			}
++		}
++		seqs = next
++	}
++	return seqs
++}
++
++func isSep(sep []rune, r rune) bool {
++	for _, s := range sep {
++		if s == r {
++			return true
++		}
++	}
++	return false
++}
++
++// matchFlat matches a flat sequence against the whole of s; literals compare
++// bytes, everything else decodes one rune at a time (an invalid byte is one
++// U+FFFD, as in Go's range).
++func matchFlat(seq []node, s string, sep []rune) bool {
++	memo := map[[2]int]bool{}
++	var f func(i, j int) bool
++	f = func(i, j int) bool {
++		key := [2]int{i, j}
++		if v, ok := memo[key]; ok {
++			return v
++		}
++		res := false
++		if i == len(seq) {
++			res = j == len(s)
++		} else {
++			nd, rest := seq[i], s[j:]
++			switch nd.kind {
++			case kLit:
++				lit := string(nd.r)
++				if strings.HasPrefix(rest, lit) {
++					res = f(i+1, j+len(lit))
++				}
++			case kSingle:
++				if len(rest) > 0 {
++					r, w := utf8.DecodeRuneInString(rest)
++					if !isSep(sep, r) {
++						res = f(i+1, j+w)
++					}
++				}
++			case kClass:
++				if len(rest) > 0 {
++					r, w := utf8.DecodeRuneInString(rest)
++					if classHas(nd, r) {
++						res = f(i+1, j+w)
++					}
++				}
++			case kAny, kSuper:
++				k := j
++				for {
++					if f(i+1, k) {
++						res = true
++						break
++					}
++					if k >= len(s) {
++						break
++					}
++					r, w := utf8.DecodeRuneInString(s[k:])
++					if nd.kind == kAny && isSep(sep, r) {
++						break
++					}
++					k += w
++				}
++			}
++		}
++		memo[key] = res
++		return res
++	}
++	return f(0, 0)
++}
++
++func modelMatch(nodes []node, s string, sep []rune) bool {
++	for _, seq := range expand(nodes) {
++		if matchFlat(seq, s, sep) {
++			return true
++		}
++	}
++	return false
++}
++
++// render writes nodes back as pattern text, escaping what needs it: the meta
++// characters in literals, `,` and `}` inside a group, `]` and `\` in a set, a
++// leading `!` of a set, and a `-` in the set's second position (which would
++// read as a range).
++func render(nodes []node, inGroup bool) string {
++	var sb strings.Builder
++	for _, nd := range nodes {
++		switch nd.kind {
++		case kLit:
++			if strings.ContainsRune(`*?\[]{}`, nd.r) || (inGroup && (nd.r == ',' || nd.r == '}')) {
++				sb.WriteByte('\\')
++			}
++			sb.WriteRune(nd.r)
++		case kAny:
++			sb.WriteString("*")
++		case kSuper:
++			sb.WriteString("**")
++		case kSingle:
++			sb.WriteString("?")
++		case kClass:
++			sb.WriteByte('[')
++			if nd.neg {
++				sb.WriteByte('!')
++			}
++			if nd.isRange {
++				sb.WriteRune(nd.lo)
++				sb.WriteByte('-')
++				sb.WriteRune(nd.hi)
++			} else {
++				for i, r := range nd.set {
++					if r == ']' || r == '\\' || (i == 0 && r == '!') || (i == 1 && r == '-') {
++						sb.WriteByte('\\')
++					}
++					sb.WriteRune(r)
++				}
++			}
++			sb.WriteByte(']')
++		case kGroup:
++			sb.WriteByte('{')
++			for i, alt := range nd.alts {
++				if i > 0 {
++					sb.WriteByte(',')
++				}
++				sb.WriteString(render(alt, true))
++			}
++			sb.WriteByte('}')
++		}
++	}
++	return sb.String()
++}
++
++// ------------------------------------------------------------- generators
++
++var (
++	litRunes  = []rune("abcxyz019./-_:,}!^] |()@+ö€�\x00")
++	rangeEnds = []rune("acegikmoqsuwyz0489AZöü")
++	setRunes  = []rune("abcxyz./-!^]\\ö")
++	metaRunes = []rune(`*?\[]{}`)
++	sepPool   = []rune("/.:ö a*\x00")
++
++	asciiLits = []rune("abcxyz019./-_:,}!^] |()@+")
++	asciiEnds = []rune("acegikmoqsuwyz0489AZ")
++	asciiSets = []rune("abcxyz./!")
++	asciiPool = []rune("abcxyz019./-_:,}!^] |()@+*?[{\\")
++	modeFull  = 0 // the whole syntax, damaged patterns, invalid bytes
++	modeStd   = 1 // path.Match's syntax: no groups, `**`, `!`, `-` or leading `^` in a set
++	modeBash  = 2 // ASCII, bash-safe classes and groups, no damage
++	genMode   = modeFull
++)
++
++// withMode sets the generation mode for one property (the properties run
++// one after another, each case drawn on the calling goroutine).
++func withMode(m int) func() {
++	genMode = m
++	return func() { genMode = modeFull }
++}
++
++// pattern is a generated pattern with the shape facts the properties need.
++type pattern struct {
++	nodes    []node
++	text     string
++	standard bool // path.Match reads it the same way
++	bashOK   bool // printable ASCII, translatable to bash extglob
++	damaged  bool
++	valid    bool // the model parses text
++	stateful bool // a group or a star with something after it
++}
++
++func genLit(tc hegel.TestCase) node {
++	if chance(tc, 8) {
++		return node{kind: kLit, r: pick(tc, metaRunes)}
++	}
++	if genMode == modeBash {
++		return node{kind: kLit, r: pick(tc, asciiLits)}
++	}
++	return node{kind: kLit, r: pick(tc, litRunes)}
++}
++
++func genClass(tc hegel.TestCase) node {
++	c := node{kind: kClass, neg: genMode != modeStd && chance(tc, 30)}
++	ends, sets := rangeEnds, setRunes
++	if genMode == modeBash {
++		ends, sets = asciiEnds, asciiSets
++	}
++	if chance(tc, 45) {
++		c.isRange = true
++		c.lo, c.hi = pick(tc, ends), pick(tc, ends)
++		if c.lo > c.hi {
++			c.lo, c.hi = c.hi, c.lo
++		}
++		return c
++	}
++	for i, k := 0, n(tc, 1, 3); i < k; i++ {
++		r := pick(tc, sets)
++		if genMode == modeStd && (r == '-' || (i == 0 && r == '^')) {
++			r = 'a'
++		}
++		if genMode == modeBash && i == 0 && r == '!' {
++			r = 'a'
++		}
++		c.set = append(c.set, r)
++	}
++	return c
++}
++
++func genNodes(tc hegel.TestCase, depth, min, max int) []node {
++	out := []node{}
++	for i, k := 0, n(tc, min, max); i < k; i++ {
++		switch x := n(tc, 1, 100); {
++		case x <= 35:
++			for j, m := 0, n(tc, 1, 3); j < m; j++ {
++				out = append(out, genLit(tc))
++			}
++		case x <= 58:
++			// Two stars in a row would render as one `**`: skip the second.
++			if len(out) > 0 && (out[len(out)-1].kind == kAny || out[len(out)-1].kind == kSuper) {
++				continue
++			}
++			if x <= 50 || genMode == modeStd {
++				out = append(out, node{kind: kAny})
++			} else {
++				out = append(out, node{kind: kSuper})
++			}
++		case x <= 70:
++			out = append(out, node{kind: kSingle})
++		case x <= 85 || depth >= 2 || genMode == modeStd:
++			out = append(out, genClass(tc))
++		default:
++			g := node{kind: kGroup}
++			for j, m := 0, n(tc, 1, 3); j < m; j++ {
++				alt := genNodes(tc, depth+1, 0, 2)
++				if genMode == modeBash && starsOnly(alt) {
++					// bash's extglob mishandles an empty or stars-only alternative.
++					alt = append(alt, genLit(tc))
++				}
++				g.alts = append(g.alts, alt)
++			}
++			if genMode == modeBash && len(out) > 0 && (out[len(out)-1].kind == kAny || out[len(out)-1].kind == kSuper) {
++				out = append(out, genLit(tc)) // and a star right before a group
++			}
++			out = append(out, g)
++		}
++	}
++	return out
++}
++
++func genPattern(tc hegel.TestCase) pattern {
++	p := pattern{nodes: genNodes(tc, 0, 0, 5)}
++	p.text = render(p.nodes, false)
++	p.standard, p.bashOK = true, true
++	walk(p.nodes, func(nd node, inGroup bool) {
++		switch nd.kind {
++		case kGroup, kSuper:
++			p.standard = false
++			// bash's extglob does not match an empty alternative, and loses
++			// matches where an alternative made of stars only must match the
++			// empty string (`*?@(*|*)` does not match "a").
++			for _, alt := range nd.alts {
++				starsOnly := true
++				for _, x := range alt {
++					if x.kind != kAny && x.kind != kSuper {
++						starsOnly = false
++					}
++				}
++				if starsOnly {
++					p.bashOK = false
++				}
++			}
++		case kClass:
++			if nd.neg || (!nd.isRange && (hasRune(nd.set, '-') || nd.set[0] == '^')) {
++				p.standard = false
++			}
++			if nd.isRange && (nd.lo == '!' || strings.ContainsRune(`]\^-`, nd.lo) || strings.ContainsRune(`]\^-`, nd.hi)) {
++				p.bashOK = false
++			}
++			if !nd.isRange && (hasRune(nd.set, ']') || hasRune(nd.set, '\\') || hasRune(nd.set, '^') || hasRune(nd.set, '-') || nd.set[0] == '!') {
++				p.bashOK = false
++			}
++		}
++	})
++	for _, r := range p.text {
++		if r < 0x20 || r > 0x7e {
++			p.bashOK = false
++		}
++	}
++	// bash 5.2 loses the match when a star is directly followed by a group
++	// (`x*@(a|*)` does not match "x" though `x@(a|*)` does).
++	walkSeqs(p.nodes, func(ns []node) {
++		for i := 1; i < len(ns); i++ {
++			if ns[i].kind == kGroup && (ns[i-1].kind == kAny || ns[i-1].kind == kSuper) {
++				p.bashOK = false
++			}
++		}
++	})
++	if p.text == "" {
++		p.bashOK = false
++	}
++	if genMode != modeBash && chance(tc, 8) {
++		p.damaged = true
++		rs := []rune(p.text)
++		at := n(tc, 0, len(rs))
++		switch n(tc, 1, 4) {
++		case 1:
++			rs = append(rs[:at], append([]rune{pick(tc, metaRunes)}, rs[at:]...)...)
++			p.text = string(rs)
++		case 2:
++			if len(rs) > 0 {
++				at = n(tc, 0, len(rs)-1)
++				rs = append(rs[:at], rs[at+1:]...)
++			}
++			p.text = string(rs)
++		case 3:
++			p.text = string(rs[:at]) + pick(tc, []string{`[a-`, `[`, `{a,`, `\`, `[]`, `[!]`, `[b-a]`, `[a-b`, `**`, `{`, `}`}) + string(rs[at:])
++		default:
++			p.text = string(rs[:at]) + "\xff" + string(rs[at:])
++		}
++		p.standard, p.bashOK = false, false
++		p.nodes, p.valid = nil, false
++		if nodes, err := parseModel(p.text); err == nil {
++			p.nodes, p.valid = nodes, true
++		}
++	} else {
++		p.valid = true
++	}
++	p.stateful = stateful(p.nodes)
++	return p
++}
++
++func walk(nodes []node, fn func(nd node, inGroup bool)) {
++	var rec func(ns []node, inGroup bool)
++	rec = func(ns []node, inGroup bool) {
++		for _, nd := range ns {
++			fn(nd, inGroup)
++			for _, alt := range nd.alts {
++				rec(alt, true)
++			}
++		}
++	}
++	rec(nodes, false)
++}
++
++// walkSeqs calls fn on every sequence: the top level and each alternative.
++func walkSeqs(nodes []node, fn func(ns []node)) {
++	fn(nodes)
++	for _, nd := range nodes {
++		for _, alt := range nd.alts {
++			walkSeqs(alt, fn)
++		}
++	}
++}
++
++func starsOnly(ns []node) bool {
++	for _, x := range ns {
++		if x.kind != kAny && x.kind != kSuper {
++			return false
++		}
++	}
++	return true
++}
++
++func hasRune(rs []rune, r rune) bool {
++	for _, x := range rs {
++		if x == r {
++			return true
++		}
++	}
++	return false
++}
++
++func stateful(nodes []node) bool {
++	for i, nd := range nodes {
++		if nd.kind == kGroup || ((nd.kind == kAny || nd.kind == kSuper) && i+1 < len(nodes)) {
++			return true
++		}
++	}
++	return false
++}
++
++func genSeps(tc hegel.TestCase) []rune {
++	if chance(tc, 30) {
++		return nil
++	}
++	var sep []rune
++	for i, k := 0, n(tc, 1, 3); i < k; i++ {
++		r := pick(tc, sepPool)
++		if !hasRune(sep, r) {
++			sep = append(sep, r)
++		}
++	}
++	return sep
++}
++
++// genString builds a string from the pattern (a witness for each node, often
++// a match) and then mutates it; sometimes a random string instead.
++func genString(tc hegel.TestCase, nodes []node, sep []rune) string {
++	pool := append(append([]rune{}, litRunes...), sep...)
++	if genMode == modeBash {
++		pool = asciiPool
++	}
++	nonSep := func() rune {
++		for i := 0; i < 8; i++ {
++			if r := pick(tc, pool); !isSep(sep, r) {
++				return r
++			}
++		}
++		return 'q'
++	}
++	var sb strings.Builder
++	if nodes == nil || chance(tc, 20) {
++		for i, k := 0, n(tc, 0, 8); i < k; i++ {
++			sb.WriteRune(pick(tc, pool))
++		}
++	} else {
++		var emit func(ns []node)
++		emit = func(ns []node) {
++			for _, nd := range ns {
++				switch nd.kind {
++				case kLit:
++					sb.WriteRune(nd.r)
++				case kAny:
++					for i, k := 0, n(tc, 0, 3); i < k; i++ {
++						sb.WriteRune(nonSep())
++					}
++				case kSuper:
++					for i, k := 0, n(tc, 0, 3); i < k; i++ {
++						sb.WriteRune(pick(tc, pool))
++					}
++				case kSingle:
++					sb.WriteRune(nonSep())
++				case kClass:
++					switch {
++					case nd.isRange && chance(tc, 70):
++						sb.WriteRune(pick(tc, []rune{nd.lo, nd.hi, (nd.lo + nd.hi) / 2, nd.lo - 1, nd.hi + 1}))
++					case !nd.isRange && chance(tc, 70):
++						sb.WriteRune(pick(tc, nd.set))
++					default:
++						sb.WriteRune(pick(tc, pool))
++					}
++				case kGroup:
++					emit(pick(tc, nd.alts))
++				}
++			}
++		}
++		emit(nodes)
++	}
++	s := sb.String()
++	if chance(tc, 35) {
++		rs := []rune(s)
++		at := n(tc, 0, len(rs))
++		switch n(tc, 1, 3) {
++		case 1:
++			rs = append(rs[:at], append([]rune{pick(tc, pool)}, rs[at:]...)...)
++		case 2:
++			if len(rs) > 0 {
++				at = n(tc, 0, len(rs)-1)
++				rs = append(rs[:at], rs[at+1:]...)
++			}
++		default:
++			if len(rs) > 0 {
++				rs[n(tc, 0, len(rs)-1)] = pick(tc, pool)
++			}
++		}
++		s = string(rs)
++	}
++	if genMode == modeFull && chance(tc, 4) {
++		at := n(tc, 0, len(s))
++		s = s[:at] + "\xff" + s[at:]
++	}
++	return s
++}
++
++// ------------------------------------------------------------------ bash
++
++var (
++	bashOnce sync.Once
++	bashMu   sync.Mutex
++	bashIn   *bufio.Writer
++	bashOut  *bufio.Scanner
++	bashErr  error
++)
++
++func startBash() {
++	cmd := exec.Command("bash", "-c", `shopt -s extglob; while IFS= read -r p && IFS= read -r s; do if [[ $s == $p ]]; then echo 1; else echo 0; fi; done`)
++	cmd.Env = append(os.Environ(), "LC_ALL=C")
++	in, err := cmd.StdinPipe()
++	if err != nil {
++		bashErr = err
++		return
++	}
++	out, err := cmd.StdoutPipe()
++	if err != nil {
++		bashErr = err
++		return
++	}
++	cmd.Stderr = os.Stderr
++	if err := cmd.Start(); err != nil {
++		bashErr = err
++		return
++	}
++	bashIn, bashOut = bufio.NewWriter(in), bufio.NewScanner(out)
++}
++
++// bashMatch asks bash whether s matches the extglob pattern p.
++func bashMatch(p, s string) (bool, error) {
++	bashOnce.Do(startBash)
++	if bashErr != nil {
++		return false, bashErr
++	}
++	bashMu.Lock()
++	defer bashMu.Unlock()
++	fmt.Fprintf(bashIn, "%s\n%s\n", p, s)
++	if err := bashIn.Flush(); err != nil {
++		return false, err
++	}
++	if !bashOut.Scan() {
++		return false, fmt.Errorf("bash exited: %v", bashOut.Err())
++	}
++	return bashOut.Text() == "1", nil
++}
++
++// bashPattern translates a model pattern into a bash extglob pattern: `**`
++// and `*` are `*` (no separators), a group is `@(a|b)`, a class keeps its
++// syntax, the other bash specials are escaped.
++func bashPattern(nodes []node) string {
++	var sb strings.Builder
++	for _, nd := range nodes {
++		switch nd.kind {
++		case kLit:
++			if strings.ContainsRune(`*?[]{}\|()@+!,$"'`+"` ", nd.r) {
++				sb.WriteByte('\\')
++			}
++			sb.WriteRune(nd.r)
++		case kAny, kSuper:
++			sb.WriteByte('*')
++		case kSingle:
++			sb.WriteByte('?')
++		case kClass:
++			sb.WriteByte('[')
++			if nd.neg {
++				sb.WriteByte('!')
++			}
++			if nd.isRange {
++				sb.WriteRune(nd.lo)
++				sb.WriteByte('-')
++				sb.WriteRune(nd.hi)
++			} else {
++				for _, r := range nd.set {
++					sb.WriteRune(r)
++				}
++			}
++			sb.WriteByte(']')
++		case kGroup:
++			sb.WriteString("@(")
++			for i, alt := range nd.alts {
++				if i > 0 {
++					sb.WriteByte('|')
++				}
++				sb.WriteString(bashPattern(alt))
++			}
++			sb.WriteByte(')')
++		}
++	}
++	return sb.String()
++}
++
++func printableASCII(s string) bool {
++	for _, r := range s {
++		if r < 0x20 || r > 0x7e {
++			return false
++		}
++	}
++	return true
++}
++
++// ------------------------------------------------------------- properties
++
++func compileErr(p string, sep []rune) (*glob.Pattern, error) {
++	return glob.Compile(p, sep...)
++}
++
++// TestHegelMatchAgreesWithPathMatch: on the syntax shared with path.Match
++// (no groups, no `**`, no negated class, no `-` or leading `^` in a set)
++// Match with '/' as the separator is path.Match, and PathMatch's twin
++// filepath.Match.
++func TestHegelMatchAgreesWithPathMatch(t *testing.T) {
++	defer withMode(modeStd)()
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		if !p.standard {
++			ht.Skip()
++		}
++		sep := []rune{'/'}
++		s := genString(ht, p.nodes, sep)
++		if strings.ContainsRune(p.text, '*') && !printableASCII(s) {
++			// path.Match retries a star at byte offsets and lets `?` and a
++			// class take the split bytes of a rune: path.Match("*??", "€").
++			ht.Skip()
++		}
++		note(ht, "pattern %q string %q", p.text, s)
++		g, err := compileErr(p.text, sep)
++		want, perr := path.Match(p.text, s)
++		if err != nil {
++			fail(ht, "Compile(%q) = %v but path.Match parses it (%v, %v)", p.text, err, want, perr)
++			return
++		}
++		if perr != nil {
++			fail(ht, "path.Match(%q) = %v but Compile accepts it", p.text, perr)
++			return
++		}
++		if got := g.Match(s); got != want {
++			fail(ht, "Match(%q, %q) = %v, path.Match %v", p.text, s, got, want)
++		}
++		if fw, ferr := filepath.Match(p.text, s); ferr != nil || fw != want {
++			fail(ht, "filepath.Match(%q, %q) = %v, %v; path.Match %v", p.text, s, fw, ferr, want)
++		}
++	})
++}
++
++// TestHegelMatchFollowsTheGrammar: Compile accepts exactly what the grammar
++// does (with a *SyntaxError whose offset is inside the pattern otherwise),
++// Match agrees with the reference matcher for any separator set, and String
++// and Separators return what was compiled.
++func TestHegelMatchFollowsTheGrammar(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		sep := genSeps(ht)
++		s := genString(ht, p.nodes, sep)
++		note(ht, "pattern %q sep %q string %q valid %v", p.text, string(sep), s, p.valid)
++		g, err := compileErr(p.text, sep)
++		if err != nil {
++			if p.valid {
++				fail(ht, "Compile(%q, %q) = %v; the grammar accepts it", p.text, string(sep), err)
++				return
++			}
++			var se *glob.SyntaxError
++			if !errors.As(err, &se) {
++				fail(ht, "Compile(%q) error %T %v is not a *SyntaxError", p.text, err, err)
++				return
++			}
++			if se.Offset < 0 || se.Offset > len(p.text) || se.Reason == "" {
++				fail(ht, "Compile(%q) = SyntaxError{Offset %d, Reason %q}: offset outside the pattern", p.text, se.Offset, se.Reason)
++			}
++			return
++		}
++		if !p.valid {
++			fail(ht, "Compile(%q, %q) accepts a pattern the grammar rejects", p.text, string(sep))
++			return
++		}
++		if g.String() != p.text {
++			fail(ht, "String() = %q, compiled %q", g.String(), p.text)
++		}
++		if gs := g.Separators(); string(gs) != string(sep) || (sep == nil) != (gs == nil) {
++			fail(ht, "Separators() = %q, compiled %q", string(gs), string(sep))
++		}
++		got, want := g.Match(s), modelMatch(p.nodes, s, sep)
++		if got != want {
++			fail(ht, "Match(%q sep %q, %q) = %v, model %v", p.text, string(sep), s, got, want)
++		}
++	})
++}
++
++// TestHegelSeparatorsOnlyRestrict: separators only take matches away, a `*`
++// widened to `**` only adds them, and a pattern rendered from its parse
++// matches the same strings.
++func TestHegelSeparatorsOnlyRestrict(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		if !p.valid {
++			ht.Skip()
++		}
++		sep := genSeps(ht)
++		more := append(append([]rune{}, sep...), pick(ht, sepPool))
++		s := genString(ht, p.nodes, more)
++		note(ht, "pattern %q sep %q more %q string %q", p.text, string(sep), string(more), s)
++		g := glob.MustCompile(p.text, sep...)
++		gm := glob.MustCompile(p.text, more...)
++		a, b := g.Match(s), gm.Match(s)
++		if b && !a {
++			fail(ht, "Match(%q, %q) is false with separators %q but true with the superset %q", p.text, s, string(sep), string(more))
++		}
++		wide := widen(p.nodes)
++		gw := glob.MustCompile(render(wide, false), sep...)
++		if a && !gw.Match(s) {
++			fail(ht, "Match(%q, %q) true but false after widening every * to **: %q", p.text, s, render(wide, false))
++		}
++		re := render(p.nodes, false)
++		gr, err := glob.Compile(re, sep...)
++		if err != nil {
++			fail(ht, "re-rendered %q (from %q) does not compile: %v", re, p.text, err)
++			return
++		}
++		if gr.Match(s) != a {
++			fail(ht, "Match(%q, %q) = %v but the re-rendered %q gives %v", p.text, s, a, re, !a)
++		}
++	})
++}
++
++func widen(nodes []node) []node {
++	out := make([]node, len(nodes))
++	for i, nd := range nodes {
++		out[i] = nd
++		if nd.kind == kAny {
++			out[i].kind = kSuper
++		}
++		if nd.kind == kGroup {
++			out[i].alts = nil
++			for _, alt := range nd.alts {
++				out[i].alts = append(out[i].alts, widen(alt))
++			}
++		}
++	}
++	return out
++}
++
++// TestHegelQuoteMetaRoundTrips: QuoteMeta(s) compiles with any separators,
++// matches s and nothing else, and unescaping it gives s back.
++func TestHegelQuoteMetaRoundTrips(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		pool := append(append([]rune{}, litRunes...), metaRunes...)
++		var sb strings.Builder
++		for i, k := 0, n(ht, 0, 8); i < k; i++ {
++			sb.WriteRune(pick(ht, pool))
++		}
++		s := sb.String()
++		sep := genSeps(ht)
++		q := glob.QuoteMeta(s)
++		note(ht, "s %q quoted %q sep %q", s, q, string(sep))
++		g, err := glob.Compile(q, sep...)
++		if err != nil {
++			fail(ht, "Compile(QuoteMeta(%q) = %q) = %v", s, q, err)
++			return
++		}
++		if !g.Match(s) {
++			fail(ht, "QuoteMeta(%q) = %q does not match %q (sep %q)", s, q, s, string(sep))
++		}
++		other := genString(ht, nil, sep)
++		if other != s && g.Match(other) {
++			fail(ht, "QuoteMeta(%q) = %q matches %q", s, q, other)
++		}
++		var un strings.Builder
++		rs := []rune(q)
++		for i := 0; i < len(rs); i++ {
++			if rs[i] == '\\' && i+1 < len(rs) {
++				if !strings.ContainsRune(`*?\[]{}`, rs[i+1]) {
++					fail(ht, "QuoteMeta(%q) = %q escapes %q, not a meta character", s, q, rs[i+1])
++				}
++				i++
++			} else if strings.ContainsRune(`*?\[]{}`, rs[i]) {
++				fail(ht, "QuoteMeta(%q) = %q leaves %q unescaped", s, q, rs[i])
++			}
++			un.WriteRune(rs[i])
++		}
++		if un.String() != s {
++			fail(ht, "QuoteMeta(%q) = %q unescapes to %q", s, q, un.String())
++		}
++	})
++}
++
++// TestHegelMatchAgreesWithBash: without separators an ASCII pattern is a bash
++// extglob pattern (`**` and `*` both `*`, `{a,b}` is `@(a|b)`).
++func TestHegelMatchAgreesWithBash(t *testing.T) {
++	defer withMode(modeBash)()
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		if !p.bashOK || !p.valid {
++			ht.Skip()
++		}
++		s := genString(ht, p.nodes, nil)
++		if !printableASCII(s) {
++			ht.Skip()
++		}
++		bp := bashPattern(p.nodes)
++		note(ht, "pattern %q bash %q string %q", p.text, bp, s)
++		want, err := bashMatch(bp, s)
++		if err != nil {
++			ht.Fatalf("bash: %v", err)
++		}
++		if got := glob.MustCompile(p.text).Match(s); got != want {
++			fail(ht, "Match(%q, %q) = %v, bash [[ %q == %s ]] %v", p.text, s, got, s, bp, want)
++		}
++	})
++}
++
++// TestHegelMatchIsConcurrencySafe: a pattern that backtracks (its state is
++// pooled) gives the same answers from many goroutines as sequentially.
++func TestHegelMatchIsConcurrencySafe(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		if !p.valid {
++			ht.Skip()
++		}
++		if !p.stateful {
++			// A leading star with something after it makes the pattern backtrack.
++			p.nodes = append([]node{{kind: kAny}, {kind: kLit, r: 'a'}}, p.nodes...)
++			p.text = render(p.nodes, false)
++		}
++		sep := genSeps(ht)
++		g := glob.MustCompile(p.text, sep...)
++		var ss []string
++		for i, k := 0, n(ht, 2, 6); i < k; i++ {
++			ss = append(ss, genString(ht, p.nodes, sep))
++		}
++		want := make([]bool, len(ss))
++		for i, s := range ss {
++			want[i] = g.Match(s)
++		}
++		note(ht, "pattern %q sep %q strings %q", p.text, string(sep), ss)
++		const workers = 6
++		got := make([][]bool, workers)
++		var wg sync.WaitGroup
++		for w := 0; w < workers; w++ {
++			wg.Add(1)
++			go func(w int) {
++				defer wg.Done()
++				got[w] = make([]bool, len(ss))
++				for round := 0; round < 3; round++ {
++					for i := range ss {
++						got[w][i] = g.Match(ss[(i+w)%len(ss)]) == want[(i+w)%len(ss)]
++					}
++				}
++			}(w)
++		}
++		wg.Wait()
++		for w := range got {
++			for i, ok := range got[w] {
++				if !ok {
++					fail(ht, "Match(%q, %q) changed its answer under concurrency (worker %d)", p.text, ss[(i+w)%len(ss)], w)
++					return
++				}
++			}
++		}
++	})
++}
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ------------------------------------------------------------------- pins
++
++// TestHegelPinInvalidSeparatorRuneOnlyStopsStar — glob/1: a separator that
++// is not a valid rune (negative, a surrogate, above U+10FFFF) becomes U+FFFD
++// in the star's separator string, so `*` stops at U+FFFD and at invalid
++// bytes while `?` (which compares runes) does not.
++func TestHegelPinInvalidSeparatorRuneOnlyStopsStar(t *testing.T) {
++	defer guard(t)
++	for _, sep := range []rune{-1, 0xD800, 0x110000} {
++		star := glob.MustCompile("*", sep).Match("�")
++		single := glob.MustCompile("?", sep).Match("�")
++		if star != single {
++			t.Errorf("separator %#x: Match(\"*\", U+FFFD) = %v but Match(\"?\", U+FFFD) = %v", sep, star, single)
++		}
++	}
++}
++
++// TestHegelPinQuoteMetaCommaInsideGroup — glob/2: QuoteMeta leaves `,`
++// unescaped, so a quoted string placed in a `{…}` group is split into
++// alternatives, although `\,` is accepted everywhere.
++func TestHegelPinQuoteMetaCommaInsideGroup(t *testing.T) {
++	defer guard(t)
++	s := "a,b"
++	pat := "{" + glob.QuoteMeta(s) + ",zz}"
++	g := glob.MustCompile(pat)
++	if !g.Match(s) || g.Match("a") || g.Match("b") {
++		t.Errorf("Compile(%q): Match(%q) = %v, Match(\"a\") = %v, Match(\"b\") = %v; want true, false, false",
++			pat, s, g.Match(s), g.Match("a"), g.Match("b"))
++	}
++}
++
++// TestHegelPinInvalidUTF8ReasonInsideClass — glob/3: invalid UTF-8 inside a
++// class or after a backslash is reported as "unexpected end of input" or
++// "trailing backslash" instead of the "invalid UTF-8 sequence" reported
++// elsewhere.
++func TestHegelPinInvalidUTF8ReasonInsideClass(t *testing.T) {
++	defer guard(t)
++	for _, p := range []string{"[\xff]", "[a\xff]", "[a-\xff]", "\\\xff"} {
++		_, err := glob.Compile(p)
++		var se *glob.SyntaxError
++		if !errors.As(err, &se) {
++			t.Fatalf("Compile(%q) = %v; want a *SyntaxError", p, err)
++		}
++		if se.Reason != "invalid UTF-8 sequence" {
++			t.Errorf("Compile(%q): Reason %q, want %q (as for \"a\\xffb\")", p, se.Reason, "invalid UTF-8 sequence")
++		}
++	}
++}
