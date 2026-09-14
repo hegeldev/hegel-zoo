@@ -45,3 +45,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 6feed7d50ee7 → 2391a343f22b (2026-09-12, "chore: Undo most of PR #836. (#837)"; 0.33.7); 1 bug(s) still reproduce. 3459 tests pass.
 - 2026-09-13: base bumped 2391a343f22b → df107d6bbfb4 (2026-09-13, "ci: run release-plz semver check on nightly (#838)"; 0.33.7); 1 bug(s) still reproduce. 3459 tests pass.
+- 2026-09-14: base bumped df107d6bbfb4 → 23343fc305cf (2026-09-14, "test: fix UB in vec3a m128 store (#840)"; 0.33.7); 1 bug(s) still reproduce. 3459 tests pass.
