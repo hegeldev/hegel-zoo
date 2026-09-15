@@ -26,3 +26,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 27166baaee68 → 4b677e343d55 (2026-09-04, "RUST-2471 Fix Eq implementation for Bson; extend Eq/Hash to raw types (#686)"; 3.1.0); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 433 tests pass.
 - 2026-09-14: base bumped 4b677e343d55 → 43b8f4c57542 (2026-09-14, "Bump the rust-dependencies group across 1 directory with 13 updates (#693)"; 3.1.0); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 433 tests pass.
+- 2026-09-15: base bumped 43b8f4c57542 → 55364b91acb3 (2026-09-15, "RUST-2488 Fix lossy `JavascriptCodeWithScope` decoding (#689)"; 3.1.0); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 434 tests pass.
