@@ -1,0 +1,1410 @@
+diff --git a/go.mod b/go.mod
+index b2dc25c..1e1e73f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/rivo/uniseg
+ 
+-go 1.18
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..1bbb9a1
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1388 @@
++// Hegel properties for github.com/rivo/uniseg (see README.md in the zoo target).
++//
++// Oracle: a Python reference implementation of the Unicode 15.0.0 grapheme cluster, word and
++// sentence boundary rules (UAX #29) written from the annex, plus the package's documented
++// monospace width rules, all reading the UCD 15.0.0 property files (GraphemeBreakProperty,
++// WordBreakProperty, SentenceBreakProperty, EastAsianWidth, emoji-data) from
++// ~/.cache/hegel-zoo/ucd-15.0.0/ (fetched by the target's [run] setup; HEGEL_UCD overrides the
++// directory). The reference passes the three UCD break-test files with zero mismatches; the
++// package embeds those same files as its own tests, so the properties add random text over every
++// property class, invalid UTF-8, the entry points against each other (Step, StepString, the
++// First* functions, the Graphemes iterator, GraphemeClusterCount, StringWidth, ReverseString),
++// and line segments against the Step flags.
++//
++// UNISEG_COLLECT=1 turns failures into a summary printed at the end (shortest first).
++package uniseg_test
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/rivo/uniseg"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++var (
++	collectMode = os.Getenv("UNISEG_COLLECT") != ""
++	collectMu   sync.Mutex
++	collectMsgs []string
++)
++
++type collected struct{}
++
++// fail reports a property failure; in collect mode it records the message and ends the case.
++func fail(ht *hegel.T, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collectMode {
++		collectMu.Lock()
++		collectMsgs = append(collectMsgs, msg)
++		collectMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf("%s", msg)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++	if collectMode {
++		collectMu.Lock()
++		msgs := append([]string(nil), collectMsgs...)
++		collectMsgs = nil
++		collectMu.Unlock()
++		sort.Slice(msgs, func(i, j int) bool { return len(msgs[i]) < len(msgs[j]) })
++		t.Logf("COLLECT %s: %d failures", t.Name(), len(msgs))
++		for i, m := range msgs {
++			if i == 40 {
++				t.Logf("  ... %d more", len(msgs)-40)
++				break
++			}
++			t.Logf("  %s", m)
++		}
++	}
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// guard turns a panic in a pin into a failure message instead of killing the test binary.
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---- the oracle: a Python reference of UAX #29 and the documented widths ------------------
++
++const pyScript = `import sys, json, os, bisect, re
++
++UCD = os.environ.get("HEGEL_UCD") or os.path.join(os.path.expanduser("~"), ".cache", "hegel-zoo", "ucd-15.0.0")
++
++def load_ranges(name, prop_filter=None):
++    """Return sorted (lo, hi, value) triples from a UCD file. prop_filter keeps only lines whose
++    value equals it (emoji-data lists several properties in one file)."""
++    out = []
++    with open(os.path.join(UCD, name), encoding="utf-8") as f:
++        for line in f:
++            line = line.split("#", 1)[0].strip()
++            if not line:
++                continue
++            fields = [x.strip() for x in line.split(";")]
++            cp, val = fields[0], fields[1]
++            if prop_filter is not None and val != prop_filter:
++                continue
++            if ".." in cp:
++                lo, hi = cp.split("..")
++            else:
++                lo = hi = cp
++            out.append((int(lo, 16), int(hi, 16), val))
++    out.sort()
++    return out
++
++class Table:
++    def __init__(self, ranges, default):
++        self.los = [r[0] for r in ranges]
++        self.ranges = ranges
++        self.default = default
++    def __call__(self, cp):
++        i = bisect.bisect_right(self.los, cp) - 1
++        if i >= 0 and self.ranges[i][0] <= cp <= self.ranges[i][1]:
++            return self.ranges[i][2]
++        return self.default
++
++GBP = Table(load_ranges("GraphemeBreakProperty.txt"), "Other")
++WBP = Table(load_ranges("WordBreakProperty.txt"), "Other")
++SBP = Table(load_ranges("SentenceBreakProperty.txt"), "Other")
++EAW = Table(load_ranges("EastAsianWidth.txt"), "N")
++EXTPICT = Table(load_ranges("emoji-data.txt", "Extended_Pictographic"), None)
++EMOJIPRES = Table(load_ranges("emoji-data.txt", "Emoji_Presentation"), None)
++
++def gcls(cp):
++    c = GBP(cp)
++    if c == "Other" and EXTPICT(cp):
++        return "ExtPict"
++    return c
++
++# ---- UAX #29 grapheme cluster boundaries, Unicode 15.0 ----------------------------------
++
++def grapheme_breaks(cps):
++    """Indices i (0 < i < n) before which a grapheme cluster boundary falls."""
++    cls = [gcls(c) for c in cps]
++    breaks = []
++    for i in range(1, len(cps)):
++        l, r = cls[i - 1], cls[i]
++        if l == "CR" and r == "LF":
++            continue  # GB3
++        if l in ("Control", "CR", "LF"):
++            breaks.append(i); continue  # GB4
++        if r in ("Control", "CR", "LF"):
++            breaks.append(i); continue  # GB5
++        if l == "L" and r in ("L", "V", "LV", "LVT"):
++            continue  # GB6
++        if l in ("LV", "V") and r in ("V", "T"):
++            continue  # GB7
++        if l in ("LVT", "T") and r == "T":
++            continue  # GB8
++        if r in ("Extend", "ZWJ"):
++            continue  # GB9
++        if r == "SpacingMark":
++            continue  # GB9a
++        if l == "Prepend":
++            continue  # GB9b
++        if l == "ZWJ" and r == "ExtPict":
++            j = i - 2
++            while j >= 0 and cls[j] == "Extend":
++                j -= 1
++            if j >= 0 and cls[j] == "ExtPict":
++                continue  # GB11
++        if l == "Regional_Indicator" and r == "Regional_Indicator":
++            j = i - 1
++            n = 0
++            while j >= 0 and cls[j] == "Regional_Indicator":
++                n += 1; j -= 1
++            if n % 2 == 1:
++                continue  # GB12/GB13
++        breaks.append(i)  # GB999
++    return breaks
++
++# ---- UAX #29 word boundaries, Unicode 15.0 ----------------------------------------------
++
++WB_IGNORE = ("Extend", "Format", "ZWJ")
++AH = ("ALetter", "Hebrew_Letter")
++MIDNUMLETQ = ("MidNumLet", "Single_Quote")
++
++def word_breaks(cps):
++    cls = [WBP(c) for c in cps]
++    extpict = [bool(EXTPICT(c)) for c in cps]
++    n = len(cps)
++    # skeleton: indices of non-ignorable code points
++    skel = [i for i in range(n) if cls[i] not in WB_IGNORE]
++    def skel_cls(k):  # class of skeleton element k, "sot"/"eot" outside
++        if k < 0:
++            return "sot"
++        if k >= len(skel):
++            return "eot"
++        return cls[skel[k]]
++    breaks = []
++    for i in range(1, n):
++        l, r = cls[i - 1], cls[i]
++        if l == "CR" and r == "LF":
++            continue  # WB3
++        if l in ("Newline", "CR", "LF"):
++            breaks.append(i); continue  # WB3a
++        if r in ("Newline", "CR", "LF"):
++            breaks.append(i); continue  # WB3b
++        if l == "ZWJ" and extpict[i]:
++            continue  # WB3c
++        if l == "WSegSpace" and r == "WSegSpace":
++            continue  # WB3d
++        if r in WB_IGNORE:
++            continue  # WB4
++        # position of r in the skeleton
++        k = bisect.bisect_left(skel, i)
++        L = skel_cls(k - 1) if k - 1 >= 0 else "sot"
++        if L == "sot" and k - 1 < 0:
++            # only ignorables before i: they behave as an Other
++            L = "Other" if i > 0 else "sot"
++        LL = skel_cls(k - 2) if k - 2 >= 0 else "sot"
++        R = r
++        RR = skel_cls(k + 1)
++        if L in AH and R in AH:
++            continue  # WB5
++        if L in AH and R in ("MidLetter",) + MIDNUMLETQ and RR in AH:
++            continue  # WB6
++        if L in ("MidLetter",) + MIDNUMLETQ and LL in AH and R in AH:
++            continue  # WB7
++        if L == "Hebrew_Letter" and R == "Single_Quote":
++            continue  # WB7a
++        if L == "Hebrew_Letter" and R == "Double_Quote" and RR == "Hebrew_Letter":
++            continue  # WB7b
++        if L == "Double_Quote" and LL == "Hebrew_Letter" and R == "Hebrew_Letter":
++            continue  # WB7c
++        if L == "Numeric" and R == "Numeric":
++            continue  # WB8
++        if L in AH and R == "Numeric":
++            continue  # WB9
++        if L == "Numeric" and R in AH:
++            continue  # WB10
++        if L in ("MidNum",) + MIDNUMLETQ and LL == "Numeric" and R == "Numeric":
++            continue  # WB11
++        if L == "Numeric" and R in ("MidNum",) + MIDNUMLETQ and RR == "Numeric":
++            continue  # WB12
++        if L == "Katakana" and R == "Katakana":
++            continue  # WB13
++        if L in AH + ("Numeric", "Katakana", "ExtendNumLet") and R == "ExtendNumLet":
++            continue  # WB13a
++        if L == "ExtendNumLet" and R in AH + ("Numeric", "Katakana"):
++            continue  # WB13b
++        if L == "Regional_Indicator" and R == "Regional_Indicator":
++            j = k - 1
++            cnt = 0
++            while j >= 0 and skel_cls(j) == "Regional_Indicator":
++                cnt += 1; j -= 1
++            if cnt % 2 == 1:
++                continue  # WB15/WB16
++        breaks.append(i)  # WB999
++    return breaks
++
++# ---- UAX #29 sentence boundaries, Unicode 15.0 ------------------------------------------
++
++SB_IGNORE = ("Extend", "Format")
++PARASEP = ("Sep", "CR", "LF")
++SATERM = ("STerm", "ATerm")
++
++def sentence_breaks(cps):
++    cls = [SBP(c) for c in cps]
++    n = len(cps)
++    skel = [i for i in range(n) if cls[i] not in SB_IGNORE]
++    def sc(k):
++        if k < 0:
++            return "sot"
++        if k >= len(skel):
++            return "eot"
++        return cls[skel[k]]
++    breaks = []
++    for i in range(1, n):
++        l, r = cls[i - 1], cls[i]
++        if l == "CR" and r == "LF":
++            continue  # SB3
++        if l in PARASEP:
++            breaks.append(i); continue  # SB4
++        if r in SB_IGNORE:
++            continue  # SB5
++        k = bisect.bisect_left(skel, i)
++        L = sc(k - 1) if k - 1 >= 0 else "Other"
++        LL = sc(k - 2)
++        R = r
++        if L == "ATerm" and R == "Numeric":
++            continue  # SB6
++        if LL in ("Upper", "Lower") and L == "ATerm" and R == "Upper":
++            continue  # SB7
++        # match backwards: Sp* Close* SATerm ending at skeleton k-1
++        j = k - 1
++        while j >= 0 and sc(j) == "Sp":
++            j -= 1
++        after_sp = j
++        while j >= 0 and sc(j) == "Close":
++            j -= 1
++        term = sc(j) if j >= 0 else None
++        if term in SATERM:
++            # SB8: ATerm Close* Sp* × (¬(OLetter|Upper|Lower|ParaSep|SATerm))* Lower
++            if term == "ATerm":
++                m = k
++                while m < len(skel) and sc(m) not in ("OLetter", "Upper", "Lower") + PARASEP + SATERM:
++                    m += 1
++                if m < len(skel) and sc(m) == "Lower":
++                    continue
++            if R in ("SContinue",) + SATERM:
++                continue  # SB8a
++            if after_sp == k - 1 and R in ("Close", "Sp") + PARASEP:
++                continue  # SB9 (no Sp consumed)
++            if R in ("Sp",) + PARASEP:
++                continue  # SB10
++            breaks.append(i); continue  # SB11
++        # SB998
++    return breaks
++
++# ---- monospace width as documented by uniseg -------------------------------------------
++
++def rune_width(cp, ambiguous):
++    c = gcls(cp)
++    if c in ("Control", "CR", "LF", "Extend", "ZWJ"):
++        return 0
++    if c == "Regional_Indicator":
++        return 2
++    if c == "ExtPict":
++        return 2 if EMOJIPRES(cp) else 1
++    if cp == 0x2E3A:
++        return 3
++    if cp == 0x2E3B:
++        return 4
++    e = EAW(cp)
++    if e in ("W", "F"):
++        return 2
++    if e == "A":
++        return ambiguous
++    return 1
++
++def cluster_width(cps, ambiguous):
++    first = gcls(cps[0])
++    if first in ("L", "LV", "LVT"):
++        return rune_width(cps[0], ambiguous)
++    if first == "Regional_Indicator":
++        return 2
++    if first == "ExtPict":
++        if len(cps) == 1:
++            return rune_width(cps[0], ambiguous)
++        if 0xFE0E in cps:
++            return 1
++        return 2
++    if len(cps) > 1 and cps[-1] == 0xFE0F:
++        return 2
++    return sum(rune_width(c, ambiguous) for c in cps)
++
++def width_skip(cps):
++    """Cluster shapes the width property does not judge: the two pinned bugs and two shapes the
++    documentation leaves open."""
++    first = gcls(cps[0])
++    if len(cps) == 1:
++        return ""
++    if first == "ExtPict" and not EMOJIPRES(cps[0]) and 0xFE0E not in cps and 0xFE0F not in cps:
++        return "uniseg/1"
++    if first in ("LV", "LVT"):
++        return "uniseg/2"
++    if first in ("V", "T"):
++        return "jamo-without-lead"
++    if first != "ExtPict" and cps[-1] == 0xFE0F:
++        return "vs16-after-text"
++    return ""
++
++def sentence_skip(cps):
++    """Sentence shapes pinned separately: a terminator followed (through Close, Sp and
++    ignorables) by a paragraph separator (uniseg/6), and U+FFFD in the SB8 look-ahead after an
++    ATerm (uniseg/5)."""
++    cls = [SBP(c) for c in cps]
++    for i, c in enumerate(cls):
++        if c in SATERM:
++            j = i + 1
++            while j < len(cls) and cls[j] in ("Close", "Sp", "Extend", "Format"):
++                j += 1
++            if j < len(cls) and cls[j] in PARASEP:
++                return "uniseg/6"
++        if c == "ATerm" and 0xFFFD in cps[i + 1:]:
++            return "uniseg/5"
++    return ""
++
++def word_skip(cps):
++    """ZWJ, then Extend/Format, then an Extended_Pictographic: whether WB3c still applies across
++    the ignorables is not settled by the test files; not judged."""
++    for i, c in enumerate(cps):
++        if c == 0x200D:
++            j = i + 1
++            while j < len(cps) and WBP(cps[j]) in WB_IGNORE:
++                j += 1
++            if j > i + 1 and j < len(cps) and EXTPICT(cps[j]):
++                return "wb3c-across-ignorables"
++            if i > 0 and WBP(cps[i - 1]) == "WSegSpace" and j < len(cps) and WBP(cps[j]) == "WSegSpace":
++                return "uniseg/8"
++    return ""
++
++def info(cp):
++    return {"g": gcls(cp), "w": WBP(cp), "s": SBP(cp), "eaw": EAW(cp), "ep": bool(EMOJIPRES(cp))}
++
++# ---- self-check against the UCD test files ---------------------------------------------
++
++def selfcheck():
++    for fname, fn in (("GraphemeBreakTest.txt", grapheme_breaks), ("WordBreakTest.txt", word_breaks), ("SentenceBreakTest.txt", sentence_breaks)):
++        total = bad = 0
++        with open(os.path.join(UCD, fname), encoding="utf-8") as f:
++            for line in f:
++                line = line.split("#", 1)[0].strip()
++                if not line:
++                    continue
++                toks = line.split()
++                cps, breaks = [], []
++                for t in toks:
++                    if t == "÷":
++                        if cps:
++                            breaks.append(len(cps))
++                    elif t == "×":
++                        pass
++                    else:
++                        cps.append(int(t, 16))
++                breaks = [b for b in breaks if b < len(cps)]
++                got = fn(cps)
++                total += 1
++                if got != breaks:
++                    bad += 1
++                    if bad <= 5:
++                        print(fname, "MISMATCH", " ".join("%04X" % c for c in cps), "want", breaks, "got", got)
++        print(fname, total, "cases,", bad, "mismatches")
++
++def serve():
++    for line in sys.stdin:
++        req = json.loads(line)
++        cps = req.get("cps", [])
++        amb = req.get("amb", 1)
++        res = {}
++        if "cps" in req:
++            res["g"] = grapheme_breaks(cps)
++            res["w"] = word_breaks(cps)
++            res["s"] = sentence_breaks(cps)
++            widths, skips = [], []
++            prev = 0
++            for b in (res["g"] + [len(cps)] if cps else []):
++                cl = cps[prev:b]
++                widths.append(cluster_width(cl, amb))
++                skips.append(width_skip(cl))
++                prev = b
++            res["widths"] = widths
++            res["skips"] = skips
++            res["sskip"] = sentence_skip(cps)
++            res["wskip"] = word_skip(cps)
++        if "info" in req:
++            res["info"] = info(req["info"])
++        print(json.dumps(res))
++        sys.stdout.flush()
++
++if __name__ == "__main__":
++    if len(sys.argv) > 1 and sys.argv[1] == "check":
++        selfcheck()
++    else:
++        serve()
++`
++
++type pyResult struct {
++	G      []int    `json:"g"`
++	W      []int    `json:"w"`
++	S      []int    `json:"s"`
++	Widths []int    `json:"widths"`
++	Skips  []string `json:"skips"`
++	Sskip  string   `json:"sskip"`
++	Wskip  string   `json:"wskip"`
++	Info   *pyInfo  `json:"info"`
++}
++
++type pyInfo struct {
++	G   string `json:"g"`
++	W   string `json:"w"`
++	S   string `json:"s"`
++	Eaw string `json:"eaw"`
++	EP  bool   `json:"ep"`
++}
++
++type pyChild struct {
++	mu  sync.Mutex
++	cmd *exec.Cmd
++	in  *bufio.Writer
++	out *bufio.Scanner
++}
++
++var (
++	pyOnce  sync.Once
++	pyProc  *pyChild
++	pyError error
++)
++
++func ucdDir() string {
++	if d := os.Getenv("HEGEL_UCD"); d != "" {
++		return d
++	}
++	home, _ := os.UserHomeDir()
++	return filepath.Join(home, ".cache", "hegel-zoo", "ucd-15.0.0")
++}
++
++func oracle(t *testing.T) *pyChild {
++	pyOnce.Do(func() {
++		for _, f := range []string{"GraphemeBreakProperty.txt", "WordBreakProperty.txt", "SentenceBreakProperty.txt", "EastAsianWidth.txt", "emoji-data.txt"} {
++			if _, err := os.Stat(filepath.Join(ucdDir(), f)); err != nil {
++				pyError = fmt.Errorf("UCD 15.0.0 file missing (run the target's setup): %v", err)
++				return
++			}
++		}
++		cmd := exec.Command("python3", "-c", pyScript)
++		cmd.Env = append(os.Environ(), "HEGEL_UCD="+ucdDir())
++		cmd.Stderr = os.Stderr
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			pyError = err
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			pyError = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			pyError = err
++			return
++		}
++		sc := bufio.NewScanner(stdout)
++		sc.Buffer(make([]byte, 1<<16), 1<<22)
++		pyProc = &pyChild{cmd: cmd, in: bufio.NewWriter(stdin), out: sc}
++	})
++	if pyError != nil {
++		t.Fatalf("cannot start the Python oracle: %v", pyError)
++	}
++	return pyProc
++}
++
++func (p *pyChild) call(req any, res any) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	b, err := json.Marshal(req)
++	if err != nil {
++		return err
++	}
++	if _, err := p.in.Write(append(b, '\n')); err != nil {
++		return err
++	}
++	if err := p.in.Flush(); err != nil {
++		return err
++	}
++	if !p.out.Scan() {
++		return fmt.Errorf("oracle died: %v", p.out.Err())
++	}
++	return json.Unmarshal(p.out.Bytes(), res)
++}
++
++func (p *pyChild) segment(t *testing.T, cps []int, amb int) pyResult {
++	var res pyResult
++	if err := p.call(map[string]any{"cps": cps, "amb": amb}, &res); err != nil {
++		t.Fatalf("oracle: %v", err)
++	}
++	return res
++}
++
++// ---- generators ----------------------------------------------------------------------------
++
++// Code points by property class (Unicode 15.0), so that the rules of all three boundary
++// algorithms and the width rules meet each other.
++var classes = [][]rune{
++	{0x0D}, {0x0A}, // CR, LF
++	{0x00, 0x09, 0x0B, 0x0C, 0x1B, 0x7F, 0x85, 0x200B, 0x2028, 0x2029, 0x061C, 0xFEFF, 0xE0001, 0xAD, 0x200E, 0x2060},                                // Control / Format / Newline / Sep
++	{0x0300, 0x0301, 0x0308, 0x0483, 0x0591, 0x064B, 0x093C, 0x0941, 0x0E31, 0x0E34, 0x200C, 0x20E3, 0x3099, 0x302A, 0x1AB0, 0xFE00, 0xFE0E, 0xFE0F}, // Extend
++	{0x1F3FB, 0x1F3FC, 0x1F3FD, 0x1F3FE, 0x1F3FF},                    // Extend: emoji modifiers
++	{0xE0020, 0xE0067, 0xE0062, 0xE007F},                             // Extend: tags
++	{0x200D},                                                         // ZWJ
++	{0x1F1E6, 0x1F1EF, 0x1F1F5, 0x1F1FA, 0x1F1F8, 0x1F1FF},           // Regional_Indicator
++	{0x0903, 0x093E, 0x0949, 0x094F, 0x0BBF, 0x0E33, 0x1B44, 0xAA33}, // SpacingMark
++	{0x0600, 0x0601, 0x0605, 0x06DD, 0x070F, 0x0890, 0x08E2, 0x0D4E, 0x110BD, 0x110CD, 0x111C2, 0x11A3A, 0x11A84, 0x11D46}, // Prepend
++	{0x1100, 0x1101, 0x1112, 0x115F, 0xA960, 0xA97C},                                                                       // L
++	{0x1160, 0x1161, 0x1175, 0x11A7, 0xD7B0, 0xD7C6},                                                                       // V
++	{0x11A8, 0x11A9, 0x11C2, 0x11FF, 0xD7CB, 0xD7FB},                                                                       // T
++	{0xAC00, 0xAC1C, 0xB098, 0xD788, 0xD7A4},                                                                               // LV
++	{0xAC01, 0xAC02, 0xB099, 0xD7A3, 0xAC1B},                                                                               // LVT
++	{0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x231A, 0x261D, 0x2764, 0x2600, 0x2603, 0x231B, 0x23F0, 0x1F004, 0x1F0CF},     // ExtPict (mixed presentation)
++	{0x1F600, 0x1F44D, 0x1F3F4, 0x1F468, 0x1F469, 0x1F467, 0x1F466, 0x1F525, 0x1F308, 0x1F3F3, 0x1FAF0, 0x1F5E8},           // ExtPict
++	{'a', 'b', 'z', 'Z', 'A', 'É', 'é', 'α', 'Α', 0x0905, 0x0915, 0x05D0, 0x05D1, 0x05EA, 0x0627, 0x3042, 0x4E00, 0x1E00},  // letters: ALetter/Hebrew/OLetter, Upper/Lower
++	{0x30A2, 0x30FC, 0x31F0, 0xFF66},                                                                                       // Katakana
++	{'\'', '"'},                                                                                                            // Single_Quote, Double_Quote / Close
++	{'.', 0x2024, 0xFE52, 0xFF0E},                                                                                          // MidNumLet / ATerm
++	{':', 0xB7, 0x0387, 0x055F, 0x05F4, 0x2027, 0xFE13, 0xFF1A},                                                            // MidLetter / SContinue
++	{',', ';', 0x037E, 0x0589, 0x060C, 0x066C, 0x2044, 0xFE10, 0xFF0C},                                                     // MidNum
++	{'0', '1', '9', 0x0660, 0x06F0, 0x0966, 0xFF10},                                                                        // Numeric
++	{'_', 0x202F, 0x203F, 0x2040, 0x2054, 0xFE33, 0xFF3F},                                                                  // ExtendNumLet
++	{' ', 0x1680, 0x2000, 0x2006, 0x2008, 0x205F, 0x3000, 0xA0},                                                            // WSegSpace / Sp
++	{'!', '?', 0x0589, 0x061F, 0x06D4, 0x0964, 0x3002, 0xFF01, 0xFF1F},                                                     // STerm
++	{'(', ')', '[', ']', '{', '}', 0xAB, 0xBB, 0x2018, 0x2019, 0x201C, 0x201D, 0x3008, 0x3009, 0xFF08},                     // Close
++	{'-', 0x2013, 0x2014, 0x3001, 0xFE10},                                                                                  // SContinue
++	{0x2E3A, 0x2E3B, 0xFF01, 0xFE6A, 0xFF61, 0x1F100, 0x2985, 0x1B05, 0x4E2D, 0x3000, 0xFFFD, 0x00A1, 0x00A4, 0x2460},      // width classes: em dashes, F, W, H, A, Na, N
++	{'-', '/', '+', '=', '@', '#', '*', '~', '\t'},                                                                         // Other punctuation
++}
++
++var blocks = [][2]rune{
++	{0x20, 0x7E}, {0xA0, 0x24F}, {0x370, 0x3FF}, {0x400, 0x4FF}, {0x590, 0x5FF}, {0x600, 0x6FF},
++	{0x900, 0x97F}, {0xE00, 0xE7F}, {0x1100, 0x11FF}, {0x2000, 0x206F}, {0x2E00, 0x2E7F},
++	{0x3000, 0x30FF}, {0x4E00, 0x4E7F}, {0xAC00, 0xD7A3}, {0xFE00, 0xFE0F}, {0xFF00, 0xFFEF},
++	{0x1F1E6, 0x1F1FF}, {0x1F300, 0x1F64F}, {0x1F900, 0x1F9FF}, {0xE0020, 0xE007F},
++}
++
++var invalidBytes = [][]byte{{0xFF}, {0x80}, {0xC3}, {0xE3, 0x81}, {0xF0, 0x9F}, {0xED, 0xA0, 0x80}, {0xC0, 0x80}}
++
++// sample is a generated string with the code point sequence the oracle sees (an invalid byte
++// counts as one U+FFFD, as utf8.DecodeRune reports it) and the byte offset of every code point.
++type sample struct {
++	text    string
++	cps     []int
++	offsets []int // offsets[k] = byte offset of cps[k]; offsets[len(cps)] = len(text)
++}
++
++func genSample(tc hegel.TestCase) sample {
++	var b []byte
++	var s sample
++	k := n(tc, 0, 10)
++	if chance(tc, 10) {
++		k = n(tc, 10, 24)
++	}
++	for i := 0; i < k; i++ {
++		switch n(tc, 1, 20) {
++		case 1:
++			b = append(b, pick(tc, invalidBytes)...)
++		case 2, 3, 4, 5:
++			blk := pick(tc, blocks)
++			b = utf8.AppendRune(b, rune(n(tc, int(blk[0]), int(blk[1]))))
++		default:
++			b = utf8.AppendRune(b, pick(tc, pick(tc, classes)))
++		}
++	}
++	// The code points the package will see: decode the bytes as it does (invalid pieces can
++	// concatenate into a valid sequence, so the bytes are the truth, not the pieces).
++	s.text = string(b)
++	for pos := 0; pos < len(b); {
++		r, size := utf8.DecodeRune(b[pos:])
++		s.offsets = append(s.offsets, pos)
++		s.cps = append(s.cps, int(r))
++		pos += size
++	}
++	s.offsets = append(s.offsets, len(b))
++	return s
++}
++
++func (s sample) toOffsets(idx []int) []int {
++	out := make([]int, 0, len(idx))
++	for _, i := range idx {
++		out = append(out, s.offsets[i])
++	}
++	return out
++}
++
++// ---- the package's answers -----------------------------------------------------------------
++
++type segCluster struct {
++	start, end int
++	width      int
++	word, sent bool
++	line       int
++}
++
++// stepAll runs Step over b from state -1 and records every cluster with its flags.
++func stepAll(b []byte) []segCluster {
++	var out []segCluster
++	state := -1
++	pos := 0
++	rest := b
++	for len(rest) > 0 {
++		var cluster []byte
++		var boundaries int
++		cluster, rest, boundaries, state = uniseg.Step(rest, state)
++		out = append(out, segCluster{pos, pos + len(cluster), boundaries >> uniseg.ShiftWidth, boundaries&uniseg.MaskWord != 0, boundaries&uniseg.MaskSentence != 0, boundaries & uniseg.MaskLine})
++		pos += len(cluster)
++	}
++	return out
++}
++
++func stepAllString(s string) []segCluster {
++	var out []segCluster
++	state := -1
++	pos := 0
++	rest := s
++	for len(rest) > 0 {
++		var cluster string
++		var boundaries int
++		cluster, rest, boundaries, state = uniseg.StepString(rest, state)
++		out = append(out, segCluster{pos, pos + len(cluster), boundaries >> uniseg.ShiftWidth, boundaries&uniseg.MaskWord != 0, boundaries&uniseg.MaskSentence != 0, boundaries & uniseg.MaskLine})
++		pos += len(cluster)
++	}
++	return out
++}
++
++// ends returns the end offsets of all segments but the last (the boundaries inside the text).
++func ends(cl []segCluster, keep func(segCluster) bool) []int {
++	var out []int
++	for i, c := range cl {
++		if i == len(cl)-1 {
++			break
++		}
++		if keep(c) {
++			out = append(out, c.end)
++		}
++	}
++	if out == nil {
++		out = []int{}
++	}
++	return out
++}
++
++func widths(cl []segCluster) []int {
++	out := make([]int, 0, len(cl))
++	for _, c := range cl {
++		out = append(out, c.width)
++	}
++	return out
++}
++
++// chain runs a First* function to the end and returns the inner boundaries.
++func chain(s string, first func(string, int) (string, string, int)) []int {
++	out := []int{}
++	state := -1
++	pos := 0
++	rest := s
++	for len(rest) > 0 {
++		var seg string
++		seg, rest, state = first(rest, state)
++		if len(seg) == 0 {
++			return append(out, -1) // would loop forever
++		}
++		pos += len(seg)
++		if len(rest) > 0 {
++			out = append(out, pos)
++		}
++	}
++	return out
++}
++
++func chainBytes(b []byte, first func([]byte, int) ([]byte, []byte, int)) []int {
++	out := []int{}
++	state := -1
++	pos := 0
++	rest := b
++	for len(rest) > 0 {
++		var seg []byte
++		seg, rest, state = first(rest, state)
++		if len(seg) == 0 {
++			return append(out, -1)
++		}
++		pos += len(seg)
++		if len(rest) > 0 {
++			out = append(out, pos)
++		}
++	}
++	return out
++}
++
++func eqInts(a, b []int) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++// setDiff returns the elements of a that are not in b, in order.
++func setDiff(a, b []int) []int {
++	set := map[int]bool{}
++	for _, x := range b {
++		set[x] = true
++	}
++	out := []int{}
++	for _, x := range a {
++		if !set[x] {
++			out = append(out, x)
++		}
++	}
++	return out
++}
++
++// ---- properties ----------------------------------------------------------------------------
++
++// TestHegelBoundariesFollowUAX29: grapheme cluster, word and sentence boundaries from Step,
++// StepString, FirstGraphemeCluster[InString], FirstWord[InString] and FirstSentence[InString]
++// all equal the reference implementation of the Unicode 15.0 rules, on text mixing every
++// property class and invalid UTF-8; GraphemeClusterCount agrees; words and sentences end on
++// cluster boundaries.
++func TestHegelBoundariesFollowUAX29(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		s := genSample(ht)
++		if len(s.text) == 0 {
++			if c, r, b, st := uniseg.Step(nil, -1); c != nil || r != nil || b != 0 || st != 0 {
++				fail(ht, "Step(nil) = %v %v %d %d, want zero values", c, r, b, st)
++			}
++			if uniseg.GraphemeClusterCount("") != 0 || uniseg.StringWidth("") != 0 || uniseg.ReverseString("") != "" {
++				fail(ht, "empty string is not empty")
++			}
++			return
++		}
++		note(ht, "%q", s.text)
++		ref := py.segment(t, s.cps, 1)
++		wantG, wantW, wantS := s.toOffsets(ref.G), s.toOffsets(ref.W), s.toOffsets(ref.S)
++		b := []byte(s.text)
++		steps := stepAll(b)
++		gotG := ends(steps, func(segCluster) bool { return true })
++		if !eqInts(gotG, wantG) {
++			fail(ht, "Step clusters of %q end at %v, UAX #29 says %v", s.text, gotG, wantG)
++		}
++		// Word and sentence boundaries can fall inside a grapheme cluster (after a Prepend
++		// character, which is Format for words; before an emoji modifier after a non-emoji base
++		// for sentences). Step reports flags at cluster ends only, so it can show the boundaries
++		// that are cluster ends (uniseg/3 pins the rest); the First* functions must show them all.
++		insideW, insideS := setDiff(wantW, wantG), setDiff(wantS, wantG)
++		if len(insideW)+len(insideS) > 0 {
++			note(ht, "boundaries inside clusters: words %v sentences %v (uniseg/3)", insideW, insideS)
++		}
++		// Sentence shapes pinned as uniseg/5 and uniseg/6, and the open WB3c question, are
++		// noted and not judged.
++		judgeW, judgeS := ref.Wskip == "", ref.Sskip == ""
++		if !judgeW {
++			note(ht, "words not judged: %s", ref.Wskip)
++		}
++		if !judgeS {
++			note(ht, "sentences not judged: %s", ref.Sskip)
++		}
++		if gotW, want := ends(steps, func(c segCluster) bool { return c.word }), setDiff(wantW, insideW); judgeW && !eqInts(gotW, want) {
++			fail(ht, "Step word boundaries of %q at %v, UAX #29 says %v", s.text, gotW, want)
++		}
++		if gotS, want := ends(steps, func(c segCluster) bool { return c.sent }), setDiff(wantS, insideS); judgeS && !eqInts(gotS, want) {
++			fail(ht, "Step sentence boundaries of %q at %v, UAX #29 says %v", s.text, gotS, want)
++		}
++		last := steps[len(steps)-1]
++		if !last.word || !last.sent || last.line != uniseg.LineMustBreak {
++			fail(ht, "Step's final cluster of %q has flags word=%v sentence=%v line=%d, want all boundaries and LineMustBreak", s.text, last.word, last.sent, last.line)
++		}
++		stepsS := stepAllString(s.text)
++		if !reflect.DeepEqual(steps, stepsS) {
++			fail(ht, "Step and StepString disagree on %q: %+v vs %+v", s.text, steps, stepsS)
++		}
++		if got := chainBytes(b, func(b []byte, st int) ([]byte, []byte, int) {
++			c, r, _, ns := uniseg.FirstGraphemeCluster(b, st)
++			return c, r, ns
++		}); !eqInts(got, wantG) {
++			fail(ht, "FirstGraphemeCluster of %q ends at %v, want %v", s.text, got, wantG)
++		}
++		if got := chain(s.text, func(s string, st int) (string, string, int) {
++			c, r, _, ns := uniseg.FirstGraphemeClusterInString(s, st)
++			return c, r, ns
++		}); !eqInts(got, wantG) {
++			fail(ht, "FirstGraphemeClusterInString of %q ends at %v, want %v", s.text, got, wantG)
++		}
++		if got := chainBytes(b, uniseg.FirstWord); judgeW && !eqInts(got, wantW) {
++			fail(ht, "FirstWord of %q ends at %v, want %v", s.text, got, wantW)
++		}
++		if got := chain(s.text, uniseg.FirstWordInString); judgeW && !eqInts(got, wantW) {
++			fail(ht, "FirstWordInString of %q ends at %v, want %v", s.text, got, wantW)
++		}
++		if got := chainBytes(b, uniseg.FirstSentence); judgeS && !eqInts(got, wantS) {
++			fail(ht, "FirstSentence of %q ends at %v, want %v", s.text, got, wantS)
++		}
++		if got := chain(s.text, uniseg.FirstSentenceInString); judgeS && !eqInts(got, wantS) {
++			fail(ht, "FirstSentenceInString of %q ends at %v, want %v", s.text, got, wantS)
++		}
++		// Whatever the shape, the byte and string variants agree with each other.
++		if a, b2 := chainBytes(b, uniseg.FirstWord), chain(s.text, uniseg.FirstWordInString); !eqInts(a, b2) {
++			fail(ht, "FirstWord %v and FirstWordInString %v disagree on %q", a, b2, s.text)
++		}
++		if a, b2 := chainBytes(b, uniseg.FirstSentence), chain(s.text, uniseg.FirstSentenceInString); !eqInts(a, b2) {
++			fail(ht, "FirstSentence %v and FirstSentenceInString %v disagree on %q", a, b2, s.text)
++		}
++		if got := uniseg.GraphemeClusterCount(s.text); got != len(wantG)+1 {
++			fail(ht, "GraphemeClusterCount(%q) = %d, want %d", s.text, got, len(wantG)+1)
++		}
++	})
++}
++
++// TestHegelWidthsFollowTheDocumentedRules: the width of every grapheme cluster from Step,
++// FirstGraphemeCluster and the Graphemes iterator, and StringWidth as their sum, follow the
++// rules in the package documentation, with EastAsianAmbiguousWidth 1 or 2. Two shapes are pinned
++// separately (uniseg/1, uniseg/2) and two the documentation leaves open are skipped.
++func TestHegelWidthsFollowTheDocumentedRules(t *testing.T) {
++	py := oracle(t)
++	defer func() { uniseg.EastAsianAmbiguousWidth = 1 }()
++	property(t, func(ht *hegel.T) {
++		s := genSample(ht)
++		if len(s.text) == 0 {
++			return
++		}
++		amb := 1
++		if chance(ht, 25) {
++			amb = 2
++		}
++		uniseg.EastAsianAmbiguousWidth = amb
++		note(ht, "%q amb=%d", s.text, amb)
++		ref := py.segment(t, s.cps, amb)
++		steps := stepAll([]byte(s.text))
++		if len(steps) != len(ref.Widths) {
++			return // clusters differ: reported by the boundary property
++		}
++		total := 0
++		for i, c := range steps {
++			total += ref.Widths[i]
++			if ref.Skips[i] != "" {
++				note(ht, "cluster %q skipped (%s)", s.text[c.start:c.end], ref.Skips[i])
++				continue
++			}
++			if c.width != ref.Widths[i] {
++				fail(ht, "Step width of cluster %q (in %q, amb=%d) = %d, documented rules give %d", s.text[c.start:c.end], s.text, amb, c.width, ref.Widths[i])
++			}
++			_, _, w, _ := uniseg.FirstGraphemeCluster([]byte(s.text[c.start:]), -1)
++			if w != c.width {
++				fail(ht, "FirstGraphemeCluster width of %q = %d, Step says %d", s.text[c.start:c.end], w, c.width)
++			}
++		}
++		skipped := false
++		for _, sk := range ref.Skips {
++			skipped = skipped || sk != ""
++		}
++		if got := uniseg.StringWidth(s.text); got != total && !skipped {
++			fail(ht, "StringWidth(%q) amb=%d = %d, sum of the documented cluster widths %d", s.text, amb, got, total)
++		}
++		sum := 0
++		for _, c := range steps {
++			sum += c.width
++		}
++		if got := uniseg.StringWidth(s.text); got != sum {
++			fail(ht, "StringWidth(%q) = %d, sum of Step widths %d", s.text, got, sum)
++		}
++	})
++}
++
++// TestHegelGraphemesIteratorMatchesStep: the Graphemes class reports the same clusters,
++// positions, runes, bytes, flags and widths as Step, before, during and after iteration, and
++// after Reset.
++func TestHegelGraphemesIteratorMatchesStep(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genSample(ht)
++		note(ht, "%q", s.text)
++		steps := stepAll([]byte(s.text))
++		g := uniseg.NewGraphemes(s.text)
++		if from, to := g.Positions(); from != 0 || to != 0 {
++			fail(ht, "Positions() before Next = %d,%d, want 0,0", from, to)
++		}
++		if g.Runes() != nil || g.Bytes() != nil || g.Str() != "" || g.Width() != 0 || !g.IsWordBoundary() || !g.IsSentenceBoundary() || g.LineBreak() != uniseg.LineDontBreak {
++			fail(ht, "fresh iterator on %q reports %v %v %q %d %v %v %d", s.text, g.Runes(), g.Bytes(), g.Str(), g.Width(), g.IsWordBoundary(), g.IsSentenceBoundary(), g.LineBreak())
++		}
++		for round := 0; round < 2; round++ {
++			i := 0
++			for g.Next() {
++				if i >= len(steps) {
++					fail(ht, "Graphemes yields more than the %d clusters of %q", len(steps), s.text)
++				}
++				c := steps[i]
++				cl := s.text[c.start:c.end]
++				from, to := g.Positions()
++				if from != c.start || to != c.end || g.Str() != cl || string(g.Bytes()) != cl || !reflect.DeepEqual(g.Runes(), []rune(cl)) {
++					fail(ht, "Graphemes cluster %d of %q: %d..%d %q %q %v, Step says %d..%d %q", i, s.text, from, to, g.Str(), g.Bytes(), g.Runes(), c.start, c.end, cl)
++				}
++				if g.Width() != c.width || g.IsWordBoundary() != c.word || g.IsSentenceBoundary() != c.sent || g.LineBreak() != c.line {
++					fail(ht, "Graphemes cluster %q of %q: width %d word %v sentence %v line %d, Step says %d %v %v %d", cl, s.text, g.Width(), g.IsWordBoundary(), g.IsSentenceBoundary(), g.LineBreak(), c.width, c.word, c.sent, c.line)
++				}
++				if !strings.Contains(g.String(), "{"+cl+"}") {
++					fail(ht, "Graphemes.String() = %q does not show the cluster %q", g.String(), cl)
++				}
++				i++
++			}
++			if i != len(steps) {
++				fail(ht, "Graphemes yields %d clusters of %q, Step %d", i, s.text, len(steps))
++			}
++			if from, to := g.Positions(); from != 1 || to != 1 {
++				fail(ht, "Positions() past the end = %d,%d, want 1,1", from, to)
++			}
++			if g.Runes() != nil || g.Bytes() != nil || g.Str() != "" || g.Width() != 0 || !g.IsWordBoundary() || !g.IsSentenceBoundary() || g.LineBreak() != uniseg.LineMustBreak {
++				fail(ht, "exhausted iterator on %q reports %v %v %q %d %v %v %d", s.text, g.Runes(), g.Bytes(), g.Str(), g.Width(), g.IsWordBoundary(), g.IsSentenceBoundary(), g.LineBreak())
++			}
++			g.Reset()
++		}
++	})
++}
++
++// TestHegelLineSegmentsMatchStepFlags: FirstLineSegment[InString] cut exactly where Step reports
++// a break opportunity (LineCanBreak or LineMustBreak), never inside a cluster, the mustBreak
++// flag equals Step's LineMustBreak, the last segment must break (LB3), and
++// HasTrailingLineBreak[InString] agree with each other and with the final rune.
++func TestHegelLineSegmentsMatchStepFlags(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genSample(ht)
++		if len(s.text) == 0 {
++			seg, rest, must, _ := uniseg.FirstLineSegmentInString("", -1)
++			if seg != "" || rest != "" || must {
++				fail(ht, "FirstLineSegmentInString(\"\") = %q %q %v", seg, rest, must)
++			}
++			return
++		}
++		note(ht, "%q", s.text)
++		steps := stepAll([]byte(s.text))
++		breakAt := map[int]int{} // cluster end → line flag
++		for _, c := range steps {
++			breakAt[c.end] = c.line
++			if c.line != uniseg.LineDontBreak && c.line != uniseg.LineCanBreak && c.line != uniseg.LineMustBreak {
++				fail(ht, "Step line flag %d for cluster %q of %q", c.line, s.text[c.start:c.end], s.text)
++			}
++		}
++		var want []int
++		for _, c := range steps {
++			if c.line != uniseg.LineDontBreak {
++				want = append(want, c.end)
++			}
++		}
++		// UAX #14 places break opportunities where UAX #29 has no cluster boundary (a
++		// non-emoji base before an emoji modifier, LB31; a Prepend character before its
++		// base): FirstLineSegment cuts there and Step cannot report it (uniseg/3). Those cuts are
++		// noted; cuts at cluster ends must match Step's flags exactly.
++		for _, variant := range []string{"bytes", "string"} {
++			state := -1
++			pos := 0
++			var got []int
++			for pos < len(s.text) {
++				var seg string
++				var must bool
++				if variant == "bytes" {
++					var sb, rb []byte
++					sb, rb, must, state = uniseg.FirstLineSegment([]byte(s.text[pos:]), state)
++					seg = string(sb)
++					if string(sb)+string(rb) != s.text[pos:] {
++						fail(ht, "FirstLineSegment of %q at %d returns %q + %q", s.text, pos, sb, rb)
++					}
++				} else {
++					var rest string
++					seg, rest, must, state = uniseg.FirstLineSegmentInString(s.text[pos:], state)
++					if seg+rest != s.text[pos:] {
++						fail(ht, "FirstLineSegmentInString of %q at %d returns %q + %q", s.text, pos, seg, rest)
++					}
++				}
++				if len(seg) == 0 {
++					fail(ht, "FirstLineSegment(%s) of %q at %d returns an empty segment", variant, s.text, pos)
++				}
++				pos += len(seg)
++				flag, ok := breakAt[pos]
++				if !ok {
++					note(ht, "FirstLineSegment(%s) of %q cuts at %d, inside a cluster (uniseg/3)", variant, s.text, pos)
++					continue
++				}
++				if flag == uniseg.LineDontBreak {
++					fail(ht, "FirstLineSegment(%s) of %q cuts at %d where Step says LineDontBreak", variant, s.text, pos)
++				}
++				if must != (flag == uniseg.LineMustBreak) {
++					fail(ht, "FirstLineSegment(%s) of %q at %d: mustBreak %v, Step flag %d", variant, s.text, pos, must, flag)
++				}
++				if pos == len(s.text) && !must {
++					fail(ht, "FirstLineSegment(%s) of %q: the last segment does not report a mandatory break", variant, s.text)
++				}
++				got = append(got, pos)
++			}
++			if !eqInts(got, want) {
++				fail(ht, "FirstLineSegment(%s) of %q cuts at %v, Step's break opportunities are %v", variant, s.text, got, want)
++			}
++		}
++		hb, hs := uniseg.HasTrailingLineBreak([]byte(s.text)), uniseg.HasTrailingLineBreakInString(s.text)
++		if hb != hs {
++			fail(ht, "HasTrailingLineBreak(%q) = %v, InString %v", s.text, hb, hs)
++		}
++		r, _ := utf8.DecodeLastRuneInString(s.text)
++		// LB4/LB5: BK (U+000B, U+000C, U+2028, U+2029), CR, LF and NL (U+0085) end a line.
++		wantTrailing := r == '\n' || r == '\r' || r == 0x0B || r == 0x0C || r == 0x85 || r == 0x2028 || r == 0x2029
++		if hs != wantTrailing {
++			fail(ht, "HasTrailingLineBreakInString(%q) = %v, want %v for the final rune %U", s.text, hs, wantTrailing, r)
++		}
++		// A mandatory break in the middle follows exactly those runes too (LB4, LB5). The
++		// break after an emoji modifier sequence is pinned separately (uniseg/4).
++		for _, c := range steps[:len(steps)-1] {
++			r, _ := utf8.DecodeLastRuneInString(s.text[:c.end])
++			isBK := r == '\n' || r == '\r' || r == 0x0B || r == 0x0C || r == 0x85 || r == 0x2028 || r == 0x2029
++			if r >= 0x1F3FB && r <= 0x1F3FF {
++				note(ht, "cluster %q ends with an emoji modifier: line flag %d not judged (uniseg/4)", s.text[c.start:c.end], c.line)
++				continue
++			}
++			if next := s.text[c.end:]; isBK && len(next) > 1 && next[0] == '-' {
++				if r2, _ := utf8.DecodeRuneInString(next[1:]); unicode.IsDigit(r2) || r2 == 0x066B || r2 == 0x066C {
++					note(ht, "newline before a hyphen and a digit in %q: line flag %d not judged (uniseg/7)", s.text, c.line)
++					continue
++				}
++			}
++			if (c.line == uniseg.LineMustBreak) != isBK {
++				fail(ht, "Step line flag after %q (ending %U) in %q is %d", s.text[c.start:c.end], r, s.text, c.line)
++			}
++		}
++	})
++}
++
++// TestHegelReverseStringReversesClusters: ReverseString keeps every cluster intact and reverses
++// their order; it is an involution and preserves the cluster count and width.
++func TestHegelReverseStringReversesClusters(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genSample(ht)
++		note(ht, "%q", s.text)
++		steps := stepAll([]byte(s.text))
++		var want strings.Builder
++		for i := len(steps) - 1; i >= 0; i-- {
++			want.WriteString(s.text[steps[i].start:steps[i].end])
++		}
++		got := uniseg.ReverseString(s.text)
++		if got != want.String() {
++			fail(ht, "ReverseString(%q) = %q, want the clusters reversed %q", s.text, got, want.String())
++		}
++		// Reversal can join clusters (a leading combining mark lands after a base), so the
++		// reverse is an involution only when the reversed text re-segments into the same clusters.
++		back := stepAll([]byte(got))
++		same := len(back) == len(steps)
++		for i := range back {
++			if !same {
++				break
++			}
++			j := len(steps) - 1 - i
++			same = got[back[i].start:back[i].end] == s.text[steps[j].start:steps[j].end]
++		}
++		if same {
++			if again := uniseg.ReverseString(got); again != s.text {
++				fail(ht, "ReverseString(ReverseString(%q)) = %q", s.text, again)
++			}
++		} else {
++			note(ht, "clusters change on reversal: %d → %d", len(steps), len(back))
++		}
++	})
++}
++
++// ---- pins ----------------------------------------------------------------------------------
++
++// TestHegelPinEmojiModifierSequencesAreTwoCellsWide pins uniseg/1: a text-presentation
++// Extended Pictographic followed by an emoji modifier or a ZWJ sequence keeps width 1, although
++// the documentation says any additional code point forces a total width of 2.
++func TestHegelPinEmojiModifierSequencesAreTwoCellsWide(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"☝🏻", "✌🏿", "©‍©", "❤‍🔥", "🏳‍🌈"} {
++		if _, _, w, _ := uniseg.FirstGraphemeClusterInString(s, -1); w != 2 {
++			t.Errorf("width of %q (%d code points, one cluster) = %d, want 2", s, utf8.RuneCountInString(s), w)
++		}
++	}
++}
++
++// TestHegelPinHangulSyllableWithTrailingJamoIsTwoCellsWide pins uniseg/2: a precomposed LV or
++// LVT syllable followed by a trailing jamo is one cluster of width 3, although the documentation
++// gives Hangul clusters the width of their first code point.
++func TestHegelPinHangulSyllableWithTrailingJamoIsTwoCellsWide(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"각", "각ᆨ", "힣ᇿ", "각ᆩ"} {
++		if got := uniseg.StringWidth(s); got != 2 {
++			t.Errorf("StringWidth(%q) = %d, want 2 (%d clusters)", s, got, uniseg.GraphemeClusterCount(s))
++		}
++	}
++}
++
++// TestHegelPinStepReportsTheBoundariesInsideClusters pins uniseg/3: UAX #29 and #14 place
++// word, sentence and line boundaries inside some grapheme clusters (after a Prepend character,
++// which is Format for word breaking; before an emoji modifier following a non-emoji base),
++// FirstWord/FirstSentence/FirstLineSegment report them, but Step and Graphemes only flag
++// cluster ends, so they yield different words, sentences and line segments.
++func TestHegelPinStepReportsTheBoundariesInsideClusters(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		s     string
++		words []int
++	}{
++		{"؀낙", []int{2}},          // ARABIC NUMBER SIGN (Prepend/Format) + Hangul syllable: two words, one cluster
++		{"࢐ᄁ", []int{3}},          // ARABIC POUND MARK ABOVE (Prepend) + jamo
++		{"a؀b", []int{}},          // Format between letters attaches (WB4): one word — a cluster end without a word boundary is fine
++		{"\U00011A3Aa", []int{4}}, // Zanabazar Square cluster-initial letter (Prepend)
++	} {
++		want := chain(tt.s, uniseg.FirstWordInString)
++		if !eqInts(want, tt.words) {
++			t.Errorf("FirstWordInString(%q) boundaries = %v, want %v (UAX #29)", tt.s, want, tt.words)
++		}
++		got := ends(stepAll([]byte(tt.s)), func(c segCluster) bool { return c.word })
++		if !eqInts(got, want) {
++			t.Errorf("Step word boundaries of %q = %v, FirstWord says %v", tt.s, got, want)
++		}
++	}
++	s := "a. 🏼B"
++	if got, want := ends(stepAll([]byte(s)), func(c segCluster) bool { return c.sent }), chain(s, uniseg.FirstSentenceInString); !eqInts(got, want) {
++		t.Errorf("Step sentence boundaries of %q = %v, FirstSentence says %v", s, got, want)
++	}
++}
++
++// TestHegelPinNoMandatoryBreakAfterAnEmojiModifierSequence pins uniseg/4: after an emoji
++// modifier sequence (Emoji_Modifier_Base + Emoji_Modifier, LB30b) followed by anything, the
++// break opportunity is reported as mandatory (LineMustBreak) although only BK, CR, LF and NL
++// force a line break (LB4, LB5).
++func TestHegelPinNoMandatoryBreakAfterAnEmojiModifierSequence(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"👧🏼a", "🧑🏽 b", "☝🏿, c", "a👧🏼b"} {
++		state := -1
++		rest := s
++		pos := 0
++		for len(rest) > 0 {
++			var seg string
++			var must bool
++			seg, rest, must, state = uniseg.FirstLineSegmentInString(rest, state)
++			pos += len(seg)
++			if must && len(rest) > 0 {
++				t.Errorf("FirstLineSegmentInString(%q) reports a mandatory break after %q", s, s[:pos])
++			}
++		}
++		for _, c := range stepAll([]byte(s)) {
++			if c.end < len(s) && c.line == uniseg.LineMustBreak {
++				t.Errorf("Step reports LineMustBreak after %q in %q", s[c.start:c.end], s)
++			}
++		}
++	}
++}
++
++// TestHegelPinSentenceLookAheadReadsPastReplacementCharacters pins uniseg/5: the SB8 look-ahead
++// after an ATerm stops at the first U+FFFD (a replacement character in the text or a byte that
++// is not UTF-8) as if the text had ended, so the following lower-case letter is never seen and
++// a sentence boundary is inserted.
++func TestHegelPinSentenceLookAheadReadsPastReplacementCharacters(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"a. �� b", "a. \xff\xff b", "a. (\xc0\x80 b", "a. x� b"} {
++		if got := chain(s, uniseg.FirstSentenceInString); len(got) != 0 {
++			t.Errorf("FirstSentenceInString splits %q at %v, want one sentence (SB8, as for %q which gives %v)", s, got, "a. x b", chain("a. x b", uniseg.FirstSentenceInString))
++		}
++	}
++}
++
++// TestHegelPinSentenceTerminatorBeforeCRLF pins uniseg/6: after a sentence terminator, a CR LF
++// pair is split (SB3) and, with spaces in between, the break lands before the CR instead of
++// after the LF (SB10, SB11).
++func TestHegelPinSentenceTerminatorBeforeCRLF(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		s    string
++		want []int
++	}{
++		{"a!\r\nb", []int{4}},
++		{"a.\r\nb", []int{4}},
++		{"a! \r\nb", []int{5}},
++		{"a!)\r\nb", []int{5}},
++		{"a!  b", []int{6}},
++		{"a\r\nb", []int{3}},
++	} {
++		if got := chain(tt.s, uniseg.FirstSentenceInString); !eqInts(got, tt.want) {
++			t.Errorf("FirstSentenceInString splits %q at %v, want %v", tt.s, got, tt.want)
++		}
++	}
++}
++
++// TestHegelPinMandatoryBreakSurvivesAHyphenAndDigit pins uniseg/7: the mandatory line break
++// after CR, LF or a paragraph separator disappears when the next line starts with a hyphen and
++// a digit (the LB25 look-ahead overrides LB4/LB5).
++func TestHegelPinMandatoryBreakSurvivesAHyphenAndDigit(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		s    string
++		flag int
++	}{
++		{"a\n-0", uniseg.LineMustBreak},
++		{"a\r-1", uniseg.LineMustBreak},
++		{"a\u2028-9", uniseg.LineMustBreak},
++		{"a\r\n-5", uniseg.LineMustBreak},
++		{"a -0", uniseg.LineCanBreak}, // LB18: SP ÷; LB25 does not reach back over the space
++		{"a\n-x", uniseg.LineMustBreak},
++		{"a\n0", uniseg.LineMustBreak},
++	} {
++		s := tt.s
++		steps := stepAllString(s)
++		if len(steps) < 2 {
++			t.Fatalf("Step gives %d clusters for %q", len(steps), s)
++		}
++		wantSeg := []int{steps[1].end}
++		if steps[1].line != tt.flag {
++			t.Errorf("Step line flag after %q in %q is %d, want %d", s[:steps[1].end], s, steps[1].line, tt.flag)
++		}
++		if got := chain(s, func(s string, st int) (string, string, int) {
++			a, b, _, c := uniseg.FirstLineSegmentInString(s, st)
++			return a, b, c
++		}); len(got) == 0 || got[0] != wantSeg[0] {
++			t.Errorf("FirstLineSegmentInString cuts %q at %v, want the first cut at %v", s, got, wantSeg)
++		}
++	}
++}
++
++// TestHegelPinZWJBetweenSpacesDoesNotJoinThem pins uniseg/8: WB3d (WSegSpace × WSegSpace)
++// precedes WB4, so a ZWJ between two spaces leaves a word boundary before the second space, as
++// U+0308 does; the package joins the spaces through the ZWJ only.
++func TestHegelPinZWJBetweenSpacesDoesNotJoinThem(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		s    string
++		want []int
++	}{
++		{" ‍ ", []int{4}},
++		{" ̈ ", []int{3}},
++		{"a ‍ b", []int{1, 5, 6}},
++		{"a ̈ b", []int{1, 4, 5}},
++	} {
++		if got := chain(tt.s, uniseg.FirstWordInString); !eqInts(got, tt.want) {
++			t.Errorf("FirstWordInString splits %q at %v, want %v", tt.s, got, tt.want)
++		}
++		if got := ends(stepAllString(tt.s), func(c segCluster) bool { return c.word }); !eqInts(got, tt.want) {
++			t.Errorf("Step word boundaries of %q at %v, want %v", tt.s, got, tt.want)
++		}
++	}
++}
++
++// ---- fixed examples ------------------------------------------------------------------------
++
++func TestHegelExamples(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		s     string
++		count int
++		width int
++	}{
++		{"🏳️‍🌈", 1, 2},
++		{"👨‍👩‍👧‍👦", 1, 2},
++		{"🇩🇰🇯🇵", 2, 4},
++		{"각", 1, 2},
++		{"각", 1, 2},
++		{"ä", 1, 1},
++		{"\r\n", 1, 0},
++		{"つのだ☆HIRO", 8, 11},
++		{"⸺⸻", 2, 7},
++		{"☝️", 1, 2},
++		{"☝︎", 1, 1},
++	} {
++		if got := uniseg.GraphemeClusterCount(tt.s); got != tt.count {
++			t.Errorf("GraphemeClusterCount(%q) = %d, want %d", tt.s, got, tt.count)
++		}
++		if got := uniseg.StringWidth(tt.s); got != tt.width {
++			t.Errorf("StringWidth(%q) = %d, want %d", tt.s, got, tt.width)
++		}
++	}
++	if got := uniseg.ReverseString("The 🏳️‍🌈 flag"); got != "galf 🏳️‍🌈 ehT" {
++		t.Errorf("ReverseString = %q", got)
++	}
++	words := chain("Hello, world! Isn't it 3.14?", uniseg.FirstWordInString)
++	if !eqInts(words, []int{5, 6, 7, 12, 13, 14, 19, 20, 22, 23, 27}) {
++		t.Errorf("word boundaries = %v", words)
++	}
++	if !bytes.Equal([]byte(uniseg.ReverseString("ab")), []byte("ba")) {
++		t.Errorf("ReverseString(ab)")
++	}
++}
