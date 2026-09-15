@@ -116,3 +116,4 @@ segment (the crate's documented deviation, below).
 - 2026-09-15: base bumped ffc98b158bad → 2cc6abcd20dc (2026-09-14, "Update Rust crate futures to v0.3.34 (#21659)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped 2cc6abcd20dc → b8aff80900e7 (2026-09-15, "Update dependency astral-sh/uv to v0.12.13 (#21655)"; 0.0.81); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped b8aff80900e7 → 000a665b745a (2026-09-15, "Batch HTTP cache writes in blocking tasks (#21675)"; 0.0.81); 6 bug(s) still reproduce. 126 tests pass.
+- 2026-09-15: base bumped 000a665b745a → fd89f638d15f (2026-09-15, "Add regression test for symlinks inside install directory (#21693)"; 0.0.81); 6 bug(s) still reproduce. 126 tests pass.
