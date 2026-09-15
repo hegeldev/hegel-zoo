@@ -50,3 +50,4 @@
 - 2026-09-14: base bumped 260f170e6d59 → cad2925616f1 (2026-09-14, "chore: build: check isolated feature builds"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
 - 2026-09-14: base bumped cad2925616f1 → 78153a39ab40 (2026-09-14, "test: rt: use runtime clock in Suite timing checks"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 612 tests pass.
 - 2026-09-14: base bumped 78153a39ab40 → 65c3d167b50e (2026-09-14, "test: rt: poll sleep with the active waker"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.
+- 2026-09-15: base bumped 65c3d167b50e → 54094270ede0 (2026-09-15, "change: errors: report discarded client-write entries"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.
