@@ -1,9 +1,9 @@
-# go/lipgloss — charmbracelet/lipgloss v2 (`Style.Render`, joins, placement, wrapping, table, tree/list, compositor)
+# go/lipgloss — charmbracelet/lipgloss v2 (`Style.Render`, joins, placement, wrapping, blends, table, tree/list, compositor)
 
 Hegel property tests for `charm.land/lipgloss/v2`, the terminal layout and styling library
 behind Bubble Tea, pinned at `6a419c65` (main, 2026-09-11). The tests live in
-`hegel_test.go` and `hegel_canvas_test.go` (package `lipgloss`, internal so the property keys
-are reachable), `table/hegel_test.go` (package `table`, internal for the resizer) and
+`hegel_test.go`, `hegel_canvas_test.go` and `hegel_blend_test.go` (package `lipgloss`, internal
+so the property keys are reachable), `table/hegel_test.go` (package `table`, internal for the resizer) and
 `tree/hegel_test.go` (package `tree_test`, covering `tree` and `list`); the shared harness and
 cell model are in `internal/zootest`. Run with
 `go test -run TestHegel . ./table ./tree`.
@@ -48,6 +48,14 @@ cell model are in `internal/zootest`. Run with
   padding); `Roman` and `Alphabet` against reference formulas; `list` auto-nesting (`Child`
   with a rootless sublist parents it to the previous item) against a model of
   `ensureParent`.
+- **Gradients against their own 1D ramp.** `Blend1D` is checked structurally (length, stops
+  kept verbatim when `steps <= len(stops)`, nil stops dropped, a single stop repeated, first
+  and last stop at the ends, stops appearing in order, reversal symmetry); `Blend2D` against
+  `Blend1D(max(w, h))` as a rotated ramp (rows equal at 0°/180°, columns at 90°/270°, the
+  180° rotation a mirror image, the top row monotone); a `BorderForegroundBlend` by parsing
+  the rendered frame and walking its perimeter against `Blend1D((h + cols + 2) * 2)` rotated
+  by the offset, with `BorderBackground` and partial sides. `StyleRunes` against per-rune
+  style membership and `SetString`/`Value`/`Render` against `strings.Join`.
 - **A cell model for `Layer`/`Compositor`.** A random layer tree (positions, z, styled
   content, children) is flattened to absolute rectangles, painted by z then insertion order
   (short lines padded with blanks), and compared with `Compositor.Render` (after
@@ -63,6 +71,12 @@ cell model are in `internal/zootest`. Run with
 | `TestHegelWrapKeepsContentAndStyles` | `Wrap` invariants above |
 | `TestHegelStyleRangesStyleTheirCells` | `StyleRanges` styles exactly the cells of each range |
 | `TestHegelInheritTakesUnsetValuesOnly` | `Inherit` semantics |
+| `TestHegelBlend1DRunsThroughItsStops` | `Blend1D` structure, ends, order, symmetry |
+| `TestHegelBlend2DIsARotatedRamp` | `Blend2D` vs the 1D ramp at right angles and mirrors |
+| `TestHegelBlend2DReachesBothEnds` | a one-row 0° gradient runs from the first stop to the last (lipgloss/25) |
+| `TestHegelBorderBlendWrapsTheFrame` | `BorderForegroundBlend`/`Offset` vs the ring, perimeter walk, backgrounds |
+| `TestHegelStyleRunesStyleTheirRunes` | `StyleRunes` styles exactly the matched runes |
+| `TestHegelSetStringJoinsAndRenders` | `SetString`, `Value`, `String`, `Render` with a value |
 | `TestHegelCompositorPaintsLayersInOrder` | `Compositor.Render`/`Bounds`/`Hit`, `Layer.Width`/`Height` vs the paint model |
 | `TestHegelTableLaysOutItsGrid` | `table.Table.String()` vs the grid model, `VisibleRows`, idempotence |
 | `TestHegelTableDataViews` | `Filter` and `DataToMatrix` |
@@ -100,11 +114,21 @@ and skipped.
 | lipgloss/20 | low | tree: auto-nesting a rootless tree onto a hidden leaf makes it visible |
 | lipgloss/21 | low | tree: a hidden first child keeps its index and shifts the enumeration |
 | lipgloss/22 | medium | Compositor draws equal-z layers out of insertion order once there are more than twelve |
+| lipgloss/23 | low | Border foreground blends skip two colours at the top-right and bottom-right corners |
+| lipgloss/24 | low | Blend1D drops the last stop when there are fewer than two steps per segment |
+| lipgloss/25 | low | Blend2D never reaches the last stop |
+| lipgloss/26 | medium | StyleRunes pads multi-line strings, inserting spaces mid-line |
+| lipgloss/27 | low | Blend2D right angles are inexact: the residue of sin/cos decides cells on a boundary |
+| lipgloss/28 | medium | A colour channel below 1/256 is written out 256 times too bright (root cause in x/ansi `shift`) |
+| lipgloss/29 | low | Render panics when every stop of a border foreground blend is nil |
 
 The block-model property tolerates lipgloss/2–4 cell by cell (counted as `tolerated-*` in
 collect mode) and skips the cluster cases of lipgloss/1 (`cluster-torn`); the generators use
 only the position constants, so lipgloss/5–7 are pinned directly. The table, tree and
-compositor properties gate the shapes of lipgloss/8–22 and pin each one.
+compositor properties gate the shapes of lipgloss/8–22 and pin each one; the blend properties
+gate lipgloss/23–28 by cause (the two right-hand corners, rings with under two steps per
+segment, the last cell, strings with a newline, cells on an exact index boundary, ring
+colours with a 16-bit channel below 256) and lipgloss/29 is pinned only.
 
 ## Not bugs (modelled as documented)
 
@@ -124,11 +148,19 @@ compositor properties gate the shapes of lipgloss/8–22 and pin each one.
   `MaxHeight(min(Height, computeHeight))`, and `MaxHeight(0)` is no limit.
 - A wide grapheme cut by a table `Width` at the right edge leaves its line one cell short
   (`wide-cut-at-edge`), as any cell clipping would.
+- `Blend1D(steps <= len(stops))` returns the stops themselves, nil included; a completely
+  transparent stop is treated as opaque (documented). A single nil stop in
+  `BorderForegroundBlend` is ignored; `BorderForegroundBlendOffset` rotates so that the
+  ramp's first colour sits `offset` cells along the perimeter (the top-left corner shows
+  ring index `-offset mod n`).
+- The Blend2D properties compare colours to within one 8-bit step per channel
+  (`colorful.Color` values are compared after `RGBA()`).
 - Table cells containing `-` or a line that starts with a space wrap through `ansi.Wrap`'s
   own quirks (x-ansi/12, /19); those cells are counted, not compared. Text sources are NFC
   (a decomposed `é` is x-ansi/5).
 
 ## Not covered (yet)
 
-Border foreground blends, `StyleRunes`, `Style.Value`/`SetString`, `table` shrinking
-heuristics beyond the total width, `tree` style functions and custom indenters.
+Blend2D at angles other than multiples of 90° beyond "every cell is a ramp colour",
+`Lighten`/`Darken`/`Complementary`, `table` shrinking heuristics beyond the total width,
+`tree` style functions and custom indenters.
