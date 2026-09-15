@@ -118,10 +118,14 @@ def scan_rust(path: str, lines: list[str]) -> list[dict]:
             name = m.group(1)
             body = body_from(lines, k)
             comment = comment_above(lines, i, ("///", "//!", "//"))
+            text = "\n".join(body)
             if is_sm:
                 kind = "state_machine"
             elif is_hegel:
                 kind = "hegel"
+            elif re.search(r"Hegel::new\(|\.draw\(|hegel::TestCase|stateful::run", text):
+                kind = "hegel"  # closure-style property inside a plain #[test]
+                attrs.append("closure-style")
             else:
                 kind = "plain"
             props.append(dict(name=name, file=path, kind=kind, attrs=attrs, comment=comment,
@@ -291,7 +295,8 @@ def main() -> None:
             if b["target"] != f"{lang}/{tname}" or b["property"] is not None or not b["id"]:
                 continue
             pat = re.compile(r"(?<![\w/])" + re.escape(b["id"]) + r"(?![\w-])")
-            hits = [p for p in props if p["kind"] == "hegel" and (pat.search(p["comment"]) or pat.search("\n".join(p["body"])) or pat.search(p["readme"]))]
+            # comment and body only: README entries can be slices of a table that mention other bugs
+            hits = [p for p in props if p["kind"] == "hegel" and (pat.search(p["comment"]) or pat.search("\n".join(p["body"])))]
             b["mentioned_by"] = [p["id"] for p in hits]
             for p in hits:
                 p["bugs_via_mention"].append(b["id"])

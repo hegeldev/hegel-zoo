@@ -17,10 +17,15 @@ NAMES = {"roundtrip": "Round trip", "external-oracle": "External oracle", "model
          "rejection": "Rejection of invalid input", "robustness": "Robustness (no crash)",
          "concurrency": "Concurrency", "other": "Other"}
 
-P = {p["id"]: p for p in (json.loads(l) for l in (HERE / "properties.jsonl").open())}
+PLIST = [json.loads(l) for l in (HERE / "properties.jsonl").open()]
+P = {p["id"]: p for p in PLIST}
+BY_ID: dict[str, list[dict]] = defaultdict(list)  # duplicate ids (same test name in two files)
+for p in PLIST:
+    BY_ID[p["id"]].append(p)
 B = {b["id"]: b for b in (json.loads(l) for l in (HERE / "bugs.jsonl").open())}
 
 cls: dict[str, dict] = {}
+seen_dup: Counter = Counter()
 attr: dict[str, dict] = {}
 notes = {}
 problems = []
@@ -37,6 +42,12 @@ for f in sorted((HERE / "out").glob("batch-*.json")):
         if c.get("category") not in CATS:
             problems.append(f"{f.name}: bad category {c.get('category')!r} for {c['id']}")
             c["category"] = "other"
+        if len(BY_ID[c["id"]]) > 1:  # pair the n-th classification with the n-th property of that id
+            k = seen_dup[c["id"]]
+            seen_dup[c["id"]] += 1
+            if k < len(BY_ID[c["id"]]):
+                BY_ID[c["id"]][k]["_cls"] = c
+            continue
         cls[c["id"]] = c
     for a in d.get("attributions", []):
         if a["bug"] not in B:
@@ -49,8 +60,11 @@ for f in sorted((HERE / "out").glob("batch-*.json")):
         attr[a["bug"]] = a
     notes[f.name] = d.get("batch_notes", "")
 
-props = [p for p in P.values() if p["kind"] in ("hegel", "state_machine")]
-missing = [p["id"] for p in props if p["id"] not in cls]
+props = [p for p in PLIST if p["kind"] in ("hegel", "state_machine")]
+for p in props:
+    if "_cls" in p:
+        cls.setdefault(p["id"], p["_cls"])
+missing = [p["id"] for p in props if p["id"] not in cls and "_cls" not in p]
 print(f"classified {len(cls)} of {len(props)} properties; {len(missing)} missing; {len(problems)} problems", file=sys.stderr)
 for m in problems[:30]:
     print("  ", m, file=sys.stderr)
@@ -72,7 +86,7 @@ for bid, a in attr.items():
 for p in props:
     p["bugs_record"] = sorted({bid for bid, ps in credit_record.items() if p["id"] in ps})
     p["bugs_inferred"] = sorted({bid for bid, ps in credit_inferred.items() if p["id"] in ps} - set(p["bugs_record"]))
-    c = cls.get(p["id"], {})
+    c = p.get("_cls") or cls.get(p["id"], {})
     p["category"] = c.get("category", "unclassified")
     p["tags"] = c.get("tags", [])
     p["confidence"] = c.get("confidence", "")
