@@ -90,3 +90,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - 2026-09-15: base bumped bf12c8e61b2d → 7752bc92b53e (2026-09-15, "Update astral-sh/setup-uv action to v10.1.0 (#21666)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped 7752bc92b53e → a265915acf9e (2026-09-15, "Expand Debian and official Python system-test images (#21726)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped a265915acf9e → 27e80c1498d9 (2026-09-15, "renovate: update uv hashes correctly with setup-uv (#21724)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
+- 2026-09-15: base bumped 27e80c1498d9 → b9df2d1d1ac7 (2026-09-15, "Move default-group selection onto project and workspace types (#21689)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
