@@ -47,3 +47,4 @@
 - 2026-09-13: base bumped 2391a343f22b → df107d6bbfb4 (2026-09-13, "ci: run release-plz semver check on nightly (#838)"; 0.33.7); 1 bug(s) still reproduce. 3459 tests pass.
 - 2026-09-14: base bumped df107d6bbfb4 → 23343fc305cf (2026-09-14, "test: fix UB in vec3a m128 store (#840)"; 0.33.7); 1 bug(s) still reproduce. 3459 tests pass.
 - 2026-09-15: base bumped 23343fc305cf → 15971997d7a9 (2026-09-15, "feat(mat): add row constructors and set_row to the matrix types (#790)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
+- 2026-09-15: base bumped 15971997d7a9 → 104058313a3a (2026-09-16, "docs(mat): mat row and col method consistency pass (#843)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
