@@ -36,3 +36,4 @@
 - 2026-09-15: base bumped 6a00e2197edd → a30671c1f938 (2026-09-15, "test(python): Fix the stalling `test_fused_many_morsels_and_skew` test (#29290)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped a30671c1f938 → 1d87e9509eea (2026-09-15, "ci: Bump build deps used in ARM64 Windows release pipeline (#29280)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 1d87e9509eea → 4fff6cc4676e (2026-09-15, "feat: Binning functions (#28888)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-15: base bumped 4fff6cc4676e → 5267819479ed (2026-09-15, "chore(rust): Update rustls dependency to version `0.23.45` (#29303)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
