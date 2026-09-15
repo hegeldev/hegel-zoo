@@ -54,3 +54,4 @@
 - 2026-09-15: base bumped 6bbd3f42c3e8 → a7305f1cd5c1 (2026-09-15, "minor: Remove empty public module `datafusion::physical_plan::joins::chain (#25286)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped a7305f1cd5c1 → add66e424fa1 (2026-09-15, "refactor: clean up aggregation planning (#25104)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped add66e424fa1 → cee7bae63ba1 (2026-09-15, "Support predicate subqueries in projections (#24972)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-15: base bumped cee7bae63ba1 → 745b1ec218d4 (2026-09-15, "fix: update rustls to address RUSTSEC-2026-0285 (#25309)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
