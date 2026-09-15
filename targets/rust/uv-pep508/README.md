@@ -113,3 +113,4 @@ segment (the crate's documented deviation, below).
 - 2026-09-14: base bumped 595c8e2c6812 → 85fe61435fe5 (2026-09-14, "Use cargo bloat via astral-dev-toolchain (#21681)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped 85fe61435fe5 → 941b557a69d7 (2026-09-14, "Remove unused Serde derives from index locations (#21685)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped 941b557a69d7 → ffc98b158bad (2026-09-14, "Forbid install-action via zizmor (#21682)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.
+- 2026-09-15: base bumped ffc98b158bad → 2cc6abcd20dc (2026-09-14, "Update Rust crate futures to v0.3.34 (#21659)"; 0.0.80); 6 bug(s) still reproduce. 126 tests pass.

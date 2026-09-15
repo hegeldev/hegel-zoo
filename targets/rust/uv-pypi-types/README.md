@@ -75,3 +75,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - 2026-09-14: base bumped 85f73f491d4c → 85fe61435fe5 (2026-09-14, "Use cargo bloat via astral-dev-toolchain (#21681)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped 85fe61435fe5 → 941b557a69d7 (2026-09-14, "Remove unused Serde derives from index locations (#21685)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped 941b557a69d7 → ffc98b158bad (2026-09-14, "Forbid install-action via zizmor (#21682)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
+- 2026-09-15: base bumped ffc98b158bad → 643950ce49e4 (2026-09-14, "Update Rust crate async-trait to v0.1.92 (#21657)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
