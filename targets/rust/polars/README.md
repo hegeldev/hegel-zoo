@@ -34,3 +34,4 @@
 - 2026-09-14: base bumped 85ee8753973a → 7d80fdf9bb7b (2026-09-14, "fix(python): Fix comparison expression method comment (#29257)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-14: base bumped 7d80fdf9bb7b → 6a00e2197edd (2026-09-14, "perf: Lower uncorrelated subqueries to semi joins and push semi/anti joins below inner joins (#29289)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 6a00e2197edd → a30671c1f938 (2026-09-15, "test(python): Fix the stalling `test_fused_many_morsels_and_skew` test (#29290)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-15: base bumped a30671c1f938 → 1d87e9509eea (2026-09-15, "ci: Bump build deps used in ARM64 Windows release pipeline (#29280)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
