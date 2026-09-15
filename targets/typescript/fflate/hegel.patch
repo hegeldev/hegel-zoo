@@ -1,0 +1,1357 @@
+diff --git a/test/hegel-zip-oracle.py b/test/hegel-zip-oracle.py
+new file mode 100644
+index 0000000..a6e806c
+--- /dev/null
++++ b/test/hegel-zip-oracle.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""Hegel zoo: Python's zipfile as the oracle for fflate's ZIP writer and reader, held open by
++the tests.
++
++Reads one JSON request per line from the FIFO given as argv[1] and writes one JSON response
++per line to the FIFO given as argv[2]. Bytes cross the boundary as base64.
++
++  {"op": "ping"}
++  {"op": "read", "zip": b64}
++      -> {"ok": true, "comment": b64, "testzip": null | name, "files": [{"name", "data": b64,
++          "crc", "method", "date_time": [y, m, d, H, M, S], "comment": b64, "external_attr",
++          "create_system", "flag_bits", "extra": b64, "is_dir", "file_size", "compress_size"}]}
++      or {"ok": false, "error": "..."}
++  {"op": "write", "files": [{"name", "data": b64, "method": 0|8|12|14, "level": int|null,
++          "date_time": [..], "comment": b64, "external_attr", "create_system", "extra": b64,
++          "force_zip64": bool}], "comment": b64, "streaming": bool}
++      -> {"ok": true, "zip": b64} or {"ok": false, "error": "..."}
++
++With "streaming" the archive is written to an unseekable sink, so zipfile writes data
++descriptors (flag bit 3) and leaves the sizes out of the local headers.
++"""
++import base64
++import io
++import json
++import sys
++import zipfile
++
++
++def b64(b):
++    return base64.b64encode(b).decode("ascii")
++
++
++def unb64(s):
++    return base64.b64decode(s)
++
++
++class Unseekable:
++    """A write-only sink: zipfile then takes the streaming path (data descriptors)."""
++
++    def __init__(self):
++        self.buf = io.BytesIO()
++
++    def write(self, b):
++        return self.buf.write(b)
++
++    def flush(self):
++        pass
++
++
++def do_read(req):
++    data = unb64(req["zip"])
++    zf = zipfile.ZipFile(io.BytesIO(data))
++    files = []
++    for info in zf.infolist():
++        files.append({
++            "name": info.filename,
++            "data": b64(zf.read(info)),
++            "crc": info.CRC,
++            "method": info.compress_type,
++            "date_time": list(info.date_time),
++            "comment": b64(info.comment),
++            "external_attr": info.external_attr,
++            "create_system": info.create_system,
++            "flag_bits": info.flag_bits,
++            "extra": b64(info.extra),
++            "is_dir": info.is_dir(),
++            "file_size": info.file_size,
++            "compress_size": info.compress_size,
++        })
++    return {"ok": True, "comment": b64(zf.comment), "testzip": zf.testzip(), "files": files}
++
++
++def do_write(req):
++    sink = Unseekable() if req.get("streaming") else io.BytesIO()
++    with zipfile.ZipFile(sink, "w", allowZip64=True) as zf:
++        for f in req["files"]:
++            info = zipfile.ZipInfo(f["name"], date_time=tuple(f["date_time"]))
++            info.compress_type = f["method"]
++            if f.get("level") is not None:
++                # the public name arrived with Python 3.13; 3.12 has the private one
++                if hasattr(info, "compress_level"):
++                    info.compress_level = f["level"]
++                else:
++                    info._compresslevel = f["level"]
++            info.comment = unb64(f.get("comment", ""))
++            info.external_attr = f.get("external_attr", 0)
++            info.create_system = f.get("create_system", 3)
++            info.extra = unb64(f.get("extra", ""))
++            data = unb64(f["data"])
++            if f.get("force_zip64"):
++                with zf.open(info, "w", force_zip64=True) as w:
++                    w.write(data)
++            else:
++                zf.writestr(info, data)
++        zf.comment = unb64(req.get("comment", ""))
++    out = sink.buf.getvalue() if isinstance(sink, Unseekable) else sink.getvalue()
++    return {"ok": True, "zip": b64(out)}
++
++
++def main():
++    req_path, resp_path = sys.argv[1], sys.argv[2]
++    with open(req_path, "r", encoding="utf-8") as req, open(resp_path, "w", encoding="utf-8") as resp:
++        for line in req:
++            r = json.loads(line)
++            try:
++                op = r["op"]
++                if op == "ping":
++                    ans = {"ok": True, "python": sys.version.split()[0]}
++                elif op == "read":
++                    ans = do_read(r)
++                elif op == "write":
++                    ans = do_write(r)
++                else:
++                    ans = {"ok": False, "error": "unknown op " + op}
++            except Exception as e:  # noqa: BLE001 - every failure is an answer
++                ans = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
++            resp.write(json.dumps(ans, ensure_ascii=True) + "\n")
++            resp.flush()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test/hegel-zip.mjs b/test/hegel-zip.mjs
+new file mode 100644
+index 0000000..bfde802
+--- /dev/null
++++ b/test/hegel-zip.mjs
+@@ -0,0 +1,92 @@
++// Hegel zoo: the bridge to Python's zipfile (test/hegel-zip-oracle.py), held open as a child
++// process over two FIFOs with one JSON line per request, so a ZIP archive can be read or
++// written by an independent implementation in well under a millisecond per case.
++
++import { execFileSync, spawn } from "node:child_process";
++import { mkdtempSync, openSync, readSync, rmSync, writeSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const here = dirname(fileURLToPath(import.meta.url));
++
++let oracle = null;
++
++function startOracle() {
++  execFileSync("python3", ["-c", "import zipfile, zlib, bz2, lzma"], { stdio: "ignore" });
++  const dir = mkdtempSync(join(tmpdir(), "hegel-zip-"));
++  const req = join(dir, "req");
++  const resp = join(dir, "resp");
++  execFileSync("mkfifo", [req, resp]);
++  const child = spawn("python3", ["-u", join(here, "hegel-zip-oracle.py"), req, resp], {
++    stdio: ["ignore", "inherit", "inherit"],
++  });
++  child.unref();
++  const wfd = openSync(req, "w");
++  const rfd = openSync(resp, "r");
++  process.on("exit", () => {
++    try { child.kill(); } catch {}
++    try { rmSync(dir, { recursive: true, force: true }); } catch {}
++  });
++  const buf = Buffer.alloc(1 << 16);
++  let pending = "";
++  return {
++    call(obj) {
++      // lone surrogates have no UTF-8; escape every surrogate code unit so the request line
++      // is plain ASCII-safe JSON
++      const line = JSON.stringify(obj).replace(/[\ud800-\udfff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
++      writeSync(wfd, line + "\n");
++      for (;;) {
++        const nl = pending.indexOf("\n");
++        if (nl !== -1) {
++          const answer = pending.slice(0, nl);
++          pending = pending.slice(nl + 1);
++          return JSON.parse(answer);
++        }
++        const got = readSync(rfd, buf, 0, buf.length, null);
++        if (got === 0) throw new Error("the zipfile oracle went away");
++        pending += buf.toString("utf8", 0, got);
++      }
++    },
++  };
++}
++
++export function b64(u8) {
++  return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength).toString("base64");
++}
++
++export function unb64(s) {
++  return new Uint8Array(Buffer.from(s, "base64"));
++}
++
++/** zipfile reads `archive` (a Uint8Array): {ok, comment, testzip, files: [...]} with the data
++ *  and comments decoded from base64 to Uint8Array, or {ok: false, error}. */
++export function pyReadZip(archive) {
++  oracle ??= startOracle();
++  const r = oracle.call({ op: "read", zip: b64(archive) });
++  if (r.ok) {
++    r.comment = unb64(r.comment);
++    for (const f of r.files) {
++      f.data = unb64(f.data);
++      f.comment = unb64(f.comment);
++      f.extra = unb64(f.extra);
++    }
++  }
++  return r;
++}
++
++/** zipfile writes an archive of `files` ([{name, data: Uint8Array, method, level, date_time,
++ *  comment: Uint8Array, external_attr, create_system, extra: Uint8Array, force_zip64}]) with
++ *  the archive `comment` (Uint8Array), streaming (data descriptors) or not: {ok, zip:
++ *  Uint8Array} or {ok: false, error}. */
++export function pyWriteZip(files, { comment = new Uint8Array(0), streaming = false } = {}) {
++  oracle ??= startOracle();
++  const r = oracle.call({
++    op: "write",
++    files: files.map((f) => ({ ...f, data: b64(f.data), comment: b64(f.comment || new Uint8Array(0)), extra: b64(f.extra || new Uint8Array(0)) })),
++    comment: b64(comment),
++    streaming,
++  });
++  if (r.ok) r.zip = unb64(r.zip);
++  return r;
++}
+diff --git a/test/hegel-zoo.mjs b/test/hegel-zoo.mjs
+new file mode 100644
+index 0000000..ef914e1
+--- /dev/null
++++ b/test/hegel-zoo.mjs
+@@ -0,0 +1,138 @@
++// Hegel zoo: the small harness shared by the zoo's TypeScript/JavaScript targets.
++//
++// `property(name, body)` registers a node:test test that runs `body(tc)` under Hegel with
++// HEGEL_TEST_CASES cases (default 100) and the database at HEGEL_DATABASE. With ZOO_COLLECT=1
++// a `fail()` records the mismatch instead of failing, the case ends there, and the counts of
++// mismatches and of the shapes seen (`count(key)`) are printed at the end of the test, so a
++// property can be run over many cases to see every shape at once. `pin(name, body)` is a
++// plain test for one pinned bug: it must fail while the bug is present and pass once it is
++// fixed (the zoo's judge reads an unexpected pass as "fixed upstream?").
++
++import { readFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { test as nodeTest } from "node:test";
++import * as hegel from "@hegeldev/hegel";
++import * as gs from "@hegeldev/hegel/generators";
++
++// The Hegel version these tests were written against (the zoo pins it in zoo.toml and installs
++// it with `npm install --no-save @hegeldev/hegel@<version>`; upstream would add it to
++// devDependencies). Checked at load time so a stray install cannot silently change the engine.
++export const HEGEL_PIN = { "@hegeldev/hegel": "0.4.5" };
++
++{
++  let dir = dirname(fileURLToPath(import.meta.resolve("@hegeldev/hegel")));
++  while (!/[\\/]hegel$/.test(dir) && dir !== dirname(dir)) dir = dirname(dir);
++  const installed = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version;
++  if (installed !== HEGEL_PIN["@hegeldev/hegel"]) {
++    throw new Error(`@hegeldev/hegel ${installed} is installed; these tests pin ${HEGEL_PIN["@hegeldev/hegel"]}`);
++  }
++}
++
++export const collecting = !!process.env.ZOO_COLLECT;
++
++class Collected extends Error {}
++
++let msgs = [];
++let stats = new Map();
++
++/** Report a mismatch: an error normally, a recorded line in collect mode. */
++export function fail(message) {
++  if (collecting) {
++    msgs.push(message);
++    throw new Collected(message);
++  }
++  throw new Error(message);
++}
++
++/** Bump a statistic (the shape of a pinned bug, a generator branch). */
++export function count(key) {
++  stats.set(key, (stats.get(key) || 0) + 1);
++}
++
++function settings() {
++  const s = { testCases: Number(process.env.HEGEL_TEST_CASES) || 100 };
++  if (process.env.HEGEL_DATABASE) {
++    s.database = hegel.Database.fromPath(process.env.HEGEL_DATABASE);
++  }
++  return s;
++}
++
++/** A property: `body(tc)` runs under Hegel; a thrown error (or `fail`) is a failure. */
++export function property(name, body) {
++  nodeTest(name, () => {
++    msgs = [];
++    stats = new Map();
++    hegel.test((tc) => {
++      try {
++        body(tc);
++      } catch (e) {
++        if (collecting && e instanceof Collected) {
++          return;
++        }
++        throw e;
++      }
++    }, settings());
++    if (collecting) {
++      const shapes = [...stats].map(([k, v]) => `${k}=${v}`).join(" ");
++      console.log(`# COLLECT ${name}: ${msgs.length} mismatches; stats ${shapes}`);
++      for (const m of msgs.slice(0, 25)) {
++        console.log(`#   ${m.split("\n").join("\n#   ")}`);
++      }
++    }
++  });
++}
++
++/** A pin: a plain test for one recorded bug. */
++export function pin(name, body) {
++  nodeTest(name, body);
++}
++
++/** An integer in [lo, hi]. */
++export function n(tc, lo, hi) {
++  return tc.draw(gs.integers({ minValue: lo, maxValue: hi }));
++}
++
++/** One of xs. */
++export function pick(tc, xs) {
++  return xs[n(tc, 0, xs.length - 1)];
++}
++
++/** True pct percent of the time. */
++export function chance(tc, pct) {
++  return n(tc, 0, 99) < pct;
++}
++
++/** A string of `len` characters drawn from `alphabet` (an array of strings). */
++export function word(tc, alphabet, lo, hi) {
++  const len = n(tc, lo, hi);
++  let s = "";
++  for (let i = 0; i < len; i++) {
++    s += pick(tc, alphabet);
++  }
++  return s;
++}
++
++/** Structural equality: arrays by position, objects by key set (prototype ignored), else ===. */
++export function same(a, b) {
++  if (Array.isArray(a) || Array.isArray(b)) {
++    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
++      return false;
++    }
++    return a.every((x, i) => same(x, b[i]));
++  }
++  if (a !== null && b !== null && typeof a === "object" && typeof b === "object") {
++    const ka = Object.keys(a).sort();
++    const kb = Object.keys(b).sort();
++    if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) {
++      return false;
++    }
++    return ka.every((k) => same(a[k], b[k]));
++  }
++  return a === b;
++}
++
++/** A compact, unambiguous rendering for messages. */
++export function show(x) {
++  return JSON.stringify(x, (k, v) => (v === undefined ? "<undefined>" : v));
++}
+diff --git a/test/hegel.test.mjs b/test/hegel.test.mjs
+new file mode 100644
+index 0000000..8e5fc79
+--- /dev/null
++++ b/test/hegel.test.mjs
+@@ -0,0 +1,966 @@
++// Hegel zoo: properties of fflate (101arrowz/fflate) — its DEFLATE / zlib / gzip output read
++// by Node's zlib and Node's read by fflate, whole, streamed and damaged; the UTF-8 helpers;
++// ZIP archives against Python's zipfile in both directions.
++//
++// Run with `node --test --test-reporter=tap test/hegel.test.mjs` once tsc has built lib/ (the
++// setup step in target.toml: `tsc -p test/tsconfig.hegel.json --noCheck`). fflate ships tsc's
++// ES5 output and its streaming classes rely on it (`Deflate.call(this, …)` in the Gzip and
++// Zlib constructors fails on a native class), so the tests import ../lib/index.js rather than
++// the sources. ZOO_COLLECT=1 records mismatches instead of failing (see test/hegel-zoo.mjs).
++
++import assert from "node:assert/strict";
++import zlib from "node:zlib";
++import * as F from "../lib/index.js";
++import { property, pin, fail, count, n, pick, chance, word, show } from "./hegel-zoo.mjs";
++import { pyReadZip, pyWriteZip } from "./hegel-zip.mjs";
++
++const Z = zlib.constants;
++
++// ---------------------------------------------------------------- helpers
++
++function eq(a, b) {
++  if (a.length !== b.length) return false;
++  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
++  return true;
++}
++
++function concat(chunks) {
++  const out = new Uint8Array(chunks.reduce((s, c) => s + c.length, 0));
++  let pos = 0;
++  for (const c of chunks) {
++    out.set(c, pos);
++    pos += c.length;
++  }
++  return out;
++}
++
++function hex(u, k = 24) {
++  return Buffer.from(u.subarray(0, k)).toString("hex") + (u.length > k ? `…(${u.length})` : "");
++}
++
++/** Node's answer as {ok, out} or {ok: false, code}. */
++function tryNode(f) {
++  try {
++    return { ok: true, out: new Uint8Array(f()) };
++  } catch (e) {
++    return { ok: false, code: e.code || e.message };
++  }
++}
++
++/** fflate's answer in the same shape (its errors carry a numeric `code`, see FlateErrorCode). */
++function tryF(f) {
++  try {
++    return { ok: true, out: f() };
++  } catch (e) {
++    return { ok: false, code: e.code ?? e.message, message: e.message };
++  }
++}
++
++function describe(r) {
++  return r.ok ? `ok ${r.out.length}` : `error ${r.code}${r.message ? " " + r.message : ""}`;
++}
++
++// Random cut points for chunked pushes.
++function genCuts(tc, len) {
++  const cuts = [];
++  const k = n(tc, 0, 6);
++  for (let i = 0; i < k; i++) cuts.push(n(tc, 0, len));
++  cuts.sort((a, b) => a - b);
++  return cuts;
++}
++
++function pieces(data, cuts) {
++  const out = [];
++  const cut = (a, b) => (typeof data === "string" ? data.slice(a, b) : data.subarray(a, b));
++  let pos = 0;
++  for (const c of cuts) {
++    out.push(cut(pos, c));
++    pos = c;
++  }
++  out.push(cut(pos));
++  return out;
++}
++
++/** Push `data` through a streaming class in pieces; returns {ok, out} or {ok: false, code}. */
++function stream(make, data, cuts) {
++  const chunks = [];
++  try {
++    const s = make((chunk, final) => chunks.push(Uint8Array.from(chunk)));
++    const parts = pieces(data, cuts);
++    parts.forEach((part, i) => s.push(part, i === parts.length - 1));
++    return { ok: true, out: concat(chunks) };
++  } catch (e) {
++    return { ok: false, code: e.code ?? e.message, message: e.message };
++  }
++}
++
++// ---------------------------------------------------------------- data
++
++// Input data of a few textures: random bytes, text with repeats, runs, and mixtures; mostly
++// small, sometimes a few hundred kilobytes (past the 32 KiB window and fflate's 64 KiB chunk).
++const WORDS = ["hello", "world", "fflate", "zlib", "deflate", "the ", "and ", "\n", " ", "é", "全", "😀", "0123456789", "aaaa"];
++
++function genData(tc, max = 20000) {
++  const r = n(tc, 0, 99);
++  const big = max > 20000 && chance(tc, 6);
++  const size = big ? (chance(tc, 30) ? pick(tc, [65535, 131070]) : n(tc, 70000, 300000)) : chance(tc, 10) ? n(tc, 0, 3) : n(tc, 0, max);
++  const out = new Uint8Array(size);
++  if (r < 30) {
++    let s = n(tc, 1, 0x7fffffff);
++    for (let i = 0; i < size; i++) {
++      s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
++      out[i] = s >> 16;
++    }
++    return { data: out, texture: "random", text: false };
++  }
++  if (r < 60) {
++    let s = "";
++    const k = n(tc, 1, 6);
++    const vocab = [];
++    for (let i = 0; i < k; i++) vocab.push(pick(tc, WORDS));
++    while (Buffer.byteLength(s) < size) s += pick(tc, vocab);
++    const b = Buffer.from(s);
++    return { data: new Uint8Array(b.buffer, b.byteOffset, b.length), texture: "text", text: true };
++  }
++  if (r < 75) {
++    let i = 0;
++    while (i < size) {
++      const v = n(tc, 0, 255);
++      const len = n(tc, 1, 5000);
++      out.fill(v, i, Math.min(size, i + len));
++      i += len;
++    }
++    return { data: out, texture: "runs", text: false };
++  }
++  let i = 0;
++  let s = n(tc, 1, 0x7fffffff);
++  while (i < size) {
++    const len = n(tc, 1, 4000);
++    const end = Math.min(size, i + len);
++    if (chance(tc, 50)) {
++      for (; i < end; i++) {
++        s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
++        out[i] = s >> 16;
++      }
++    } else {
++      const period = n(tc, 1, 40);
++      for (; i < end; i++) out[i] = 65 + (i % period);
++    }
++  }
++  return { data: out, texture: "mixed", text: false };
++}
++
++function genBytes(tc, lo, hi) {
++  const len = n(tc, lo, hi);
++  const out = new Uint8Array(len);
++  for (let i = 0; i < len; i++) out[i] = n(tc, 0, 255);
++  return out;
++}
++
++const LATIN1 = ["a", "b", "z", "0", " ", ".", "/", "é", "ÿ", "-", "_", "x", "", "\u00a0"];
++
++// ---------------------------------------------------------------- fflate writes, zlib reads
++
++// fflate's compression options; the dictionary only where the format carries one.
++function genFflateOptions(tc) {
++  const mode = pick(tc, ["raw", "zlib", "zlib", "gzip", "gzip"]);
++  const o = {};
++  if (chance(tc, 70)) o.level = n(tc, 0, 9);
++  if (chance(tc, 40)) o.mem = n(tc, 0, 12);
++  let dictionary = null;
++  if (mode !== "gzip" && chance(tc, 25)) {
++    dictionary = chance(tc, 15) ? genData(tc, 40000).data : new Uint8Array(Buffer.from(word(tc, WORDS, 1, 40)));
++    o.dictionary = dictionary;
++  }
++  const shapes = new Set();
++  if (mode === "gzip") {
++    if (chance(tc, 50)) {
++      o.filename = word(tc, LATIN1, 0, 12);
++      if (chance(tc, 8)) {
++        o.filename += pick(tc, ["一", "😀", "Ā", "\u0000"]);
++        shapes.add("gzip/filename-outside-latin1");
++      }
++    }
++    if (chance(tc, 50)) {
++      const secs = pick(tc, [0, 1, 1700000000, 0x7fffffff, 0x80000000, 0xffffffff, n(tc, 1, 0xffffffff)]);
++      o.mtime = pick(tc, [secs * 1000, new Date(secs * 1000), new Date(secs * 1000).toISOString()]);
++      if (secs === 0) o.mtime = 0;
++    }
++  }
++  return { mode, o, dictionary, shapes };
++}
++
++function fflateCompress(mode, data, o) {
++  if (mode === "raw") return F.deflateSync(data, o);
++  if (mode === "gzip") return F.gzipSync(data, o);
++  return F.zlibSync(data, o);
++}
++
++function fflateStreamClass(mode) {
++  return mode === "raw" ? F.Deflate : mode === "gzip" ? F.Gzip : F.Zlib;
++}
++
++function nodeDecompress(mode, data, o = {}) {
++  if (mode === "raw") return zlib.inflateRawSync(data, o);
++  if (mode === "gzip") return zlib.gunzipSync(data, o);
++  return zlib.inflateSync(data, o);
++}
++
++function fflateDecompress(mode, data, o = {}) {
++  if (mode === "raw") return F.inflateSync(data, o);
++  if (mode === "gzip") return F.gunzipSync(data, o);
++  return F.unzlibSync(data, o);
++}
++
++function fflateDecompressClass(mode) {
++  return mode === "raw" ? F.Inflate : mode === "gzip" ? F.Gunzip : F.Unzlib;
++}
++
++/** The gzip header of `out`: {mtime, filename (Latin-1, null if absent), flags}. */
++function gzipHeader(out) {
++  const flg = out[3];
++  const mtime = out[4] | (out[5] << 8) | (out[6] << 16) | ((out[7] << 24) >>> 0);
++  let pos = 10;
++  if (flg & 4) pos += (out[10] | (out[11] << 8)) + 2;
++  let filename = null;
++  if (flg & 8) {
++    const start = pos;
++    while (pos < out.length && out[pos] !== 0) pos++;
++    filename = Buffer.from(out.subarray(start, pos)).toString("latin1");
++  }
++  return { mtime: mtime >>> 0, filename, flags: flg };
++}
++
++// fflate's output is read by zlib (with the fields it wrote), by fflate itself, and the
++// streaming classes agree with the one-shot functions; a sync flush leaves a decodable prefix.
++property("TestHegelZlibReadsWhatFflateWrites", (tc) => {
++  const { data, texture } = genData(tc, 300000);
++  const { mode, o, dictionary, shapes } = genFflateOptions(tc);
++  count(`${mode}/${texture}`);
++  const io = dictionary ? { dictionary } : {};
++  const c = tryF(() => fflateCompress(mode, data, o));
++  if (!c.ok) fail(`${mode} ${show(o)} of ${texture}[${data.length}]: fflate threw ${c.code} ${c.message}`);
++  const back = tryNode(() => nodeDecompress(mode, c.out, io));
++  if (!back.ok || !eq(back.out, data)) {
++    if (shapes.has("gzip/filename-outside-latin1")) {
++      // fflate/3: the FNAME field is written from the low byte of each UTF-16 code unit
++      count("fflate/3");
++      return;
++    }
++    if (o.level === 0 && data.length > 0 && data.length % 65535 === 0) {
++      // fflate/13: at level 0 an input of exactly k × 65535 bytes gets an empty final block
++      // after the final block; the zlib and gzip trailers are then read from the wrong place
++      count("fflate/13");
++      return;
++    }
++    if (dictionary) {
++      // fflate/10: a short dictionary (or one beginning with zeros) with incompressible input
++      // gives a stream zlib rejects (invalid distance) and fflate misreads: matches run into
++      // the zero-filled window before the dictionary
++      count(dictionary.length <= 32 ? "fflate/10" : "fflate/10-longer-dictionary");
++      return;
++    }
++    fail(`zlib cannot read fflate's ${mode} ${show(o)} output of ${texture}[${data.length}]: ${back.ok ? "wrong bytes" : back.code}`);
++  }
++  const own = tryF(() => fflateDecompress(mode, c.out, io));
++  if (!own.ok || !eq(own.out, data)) fail(`fflate cannot read its own ${mode} ${show(o)} output: ${describe(own)}`);
++  if (mode === "gzip") {
++    const h = gzipHeader(c.out);
++    if (o.filename !== undefined) {
++      const want = o.filename === "" ? null : o.filename;
++      if (h.filename !== want && !shapes.has("gzip/filename-outside-latin1")) fail(`gzip FNAME read back as ${show(h.filename)}, not ${show(want)}`);
++    } else if (h.filename !== null) fail(`gzip FNAME ${show(h.filename)} written without a filename option`);
++    if (o.mtime !== undefined) {
++      const want = o.mtime === 0 ? 0 : Math.floor(new Date(o.mtime).getTime() / 1000) >>> 0;
++      if (h.mtime !== want) fail(`gzip MTIME ${h.mtime} for mtime ${show(o.mtime)}, expected ${want}`);
++    }
++  }
++  // the streaming class, pushed in pieces (also as an empty final push)
++  const cuts = genCuts(tc, data.length);
++  if (chance(tc, 30)) cuts.push(data.length);
++  const s = stream((cb) => new (fflateStreamClass(mode))(o, cb), data, cuts);
++  if (!s.ok) fail(`${mode} stream ${show(o)} pushed at ${show(cuts)} threw ${s.code} ${s.message}`);
++  const sback = tryNode(() => nodeDecompress(mode, s.out, io));
++  if (!sback.ok || !eq(sback.out, data)) {
++    if (shapes.has("gzip/filename-outside-latin1")) return;
++    fail(`zlib cannot read fflate's ${mode} stream ${show(o)} pushed at ${show(cuts)}: ${sback.ok ? "wrong bytes" : sback.code}`);
++  }
++  if (mode === "gzip" && o.mtime === undefined) count(eq(s.out.subarray(8), c.out.subarray(8)) ? "stream/same-as-one-shot" : "stream/differs");
++  else count(eq(s.out, c.out) ? "stream/same-as-one-shot" : "stream/differs");
++  // flush(true) emits a sync-flush marker: the bytes so far decode to the input so far
++  if (mode === "raw" && chance(tc, 40) && cuts.length) {
++    const chunks = [];
++    const d = new F.Deflate(o, (chunk) => chunks.push(Uint8Array.from(chunk)));
++    const parts = pieces(data, cuts);
++    const at = n(tc, 0, parts.length - 2);
++    let consumed = 0;
++    for (let i = 0; i <= at; i++) {
++      d.push(parts[i], false);
++      consumed += parts[i].length;
++    }
++    d.flush(true);
++    const sofar = concat(chunks);
++    const dec = tryNode(() => zlib.inflateRawSync(sofar, { ...io, finishFlush: Z.Z_SYNC_FLUSH }));
++    // fflate/9: a sync flush after a stored block (level 0 always; incompressible input at
++    // any level) writes a malformed empty stored block and the stream is undecodable from
++    // there
++    const storedBlocks = o.level === 0 || texture === "random" || texture === "mixed";
++    if (!dec.ok || !eq(dec.out, data.subarray(0, consumed))) {
++      count(storedBlocks ? "fflate/9" : "fflate/9-other-shape");
++      return;
++    }
++    for (let i = at + 1; i < parts.length; i++) d.push(parts[i], i === parts.length - 1);
++    const whole = concat(chunks);
++    const w = tryNode(() => zlib.inflateRawSync(whole, io));
++    if (!w.ok || !eq(w.out, data)) {
++      count(storedBlocks ? "fflate/9" : "fflate/9-other-shape");
++      return;
++    }
++    count("flush/decodable");
++  }
++});
++
++// ---------------------------------------------------------------- zlib writes, fflate reads
++
++// zlib's options for the streams fflate has to read.
++function genZlibOptions(tc) {
++  const mode = pick(tc, ["raw", "zlib", "zlib", "gzip", "gzip"]);
++  const o = {};
++  if (chance(tc, 70)) o.level = pick(tc, [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
++  if (chance(tc, 50)) o.strategy = pick(tc, [0, 1, 2, 3, 4]);
++  if (chance(tc, 50)) o.windowBits = mode === "zlib" ? n(tc, 8, 15) : n(tc, 9, 15);
++  if (chance(tc, 50)) o.memLevel = n(tc, 1, 9);
++  let dictionary = null;
++  if (mode !== "gzip" && chance(tc, 25)) {
++    dictionary = new Uint8Array(Buffer.from(word(tc, WORDS, 1, 40)));
++    o.dictionary = dictionary;
++  }
++  return { mode, o, dictionary };
++}
++
++function nodeCompress(mode, data, o) {
++  if (mode === "raw") return zlib.deflateRawSync(data, o);
++  if (mode === "gzip") return zlib.gzipSync(data, o);
++  return zlib.deflateSync(data, o);
++}
++
++// On zlib's output — whole, in pieces, or damaged — fflate says what zlib says, one-shot and
++// streamed, with the format detected or given.
++property("TestHegelFflateReadsWhatZlibWrites", (tc) => {
++  const { data, texture, text } = genData(tc, 300000);
++  const { mode, o, dictionary } = genZlibOptions(tc);
++  const z = tryNode(() => nodeCompress(mode, data, o));
++  if (!z.ok) return;
++  let s = z.out;
++  const io = dictionary ? { dictionary } : {};
++  const damage = pick(tc, ["none", "none", "none", "truncate", "flip", "zeros", "junk", "member", "member"]);
++  let expect = data;
++  if (damage === "truncate" && s.length > 1) {
++    s = s.subarray(0, n(tc, 0, s.length - 1));
++  } else if (damage === "flip" && s.length > 0) {
++    s = Uint8Array.from(s);
++    const i = n(tc, 0, s.length - 1);
++    s[i] ^= 1 << n(tc, 0, 7);
++  } else if (damage === "zeros") {
++    s = concat([s, new Uint8Array(n(tc, 1, 12))]);
++  } else if (damage === "junk") {
++    const tail = genBytes(tc, 1, 5);
++    tail[0] = tail[0] || 1;
++    s = concat([s, tail]);
++  } else if (damage === "member") {
++    if (mode !== "gzip") return;
++    const second = genData(tc).data;
++    s = concat([s, new Uint8Array(zlib.gzipSync(second))]);
++    expect = concat([data, second]);
++  }
++  count(`${mode}/${damage}`);
++  const want = tryNode(() => nodeDecompress(mode, s, io));
++  const got = tryF(() => fflateDecompress(mode, s, io));
++  // the streaming class, pushed in pieces
++  const cuts = genCuts(tc, s.length);
++  const st = stream((cb) => new (fflateDecompressClass(mode))(io, cb), s, cuts);
++  const known = new Set();
++  if (want.ok && !got.ok) {
++    // fflate/1: gunzipSync sizes its output from the last four bytes of the input and reads
++    // one member; zero padding after the member makes that size 0, a second member makes it
++    // the second member's, which the first overruns ("offset is out of bounds")
++    if (mode === "gzip" && (damage === "zeros" || damage === "member")) known.add("fflate/1");
++  }
++  if (want.ok && got.ok && !eq(want.out, got.out)) {
++    if (mode === "gzip" && (damage === "zeros" || damage === "member")) known.add("fflate/1");
++  }
++  if (!want.ok && got.ok) {
++    if (mode === "gzip" && damage === "junk") {
++      // zlib rejects bytes after a member that are not a member; gzip(1) warns and goes on;
++      // fflate ignores them: not counted
++      known.add("limit/gzip-trailing-garbage-ignored");
++    } else if (damage === "truncate" && got.out.length === 0 && data.length > 0) {
++      // fflate/8: a raw stream cut to nothing, or a zlib stream cut to under seven bytes
++      // (header + trailer are sliced off first), decodes to empty output without an error
++      known.add("fflate/8");
++    } else if (damage === "flip" || damage === "truncate") {
++      // fflate/2: the Adler-32 / CRC-32 trailer is never verified, so damage that zlib
++      // catches by the checksum passes silently (the data may or may not be intact)
++      known.add(eq(got.out, data) ? "fflate/2" : "fflate/2-garbage");
++    }
++  }
++  for (const k of known) count(k);
++  if (!known.size) {
++    if (want.ok !== got.ok) {
++      fail(`${mode} (${damage}, ${show(o)}) of ${texture}[${data.length}]: zlib ${describe(want)}, fflate ${describe(got)}`);
++    }
++    if (want.ok && !eq(want.out, got.out)) fail(`${mode} (${damage}) outputs differ: zlib ${hex(want.out)} fflate ${hex(got.out)}`);
++  }
++  // the stream agrees with the one-shot — or, where the one-shot is known wrong, with zlib
++  const ref = known.has("fflate/1") ? want : got;
++  if (st.ok !== ref.ok || (ref.ok && !eq(st.out, ref.out))) {
++    if (known.has("fflate/2") || known.has("fflate/2-garbage")) {
++      count("fflate/2-stream-differs"); // unverified damage: the two paths need not agree
++    } else if (mode === "gzip" && damage === "truncate" && !got.ok && st.ok) {
++      // fflate/11: the streaming Gunzip ends a stream cut inside the header (nothing out) or
++      // inside the trailer (everything out) without an error
++      count("fflate/11");
++    } else if (mode === "raw" && dictionary && cuts[0] === 0 && st.ok && ref.ok) {
++      // fflate/12: the raw Inflate stream with a dictionary loses the dictionary window on an
++      // empty first push and decodes the rest to other bytes
++      count("fflate/12");
++    } else if (known.has("fflate/8") && !st.ok) {
++      count("fflate/8-stream-errors"); // the stream at least says so
++    } else if (mode === "gzip" && damage === "zeros" && !st.ok) {
++      // the streaming Gunzip rejects the padding as "invalid gzip data" (fflate/1 as well)
++      count("fflate/1-stream");
++    } else if (mode === "gzip" && damage === "junk") {
++      count("limit/gzip-trailing-garbage-ignored");
++    } else {
++      fail(`${mode} stream (${damage}, ${show(o)}) pushed at ${show(cuts)}: ${describe(st)}; ${known.has("fflate/1") ? "zlib" : "one-shot"} ${describe(ref)}`);
++    }
++  }
++  if (damage !== "none") return;
++  // detected format (raw streams are detected by not looking like the others)
++  const det = tryF(() => F.decompressSync(s, io));
++  if (!det.ok || !eq(det.out, data)) fail(`decompressSync does not detect zlib's ${mode} ${show(o)} output: ${describe(det)}`);
++  const dst = stream((cb) => new F.Decompress(io, cb), s, cuts);
++  if (!dst.ok || !eq(dst.out, data)) {
++    if (cuts.length && cuts[0] < 3 && dst.ok && dst.out.length === 0) {
++      // fflate/6: Decompress concatenates a short first push with the next into a new buffer
++      // it never keeps, so the format is never detected and nothing comes out
++      count("fflate/6");
++    } else {
++      fail(`Decompress stream pushed at ${show(cuts)} does not detect zlib's ${mode} output: ${describe(dst)}`);
++    }
++  }
++  // a preallocated output buffer of the right size
++  const pre = tryF(() => fflateDecompress(mode, s, { ...io, out: new Uint8Array(data.length) }));
++  if (!pre.ok || !eq(pre.out, data)) fail(`${mode} with a preallocated out of ${data.length} bytes: ${describe(pre)}`);
++  if (text && got.ok) {
++    const str = F.strFromU8(got.out);
++    if (str !== Buffer.from(data).toString("utf8")) fail(`strFromU8 differs for ${texture}[${data.length}]`);
++  }
++});
++
++// ---------------------------------------------------------------- UTF-8 helpers
++
++const PIECES = ["a", "Z", "0", " ", "\n", "é", "ÿ", "Ā", "一", "€", "\ufeff", "\u0000", "😀", "🇩🇪", "😀", "\ud800", "\udc00", "­"];
++
++function genString(tc) {
++  let s = "";
++  const k = n(tc, 0, 30);
++  for (let i = 0; i < k; i++) s += pick(tc, PIECES);
++  return s;
++}
++
++// strToU8/strFromU8 are TextEncoder/TextDecoder; the streaming DecodeUTF8 and EncodeUTF8
++// give the same result however the input is cut.
++property("TestHegelUtf8HelpersAgreeWithTheEncodingApi", (tc) => {
++  const s = genString(tc);
++  const lone = /(^|[^\ud800-\udbff])[\udc00-\udfff]|[\ud800-\udbff]([^\udc00-\udfff]|$)/.test(s);
++  count(lone ? "str/lone-surrogate" : "str/well-formed");
++  const want = new TextEncoder().encode(s);
++  const got = F.strToU8(s);
++  if (!eq(got, want)) fail(`strToU8(${show(s)}) = ${hex(got)}, TextEncoder ${hex(want)}`);
++  const back = F.strFromU8(want);
++  const wantBack = new TextDecoder().decode(want);
++  if (back !== wantBack) fail(`strFromU8 of ${hex(want)} = ${show(back)}, TextDecoder ${show(wantBack)}`);
++  if (s.startsWith("\ufeff")) count("limit/leading-bom-stripped"); // TextDecoder's default
++  else if (!lone && back !== s) fail(`strFromU8(strToU8(${show(s)})) = ${show(back)}`);
++  if (/^[\u0000-ÿ]*$/.test(s)) {
++    const l1 = F.strToU8(s, true);
++    if (!eq(l1, new Uint8Array(Buffer.from(s, "latin1")))) fail(`strToU8(${show(s)}, latin1) = ${hex(l1)}`);
++    if (F.strFromU8(l1, true) !== s) fail(`strFromU8(latin1) does not give ${show(s)} back`);
++  }
++  // decoding in pieces cut anywhere in the byte stream
++  const cuts = genCuts(tc, want.length);
++  if (cuts.some((c, i) => i > 0 && c === cuts[i - 1])) count("cut/repeated");
++  let out = "";
++  const dec = new F.DecodeUTF8((str, final) => { out += str; });
++  const parts = pieces(want, cuts);
++  const d = tryF(() => parts.forEach((p, i) => dec.push(p, i === parts.length - 1)));
++  if (!d.ok) fail(`DecodeUTF8 of ${hex(want)} cut at ${show(cuts)} threw ${d.code} ${d.message}`);
++  if (out !== wantBack) fail(`DecodeUTF8 of ${hex(want)} cut at ${show(cuts)} = ${show(out)}, whole ${show(wantBack)}`);
++  // encoding in pieces cut between code units
++  const scuts = genCuts(tc, s.length);
++  const splitsPair = scuts.some((c) => c > 0 && c < s.length && /[\ud800-\udbff]/.test(s[c - 1]) && /[\udc00-\udfff]/.test(s[c]));
++  const chunks = [];
++  const enc = new F.EncodeUTF8((bytes) => chunks.push(Uint8Array.from(bytes)));
++  const sparts = pieces(s, scuts);
++  sparts.forEach((p, i) => enc.push(p, i === sparts.length - 1));
++  const eout = concat(chunks);
++  if (!eq(eout, want)) {
++    if (splitsPair) {
++      // fflate/4: EncodeUTF8 keeps no state between pushes, so a surrogate pair cut between
++      // two pushes becomes two U+FFFD
++      count("fflate/4");
++    } else {
++      fail(`EncodeUTF8 of ${show(s)} cut at ${show(scuts)} = ${hex(eout)}, whole ${hex(want)}`);
++    }
++  } else if (splitsPair) count("pair-split/encoded-right");
++});
++
++// ---------------------------------------------------------------- ZIP: fflate writes, zipfile reads
++
++const NAME_WORDS = ["a", "b", "file", "data", "readme", "img", "x", "y", "z", "dir", "sub", "deep", "01", "-", "_", ".", " ", "tmp"];
++const UNICODE_WORDS = ["é", "ü", "一", "文", "😀", "Ā", "ß", "日本"];
++
++function genName(tc, used) {
++  for (let tries = 0; tries < 20; tries++) {
++    let name = word(tc, NAME_WORDS, 1, 3);
++    if (chance(tc, 15)) name += pick(tc, UNICODE_WORDS);
++    if (chance(tc, 30)) name += pick(tc, [".txt", ".bin", ".json", ""]);
++    if (chance(tc, 10)) name = word(tc, NAME_WORDS, 1, 2) + "/" + name;
++    if (name === "." || name === ".." || name.endsWith("/") || name.startsWith("/") || used.has(name)) continue;
++    return name;
++  }
++  return null;
++}
++
++// A modification time inside the DOS range (1980–2099 for fflate) in one of the accepted forms.
++function genMtime(tc) {
++  const ms = Date.UTC(n(tc, 1980, 2099), n(tc, 0, 11), n(tc, 1, 28), n(tc, 0, 23), n(tc, 0, 59), n(tc, 0, 59), n(tc, 0, 999));
++  return pick(tc, [ms, new Date(ms), new Date(ms).toISOString()]);
++}
++
++function dosTime(mtime) {
++  const d = new Date(mtime);
++  return [d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds() & ~1];
++}
++
++function genComment(tc) {
++  let c = word(tc, NAME_WORDS, 0, 6);
++  if (chance(tc, 20)) c += pick(tc, UNICODE_WORDS);
++  return c;
++}
++
++function genExtra(tc) {
++  const extra = {};
++  const k = n(tc, 1, 3);
++  for (let i = 0; i < k; i++) {
++    let id = pick(tc, [0, 2, 7, 0x5455, 0x7875, 0xcafe, 0xffff, n(tc, 3, 0xfffe)]);
++    if (id === 1) id = 2; // 1 is the zip64 record, which readers parse
++    extra[id] = genBytes(tc, 0, 60);
++  }
++  return extra;
++}
++
++function genZipAttributes(tc, shapes) {
++  const a = {};
++  if (chance(tc, 40)) a.level = n(tc, 0, 9);
++  if (chance(tc, 40)) a.mtime = genMtime(tc);
++  if (chance(tc, 30)) a.os = pick(tc, [0, 3, 3, 19, n(tc, 0, 255)]);
++  if (chance(tc, 30)) a.attrs = pick(tc, [0o644 << 16, 0o755 << 16, (0o100644 << 16) >>> 0, 0x10, 0x20, 1, n(tc, 0, 0xffffffff)]);
++  if (chance(tc, 25)) a.extra = genExtra(tc);
++  if (chance(tc, 30)) {
++    a.comment = genComment(tc);
++    if (chance(tc, 3)) {
++      a.comment = "c".repeat(n(tc, 65536, 70000));
++      shapes.add("zip/comment-over-65535");
++    }
++  }
++  return a;
++}
++
++/** The expected bytes of an extra field written by fflate: ids in ascending numeric order. */
++function extraBytes(extra) {
++  if (!extra) return new Uint8Array(0);
++  const parts = [];
++  for (const k of Object.keys(extra).map(Number).sort((a, b) => a - b)) {
++    const v = extra[k];
++    const h = new Uint8Array(4);
++    h[0] = k & 255; h[1] = k >> 8; h[2] = v.length & 255; h[3] = v.length >> 8;
++    parts.push(h, v);
++  }
++  return concat(parts);
++}
++
++/** A random Zippable tree with the flat list of entries fflate should write (dirs included). */
++function genZippable(tc, shapes, global, prefix = "", depth = 0, used = new Set(), flat = []) {
++  const tree = {};
++  const k = depth ? n(tc, 0, 3) : n(tc, 0, 6);
++  for (let i = 0; i < k; i++) {
++    const name = genName(tc, used);
++    if (name === null) continue;
++    const full = prefix + name;
++    if (used.has(full) || used.has(full + "/")) continue;
++    if (depth < 2 && chance(tc, 25)) {
++      used.add(full + "/");
++      // a directory's own options apply to its entry only: fltn hands the global options,
++      // not the merged ones, down to the contents
++      const own = chance(tc, 30) ? genZipAttributes(tc, shapes) : null;
++      flat.push({ name: full + "/", data: new Uint8Array(0), attrs: own ? { ...global, ...own } : global });
++      const sub = genZippable(tc, shapes, global, full + "/", depth + 1, used, flat);
++      tree[name] = own ? [sub, own] : sub;
++    } else {
++      used.add(full);
++      const data = chance(tc, 10) ? new Uint8Array(0) : genData(tc, 6000).data;
++      if (chance(tc, 50)) {
++        const a = genZipAttributes(tc, shapes);
++        tree[name] = [data, a];
++        flat.push({ name: full, data, attrs: { ...global, ...a } });
++      } else {
++        tree[name] = data;
++        flat.push({ name: full, data, attrs: global });
++      }
++    }
++  }
++  return depth ? tree : { tree, flat };
++}
++
++function checkPythonReads(archive, flat, shapes, what) {
++  const py = pyReadZip(archive);
++  if (!py.ok) {
++    if (shapes.has("zip/comment-over-65535")) {
++      // fflate/5: a comment beyond 65535 bytes is written without an error (names and extra
++      // fields have one), its length truncated to 16 bits, and the archive is unreadable
++      count("fflate/5");
++      return false;
++    }
++    fail(`${what}: zipfile cannot read the archive of ${show(flat.map((f) => f.name))}: ${py.error}`);
++  }
++  if (py.testzip !== null) fail(`${what}: zipfile's testzip finds ${show(py.testzip)} corrupt`);
++  const names = py.files.map((f) => f.name).sort();
++  const wantNames = flat.map((f) => f.name).sort();
++  if (show(names) !== show(wantNames)) fail(`${what}: zipfile lists ${show(names)}, fflate was given ${show(wantNames)}`);
++  for (const f of flat) {
++    const p = py.files.find((x) => x.name === f.name);
++    const a = f.attrs;
++    if (!eq(p.data, f.data)) fail(`${what}: ${show(f.name)} reads back as ${hex(p.data)}, not ${hex(f.data)}`);
++    const method = a.level === 0 ? 0 : 8;
++    if (p.method !== method) fail(`${what}: ${show(f.name)} has method ${p.method}, expected ${method} for level ${show(a.level)}`);
++    if (a.mtime !== undefined && show(p.date_time) !== show(dosTime(a.mtime))) fail(`${what}: ${show(f.name)} date_time ${show(p.date_time)} for mtime ${show(a.mtime)}, expected ${show(dosTime(a.mtime))}`);
++    const comment = Buffer.from(a.comment || "").toString("utf8");
++    if (Buffer.from(p.comment).toString("utf8") !== comment) fail(`${what}: ${show(f.name)} comment ${show(Buffer.from(p.comment).toString("utf8"))}, expected ${show(comment)}`);
++    if (p.external_attr !== ((a.attrs || 0) >>> 0)) fail(`${what}: ${show(f.name)} external_attr ${p.external_attr}, expected ${(a.attrs || 0) >>> 0}`);
++    if (p.create_system !== (a.os || 0)) fail(`${what}: ${show(f.name)} create_system ${p.create_system}, expected ${a.os || 0}`);
++    if (!eq(p.extra, extraBytes(a.extra))) fail(`${what}: ${show(f.name)} extra ${hex(p.extra)}, expected ${hex(extraBytes(a.extra))}`);
++    const nonAscii = /[^\u0000-\u007f]/.test(f.name) || /[^\u0000-\u007f]/.test(comment);
++    if (!!(p.flag_bits & 0x800) !== nonAscii) fail(`${what}: ${show(f.name)} UTF-8 flag ${!!(p.flag_bits & 0x800)}, expected ${nonAscii}`);
++    if (p.is_dir !== f.name.endsWith("/")) fail(`${what}: ${show(f.name)} is_dir ${p.is_dir}`);
++  }
++  return true;
++}
++
++// zipSync and the streaming Zip write archives that zipfile reads back entry for entry, with
++// every attribute as given, and that fflate's own unzipSync reads too.
++property("TestHegelZipfileReadsWhatFflateZips", (tc) => {
++  const shapes = new Set();
++  const global = genZipAttributes(tc, shapes);
++  const { tree, flat } = genZippable(tc, shapes, global);
++  count(`entries/${Math.min(flat.length, 5)}${flat.length > 5 ? "+" : ""}`);
++  if (flat.some((f) => f.name.endsWith("/"))) count("has/directory");
++  const archive = tryF(() => F.zipSync(tree, global));
++  if (!archive.ok) fail(`zipSync of ${show(flat.map((f) => f.name))} with ${show(global)} threw ${archive.code} ${archive.message}`);
++  if (!checkPythonReads(archive.out, flat, shapes, "zipSync")) return;
++  const own = tryF(() => F.unzipSync(archive.out));
++  if (!own.ok) fail(`unzipSync cannot read zipSync's archive: ${describe(own)}`);
++  else {
++    const names = Object.keys(own.out).sort();
++    if (show(names) !== show(flat.map((f) => f.name).sort())) fail(`unzipSync lists ${show(names)} of zipSync's ${show(flat.map((f) => f.name).sort())}`);
++    for (const f of flat) if (own.out[f.name] && !eq(own.out[f.name], f.data)) fail(`unzipSync reads ${show(f.name)} as ${hex(own.out[f.name])}, not ${hex(f.data)}`);
++  }
++  // the streaming writer, with data descriptors, files pushed in pieces
++  const chunks = [];
++  let zerr = null;
++  const zs = tryF(() => {
++    const zip = new F.Zip((err, chunk, final) => {
++      if (err) zerr = err;
++      else chunks.push(Uint8Array.from(chunk));
++    });
++    for (const f of flat) {
++      const a = f.attrs;
++      const file = a.level === 0 ? new F.ZipPassThrough(f.name) : new F.ZipDeflate(f.name, { level: a.level, mem: a.mem });
++      for (const k of ["mtime", "os", "attrs", "extra", "comment"]) if (a[k] !== undefined) file[k] = a[k];
++      zip.add(file);
++      const parts = pieces(f.data, genCuts(tc, f.data.length));
++      parts.forEach((p, i) => file.push(p, i === parts.length - 1));
++    }
++    zip.end();
++  });
++  if (!zs.ok) fail(`the streaming Zip of ${show(flat.map((f) => f.name))} threw ${zs.code} ${zs.message}`);
++  if (zerr) fail(`the streaming Zip reported ${zerr.code} ${zerr.message}`);
++  checkPythonReads(concat(chunks), flat, shapes, "Zip stream");
++});
++
++// ---------------------------------------------------------------- ZIP: zipfile writes, fflate reads
++
++function genPyFiles(tc) {
++  const used = new Set();
++  const files = [];
++  const k = n(tc, 0, 6);
++  for (let i = 0; i < k; i++) {
++    let name = genName(tc, used);
++    if (name === null) continue;
++    const dir = chance(tc, 15);
++    if (dir) name += "/";
++    if (used.has(name)) continue;
++    used.add(name);
++    const method = dir ? 0 : pick(tc, [0, 0, 8, 8, 8, 8, 12, 14]);
++    const f = {
++      name,
++      data: dir || chance(tc, 10) ? new Uint8Array(0) : genData(tc, 6000).data,
++      method,
++      level: method === 8 && chance(tc, 50) ? n(tc, 0, 9) : null,
++      date_time: [n(tc, 1980, 2107), n(tc, 1, 12), n(tc, 1, 28), n(tc, 0, 23), n(tc, 0, 59), n(tc, 0, 58) & ~1],
++      comment: chance(tc, 30) ? new Uint8Array(Buffer.from(genComment(tc))) : new Uint8Array(0),
++      external_attr: chance(tc, 30) ? n(tc, 0, 0xffffffff) : 0,
++      create_system: pick(tc, [0, 3, 3]),
++      extra: chance(tc, 15) ? extraBytes(genExtra(tc)) : new Uint8Array(0),
++      force_zip64: chance(tc, 10),
++    };
++    files.push(f);
++  }
++  return files;
++}
++
++// zipfile's archives — stored and deflated, streamed with data descriptors or not, zip64
++// records, comments, non-ASCII names — are read by unzipSync and the streaming Unzip alike;
++// bzip2 and lzma entries are refused as unknown, not misread.
++property("TestHegelFflateReadsWhatZipfileWrites", (tc) => {
++  const files = genPyFiles(tc);
++  const streaming = chance(tc, 40);
++  const comment = chance(tc, 30) ? new Uint8Array(Buffer.from(genComment(tc))) : new Uint8Array(0);
++  const py = pyWriteZip(files, { comment, streaming });
++  if (!py.ok) fail(`zipfile refused ${show(files.map((f) => f.name))}: ${py.error}`);
++  const archive = py.zip;
++  const unsupported = files.filter((f) => f.method !== 0 && f.method !== 8);
++  count(`${streaming ? "streamed" : "seekable"}/${unsupported.length ? "with-unknown-method" : "known-methods"}`);
++  if (files.some((f) => f.force_zip64)) count("has/zip64");
++  const supported = files.filter((f) => f.method === 0 || f.method === 8);
++  // one-shot
++  const got = tryF(() => F.unzipSync(archive));
++  if (unsupported.length) {
++    if (got.ok) fail(`unzipSync accepts an archive with method ${unsupported[0].method} entries: ${show(Object.keys(got.out))}`);
++    else if (got.code !== 14) fail(`unzipSync on a method ${unsupported[0].method} entry: error ${got.code} ${got.message}, expected 14`);
++  } else if (!got.ok) {
++    fail(`unzipSync cannot read zipfile's archive of ${show(files.map((f) => f.name))} (${streaming ? "streamed" : "seekable"}): ${describe(got)}`);
++  }
++  // filtered to the entries it can read
++  const filtered = tryF(() => F.unzipSync(archive, { filter: (f) => f.compression === 0 || f.compression === 8 }));
++  if (!filtered.ok) fail(`unzipSync with a filter cannot read zipfile's archive: ${describe(filtered)}`);
++  else {
++    const names = Object.keys(filtered.out).sort();
++    const want = supported.map((f) => f.name).sort();
++    if (show(names) !== show(want)) fail(`unzipSync lists ${show(names)}, zipfile wrote ${show(want)}`);
++    for (const f of supported) if (filtered.out[f.name] && !eq(filtered.out[f.name], f.data)) fail(`unzipSync reads ${show(f.name)} (method ${f.method}) as ${hex(filtered.out[f.name])}, not ${hex(f.data)}`);
++  }
++  // streaming, pushed in pieces
++  const seen = new Map();
++  const errors = [];
++  const skipped = [];
++  const st = tryF(() => {
++    const u = new F.Unzip((file) => {
++      const chunks = [];
++      file.ondata = (err, chunk, final) => {
++        if (err) errors.push({ name: file.name, code: err.code, message: err.message });
++        else {
++          chunks.push(Uint8Array.from(chunk));
++          if (final) seen.set(file.name, concat(chunks));
++        }
++      };
++      if (file.compression === 0 || file.compression === 8) file.start();
++      else skipped.push(file.name);
++    });
++    u.register(F.UnzipInflate);
++    const parts = pieces(archive, genCuts(tc, archive.length));
++    parts.forEach((p, i) => u.push(p, i === parts.length - 1));
++  });
++  if (show(skipped.sort()) !== show(unsupported.map((f) => f.name).sort())) fail(`the streaming Unzip announces ${show(skipped)} with an unknown method, zipfile wrote ${show(unsupported.map((f) => f.name))}`);
++  if (unsupported.length) {
++    // starting an entry whose method has no decoder must report error 14 through ondata
++    let reported = null;
++    const started = tryF(() => {
++      const u = new F.Unzip((file) => {
++        file.ondata = (err) => { if (err) reported = err.code; };
++        file.start();
++      });
++      u.register(F.UnzipInflate);
++      u.push(archive, true);
++    });
++    if (!started.ok) {
++      // fflate/7: after reporting error 14, start() goes on to construct the missing decoder
++      if (reported === 14 && /not a constructor/.test(started.message)) count("fflate/7");
++      else fail(`starting a method ${unsupported[0].method} entry threw ${started.code} ${started.message} (reported ${reported})`);
++    } else if (reported !== 14) fail(`starting a method ${unsupported[0].method} entry reported ${reported}, expected 14`);
++  }
++  if (!st.ok) fail(`the streaming Unzip of zipfile's archive (${streaming ? "streamed" : "seekable"}) threw ${st.code} ${st.message}`);
++  for (const e of errors) {
++    const f = files.find((x) => x.name === e.name);
++    if (!f || (f.method === 0 || f.method === 8)) fail(`the streaming Unzip reports ${e.code} ${e.message} for ${show(e.name)}`);
++    else if (e.code !== 14) fail(`the streaming Unzip reports ${e.code} ${e.message} for a method ${f.method} entry, expected 14`);
++  }
++  const names = [...seen.keys()].sort();
++  const want = supported.map((f) => f.name).sort();
++  if (show(names) !== show(want)) fail(`the streaming Unzip delivers ${show(names)}, zipfile wrote ${show(want)} (${streaming ? "streamed" : "seekable"})`);
++  for (const f of supported) if (seen.has(f.name) && !eq(seen.get(f.name), f.data)) fail(`the streaming Unzip reads ${show(f.name)} (method ${f.method}) as ${hex(seen.get(f.name))}, not ${hex(f.data)}`);
++});
++
++// ---------------------------------------------------------------- pins
++
++pin("TestHegelPinGunzipSyncAcceptsZeroPadding", () => {
++  // fflate/1: gunzipSync sizes its output from the last four bytes of the input; a member
++  // followed by zero padding (which gzip(1) and zlib accept) comes back empty
++  const g = zlib.gzipSync(Buffer.from("abc".repeat(100)));
++  const padded = concat([new Uint8Array(g), new Uint8Array(8)]);
++  assert.deepEqual(new Uint8Array(zlib.gunzipSync(padded)), new Uint8Array(Buffer.from("abc".repeat(100))));
++  assert.equal(F.gunzipSync(padded).length, 300);
++});
++
++pin("TestHegelPinGunzipSyncReadsEveryMember", () => {
++  // fflate/1: the one-shot gunzipSync reads the first member only, into a buffer sized by the
++  // last member's ISIZE (the streaming Gunzip reads them all)
++  const two = concat([new Uint8Array(zlib.gzipSync(Buffer.from("abc".repeat(100)))), new Uint8Array(zlib.gzipSync(Buffer.from("xyz")))]);
++  assert.equal(zlib.gunzipSync(two).toString(), "abc".repeat(100) + "xyz");
++  assert.equal(Buffer.from(F.gunzipSync(two)).toString(), "abc".repeat(100) + "xyz");
++});
++
++pin("TestHegelPinDamagedChecksumIsAnError", () => {
++  // fflate/2: the Adler-32 (zlib) and CRC-32 (gzip) trailers are not verified
++  const data = Buffer.from("abc".repeat(100));
++  const z = Uint8Array.from(zlib.deflateSync(data));
++  z[z.length - 1] ^= 1;
++  assert.throws(() => zlib.inflateSync(z));
++  assert.throws(() => F.unzlibSync(z), "unzlibSync accepts a wrong Adler-32");
++});
++
++pin("TestHegelPinGzipFilenameOutsideLatin1IsNotCorrupting", () => {
++  // fflate/3: FNAME is written from the low byte of each UTF-16 code unit; a character whose
++  // low byte is 0 ends the name early and the rest of the header is read as compressed data
++  const data = new Uint8Array(Buffer.from("abc".repeat(100)));
++  const g = F.gzipSync(data, { filename: "a一b" });
++  assert.deepEqual(new Uint8Array(zlib.gunzipSync(g)), data);
++});
++
++pin("TestHegelPinEncodeUtf8KeepsASplitSurrogatePair", () => {
++  // fflate/4: EncodeUTF8 pushes each chunk through strToU8 with no state between pushes
++  const chunks = [];
++  const enc = new F.EncodeUTF8((b) => chunks.push(Uint8Array.from(b)));
++  enc.push("\ud83d", false);
++  enc.push("\ude00", true);
++  assert.deepEqual(concat(chunks), new TextEncoder().encode("😀"));
++});
++
++pin("TestHegelPinDecompressStreamKeepsAShortFirstPush", () => {
++  // fflate/6: the Decompress stream's buffer for a first push under 3 bytes is built and
++  // dropped, so the format is never detected and the stream yields nothing
++  const data = new Uint8Array(Buffer.from("abc".repeat(100)));
++  const s = new Uint8Array(zlib.deflateSync(data));
++  const out = [];
++  const d = new F.Decompress((chunk) => out.push(Uint8Array.from(chunk)));
++  d.push(s.subarray(0, 1), false);
++  d.push(s.subarray(1), true);
++  assert.deepEqual(concat(out), data);
++});
++
++pin("TestHegelPinUnzipStartOnAnUnknownMethodOnlyReports", () => {
++  // fflate/7: start() on an entry whose compression method has no registered decoder calls
++  // ondata with error 14 and then throws "ctr is not a constructor"
++  const py = pyWriteZip([{ name: "a", data: new Uint8Array([1, 2, 3]), method: 12, level: null, date_time: [2020, 1, 1, 0, 0, 0], external_attr: 0, create_system: 3, force_zip64: false }]);
++  assert.ok(py.ok, py.error);
++  let reported = null;
++  const u = new F.Unzip((file) => {
++    file.ondata = (err) => { if (err) reported = err.code; };
++    file.start();
++  });
++  u.push(py.zip, true);
++  assert.equal(reported, 14);
++});
++
++pin("TestHegelPinTruncatedZlibStreamIsAnError", () => {
++  // fflate/8: unzlibSync slices the header and trailer off first, so a stream cut to fewer
++  // than seven bytes decodes to nothing without an error (zlib: unexpected end of file)
++  const s = new Uint8Array(zlib.deflateSync(Buffer.from("abc".repeat(100)))).subarray(0, 4);
++  assert.throws(() => zlib.inflateSync(s));
++  assert.throws(() => F.unzlibSync(s), "unzlibSync returns for 4 bytes of a zlib stream");
++});
++
++pin("TestHegelPinSyncFlushAtLevelZeroStaysDecodable", () => {
++  // fflate/9: at level 0 (stored blocks) flush(true) writes the empty stored block without
++  // its header byte: `00 0100 feff 01 | 0000ffff | …`, and nothing can read on
++  const chunks = [];
++  const d = new F.Deflate({ level: 0 }, (c) => chunks.push(Uint8Array.from(c)));
++  d.push(new Uint8Array([1]), false);
++  d.flush(true);
++  d.push(new Uint8Array([2, 3]), true);
++  assert.deepEqual(new Uint8Array(zlib.inflateRawSync(concat(chunks))), new Uint8Array([1, 2, 3]));
++});
++
++pin("TestHegelPinShortDictionaryOutputIsReadable", () => {
++  // fflate/10: 1000 incompressible bytes with a one-byte dictionary: zlib rejects the
++  // output ("invalid distance too far back") and fflate reads it back as other bytes
++  const data = new Uint8Array(1000);
++  let s = 1;
++  for (let i = 0; i < data.length; i++) {
++    s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
++    data[i] = s >> 16;
++  }
++  const dictionary = new Uint8Array([7]);
++  const c = F.zlibSync(data, { dictionary });
++  assert.deepEqual(new Uint8Array(zlib.inflateSync(c, { dictionary })), data);
++});
++
++pin("TestHegelPinGunzipStreamReportsATruncatedStream", () => {
++  // fflate/11: a gzip stream cut inside its header, pushed as final, ends with no output and
++  // no error (gunzipSync: error 6; Node: unexpected end of file)
++  const g = new Uint8Array(zlib.gzipSync(Buffer.from("abc".repeat(100))));
++  assert.throws(() => zlib.gunzipSync(g.subarray(0, 5)));
++  assert.throws(() => F.gunzipSync(g.subarray(0, 5)));
++  assert.throws(() => {
++    const s = new F.Gunzip(() => {});
++    s.push(g.subarray(0, 5), true);
++  }, "the Gunzip stream accepts five bytes of header as a whole stream");
++});
++
++pin("TestHegelPinInflateStreamWithDictionaryAcceptsAnEmptyFirstPush", () => {
++  // fflate/12: `new Inflate({ dictionary })` pushed an empty chunk first slices its window
++  // with a negative start and the data that follows decodes to wrong bytes, silently
++  const data = new Uint8Array(Buffer.from("hello world 0123456789 ".repeat(200)));
++  const dictionary = new Uint8Array(Buffer.from("hello".repeat(31) + "0123456789"));
++  const s = new Uint8Array(zlib.deflateRawSync(data, { dictionary }));
++  const out = [];
++  const inf = new F.Inflate({ dictionary }, (c) => out.push(Uint8Array.from(c)));
++  inf.push(new Uint8Array(0), false);
++  inf.push(s, true);
++  assert.deepEqual(concat(out), data);
++});
++
++pin("TestHegelPinStoredBlocksOfExactly65535BytesEndTheStream", () => {
++  // fflate/13: `zlibSync(new Uint8Array(65535), { level: 0 })` writes `01 ffff 0000 <data>
++  // 01 0000 ffff <adler>`: two final blocks, and zlib reads the Adler-32 where the second
++  // block is
++  const data = new Uint8Array(65535).fill(7);
++  assert.deepEqual(new Uint8Array(zlib.inflateSync(F.zlibSync(data, { level: 0 }))), data);
++});
++
++pin("TestHegelPinZipCommentOver65535BytesIsRefused", () => {
++  // fflate/5: a file comment longer than the 16-bit length field is written without an error
++  // (a long filename gets error 11, a long extra field error 9) and the archive is unreadable
++  const archive = (() => {
++    try {
++      return F.zipSync({ a: [new Uint8Array([1, 2, 3]), { comment: "c".repeat(70000) }] });
++    } catch (e) {
++      return null; // an error is the fix
++    }
++  })();
++  if (archive === null) return;
++  const py = pyReadZip(archive);
++  assert.ok(py.ok, `zipfile cannot read it: ${py.error}`);
++  assert.equal(Buffer.from(py.files[0].comment).length, 70000);
++});
+diff --git a/test/tsconfig.hegel.json b/test/tsconfig.hegel.json
+new file mode 100644
+index 0000000..ef42bb2
+--- /dev/null
++++ b/test/tsconfig.hegel.json
+@@ -0,0 +1,9 @@
++{
++  "extends": "../tsconfig.json",
++  "compilerOptions": {
++    "rootDir": "../src/",
++    "outDir": "../lib/",
++    "types": []
++  },
++  "include": ["../src/*.ts"]
++}
