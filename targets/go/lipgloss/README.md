@@ -121,6 +121,7 @@ and skipped.
 | lipgloss/27 | low | Blend2D right angles are inexact: the residue of sin/cos decides cells on a boundary |
 | lipgloss/28 | medium | A colour channel below 1/256 is written out 256 times too bright (root cause in x/ansi `shift`) |
 | lipgloss/29 | low | Render panics when every stop of a border foreground blend is nil |
+| lipgloss/30 | medium | tree: a hidden child anywhere but first makes the renderer call the style functions with an index past the children it passes them |
 
 The block-model property tolerates lipgloss/2–4 cell by cell (counted as `tolerated-*` in
 collect mode) and skips the cluster cases of lipgloss/1 (`cluster-torn`); the generators use
@@ -128,7 +129,8 @@ only the position constants, so lipgloss/5–7 are pinned directly. The table, t
 compositor properties gate the shapes of lipgloss/8–22 and pin each one; the blend properties
 gate lipgloss/23–28 by cause (the two right-hand corners, rings with under two steps per
 segment, the last cell, strings with a newline, cells on an exact index boundary, ring
-colours with a 16-bit channel below 256) and lipgloss/29 is pinned only.
+colours with a 16-bit channel below 256), lipgloss/29 and lipgloss/30 (found through `go/bubbles`,
+whose tree component indexes the children its style functions are given) are pinned only.
 
 ## Not bugs (modelled as documented)
 
@@ -140,7 +142,8 @@ colours with a 16-bit channel below 256) and lipgloss/29 is pinned only.
 - Tabs are expanded (4 cells by default) even when no other property is set.
 - `list.Roman` is correct; a hidden child that follows a visible one is removed correctly
   from the branch and the enumeration (only a hidden *first* child, lipgloss/21, and
-  *adjacent* hidden children, lipgloss/14, go wrong).
+  *adjacent* hidden children, lipgloss/14, go wrong — and the style functions are then
+  called once past the end, lipgloss/30).
 - `Compositor.Render` trims trailing unstyled blanks per line (`uv.TrimSpace`) but keeps
   styled blanks; a layer is a full rectangle for `Hit`, blank cells included.
 - A table `Width` below the sum of the columns' frames (`width-below-minimum`) cannot be
