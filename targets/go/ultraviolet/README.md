@@ -74,7 +74,7 @@ Output:
 | `BufferFollowsTheGridModel` | 1–25 random `SetCell`/`FillArea`/`ClearArea`/`InsertLineArea`/`DeleteLineArea`/`InsertCellArea`/`DeleteCellArea`/`Resize`/`CloneArea`/`Clone`/`Draw`/`Line` operations on a `Buffer` or `RenderBuffer` (1–10 × 1–5, wide cells, styles, links, out-of-range coordinates) agree with the model after each; changed lines are touched; at the end every placeholder has a head and every head fits | wide cells in ICH/DCH rows (/20), a shrink through a wide cell (/21), a wide cell over a placeholder and a head (/22, also for wide fills), IL/DL areas whose edge cuts a wide cell (/23) |
 | `StylesRoundTripThroughSGR` | `Style.String()` reads back as the style; `StyleDiff(o, s)` after `o` gives `s`; `s.Diff(&o)` is `StyleDiff(&o, &s)`; equal styles diff to `""`; the zero style prints `CSI m` | — |
 | `LinesRenderWhatTheyHold` | `Buffer.Render()` is the lines' `Render()` joined by `\n`; each replayed onto a blank row gives the line's cells with styles and links; the stripped text is `String()`; the printed width is the line width; `NewCell` follows the width method | orphan placeholders (/22) |
-| `RendererDrawsWhatTheEmulatorShows` | 1–6 frames on a 2–16 × 1–6 screen (see Oracles) leave the emulator's screen, the renderer's current buffer and its cursor equal to the frame | frames with an orphan placeholder (/22), a linked cell whose link the emulator lacks after the renderer reset the hyperlink (/24), IRM emitted (the emulator has no insert mode) |
+| `RendererDrawsWhatTheEmulatorShows` | 1–6 frames on a 2–16 × 1–6 screen (see Oracles) leave the emulator's screen, the renderer's current buffer and its cursor equal to the frame | frames with an orphan placeholder (/22), a linked cell whose link the emulator lacks after the renderer reset the hyperlink (/24), a mismatch after a scroll sequence when some row was untouched (/25), IRM emitted (the emulator has no insert mode) |
 | `Examples` | fixed examples from the protocols, and the x-input bugs fixed here (/2 event types, /3 num lock, /4 buffer mutation, alt+`[`) | — |
 
 Each `TestHegelPin…` reproduces one bug and is an expected failure. `UV_COLLECT=1` turns
@@ -111,6 +111,7 @@ runs of such blanks with EL and terminals keep only the background of erased cel
 | ultraviolet/22 | medium | a wide cell written over a placeholder and the next head leaves an orphan placeholder: the line loses a column (cellbuf/2's shape) |
 | ultraviolet/23 | low | `InsertLineArea`/`DeleteLineArea` tear a wide cell straddling the area's edge |
 | ultraviolet/24 | medium | the renderer resets the terminal's hyperlink on a row change but keeps it in its pen: the next linked cell is drawn without its link |
+| ultraviolet/25 | high | the scroll optimisation moves a row the new frame did not touch and never paints it back: a blank on the terminal where the frame has the row, and the renderer's record agrees with the terminal |
 
 Fixed here relative to charmbracelet/x/input (held as examples): x-input/2 (event types on
 `CSI n;mod:ev ~`), x-input/3 (num lock text), x-input/4 (URxvt `$` rewrote the caller's
