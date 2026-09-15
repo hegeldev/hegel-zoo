@@ -61,3 +61,18 @@ upstream, `zoo bump --accept-fixed` records that). Upstream's own tests failing 
   out of the patch. `@hegeldev/hegel` reads no environment variable: the harness passes
   `HEGEL_TEST_CASES` as `testCases` and `HEGEL_DATABASE` as the database path. Node 22+.
   See `targets/typescript/ini` for the harness.
+- **Java**: the patch adds a self-contained Maven module `hegel/` at the repository root:
+  `hegel/pom.xml` depends on the library's own artifact at the version its pom declares (the
+  `[run] setup` step installs it into the local Maven repository with `mvn -DskipTests install`,
+  or Gradle's `publishToMavenLocal`), on `dev.hegel:hegel` (the FFM binding, JDK 22+; the version
+  is the module's `<hegel.version>` property — the line `zoo check` reads) and on JUnit 5, and
+  runs surefire with `--enable-native-access=ALL-UNNAMED` and `testFailureIgnore`. Under
+  `hegel/src/test/java/zoo/` sit the harness `Zoo.java` (`settings(name)` reads `HEGEL_TEST_CASES`
+  and `HEGEL_DATABASE`, which hegel-java itself does not; `fail`/`count` with a collect mode under
+  `ZOO_COLLECT=1`), `ZooListener.java` — a JUnit platform `TestExecutionListener`, registered in
+  `hegel/src/test/resources/META-INF/services/`, that prints one `ZOO ok|FAILED|ignored <method>`
+  line per test method, the lines the judge reads — and the tests: plain `@Test` methods, each
+  property calling `Hegel.test(body, Zoo.settings("<method>"))` (the `@HegelTest` annotation takes
+  only compile-time settings). `mvn -q -B -ntp -f hegel/pom.xml test` is the runner; the
+  annotation must sit on the line before `void name(`. JDK 25 and Maven on the machine. See
+  `targets/java/gson` for the harness.
