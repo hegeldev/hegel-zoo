@@ -62,3 +62,4 @@
 - 2026-09-15: base bumped b376290aad68 → 7917a9a65a03 (2026-09-15, "bench: cover dictionary group keys with a shared values array (#25198)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped 7917a9a65a03 → a0631edb7748 (2026-09-15, "perf: reuse cached dictionary value hashes in vectorized_append (#25185)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped a0631edb7748 → 22651d24cc81 (2026-09-15, "test: bound merge fan-in in ordered aggregate spill tests (#25252)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-15: base bumped 22651d24cc81 → 8bd6629db689 (2026-09-15, "chore(deps): bump taiki-e/install-action from 2.87.6 to 2.87.12 (#25321)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
