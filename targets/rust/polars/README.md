@@ -38,3 +38,4 @@
 - 2026-09-15: base bumped 1d87e9509eea → 4fff6cc4676e (2026-09-15, "feat: Binning functions (#28888)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 4fff6cc4676e → 5267819479ed (2026-09-15, "chore(rust): Update rustls dependency to version `0.23.45` (#29303)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 5267819479ed → 1bcbd4fef4ff (2026-09-15, "fix: Resolve arithmetic `Struct` supertypes per-field (#29261)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-15: base bumped 1bcbd4fef4ff → d68e93010fed (2026-09-15, "fix(rust): Fix musl Python build (#29306)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
