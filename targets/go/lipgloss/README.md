@@ -99,11 +99,12 @@ and skipped.
 | lipgloss/19 | high | Compositor.Render draws layers at absolute coordinates on a canvas sized to the bounds |
 | lipgloss/20 | low | tree: auto-nesting a rootless tree onto a hidden leaf makes it visible |
 | lipgloss/21 | low | tree: a hidden first child keeps its index and shifts the enumeration |
+| lipgloss/22 | medium | Compositor draws equal-z layers out of insertion order once there are more than twelve |
 
 The block-model property tolerates lipgloss/2–4 cell by cell (counted as `tolerated-*` in
 collect mode) and skips the cluster cases of lipgloss/1 (`cluster-torn`); the generators use
 only the position constants, so lipgloss/5–7 are pinned directly. The table, tree and
-compositor properties gate the shapes of lipgloss/8–21 and pin each one.
+compositor properties gate the shapes of lipgloss/8–22 and pin each one.
 
 ## Not bugs (modelled as documented)
 
@@ -118,6 +119,11 @@ compositor properties gate the shapes of lipgloss/8–21 and pin each one.
   *adjacent* hidden children, lipgloss/14, go wrong).
 - `Compositor.Render` trims trailing unstyled blanks per line (`uv.TrimSpace`) but keeps
   styled blanks; a layer is a full rectangle for `Hit`, blank cells included.
+- A table `Width` below the sum of the columns' frames (`width-below-minimum`) cannot be
+  honoured; the property stops at the total width there. `Height` clips through
+  `MaxHeight(min(Height, computeHeight))`, and `MaxHeight(0)` is no limit.
+- A wide grapheme cut by a table `Width` at the right edge leaves its line one cell short
+  (`wide-cut-at-edge`), as any cell clipping would.
 - Table cells containing `-` or a line that starts with a space wrap through `ansi.Wrap`'s
   own quirks (x-ansi/12, /19); those cells are counted, not compared. Text sources are NFC
   (a decomposed `é` is x-ansi/5).
