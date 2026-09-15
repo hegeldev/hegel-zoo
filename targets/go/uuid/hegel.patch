@@ -1,0 +1,1205 @@
+diff --git a/go.mod b/go.mod
+index fc84cd7..fd24afc 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1 +1,10 @@
+ module github.com/google/uuid
++
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..bd7b4dc
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1184 @@
++// Hegel property tests for github.com/google/uuid, with Python's `uuid` module (one child
++// process held open) as the oracle for parsing, field extraction, ordering and the name-based
++// versions, plus models of the RFC 9562 layouts (versions 1, 6, 7, DCE), the documented Parse
++// grammar, and round trips through the text/binary/JSON/sql encodings.
++//
++// UUID_COLLECT=1 turns failures into a summary printed at the end (shortest messages first).
++package uuid_test
++
++import (
++	"bufio"
++	"bytes"
++	"crypto/md5"
++	"crypto/sha1"
++	"crypto/sha256"
++	"database/sql/driver"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"hash"
++	"math/big"
++	"os"
++	"os/exec"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/google/uuid"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++var (
++	collectMode = os.Getenv("UUID_COLLECT") != ""
++	collectMu   sync.Mutex
++	collectMsgs []string
++)
++
++type collected struct{}
++
++// fail reports a property failure; in collect mode it records the message and ends the case.
++func fail(ht *hegel.T, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collectMode {
++		collectMu.Lock()
++		collectMsgs = append(collectMsgs, msg)
++		collectMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf("%s", msg)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++	if collectMode {
++		collectMu.Lock()
++		msgs := append([]string(nil), collectMsgs...)
++		collectMsgs = nil
++		collectMu.Unlock()
++		sort.Slice(msgs, func(i, j int) bool { return len(msgs[i]) < len(msgs[j]) })
++		t.Logf("COLLECT %s: %d failures", t.Name(), len(msgs))
++		for i, m := range msgs {
++			if i == 40 {
++				t.Logf("  ... %d more", len(msgs)-40)
++				break
++			}
++			t.Logf("  %s", m)
++		}
++	}
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// guard turns a panic in a pin into a failure message instead of killing the test binary.
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---- the oracle: Python's uuid module ------------------------------------------------------
++
++const pyScript = `
++import sys, json, uuid, base64, hashlib
++def fields(u):
++    return {'ok': True, 'hex': u.hex, 'str': str(u), 'urn': u.urn, 'int': str(u.int),
++            'version': u.version, 'variant': u.variant, 'time': u.time,
++            'clock_seq': u.clock_seq, 'node': u.node,
++            'time_low': u.time_low, 'time_mid': u.time_mid, 'time_hi_version': u.time_hi_version,
++            'clock_seq_hi_variant': u.clock_seq_hi_variant, 'clock_seq_low': u.clock_seq_low}
++for line in sys.stdin:
++    req = json.loads(line)
++    op = req['op']
++    if op == 'parse':
++        try:
++            res = fields(uuid.UUID(req['s']))
++        except (ValueError, TypeError) as e:
++            res = {'ok': False, 'err': str(e)}
++    elif op == 'frombytes':
++        res = fields(uuid.UUID(bytes=base64.b64decode(req['b'])))
++    elif op == 'name':
++        ns = uuid.UUID(bytes=base64.b64decode(req['ns']))
++        name = base64.b64decode(req['name'])
++        u = uuid.uuid3(ns, name) if req['version'] == 3 else uuid.uuid5(ns, name)
++        res = {'hex': u.hex}
++    else:
++        res = {'err': 'unknown op'}
++    sys.stdout.write(json.dumps(res) + '\n')
++    sys.stdout.flush()
++`
++
++type pyFields struct {
++	OK        bool   `json:"ok"`
++	Err       string `json:"err"`
++	Hex       string `json:"hex"`
++	Str       string `json:"str"`
++	URN       string `json:"urn"`
++	Int       string `json:"int"`
++	Version   *int   `json:"version"`
++	Variant   string `json:"variant"`
++	Time      int64  `json:"time"`
++	ClockSeq  int    `json:"clock_seq"`
++	Node      int64  `json:"node"`
++	TimeLow   int64  `json:"time_low"`
++	TimeMid   int64  `json:"time_mid"`
++	TimeHiVer int64  `json:"time_hi_version"`
++	CSHiVar   int    `json:"clock_seq_hi_variant"`
++	CSLow     int    `json:"clock_seq_low"`
++}
++
++type pyChild struct {
++	mu  sync.Mutex
++	cmd *exec.Cmd
++	in  *bufio.Writer
++	out *bufio.Scanner
++}
++
++var (
++	pyOnce  sync.Once
++	pyProc  *pyChild
++	pyError error
++)
++
++func oracle(t *testing.T) *pyChild {
++	pyOnce.Do(func() {
++		cmd := exec.Command("python3", "-c", pyScript)
++		cmd.Stderr = os.Stderr
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			pyError = err
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			pyError = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			pyError = err
++			return
++		}
++		sc := bufio.NewScanner(stdout)
++		sc.Buffer(make([]byte, 1<<16), 1<<22)
++		pyProc = &pyChild{cmd: cmd, in: bufio.NewWriter(stdin), out: sc}
++	})
++	if pyError != nil {
++		t.Fatalf("cannot start the Python oracle: %v", pyError)
++	}
++	return pyProc
++}
++
++func (p *pyChild) call(req any, res any) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	b, err := json.Marshal(req)
++	if err != nil {
++		return err
++	}
++	if _, err := p.in.Write(append(b, '\n')); err != nil {
++		return err
++	}
++	if err := p.in.Flush(); err != nil {
++		return err
++	}
++	if !p.out.Scan() {
++		return fmt.Errorf("oracle died: %v", p.out.Err())
++	}
++	return json.Unmarshal(p.out.Bytes(), res)
++}
++
++func (p *pyChild) parse(t *testing.T, s string) pyFields {
++	var res pyFields
++	if err := p.call(map[string]any{"op": "parse", "s": s}, &res); err != nil {
++		t.Fatalf("oracle: %v", err)
++	}
++	return res
++}
++
++func (p *pyChild) fromBytes(t *testing.T, b []byte) pyFields {
++	var res pyFields
++	if err := p.call(map[string]any{"op": "frombytes", "b": b}, &res); err != nil {
++		t.Fatalf("oracle: %v", err)
++	}
++	return res
++}
++
++func (p *pyChild) nameBased(t *testing.T, version int, ns uuid.UUID, name []byte) string {
++	var res struct {
++		Hex string `json:"hex"`
++	}
++	if err := p.call(map[string]any{"op": "name", "version": version, "ns": ns[:], "name": name}, &res); err != nil {
++		t.Fatalf("oracle: %v", err)
++	}
++	return res.Hex
++}
++
++// ---- generators and models -----------------------------------------------------------------
++
++// genUUID draws 16 bytes: uniformly random, or shaped (a given version/variant, Nil, Max, a
++// name-space constant) often enough that the special cases are exercised.
++func genUUID(tc hegel.TestCase) uuid.UUID {
++	var u uuid.UUID
++	switch n(tc, 0, 9) {
++	case 0:
++		return uuid.Nil
++	case 1:
++		return uuid.Max
++	case 2:
++		return pick(tc, []uuid.UUID{uuid.NameSpaceDNS, uuid.NameSpaceURL, uuid.NameSpaceOID, uuid.NameSpaceX500})
++	}
++	for i := range u {
++		u[i] = byte(n(tc, 0, 255))
++	}
++	if chance(tc, 60) {
++		u[6] = (u[6] & 0x0f) | byte(n(tc, 0, 15))<<4
++	}
++	if chance(tc, 60) {
++		switch n(tc, 0, 3) {
++		case 0:
++			u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 / 9562
++		case 1:
++			u[8] = u[8] & 0x7f // NCS
++		case 2:
++			u[8] = (u[8] & 0x1f) | 0xc0 // Microsoft
++		case 3:
++			u[8] = u[8] | 0xe0 // future
++		}
++	}
++	return u
++}
++
++var hexUpper = "0123456789ABCDEF"
++
++// hexText spells the 32 hex digits of u with a random case per digit.
++func hexText(tc hegel.TestCase, u uuid.UUID) string {
++	s := hex.EncodeToString(u[:])
++	if !chance(tc, 40) {
++		return s
++	}
++	b := []byte(s)
++	for i, c := range b {
++		if c >= 'a' && chance(tc, 50) {
++			b[i] = hexUpper[c-'a'+10]
++		}
++	}
++	return string(b)
++}
++
++func hyphenate(h string) string {
++	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
++}
++
++// spelling is one of the documented Parse forms of a UUID; python says whether Python's
++// constructor takes it as well (Python wants a lower-case `urn:uuid:` prefix and `{}` braces).
++type spelling struct {
++	text   string
++	python bool
++	valid  bool // accepted by Validate as well (Parse also takes `(...)`-style brackets)
++}
++
++func spellings(tc hegel.TestCase, u uuid.UUID) spelling {
++	h := hyphenate(hexText(tc, u))
++	switch n(tc, 0, 4) {
++	case 0:
++		return spelling{h, true, true}
++	case 1:
++		p := pick(tc, []string{"urn:uuid:", "URN:UUID:", "Urn:Uuid:", "urn:UUID:"})
++		return spelling{p + h, p == "urn:uuid:", true}
++	case 2:
++		return spelling{"{" + h + "}", true, true}
++	case 3:
++		l, r := pick(tc, []string{"(", "[", "<", "x", " "}), pick(tc, []string{")", "]", ">", "y", " "})
++		return spelling{l + h + r, false, false}
++	default:
++		return spelling{hexText(tc, u), true, true}
++	}
++}
++
++func isHex(c byte) bool {
++	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
++}
++
++func asciiFoldEq(a, b string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := 0; i < len(a); i++ {
++		x, y := a[i], b[i]
++		if x >= 'A' && x <= 'Z' {
++			x += 'a' - 'A'
++		}
++		if y >= 'A' && y <= 'Z' {
++			y += 'a' - 'A'
++		}
++		if x != y {
++			return false
++		}
++	}
++	return true
++}
++
++func hyphenatedOK(s string) bool {
++	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
++		return false
++	}
++	for i := 0; i < 36; i++ {
++		if i == 8 || i == 13 || i == 18 || i == 23 {
++			continue
++		}
++		if !isHex(s[i]) {
++			return false
++		}
++	}
++	return true
++}
++
++type parseErr int
++
++const (
++	peNone parseErr = iota
++	peLength
++	peURN
++	peFormat
++	peBracket
++)
++
++func (e parseErr) String() string {
++	return [...]string{"ok", "length", "urn-prefix", "format", "bracket"}[e]
++}
++
++// modelParse is Parse's documented grammar: the four forms by length, the middle 36 bytes of a
++// 38-byte string, a case-insensitive `urn:uuid:` prefix.  validate adds Validate's brace check.
++func modelParse(s string, validate bool) (uuid.UUID, parseErr) {
++	var u uuid.UUID
++	body := s
++	switch len(s) {
++	case 36:
++	case 45:
++		if !asciiFoldEq(s[:9], "urn:uuid:") {
++			return u, peURN
++		}
++		body = s[9:]
++	case 38:
++		if validate && (s[0] != '{' || s[37] != '}') {
++			return u, peBracket
++		}
++		body = s[1:37]
++	case 32:
++		for i := 0; i < 32; i++ {
++			if !isHex(s[i]) {
++				return u, peFormat
++			}
++		}
++		b, _ := hex.DecodeString(s)
++		copy(u[:], b)
++		return u, peNone
++	default:
++		return u, peLength
++	}
++	if !hyphenatedOK(body) {
++		return u, peFormat
++	}
++	b, _ := hex.DecodeString(strings.ReplaceAll(body, "-", ""))
++	copy(u[:], b)
++	return u, peNone
++}
++
++func classify(err error) parseErr {
++	switch {
++	case err == nil:
++		return peNone
++	case uuid.IsInvalidLengthError(err):
++		return peLength
++	case errors.Is(err, uuid.ErrInvalidURNPrefix):
++		return peURN
++	case errors.Is(err, uuid.ErrInvalidBracketedFormat):
++		return peBracket
++	case errors.Is(err, uuid.ErrInvalidUUIDFormat):
++		return peFormat
++	}
++	return parseErr(-1)
++}
++
++var junkChars = []string{"-", "g", "G", "z", " ", "\t", "\n", "{", "}", ":", "u", "0", "9", "a", "F", "é", "\x00", "\xff", "K", "K", "ſ"}
++
++// genText draws a string that is usually near a valid spelling: a valid one, a mutated one, or
++// junk of a plausible length.
++func genText(tc hegel.TestCase) string {
++	u := genUUID(tc)
++	sp := spellings(tc, u)
++	s := sp.text
++	switch n(tc, 0, 3) {
++	case 0:
++		return s
++	case 1: // replace a byte
++		b := []byte(s)
++		i := n(tc, 0, len(b)-1)
++		c := pick(tc, junkChars)
++		return string(b[:i]) + c + string(b[i+1:])
++	case 2: // insert or delete
++		i := n(tc, 0, len(s))
++		if chance(tc, 50) && i < len(s) {
++			return s[:i] + s[i+1:]
++		}
++		return s[:i] + pick(tc, junkChars) + s[i:]
++	default:
++		var sb strings.Builder
++		k := pick(tc, []int{0, 1, 31, 32, 33, 35, 36, 37, 38, 39, 44, 45, 46})
++		for sb.Len() < k {
++			sb.WriteString(pick(tc, junkChars))
++		}
++		return sb.String()[:k]
++	}
++}
++
++// RFC 9562 layouts.
++const g1582ns100 = 122192928000000000 // 100 ns ticks from 1582-10-15 to 1970-01-01
++
++func v1Time(u uuid.UUID) int64 {
++	return int64(binary.BigEndian.Uint32(u[0:4])) | int64(binary.BigEndian.Uint16(u[4:6]))<<32 |
++		int64(binary.BigEndian.Uint16(u[6:8])&0x0fff)<<48
++}
++
++func v6Time(u uuid.UUID) int64 {
++	return int64(binary.BigEndian.Uint32(u[0:4]))<<28 | int64(binary.BigEndian.Uint16(u[4:6]))<<12 |
++		int64(binary.BigEndian.Uint16(u[6:8])&0x0fff)
++}
++
++func v7Millis(u uuid.UUID) int64 {
++	return int64(binary.BigEndian.Uint64(u[0:8]) >> 16)
++}
++
++// gregorian is the RFC timestamp of t: 100 ns ticks since 1582-10-15 (floor).
++func gregorian(t time.Time) int64 {
++	ns := new(big.Int).Mul(big.NewInt(t.Unix()), big.NewInt(1e9))
++	ns.Add(ns, big.NewInt(int64(t.Nanosecond())))
++	ticks := new(big.Int).Div(ns, big.NewInt(100)) // Euclidean division: floor for a positive divisor
++	return ticks.Int64() + g1582ns100
++}
++
++func variantOf(u uuid.UUID) uuid.Variant {
++	switch {
++	case u[8]&0x80 == 0:
++		return uuid.Reserved
++	case u[8]&0x40 == 0:
++		return uuid.RFC4122
++	case u[8]&0x20 == 0:
++		return uuid.Microsoft
++	}
++	return uuid.Future
++}
++
++var pyVariant = map[uuid.Variant]string{
++	uuid.Reserved: "reserved for NCS compatibility", uuid.RFC4122: "specified in RFC 4122",
++	uuid.Microsoft: "reserved for Microsoft compatibility", uuid.Future: "reserved for future definition",
++}
++
++// ---- properties ----------------------------------------------------------------------------
++
++// TestHegelParseAgreesWithPython: every documented spelling of a UUID parses (Parse, ParseBytes,
++// Validate, UnmarshalText, Scan, MustParse) to the same 16 bytes as Python's constructor, and
++// the outputs (String, URN, MarshalText, Value) are Python's spellings.
++func TestHegelParseAgreesWithPython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		u := genUUID(ht)
++		sp := spellings(ht, u)
++		note(ht, "text %q", sp.text)
++		got, err := uuid.Parse(sp.text)
++		if err != nil || got != u {
++			fail(ht, "Parse(%q) = %v, %v; want %v", sp.text, got, err, u)
++		}
++		if gb, err := uuid.ParseBytes([]byte(sp.text)); err != nil || gb != got {
++			fail(ht, "ParseBytes(%q) = %v, %v; Parse gave %v", sp.text, gb, err, got)
++		}
++		if err := uuid.Validate(sp.text); (err == nil) != sp.valid {
++			fail(ht, "Validate(%q) = %v; want valid=%v", sp.text, err, sp.valid)
++		}
++		var ut uuid.UUID
++		if err := ut.UnmarshalText([]byte(sp.text)); err != nil || ut != u {
++			fail(ht, "UnmarshalText(%q) = %v, %v; want %v", sp.text, ut, err, u)
++		}
++		var us uuid.UUID
++		if err := us.Scan(sp.text); err != nil || us != u {
++			fail(ht, "Scan(%q) = %v, %v; want %v", sp.text, us, err, u)
++		}
++		var ub uuid.UUID
++		if err := ub.Scan([]byte(sp.text)); err != nil || ub != u {
++			fail(ht, "Scan([]byte(%q)) = %v, %v; want %v", sp.text, ub, err, u)
++		}
++		if mp := uuid.MustParse(sp.text); mp != u {
++			fail(ht, "MustParse(%q) = %v; want %v", sp.text, mp, u)
++		}
++		var js uuid.UUID
++		if err := json.Unmarshal([]byte(strconv.Quote(sp.text)), &js); err != nil || js != u {
++			fail(ht, "json.Unmarshal(%q) = %v, %v; want %v", sp.text, js, err, u)
++		}
++		// outputs vs Python
++		pf := py.fromBytes(t, u[:])
++		if u.String() != pf.Str {
++			fail(ht, "String() = %q; Python %q", u.String(), pf.Str)
++		}
++		if u.URN() != pf.URN {
++			fail(ht, "URN() = %q; Python %q", u.URN(), pf.URN)
++		}
++		if mt, err := u.MarshalText(); err != nil || string(mt) != pf.Str {
++			fail(ht, "MarshalText() = %q, %v; Python %q", mt, err, pf.Str)
++		}
++		if v, err := u.Value(); err != nil || v != driver.Value(pf.Str) {
++			fail(ht, "Value() = %v, %v; Python %q", v, err, pf.Str)
++		}
++		if sp.python {
++			pp := py.parse(t, sp.text)
++			if !pp.OK || pp.Hex != hex.EncodeToString(u[:]) {
++				fail(ht, "Python UUID(%q) = %+v; Go parsed %v", sp.text, pp, u)
++			}
++		}
++	})
++}
++
++// TestHegelParseFollowsTheDocumentedGrammar: on arbitrary (mostly near-valid) text, Parse,
++// ParseBytes and Validate accept exactly the documented forms and return the documented error
++// kinds; whatever Parse accepts, Python accepts with the same value when spelled in Python's
++// dialect (lower-case urn prefix, braces).
++func TestHegelParseFollowsTheDocumentedGrammar(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		s := genText(ht)
++		note(ht, "text %q", s)
++		want, wantErr := modelParse(s, false)
++		got, err := uuid.Parse(s)
++		if classify(err) != wantErr || (wantErr == peNone && got != want) {
++			fail(ht, "Parse(%q) = %v, %v (%s); model %v, %s", s, got, err, classify(err), want, wantErr)
++		}
++		gb, errb := uuid.ParseBytes([]byte(s))
++		if classify(errb) != classify(err) || gb != got {
++			fail(ht, "ParseBytes(%q) = %v, %v; Parse gave %v, %v", s, gb, errb, got, err)
++		}
++		if err != nil && uuid.IsInvalidLengthError(err) && !strings.Contains(err.Error(), strconv.Itoa(len(s))) {
++			fail(ht, "Parse(%q) length error %q does not name the length %d", s, err, len(s))
++		}
++		_, wantV := modelParse(s, true)
++		if verr := uuid.Validate(s); classify(verr) != wantV {
++			fail(ht, "Validate(%q) = %v (%s); model %s", s, verr, classify(verr), wantV)
++		}
++		if err == nil {
++			// Python's dialect of the same text.
++			ps := s
++			switch len(s) {
++			case 45:
++				ps = "urn:uuid:" + s[9:]
++			case 38:
++				ps = "{" + s[1:37] + "}"
++			}
++			pp := py.parse(t, ps)
++			if !pp.OK || pp.Hex != hex.EncodeToString(got[:]) {
++				fail(ht, "Python UUID(%q) = %+v; Go parsed %q as %v", ps, pp, s, got)
++			}
++		}
++	})
++}
++
++// TestHegelFieldsAgreeWithPython: Version, Variant, Time (versions other than 6 and 7), the
++// clock sequence, the node and Compare agree with Python's field accessors and integer order,
++// and with the RFC bit layouts.
++func TestHegelFieldsAgreeWithPython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		u := genUUID(ht)
++		v := genUUID(ht)
++		note(ht, "u %v v %v", u, v)
++		pf := py.fromBytes(t, u[:])
++		if int(u.Version()) != int(u[6]>>4) {
++			fail(ht, "%v.Version() = %d; want %d", u, u.Version(), u[6]>>4)
++		}
++		if pf.Version != nil && int(u.Version()) != *pf.Version {
++			fail(ht, "%v.Version() = %d; Python %d", u, u.Version(), *pf.Version)
++		}
++		if u.Variant() != variantOf(u) || pyVariant[u.Variant()] != pf.Variant {
++			fail(ht, "%v.Variant() = %v (%s); model %v, Python %q", u, u.Variant(), u.Variant(), variantOf(u), pf.Variant)
++		}
++		if u.Version() != 6 && u.Version() != 7 {
++			if int64(u.Time()) != pf.Time || int64(u.Time()) != v1Time(u) {
++				fail(ht, "%v.Time() = %d; Python %d, layout %d", u, u.Time(), pf.Time, v1Time(u))
++			}
++		} else if u.Version() == 6 {
++			if int64(u.Time()) != v6Time(u) {
++				fail(ht, "%v.Time() = %d; v6 layout %d", u, u.Time(), v6Time(u))
++			}
++		} else if int64(u.Time()) != v7Millis(u)*10000+g1582ns100 {
++			fail(ht, "%v.Time() = %d; v7 layout %d", u, u.Time(), v7Millis(u)*10000+g1582ns100)
++		}
++		if u.ClockSequence() != pf.ClockSeq {
++			fail(ht, "%v.ClockSequence() = %d; Python %d", u, u.ClockSequence(), pf.ClockSeq)
++		}
++		node := new(big.Int).SetBytes(u.NodeID()).Int64()
++		if len(u.NodeID()) != 6 || node != pf.Node {
++			fail(ht, "%v.NodeID() = %x; Python node %x", u, u.NodeID(), pf.Node)
++		}
++		// UnixTime inverts the Gregorian tick count (exactly, at 100 ns resolution).
++		sec, nsec := u.Time().UnixTime()
++		if nsec%100 != 0 || gregorian(time.Unix(sec, nsec)) != int64(u.Time()) {
++			fail(ht, "%v.Time() = %d, UnixTime = %d, %d (ticks back %d)", u, u.Time(), sec, nsec, gregorian(time.Unix(sec, nsec)))
++		}
++		// Compare is the integer order.
++		pv := py.fromBytes(t, v[:])
++		iu, _ := new(big.Int).SetString(pf.Int, 10)
++		iv, _ := new(big.Int).SetString(pv.Int, 10)
++		if uuid.Compare(u, v) != iu.Cmp(iv) || uuid.Compare(v, u) != -uuid.Compare(u, v) {
++			fail(ht, "Compare(%v, %v) = %d; Python ints compare %d", u, v, uuid.Compare(u, v), iu.Cmp(iv))
++		}
++		if strings.Compare(u.String(), v.String()) != uuid.Compare(u, v) {
++			fail(ht, "Compare(%v, %v) = %d but the strings compare %d", u, v, uuid.Compare(u, v), strings.Compare(u.String(), v.String()))
++		}
++		// Version and Variant names.
++		if u.Version().String() != fmt.Sprintf("VERSION_%d", u[6]>>4) {
++			fail(ht, "%v.Version().String() = %q", u, u.Version().String())
++		}
++		if s := u.Variant().String(); s != map[uuid.Variant]string{uuid.Reserved: "Reserved", uuid.RFC4122: "RFC4122", uuid.Microsoft: "Microsoft", uuid.Future: "Future"}[variantOf(u)] {
++			fail(ht, "%v.Variant().String() = %q", u, s)
++		}
++	})
++}
++
++// TestHegelNameBasedAgreeWithPython: NewMD5/NewSHA1 are Python's uuid3/uuid5 for arbitrary
++// name spaces and byte names; NewHash with any hash and version is the documented
++// "first 16 bytes of H(space || data) with the version and variant bits set".
++func TestHegelNameBasedAgreeWithPython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		ns := genUUID(ht)
++		name := make([]byte, n(ht, 0, 64))
++		for i := range name {
++			name[i] = byte(n(ht, 0, 255))
++		}
++		note(ht, "ns %v name %x", ns, name)
++		if got, want := uuid.NewMD5(ns, name), py.nameBased(t, 3, ns, name); hex.EncodeToString(got[:]) != want {
++			fail(ht, "NewMD5(%v, %x) = %v; Python uuid3 %s", ns, name, got, want)
++		}
++		if got, want := uuid.NewSHA1(ns, name), py.nameBased(t, 5, ns, name); hex.EncodeToString(got[:]) != want {
++			fail(ht, "NewSHA1(%v, %x) = %v; Python uuid5 %s", ns, name, got, want)
++		}
++		var h hash.Hash
++		switch n(ht, 0, 2) {
++		case 0:
++			h = md5.New()
++		case 1:
++			h = sha1.New()
++		default:
++			h = sha256.New()
++		}
++		version := n(ht, 0, 15)
++		h.Reset()
++		h.Write(ns[:])
++		h.Write(name)
++		sum := h.Sum(nil)
++		var want uuid.UUID
++		copy(want[:], sum)
++		want[6] = want[6]&0x0f | byte(version)<<4
++		want[8] = want[8]&0x3f | 0x80
++		h.Write([]byte("stale state that NewHash must Reset")) // NewHash documents h.Reset()
++		got := uuid.NewHash(h, ns, name, version)
++		if got != want || int(got.Version()) != version || got.Variant() != uuid.RFC4122 {
++			fail(ht, "NewHash(%T, %v, %x, %d) = %v; want %v", h, ns, name, version, got, want)
++		}
++		if uuid.NewHash(h, ns, name, version) != got {
++			fail(ht, "NewHash is not deterministic: %v then %v", got, uuid.NewHash(h, ns, name, version))
++		}
++	})
++}
++
++// genV6Time draws an instant NewV6WithTime can represent: within Go's UnixNano range
++// (1678 ≤ t < 2262; pin /5 covers the rest); for pre-1970 instants the nanoseconds are a
++// multiple of 100 (see README, Not bugs).
++func genV6Time(tc hegel.TestCase) time.Time {
++	var t time.Time
++	switch n(tc, 0, 3) {
++	case 0: // recent
++		t = time.Unix(int64(n(tc, 0, 2_000_000_000)), int64(n(tc, 0, 999_999_999)))
++	case 1: // pre-1970, back to 1678 (Go's UnixNano range; pin /5 covers the rest)
++		t = time.Unix(-int64(n(tc, 1, 9_200_000_000)), int64(n(tc, 0, 9_999_999))*100)
++	case 2: // far future, before UnixNano overflows (2262-04-11)
++		t = time.Unix(int64(n(tc, 2_000_000_000, 9_200_000_000)), int64(n(tc, 0, 999_999_999)))
++	default: // around now
++		t = time.Now().Add(time.Duration(n(tc, -1_000_000_000, 1_000_000_000)))
++	}
++	return t.UTC()
++}
++
++// TestHegelTimeBasedLayoutsFollowTheRFC: NewUUID (v1), NewV6WithTime (v6) and NewV7FromReader
++// (v7) put the time, clock sequence, node and random bits where RFC 9562 says, Time() reads
++// them back, the clock sequence advances when the same instant is used twice, and the
++// package-level clock sequence / node accessors describe the UUIDs generated.
++func TestHegelTimeBasedLayoutsFollowTheRFC(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		// Clock sequence and node under our control.
++		seq := n(ht, 0, 0x3fff)
++		if chance(ht, 20) {
++			seq |= n(ht, 0, 3) << 14 // only the low 14 bits count
++		}
++		// Setting a *changed* sequence resets the library's "last time" (a same-valued call keeps
++		// it, and a later instant left by an earlier case would then bump the sequence).
++		uuid.SetClockSequence((seq + 1) & 0x3fff)
++		uuid.SetClockSequence(seq)
++		if got := uuid.ClockSequence(); got != seq&0x3fff {
++			fail(ht, "SetClockSequence(%#x); ClockSequence() = %#x", seq, got)
++		}
++		node := make([]byte, 6+n(ht, 0, 2))
++		for i := range node {
++			node[i] = byte(n(ht, 0, 255))
++		}
++		if bytes.Equal(node[:6], make([]byte, 6)) {
++			node[5] = 1 // an all-zero node is "unset" to the library (pin /6)
++		}
++		if !uuid.SetNodeID(node) || !bytes.Equal(uuid.NodeID(), node[:6]) || uuid.NodeInterface() != "user" {
++			fail(ht, "SetNodeID(%x): NodeID() = %x, NodeInterface() = %q", node, uuid.NodeID(), uuid.NodeInterface())
++		}
++		note(ht, "seq %#x node %x", seq, node)
++
++		// Version 1.
++		before := time.Now()
++		v1, err := uuid.NewUUID()
++		after := time.Now()
++		if err != nil {
++			fail(ht, "NewUUID: %v", err)
++		}
++		if v1.Version() != 1 || v1.Variant() != uuid.RFC4122 {
++			fail(ht, "NewUUID() = %v: version %d variant %v", v1, v1.Version(), v1.Variant())
++		}
++		if int64(v1.Time()) != v1Time(v1) || int64(v1.Time()) < gregorian(before) || int64(v1.Time()) > gregorian(after) {
++			fail(ht, "NewUUID() = %v: Time() %d, layout %d, wall clock %d..%d", v1, v1.Time(), v1Time(v1), gregorian(before), gregorian(after))
++		}
++		if v1.ClockSequence() != seq&0x3fff || !bytes.Equal(v1.NodeID(), node[:6]) {
++			fail(ht, "NewUUID() = %v: ClockSequence() %#x (set %#x), NodeID() %x (set %x)", v1, v1.ClockSequence(), seq&0x3fff, v1.NodeID(), node[:6])
++		}
++
++		// Version 6 at a chosen instant, twice: same time, next clock sequence.
++		ct := genV6Time(ht)
++		note(ht, "v6 time %v", ct)
++		v6, err := uuid.NewV6WithTime(&ct)
++		if err != nil {
++			fail(ht, "NewV6WithTime(%v): %v", ct, err)
++		}
++		if v6.Version() != 6 || v6.Variant() != uuid.RFC4122 {
++			fail(ht, "NewV6WithTime(%v) = %v: version %d variant %v", ct, v6, v6.Version(), v6.Variant())
++		}
++		if int64(v6.Time()) != gregorian(ct) || int64(v6.Time()) != v6Time(v6) {
++			fail(ht, "NewV6WithTime(%v) = %v: Time() %d, want %d (layout %d)", ct, v6, v6.Time(), gregorian(ct), v6Time(v6))
++		}
++		sec, nsec := v6.Time().UnixTime()
++		if back := time.Unix(sec, nsec).UTC(); !back.Equal(ct.Truncate(100 * time.Nanosecond)) {
++			fail(ht, "NewV6WithTime(%v).Time().UnixTime() = %v", ct, back)
++		}
++		if !bytes.Equal(v6.NodeID(), node[:6]) {
++			fail(ht, "NewV6WithTime(%v) = %v: NodeID() %x, set %x", ct, v6, v6.NodeID(), node[:6])
++		}
++		v6b, _ := uuid.NewV6WithTime(&ct)
++		if v6b == v6 || v6b.Time() != v6.Time() || v6b.ClockSequence() != (v6.ClockSequence()+1)&0x3fff {
++			fail(ht, "NewV6WithTime(%v) twice: %v then %v (clock sequences %#x, %#x)", ct, v6, v6b, v6.ClockSequence(), v6b.ClockSequence())
++		}
++		// A v1 re-laid as v6 has the same Time().
++		var re uuid.UUID
++		ts := uint64(v1Time(v1))
++		binary.BigEndian.PutUint32(re[0:4], uint32(ts>>28))
++		binary.BigEndian.PutUint16(re[4:6], uint16(ts>>12))
++		binary.BigEndian.PutUint16(re[6:8], uint16(ts&0x0fff)|0x6000)
++		copy(re[8:], v1[8:])
++		if re.Time() != v1.Time() || re.ClockSequence() != v1.ClockSequence() || !bytes.Equal(re.NodeID(), v1.NodeID()) {
++			fail(ht, "v1 %v re-laid as v6 %v: Time() %d vs %d", v1, re, re.Time(), v1.Time())
++		}
++
++		// Version 7 from a reader we control: the random bits are ours, the time is the wall clock
++		// (ms), and consecutive values are strictly increasing.
++		rnd := make([]byte, 16)
++		for i := range rnd {
++			rnd[i] = byte(n(ht, 0, 255))
++		}
++		before = time.Now()
++		v7, err := uuid.NewV7FromReader(bytes.NewReader(rnd))
++		after = time.Now()
++		if err != nil {
++			fail(ht, "NewV7FromReader: %v", err)
++		}
++		if v7.Version() != 7 || v7.Variant() != uuid.RFC4122 || v7[8]&0x3f != rnd[8]&0x3f || !bytes.Equal(v7[9:], rnd[9:]) {
++			fail(ht, "NewV7FromReader(%x) = %v: version %d variant %v, rand_b not the reader's", rnd, v7, v7.Version(), v7.Variant())
++		}
++		ms := v7Millis(v7)
++		if ms < before.UnixMilli() || ms > after.UnixMilli()+1 {
++			fail(ht, "NewV7FromReader = %v: unix_ts_ms %d, wall clock %d..%d", v7, ms, before.UnixMilli(), after.UnixMilli())
++		}
++		if int64(v7.Time()) != ms*10000+g1582ns100 {
++			fail(ht, "NewV7FromReader = %v: Time() %d, want %d", v7, v7.Time(), ms*10000+g1582ns100)
++		}
++		v7b, _ := uuid.NewV7()
++		if uuid.Compare(v7, v7b) >= 0 || v7b.Time() < v7.Time() {
++			fail(ht, "consecutive v7 values not increasing: %v then %v", v7, v7b)
++		}
++	})
++}
++
++// TestHegelDCEFieldsRoundTrip: NewDCESecurity(domain, id) is a version-2 UUID whose Domain()
++// and ID() are the arguments and whose node is the current NodeID.
++func TestHegelDCEFieldsRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		d := uuid.Domain(n(ht, 0, 255))
++		id := uint32(hegel.Draw(ht, hegel.Integers[int64](0, 1<<32-1)))
++		u, err := uuid.NewDCESecurity(d, id)
++		if err != nil {
++			fail(ht, "NewDCESecurity(%v, %d): %v", d, id, err)
++		}
++		if u.Version() != 2 || u.Variant() != uuid.RFC4122 || u.Domain() != d || u.ID() != id || !bytes.Equal(u.NodeID(), uuid.NodeID()) {
++			fail(ht, "NewDCESecurity(%v, %d) = %v: version %d variant %v domain %v id %d", d, id, u, u.Version(), u.Variant(), u.Domain(), u.ID())
++		}
++		want := map[uuid.Domain]string{uuid.Person: "Person", uuid.Group: "Group", uuid.Org: "Org"}[d]
++		if want == "" {
++			want = fmt.Sprintf("Domain%d", int(d))
++		}
++		if d.String() != want {
++			fail(ht, "Domain(%d).String() = %q; want %q", int(d), d.String(), want)
++		}
++	})
++}
++
++type box struct {
++	ID   uuid.UUID     `json:"id"`
++	Opt  uuid.NullUUID `json:"opt"`
++	Many uuid.UUIDs    `json:"many"`
++}
++
++// TestHegelEncodingsRoundTrip: JSON, text and binary marshalling, database/sql Scan/Value and
++// NullUUID's JSON form all invert each other for valid values, and NullUUID's null is a JSON
++// null / a nil driver.Value.  (The null value's text and binary forms are pinned: /4.)
++func TestHegelEncodingsRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		u := genUUID(ht)
++		valid := chance(ht, 70)
++		many := make(uuid.UUIDs, n(ht, 0, 3))
++		for i := range many {
++			many[i] = genUUID(ht)
++		}
++		in := box{ID: u, Opt: uuid.NullUUID{UUID: u, Valid: valid}, Many: many}
++		if !valid && chance(ht, 50) {
++			in.Opt.UUID = uuid.Nil
++		}
++		note(ht, "u %v valid %v many %v", u, valid, many)
++		js, err := json.Marshal(in)
++		if err != nil {
++			fail(ht, "json.Marshal(%+v): %v", in, err)
++		}
++		wantOpt := "null"
++		if valid {
++			wantOpt = strconv.Quote(u.String())
++		}
++		wantMany, _ := json.Marshal(many.Strings())
++		if len(many) == 0 {
++			wantMany = []byte("[]")
++		}
++		want := fmt.Sprintf(`{"id":%q,"opt":%s,"many":%s}`, u.String(), wantOpt, wantMany)
++		if string(js) != want {
++			fail(ht, "json.Marshal = %s; want %s", js, want)
++		}
++		var out box
++		if err := json.Unmarshal(js, &out); err != nil {
++			fail(ht, "json.Unmarshal(%s): %v", js, err)
++		}
++		if out.ID != u || out.Opt.Valid != valid || (valid && out.Opt.UUID != u) || !reflect.DeepEqual(out.Many, many) && !(len(many) == 0 && len(out.Many) == 0) {
++			fail(ht, "json round trip of %s gave %+v", js, out)
++		}
++		if !valid && out.Opt.UUID != uuid.Nil {
++			fail(ht, "json null decoded into NullUUID with UUID %v", out.Opt.UUID)
++		}
++		// NullUUID's own MarshalJSON/UnmarshalJSON.
++		nj, err := in.Opt.MarshalJSON()
++		if err != nil || string(nj) != wantOpt {
++			fail(ht, "NullUUID.MarshalJSON = %s, %v; want %s", nj, err, wantOpt)
++		}
++		var nu uuid.NullUUID
++		if err := nu.UnmarshalJSON(nj); err != nil || nu.Valid != valid || (valid && nu.UUID != u) {
++			fail(ht, "NullUUID.UnmarshalJSON(%s) = %+v, %v", nj, nu, err)
++		}
++		// Text and binary for the UUID itself.
++		mt, _ := u.MarshalText()
++		var ut uuid.UUID
++		if err := ut.UnmarshalText(mt); err != nil || ut != u {
++			fail(ht, "UnmarshalText(MarshalText(%v)) = %v, %v", u, ut, err)
++		}
++		mb, _ := u.MarshalBinary()
++		var ub uuid.UUID
++		if err := ub.UnmarshalBinary(mb); err != nil || ub != u || !bytes.Equal(mb, u[:]) {
++			fail(ht, "UnmarshalBinary(MarshalBinary(%v)) = %v, %v (binary %x)", u, ub, err, mb)
++		}
++		if fb, err := uuid.FromBytes(mb); err != nil || fb != u {
++			fail(ht, "FromBytes(%x) = %v, %v", mb, fb, err)
++		}
++		if valid {
++			nt, _ := in.Opt.MarshalText()
++			var nut uuid.NullUUID
++			if err := nut.UnmarshalText(nt); err != nil || nut != in.Opt {
++				fail(ht, "NullUUID.UnmarshalText(%q) = %+v, %v", nt, nut, err)
++			}
++			nb, _ := in.Opt.MarshalBinary()
++			var nub uuid.NullUUID
++			if err := nub.UnmarshalBinary(nb); err != nil || nub != in.Opt {
++				fail(ht, "NullUUID.UnmarshalBinary(%x) = %+v, %v", nb, nub, err)
++			}
++		}
++		// database/sql: Value then Scan, on fresh destinations.
++		v, err := u.Value()
++		if err != nil {
++			fail(ht, "Value(%v): %v", u, err)
++		}
++		var us uuid.UUID
++		if err := us.Scan(v); err != nil || us != u {
++			fail(ht, "Scan(Value(%v)) = %v, %v", u, us, err)
++		}
++		var ub16 uuid.UUID
++		if err := ub16.Scan(u[:]); err != nil || ub16 != u {
++			fail(ht, "Scan(16 bytes of %v) = %v, %v", u, ub16, err)
++		}
++		nv, err := in.Opt.Value()
++		if err != nil || (valid && nv != driver.Value(u.String())) || (!valid && nv != nil) {
++			fail(ht, "NullUUID.Value(%+v) = %v, %v", in.Opt, nv, err)
++		}
++		var ns uuid.NullUUID
++		if err := ns.Scan(nv); err != nil || ns.Valid != valid || (valid && ns.UUID != u) || (!valid && ns.UUID != uuid.Nil) {
++			fail(ht, "NullUUID.Scan(%v) = %+v, %v", nv, ns, err)
++		}
++		// Wrong binary lengths are rejected.
++		k := pick(ht, []int{0, 1, 15, 17, 32})
++		var bad uuid.UUID
++		if err := bad.UnmarshalBinary(make([]byte, k)); err == nil {
++			fail(ht, "UnmarshalBinary of %d bytes accepted", k)
++		}
++		if _, err := uuid.FromBytes(make([]byte, k)); err == nil {
++			fail(ht, "FromBytes of %d bytes accepted", k)
++		}
++	})
++}
++
++// TestHegelRandomVersionsSetOnlyTheirBits: NewRandomFromReader keeps 122 of the reader's bits
++// and sets the version and variant; New/NewRandom/NewString are version 4 RFC UUIDs; a short
++// reader is an error, not a panic.
++func TestHegelRandomVersionsSetOnlyTheirBits(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		rnd := make([]byte, n(ht, 0, 40))
++		for i := range rnd {
++			rnd[i] = byte(n(ht, 0, 255))
++		}
++		u, err := uuid.NewRandomFromReader(bytes.NewReader(rnd))
++		if len(rnd) < 16 {
++			if err == nil || u != uuid.Nil {
++				fail(ht, "NewRandomFromReader(%d bytes) = %v, %v", len(rnd), u, err)
++			}
++			return
++		}
++		var want uuid.UUID
++		copy(want[:], rnd)
++		want[6] = want[6]&0x0f | 0x40
++		want[8] = want[8]&0x3f | 0x80
++		if err != nil || u != want {
++			fail(ht, "NewRandomFromReader(%x) = %v, %v; want %v", rnd[:16], u, err, want)
++		}
++		v7, err := uuid.NewV7FromReader(bytes.NewReader(rnd))
++		if err != nil || v7[8] != want[8] || !bytes.Equal(v7[9:], want[9:]) || v7.Version() != 7 {
++			fail(ht, "NewV7FromReader(%x) = %v, %v", rnd[:16], v7, err)
++		}
++		for _, g := range []uuid.UUID{uuid.New(), uuid.Must(uuid.NewRandom()), uuid.MustParse(uuid.NewString())} {
++			if g.Version() != 4 || g.Variant() != uuid.RFC4122 {
++				fail(ht, "random UUID %v: version %d variant %v", g, g.Version(), g.Variant())
++			}
++		}
++	})
++}
++
++// ---- pins ----------------------------------------------------------------------------------
++
++// uuid/1: NewV6WithTime reads and writes the shared clock state (clockSeq, lasttime) without
++// timeMu, unlike GetTime/NewUUID/NewV6; concurrent callers with the same instant get identical
++// UUIDs.  Four goroutines × 3000 calls at one instant (well under the 16384 clock sequences the
++// contract allows for one timestamp) must all be distinct; a data race makes duplicates
++// (`go test -race` reports the race on time.go:67/70).
++func TestHegelPinNewV6WithTimeIsRaceFree(t *testing.T) {
++	defer guard(t)
++	ct := time.Date(2001, 2, 3, 4, 5, 6, 700, time.UTC)
++	const G, N, rounds = 4, 3000, 8
++	for round := 0; round < rounds; round++ {
++		uuid.SetClockSequence(1)
++		res := make([][]uuid.UUID, G)
++		var wg sync.WaitGroup
++		for g := 0; g < G; g++ {
++			wg.Add(1)
++			go func(g int) {
++				defer wg.Done()
++				for i := 0; i < N; i++ {
++					u, err := uuid.NewV6WithTime(&ct)
++					if err != nil {
++						panic(err)
++					}
++					res[g] = append(res[g], u)
++				}
++			}(g)
++		}
++		wg.Wait()
++		seen := map[uuid.UUID]int{}
++		dups := 0
++		for _, r := range res {
++			for _, u := range r {
++				seen[u]++
++				if seen[u] == 2 {
++					dups++
++				}
++			}
++		}
++		if dups > 0 {
++			t.Fatalf("round %d: %d goroutines × %d NewV6WithTime(%v) calls: %d distinct UUIDs, %d duplicated", round, G, N, ct, len(seen), dups)
++		}
++	}
++}
++
++// uuid/2: UUID.Scan of a NULL, an empty string or an empty []byte leaves the previous value in
++// the destination (the source comments say "we return a null UUID").
++func TestHegelPinScanOfNullResetsTheValue(t *testing.T) {
++	defer guard(t)
++	for _, src := range []any{nil, "", []byte{}} {
++		u := uuid.MustParse("12345678-abcd-1234-abcd-0123456789ab")
++		if err := u.Scan(src); err != nil {
++			t.Fatalf("Scan(%#v): %v", src, err)
++		}
++		if u != uuid.Nil {
++			t.Fatalf("Scan(%#v) left the previous value %v in place; want the Nil UUID", src, u)
++		}
++	}
++}
++
++// uuid/3: NullUUID.Scan("") reports Valid = true (with the Nil UUID, or a stale one) although
++// UUID.Scan treats the empty string as a NULL and Scan(nil) gives Valid = false.
++func TestHegelPinNullUUIDScanOfEmptyStringIsNull(t *testing.T) {
++	defer guard(t)
++	for _, src := range []any{"", []byte{}} {
++		var nu uuid.NullUUID
++		if err := nu.Scan(src); err != nil {
++			t.Fatalf("NullUUID.Scan(%#v): %v", src, err)
++		}
++		if nu.Valid {
++			t.Fatalf("NullUUID.Scan(%#v) = %+v; want Valid = false as for Scan(nil)", src, nu)
++		}
++	}
++}
++
++// uuid/4: the null NullUUID marshals to the text "null" and to an empty binary, and neither
++// decodes: UnmarshalText("null") and UnmarshalBinary(nil) are errors, so a JSON object keyed by
++// NullUUID (map keys use the text form) does not round-trip.
++func TestHegelPinNullUUIDNullTextAndBinaryRoundTrip(t *testing.T) {
++	defer guard(t)
++	var null uuid.NullUUID
++	txt, err := null.MarshalText()
++	if err != nil {
++		t.Fatalf("MarshalText: %v", err)
++	}
++	var back uuid.NullUUID
++	if err := back.UnmarshalText(txt); err != nil || back != null {
++		t.Fatalf("UnmarshalText(MarshalText(null) = %q) = %+v, %v", txt, back, err)
++	}
++	bin, err := null.MarshalBinary()
++	if err != nil {
++		t.Fatalf("MarshalBinary: %v", err)
++	}
++	if err := back.UnmarshalBinary(bin); err != nil || back != null {
++		t.Fatalf("UnmarshalBinary(MarshalBinary(null) = %x) = %+v, %v", bin, back, err)
++	}
++}
++
++// uuid/5: NewV6WithTime accepts instants the 60-bit Gregorian timestamp cannot hold (before
++// 1582-10-15) and instants Go's UnixNano cannot hold (before 1678-09-21 or after 2262-04-11,
++// although the RFC timestamp reaches 5236) and returns a UUID with a garbage timestamp
++// (1500-01-01 reads back as 2084-07-20, 1600-01-01 as 2184-07-20, 2300-01-01 as 1715-06-13)
++// instead of an error.
++func TestHegelPinNewV6WithTimeRejectsUnrepresentableInstants(t *testing.T) {
++	defer guard(t)
++	for _, y := range []int{1500, 1600, 2300} {
++		at := time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
++		u, err := uuid.NewV6WithTime(&at)
++		if err != nil {
++			continue // an error is the acceptable outcome
++		}
++		sec, nsec := u.Time().UnixTime()
++		if back := time.Unix(sec, nsec).UTC(); !back.Equal(at) {
++			t.Fatalf("NewV6WithTime(%v) = %v with no error; Time() reads back as %v", at, u, back)
++		}
++	}
++}
++
++// uuid/6: SetNodeID of six zero bytes returns true but the zero node is the library's "not set"
++// sentinel: NodeID() and the next NewUUID/NewV6 replace it with the hardware address (or random
++// bits), so the caller's node is silently discarded.
++func TestHegelPinSetNodeIDAcceptsTheZeroNode(t *testing.T) {
++	defer guard(t)
++	zero := make([]byte, 6)
++	if !uuid.SetNodeID(zero) {
++		t.Fatalf("SetNodeID(%x) = false", zero)
++	}
++	got := uuid.NodeID()
++	u, err := uuid.NewUUID()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(got, zero) || !bytes.Equal(u.NodeID(), zero) {
++		t.Fatalf("after SetNodeID(%x): NodeID() = %x, NewUUID().NodeID() = %x (interface %q)", zero, got, u.NodeID(), uuid.NodeInterface())
++	}
++}
++
++// sanity: the harness's own model is exact on the RFC's example v1/v6/v7 values.
++func TestHegelRFCExamples(t *testing.T) {
++	v1 := uuid.MustParse("C232AB00-9414-11EC-B3C8-9F6BDECED846")
++	v6 := uuid.MustParse("1EC9414C-232A-6B00-B3C8-9F6BDECED846")
++	v7 := uuid.MustParse("017F22E2-79B0-7CC3-98C4-DC0C0C07398F")
++	if v1.Time() != v6.Time() || v1Time(v1) != v6Time(v6) {
++		t.Fatalf("RFC 9562 v1/v6 examples: Time() %d vs %d", v1.Time(), v6.Time())
++	}
++	if s, ns := v1.Time().UnixTime(); time.Unix(s, ns).UTC() != time.Date(2022, 2, 22, 19, 22, 22, 0, time.UTC) {
++		t.Fatalf("RFC 9562 v1 example: UnixTime %v", time.Unix(s, ns).UTC())
++	}
++	if s, ns := v7.Time().UnixTime(); time.Unix(s, ns).UTC() != time.Date(2022, 2, 22, 19, 22, 22, 0, time.UTC) {
++		t.Fatalf("RFC 9562 v7 example: UnixTime %v", time.Unix(s, ns).UTC())
++	}
++}
