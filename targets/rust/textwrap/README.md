@@ -56,3 +56,4 @@
 - 2026-09-14: base bumped 6df2560c0d87 → 655a60a8af0d (2026-09-14, "Merge pull request #642 from mgeisler/crates-io-trusted-publishing"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
 - 2026-09-14: base bumped 655a60a8af0d → c54a1f3e8f24 (2026-09-14, "Merge pull request #644 from mgeisler/document-pr-separation-of-concerns"; 0.16.4); 2 bug(s) still reproduce. 233 tests pass.
 - 2026-09-15: base bumped c54a1f3e8f24 → 9b2e24ad12d3 (2026-09-15, "Merge pull request #645 from mgeisler/cleanup-wasm-demo-draw-text-arguments"; 0.16.4); 1 bug(s) still reproduce; intermittent, not seen this run: textwrap/2. 233 tests pass.
+- 2026-09-15: base bumped 9b2e24ad12d3 → f26a8df61bff (2026-09-15, "Merge pull request #646 from mgeisler/deploy-pages-via-actions"; 0.16.4); 1 bug(s) still reproduce; intermittent, not seen this run: textwrap/2. 233 tests pass.
