@@ -52,3 +52,4 @@
 - 2026-09-14: base bumped 85d4cbb0a9a8 → c14976481ea5 (2026-09-14, "fix: preserve missing Parquet null counts (#25242)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-14: base bumped c14976481ea5 → 6bbd3f42c3e8 (2026-09-14, "chore: Update Rust toolchain to 1.98.1 (#25295)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped 6bbd3f42c3e8 → a7305f1cd5c1 (2026-09-15, "minor: Remove empty public module `datafusion::physical_plan::joins::chain (#25286)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-15: base bumped a7305f1cd5c1 → add66e424fa1 (2026-09-15, "refactor: clean up aggregation planning (#25104)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
