@@ -33,6 +33,18 @@ largest Date, byte arrays, Sets, Maps with non-string keys, shared substructure 
   random `default_flow_style`, `width`, `indent`, `default_style` (`"`, `'`, `|`, `>`) and
   `allow_unicode`, read with js-yaml's YAML11 schema (plus `realMapTag` for Maps): same value.
 
+- **TestHegelGeneratedDocumentsLoadToTheTreeTheyWereWrittenFrom** — the parser side: a tree
+  of nulls, booleans, ints, floats, strings, sequences and mappings is written by the zoo's
+  randomised writer (`test/hegel-yaml-writer.mjs`, a port of the go-yaml target's) as a
+  document in random styles — block collections at random indentation (indentless
+  sequences, compact `- - a` / `- k: v`, an indented root), flow collections with random
+  spacing and trailing commas, plain / single-quoted / double-quoted scalars with every
+  escape form, literal and folded block scalars with random chomping and indentation
+  indicators, explicit `? ` keys, comments everywhere, `---`/`...` markers — staying inside
+  what YAML 1.1 and 1.2 read alike (both js-yaml schemas must give a plain string back before
+  it is written plain). `load` must return the tree; PyYAML reads the same text as the second
+  opinion, so a difference is attributed to js-yaml only when PyYAML agrees with the writer.
+
 Each bug has a pin (`TestHegelPin…`, listed in `target.toml`) that fails while the bug is
 present; the pins need only js-yaml.
 
@@ -48,8 +60,10 @@ consulted by hand where the two disagreed.
 - The `Type`/schema extension API beyond `withTags(realMapTag)`, `%TAG` handles, the CLI, the
   browser bundle, `maxAliases`/`maxDepth`/`maxTotalMergeKeys` limits, `json: true`, `onWarning`,
   `filename`/error positions, the FAILSAFE and JSON schemas on their own.
-- Arbitrary YAML *text*: there is no grammar generator yet, so the parser is exercised only on
-  what js-yaml and PyYAML write.
+- What the writer does not yet produce: anchors and aliases, explicit tags, multi-line plain
+  scalars, tabs as in-line separation, `%YAML`/`%TAG` directives, multi-document streams,
+  keys that are collections, and the YAML 1.1/1.2 differences themselves (`0o17`, `1_000`,
+  `y`/`n`, `1:30`, timestamps as plain scalars are always quoted).
 
 Differences between js-yaml and PyYAML that are not counted (each skipped with a `limit/…`):
 Python cannot hash a list or dict, so Sets with collection members and Maps with collection
