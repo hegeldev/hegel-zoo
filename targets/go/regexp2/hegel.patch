@@ -1,0 +1,1716 @@
+diff --git a/go.mod b/go.mod
+index 316580a..798182e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/dlclark/regexp2/v2
+ 
+-go 1.25
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..d4c683e
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1694 @@
++package regexp2_test
++
++import (
++	"bufio"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"reflect"
++	"regexp"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode"
++	"unicode/utf8"
++
++	regexp2 "github.com/dlclark/regexp2/v2"
++	"github.com/dlclark/regexp2/v2/compat"
++	"github.com/dlclark/regexp2/v2/syntax"
++	"hegel.dev/go/hegel"
++)
++
++// Property-based tests for dlclark/regexp2. The oracles: Perl 5.38 held open as a child
++// for the default (.NET/Perl) syntax — literals, classes, anchors, groups (named and not),
++// lookarounds, atomic groups, possessive quantifiers, backreferences, i/m/s flags — on the
++// first match from a start position and on the sequence of matches; Go's regexp for the
++// compat adapter and the RE2 option on the RE2-expressible subset of the same grammar, method
++// by method; and models for Replace (the documented substitution syntax over the match
++// sequence), Split (the documented rules), group numbering, Escape/Unescape and
++// RightToLeft. Collect mode (REGEXP2_COLLECT=1) prints every disagreement instead of failing.
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("REGEXP2_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			statsMu.Lock()
++			keys := make([]string, 0, len(stats))
++			for k := range stats {
++				keys = append(keys, k)
++			}
++			sort.Strings(keys)
++			var sb strings.Builder
++			for _, k := range keys {
++				fmt.Fprintf(&sb, " %s=%d", k, stats[k])
++			}
++			stats = map[string]int{}
++			statsMu.Unlock()
++			t.Logf("COLLECT %s: %d mismatches; stats%s", t.Name(), len(collectedMsgs), sb.String())
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++var (
++	statsMu sync.Mutex
++	stats   = map[string]int{}
++)
++
++// count tallies an outcome for the collect-mode summary.
++func count(name string) {
++	statsMu.Lock()
++	stats[name]++
++	statsMu.Unlock()
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---------------------------------------------------------------- Perl child
++
++const perlScript = `
++use strict; use warnings; use JSON::PP;
++binmode(STDIN, ':encoding(UTF-8)'); binmode(STDOUT, ':encoding(UTF-8)');
++$| = 1;
++my $json = JSON::PP->new->utf8(0)->canonical(1);
++sub groups { my @g; for my $i (0..$#+) { push @g, defined $-[$i] ? [$-[$i], $+[$i]-$-[$i]] : undef } return \@g }
++while (my $line = <STDIN>) {
++  chomp $line;
++  my $req = $json->decode($line);
++  my $res = {};
++  my @warns;
++  local $SIG{__WARN__} = sub { push @warns, "$_[0]" };
++  my $pat = $req->{pattern};
++  my $flags = $req->{flags} // "";
++  my $re = eval { length($flags) ? qr/(?$flags)$pat/ : qr/$pat/ };
++  if (!defined $re) { $res->{error} = "compile: $@"; }
++  else {
++    my $text = $req->{text};
++    my $start = $req->{start} // 0;
++    eval {
++      local $SIG{ALRM} = sub { die "timeout\n" };
++      alarm 3;
++      pos($text) = $start;
++      if ($text =~ /$re/g) { $res->{first} = groups(); } else { $res->{first} = undef; }
++      if ($req->{all}) {
++        my @all; pos($text) = 0;
++        while ($text =~ /$re/g) { push @all, groups(); last if @all > 200; }
++        $res->{all} = \@all;
++      }
++      alarm 0;
++    };
++    if ($@) { $res->{error} = "match: $@"; }
++  }
++  $res->{warn} = join(" | ", @warns) if @warns;
++  print $json->encode($res), "\n";
++}
++`
++
++type perlGroups [][2]int // per group: {index, length}; length -1 = did not participate
++
++type perlResult struct {
++	First *[]*[2]int  `json:"first"`
++	All   [][]*[2]int `json:"all"`
++	Error string      `json:"error"`
++	Warn  string      `json:"warn"`
++}
++
++type perlChild struct {
++	mu  sync.Mutex
++	in  *bufio.Writer
++	out *bufio.Reader
++	err error
++}
++
++var (
++	perl     *perlChild
++	perlOnce sync.Once
++)
++
++func perlOracle(t testing.TB) *perlChild {
++	perlOnce.Do(func() {
++		c := &perlChild{}
++		cmd := exec.Command("perl", "-e", perlScript)
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			c.err = err
++			perl = c
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			c.err = err
++			perl = c
++			return
++		}
++		cmd.Stderr = os.Stderr
++		if err := cmd.Start(); err != nil {
++			c.err = err
++			perl = c
++			return
++		}
++		c.in = bufio.NewWriter(stdin)
++		c.out = bufio.NewReader(stdout)
++		perl = c
++	})
++	if perl.err != nil {
++		t.Fatalf("perl child: %v", perl.err)
++	}
++	return perl
++}
++
++func perlMatch(t testing.TB, pattern, flags, text string, start int, all bool) perlResult {
++	c := perlOracle(t)
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	req, _ := json.Marshal(map[string]any{"pattern": pattern, "flags": flags, "text": text, "start": start, "all": all})
++	c.in.Write(req)
++	c.in.WriteByte('\n')
++	if err := c.in.Flush(); err != nil {
++		t.Fatalf("perl child write: %v", err)
++	}
++	line, err := c.out.ReadBytes('\n')
++	if err != nil {
++		t.Fatalf("perl child read: %v", err)
++	}
++	var res perlResult
++	if err := json.Unmarshal(line, &res); err != nil {
++		t.Fatalf("perl child: bad reply %q: %v", line, err)
++	}
++	return res
++}
++
++// toGroups turns Perl's group list into perlGroups (a nil entry becomes {-1, -1}).
++func toGroups(gs []*[2]int) perlGroups {
++	out := make(perlGroups, len(gs))
++	for i, g := range gs {
++		if g == nil {
++			out[i] = [2]int{-1, -1}
++		} else {
++			out[i] = *g
++		}
++	}
++	return out
++}
++
++// ---------------------------------------------------------------- pattern grammar
++
++// A generated pattern rendered for the three consumers. Textual group k (1-based) is named
++// name[k-1] ("" for an unnamed group). .NET numbers unnamed groups first, then named ones;
++// Perl and Go number them in textual order.
++type pattern struct {
++	net, perl, re2 string
++	names          []string // per textual capturing group
++	flags          string   // subset of "ims"
++	re2ok          bool     // expressible in Go's regexp
++	simple         bool     // no backreference, atomic group, possessive quantifier or lookaround
++	hasCaret       bool
++	possessive     bool   // a possessive quantifier (Perl's own answers are unreliable there)
++	wordBoundary   bool   // \b or \B present
++	nullLoop       bool   // a group whose body may match empty sits under a quantifier other than ? or {1}
++	inNeg          []bool // per textual capturing group: inside a negative lookaround
++	perlLazyWide   bool   // a lazy quantifier directly before a literal above U+00FF (Perl's optimiser answers wrongly)
++	perlLookQuant  bool   // a quantifier inside a lookahead (Perl's optimiser answers wrongly under /i)
++	nonWordLoopB   bool   // \B right after a loop of non-word characters (regexp2/8)
++}
++
++// netNumber is the .NET group number of textual group k.
++func (p *pattern) netNumber(k int) int {
++	unnamed := 0
++	for _, nm := range p.names {
++		if nm == "" {
++			unnamed++
++		}
++	}
++	if p.names[k-1] == "" {
++		j := 0
++		for i := 0; i < k; i++ {
++			if p.names[i] == "" {
++				j++
++			}
++		}
++		return j
++	}
++	j := 0
++	for i := 0; i < k; i++ {
++		if p.names[i] != "" {
++			j++
++		}
++	}
++	return unnamed + j
++}
++
++type gen struct {
++	tc             hegel.TestCase
++	net, perl, re2 strings.Builder
++	p              *pattern
++	naming         int // 0 unnamed, 1 all named, 2 mixed
++	depth          int
++	closed         int  // capturing groups already closed (backreference targets)
++	neg            int  // negative lookarounds open
++	lastLazy       bool // the previous piece ended with a lazy quantifier
++	look           int  // lookarounds open
++	nonWordLoop    bool // the last consuming atom was a quantified \D, \W or non-word literal
++	lastNonWord    bool // the atom just emitted was \D, \W or a non-word literal
++}
++
++func (g *gen) emit(s string) { g.net.WriteString(s); g.perl.WriteString(s); g.re2.WriteString(s) }
++
++func (g *gen) emit3(net, perl, re2 string) {
++	g.net.WriteString(net)
++	g.perl.WriteString(perl)
++	g.re2.WriteString(re2)
++}
++
++var (
++	literalPool = []string{"a", "b", "A", "0", "1", " ", "-", `\n`, "é", "日", "😀"}
++	classPool   = []string{`\d`, `\w`, `\s`, `\D`, `\W`, `\S`}
++	bracketPool = []string{"a", "b", "0", "a-b", "0-1", `\d`, `\w`, `\s`, "é", "日", " ", `\n`, "😀"}
++	anchorPool  = []string{"^", "$", `\A`, `\z`, `\b`, `\B`, `\Z`}
++)
++
++func genPattern(tc hegel.TestCase) *pattern {
++	g := &gen{tc: tc, p: &pattern{re2ok: true, simple: true}}
++	g.naming = n(tc, 0, 2)
++	if chance(tc, 40) {
++		for _, f := range "ims" {
++			if chance(tc, 50) {
++				g.p.flags += string(f)
++			}
++		}
++	}
++	g.alt(true)
++	g.p.net, g.p.perl, g.p.re2 = g.net.String(), g.perl.String(), g.re2.String()
++	return g.p
++}
++
++// alt, cat and piece report whether what they emitted can match the empty string.
++func (g *gen) alt(nonEmpty bool) bool {
++	k := 1
++	if g.depth < 3 && chance(g.tc, 30) {
++		k = n(g.tc, 2, 3)
++	}
++	nullable := false
++	for i := 0; i < k; i++ {
++		if i > 0 {
++			g.emit("|")
++		}
++		if g.cat(nonEmpty && i == 0) {
++			nullable = true
++		}
++	}
++	return nullable
++}
++
++func (g *gen) cat(nonEmpty bool) bool {
++	lo := 0
++	if nonEmpty {
++		lo = 1
++	}
++	k := n(g.tc, lo, 4)
++	nullable := true
++	for i := 0; i < k; i++ {
++		if !g.piece() {
++			nullable = false
++		}
++	}
++	return nullable
++}
++
++func (g *gen) piece() bool {
++	quantifiable, nullable := g.atom()
++	if quantifiable && chance(g.tc, 35) {
++		lo, hi := 1, 1 // hi -1: unbounded
++		switch n(g.tc, 0, 5) {
++		case 0:
++			g.emit("*")
++			lo, hi = 0, -1
++		case 1:
++			g.emit("+")
++			lo, hi = 1, -1
++		case 2:
++			g.emit("?")
++			lo, hi = 0, 1
++		case 3:
++			m := n(g.tc, 0, 2)
++			g.emit(fmt.Sprintf("{%d}", m))
++			lo, hi = m, m
++		case 4:
++			m := n(g.tc, 0, 2)
++			g.emit(fmt.Sprintf("{%d,}", m))
++			lo, hi = m, -1
++		case 5:
++			m := n(g.tc, 0, 2)
++			x := m + n(g.tc, 0, 2)
++			g.emit(fmt.Sprintf("{%d,%d}", m, x))
++			lo, hi = m, x
++		}
++		if nullable && hi != 1 {
++			// An iteration that matches empty: .NET takes it once (and keeps its captures),
++			// Perl and RE2 do not — the group captures are legitimately different.
++			g.p.nullLoop = true
++		}
++		if lo == 0 {
++			nullable = true
++		}
++		if g.lastNonWord && lo > 0 {
++			g.nonWordLoop = true
++		}
++		if g.look > 0 {
++			g.p.perlLookQuant = true
++		}
++		lazy := false
++		switch n(g.tc, 0, 9) {
++		case 0, 1, 2:
++			g.emit("?") // lazy
++			lazy = true
++		case 3:
++			g.emit("+") // possessive
++			g.p.re2ok, g.p.simple, g.p.possessive = false, false, true
++		}
++		g.lastLazy = lazy
++	} else {
++		g.lastLazy = false
++	}
++	return nullable
++}
++
++// nonWordLiteral: a literal from literalPool that is not a word character.
++func nonWordLiteral(lit string) bool {
++	return lit == " " || lit == "-" || lit == `\n`
++}
++
++// atom emits one atom and reports whether a quantifier may follow it and whether it can
++// match the empty string.
++func (g *gen) atom() (quantifiable, nullable bool) {
++	w := n(g.tc, 0, 99)
++	if g.depth >= 3 {
++		w = n(g.tc, 0, 64) // no groups or lookarounds at the bottom
++	}
++	g.lastNonWord = false
++	if w < 65 || w >= 94 { // literal, ., class, bracket, backreference: consuming
++		g.nonWordLoop = false
++	}
++	switch {
++	case w < 35:
++		lit := pick(g.tc, literalPool)
++		if r, _ := utf8.DecodeRuneInString(lit); g.lastLazy && r > 0xFF {
++			g.p.perlLazyWide = true
++		}
++		g.lastNonWord = nonWordLiteral(lit)
++		g.emit(lit)
++		return true, false
++	case w < 43:
++		g.emit(".")
++		return true, false
++	case w < 53:
++		c := pick(g.tc, classPool)
++		g.lastNonWord = c == `\D` || c == `\W`
++		g.emit(c)
++		return true, false
++	case w < 65:
++		var sb strings.Builder
++		sb.WriteString("[")
++		if chance(g.tc, 30) {
++			sb.WriteString("^")
++		}
++		if chance(g.tc, 20) {
++			sb.WriteString("-")
++		}
++		for i, k := 0, n(g.tc, 1, 3); i < k; i++ {
++			sb.WriteString(pick(g.tc, bracketPool))
++		}
++		sb.WriteString("]")
++		g.emit(sb.String())
++		return true, false
++	case w < 73:
++		a := pick(g.tc, anchorPool)
++		if a == "^" {
++			g.p.hasCaret = true
++		}
++		if a == `\Z` {
++			g.p.re2ok = false
++		}
++		if a == `\b` || a == `\B` {
++			g.p.wordBoundary = true
++		}
++		if a == `\B` && g.nonWordLoop {
++			g.p.nonWordLoopB = true
++		}
++		g.emit(a)
++		return false, true
++	case w < 88:
++		return true, g.group()
++	case w < 94:
++		g.lookaround()
++		return false, true
++	default:
++		if g.closed == 0 {
++			g.emit(pick(g.tc, literalPool))
++			return true, false
++		}
++		k := n(g.tc, 1, g.closed)
++		g.p.re2ok, g.p.simple = false, false
++		if nm := g.p.names[k-1]; nm != "" {
++			g.emit3(`\k<`+nm+`>`, `\k<`+nm+`>`, "")
++		} else {
++			g.emit3(fmt.Sprintf(`(?:\%d)`, g.p.netNumber(k)), fmt.Sprintf(`\g{%d}`, k), "")
++		}
++		return true, true // the group it refers to may have captured ""
++	}
++}
++
++// group emits a group and reports whether its body can match the empty string.
++func (g *gen) group() (nullable bool) {
++	g.depth++
++	defer func() { g.depth-- }()
++	switch n(g.tc, 0, 9) {
++	case 0, 1:
++		g.emit("(?:")
++		nullable = g.alt(false)
++		g.emit(")")
++	case 2:
++		g.p.re2ok, g.p.simple = false, false
++		g.emit3("(?>", "(?>", "(?:")
++		nullable = g.alt(false)
++		g.emit(")")
++	default:
++		named := g.naming == 1 || (g.naming == 2 && chance(g.tc, 50))
++		k := len(g.p.names) + 1
++		name := ""
++		if named {
++			name = fmt.Sprintf("g%d", k)
++			g.emit3("(?<"+name+">", "(?<"+name+">", "(?P<"+name+">")
++		} else {
++			g.emit("(")
++		}
++		g.p.names = append(g.p.names, name)
++		g.p.inNeg = append(g.p.inNeg, g.neg > 0)
++		nullable = g.alt(false)
++		g.emit(")")
++		g.closed++
++	}
++	return nullable
++}
++
++func (g *gen) lookaround() {
++	g.p.re2ok, g.p.simple = false, false
++	g.depth++
++	defer func() { g.depth-- }()
++	switch n(g.tc, 0, 3) {
++	case 0:
++		g.emit("(?=")
++		g.look++
++		g.alt(false)
++		g.look--
++	case 1:
++		g.emit("(?!")
++		g.neg++
++		g.look++
++		g.alt(false)
++		g.look--
++		g.neg--
++	case 2:
++		g.emit("(?<=")
++		g.fixed()
++	default:
++		g.emit("(?<!")
++		g.fixed()
++	}
++	g.emit(")")
++}
++
++// fixed emits a fixed-length body (single-character atoms only): Perl's variable-length
++// lookbehind is experimental, .NET's is not, so the comparison stays on common ground.
++func (g *gen) fixed() {
++	for i, k := 0, n(g.tc, 1, 2); i < k; i++ {
++		switch n(g.tc, 0, 2) {
++		case 0:
++			g.emit(pick(g.tc, literalPool))
++		case 1:
++			g.emit(".")
++		default:
++			g.emit(pick(g.tc, classPool))
++		}
++	}
++}
++
++var textAlphabet = []rune{'a', 'b', 'A', '0', '1', ' ', '\n', '-', 'é', 'É', '日', '😀'}
++
++func genText(tc hegel.TestCase) string {
++	var sb strings.Builder
++	for i, k := 0, n(tc, 0, 10); i < k; i++ {
++		sb.WriteRune(pick(tc, textAlphabet))
++	}
++	return sb.String()
++}
++
++func netOptions(flags string) regexp2.RegexOptions {
++	var o regexp2.RegexOptions
++	for _, f := range flags {
++		switch f {
++		case 'i':
++			o |= regexp2.IgnoreCase
++		case 'm':
++			o |= regexp2.Multiline
++		case 's':
++			o |= regexp2.Singleline
++		}
++	}
++	return o
++}
++
++// ---------------------------------------------------------------- helpers
++
++// firstCharExcludes reports whether the engine's start-position filters for pattern (the
++// first-character set and the fixed-distance sets the analyser derives) reject a match that
++// begins at runes[start]. A true answer on a genuine match is the pinned regexp2/1.
++func firstCharExcludes(pattern string, opts regexp2.RegexOptions, runes []rune, start int) bool {
++	if start >= len(runes) {
++		return false
++	}
++	tree, err := syntax.Parse(pattern, syntax.ParseOptions{RegexOptions: syntax.RegexOptions(opts)})
++	if err != nil {
++		return false
++	}
++	code, err := syntax.Write(tree)
++	if err != nil {
++		return false
++	}
++	in := func(set syntax.CharSet, r rune) bool {
++		return set.CharIn(r) || set.CharIn(unicode.ToLower(r)) || set.CharIn(unicode.ToUpper(r))
++	}
++	// The decisive check: anchored at start with \G the engine's search filters are not
++	// consulted; if the pattern matches there but the unanchored search skipped the
++	// position, a filter excluded it.
++	anchored, err := regexp2.Compile(`\G(?:`+pattern+`)`, opts)
++	if err != nil {
++		anchored, err = regexp2.Compile(`\G(?:`+pattern+`)`, opts&^regexp2.RE2)
++	}
++	if err == nil {
++		if m, err := anchored.FindRunesMatchStartingAt(runes, start); err == nil && m != nil {
++			plain, err := regexp2.Compile(pattern, opts)
++			if err == nil {
++				if pm, err := plain.FindRunesMatchStartingAt(runes, start); err == nil && (pm == nil || pm.RuneIndex != start) {
++					return true
++				}
++			}
++		}
++	}
++	if fc := code.FcPrefix; fc != nil && !in(fc.PrefixSet, runes[start]) {
++		return true
++	}
++	if fo := code.FindOptimizations; fo != nil {
++		for _, fs := range fo.FixedDistanceSets {
++			i := start + fs.Distance
++			if i >= len(runes) {
++				continue
++			}
++			r := runes[i]
++			switch {
++			case fs.Set != nil:
++				if !in(*fs.Set, r) {
++					return true
++				}
++			case fs.Range != nil:
++				inRange := (r >= fs.Range.First && r <= fs.Range.Last) ||
++					(unicode.ToLower(r) >= fs.Range.First && unicode.ToLower(r) <= fs.Range.Last) ||
++					(unicode.ToUpper(r) >= fs.Range.First && unicode.ToUpper(r) <= fs.Range.Last)
++				if inRange == fs.Negated {
++					return true
++				}
++			case len(fs.Chars) > 0:
++				found := false
++				for _, c := range fs.Chars {
++					if c == r || c == unicode.ToLower(r) || c == unicode.ToUpper(r) {
++						found = true
++					}
++				}
++				if found == fs.Negated {
++					return true
++				}
++			}
++		}
++	}
++	return false
++}
++
++// groupsOf reads textual groups 0..len(names) of m in the Perl layout: rune index and length,
++// {-1,-1} when the group did not participate.
++func groupsOf(m *regexp2.Match, p *pattern) perlGroups {
++	out := perlGroups{{m.RuneIndex, m.RuneLength}}
++	for k := 1; k <= len(p.names); k++ {
++		var grp *regexp2.Group
++		if nm := p.names[k-1]; nm != "" {
++			grp = m.GroupByName(nm)
++		} else {
++			grp = m.GroupByNumber(p.netNumber(k))
++		}
++		if grp == nil || len(grp.Captures) == 0 {
++			out = append(out, [2]int{-1, -1})
++		} else {
++			out = append(out, [2]int{grp.RuneIndex, grp.RuneLength})
++		}
++	}
++	return out
++}
++
++// judged keeps of a group vector what both engines define: only group 0 when a group with a
++// nullable body sits under a loop (.NET takes one empty iteration and keeps its captures,
++// Perl does not), and no group inside a negative lookaround (Perl keeps the captures of the
++// failed body, .NET discards them).
++func judged(p *pattern, gs perlGroups) perlGroups {
++	if p.nullLoop {
++		return gs[:1]
++	}
++	out := append(perlGroups(nil), gs...)
++	for k := 1; k < len(out) && k-1 < len(p.inNeg); k++ {
++		if p.inNeg[k-1] {
++			out[k] = [2]int{-1, -1}
++		}
++	}
++	return out
++}
++
++func (p *pattern) hasNegGroup() bool {
++	for _, b := range p.inNeg {
++		if b {
++			return true
++		}
++	}
++	return false
++}
++
++func chainMatches(re *regexp2.Regexp, text string) ([]*regexp2.Match, error) {
++	var out []*regexp2.Match
++	m, err := re.FindStringMatch(text)
++	for err == nil && m != nil && len(out) < 200 {
++		out = append(out, m)
++		m, err = re.FindNextMatch(m)
++	}
++	return out, err
++}
++
++func hasEmpty(ms []*regexp2.Match) bool {
++	for _, m := range ms {
++		if m.RuneLength == 0 {
++			return true
++		}
++	}
++	return false
++}
++
++// skipMultilineCaret: .NET's Multiline ^ matches after a final newline, Perl's /m does not.
++func skipMultilineCaret(p *pattern, text string) bool {
++	return p.hasCaret && strings.Contains(p.flags, "m") && strings.HasSuffix(text, "\n")
++}
++
++// ---------------------------------------------------------------- properties
++
++// TestHegelFirstMatchAgreesWithPerl: FindRunesMatchStartingAt from every start position, and
++// FindStringMatch from 0, give the same group 0 and the same participating groups (rune index
++// and length, last capture) as Perl.
++func TestHegelFirstMatchAgreesWithPerl(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		text := genText(ht)
++		runes := []rune(text)
++		start := n(ht, 0, len(runes))
++		note(ht, "pattern=%q perl=%q flags=%q text=%q start=%d", p.net, p.perl, p.flags, text, start)
++		re, err := regexp2.Compile(p.net, netOptions(p.flags))
++		pr := perlMatch(ht, p.perl, p.flags, text, start, false)
++		if pr.Error != "" && strings.HasPrefix(pr.Error, "compile") {
++			count("perl-rejects")
++			if err == nil {
++				note(ht, "perl rejects %q (%s), regexp2 accepts", p.perl, strings.TrimSpace(pr.Error))
++			}
++			return
++		}
++		if err != nil {
++			fail(ht, "Compile(%q) fails: %v; perl accepts %q", p.net, err, p.perl)
++		}
++		if pr.Error != "" {
++			count("perl-match-error")
++			note(ht, "perl: %s", strings.TrimSpace(pr.Error))
++			return
++		}
++		if pr.Warn != "" {
++			w := pr.Warn
++			if i := strings.Index(w, " in m/"); i > 0 {
++				w = w[:i]
++			}
++			if i := strings.Index(w, " at -e"); i > 0 {
++				w = w[:i]
++			}
++			count("perl-warns:" + w)
++			note(ht, "perl warns: %s", pr.Warn)
++		}
++		if skipMultilineCaret(p, text) {
++			count("skip-multiline-caret")
++			note(ht, "multiline ^ after a final newline: not judged")
++			return
++		}
++		m, err := re.FindRunesMatchStartingAt(runes, start)
++		if errors.Is(err, regexp2.ErrBacktrackingStackLimit) {
++			count("backtracking-limit")
++			note(ht, "backtracking limit")
++			return
++		}
++		if err != nil {
++			fail(ht, "FindRunesMatchStartingAt(%q, %d) with %q: %v", text, start, p.net, err)
++		}
++		if p.possessive {
++			count("skip-possessive")
++			note(ht, "possessive quantifier: perl's own answer is unreliable, not judged")
++			return
++		}
++		if p.perlLazyWide {
++			count("skip-perl-lazy-wide-literal")
++			note(ht, "lazy quantifier before a literal above U+00FF: perl's own answer is unreliable, not judged")
++			return
++		}
++		if p.perlLookQuant && strings.Contains(p.flags, "i") {
++			count("skip-perl-quantifier-in-lookahead-i")
++			note(ht, "quantifier inside a lookahead under /i: perl's own answer is unreliable, not judged")
++			return
++		}
++		if p.nonWordLoopB {
++			count("skip-non-word-loop-before-B")
++			note(ht, `\B after a loop of non-word characters: pinned (regexp2/8), not judged`)
++			return
++		}
++		if pr.First != nil && (m == nil || m.RuneIndex != (*pr.First)[0][0]) {
++			if at := (*pr.First)[0][0]; at < len(runes) && firstCharExcludes(p.net, netOptions(p.flags), runes, at) {
++				count("skip-first-char-filter")
++				note(ht, "perl's match starts with %q, which the first-character filter excludes (regexp2/1)", runes[at])
++				return
++			}
++		}
++		if m == nil {
++			count("compared-nomatch")
++		} else {
++			count("compared-match")
++		}
++		if p.nullLoop {
++			count("judged-group0-only")
++		} else if p.hasNegGroup() {
++			count("judged-without-negative-lookaround-groups")
++		}
++		if pr.First == nil {
++			if m != nil {
++				fail(ht, "%q matches %q from %d at %v; perl (%q) finds no match", p.net, text, start, groupsOf(m, p), p.perl)
++			}
++		} else {
++			want := judged(p, toGroups(*pr.First))
++			if m == nil {
++				fail(ht, "%q finds no match in %q from %d; perl (%q) matches %v", p.net, text, start, p.perl, want)
++			}
++			if got := judged(p, groupsOf(m, p)); !reflect.DeepEqual(got, want) {
++				fail(ht, "%q on %q from %d: groups %v; perl (%q) %v", p.net, text, start, got, p.perl, want)
++			}
++		}
++		if start == 0 {
++			ms, err := re.FindStringMatch(text)
++			if err == nil && (ms == nil) != (m == nil) {
++				fail(ht, "FindStringMatch and FindRunesMatchStartingAt(0) disagree on %q / %q", p.net, text)
++			}
++			if err == nil && m != nil && !reflect.DeepEqual(groupsOf(ms, p), groupsOf(m, p)) {
++				fail(ht, "FindStringMatch %v and FindRunesMatchStartingAt(0) %v differ on %q / %q", groupsOf(ms, p), groupsOf(m, p), p.net, text)
++			}
++		}
++	})
++}
++
++// TestHegelMatchSequenceAgreesWithPerl: the FindStringMatch/FindNextMatch chain equals Perl's
++// //g sequence when no match is empty (the two engines restart differently after an empty
++// match — .NET one position on, Perl a non-empty retry — so those are judged by the model in
++// TestHegelReplaceAndSplitFollowTheMatchSequence).
++func TestHegelMatchSequenceAgreesWithPerl(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		text := genText(ht)
++		note(ht, "pattern=%q perl=%q flags=%q text=%q", p.net, p.perl, p.flags, text)
++		re, err := regexp2.Compile(p.net, netOptions(p.flags))
++		if err != nil {
++			return // judged by TestHegelFirstMatchAgreesWithPerl
++		}
++		if skipMultilineCaret(p, text) {
++			return
++		}
++		ms, err := chainMatches(re, text)
++		if errors.Is(err, regexp2.ErrBacktrackingStackLimit) {
++			note(ht, "backtracking limit")
++			return
++		}
++		if err != nil {
++			fail(ht, "match chain of %q on %q: %v", p.net, text, err)
++		}
++		if hasEmpty(ms) {
++			count("skip-empty-match")
++			note(ht, "empty match in the sequence: not judged against perl")
++			return
++		}
++		if p.possessive {
++			count("skip-possessive")
++			return
++		}
++		if p.perlLazyWide {
++			count("skip-perl-lazy-wide-literal")
++			return
++		}
++		if p.perlLookQuant && strings.Contains(p.flags, "i") {
++			count("skip-perl-quantifier-in-lookahead-i")
++			return
++		}
++		if p.nonWordLoopB {
++			count("skip-non-word-loop-before-B")
++			return
++		}
++		pr := perlMatch(ht, p.perl, p.flags, text, 0, true)
++		if pr.Error != "" {
++			count("perl-error")
++			note(ht, "perl: %s", strings.TrimSpace(pr.Error))
++			return
++		}
++		runes := []rune(text)
++		for _, gs := range pr.All {
++			if gs[0] != nil && gs[0][0] < len(runes) && firstCharExcludes(p.net, netOptions(p.flags), runes, gs[0][0]) {
++				count("skip-first-char-filter")
++				note(ht, "a perl match starts with %q, which the first-character filter excludes (regexp2/1)", runes[gs[0][0]])
++				return
++			}
++		}
++		count("compared")
++		if p.nullLoop {
++			count("judged-group0-only")
++		} else if p.hasNegGroup() {
++			count("judged-without-negative-lookaround-groups")
++		}
++		got := make([]perlGroups, len(ms))
++		for i, m := range ms {
++			got[i] = judged(p, groupsOf(m, p))
++		}
++		want := make([]perlGroups, len(pr.All))
++		for i, gs := range pr.All {
++			want[i] = judged(p, toGroups(gs))
++		}
++		if !reflect.DeepEqual(got, want) {
++			fail(ht, "%q on %q: match sequence %v; perl (%q) %v", p.net, text, got, p.perl, want)
++		}
++	})
++}
++
++// ---- RE2 mode vs Go's regexp, through the compat adapter ----
++
++func byteIndex(text string, runeIdx int) int {
++	i := 0
++	for k := 0; k < runeIdx; k++ {
++		_, sz := utf8.DecodeRuneInString(text[i:])
++		i += sz
++	}
++	return i
++}
++
++// TestHegelCompatAdapterMatchesGoRegexp: on the RE2-expressible subset, every compat method
++// returns what regexp's does.
++func TestHegelCompatAdapterMatchesGoRegexp(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		if !p.re2ok {
++			return
++		}
++		text := genText(ht)
++		src := p.re2
++		if p.flags != "" {
++			src = "(?" + p.flags + ")" + src
++		}
++		note(ht, "pattern=%q text=%q", src, text)
++		std, serr := regexp.Compile(src)
++		copts := []regexp2.CompileOption{regexp2.RE2}
++		named, unnamed := false, false
++		for _, nm := range p.names {
++			if nm == "" {
++				unnamed = true
++			} else {
++				named = true
++			}
++		}
++		if named && unnamed {
++			// Pinned (regexp2/7): without it the submatch order is .NET's, not regexp's.
++			count("maintain-capture-order")
++			copts = append(copts, regexp2.OptionMaintainCaptureOrder())
++		}
++		re, err := compat.Compile(src, copts...)
++		if serr != nil {
++			if err == nil {
++				note(ht, "regexp rejects %q (%v), regexp2 RE2 accepts", src, serr)
++			}
++			return
++		}
++		if err != nil {
++			fail(ht, "compat.Compile(%q, RE2) fails: %v; regexp accepts", src, err)
++		}
++		if p.nullLoop {
++			// RE2 rejects an empty loop iteration, .NET takes one: "(?:a*?|b*?)*b+?" on "abb"
++			// is [0 3] for regexp and [0 2] for regexp2 (and Perl) — a difference between the
++			// two families, not judged.
++			count("skip-null-loop")
++			return
++		}
++		if p.nonWordLoopB {
++			count("skip-non-word-loop-before-B")
++			note(ht, `\B after a loop of non-word characters: pinned (regexp2/8), not judged`)
++			return
++		}
++		if p.wordBoundary && strings.ContainsAny(text, "éÉ日") {
++			// Pinned (regexp2/6): \b in RE2 mode treats non-ASCII letters as word characters.
++			count("skip-word-boundary-non-ascii")
++			note(ht, `\b with non-ASCII letters in the text: not judged (regexp2/6)`)
++			return
++		}
++		for _, loc := range std.FindAllStringIndex(text, -1) {
++			if loc[0] < len(text) {
++				if r, _ := utf8.DecodeRuneInString(text[loc[0]:]); firstCharExcludes(src, regexp2.RE2, []rune(text), utf8.RuneCountInString(text[:loc[0]])) {
++					count("skip-first-char-filter")
++					note(ht, "a regexp match starts with %q, which the first-character filter excludes (regexp2/1)", r)
++					return
++				}
++			}
++		}
++		count("compared")
++		b := []byte(text)
++		check := func(what string, got, want any) {
++			// A nil slice from regexp against an empty one from compat is pinned (regexp2/2).
++			gv, wv := reflect.ValueOf(got), reflect.ValueOf(want)
++			if gv.IsValid() && gv.Kind() == reflect.Slice && wv.IsValid() && wv.Kind() == reflect.Slice && gv.Len() == 0 && wv.Len() == 0 && gv.IsNil() != wv.IsNil() {
++				count("nil-vs-empty:" + what)
++				note(ht, "%s: compat %#v, regexp %#v (regexp2/2)", what, got, want)
++				return
++			}
++			if !reflect.DeepEqual(got, want) {
++				fail(ht, "%s: compat %v, regexp %v (pattern %q, text %q)", what, got, want, src, text)
++			}
++		}
++		check("MatchString", re.MatchString(text), std.MatchString(text))
++		check("Match", re.Match(b), std.Match(b))
++		check("MatchReader", re.MatchReader(strings.NewReader(text)), std.MatchReader(strings.NewReader(text)))
++		check("FindStringIndex", re.FindStringIndex(text), std.FindStringIndex(text))
++		check("FindString", re.FindString(text), std.FindString(text))
++		check("FindIndex", re.FindIndex(b), std.FindIndex(b))
++		check("Find", re.Find(b), std.Find(b))
++		check("FindReaderIndex", re.FindReaderIndex(strings.NewReader(text)), std.FindReaderIndex(strings.NewReader(text)))
++		check("FindStringSubmatchIndex", re.FindStringSubmatchIndex(text), std.FindStringSubmatchIndex(text))
++		check("FindStringSubmatch", re.FindStringSubmatch(text), std.FindStringSubmatch(text))
++		check("FindSubmatchIndex", re.FindSubmatchIndex(b), std.FindSubmatchIndex(b))
++		check("FindSubmatch", re.FindSubmatch(b), std.FindSubmatch(b))
++		check("FindReaderSubmatchIndex", re.FindReaderSubmatchIndex(strings.NewReader(text)), std.FindReaderSubmatchIndex(strings.NewReader(text)))
++		for _, lim := range []int{-1, 0, 1, 2} {
++			tag := fmt.Sprintf("(n=%d)", lim)
++			check("FindAllStringIndex"+tag, re.FindAllStringIndex(text, lim), std.FindAllStringIndex(text, lim))
++			check("FindAllString"+tag, re.FindAllString(text, lim), std.FindAllString(text, lim))
++			check("FindAllIndex"+tag, re.FindAllIndex(b, lim), std.FindAllIndex(b, lim))
++			check("FindAll"+tag, re.FindAll(b, lim), std.FindAll(b, lim))
++			check("FindAllStringSubmatchIndex"+tag, re.FindAllStringSubmatchIndex(text, lim), std.FindAllStringSubmatchIndex(text, lim))
++			check("FindAllStringSubmatch"+tag, re.FindAllStringSubmatch(text, lim), std.FindAllStringSubmatch(text, lim))
++			check("FindAllSubmatchIndex"+tag, re.FindAllSubmatchIndex(b, lim), std.FindAllSubmatchIndex(b, lim))
++			check("FindAllSubmatch"+tag, re.FindAllSubmatch(b, lim), std.FindAllSubmatch(b, lim))
++		}
++		// The underlying Regexp's own FindAllStringIndex too.
++		locs, err := re.Unwrap().FindAllStringIndex(text, -1)
++		if err != nil {
++			fail(ht, "FindAllStringIndex: %v", err)
++		}
++		check("Regexp.FindAllStringIndex", locs, std.FindAllStringIndex(text, -1))
++		// String() is the source.
++		check("String", re.String(), src)
++	})
++}
++
++// ---- Replace and Split against the match sequence ----
++
++// expand applies the documented substitution syntax to m over input.
++func expand(tmpl string, m *regexp2.Match, input string, p *pattern, re *regexp2.Regexp) string {
++	var sb strings.Builder
++	runes := []rune(input)
++	start, length := m.RuneIndex, m.RuneLength
++	grpText := func(grp *regexp2.Group) string {
++		if grp == nil || len(grp.Captures) == 0 {
++			return ""
++		}
++		return string(runes[grp.RuneIndex : grp.RuneIndex+grp.RuneLength])
++	}
++	for i := 0; i < len(tmpl); i++ {
++		c := tmpl[i]
++		if c != '$' || i+1 >= len(tmpl) {
++			sb.WriteByte(c)
++			continue
++		}
++		i++
++		switch d := tmpl[i]; {
++		case d == '$':
++			sb.WriteByte('$')
++		case d == '&':
++			sb.WriteString(string(runes[start : start+length]))
++		case d == '`':
++			sb.WriteString(string(runes[:start]))
++		case d == '\'':
++			sb.WriteString(string(runes[start+length:]))
++		case d == '_':
++			sb.WriteString(input)
++		case d == '{':
++			end := strings.IndexByte(tmpl[i:], '}')
++			name := tmpl[i+1 : i+end]
++			i += end
++			if num, err := strconv.Atoi(name); err == nil {
++				sb.WriteString(grpText(m.GroupByNumber(num)))
++			} else {
++				sb.WriteString(grpText(m.GroupByName(name)))
++			}
++		case d >= '0' && d <= '9':
++			sb.WriteString(grpText(m.GroupByNumber(int(d - '0'))))
++		default:
++			sb.WriteByte('$')
++			sb.WriteByte(d)
++		}
++	}
++	return sb.String()
++}
++
++// genTemplate draws a substitution template whose every $-reference exists.
++func genTemplate(tc hegel.TestCase, p *pattern) string {
++	var sb strings.Builder
++	for i, k := 0, n(tc, 0, 4); i < k; i++ {
++		switch n(tc, 0, 7) {
++		case 0, 1:
++			sb.WriteString(pick(tc, []string{"x", "-", "é", " "}))
++		case 2:
++			sb.WriteString("$$")
++		case 3:
++			sb.WriteString("$&")
++		case 4:
++			sb.WriteString(pick(tc, []string{"$`", "$'", "$_"}))
++		default:
++			if len(p.names) == 0 {
++				sb.WriteString("$0")
++				continue
++			}
++			k := n(tc, 1, len(p.names))
++			if nm := p.names[k-1]; nm != "" && chance(tc, 70) {
++				sb.WriteString("${" + nm + "}")
++			} else {
++				sb.WriteString(fmt.Sprintf("${%d}", p.netNumber(k)))
++			}
++		}
++	}
++	return sb.String()
++}
++
++// splitModel is Split's documented behaviour over the match sequence: the text between
++// matches, with the text of every participating capturing group (in .NET number order)
++// after each piece; count limits the matches used (-1 all, 0 nil, 1 the input).
++func splitModel(input string, ms []*regexp2.Match, count int, groups int) []string {
++	if count == 0 {
++		return nil
++	}
++	if count == 1 {
++		return []string{input}
++	}
++	runes := []rune(input)
++	if count > 0 && len(ms) > count-1 {
++		ms = ms[:count-1]
++	}
++	out := []string{}
++	prev := 0
++	for _, m := range ms {
++		out = append(out, string(runes[prev:m.RuneIndex]))
++		for k := 1; k <= groups; k++ {
++			if grp := m.GroupByNumber(k); grp != nil && len(grp.Captures) > 0 {
++				out = append(out, string(runes[grp.RuneIndex:grp.RuneIndex+grp.RuneLength]))
++			}
++		}
++		prev = m.RuneIndex + m.RuneLength
++	}
++	out = append(out, string(runes[prev:]))
++	return out
++}
++
++// TestHegelReplaceAndSplitFollowTheMatchSequence: Replace with a template, ReplaceFunc, and
++// Split equal their models over the FindStringMatch/FindNextMatch sequence; count limits apply.
++func TestHegelReplaceAndSplitFollowTheMatchSequence(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		text := genText(ht)
++		re, err := regexp2.Compile(p.net, netOptions(p.flags))
++		if err != nil {
++			return
++		}
++		ms, err := chainMatches(re, text)
++		if err != nil {
++			note(ht, "chain: %v", err)
++			return
++		}
++		tmpl := genTemplate(ht, p)
++		count := pick(ht, []int{-1, -1, -1, 0, 1, 2, 3})
++		note(ht, "pattern=%q flags=%q text=%q tmpl=%q count=%d matches=%d", p.net, p.flags, text, tmpl, count, len(ms))
++		// Replace: every match (up to count) replaced by its expansion, the rest copied.
++		use := ms
++		if count >= 0 && len(use) > count {
++			use = use[:count]
++		}
++		runes := []rune(text)
++		var sb strings.Builder
++		prev := 0
++		for _, m := range use {
++			sb.WriteString(string(runes[prev:m.RuneIndex]))
++			sb.WriteString(expand(tmpl, m, text, p, re))
++			prev = m.RuneIndex + m.RuneLength
++		}
++		sb.WriteString(string(runes[prev:]))
++		want := sb.String()
++		got, err := re.Replace(text, tmpl, -1, count)
++		if err != nil {
++			fail(ht, "Replace(%q, %q, -1, %d) with %q: %v", text, tmpl, count, p.net, err)
++		}
++		gotF, err := re.ReplaceFunc(text, func(m regexp2.Match) string { return expand(tmpl, &m, text, p, re) }, -1, count)
++		if err != nil {
++			fail(ht, "ReplaceFunc: %v", err)
++		}
++		if count == 0 {
++			// Pinned (regexp2/3): count 0 returns "" instead of the input.
++			note(ht, "count 0: Replace %q, ReplaceFunc %q (regexp2/3)", got, gotF)
++		} else {
++			if got != want {
++				fail(ht, "Replace(%q, %q, -1, %d) with %q = %q, the match sequence gives %q", text, tmpl, count, p.net, got, want)
++			}
++			if gotF != want {
++				fail(ht, "ReplaceFunc(%q, %q, -1, %d) with %q = %q, the match sequence gives %q", text, tmpl, count, p.net, gotF, want)
++			}
++		}
++		// Split: counts above 1 are pinned (regexp2/4: count splits instead of count-1).
++		gotS, err := re.Split(text, count)
++		if err != nil {
++			fail(ht, "Split(%q, %d) with %q: %v", text, count, p.net, err)
++		}
++		unmatchedGroup := false
++		for _, m := range ms {
++			for k := 1; k <= len(p.names); k++ {
++				if grp := m.GroupByNumber(k); grp == nil || len(grp.Captures) == 0 {
++					unmatchedGroup = true
++				}
++			}
++		}
++		if count > 1 {
++			note(ht, "Split count %d: %q (regexp2/4)", count, gotS)
++		} else if unmatchedGroup {
++			// Pinned (regexp2/5): an empty string is added for every group that did not take part.
++			note(ht, "Split with a non-participating group: %q (regexp2/5)", gotS)
++		} else if wantS := splitModel(text, ms, count, len(p.names)); !reflect.DeepEqual(gotS, wantS) {
++			fail(ht, "Split(%q, %d) with %q = %q, the match sequence gives %q", text, count, p.net, gotS, wantS)
++		}
++	})
++}
++
++// TestHegelGroupNumberingFollowsTheDotNetRule: unnamed groups first in textual order, then
++// named ones; the name tables and the two lookups agree with that; with
++// OptionMaintainCaptureOrder every group keeps its textual number.
++func TestHegelGroupNumberingFollowsTheDotNetRule(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		re, err := regexp2.Compile(p.net, netOptions(p.flags))
++		if err != nil {
++			return
++		}
++		note(ht, "pattern=%q names=%q", p.net, p.names)
++		wantNums := []int{0}
++		wantNames := []string{"0"}
++		byNumber := map[int]string{0: "0"}
++		for k := 1; k <= len(p.names); k++ {
++			wantNums = append(wantNums, k)
++		}
++		unnamed := 0
++		for _, nm := range p.names {
++			if nm == "" {
++				unnamed++
++				byNumber[unnamed] = strconv.Itoa(unnamed)
++			}
++		}
++		named := 0
++		for _, nm := range p.names {
++			if nm != "" {
++				named++
++				byNumber[unnamed+named] = nm
++			}
++		}
++		for k := 1; k <= len(p.names); k++ {
++			wantNames = append(wantNames, byNumber[k])
++		}
++		if got := re.GetGroupNumbers(); !reflect.DeepEqual(got, wantNums) {
++			fail(ht, "GetGroupNumbers of %q = %v, want %v", p.net, got, wantNums)
++		}
++		if got := re.GetGroupNames(); !reflect.DeepEqual(got, wantNames) {
++			fail(ht, "GetGroupNames of %q = %q, want %q", p.net, got, wantNames)
++		}
++		for num, nm := range byNumber {
++			if got := re.GroupNameFromNumber(num); got != nm {
++				fail(ht, "GroupNameFromNumber(%d) of %q = %q, want %q", num, p.net, got, nm)
++			}
++			if got := re.GroupNumberFromName(nm); got != num {
++				fail(ht, "GroupNumberFromName(%q) of %q = %d, want %d", nm, p.net, got, num)
++			}
++		}
++		if got := re.GroupNumberFromName("nope"); got != -1 {
++			fail(ht, "GroupNumberFromName(\"nope\") of %q = %d, want -1", p.net, got)
++		}
++		if got := re.GroupNameFromNumber(len(p.names) + 1); got != "" {
++			fail(ht, "GroupNameFromNumber(%d) of %q = %q, want \"\"", len(p.names)+1, p.net, got)
++		}
++		// Textual order when asked for.
++		reT, err := regexp2.Compile(p.net, netOptions(p.flags), regexp2.OptionMaintainCaptureOrder())
++		if err != nil {
++			fail(ht, "Compile with OptionMaintainCaptureOrder: %v", err)
++		}
++		wantT := []string{"0"}
++		for k, nm := range p.names {
++			if nm == "" {
++				nm = strconv.Itoa(k + 1)
++			}
++			wantT = append(wantT, nm)
++		}
++		if got := reT.GetGroupNames(); !reflect.DeepEqual(got, wantT) {
++			fail(ht, "GetGroupNames of %q with OptionMaintainCaptureOrder = %q, want %q", p.net, got, wantT)
++		}
++	})
++}
++
++// TestHegelRightToLeftFindsTheSameTexts: for patterns without backreferences, atomic groups,
++// possessive quantifiers or lookarounds, whether a match exists does not depend on the
++// direction; and the RightToLeft match is a valid match (its text matches the pattern
++// anchored, in either direction).
++func TestHegelRightToLeftFindsTheSameTexts(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := genPattern(ht)
++		if !p.simple {
++			return
++		}
++		text := genText(ht)
++		if skipMultilineCaret(p, text) {
++			return
++		}
++		if p.nonWordLoopB {
++			count("skip-non-word-loop-before-B")
++			return
++		}
++		note(ht, "pattern=%q flags=%q text=%q", p.net, p.flags, text)
++		ltr, err := regexp2.Compile(p.net, netOptions(p.flags))
++		if err != nil {
++			return
++		}
++		rtl, err := regexp2.Compile(p.net, netOptions(p.flags)|regexp2.RightToLeft)
++		if err != nil {
++			fail(ht, "Compile(%q, RightToLeft): %v", p.net, err)
++		}
++		a, err1 := ltr.MatchString(text)
++		b, err2 := rtl.MatchString(text)
++		if err1 != nil || err2 != nil {
++			note(ht, "errors: %v %v", err1, err2)
++			return
++		}
++		if a != b {
++			// A false negative from the first-character filter is pinned (regexp2/1): the
++			// filter is consulted in one direction only.
++			var m *regexp2.Match
++			if b {
++				m, _ = rtl.FindStringMatch(text)
++			} else {
++				m, _ = ltr.FindStringMatch(text)
++			}
++			runes := []rune(text)
++			if m != nil && m.RuneIndex < len(runes) && firstCharExcludes(p.net, netOptions(p.flags), runes, m.RuneIndex) {
++				count("skip-first-char-filter")
++				note(ht, "the match starts with %q, which the first-character filter excludes (regexp2/1)", runes[m.RuneIndex])
++				return
++			}
++			fail(ht, "%q on %q: MatchString %v left-to-right, %v right-to-left", p.net, text, a, b)
++		}
++		count("compared")
++		if !b {
++			return
++		}
++		m, err := rtl.FindStringMatch(text)
++		if err != nil || m == nil {
++			fail(ht, "%q on %q: RightToLeft MatchString true but FindStringMatch %v, %v", p.net, text, m, err)
++		}
++		// The matched span is one the pattern accepts at that position left-to-right too.
++		runes := []rune(text)
++		ms, err := chainMatches(ltr, text)
++		if err != nil {
++			return
++		}
++		spans := map[[2]int]bool{}
++		for _, lm := range ms {
++			spans[[2]int{lm.RuneIndex, lm.RuneLength}] = true
++		}
++		_ = runes
++		note(ht, "rtl span %d+%d, ltr spans %v", m.RuneIndex, m.RuneLength, spans)
++	})
++}
++
++// TestHegelEscapeRoundTrips: Escape(s) compiled matches exactly s, and Unescape inverts it.
++func TestHegelEscapeRoundTrips(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var sb strings.Builder
++		for i, k := 0, n(ht, 0, 8); i < k; i++ {
++			sb.WriteString(pick(ht, []string{"a", ".", "*", "+", "?", "(", ")", "[", "]", "{", "}", "|", "^", "$", `\`, "#", " ", "\n", "\t", "é", "😀", "-", "0", "1", "#"}))
++		}
++		s := sb.String()
++		esc := regexp2.Escape(s)
++		re, err := regexp2.Compile(`\A(?:`+esc+`)\z`, regexp2.None)
++		if err != nil {
++			fail(ht, "Escape(%q) = %q does not compile: %v", s, esc, err)
++		}
++		ok, err := re.MatchString(s)
++		if err != nil || !ok {
++			fail(ht, "Escape(%q) = %q does not match its source: %v %v", s, esc, ok, err)
++		}
++		if len(s) > 0 {
++			other := s + "x"
++			if ok, _ := re.MatchString(other); ok {
++				fail(ht, "Escape(%q) = %q matches %q", s, esc, other)
++			}
++		}
++		// Escaped text under IgnorePatternWhitespace still matches (the escape is documented
++		// to make the text safe for any option set).
++		reX, err := regexp2.Compile(`\A(?:`+esc+`)\z`, regexp2.IgnorePatternWhitespace)
++		if err != nil {
++			fail(ht, "Escape(%q) = %q does not compile with IgnorePatternWhitespace: %v", s, esc, err)
++		}
++		if ok, _ := reX.MatchString(s); !ok {
++			fail(ht, "Escape(%q) = %q does not match its source under IgnorePatternWhitespace", s, esc)
++		}
++		un, err := regexp2.Unescape(esc)
++		if err != nil || un != s {
++			fail(ht, "Unescape(Escape(%q) = %q) = %q, %v", s, esc, un, err)
++		}
++	})
++}
++
++// ---------------------------------------------------------------- pins
++
++// TestHegelPinAlternationKeepsTheLiteralBranch pins regexp2/1: when a branch beginning with a
++// literal or a positive class precedes a branch beginning with `.` or a negated class, the
++// first-character filter excludes the literal's characters, so the literal branch (and any
++// match starting with those characters) is never found.
++func TestHegelPinAlternationKeepsTheLiteralBranch(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		p, s string
++		want string // "index+length" of the leftmost match
++	}{
++		{"a|.", "a", "0+1"},
++		{"a|.", "ba", "0+1"},
++		{"a|.+", "a", "0+1"},
++		{"x|a|.", "xa", "0+1"},
++		{`a|[^x]`, "a", "0+1"},
++		{`\\.|[^"\\]`, `\"`, "0+2"},
++		{"(a)|.", "a", "0+1"},
++		{"a*.", "a", "0+1"},
++		{"(a||b)+.", "b", "0+1"},
++		{"é|.", "é", "0+1"},
++	} {
++		for _, opt := range []regexp2.RegexOptions{regexp2.None, regexp2.RE2} {
++			re, err := regexp2.Compile(tt.p, opt)
++			if err != nil {
++				if opt == regexp2.RE2 {
++					continue
++				}
++				t.Fatalf("Compile(%q): %v", tt.p, err)
++			}
++			m, err := re.FindStringMatch(tt.s)
++			if err != nil {
++				t.Fatalf("FindStringMatch: %v", err)
++			}
++			got := "none"
++			if m != nil {
++				got = fmt.Sprintf("%d+%d", m.RuneIndex, m.RuneLength)
++			}
++			if got != tt.want {
++				t.Errorf("%q (options %v) on %q: match %s, want %s", tt.p, opt, tt.s, got, tt.want)
++			}
++		}
++	}
++}
++
++// TestHegelPinCompatFindAllReturnsNilWhenNothingMatches pins regexp2/2: with a positive n and
++// no match, compat's FindAll, FindAllIndex and FindAllStringIndex return an empty non-nil slice
++// where regexp returns nil.
++func TestHegelPinCompatFindAllReturnsNilWhenNothingMatches(t *testing.T) {
++	defer guard(t)
++	re := compat.MustCompile("x", regexp2.RE2)
++	for _, lim := range []int{1, 2, -1} {
++		if got := re.FindAllStringIndex("abc", lim); got != nil {
++			t.Errorf("FindAllStringIndex(\"abc\", %d) = %#v, want nil (regexp gives nil)", lim, got)
++		}
++		if got := re.FindAllIndex([]byte("abc"), lim); got != nil {
++			t.Errorf("FindAllIndex(\"abc\", %d) = %#v, want nil", lim, got)
++		}
++		if got := re.FindAll([]byte("abc"), lim); got != nil {
++			t.Errorf("FindAll(\"abc\", %d) = %#v, want nil", lim, got)
++		}
++	}
++}
++
++// TestHegelPinReplaceWithCountZeroReturnsTheInput pins regexp2/3: Replace and ReplaceFunc with
++// count 0 return "" instead of the input unchanged (no replacement), as Regex.Replace does.
++func TestHegelPinReplaceWithCountZeroReturnsTheInput(t *testing.T) {
++	defer guard(t)
++	re := regexp2.MustCompile("-", regexp2.None)
++	if got, err := re.Replace("a-b", "+", -1, 0); err != nil || got != "a-b" {
++		t.Errorf("Replace(\"a-b\", \"+\", -1, 0) = %q, %v; want the input unchanged", got, err)
++	}
++	if got, err := re.ReplaceFunc("a-b", func(regexp2.Match) string { return "+" }, -1, 0); err != nil || got != "a-b" {
++		t.Errorf("ReplaceFunc(\"a-b\", …, -1, 0) = %q, %v; want the input unchanged", got, err)
++	}
++}
++
++// TestHegelPinSplitCountIsTheNumberOfPieces pins regexp2/4: Split(input, count) makes count
++// splits for count ≥ 2 but none for count 1, so exactly one split is unreachable; Regex.Split's
++// count is the maximum number of pieces (count-1 splits), which the doc's "count 1 returns the
++// input" case also implies.
++func TestHegelPinSplitCountIsTheNumberOfPieces(t *testing.T) {
++	defer guard(t)
++	re := regexp2.MustCompile("-", regexp2.None)
++	for _, tt := range []struct {
++		count int
++		want  []string
++	}{
++		{2, []string{"a", "b-c-d"}},
++		{3, []string{"a", "b", "c-d"}},
++		{4, []string{"a", "b", "c", "d"}},
++	} {
++		if got, err := re.Split("a-b-c-d", tt.count); err != nil || !reflect.DeepEqual(got, tt.want) {
++			t.Errorf("Split(\"a-b-c-d\", %d) = %q, %v; want %q", tt.count, got, err, tt.want)
++		}
++	}
++}
++
++// TestHegelPinSplitOmitsGroupsThatDidNotTakePart pins regexp2/5: Split adds an empty string
++// for every capturing group that did not participate in a match; the documentation ("any
++// captured text is included") and Regex.Split include only the groups that matched.
++func TestHegelPinSplitOmitsGroupsThatDidNotTakePart(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct {
++		p, s string
++		want []string
++	}{
++		{`-(x)?`, "a-b", []string{"a", "b"}},
++		{`(x)|-`, "a-b", []string{"a", "b"}},
++		{`(-)|(x)`, "a-b", []string{"a", "-", "b"}},
++	} {
++		got, err := regexp2.MustCompile(tt.p, regexp2.None).Split(tt.s, -1)
++		if err != nil || !reflect.DeepEqual(got, tt.want) {
++			t.Errorf("Split(%q, -1) with %q = %q, %v; want %q", tt.s, tt.p, got, err, tt.want)
++		}
++	}
++}
++
++// TestHegelPinRE2ModeWordBoundaryIsASCII pins regexp2/6: with the RE2 option \w is ASCII (as
++// documented) but \b and \B still count non-ASCII letters as word characters, so the compat
++// adapter disagrees with regexp around any accented or CJK letter.
++func TestHegelPinRE2ModeWordBoundaryIsASCII(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct{ p, s string }{
++		{`\B日`, "a日"}, {`\b`, "é"}, {`\bb`, "éb"}, {`\B\B`, "éÉ"}, {`é\b`, "éa"},
++	} {
++		std := regexp.MustCompile(tt.p)
++		re := compat.MustCompile(tt.p, regexp2.RE2)
++		if got, want := re.FindStringIndex(tt.s), std.FindStringIndex(tt.s); !reflect.DeepEqual(got, want) {
++			t.Errorf("RE2 mode %q on %q: FindStringIndex %v, regexp %v", tt.p, tt.s, got, want)
++		}
++		wre := compat.MustCompile(`\w`, regexp2.RE2)
++		if got, want := wre.FindAllStringIndex(tt.s, -1), regexp.MustCompile(`\w`).FindAllStringIndex(tt.s, -1); !reflect.DeepEqual(got, want) {
++			t.Errorf(`RE2 mode \w on %q: %v, regexp %v`, tt.s, got, want)
++		}
++	}
++}
++
++// TestHegelPinCompatSubmatchesFollowRegexpOrder pins regexp2/7: with named and unnamed groups
++// mixed, the compat adapter (RE2 mode) returns submatches in .NET order — unnamed groups
++// first — while regexp numbers them in order of appearance, so FindStringSubmatch and the
++// *Index methods permute the groups.
++func TestHegelPinCompatSubmatchesFollowRegexpOrder(t *testing.T) {
++	defer guard(t)
++	for _, tt := range []struct{ p, s string }{
++		{`(?P<g1>a)(b)`, "ab"},
++		{`(a)(?P<g2>b)(c)`, "abc"},
++	} {
++		std := regexp.MustCompile(tt.p)
++		re := compat.MustCompile(tt.p, regexp2.RE2)
++		if got, want := re.FindStringSubmatch(tt.s), std.FindStringSubmatch(tt.s); !reflect.DeepEqual(got, want) {
++			t.Errorf("compat %q on %q: FindStringSubmatch %q, regexp %q", tt.p, tt.s, got, want)
++		}
++		if got, want := re.FindStringSubmatchIndex(tt.s), std.FindStringSubmatchIndex(tt.s); !reflect.DeepEqual(got, want) {
++			t.Errorf("compat %q on %q: FindStringSubmatchIndex %v, regexp %v", tt.p, tt.s, got, want)
++		}
++	}
++}
++
++// ---------------------------------------------------------------- examples
++
++// TestHegelPinNonBoundaryAfterANonWordLoopBacktracks (regexp2/8): a greedy loop of non-word
++// characters followed by \B is made atomic, so the loop never gives back a character to put
++// \B between two non-word characters.
++func TestHegelPinNonBoundaryAfterANonWordLoopBacktracks(t *testing.T) {
++	defer guard(t)
++	cases := []struct {
++		pattern, text string
++		want          []int // index, length of every match in the chain
++	}{
++		{`\D+\B`, "ba", []int{0, 1}},
++		{`\D+\B|a`, "ba", []int{0, 1, 1, 1}},
++		{`(\D+)\B`, "ba", []int{0, 1}},
++		{`\D{1,2}\B`, "ba", []int{0, 1}},
++		{`[\D]+\B`, "ba", []int{0, 1}},
++		{`\W+\B`, "--a", []int{0, 1}},
++		{`\W{2,}\B`, "---a", []int{0, 2}},
++		{`-+\B`, "--a", []int{0, 1}},
++		{`-{1,3}\B`, "--a", []int{0, 1}},
++		{` +\B`, "  a", []int{0, 1}},
++		{`\D+\B(?:)`, "ba", []int{0, 1}},
++	}
++	for _, c := range cases {
++		for _, opts := range []regexp2.RegexOptions{regexp2.None, regexp2.RE2} {
++			re, err := regexp2.Compile(c.pattern, opts)
++			if err != nil {
++				t.Fatalf("Compile(%q, %d): %v", c.pattern, opts, err)
++			}
++			ms, err := chainMatches(re, c.text)
++			if err != nil {
++				t.Fatalf("%q on %q: %v", c.pattern, c.text, err)
++			}
++			var got []int
++			for _, m := range ms {
++				got = append(got, m.RuneIndex, m.RuneLength)
++			}
++			if !reflect.DeepEqual(got, c.want) {
++				t.Errorf("%q (options %d) on %q: matches (index, length) %v, want %v", c.pattern, opts, c.text, got, c.want)
++			}
++		}
++	}
++	// The lazy and the zero-minimum loops are not made atomic and behave.
++	for _, pat := range []string{`\D+?\B`, `\D*\B`, `-+?\B`} {
++		re := regexp2.MustCompile(pat, regexp2.None)
++		if m, _ := re.FindStringMatch(strings.Repeat("-", 2) + "a"); pat != `\D*\B` && (m == nil || m.RuneIndex != 0 || m.RuneLength != 1) {
++			t.Errorf("%q on %q: %v", pat, "--a", m)
++		}
++	}
++}
++
++func TestHegelExamples(t *testing.T) {
++	re := regexp2.MustCompile(`(?<y>\d{4})-(\d{2})`, regexp2.None)
++	m, err := re.FindStringMatch("on 2024-05 and 2025-06")
++	if err != nil || m == nil || m.String() != "2024-05" || m.GroupByName("y").String() != "2024" {
++		t.Fatalf("FindStringMatch: %v %v", m, err)
++	}
++	if got := re.GetGroupNames(); !reflect.DeepEqual(got, []string{"0", "1", "y"}) {
++		t.Errorf("GetGroupNames = %q", got)
++	}
++	out, err := re.Replace("on 2024-05 and 2025-06", "${y}/$1", -1, -1)
++	if err != nil || out != "on 2024/05 and 2025/06" {
++		t.Errorf("Replace = %q, %v", out, err)
++	}
++	parts, err := regexp2.MustCompile(`(-)`, regexp2.None).Split("a-b", -1)
++	if err != nil || !reflect.DeepEqual(parts, []string{"a", "-", "b"}) {
++		t.Errorf("Split = %q, %v", parts, err)
++	}
++}
