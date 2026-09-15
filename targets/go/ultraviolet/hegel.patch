@@ -28,10 +28,10 @@ index 6390d83..f82a339 100644
 +)
 diff --git a/hegel_buffer_test.go b/hegel_buffer_test.go
 new file mode 100644
-index 0000000..649f58f
+index 0000000..0e40405
 --- /dev/null
 +++ b/hegel_buffer_test.go
-@@ -0,0 +1,1091 @@
+@@ -0,0 +1,1094 @@
 +package uv
 +
 +// The second slice of go/ultraviolet: the cell buffer (Line, Buffer, RenderBuffer,
@@ -1123,6 +1123,9 @@ index 0000000..649f58f
 +		t.Errorf("after DeleteLineArea over columns 2-3 of a row holding 世 at 1, a placeholder lost its head:\n%s", dumpBuffer(b))
 +	}
 +}
++
++// ScreenRendererT gives the screen tests the renderer's position record.
++func ScreenRendererT(s *TerminalScreen) *TerminalRenderer { return s.rend }
 diff --git a/hegel_render_test.go b/hegel_render_test.go
 new file mode 100644
 index 0000000..1aa1083
@@ -1554,6 +1557,1138 @@ index 0000000..1aa1083
 +		}
 +		count("ok")
 +	})
++}
+diff --git a/hegel_screen_test.go b/hegel_screen_test.go
+new file mode 100644
+index 0000000..64a4790
+--- /dev/null
++++ b/hegel_screen_test.go
+@@ -0,0 +1,1126 @@
++package uv_test
++
++// TerminalScreen's bookkeeping against the bytes it flushes and the x/vt emulator, and
++// TabStops against a model.
++//
++// TerminalScreen records what the application asked for (alt screen, cursor, colours, modes,
++// title, keyboard enhancements, progress bar) and queues the escape sequences that ask the
++// terminal for it; Terminal.Start replays the record with Restore and Terminal.Stop undoes it
++// with Reset. A random sequence of setters is run against a model of the requests; after every
++// Flush the sequences are read back (a small tracker of the modes the terminal would be in,
++// since x/vt models few of them) and must agree with the model, the getters must agree with
++// the model, and the emulator's screen must show the frame where the renderer believes it is.
++// Reset must leave the tracker at the terminal's defaults, Restore must bring it back, and
++// InsertAbove must put its lines above an intact frame.
++
++import (
++	"bytes"
++	"fmt"
++	"image/color"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/charmbracelet/colorprofile"
++	uv "github.com/charmbracelet/ultraviolet"
++	"github.com/charmbracelet/x/ansi"
++	"github.com/charmbracelet/x/vt"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------- tracker
++
++// termTracker is the state a terminal would be in after the flushed bytes, read back from the
++// sequences themselves. Mouse tracking and its encoding follow xterm: the last DECSET of a
++// tracking mode wins and a DECRST of any of them turns tracking off.
++type termTracker struct {
++	alt, visible, paste bool
++	sync                int // nesting of mode 2026 inside one flush; back to 0 at its end
++	mouse               uv.MouseMode
++	enc                 uv.MouseEncoding
++	style               int // as encoded by DECSCUSR; 0 and 1 are both the blinking block
++	cursorColor, bg, fg string
++	title               string
++	kitty               int
++	progress            string // "0" none, "3" indeterminate, "state;value" otherwise
++	tabsReset           bool
++	unknown             []string
++	transcript          string
++}
++
++func newTracker() *termTracker { return &termTracker{visible: true, progress: "0"} }
++
++func (tk *termTracker) mode(m int, on bool) {
++	switch m {
++	case 1049:
++		tk.alt = on
++	case 25:
++		tk.visible = on
++	case 2004:
++		tk.paste = on
++	case 9, 1000, 1002, 1003:
++		if !on {
++			tk.mouse = uv.MouseModeNone
++			return
++		}
++		tk.mouse = map[int]uv.MouseMode{9: uv.MouseModePress, 1000: uv.MouseModeClick, 1002: uv.MouseModeDrag, 1003: uv.MouseModeMotion}[m]
++	case 1006, 1016, 1015:
++		if !on {
++			tk.enc = uv.MouseEncodingLegacy
++			return
++		}
++		if m == 1006 {
++			tk.enc = uv.MouseEncodingSGR
++		} else {
++			tk.enc = uv.MouseEncodingSGRPixel
++		}
++	case 2026:
++		if on {
++			tk.sync++
++		} else {
++			tk.sync--
++		}
++	case 2027:
++		// Unicode core mode: requested by Terminal.Start, set by enableGraphemeWidth.
++	case 7:
++		// Autowrap: the renderer turns it off around a write to the last column.
++	default:
++		tk.unknown = append(tk.unknown, fmt.Sprintf("mode %d %v", m, on))
++	}
++}
++
++func (tk *termTracker) feed(out string) {
++	tk.transcript += out
++	p := ansi.GetParser()
++	defer ansi.PutParser(p)
++	var state byte
++	for len(out) > 0 {
++		seq, _, k, ns := ansi.DecodeSequence(out, state, p)
++		switch {
++		case ansi.HasCsiPrefix(seq):
++			cmd := ansi.Cmd(p.Command())
++			switch {
++			case cmd.Prefix() == '?' && (cmd.Final() == 'h' || cmd.Final() == 'l'):
++				for i := 0; i < len(p.Params()); i++ {
++					m, _ := p.Param(i, 0)
++					tk.mode(m, cmd.Final() == 'h')
++				}
++			case cmd.Prefix() == '=' && cmd.Final() == 'u':
++				flags, _ := p.Param(0, 0)
++				tk.kitty = flags
++			case cmd.Intermediate() == ' ' && cmd.Final() == 'q':
++				tk.style, _ = p.Param(0, 0)
++			case cmd.Prefix() == '?' && cmd.Final() == 'W':
++				if v, _ := p.Param(0, 0); v == 5 {
++					tk.tabsReset = true
++				}
++			}
++		case ansi.HasOscPrefix(seq):
++			cmd, rest, _ := strings.Cut(string(p.Data()), ";")
++			switch cmd {
++			case "0", "2":
++				tk.title = rest
++			case "10":
++				tk.fg = rest
++			case "11":
++				tk.bg = rest
++			case "12":
++				tk.cursorColor = rest
++			case "110":
++				tk.fg = ""
++			case "111":
++				tk.bg = ""
++			case "112":
++				tk.cursorColor = ""
++			case "9":
++				if strings.HasPrefix(rest, "4;") {
++					tk.progress = rest[2:]
++				}
++			}
++		}
++		out = out[k:]
++		state = ns
++	}
++}
++
++// ---------------------------------------------------------------- model
++
++// screenModel is what the application asked the screen for.
++type screenModel struct {
++	alt, visible, paste, sync bool
++	mouse                     uv.MouseMode
++	enc                       uv.MouseEncoding
++	shape                     uv.CursorShape
++	blink, styleSet           bool
++	cursorColor, bg, fg       color.Color
++	title                     string
++	kitty                     *uv.KeyboardEnhancements
++	kittySet                  bool
++	progress                  *uv.ProgressBar
++	progressSet               bool
++	x, y                      int
++	cursorObj                 bool // the screen holds a Cursor (Show, SetCursorPosition, style or colour)
++}
++
++func newScreenModel() *screenModel {
++	return &screenModel{blink: true, x: -1, y: -1}
++}
++
++func hexOf(c color.Color) string {
++	if c == nil {
++		return ""
++	}
++	r, g, b, _ := c.RGBA()
++	return fmt.Sprintf("#%02x%02x%02x", r>>8, g>>8, b>>8)
++}
++
++func progressString(pb *uv.ProgressBar) string {
++	if pb == nil || pb.State == uv.ProgressBarNone {
++		return "0"
++	}
++	if pb.State == uv.ProgressBarIndeterminate {
++		return "3"
++	}
++	return fmt.Sprintf("%d;%d", int(pb.State), min(max(pb.Value, 0), 100))
++}
++
++// terminalDiffers returns the differences between what the application asked for and what the
++// flushed bytes established; defaults says the terminal should instead be at its defaults
++// (after Reset).
++func (m *screenModel) terminalDiffers(tk *termTracker, defaults bool) []string {
++	var diffs []string
++	check := func(name string, want, got any) {
++		if fmt.Sprint(want) != fmt.Sprint(got) {
++			diffs = append(diffs, fmt.Sprintf("%s: asked %v, terminal has %v", name, want, got))
++		}
++	}
++	if defaults {
++		check("alt screen", false, tk.alt)
++		check("cursor visible", true, tk.visible)
++		check("bracketed paste", false, tk.paste)
++		check("mouse mode", uv.MouseModeNone, tk.mouse)
++		check("mouse encoding", uv.MouseEncodingLegacy, tk.enc)
++		if tk.style > 1 {
++			check("cursor style", "default", tk.style)
++		}
++		check("cursor colour", "", tk.cursorColor)
++		check("background", "", tk.bg)
++		check("foreground", "", tk.fg)
++		check("title", "", tk.title)
++		check("kitty flags", 0, tk.kitty)
++		check("progress bar", "0", tk.progress)
++		return diffs
++	}
++	check("alt screen", m.alt, tk.alt)
++	check("cursor visible", m.visible, tk.visible)
++	check("bracketed paste", m.paste, tk.paste)
++	check("mouse mode", m.mouse, tk.mouse)
++	check("mouse encoding", m.enc, tk.enc)
++	if m.styleSet {
++		check("cursor style", m.shape.Encode(m.blink), tk.style)
++	} else if tk.style > 1 {
++		check("cursor style", "default", tk.style)
++	}
++	check("cursor colour", hexOf(m.cursorColor), tk.cursorColor)
++	check("background", hexOf(m.bg), tk.bg)
++	check("foreground", hexOf(m.fg), tk.fg)
++	check("title", m.title, tk.title)
++	flags := 0
++	if m.kitty != nil {
++		flags = m.kitty.Flags()
++	}
++	check("kitty flags", flags, tk.kitty)
++	check("progress bar", progressString(m.progress), tk.progress)
++	return diffs
++}
++
++// gettersDiffer returns the differences between the model and the screen's getters.
++func (m *screenModel) gettersDiffer(s *uv.TerminalScreen) []string {
++	var diffs []string
++	check := func(name string, want, got any) {
++		if fmt.Sprint(want) != fmt.Sprint(got) {
++			diffs = append(diffs, fmt.Sprintf("%s: asked %v, getter says %v", name, want, got))
++		}
++	}
++	check("AltScreen", m.alt, s.AltScreen())
++	check("CursorVisible", m.visible, s.CursorVisible())
++	check("BracketedPaste", m.paste, s.BracketedPaste())
++	check("SynchronizedUpdates", m.sync, s.SynchronizedUpdates())
++	check("MouseMode", m.mouse, s.MouseMode())
++	check("MouseEncoding", m.enc, s.MouseEncoding())
++	shape, blink := s.CursorStyle()
++	check("CursorStyle", fmt.Sprint(m.shape, m.blink), fmt.Sprint(shape, blink))
++	if !colorEqual(m.cursorColor, s.CursorColor()) {
++		check("CursorColor", m.cursorColor, s.CursorColor())
++	}
++	if !colorEqual(m.bg, s.BackgroundColor()) {
++		check("BackgroundColor", m.bg, s.BackgroundColor())
++	}
++	if !colorEqual(m.fg, s.ForegroundColor()) {
++		check("ForegroundColor", m.fg, s.ForegroundColor())
++	}
++	check("WindowTitle", m.title, s.WindowTitle())
++	if m.kitty != s.KeyboardEnhancements() {
++		check("KeyboardEnhancements", m.kitty, s.KeyboardEnhancements())
++	}
++	if m.progress != s.ProgressBar() {
++		check("ProgressBar", m.progress, s.ProgressBar())
++	}
++	x, y := s.CursorPosition()
++	check("CursorPosition", fmt.Sprint(m.x, m.y), fmt.Sprint(x, y))
++	return diffs
++}
++
++// ---------------------------------------------------------------- frame
++
++// frameCells copies the screen's cells (the frame the renderer is asked to show).
++func frameCells(s *uv.TerminalScreen) [][]uv.Cell {
++	w, h := s.Width(), s.Height()
++	out := make([][]uv.Cell, h)
++	for y := 0; y < h; y++ {
++		out[y] = make([]uv.Cell, w)
++		for x := 0; x < w; x++ {
++			if c := s.CellAt(x, y); c != nil {
++				out[y][x] = *c
++			}
++		}
++	}
++	return out
++}
++
++// frameDiffers compares the emulator's rows from top with the frame: content, width and the
++// visible part of the style (bold, faint, italic, blink and the foreground are invisible on a
++// blank).
++func frameDiffers(e *vt.Emulator, top int, frame [][]uv.Cell) string {
++	for y, row := range frame {
++		for x, c := range row {
++			u := e.CellAt(x, top+y)
++			if c.IsZero() {
++				if u != nil && u.Width != 0 {
++					return fmt.Sprintf("(%d,%d) is a placeholder in the frame, emulator has %q w%d", x, y, u.Content, u.Width)
++				}
++				continue
++			}
++			if u == nil {
++				return fmt.Sprintf("emulator has no cell at (%d,%d)", x, top+y)
++			}
++			if u.Content != c.Content || u.Width != c.Width {
++				return fmt.Sprintf("(%d,%d) frame %q w%d, emulator %q w%d", x, y, c.Content, c.Width, u.Content, u.Width)
++			}
++			cs, us := c.Style, u.Style
++			if c.Content == " " {
++				invisible := uint8(uv.AttrBold | uv.AttrFaint | uv.AttrItalic | uv.AttrBlink | uv.AttrRapidBlink)
++				cs.Attrs &^= invisible
++				us.Attrs &^= invisible
++				cs.Fg, us.Fg = nil, nil
++				cs.UnderlineColor, us.UnderlineColor = nil, nil
++			}
++			if cs.Attrs != us.Attrs || cs.Underline != us.Underline ||
++				!colorEqual(cs.Fg, us.Fg) || !colorEqual(cs.Bg, us.Bg) || !colorEqual(cs.UnderlineColor, us.UnderlineColor) {
++				return fmt.Sprintf("(%d,%d) %q style %s, emulator %s", x, y, c.Content, styleString(c.Style), styleString(u.Style))
++			}
++		}
++	}
++	return ""
++}
++
++// emulatorCells copies the emulator's rows from top as a frame for frameDiffers.
++func emulatorCells(e *vt.Emulator, top, w, h int) [][]uv.Cell {
++	out := make([][]uv.Cell, h)
++	for y := 0; y < h; y++ {
++		out[y] = make([]uv.Cell, w)
++		for x := 0; x < w; x++ {
++			if c := e.CellAt(x, top+y); c != nil {
++				out[y][x] = *c
++			}
++		}
++	}
++	return out
++}
++
++func emulatorRows(e *vt.Emulator, from, to int) string {
++	var sb strings.Builder
++	for y := from; y < to && y < e.Height(); y++ {
++		if y < 0 {
++			continue
++		}
++		fmt.Fprintf(&sb, "%2d|", y)
++		for x := 0; x < e.Width(); x++ {
++			if c := e.CellAt(x, y); c != nil && c.Width > 0 {
++				sb.WriteString(c.Content)
++			}
++		}
++		sb.WriteString("|\n")
++	}
++	return sb.String()
++}
++
++// genPlainText draws lines of letters, spaces and SGR sequences without wide graphemes.
++func genPlainText(tc hegel.TestCase, w, lines int) string {
++	var sb strings.Builder
++	for i := 0; i < lines; i++ {
++		if i > 0 {
++			sb.WriteString("\n")
++		}
++		for k := n(tc, 0, w+1); k > 0; k-- {
++			switch n(tc, 0, 6) {
++			case 0:
++				st := genStyle(tc)
++				sb.WriteString(st.String())
++			case 1:
++				sb.WriteString("\x1b[m")
++			case 2:
++				sb.WriteString(" ")
++			default:
++				sb.WriteByte(byte('a' + n(tc, 0, 25)))
++			}
++		}
++	}
++	return sb.String()
++}
++
++// genLetters draws a line of exactly width letters.
++func genLetters(tc hegel.TestCase, width int) string {
++	var sb strings.Builder
++	for k := 0; k < width; k++ {
++		sb.WriteByte(byte('A' + n(tc, 0, 25)))
++	}
++	return sb.String()
++}
++
++func genRGB(tc hegel.TestCase) color.Color {
++	return color.RGBA{uint8(n(tc, 0, 255)), uint8(n(tc, 0, 255)), uint8(n(tc, 0, 255)), 255}
++}
++
++func genEnhancements(tc hegel.TestCase) *uv.KeyboardEnhancements {
++	if chance(tc, 20) {
++		return nil
++	}
++	return &uv.KeyboardEnhancements{
++		DisambiguateEscapeCodes:    chance(tc, 60),
++		ReportEventTypes:           chance(tc, 40),
++		ReportAlternateKeys:        chance(tc, 30),
++		ReportAllKeysAsEscapeCodes: chance(tc, 30),
++		ReportAssociatedText:       chance(tc, 30),
++	}
++}
++
++func genProgressBar(tc hegel.TestCase) *uv.ProgressBar {
++	if chance(tc, 20) {
++		return nil
++	}
++	return &uv.ProgressBar{
++		State: uv.ProgressBarState(n(tc, 0, 4)),
++		Value: n(tc, -5, 105),
++	}
++}
++
++// ---------------------------------------------------------------- properties
++
++// TestHegelScreenKeepsItsWord: TerminalScreen's getters, its flushed sequences and the
++// emulator's screen all follow the model through a random sequence of setters, a Reset
++// leaves the terminal at its defaults, and a Restore brings the requests back.
++func TestHegelScreenKeepsItsWord(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		w, h := n(ht, 2, 20), n(ht, 1, 8)
++		extra := n(ht, 0, 6)
++		H := h + extra
++		var out bytes.Buffer
++		s := uv.NewTerminalScreen(&out, []string{"TERM=xterm-256color"})
++		s.SetColorProfile(colorprofile.TrueColor)
++		s.SetWidthMethod(ansi.WcWidth)
++		s.Resize(w, h)
++		m := newScreenModel()
++		tk := newTracker()
++		e := vt.NewEmulator(w, H)
++		top := 0 // the emulator row of the frame's first row in inline mode
++		note(ht, "screen %dx%d, terminal %dx%d", w, h, w, H)
++
++		frameTop := func() int {
++			if m.alt {
++				return 0
++			}
++			return top
++		}
++		// pendingMove reports whether the renderer believes the cursor is somewhere the
++		// terminal's is not: a move Flush queued in the renderer that has not been written
++		// (ultraviolet/27). Only meaningful right after a flush.
++		pendingMove := func() bool {
++			r := uv.ScreenRendererT(s)
++			rx, ry := r.Position()
++			pos := e.CursorPosition()
++			if ry != pos.Y-frameTop() {
++				return true
++			}
++			return rx != pos.X && !(rx >= w-1 && pos.X == w-1)
++		}
++		// flush commits the queue, feeds it to the tracker and the emulator, and checks the
++		// three views against the model.
++		flush := func(what string) bool {
++			if err := s.Flush(); err != nil {
++				fail(ht, "%s: Flush: %v", what, err)
++			}
++			chunk := out.String()
++			out.Reset()
++			tk.feed(chunk)
++			if _, err := e.WriteString(chunk); err != nil {
++				fail(ht, "%s: emulator: %v", what, err)
++			}
++			if len(chunk) > 0 {
++				if m.sync {
++					if !strings.HasPrefix(chunk, ansi.SetModeSynchronizedOutput) || !strings.HasSuffix(chunk, ansi.ResetModeSynchronizedOutput) {
++						fail(ht, "%s: synchronized updates on but the flush is not wrapped in mode 2026: %q", what, chunk)
++					}
++				} else if m.visible {
++					if !strings.HasPrefix(chunk, ansi.HideCursor) || !strings.HasSuffix(chunk, ansi.ShowCursor) {
++						fail(ht, "%s: cursor visible but the flush is not wrapped in hide/show: %q", what, chunk)
++					}
++				}
++			}
++			if tk.sync != 0 {
++				fail(ht, "%s: mode 2026 left at depth %d: %q", what, tk.sync, chunk)
++			}
++			if len(tk.unknown) > 0 {
++				fail(ht, "%s: unexpected modes %v in %q", what, tk.unknown, chunk)
++			}
++			if d := m.gettersDiffer(s); len(d) > 0 {
++				fail(ht, "%s: getters disagree with the requests:\n  %s", what, strings.Join(d, "\n  "))
++			}
++			if d := m.terminalDiffers(tk, false); len(d) > 0 {
++				fail(ht, "%s: the terminal disagrees with the requests:\n  %s\nflushed %q", what, strings.Join(d, "\n  "), chunk)
++			}
++			if e.IsAltScreen() != m.alt {
++				fail(ht, "%s: emulator alt screen %v, asked %v", what, e.IsAltScreen(), m.alt)
++			}
++			if m.visible && m.x >= 0 && m.y >= 0 && m.x < w && m.y < h && frameTop()+m.y < H {
++				// Flush queues the cursor move in the renderer and only the next Render
++				// commits it (ultraviolet/27), so the emulator's cursor is not checked.
++				count("ultraviolet/27-shape")
++			}
++			return true
++		}
++		display := func(what string) {
++			if err := s.Display(nil); err != nil {
++				fail(ht, "%s: Display: %v", what, err)
++			}
++			chunk := out.String()
++			out.Reset()
++			tk.feed(chunk)
++			if _, err := e.WriteString(chunk); err != nil {
++				fail(ht, "%s: emulator: %v", what, err)
++			}
++			if d := frameDiffers(e, frameTop(), frameCells(s)); d != "" {
++				fail(ht, "%s: after Display the emulator does not show the frame at row %d: %s\nframe rows:\n%s\nflushed %q\ntranscript %q", what, frameTop(), d, emulatorRows(e, 0, H), chunk, tk.transcript)
++			}
++		}
++
++		// Terminal.Start replays the record first.
++		s.Restore()
++		flush("Restore at start")
++
++		for step, steps := 0, n(ht, 1, 25); step < steps; step++ {
++			what := fmt.Sprintf("step %d", step)
++			switch op := n(ht, 0, 22); op {
++			case 0, 1:
++				// The terminal saves and restores its cursor with the alt screen and the
++				// renderer its record; a move still queued in the renderer (ultraviolet/27)
++				// makes the two diverge. Pinned; the switch is not generated then.
++				flush(what + " before the screen switch")
++				if pendingMove() {
++					count("ultraviolet/27-shape")
++					continue
++				}
++				if op == 0 {
++					note(ht, "EnterAltScreen")
++					s.EnterAltScreen()
++					m.alt = true
++				} else {
++					note(ht, "ExitAltScreen")
++					s.ExitAltScreen()
++					m.alt = false
++				}
++			case 2:
++				note(ht, "HideCursor")
++				s.HideCursor()
++				m.visible = false
++			case 3:
++				note(ht, "ShowCursor")
++				s.ShowCursor()
++				m.visible, m.cursorObj = true, true
++			case 4:
++				x, y := n(ht, -1, w), n(ht, -1, h)
++				note(ht, "SetCursorPosition(%d,%d)", x, y)
++				s.SetCursorPosition(x, y)
++				m.x, m.y = x, y
++				m.cursorObj = true
++			case 5:
++				if !m.cursorObj {
++					// SetCursorStyle on a screen without a Cursor creates a visible one
++					// (ultraviolet/29): pinned, not generated.
++					count("ultraviolet/29-shape")
++					continue
++				}
++				shape, blink := uv.CursorShape(n(ht, 0, 2)), chance(ht, 50)
++				note(ht, "SetCursorStyle(%d,%v)", shape, blink)
++				s.SetCursorStyle(shape, blink)
++				m.shape, m.blink, m.styleSet = shape, blink, true
++			case 6:
++				if !m.cursorObj {
++					count("ultraviolet/29-shape")
++					continue
++				}
++				var c color.Color
++				if chance(ht, 70) {
++					c = genRGB(ht)
++				}
++				note(ht, "SetCursorColor(%v)", c)
++				s.SetCursorColor(c)
++				m.cursorColor = c
++			case 7:
++				var c color.Color
++				if chance(ht, 70) {
++					c = genRGB(ht)
++				}
++				note(ht, "SetBackgroundColor(%v)", c)
++				s.SetBackgroundColor(c)
++				m.bg = c
++			case 8:
++				var c color.Color
++				if chance(ht, 70) {
++					c = genRGB(ht)
++				}
++				note(ht, "SetForegroundColor(%v)", c)
++				s.SetForegroundColor(c)
++				m.fg = c
++			case 9:
++				if chance(ht, 60) {
++					note(ht, "EnableBracketedPaste")
++					s.EnableBracketedPaste()
++					m.paste = true
++				} else {
++					note(ht, "DisableBracketedPaste")
++					s.DisableBracketedPaste()
++					m.paste = false
++				}
++			case 10:
++				mode := uv.MouseMode(n(ht, 0, 4))
++				note(ht, "SetMouseMode(%d)", mode)
++				s.SetMouseMode(mode)
++				m.mouse = mode
++			case 11:
++				enc := uv.MouseEncoding(n(ht, 0, 2))
++				note(ht, "SetMouseEncoding(%d)", enc)
++				s.SetMouseEncoding(enc)
++				m.enc = enc
++			case 12:
++				title := ""
++				if chance(ht, 75) {
++					title = genLetters(ht, n(ht, 1, 8))
++				}
++				note(ht, "SetWindowTitle(%q)", title)
++				s.SetWindowTitle(title)
++				m.title = title
++			case 13:
++				ke := genEnhancements(ht)
++				note(ht, "SetKeyboardEnhancements(%+v)", ke)
++				s.SetKeyboardEnhancements(ke)
++				m.kitty, m.kittySet = ke, true
++			case 14:
++				pb := genProgressBar(ht)
++				note(ht, "SetProgressBar(%+v)", pb)
++				s.SetProgressBar(pb)
++				m.progress, m.progressSet = pb, true
++			case 15:
++				on := chance(ht, 50)
++				note(ht, "SetSynchronizedUpdates(%v)", on)
++				s.SetSynchronizedUpdates(on)
++				m.sync = on
++			case 16, 17:
++				for k := n(ht, 1, 5); k > 0; k-- {
++					x, y := n(ht, 0, w-1), n(ht, 0, h-1)
++					c := genCell(ht, false)
++					note(ht, "SetCell(%d,%d,%s)", x, y, cellString(c))
++					s.SetCell(x, y, c)
++				}
++				display(what + " cells")
++				continue
++			case 18:
++				text := genPlainText(ht, w, n(ht, 1, h+1))
++				note(ht, "Display(%q)", text)
++				if err := s.Display(uv.NewStyledString(text)); err != nil {
++					fail(ht, "%s: Display: %v", what, err)
++				}
++				chunk := out.String()
++				out.Reset()
++				tk.feed(chunk)
++				if _, err := e.WriteString(chunk); err != nil {
++					fail(ht, "%s: emulator: %v", what, err)
++				}
++				if d := frameDiffers(e, frameTop(), frameCells(s)); d != "" {
++					fail(ht, "%s: after Display the emulator does not show the frame at row %d: %s\nframe rows:\n%s\nflushed %q", what, frameTop(), d, emulatorRows(e, 0, H), chunk)
++				}
++				continue
++			case 19:
++				// Content above the frame: every line takes ceil(width/w) rows.
++				lines := make([]string, n(ht, 1, 3))
++				rows := 0
++				fullLine := false
++				for i := range lines {
++					width := n(ht, 0, 2*w+1)
++					if chance(ht, 10) {
++						width = w * n(ht, 1, 2)
++					}
++					lines[i] = genLetters(ht, width)
++					rows += max(1, (width+w-1)/w)
++					fullLine = fullLine || (width > 0 && width%w == 0)
++				}
++				content := strings.Join(lines, "\n")
++				if m.alt {
++					// Documented as invisible in the alt screen; it draws on it
++					// (ultraviolet/30): pinned, not generated.
++					count("ultraviolet/30-shape")
++					continue
++				}
++				if fullLine {
++					// A line exactly as wide as the screen loses its last cell
++					// (ultraviolet/31): pinned, not generated.
++					count("ultraviolet/31-shape")
++					continue
++				}
++				if content == "" {
++					// Documented no-op.
++					count("insert-empty")
++					continue
++				}
++				if h+rows > H {
++					// The frame and the content do not fit the terminal together.
++					count("insert-taller-than-terminal")
++					continue
++				}
++				// InsertAbove writes straight to the terminal, ahead of anything still
++				// queued (documented); a program flushes first, so does the property.
++				flush(what + " before InsertAbove")
++				if pendingMove() {
++					// A move Flush queued in the renderer has not reached the terminal
++					// (ultraviolet/27); InsertAbove reads the renderer's position, writes
++					// past the queue and resets the position, and the stale move is
++					// replayed later. Pinned, not generated.
++					count("ultraviolet/27-shape")
++					continue
++				}
++				// Whatever the terminal shows on the frame's rows (the frame, or the
++				// main screen's old content right after ExitAltScreen) must move down
++				// intact; the Display afterwards checks the frame itself.
++				before := emulatorCells(e, top, w, h)
++				oldTop := top
++				note(ht, "InsertAbove(%q): %d rows", content, rows)
++				if err := s.InsertAbove(content); err != nil {
++					fail(ht, "%s: InsertAbove: %v", what, err)
++				}
++				chunk := out.String()
++				out.Reset()
++				tk.transcript += chunk
++				if _, err := e.WriteString(chunk); err != nil {
++					fail(ht, "%s: emulator: %v", what, err)
++				}
++				top = min(oldTop+rows, H-h)
++				// The lines, wrapped at the width, sit right above the frame.
++				var want []string
++				for _, line := range lines {
++					for {
++						if len(line) <= w {
++							want = append(want, line+strings.Repeat(" ", w-len(line)))
++							break
++						}
++						want = append(want, line[:w])
++						line = line[w:]
++					}
++				}
++				for i, row := range want {
++					y := top - rows + i
++					var got strings.Builder
++					for x := 0; x < w; x++ {
++						c := e.CellAt(x, y)
++						if c == nil {
++							got.WriteString("?")
++						} else if c.Width > 0 {
++							got.WriteString(c.Content)
++						}
++					}
++					if got.String() != row {
++						fail(ht, "%s: InsertAbove(%q) with a %d-wide frame at row %d: row %d shows %q, want %q\n%s\nwrote %q", what, content, w, oldTop, y, got.String(), row, emulatorRows(e, 0, H), chunk)
++					}
++				}
++				if d := frameDiffers(e, top, before); d != "" {
++					fail(ht, "%s: after InsertAbove(%q) the frame (now at row %d) is not intact: %s\n%s\nwrote %q", what, content, top, d, emulatorRows(e, 0, H), chunk)
++				}
++				if pos := e.CursorPosition(); pos.X != 0 || pos.Y != top {
++					fail(ht, "%s: after InsertAbove(%q) the renderer believes the cursor is at the frame's (0,0) = row %d, the emulator has it at (%d,%d)\n%s\nwrote %q", what, content, top, pos.X, pos.Y, emulatorRows(e, 0, H), chunk)
++				}
++				// A change after it is drawn where the frame now is.
++				display(what + " after InsertAbove")
++				continue
++			default:
++				flush(what + " flush")
++				continue
++			}
++			if chance(ht, 60) {
++				flush(what)
++			}
++		}
++		flush("final flush")
++
++		// Terminal.Stop: the terminal must be back at its defaults.
++		frame := frameCells(s)
++		mainTop := frameTop()
++		s.Reset()
++		if err := s.Flush(); err != nil {
++			fail(ht, "Reset: Flush: %v", err)
++		}
++		chunk := out.String()
++		out.Reset()
++		tk.feed(chunk)
++		if _, err := e.WriteString(chunk); err != nil {
++			fail(ht, "Reset: emulator: %v", err)
++		}
++		d := m.terminalDiffers(tk, true)
++		if !m.visible && m.cursorObj {
++			// Reset shows the cursor only when the screen holds no hidden Cursor
++			// (ultraviolet/28): pinned; the other defaults are still checked.
++			count("ultraviolet/28-shape")
++			d = slices.DeleteFunc(d, func(s string) bool { return strings.HasPrefix(s, "cursor visible:") })
++		}
++		if len(d) > 0 {
++			fail(ht, "after Reset the terminal is not at its defaults:\n  %s\nReset wrote %q\ntranscript %q", strings.Join(d, "\n  "), chunk, tk.transcript)
++		}
++		if e.IsAltScreen() {
++			fail(ht, "after Reset the emulator is still in the alt screen; Reset wrote %q", chunk)
++		}
++		if tk.sync != 0 {
++			fail(ht, "Reset left mode 2026 at depth %d: %q", tk.sync, chunk)
++		}
++		// The record survives Reset, so the getters still say what was asked.
++		if d := m.gettersDiffer(s); len(d) > 0 {
++			fail(ht, "after Reset the getters forgot the requests:\n  %s", strings.Join(d, "\n  "))
++		}
++
++		// Terminal.Start again: Restore brings the requests back, and the frame with them.
++		s.Restore()
++		if err := s.Flush(); err != nil {
++			fail(ht, "Restore: Flush: %v", err)
++		}
++		chunk = out.String()
++		out.Reset()
++		tk.feed(chunk)
++		if _, err := e.WriteString(chunk); err != nil {
++			fail(ht, "Restore: emulator: %v", err)
++		}
++		if d := m.terminalDiffers(tk, false); len(d) > 0 {
++			fail(ht, "after Restore the terminal disagrees with the requests:\n  %s\nRestore wrote %q", strings.Join(d, "\n  "), chunk)
++		}
++		if d := m.gettersDiffer(s); len(d) > 0 {
++			fail(ht, "after Restore the getters disagree with the requests:\n  %s", strings.Join(d, "\n  "))
++		}
++		if m.alt {
++			// Restore re-enters the alt screen, which the terminal clears, and its Render
++			// finds nothing changed (ultraviolet/34): pinned; the frame is not checked.
++			count("ultraviolet/34-shape")
++			return
++		}
++		if d := frameDiffers(e, mainTop, frame); d != "" {
++			fail(ht, "after Reset and Restore the emulator does not show the frame at row %d: %s\n%s\nReset+Restore wrote %q", mainTop, d, emulatorRows(e, 0, H), chunk)
++		}
++		display("after Restore")
++	})
++}
++
++// ---------------------------------------------------------------- tab stops
++
++// TestHegelTabStopsFollowTheModel: with the default interval, NewTabStops/Set/Reset/Clear/Resize
++// keep the documented set of stops and Find walks it.
++func TestHegelTabStopsFollowTheModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		width := n(ht, 0, 100)
++		interval := pick(ht, []int{1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 9, 12, 16, 32})
++		if interval != 8 {
++			// TabStops hard-codes an interval of 8 in its bit set (ultraviolet/32).
++			count("ultraviolet/32-shape")
++			return
++		}
++		ts := uv.NewTabStops(width, interval)
++		stops := map[int]bool{}
++		for x := 0; x < width; x += interval {
++			stops[x] = true
++		}
++		next := func(col int) int {
++			if col >= width-1 {
++				return col
++			}
++			for c := col + 1; c < width; c++ {
++				if stops[c] {
++					return c
++				}
++			}
++			return width - 1
++		}
++		prev := func(col int) int {
++			if col < 1 {
++				return col
++			}
++			for c := col - 1; c > 0; c-- {
++				if stops[c] {
++					return c
++				}
++			}
++			return 0
++		}
++		check := func(what string) {
++			if ts.Width() != width {
++				fail(ht, "%s: Width() = %d, want %d", what, ts.Width(), width)
++			}
++			for col := 0; col < width; col++ {
++				if ts.IsStop(col) != stops[col] {
++					fail(ht, "%s: IsStop(%d) = %v, model %v (width %d)", what, col, ts.IsStop(col), stops[col], width)
++				}
++			}
++			for k := 0; k < 4; k++ {
++				// Columns at or beyond the width are outside the contract: a shrinking
++				// Resize leaves their bits as they were.
++				col := n(ht, -1, width-1)
++				if got, want := ts.Next(col), next(col); got != want {
++					fail(ht, "%s: Next(%d) = %d, model %d (width %d, stops %v)", what, col, got, want, width, stops)
++				}
++				if got, want := ts.Prev(col), prev(col); got != want {
++					fail(ht, "%s: Prev(%d) = %d, model %d (width %d, stops %v)", what, col, got, want, width, stops)
++				}
++				delta := n(ht, -3, 3)
++				want := col
++				for d := delta; d > 0; d-- {
++					want = next(want)
++				}
++				for d := delta; d < 0; d++ {
++					want = prev(want)
++				}
++				if got := ts.Find(col, delta); got != want {
++					fail(ht, "%s: Find(%d,%d) = %d, model %d (width %d, stops %v)", what, col, delta, got, want, width, stops)
++				}
++			}
++		}
++		check("fresh")
++		for step, steps := 0, n(ht, 0, 12); step < steps; step++ {
++			switch n(ht, 0, 4) {
++			case 0:
++				if width == 0 {
++					continue
++				}
++				col := n(ht, 0, width-1)
++				ts.Set(col)
++				stops[col] = true
++				check(fmt.Sprintf("Set(%d)", col))
++			case 1:
++				if width == 0 {
++					continue
++				}
++				col := n(ht, 0, width-1)
++				ts.Reset(col)
++				delete(stops, col)
++				check(fmt.Sprintf("Reset(%d)", col))
++			case 2:
++				ts.Clear()
++				stops = map[int]bool{}
++				check("Clear")
++			default:
++				nw := n(ht, 0, 100)
++				ts.Resize(nw)
++				for x := range stops {
++					if x >= nw {
++						delete(stops, x)
++					}
++				}
++				for x := (width + interval - 1) / interval * interval; x < nw; x += interval {
++					stops[x] = true
++				}
++				width = nw
++				check(fmt.Sprintf("Resize(%d)", nw))
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------- pins (screen)
++
++func newScreen(w, h int) (*uv.TerminalScreen, *bytes.Buffer) {
++	var out bytes.Buffer
++	s := uv.NewTerminalScreen(&out, []string{"TERM=xterm-256color"})
++	s.SetColorProfile(colorprofile.TrueColor)
++	s.SetWidthMethod(ansi.WcWidth)
++	s.Resize(w, h)
++	return s, &out
++}
++
++func rowString(e *vt.Emulator, y int) string {
++	var sb strings.Builder
++	for x := 0; x < e.Width(); x++ {
++		if c := e.CellAt(x, y); c != nil && c.Width > 0 {
++			sb.WriteString(c.Content)
++		}
++	}
++	return strings.TrimRight(sb.String(), " ")
++}
++
++// ultraviolet/27: Flush asks the renderer to move the cursor to the requested position, but the
++// renderer queues the sequence in its own buffer and only Render flushes it, so the position
++// reaches the terminal with the next frame.
++func TestHegelPinFlushDoesNotCommitTheCursorPosition(t *testing.T) {
++	defer guard(t)
++	s, out := newScreen(10, 3)
++	s.EnterAltScreen()
++	s.ShowCursor()
++	_ = s.Display(nil)
++	out.Reset()
++	s.SetCursorPosition(5, 1)
++	_ = s.Flush()
++	first := out.String()
++	out.Reset()
++	_ = s.Display(nil)
++	second := out.String()
++	if strings.Contains(first, "\x1b[2;6H") {
++		return
++	}
++	t.Fatalf("SetCursorPosition(5,1) then Flush wrote %q; the move came out of the next Display: %q", first, second)
++}
++
++// ultraviolet/28: Reset writes ShowCursor only when the screen holds no Cursor or a visible one;
++// with a hidden Cursor (Terminal.Start hides it, and SetCursorPosition or HideCursor after
++// ShowCursor creates a hidden one) Terminal.Stop leaves the user's cursor hidden.
++func TestHegelPinResetLeavesAHiddenCursorHidden(t *testing.T) {
++	defer guard(t)
++	s, out := newScreen(10, 3)
++	s.Restore() // Terminal.Start
++	_ = s.Flush()
++	out.Reset()
++	s.SetCursorPosition(1, 1)
++	_ = s.Flush()
++	out.Reset()
++	s.Reset() // Terminal.Stop
++	_ = s.Flush()
++	if strings.Contains(out.String(), ansi.ShowCursor) {
++		return
++	}
++	t.Fatalf("Start hid the cursor (cursor unset), SetCursorPosition(1,1) recorded a hidden cursor, and Stop's Reset wrote %q: the cursor stays hidden after the program exits", out.String())
++}
++
++// ultraviolet/29: SetCursorStyle and SetCursorColor create the screen's Cursor with the
++// default, visible, state when there is none, so after HideCursor (which records nothing when
++// there is no Cursor) they report a visible cursor and the next Flush shows it.
++func TestHegelPinCursorStyleShowsAHiddenCursor(t *testing.T) {
++	defer guard(t)
++	s, out := newScreen(10, 3)
++	s.HideCursor()
++	_ = s.Flush()
++	out.Reset()
++	s.SetCursorStyle(uv.CursorBar, false)
++	visible := s.CursorVisible()
++	_ = s.Flush()
++	if !visible && !strings.Contains(out.String(), ansi.ShowCursor) {
++		return
++	}
++	t.Fatalf("after HideCursor, SetCursorStyle(CursorBar, false) made CursorVisible() %v and the flush wrote %q", visible, out.String())
++}
++
++// ultraviolet/30: InsertAbove is documented to have no visible effect in the alt screen; its
++// bytes go to the active (alternate) screen, so the lines appear at the top and the frame is
++// pushed down while the renderer still believes it is in place.
++func TestHegelPinInsertAboveDrawsOnTheAltScreen(t *testing.T) {
++	defer guard(t)
++	s, out := newScreen(6, 3)
++	e := vt.NewEmulator(6, 5)
++	s.EnterAltScreen()
++	_ = s.Display(uv.NewStyledString("aaaaaa\nbbbbbb\ncccccc"))
++	_, _ = e.WriteString(out.String())
++	out.Reset()
++	_ = s.InsertAbove("hello")
++	_, _ = e.WriteString(out.String())
++	out.Reset()
++	_ = s.Display(nil)
++	_, _ = e.WriteString(out.String())
++	if rowString(e, 0) == "aaaaaa" && rowString(e, 1) == "bbbbbb" && rowString(e, 2) == "cccccc" {
++		return
++	}
++	t.Fatalf("InsertAbove(\"hello\") in the alt screen, then Display: the alt screen shows %q / %q / %q / %q", rowString(e, 0), rowString(e, 1), rowString(e, 2), rowString(e, 3))
++}
++
++// ultraviolet/31: InsertAbove writes each line followed by EL; a line exactly as wide as the
++// screen leaves the cursor on its last cell with the wrap pending, and EL erases that cell.
++func TestHegelPinInsertAboveErasesTheLastCellOfAFullLine(t *testing.T) {
++	defer guard(t)
++	s, out := newScreen(6, 2)
++	e := vt.NewEmulator(6, 6)
++	_ = s.Display(uv.NewStyledString("aaaaaa\nbbbbbb"))
++	_, _ = e.WriteString(out.String())
++	out.Reset()
++	_ = s.InsertAbove("ABCDEF")
++	_, _ = e.WriteString(out.String())
++	if rowString(e, 0) == "ABCDEF" {
++		return
++	}
++	t.Fatalf("InsertAbove(\"ABCDEF\") on a 6-column screen: row 0 shows %q; wrote %q", rowString(e, 0), out.String())
++}
++
++// ultraviolet/32: TabStops indexes its bit set by col>>3 and masks by col&(interval-1), so
++// NewTabStops with an interval above 8 indexes past the slice and one below 8 aliases columns.
++func TestHegelPinTabStopsAssumeAnIntervalOfEight(t *testing.T) {
++	defer guard(t)
++	var panicked any
++	func() {
++		defer func() { panicked = recover() }()
++		uv.NewTabStops(80, 16)
++	}()
++	ts := uv.NewTabStops(16, 4)
++	ts.Reset(4)
++	if panicked == nil && ts.IsStop(0) {
++		return
++	}
++	t.Fatalf("NewTabStops(80, 16) panics with %v; NewTabStops(16, 4) then Reset(4) leaves IsStop(0) = %v", panicked, ts.IsStop(0))
++}
++
++// ultraviolet/34: Reset leaves the alt screen without forgetting what the renderer drew, and
++// Restore re-enters it (the terminal clears it) and calls Render, which finds no change; a
++// program that Stops and Starts again in the alt screen comes back to a blank screen.
++func TestHegelPinRestoreDoesNotRedrawTheAltScreen(t *testing.T) {
++	defer guard(t)
++	s, out := newScreen(6, 3)
++	e := vt.NewEmulator(6, 3)
++	s.EnterAltScreen()
++	_ = s.Display(uv.NewStyledString("aaaaaa\nbbbbbb\ncccccc"))
++	_, _ = e.WriteString(out.String())
++	out.Reset()
++	s.Reset() // Terminal.Stop
++	_ = s.Flush()
++	_, _ = e.WriteString(out.String())
++	out.Reset()
++	s.Restore() // Terminal.Start
++	_ = s.Flush()
++	_, _ = e.WriteString(out.String())
++	if rowString(e, 0) == "aaaaaa" && rowString(e, 1) == "bbbbbb" && rowString(e, 2) == "cccccc" {
++		return
++	}
++	t.Fatalf("after Reset and Restore in the alt screen the terminal shows %q / %q / %q; Restore wrote %q", rowString(e, 0), rowString(e, 1), rowString(e, 2), out.String())
++}
++
++// ultraviolet/33: NewKeyboardEnhancements decodes only the first two Kitty flags, so
++// NewKeyboardEnhancements(flags).Flags() drops ReportAlternateKeys, ReportAllKeysAsEscapeCodes
++// and ReportAssociatedText.
++func TestHegelPinNewKeyboardEnhancementsDropsThreeFlags(t *testing.T) {
++	defer guard(t)
++	var lost []string
++	for f := 0; f < 32; f++ {
++		if got := uv.NewKeyboardEnhancements(f).Flags(); got != f {
++			lost = append(lost, fmt.Sprintf("%d->%d", f, got))
++		}
++	}
++	if len(lost) == 0 {
++		return
++	}
++	t.Fatalf("NewKeyboardEnhancements(flags).Flags() != flags for %d of 32 values: %s", len(lost), strings.Join(lost, " "))
 +}
 diff --git a/hegel_test.go b/hegel_test.go
 new file mode 100644

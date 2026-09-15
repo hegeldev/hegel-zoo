@@ -1,6 +1,6 @@
-# go/ultraviolet — charmbracelet/ultraviolet (input decoder, cell buffer, renderer, layout)
+# go/ultraviolet — charmbracelet/ultraviolet (input decoder, cell buffer, renderer, layout, terminal screen)
 
-The terminal primitives under Bubble Tea v2, in three slices. **Input**: `EventDecoder` (bytes →
+The terminal primitives under Bubble Tea v2, in four slices. **Input**: `EventDecoder` (bytes →
 key, mouse, paste, focus and report events; the successor of charmbracelet/x/input's parser),
 `eventScanner` (the read loop behind `TerminalReader` and `Terminal`: whole-read key-table
 lookup, bracketed paste, waiting for incomplete sequences across reads), the key table
@@ -18,8 +18,13 @@ flag constants and the renderer's current buffer; the renderer differential is i
 through exported `…T` bridges. **Layout**: the `layout` subpackage (a translation of
 ratatui's Cassowary-based `Layout`: `Len`/`Percent`/`Ratio`/`Min`/`Max`/`Fill` constraints,
 seven `Flex` modes, spacing, padding, the split cache) in `layout/hegel_test.go` (package
-`layout_test`), checked against the documented invariants and against ratatui itself. Open
-slices: win32 input mode, `Terminal`.
+`layout_test`), checked against the documented invariants and against ratatui itself.
+**Terminal screen**: `TerminalScreen` (the object behind `Terminal`: alt screen, cursor
+visibility/position/style/colour, terminal colours, bracketed paste, mouse mode and encoding,
+window title, Kitty keyboard flags, progress bar, synchronized updates, `Display`,
+`InsertAbove`, and the `Reset`/`Restore` pair `Terminal.Stop`/`Start` use), `TabStops` and
+`NewKeyboardEnhancements`, in `hegel_screen_test.go` (package `uv_test`, since it drives the
+x/vt emulator). Open slices: win32 input mode, `Terminal`'s event loop.
 
 ## Oracles
 
@@ -75,6 +80,20 @@ the fixed modes and the outer ones empty where the mode says so; `Max` is never 
 since positions are rounded) whenever everything asked for fits in the area; Legacy covers
 the area exactly; the cache returns what a fresh solve returns.
 
+Terminal screen — **the sequences themselves and the x/vt emulator**. A model records what
+the application asked for (each setter's last value); after every `Flush` a small tracker
+reads the flushed bytes back (DECSET/DECRST 1049, 25, 2004, 9/1000/1002/1003 with xterm's
+"last set wins, any reset turns tracking off", 1006/1016, 2026 nesting, 2027, DECSCUSR, OSC
+0/2/10/11/12/110/111/112, `CSI = flags ; 1 u`, OSC 9;4) and must agree with the model, as
+must the getters; the same bytes drive the emulator, whose alt-screen state and screen
+content must show the frame where the renderer believes it is (after `Display`, and after
+`InsertAbove`, whose lines wrapped at the width must sit right above an intact frame). The
+case runs as `Terminal` does: `Restore` first, `Reset` at the end (the tracker must then be
+at the terminal's defaults: main screen, cursor visible, no mouse, no paste, default
+colours/style/title, Kitty flags 0, no progress bar) and `Restore` again (the tracker back at
+the requests, the frame back on the screen). `TabStops` against a set of columns (multiples
+of the interval, `Set`/`Reset`/`Clear`/`Resize`, `Next`/`Prev`/`Find` walking it).
+
 ## Properties
 
 | Test | What it checks | Gates |
@@ -101,6 +120,8 @@ runs of such blanks with EL and terminals keep only the background of erased cel
 | `LayoutSplitsTileTheArea` | random layouts (0–6 constraints, 7 flex modes, spacing −3..5, padding, areas up to 60) satisfy the invariants above | Legacy and single-segment SpaceBetween give the surplus to a segment regardless of its constraint (documented); negative spacing makes every segment at least the overlap |
 | `LayoutCacheIsTransparent` | the same layout split twice, through `Split` and `SplitWithSpacers`, and with a nudged constraint against a fresh solve, agrees | over-constrained layouts (/26) |
 | `LayoutAgreesWithRatatui` | `SplitWithSpacers` equals ratatui's `split_with_spacers` for the same layout | over-constrained layouts and Legacy surplus ties, where equally good solutions exist |
+| `ScreenKeepsItsWord` | Restore, 1–25 setters/`Display`/`InsertAbove` on a 2–20 × 1–8 screen in a terminal up to 6 rows taller, Reset, Restore: getters, flushed sequences and the emulator follow the model (see Oracles); a flush is wrapped in mode 2026 or hide/show cursor as configured | the emulator's cursor position (/27), `InsertAbove` with a visible positioned cursor (/27), the cursor default after Reset with a hidden cursor (/28), `SetCursorStyle`/`SetCursorColor` before any cursor exists (/29), `InsertAbove` in the alt screen (/30) or with a line a multiple of the width (/31), the frame after Restore in the alt screen (/34); `InsertAbove` when frame + content exceed the terminal (counted, see below) |
+| `TabStopsFollowTheModel` | `NewTabStops`, `Set`, `Reset`, `Clear`, `Resize`, `IsStop`, `Next`, `Prev`, `Find` against the set of stops, widths 0–100 | intervals other than 8 (/32) |
 
 ## Bugs
 
@@ -132,6 +153,14 @@ runs of such blanks with EL and terminals keep only the background of erased cel
 | ultraviolet/24 | medium | the renderer resets the terminal's hyperlink on a row change but keeps it in its pen: the next linked cell is drawn without its link |
 | ultraviolet/25 | high | the scroll optimisation moves a row the new frame did not touch and never paints it back: a blank on the terminal where the frame has the row, and the renderer's record agrees with the terminal |
 | ultraviolet/26 | medium | layout: the solver picks among equally good splits at random (Go map iteration in `internal/casso`), so an over-constrained layout changes from call to call |
+| ultraviolet/27 | medium | `TerminalScreen.Flush` does not commit the cursor move it asks the renderer for: the position reaches the terminal with the next Render, one frame late (and Reset's move to the bottom at Stop never does) |
+| ultraviolet/28 | medium | `Reset` leaves the cursor hidden when the screen holds a hidden Cursor: `Terminal.Stop` hands back a terminal without a cursor |
+| ultraviolet/29 | low | `SetCursorStyle`/`SetCursorColor` create a visible Cursor, so after `HideCursor` they report a visible cursor and the next Flush shows it |
+| ultraviolet/30 | medium | `InsertAbove` in the alt screen draws its lines on the alt screen and pushes the frame down, though documented as invisible there |
+| ultraviolet/31 | low | `InsertAbove` erases the last cell of a line exactly as wide as the screen (EL with the wrap pending) |
+| ultraviolet/32 | low | `TabStops` hard-codes an interval of 8: a larger interval panics in `NewTabStops`, a smaller one aliases columns |
+| ultraviolet/33 | low | `NewKeyboardEnhancements` decodes two of the five Kitty flags; `NewKeyboardEnhancements(f).Flags() != f` for 24 of 32 values |
+| ultraviolet/34 | medium | `Restore` after `Reset` re-enters the alt screen without redrawing the frame: Stop then Start comes back to a blank screen |
 
 Fixed here relative to charmbracelet/x/input (held as examples): x-input/2 (event types on
 `CSI n;mod:ev ~`), x-input/3 (num lock text), x-input/4 (URxvt `$` rewrote the caller's
@@ -180,5 +209,16 @@ cellbuf/17 (multi-line scroll without SU), cellbuf/18 (IRM without the cells).
   blank, so not compared.
 - The x/vt emulator has no insert mode (IRM); frames where the renderer uses it (terminals
   without ICH) are not compared.
+- `InsertAbove` when the frame and the inserted rows together exceed the terminal's height:
+  `CUU` stops at the top row and the frame is pushed off the bottom — inherent to the
+  approach (the screen does not know the terminal's height), counted as
+  `insert-taller-than-terminal`, not compared. Its row count is right for lines wider than
+  the screen (they wrap).
+- `TabStops` columns at or beyond the width: a shrinking `Resize` keeps their bits, so
+  `IsStop`/`Prev` queried there see old stops; `Next` guards the width, `Prev` does not.
+  Outside the contract, not queried.
+- Mouse tracking modes are modelled as xterm does them (the last DECSET wins, any DECRST
+  turns tracking off), so `SetMouseMode` setting only the new mode is fine; `Reset` and
+  `SetMouseMode(None)` reset all four.
 - Win32 input mode (`CSI vk;sc;uc;kd;cs;rc _`) and the Windows console path are not covered
   (no encoder written; open slice).
