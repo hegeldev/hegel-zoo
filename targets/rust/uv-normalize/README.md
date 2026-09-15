@@ -75,3 +75,4 @@ does for pip.
 - 2026-09-15: base bumped 6f7795bb4f6e → b8aff80900e7 (2026-09-15, "Update dependency astral-sh/uv to v0.12.13 (#21655)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-15: base bumped b8aff80900e7 → 000a665b745a (2026-09-15, "Batch HTTP cache writes in blocking tasks (#21675)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-15: base bumped 000a665b745a → fd89f638d15f (2026-09-15, "Add regression test for symlinks inside install directory (#21693)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
+- 2026-09-15: base bumped fd89f638d15f → cdabfcedb50b (2026-09-15, "Revert "Reject symlinked wheel installation destinations" (#21699)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.

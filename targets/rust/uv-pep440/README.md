@@ -71,3 +71,4 @@ candidates). Four `pep440_rs` pins hold here as regular properties, since the fo
 - 2026-09-15: base bumped 6f7795bb4f6e → b8aff80900e7 (2026-09-15, "Update dependency astral-sh/uv to v0.12.13 (#21655)"; 0.0.81); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-15: base bumped b8aff80900e7 → 000a665b745a (2026-09-15, "Batch HTTP cache writes in blocking tasks (#21675)"; 0.0.81); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-15: base bumped 000a665b745a → fd89f638d15f (2026-09-15, "Add regression test for symlinks inside install directory (#21693)"; 0.0.81); 5 bug(s) still reproduce. 83 tests pass.
+- 2026-09-15: base bumped fd89f638d15f → a064ab2f6761 (2026-09-15, "Add regression test for `--target .` (#21695)"; 0.0.81); 5 bug(s) still reproduce. 83 tests pass.

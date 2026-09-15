@@ -56,3 +56,4 @@
 - 2026-09-15: base bumped add66e424fa1 → cee7bae63ba1 (2026-09-15, "Support predicate subqueries in projections (#24972)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped cee7bae63ba1 → 745b1ec218d4 (2026-09-15, "fix: update rustls to address RUSTSEC-2026-0285 (#25309)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped 745b1ec218d4 → 133111f43a57 (2026-09-15, "fix: report a negative array_resize size as a user error (#25179)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-15: base bumped 133111f43a57 → 2178f275ed51 (2026-09-15, "perf: Optimize prefix-group processing in `PartialSortExec` (#24979)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
