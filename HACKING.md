@@ -49,3 +49,15 @@ upstream, `zoo bump --accept-fixed` records that). Upstream's own tests failing 
   each property in a `recover` that turns a panic in the code under test into a test-case
   failure — hegel-go re-raises panics after shrinking, which would abort the test binary and
   hide every later test. See `targets/go/jsonparser` for the harness.
+- **TypeScript / JavaScript**: the patch adds ESM test files under the package's test directory
+  (`test/hegel.test.mjs` plus the small harness `test/hegel-zoo.mjs`: `property`, `pin`,
+  `fail`/`count` with a collect mode under `ZOO_COLLECT=1`, and a load-time check that the
+  installed `@hegeldev/hegel` is the pinned version, `HEGEL_PIN` — the line `zoo check` reads);
+  package.json is not touched. `node --test --test-reporter=tap <files>` is the runner and the
+  top-level TAP lines are judged (`ok N - TestHegel…`, `not ok`, `# SKIP`); test names are
+  `TestHegel…` without spaces. `zoo test` installs the package's runtime dependencies and
+  Hegel with `npm install --no-save --no-package-lock --omit=dev @hegeldev/hegel@<pin>`
+  (override with `[run] setup` when a build step is needed); lockfiles and node_modules stay
+  out of the patch. `@hegeldev/hegel` reads no environment variable: the harness passes
+  `HEGEL_TEST_CASES` as `testCases` and `HEGEL_DATABASE` as the database path. Node 22+.
+  See `targets/typescript/ini` for the harness.
