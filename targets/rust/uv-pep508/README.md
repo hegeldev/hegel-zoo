@@ -122,3 +122,4 @@ segment (the crate's documented deviation, below).
 - 2026-09-15: base bumped 2c35bb31de15 → ad552557b635 (2026-09-15, "Preserve local path intent when merging dependency metadata (#20631)"; 0.0.82); 6 bug(s) still reproduce. 127 tests pass.
 - 2026-09-15: base bumped ad552557b635 → 694dfd8155ec (2026-09-15, "Verify distribution hashes (#21562)"; 0.0.82); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped 694dfd8155ec → ac9201b10433 (2026-09-15, "Allow manually specifying build dependency hashes in configuration (#21467)"; 0.0.82); 6 bug(s) still reproduce. 127 tests pass.
+- 2026-09-15: base bumped ac9201b10433 → 1f245a625114 (2026-09-15, "Cover packaged editable self-dependency name mismatches (#21714)"; 0.0.82); 6 bug(s) still reproduce. 126 tests pass.
