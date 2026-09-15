@@ -1,0 +1,1231 @@
+diff --git a/go.mod b/go.mod
+index 8aa39aa..2b65d65 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,14 @@
+ module github.com/muesli/reflow
+ 
+-go 1.13
++go 1.26.0
+ 
+-require github.com/mattn/go-runewidth v0.0.14
++require (
++	github.com/mattn/go-runewidth v0.0.14
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	github.com/rivo/uniseg v0.2.0 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..8be61e6
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1204 @@
++// Hegel properties for muesli/reflow: ANSI-aware word wrapping, unconditional wrapping,
++// indentation, padding, margins, truncation and dedentation.
++//
++// Oracles: models written from the README and the package documentation, mattn/go-runewidth
++// (the library's own width dependency) for cell widths, and a small SGR model — every printable
++// rune of a result carries the style (the SGR sequences since the last reset) it had in the
++// input, so "ANSI sequences do not affect the algorithms" is checked as a semantic statement,
++// not as a byte comparison. REFLOW_COLLECT=1 turns failures into a tally per property.
++package reflow_test
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/mattn/go-runewidth"
++	"github.com/muesli/reflow/ansi"
++	"github.com/muesli/reflow/dedent"
++	"github.com/muesli/reflow/indent"
++	"github.com/muesli/reflow/margin"
++	"github.com/muesli/reflow/padding"
++	"github.com/muesli/reflow/truncate"
++	"github.com/muesli/reflow/wordwrap"
++	"github.com/muesli/reflow/wrap"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("REFLOW_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			statsMu.Lock()
++			keys := make([]string, 0, len(stats))
++			for k := range stats {
++				keys = append(keys, k)
++			}
++			sort.Strings(keys)
++			var sb strings.Builder
++			for _, k := range keys {
++				fmt.Fprintf(&sb, " %s=%d", k, stats[k])
++			}
++			stats = map[string]int{}
++			statsMu.Unlock()
++			t.Logf("COLLECT %s: %d mismatches; stats%s", t.Name(), len(collectedMsgs), sb.String())
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++var (
++	statsMu sync.Mutex
++	stats   = map[string]int{}
++)
++
++// count tallies an outcome for the collect-mode summary.
++func count(name string) {
++	statsMu.Lock()
++	stats[name]++
++	statsMu.Unlock()
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---------------------------------------------------------------- ANSI model
++
++const esc = '\x1b'
++
++// strip removes every escape sequence (ESC up to and including the first terminator, as
++// ansi.IsTerminator defines it).
++func strip(s string) string {
++	var sb strings.Builder
++	in := false
++	for _, c := range s {
++		switch {
++		case c == esc:
++			in = true
++		case in:
++			if ansi.IsTerminator(c) {
++				in = false
++			}
++		default:
++			sb.WriteRune(c)
++		}
++	}
++	return sb.String()
++}
++
++// srune is a printable rune with the SGR style in force where it appears: the concatenation
++// of the SGR sequences (ESC [ ... m) since the last reset (ESC [0m), "" after a reset.
++type srune struct {
++	r     rune
++	style string
++}
++
++// styled reads s into styled runes.
++func styled(s string) []srune {
++	var out []srune
++	style := ""
++	var seq strings.Builder
++	in := false
++	for _, c := range s {
++		switch {
++		case c == esc:
++			in = true
++			seq.Reset()
++			seq.WriteRune(c)
++		case in:
++			seq.WriteRune(c)
++			if ansi.IsTerminator(c) {
++				in = false
++				if c == 'm' {
++					if strings.HasSuffix(seq.String(), "[0m") {
++						style = ""
++					} else {
++						style += seq.String()
++					}
++				}
++			}
++		default:
++			out = append(out, srune{c, style})
++		}
++	}
++	return out
++}
++
++func runesOf(ss []srune) string {
++	var sb strings.Builder
++	for _, x := range ss {
++		sb.WriteRune(x.r)
++	}
++	return sb.String()
++}
++
++// lastSGR is what ansi.Writer.LastSequence should report after s: the SGR sequences since the
++// last reset.
++func lastSGR(s string) string {
++	ss := styled(s + "x")
++	return ss[len(ss)-1].style
++}
++
++func rw(r rune) int { return runewidth.RuneWidth(r) }
++
++// width is the printable cell width of s (sequences excluded), summing per rune as the
++// library does.
++func width(s string) int {
++	w := 0
++	for _, c := range strip(s) {
++		w += rw(c)
++	}
++	return w
++}
++
++func removeSpace(s string) string {
++	return strings.Map(func(r rune) rune {
++		if unicode.IsSpace(r) {
++			return -1
++		}
++		return r
++	}, s)
++}
++
++// ---------------------------------------------------------------- generators
++
++var (
++	wordRunes = []rune{'a', 'b', 'A', '0', '1', 'é', '日', '\U0001F600'}
++	sgrPool   = []string{"\x1b[31m", "\x1b[1m", "\x1b[4m", "\x1b[38;2;249;38;114m", "\x1b[0m", "\x1b[32;1m", "\x1b[0m"}
++)
++
++type docCfg struct {
++	ansi, hyphen, tab bool
++}
++
++// genWord: 1-5 runes, a breakpoint inside when allowed.
++func genWord(tc hegel.TestCase, cfg docCfg) string {
++	var sb strings.Builder
++	k := n(tc, 1, 5)
++	for i := 0; i < k; i++ {
++		if cfg.hyphen && i > 0 && chance(tc, 20) {
++			sb.WriteRune('-')
++		}
++		sb.WriteRune(pick(tc, wordRunes))
++	}
++	return sb.String()
++}
++
++// genDoc: words, runs of spaces, newlines, tabs (when allowed) and SGR sequences attached to
++// words (directly before the first or after the last rune of a word) when allowed.
++func genDoc(tc hegel.TestCase, cfg docCfg) string {
++	var sb strings.Builder
++	k := n(tc, 0, 8)
++	for i := 0; i < k; i++ {
++		switch n(tc, 0, 9) {
++		case 0:
++			sb.WriteString("\n")
++		case 1, 2:
++			sb.WriteString(strings.Repeat(" ", n(tc, 1, 3)))
++		case 3:
++			if cfg.tab {
++				sb.WriteString("\t")
++			} else {
++				sb.WriteString(" ")
++			}
++		default:
++			if cfg.ansi && chance(tc, 30) {
++				sb.WriteString(pick(tc, sgrPool))
++			}
++			sb.WriteString(genWord(tc, cfg))
++			if cfg.ansi && chance(tc, 30) {
++				sb.WriteString(pick(tc, sgrPool))
++			}
++		}
++	}
++	return sb.String()
++}
++
++// chunk splits s at random rune boundaries that are not inside an escape sequence.
++func chunk(tc hegel.TestCase, s string) []string {
++	var cuts []int
++	in := false
++	for i, c := range s {
++		if i > 0 && !in {
++			cuts = append(cuts, i)
++		}
++		if c == esc {
++			in = true
++		} else if in && ansi.IsTerminator(c) {
++			in = false
++		}
++	}
++	var chosen []int
++	for _, c := range cuts {
++		if chance(tc, 30) {
++			chosen = append(chosen, c)
++		}
++	}
++	var out []string
++	prev := 0
++	for _, c := range chosen {
++		out = append(out, s[prev:c])
++		prev = c
++	}
++	return append(out, s[prev:])
++}
++
++// splitLines: the segments between newlines; the last one is the text after the final newline
++// ("" when the input ends with one).
++func splitLines(s string) []string { return strings.Split(s, "\n") }
++
++// ---------------------------------------------------------------- word wrapping
++
++// TestHegelWordWrapKeepsLinesWithinTheLimit: wordwrap.String preserves every non-whitespace
++// rune and sequence in order, is transparent to escape sequences, and every output line fits
++// the limit unless it is a single unbreakable word. Lines containing a breakpoint (regexp
++// reflow/1) and limits of 1 and 2 (reflow/2) are pinned and not judged for width.
++func TestHegelWordWrapKeepsLinesWithinTheLimit(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true, hyphen: true})
++		limit := n(ht, 1, 12)
++		note(ht, "input=%q limit=%d", s, limit)
++		out := wordwrap.String(s, limit)
++		note(ht, "output=%q", out)
++		if removeSpace(out) != removeSpace(s) {
++			fail(ht, "wordwrap.String(%q, %d) = %q: non-whitespace content changed", s, limit, out)
++		}
++		if got, want := strip(out), wordwrap.String(strip(s), limit); got != want {
++			fail(ht, "wordwrap.String(%q, %d) = %q; stripped of sequences %q, but the stripped input wraps to %q", s, limit, out, got, want)
++		}
++		plain := strip(out)
++		if strings.Count(plain, "\n") < strings.Count(s, "\n") {
++			fail(ht, "wordwrap.String(%q, %d) = %q lost a newline", s, limit, out)
++		}
++		if limit <= 2 {
++			count("skip-width-limit-le-2")
++		} else {
++			for _, line := range splitLines(plain) {
++				if width(line) <= limit {
++					continue
++				}
++				if strings.ContainsRune(line, '-') {
++					count("skip-width-breakpoint-line")
++					note(ht, "line %q exceeds the limit with a breakpoint on it: pinned (reflow/1), not judged", line)
++					continue
++				}
++				// The last word of the line and what precedes it.
++				idx := strings.LastIndexFunc(line, unicode.IsSpace)
++				last, before := line[idx+1:], line[:idx+1]
++				if strings.TrimSpace(before) == "" && width(last) > limit {
++					count("unbreakable-line") // a word wider than the limit, possibly after leading spaces
++					continue
++				}
++				if width(last) >= limit && width(before) <= 2 {
++					// Pinned (reflow/2): a word at least as wide as the limit after at most two
++					// cells of content is not moved to its own line.
++					count("skip-width-word-as-wide-as-limit")
++					note(ht, "line %q: a word as wide as the limit after short content: pinned (reflow/2), not judged", line)
++					continue
++				}
++				fail(ht, "wordwrap.String(%q, %d) = %q: line %q is %d wide and breakable", s, limit, out, line, width(line))
++			}
++			if !strings.Contains(s, "-") {
++				if again := wordwrap.String(out, limit); again != out {
++					fail(ht, "wordwrap.String(%q, %d) = %q is not stable: wrapping it again gives %q", s, limit, out, again)
++				}
++			}
++		}
++		// KeepNewlines = false is documented as folding the text into one paragraph first.
++		w := wordwrap.NewWriter(limit)
++		w.KeepNewlines = false
++		_, _ = w.Write([]byte(s))
++		_ = w.Close()
++		folded := strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
++		if got, want := w.String(), wordwrap.String(folded, limit); got != want {
++			fail(ht, "KeepNewlines=false on %q: %q, want the wrap of the folded text %q = %q", s, got, folded, want)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- unconditional wrapping
++
++// wrapModel: the documented rules — tabs become TabWidth spaces, newlines are dropped unless
++// kept, a rune that would exceed the limit starts a new line, and after such a forced break
++// leading whitespace is dropped unless PreserveSpace; escape sequences are copied and have no
++// width.
++func wrapModel(s string, limit int, keepNL, preserve bool, tabw int) string {
++	s = strings.ReplaceAll(s, "\t", strings.Repeat(" ", tabw))
++	if !keepNL {
++		s = strings.ReplaceAll(s, "\n", "")
++	}
++	if limit <= 0 {
++		return s
++	}
++	var out strings.Builder
++	lineLen := 0
++	forceful, in := false, false
++	for _, c := range s {
++		switch {
++		case c == esc:
++			in = true
++		case in:
++			if ansi.IsTerminator(c) {
++				in = false
++			}
++		case c == '\n':
++			out.WriteRune('\n')
++			lineLen = 0
++			forceful = false
++			continue
++		default:
++			w := rw(c)
++			if lineLen+w > limit {
++				out.WriteRune('\n')
++				lineLen = 0
++				forceful = true
++			}
++			if lineLen == 0 {
++				if forceful && !preserve && unicode.IsSpace(c) {
++					continue
++				}
++			} else {
++				forceful = false
++			}
++			lineLen += w
++		}
++		out.WriteRune(c)
++	}
++	return out.String()
++}
++
++// TestHegelWrapFollowsTheDocumentedRules: wrap.Wrap equals the model for every combination of
++// KeepNewlines, PreserveSpace and TabWidth, and writing in chunks equals one write. The
++// chunk that fits the limit whole is pinned (reflow/5, reflow/6) and not judged.
++func TestHegelWrapFollowsTheDocumentedRules(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true, tab: true})
++		limit := n(ht, 1, 12)
++		keepNL, preserve := chance(ht, 70), chance(ht, 50)
++		tabw := n(ht, 1, 4)
++		note(ht, "input=%q limit=%d keepNewlines=%v preserveSpace=%v tabWidth=%d", s, limit, keepNL, preserve, tabw)
++		mk := func() *wrap.Wrap {
++			w := wrap.NewWriter(limit)
++			w.KeepNewlines, w.PreserveSpace, w.TabWidth = keepNL, preserve, tabw
++			return w
++		}
++		w := mk()
++		_, _ = w.Write([]byte(s))
++		got := w.String()
++		want := wrapModel(s, limit, keepNL, preserve, tabw)
++		expanded := strings.ReplaceAll(s, "\t", strings.Repeat(" ", tabw))
++		if !keepNL {
++			expanded = strings.ReplaceAll(expanded, "\n", "")
++		}
++		fits := width(expanded) <= limit
++		if fits && (strings.Contains(s, "\t") || (!keepNL && strings.Contains(s, "\n"))) {
++			count("skip-fast-path-tab-or-newline")
++			note(ht, "input fits the limit whole with a tab or a dropped newline: pinned (reflow/5), not judged")
++		} else {
++			if got != want {
++				fail(ht, "wrap of %q (limit %d, keepNewlines %v, preserveSpace %v, tabWidth %d) = %q, want %q", s, limit, keepNL, preserve, tabw, got, want)
++			}
++			count("compared")
++		}
++		if keepNL && tabw == 4 && !preserve {
++			if got2 := wrap.String(s, limit); got2 != got {
++				fail(ht, "wrap.String(%q, %d) = %q, but the default writer gives %q", s, limit, got2, got)
++			}
++		}
++		if !strings.ContainsAny(s, " \n\t") {
++			// With whitespace in the text a chunk that fits whole is written raw and skips the
++			// whitespace-dropping after a forced break: pinned (reflow/6), not judged.
++			w2 := mk()
++			for _, c := range chunk(ht, s) {
++				_, _ = w2.Write([]byte(c))
++			}
++			if w2.String() != got {
++				fail(ht, "wrap of %q in chunks = %q, in one write %q", s, w2.String(), got)
++			}
++			count("chunked")
++		} else {
++			count("skip-chunked-whitespace")
++		}
++	})
++}
++
++// ---------------------------------------------------------------- indentation
++
++// indentModel: every line that has at least one rune (a newline counts) is prefixed with the
++// indentation; the empty text after a final newline is not.
++func indentModel(ss []srune, prefix string) []srune {
++	var out []srune
++	atStart := true
++	for _, x := range ss {
++		if atStart {
++			for _, p := range prefix {
++				out = append(out, srune{p, ""})
++			}
++			atStart = false
++		}
++		out = append(out, x)
++		if x.r == '\n' {
++			atStart = true
++		}
++	}
++	return out
++}
++
++// TestHegelIndentPrefixesEveryLine: indent.String and the writers prefix every line, the
++// indentation carries no style and every input rune keeps its style; a custom IndentFunc is
++// applied Indent times.
++func TestHegelIndentPrefixesEveryLine(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true})
++		ind := n(ht, 0, 4)
++		note(ht, "input=%q indent=%d", s, ind)
++		out := indent.String(s, uint(ind))
++		note(ht, "output=%q", out)
++		want := indentModel(styled(s), strings.Repeat(" ", ind))
++		if got := styled(out); !reflect.DeepEqual(got, want) {
++			fail(ht, "indent.String(%q, %d) = %q: styled runes %v, want %v", s, ind, out, got, want)
++		}
++		if strip(s) == s && out != runesOf(want) {
++			fail(ht, "indent.String(%q, %d) = %q, want %q", s, ind, out, runesOf(want))
++		}
++		dots := indent.NewWriter(uint(ind), func(w io.Writer) { _, _ = w.Write([]byte(".")) })
++		_, _ = dots.Write([]byte(s))
++		if got, want := styled(dots.String()), indentModel(styled(s), strings.Repeat(".", ind)); !reflect.DeepEqual(got, want) {
++			fail(ht, "indent with a '.' IndentFunc of %q (%d) = %q: styled runes %v, want %v", s, ind, dots.String(), got, want)
++		}
++		var fw bytes.Buffer
++		pipe := indent.NewWriterPipe(&fw, uint(ind), nil)
++		_, _ = pipe.Write([]byte(s))
++		if fw.String() != out {
++			fail(ht, "indent.NewWriterPipe forwards %q, indent.String gives %q", fw.String(), out)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- padding
++
++// padModel: every line before a newline is padded to the width; the text after the last
++// newline only when it has printable width. Padding runes are marked with style "*" (not
++// judged).
++func padModel(ss []srune, w int, pad rune) []srune {
++	var out []srune
++	lineW := 0
++	flush := func(final bool) {
++		if (!final || lineW > 0) && lineW < w {
++			for i := lineW; i < w; i++ {
++				out = append(out, srune{pad, "*"})
++			}
++		}
++		lineW = 0
++	}
++	for _, x := range ss {
++		if x.r == '\n' {
++			flush(false)
++			out = append(out, srune{'\n', "*"}) // the style of a newline has no visible effect
++			continue
++		}
++		lineW += rw(x.r)
++		out = append(out, x)
++	}
++	flush(true)
++	return out
++}
++
++// sameStyled compares styled runes, "*" in want matching any style; withStyle false compares
++// runes only.
++func sameStyled(got, want []srune, withStyle bool) bool {
++	if len(got) != len(want) {
++		return false
++	}
++	for i := range got {
++		if got[i].r != want[i].r {
++			return false
++		}
++		if withStyle && want[i].style != "*" && got[i].style != want[i].style {
++			return false
++		}
++	}
++	return true
++}
++
++// styleCrossesNewline: some rune after a newline is still styled (the shape pinned as reflow/8).
++func styleCrossesNewline(ss []srune) bool {
++	for i := 1; i < len(ss); i++ {
++		if ss[i-1].r == '\n' && ss[i].style != "" {
++			return true
++		}
++	}
++	return false
++}
++
++// TestHegelPaddingFillsEveryLineToTheWidth: padding.String pads every line to the width, keeps
++// every rune with its style, and a custom PadFunc is applied once per missing cell.
++func TestHegelPaddingFillsEveryLineToTheWidth(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true})
++		w := n(ht, 0, 10)
++		note(ht, "input=%q width=%d", s, w)
++		out := padding.String(s, uint(w))
++		note(ht, "output=%q", out)
++		in := styled(s)
++		want := padModel(in, w, ' ')
++		withStyle := !styleCrossesNewline(in)
++		if !withStyle {
++			count("skip-style-across-newline")
++			note(ht, "a style is in force across a newline: pinned (reflow/8), styles not judged")
++		}
++		if got := styled(out); !sameStyled(got, want, withStyle) {
++			fail(ht, "padding.String(%q, %d) = %q: styled runes %v, want %v", s, w, out, got, want)
++		}
++		if strip(s) == s && out != runesOf(want) {
++			fail(ht, "padding.String(%q, %d) = %q, want %q", s, w, out, runesOf(want))
++		}
++		lines := splitLines(strip(out))
++		for i, line := range lines {
++			if i < len(lines)-1 && width(line) < w {
++				fail(ht, "padding.String(%q, %d) = %q: line %q is %d wide", s, w, out, line, width(line))
++			}
++		}
++		dots := padding.NewWriter(uint(w), func(w io.Writer) { _, _ = w.Write([]byte(".")) })
++		_, _ = dots.Write([]byte(s))
++		_ = dots.Close()
++		if got, want := styled(dots.String()), padModel(in, w, '.'); !sameStyled(got, want, withStyle) {
++			fail(ht, "padding with a '.' PadFunc of %q (%d) = %q: styled runes %v, want %v", s, w, dots.String(), got, want)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- margin
++
++// TestHegelMarginIsIndentThenPadding: margin.String is padding applied to the indented text,
++// for spaces and for a custom function.
++func TestHegelMarginIsIndentThenPadding(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true})
++		w, m := n(ht, 0, 10), n(ht, 0, 4)
++		note(ht, "input=%q width=%d margin=%d", s, w, m)
++		got := margin.String(s, uint(w), uint(m))
++		want := padding.String(indent.String(s, uint(m)), uint(w))
++		if got != want {
++			fail(ht, "margin.String(%q, %d, %d) = %q, want padding of the indented text %q", s, w, m, got, want)
++		}
++		dot := func(w io.Writer) { _, _ = w.Write([]byte(".")) }
++		mw := margin.NewWriter(uint(w), uint(m), dot)
++		_, _ = mw.Write([]byte(s))
++		_ = mw.Close()
++		iw := indent.NewWriter(uint(m), dot)
++		_, _ = iw.Write([]byte(s))
++		pw := padding.NewWriter(uint(w), dot)
++		_, _ = pw.Write(iw.Bytes())
++		_ = pw.Close()
++		if mw.String() != pw.String() {
++			fail(ht, "margin with a '.' function of %q (%d, %d) = %q, want %q", s, w, m, mw.String(), pw.String())
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- truncation
++
++// truncateModel: the input unchanged when it fits; otherwise the longest prefix (sequences
++// copied, no width) fitting width - tail width, the tail, and a reset if an SGR style is open.
++func truncateModel(s string, w int, tail string) string {
++	if width(s) <= w {
++		return s
++	}
++	budget := w - width(tail)
++	var out strings.Builder
++	cur := 0
++	in := false
++	var seq strings.Builder
++	open := false
++	for _, c := range s {
++		switch {
++		case c == esc:
++			in = true
++			seq.Reset()
++			seq.WriteRune(c)
++		case in:
++			seq.WriteRune(c)
++			if ansi.IsTerminator(c) {
++				in = false
++				if c == 'm' {
++					open = !strings.HasSuffix(seq.String(), "[0m")
++				}
++			}
++		default:
++			cur += rw(c)
++			if cur > budget {
++				out.WriteString(tail)
++				if open {
++					out.WriteString("\x1b[0m")
++				}
++				return out.String()
++			}
++		}
++		out.WriteRune(c)
++	}
++	return out.String()
++}
++
++var tailPool = []string{"", ".", "...", "…", "日"}
++
++// TestHegelTruncateCutsAtTheWidth: truncate.StringWithTail equals the model, the result is
++// never wider than the width, and its printable text is a prefix of the input plus the tail.
++// A tail wider than the width is pinned (reflow/12) and not judged.
++func TestHegelTruncateCutsAtTheWidth(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true})
++		w := n(ht, 0, 12)
++		tail := pick(ht, tailPool)
++		note(ht, "input=%q width=%d tail=%q", s, w, tail)
++		if width(tail) > w {
++			count("skip-tail-wider-than-width")
++			note(ht, "tail wider than the width: pinned (reflow/12), not judged")
++			return
++		}
++		if sw := width(s); sw <= w && sw > w-width(tail) {
++			count("skip-fits-within-the-tail-reserve")
++			note(ht, "the text fits the width but not the width minus the tail: pinned (reflow/18), not judged")
++			return
++		}
++		got := truncate.StringWithTail(s, uint(w), tail)
++		want := truncateModel(s, w, tail)
++		if got != want {
++			fail(ht, "truncate.StringWithTail(%q, %d, %q) = %q, want %q", s, w, tail, got, want)
++		}
++		if width(got) > w && width(s) > w {
++			fail(ht, "truncate.StringWithTail(%q, %d, %q) = %q is %d wide", s, w, tail, got, width(got))
++		}
++		if plain := strip(got); width(s) > w {
++			if !strings.HasSuffix(plain, strip(tail)) || !strings.HasPrefix(strip(s), strings.TrimSuffix(plain, strip(tail))) {
++				fail(ht, "truncate.StringWithTail(%q, %d, %q) = %q: not a prefix of the input plus the tail", s, w, tail, got)
++			}
++		}
++		if tail == "" && truncate.String(s, uint(w)) != got {
++			fail(ht, "truncate.String and StringWithTail(\"\") differ on %q", s)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- dedent
++
++// dedentModel: the smallest indentation of the non-blank lines is removed from every line
++// (blank lines lose what they have, up to that much).
++func dedentModel(s string) string {
++	lines := splitLines(s)
++	common := -1
++	for _, l := range lines {
++		trimmed := strings.TrimLeft(l, " \t")
++		if trimmed == "" {
++			continue
++		}
++		if k := len(l) - len(trimmed); common < 0 || k < common {
++			common = k
++		}
++	}
++	if common <= 0 {
++		return s
++	}
++	for i, l := range lines {
++		k := len(l) - len(strings.TrimLeft(l, " \t"))
++		if k > common {
++			k = common
++		}
++		lines[i] = l[k:]
++	}
++	return strings.Join(lines, "\n")
++}
++
++// TestHegelDedentRemovesTheCommonIndent: dedent.String removes the common indentation of
++// texts whose non-blank lines are all indented with the same character. Unindented lines
++// (reflow/13) and mixed tabs and spaces (reflow/14) are pinned and not generated.
++func TestHegelDedentRemovesTheCommonIndent(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		ws := pick(ht, []string{" ", "\t"})
++		var lines []string
++		for i, k := 0, n(ht, 1, 5); i < k; i++ {
++			if chance(ht, 70) {
++				lines = append(lines, strings.Repeat(ws, n(ht, 1, 4))+genWord(ht, docCfg{}))
++			} else {
++				lines = append(lines, strings.Repeat(ws, n(ht, 0, 4)))
++			}
++		}
++		s := strings.Join(lines, "\n")
++		if chance(ht, 50) {
++			s += "\n"
++		}
++		note(ht, "input=%q", s)
++		got, want := dedent.String(s), dedentModel(s)
++		if got != want {
++			fail(ht, "dedent.String(%q) = %q, want %q", s, got, want)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- ansi helpers
++
++// TestHegelAnsiHelpersFollowTheirModels: PrintableRuneWidth agrees with go-runewidth on the
++// stripped text, ansi.Writer forwards its input unchanged (in one write or in chunks) and
++// LastSequence reports the SGR sequences since the last reset.
++func TestHegelAnsiHelpersFollowTheirModels(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true, hyphen: true, tab: true})
++		note(ht, "input=%q", s)
++		if got, want := ansi.PrintableRuneWidth(s), runewidth.StringWidth(strip(s)); got != want {
++			fail(ht, "PrintableRuneWidth(%q) = %d, runewidth.StringWidth of the stripped text %d", s, got, want)
++		}
++		var b ansi.Buffer
++		b.WriteString(s)
++		if b.PrintableRuneWidth() != ansi.PrintableRuneWidth(s) {
++			fail(ht, "Buffer.PrintableRuneWidth differs from PrintableRuneWidth on %q", s)
++		}
++		var fw bytes.Buffer
++		aw := &ansi.Writer{Forward: &fw}
++		for _, c := range chunk(ht, s) {
++			nn, err := aw.Write([]byte(c))
++			if err != nil || nn != len(c) {
++				fail(ht, "ansi.Writer.Write(%q) = %d, %v", c, nn, err)
++			}
++		}
++		if fw.String() != s {
++			fail(ht, "ansi.Writer forwarded %q for %q", fw.String(), s)
++		}
++		if got, want := aw.LastSequence(), lastSGR(s); got != want {
++			fail(ht, "ansi.Writer.LastSequence after %q = %q, want %q", s, got, want)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- chunked writes
++
++// TestHegelWritersAreChunkInvariant: writing the text in pieces (never inside a sequence or
++// a rune) gives what one write gives, for wordwrap, indent and padding. wrap with newlines
++// (reflow/6), truncate (reflow/10, /11) and margin (reflow/9) are pinned and not judged.
++func TestHegelWritersAreChunkInvariant(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genDoc(ht, docCfg{ansi: true, hyphen: true})
++		limit := n(ht, 1, 12)
++		pieces := chunk(ht, s)
++		note(ht, "input=%q limit=%d pieces=%q", s, limit, pieces)
++		ww := wordwrap.NewWriter(limit)
++		for _, c := range pieces {
++			_, _ = ww.Write([]byte(c))
++		}
++		_ = ww.Close()
++		if got, want := ww.String(), wordwrap.String(s, limit); got != want {
++			fail(ht, "wordwrap in %d chunks %q = %q, in one write %q", len(pieces), pieces, got, want)
++		}
++		// wordwrap with KeepNewlines = false trims every chunk on its own: pinned (reflow/19).
++		iw := indent.NewWriter(uint(limit), nil)
++		for _, c := range pieces {
++			_, _ = iw.Write([]byte(c))
++		}
++		if got, want := iw.String(), indent.String(s, uint(limit)); got != want {
++			fail(ht, "indent in chunks %q = %q, in one write %q", pieces, got, want)
++		}
++		pw := padding.NewWriter(uint(limit), nil)
++		for _, c := range pieces {
++			_, _ = pw.Write([]byte(c))
++		}
++		_ = pw.Close()
++		if got, want := pw.String(), padding.String(s, uint(limit)); got != want {
++			fail(ht, "padding in chunks %q = %q, in one write %q", pieces, got, want)
++		}
++		count("compared")
++	})
++}
++
++// ---------------------------------------------------------------- pins
++
++// TestHegelPinWordWrapCountsBreakpoints (reflow/1): a breakpoint character is written without
++// being counted in the line length, so lines with hyphens exceed the limit.
++func TestHegelPinWordWrapCountsBreakpoints(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		in    string
++		limit int
++	}{{"ab-cd-ef", 5}, {"aa-bb", 4}, {"a-b-c-d-e-f", 3}} {
++		out := wordwrap.String(c.in, c.limit)
++		for _, line := range splitLines(out) {
++			if width(line) > c.limit {
++				t.Errorf("wordwrap.String(%q, %d) = %q: line %q is %d wide", c.in, c.limit, out, line, width(line))
++			}
++		}
++	}
++}
++
++// TestHegelPinWordWrapBreaksBeforeAWordAsWideAsTheLimit (reflow/2): a word at least as wide as
++// the limit stays on the current line after other content instead of starting a new one.
++func TestHegelPinWordWrapBreaksBeforeAWordAsWideAsTheLimit(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		in    string
++		limit int
++		want  string
++	}{{"a bc", 1, "a\nbc"}, {"a 日", 2, "a\n日"}, {"ab 日", 2, "ab\n日"}, {"a \U0001F600", 2, "a\n\U0001F600"}} {
++		if got := wordwrap.String(c.in, c.limit); got != c.want {
++			t.Errorf("wordwrap.String(%q, %d) = %q, want %q", c.in, c.limit, got, c.want)
++		}
++	}
++}
++
++// TestHegelPinWordWrapMeasuresSpacesByWidth (reflow/3): whitespace is measured in bytes, so a
++// no-break space counts two cells and an ideographic space three.
++func TestHegelPinWordWrapMeasuresSpacesByWidth(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		in    string
++		limit int
++	}{{"a bc", 4}, {"a bcd", 5}, {"日　b", 5}} {
++		if got := wordwrap.String(c.in, c.limit); got != c.in {
++			t.Errorf("wordwrap.String(%q, %d) = %q, but the text is %d wide and fits", c.in, c.limit, got, width(c.in))
++		}
++	}
++}
++
++// TestHegelPinWordWrapIsTransparentToASequenceBeforeANewline (reflow/4): trailing whitespace
++// followed by an escape sequence is kept past the limit; without the sequence it is dropped.
++func TestHegelPinWordWrapIsTransparentToASequenceBeforeANewline(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		in    string
++		limit int
++	}{{"a \x1b[0m\nb", 1}, {"ab  \x1b[31m\ncd", 3}} {
++		got, want := strip(wordwrap.String(c.in, c.limit)), wordwrap.String(strip(c.in), c.limit)
++		if got != want {
++			t.Errorf("wordwrap.String(%q, %d) stripped = %q; the stripped input wraps to %q", c.in, c.limit, got, want)
++		}
++	}
++}
++
++// TestHegelPinWrapFastPathExpandsTabsAndDropsNewlines (reflow/5): a chunk that fits the limit
++// is written raw — tabs unexpanded, newlines kept with KeepNewlines = false.
++func TestHegelPinWrapFastPathExpandsTabsAndDropsNewlines(t *testing.T) {
++	defer guard(t)
++	if got, want := wrap.String("a\tb", 10), "a    b"; got != want {
++		t.Errorf("wrap.String(%q, 10) = %q, want %q (wrap.String(%q, 5) = %q does expand)", "a\tb", got, want, "a\tb", wrap.String("a\tb", 5))
++	}
++	w := wrap.NewWriter(10)
++	w.KeepNewlines = false
++	_, _ = w.Write([]byte("ab\ncd"))
++	if got, want := w.String(), "abcd"; got != want {
++		t.Errorf("wrap with KeepNewlines=false of %q (limit 10) = %q, want %q", "ab\ncd", got, want)
++	}
++}
++
++// TestHegelPinWrapWriterTracksTheCurrentLine (reflow/6): a chunk that fits whole adds its
++// total width, across its newlines, to the current line length.
++func TestHegelPinWrapWriterTracksTheCurrentLine(t *testing.T) {
++	defer guard(t)
++	w := wrap.NewWriter(4)
++	_, _ = w.Write([]byte("ab\ncd"))
++	_, _ = w.Write([]byte("ef"))
++	if got, want := w.String(), wrap.String("ab\ncdef", 4); got != want {
++		t.Errorf("wrap of %q then %q (limit 4) = %q; in one write %q", "ab\ncd", "ef", got, want)
++	}
++}
++
++// TestHegelPinIndentAndPaddingTerminateSequencesLikeAnsi (reflow/7): indent and padding end
++// an escape sequence only at a letter, ansi.IsTerminator also at '@'.
++func TestHegelPinIndentAndPaddingTerminateSequencesLikeAnsi(t *testing.T) {
++	defer guard(t)
++	in := "\x1b[1@ab\ncd"
++	if got, want := strip(indent.String(in, 2)), indent.String(strip(in), 2); got != want {
++		t.Errorf("indent.String(%q, 2) stripped = %q, want %q", in, got, want)
++	}
++	if got, want := strip(padding.String(in, 4)), padding.String(strip(in), 4); got != want {
++		t.Errorf("padding.String(%q, 4) stripped = %q, want %q", in, got, want)
++	}
++}
++
++// TestHegelPinPaddingKeepsStylesAcrossLines (reflow/8): padding resets the style at every
++// newline and does not restore it, so a style spanning lines ends after the first.
++func TestHegelPinPaddingKeepsStylesAcrossLines(t *testing.T) {
++	defer guard(t)
++	in := "\x1b[31ma\nb\x1b[0m"
++	out := padding.String(in, 3)
++	got := styled(out)
++	for _, x := range got {
++		if x.r == 'b' && x.style != "\x1b[31m" {
++			t.Errorf("padding.String(%q, 3) = %q: 'b' has style %q, want %q (indent.String keeps it: %q)", in, out, x.style, "\x1b[31m", indent.String(in, 1))
++		}
++	}
++}
++
++// TestHegelPinMarginWriterDoesNotRepeatEarlierWrites (reflow/9): every Write feeds the whole
++// indented buffer so far to the padder, duplicating earlier chunks.
++func TestHegelPinMarginWriterDoesNotRepeatEarlierWrites(t *testing.T) {
++	defer guard(t)
++	m := margin.NewWriter(6, 2, nil)
++	_, _ = m.Write([]byte("ab\n"))
++	_, _ = m.Write([]byte("cd"))
++	_ = m.Close()
++	if got, want := m.String(), margin.String("ab\ncd", 6, 2); got != want {
++		t.Errorf("margin.Writer with two writes = %q, margin.String = %q", got, want)
++	}
++}
++
++// TestHegelPinTruncateWriterCountsAcrossWrites (reflow/10): the printed width restarts at zero
++// in every Write, so the writer never truncates text spread over several writes.
++func TestHegelPinTruncateWriterCountsAcrossWrites(t *testing.T) {
++	defer guard(t)
++	w := truncate.NewWriter(6, "")
++	_, _ = w.Write([]byte("abcde"))
++	_, _ = w.Write([]byte("fghij"))
++	if got, want := w.String(), "abcdef"; got != want {
++		t.Errorf("truncate.Writer(6) after writing %q and %q = %q, want %q", "abcde", "fghij", got, want)
++	}
++}
++
++// TestHegelPinTruncateWriterSubtractsTheTailOnce (reflow/11): the tail's width is subtracted
++// from the writer's width on every Write.
++func TestHegelPinTruncateWriterSubtractsTheTailOnce(t *testing.T) {
++	defer guard(t)
++	w := truncate.NewWriter(10, "...")
++	for _, c := range []string{"abc", "def", "gh"} {
++		_, _ = w.Write([]byte(c))
++	}
++	if got, want := w.String(), "abcdefgh"; got != want {
++		t.Errorf("truncate.Writer(10, \"...\") after %q = %q, want %q (8 cells fit in 10)", "abc def gh", got, want)
++	}
++}
++
++// TestHegelPinTruncateKeepsInputThatFitsWhenTheTailIsWider (reflow/12): with a tail wider
++// than the width the tail is emitted whatever the input, even when the input fits or is empty.
++func TestHegelPinTruncateKeepsInputThatFitsWhenTheTailIsWider(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct{ in, tail string }{{"ab", "..."}, {"", "..."}, {"a", "日"}} {
++		if got := truncate.StringWithTail(c.in, 2, c.tail); got != c.in {
++			t.Errorf("truncate.StringWithTail(%q, 2, %q) = %q, want the input, which fits", c.in, c.tail, got)
++		}
++	}
++}
++
++// TestHegelPinDedentCountsUnindentedLines (reflow/13): lines without indentation are ignored
++// when the common indentation is computed, so indented lines lose theirs.
++func TestHegelPinDedentCountsUnindentedLines(t *testing.T) {
++	defer guard(t)
++	for _, in := range []string{"a\n  b", "  a\nb\n    c", "a\n\tb\n"} {
++		if got := dedent.String(in); got != in {
++			t.Errorf("dedent.String(%q) = %q, want the input (a line has no indentation)", in, got)
++		}
++	}
++}
++
++// TestHegelPinDedentDoesNotMixTabsAndSpaces (reflow/14): a tab and a space count as the same
++// indentation, so lines indented differently are both stripped.
++func TestHegelPinDedentDoesNotMixTabsAndSpaces(t *testing.T) {
++	defer guard(t)
++	for _, in := range []string{"\ta\n b", " a\n\tb\n"} {
++		if got := dedent.String(in); got != in {
++			t.Errorf("dedent.String(%q) = %q, want the input (no shared indentation)", in, got)
++		}
++	}
++}
++
++// TestHegelPinWritersKeepRunesSplitAcrossWrites (reflow/15): a multi-byte rune split over two
++// Write calls is decoded per call and comes out as two U+FFFD.
++func TestHegelPinWritersKeepRunesSplitAcrossWrites(t *testing.T) {
++	defer guard(t)
++	e := []byte("é")
++	writers := map[string]interface {
++		io.Writer
++		String() string
++	}{
++		"indent":   indent.NewWriter(1, nil),
++		"padding":  padding.NewWriter(4, nil),
++		"truncate": truncate.NewWriter(4, ""),
++		"wordwrap": wordwrap.NewWriter(4),
++		"wrap":     wrap.NewWriter(4),
++	}
++	for name, w := range writers {
++		_, _ = w.Write(e[:1])
++		_, _ = w.Write(e[1:])
++		if c, ok := w.(interface{ Close() error }); ok {
++			_ = c.Close()
++		}
++		if !strings.Contains(w.String(), "é") {
++			t.Errorf("%s: writing %q byte by byte gives %q", name, "é", w.String())
++		}
++	}
++	var fw bytes.Buffer
++	aw := &ansi.Writer{Forward: &fw}
++	_, _ = aw.Write(e[:1])
++	_, _ = aw.Write(e[1:])
++	if fw.String() != "é" {
++		t.Errorf("ansi.Writer: writing %q byte by byte forwards %q", "é", fw.String())
++	}
++}
++
++// TestHegelPinWritersPassInvalidBytesThrough (reflow/16): invalid UTF-8 bytes are replaced by
++// U+FFFD on the way through every writer.
++func TestHegelPinWritersPassInvalidBytesThrough(t *testing.T) {
++	defer guard(t)
++	in := "a\xffb"
++	got := map[string]string{
++		"indent":   indent.String(in, 1),
++		"padding":  padding.String(in, 4),
++		"truncate": truncate.String(in, 4),
++		"wordwrap": wordwrap.String(in, 4),
++		"wrap":     wrap.String(in, 1),
++	}
++	for name, out := range got {
++		if !strings.Contains(out, "\xff") {
++			t.Errorf("%s of %q = %q: the invalid byte was rewritten", name, in, out)
++		}
++	}
++}
++
++// TestHegelPinPrintableRuneWidthMeasuresGraphemeClusters (reflow/17): widths are summed per
++// rune, so ZWJ sequences and emoji modifiers count more than go-runewidth's StringWidth.
++func TestHegelPinPrintableRuneWidthMeasuresGraphemeClusters(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"\U0001F468‍\U0001F469", "\U0001F44D\U0001F3FD", "\U0001F468‍\U0001F469‍\U0001F467"} {
++		if got, want := ansi.PrintableRuneWidth(s), runewidth.StringWidth(s); got != want {
++			t.Errorf("PrintableRuneWidth(%q) = %d, runewidth.StringWidth %d", s, got, want)
++		}
++		if got := truncate.String(s, 2); got != s {
++			t.Errorf("truncate.String(%q, 2) = %q, but the text is %d cells wide", s, got, runewidth.StringWidth(s))
++		}
++	}
++}
++
++// TestHegelPinTruncateKeepsTextThatFits (reflow/18): the tail's width is reserved even when
++// the text fits, so text wider than width - tail is truncated although it fits the width.
++func TestHegelPinTruncateKeepsTextThatFits(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		in   string
++		w    int
++		tail string
++	}{{"ab", 2, "."}, {"Hello", 5, "\u2026"}, {"\u65e5\u672c", 4, "..."}, {"  ", 2, "."}} {
++		if got := truncate.StringWithTail(c.in, uint(c.w), c.tail); got != c.in {
++			t.Errorf("truncate.StringWithTail(%q, %d, %q) = %q, want the input: it is %d cells wide and fits", c.in, c.w, c.tail, got, width(c.in))
++		}
++	}
++}
++
++// TestHegelPinWordWrapFoldsAcrossWrites (reflow/19): with KeepNewlines = false every Write
++// call is trimmed on its own, so whitespace at a chunk boundary disappears.
++func TestHegelPinWordWrapFoldsAcrossWrites(t *testing.T) {
++	defer guard(t)
++	one := wordwrap.NewWriter(10)
++	one.KeepNewlines = false
++	_, _ = one.Write([]byte("a b"))
++	_ = one.Close()
++	two := wordwrap.NewWriter(10)
++	two.KeepNewlines = false
++	_, _ = two.Write([]byte("a "))
++	_, _ = two.Write([]byte("b"))
++	_ = two.Close()
++	if one.String() != two.String() {
++		t.Errorf("wordwrap (KeepNewlines=false) of %q in one write = %q, as %q then %q = %q", "a b", one.String(), "a ", "b", two.String())
++	}
++}
++
++func TestHegelExamples(t *testing.T) {
++	defer guard(t)
++	if got := wordwrap.String("Hello World!", 5); got != "Hello\nWorld!" {
++		t.Errorf("README wordwrap example: %q", got)
++	}
++	if got := wrap.String("Hello World!", 7); got != "Hello W\norld!" {
++		t.Errorf("README wrap example: %q", got)
++	}
++	if got := wrap.String(wordwrap.String("Just an example", 5), 5); got != "Just\nan\nexamp\nle" {
++		t.Errorf("README wrap+wordwrap example: %q", got)
++	}
++	if got := indent.String("Hello World!", 4); got != "    Hello World!" {
++		t.Errorf("README indent example: %q", got)
++	}
++	if got := dedent.String("    Hello World!\n  Hello World!\n"); got != "  Hello World!\nHello World!\n" {
++		t.Errorf("README dedent example: %q", got)
++	}
++	if got := padding.String("Hello", 8); got != "Hello   " {
++		t.Errorf("README padding example: %q", got)
++	}
++	_ = utf8.RuneLen
++}
