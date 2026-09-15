@@ -61,3 +61,4 @@ External test package with a dot-free import (`bolt`); `HEGEL_TEST_CASES` via `h
 `property()` turns panics into test-case failures; every test case opens its own file in
 `t.TempDir()` and removes it. Helper names avoid those of bbolt's own tests (`dumpBucket`,
 `pickBucket`, `run`).
+- 2026-09-15: base bumped b6b954af019b → 4dc08f7187c7 (2026-09-15, "build(deps): Bump golang.org/x/sys from 0.47.0 to 0.48.0"; v1.5.0+); 2 bug(s) still reproduce; add/add conflicts in go.mod resolved by keeping both sides. 2 tests pass.
