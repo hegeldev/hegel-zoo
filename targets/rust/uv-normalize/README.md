@@ -76,3 +76,4 @@ does for pip.
 - 2026-09-15: base bumped b8aff80900e7 → 000a665b745a (2026-09-15, "Batch HTTP cache writes in blocking tasks (#21675)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-15: base bumped 000a665b745a → fd89f638d15f (2026-09-15, "Add regression test for symlinks inside install directory (#21693)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-15: base bumped fd89f638d15f → cdabfcedb50b (2026-09-15, "Revert "Reject symlinked wheel installation destinations" (#21699)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
+- 2026-09-15: base bumped cdabfcedb50b → 2c35bb31de15 (2026-09-15, "Use Packse scenarios to speed up tool tests (#21634)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
