@@ -1,7 +1,7 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`, `filepicker`, `tree`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`, `filepicker`, `tree`, `cursor`, `key`, `timer`, `stopwatch`, `spinner`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Ten slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Fifteen slices, the whole library: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
 `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
 for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
@@ -12,10 +12,12 @@ soft-wrapped rows), `paginator` (`paginator/hegel_test.go`) and `table`
 (`progress/hegel_test.go`, package `progress`, internal for the frame messages and the shown
 percentage) and `filepicker` (`filepicker/hegel_test.go`, package `filepicker`, internal for
 the window indices; it builds its directory trees under the system temp directory) and `tree`
-(`tree/hegel_test.go`, package `tree`, internal for the viewport and the help view), with the
+(`tree/hegel_test.go`, package `tree`, internal for the viewport and the help view) and the
+five small ones, `cursor`, `key`, `timer`, `stopwatch` and `spinner` (`<package>/hegel_test.go`,
+internal except `key`, so the blink and tick tags are readable), with the
 shared harness in `internal/zootest`.
 Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table ./list
-./help ./progress ./filepicker ./tree`.
+./help ./progress ./filepicker ./tree ./cursor ./key ./timer ./stopwatch ./spinner`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -156,6 +158,19 @@ records bugs.
   `Node(i)`, every visible node's `YOffset`/`LineOffset`/`IsSelected`, `Width`/`Height`, the
   viewport's height and offset, the number of lines of `View` and each row of the viewport
   window must match, and the selected node's line must be inside the window.
+- **cursor, key, timer, stopwatch, spinner: the small state machines against mirrors.** The
+  timer, stopwatch and spinner are driven with their own commands, run synchronously (batches
+  and sequences flattened; intervals of a microsecond or two so a tick command returns at
+  once), and the mirror keeps what they have in flight: every tick the library scheduled, with
+  the tag or timeout flag it should carry, delivered in "rounds" (one interval passing) or
+  left pending while start/stop/toggle/reset, foreign IDs, stale tags and ID-0 broadcasts are
+  sent; after each step `Timeout`/`Elapsed`/the frame, `Running`, `Timedout`, `View`, `ID` and
+  the messages returned must match. The cursor is driven with `Focus`/`Blur`/`SetMode`, the
+  focus and blur messages, the initial blink and blink messages built with the expected, a
+  stale or a foreign tag (the real blink commands are not waited for), and must match on
+  `IsBlinked`, `Mode`, the tag, whether a command came back and the view (the character,
+  reversed exactly when the cursor is shown). `key.Matches` must be membership among the
+  enabled bindings while keys, help, enabled/disabled and `Unbind` are changed.
 
 ## Properties
 
@@ -180,6 +195,11 @@ records bugs.
 | `TestHegelProgressSettles` | the setters' clamping and commands, stale and foreign frames ignored, the spring driven to equilibrium |
 | `TestHegelFilepickerFollowsTheModel` | every binding, resize and setter over a random directory tree vs the listing/window/selection mirror: the paths, the indices, the lines of `View`, the window invariants, the `DidSelect` reports |
 | `TestHegelTreeFollowsTheModel` | every binding and setter over a random tree vs the layout/selection/scroll mirror: the offsets of every node, the selection, the viewport height and offset, the rows of `View`, the selection in view |
+| `TestHegelCursorFollowsFocus` | focus, blur, mode changes, initial/tagged/stale/foreign blink messages vs the mirror: `IsBlinked`, `Mode`, the tag, the command returned, the reversed cell |
+| `TestHegelKeyMatches` | `Matches` vs membership among enabled bindings; `Keys`, `Help`, `Enabled` through `SetKeys`/`SetEnabled`/`Unbind`/`SetHelp` |
+| `TestHegelTimerCountsDown` | start/stop/toggle, rounds of tick delivery, foreign/stale/broadcast ticks vs the mirror of the countdown and the chains in flight: `Timeout`, `Running`, `Timedout`, `View`, the ticks and `TimeoutMsg` emitted |
+| `TestHegelStopwatchCounts` | start/stop/toggle/reset, rounds, foreign/stale/ID-0 ticks vs the mirror: `Elapsed`, `Running`, the tag, `View`, the ticks emitted |
+| `TestHegelSpinnerAdvances` | `Tick`, rounds, spinner swaps, foreign/stale/broadcast ticks vs the mirror: the frame shown, the tag, the ticks emitted |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -278,6 +298,13 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/88 | low | tree: an open node with an empty value counts one line too few, so its later siblings' offsets and cursor are off by one |
 | bubbles/89 | low | tree: SetSize measures the help before giving it the new width, so with the full help a width change sizes the viewport by the old help height |
 | bubbles/90 | low | tree: a SetNodes that clamps the selection to the root of a smaller tree does not scroll, so the root is selected but out of view |
+| bubbles/91 | medium | stopwatch: New() leaves the interval at zero, so the tick fires without a pause and Elapsed never advances |
+| bubbles/92 | medium | timer: the tick tag is never advanced, so no tick is ever rejected and every Start, Stop, Toggle or ID-0 tick adds a chain that makes the countdown run faster |
+| bubbles/93 | low | timer: a timeout that is not a multiple of the interval counts past zero, and View shows a negative duration |
+| bubbles/94 | low | stopwatch: a tick carrying tag 0 is never rejected, so two Start commands on a fresh stopwatch both count |
+| bubbles/95 | low | spinner: a tick carrying tag 0 is never rejected, so two initial Ticks advance the spinner by two frames |
+| bubbles/96 | low | cursor: Mode.String panics for a value outside blink/static/hidden |
+| bubbles/97 | low | cursor: a zero-value Model panics in Focus, Blink and on the initial blink message |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -376,6 +403,17 @@ pinned only (no nil root, no hidden nodes, no `SetValue`, no styles in the prope
 pinned. Hiding any child but the first also panics inside lipgloss's renderer (lipgloss/30,
 recorded in `go/lipgloss`).
 
+For the five small packages (1 105 lines together, read end to end) all seven were on paper and
+confirmed by a probe file per package before the properties, which agreed with their mirrors
+over 3 × 8 000 cases each and found nothing further: the missing interval in `stopwatch.New`
+(/91), the timer's tag that is never incremented (/92) and its unclamped countdown (/93), the
+tag-0 escape shared by the stopwatch and the spinner (/94, /95), `Mode.String` (/96) and the
+zero-value cursor (/97). /92 is counted whenever more than one tick is in flight for a running
+timer (the mirror then decrements once per tick, as the library does), /93 after every
+decrement below zero, /94 and /95 when a tick with tag 0 is accepted by a model whose tag is
+not 0; the stopwatch property always passes `WithInterval` (/91), and the cursor property uses
+`New()` and in-range modes (/96, /97).
+
 ## Not bugs (modelled as documented)
 
 - Tab keeps the typed prefix's case and appends the suggestion's remainder (`bb` + `BbAa` →
@@ -435,11 +473,25 @@ recorded in `go/lipgloss`).
   its ANSI stripped while children keep theirs; `SetNodes` re-applies the enumerator and the
   indenter; values wider than the width but not wider than the width minus the cursor column
   are cut, not wrapped.
+- timer: `TimeoutMsg` is sent the moment the countdown reaches zero while the `TickMsg` with
+  `Timeout: true` is scheduled then and arrives one interval later (the doc's "alongside");
+  `New(0)` is timed out from the start, its first tick is dropped and no `TimeoutMsg` is ever
+  sent; `Stop` schedules a tick that is dropped; a `StartStopMsg` or `TickMsg` with ID 0 is
+  accepted by every timer (documented), while the stopwatch accepts only its own ID; a tick
+  with a non-zero tag other than the model's is rejected.
+- spinner: a `TickMsg` with ID 0 is accepted by every spinner (documented); after `Spinner` is
+  swapped for one with fewer frames the view is the literal `(error)` until the next tick
+  (the guard in `View`); an empty frame list shows `(error)`.
+- cursor: `SetMode` with a value outside blink/static/hidden is ignored (returns nil, the mode
+  unchanged; the comment says "adjust"); `Focus` shows the cursor at once and `Blur` hides it;
+  a `BlinkSpeed` of 0 fires the blink command at once (a hot loop, the caller's choice); a
+  blink message with the wrong tag, id, mode or focus is dropped silently.
 
 ## Not covered (yet)
 
-`key`,
-`timer`/`stopwatch`/`spinner`, `cursor` blinking; tree's styles beyond the pinned frames and
+the cursor's real blink timing (the commands' cancel contexts; the property builds the blink
+messages itself); timer/stopwatch/spinner ticks in real time (microsecond intervals, the
+commands run synchronously); tree's styles beyond the pinned frames and
 paddings (the selected/parent/root colours), custom indenters and multi-line enumerators,
 `SetViewportYOffset`, `Node.Close`/`Open` on a node other than the selected one, help's styles; progress's `PercentageStyle`
 and springs outside frequency 1–60 / damping 0.1–2; filepicker's styles, a custom `Cursor`,
