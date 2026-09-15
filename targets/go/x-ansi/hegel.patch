@@ -1,0 +1,2173 @@
+diff --git a/ansi/go.mod b/ansi/go.mod
+index 1c03003..2ce732c 100644
+--- a/ansi/go.mod
++++ b/ansi/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/charmbracelet/x/ansi
+ 
+-go 1.24.2
++go 1.26.0
+ 
+ require (
+ 	github.com/bits-and-blooms/bitset v1.24.6
+@@ -8,4 +8,10 @@ require (
+ 	github.com/clipperhouse/uax29/v2 v2.7.0
+ 	github.com/lucasb-eyer/go-colorful v1.4.1
+ 	github.com/mattn/go-runewidth v0.0.27
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
+ )
+diff --git a/ansi/hegel_test.go b/ansi/hegel_test.go
+new file mode 100644
+index 0000000..c7b1626
+--- /dev/null
++++ b/ansi/hegel_test.go
+@@ -0,0 +1,2144 @@
++// Hegel properties for charmbracelet/x/ansi: the escape-sequence decoder and state-machine
++// parser, Strip and the cell widths, truncation and cutting, the three wrappers, the SGR style
++// builder and colour reader, XParseColor and the palette conversions.
++//
++// Oracles: a token grammar of ECMA-48 sequences (CSI, ESC, OSC, DCS, APC/PM/SOS strings), C0
++// controls and grapheme clusters of known width — every generated document is a token list, so
++// the decoder, the parser, Strip and the widths are all compared against the list they were
++// built from; models of Truncate/TruncateLeft/Cut and Hardwrap written from the documentation;
++// an SGR model (every printable rune of a wrapper's output carries the style it had in the
++// input) and line-width invariants for Wordwrap and Wrap; the SGR parameter table for the style
++// builder and ITU T.416 for ReadStyleColor; X11's XParseColor rules; the xterm palette for the
++// colour conversions. X_ANSI_COLLECT=1 turns failures into a tally per property.
++package ansi_test
++
++import (
++	"fmt"
++	"image/color"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode/utf8"
++
++	"github.com/charmbracelet/x/ansi"
++	"github.com/charmbracelet/x/ansi/parser"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("X_ANSI_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			statsMu.Lock()
++			keys := make([]string, 0, len(stats))
++			for k := range stats {
++				keys = append(keys, k)
++			}
++			sort.Strings(keys)
++			var sb strings.Builder
++			for _, k := range keys {
++				fmt.Fprintf(&sb, " %s=%d", k, stats[k])
++			}
++			stats = map[string]int{}
++			statsMu.Unlock()
++			t.Logf("COLLECT %s: %d mismatches; stats%s", t.Name(), len(collectedMsgs), sb.String())
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++var (
++	statsMu sync.Mutex
++	stats   = map[string]int{}
++)
++
++// count tallies an outcome for the collect-mode summary.
++func count(name string) {
++	statsMu.Lock()
++	stats[name]++
++	statsMu.Unlock()
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---------------------------------------------------------------- the token grammar
++
++type kind int
++
++const (
++	kText kind = iota // one grapheme cluster
++	kCtrl             // one C0 control byte
++	kCSI
++	kESC
++	kOSC
++	kDCS
++	kStr // APC, PM or SOS string
++)
++
++type tok struct {
++	kind   kind
++	s      string // the raw bytes
++	w, wc  int    // cell widths under GraphemeWidth and WcWidth (text only)
++	prefix byte   // CSI/DCS private marker, 0 if none (the last one written)
++	inter  byte   // CSI/DCS/ESC intermediate, 0 if none (the last one written)
++	final  byte   // CSI/DCS/ESC final byte
++	params []int  // CSI/DCS packed parameters, as the decoder reports them
++	cmd    int    // OSC command number (parser.MissingCommand when there is none); kStr: the introducer
++	data   string // OSC/DCS/kStr payload as the decoder and the parser report it
++	escST  bool   // string terminated by ESC \ (the state machine dispatches that ESC too)
++}
++
++// A cluster and its widths. Grapheme widths from displaywidth and wc widths from runewidth agree
++// with these for every entry (checked once in TestHegelExamples).
++type cl struct {
++	s     string
++	w, wc int
++}
++
++var clusters = []cl{
++	{"a", 1, 1}, {"b", 1, 1}, {"Z", 1, 1}, {"0", 1, 1}, {"\u00e9", 1, 1},
++	{"\u65e5", 2, 2}, {"\U0001F600", 2, 2},
++	{"\U0001F468\u200d\U0001F469\u200d\U0001F467", 2, 6}, // family ZWJ sequence
++	{"\u00a0", 1, 1}, // no-break space: text for every algorithm here
++}
++
++var (
++	spaceCl  = cl{" ", 1, 1}
++	hyphenCl = cl{"-", 1, 1}
++)
++
++type docCfg struct {
++	seqs     bool // CSI/ESC/OSC/DCS/string tokens
++	sgrOnly  bool // with seqs: only SGR sequences and OSC 8 hyperlinks (the style model reads them)
++	spaces   bool // ASCII spaces
++	newlines bool
++	ctrls    bool // C0 controls other than newline
++	hyphen   bool
++	wcSafe   bool // no cluster whose grapheme and wc widths differ
++	narrow   bool // no width-2 clusters
++	nbsp     bool // allow the no-break space
++	eightBit bool // 8-bit C1 introducers and terminators now and then
++	twoMarks bool // two private markers in a CSI now and then (the Parser keeps the first: x-ansi/20)
++}
++
++func genCluster(tc hegel.TestCase, cfg docCfg) tok {
++	for {
++		c := pick(tc, clusters)
++		if cfg.wcSafe && c.w != c.wc {
++			continue
++		}
++		if cfg.narrow && c.w != 1 {
++			continue
++		}
++		if !cfg.nbsp && c.s == "\u00a0" {
++			continue
++		}
++		return tok{kind: kText, s: c.s, w: c.w, wc: c.wc}
++	}
++}
++
++// genParamText draws a CSI/DCS parameter string and returns the packed parameters the decoder
++// documents: ';' separates parameters, ':' marks the one before it as having sub-parameters,
++// an empty parameter is missing, and a lone empty string is no parameter at all.
++func genParamText(tc hegel.TestCase) (string, []int) {
++	np := n(tc, 0, 4)
++	var sb strings.Builder
++	for i := 0; i < np; i++ {
++		if i > 0 {
++			if chance(tc, 25) {
++				sb.WriteByte(':')
++			} else {
++				sb.WriteByte(';')
++			}
++		}
++		if chance(tc, 20) {
++			continue // missing
++		}
++		if chance(tc, 10) {
++			sb.WriteByte('0')
++		}
++		sb.WriteString(strconv.Itoa(n(tc, 0, 999)))
++	}
++	return sb.String(), packParams(sb.String())
++}
++
++// packParams is the model of the parameter format.
++func packParams(text string) []int {
++	if text == "" {
++		return nil
++	}
++	var out []int
++	cur := -1 // -1 = missing
++	flush := func(more bool) {
++		v := parser.MissingParam
++		if cur >= 0 {
++			v = cur
++		}
++		if more {
++			v |= parser.HasMoreFlag
++		}
++		out = append(out, v)
++		cur = -1
++	}
++	for i := 0; i < len(text); i++ {
++		c := text[i]
++		switch {
++		case c >= '0' && c <= '9':
++			if cur < 0 {
++				cur = 0
++			}
++			cur = cur*10 + int(c-'0')
++		case c == ';':
++			flush(false)
++		case c == ':':
++			flush(true)
++		}
++	}
++	flush(false)
++	return out
++}
++
++const (
++	intermediates = " !\"#$%&'()*+,-./"
++	prefixes      = "<=>?"
++)
++
++func genFinal(tc hegel.TestCase) byte { return byte(n(tc, 0x40, 0x7e)) }
++
++func genCSI(tc hegel.TestCase, cfg docCfg) tok {
++	var sb strings.Builder
++	if cfg.eightBit && chance(tc, 15) {
++		sb.WriteByte(0x9b)
++	} else {
++		sb.WriteString("\x1b[")
++	}
++	t := tok{kind: kCSI}
++	if chance(tc, 30) {
++		k := 1
++		if cfg.twoMarks && chance(tc, 30) {
++			k = 2
++		}
++		for i := k; i > 0; i-- {
++			t.prefix = prefixes[n(tc, 0, len(prefixes)-1)]
++			sb.WriteByte(t.prefix)
++		}
++	}
++	text, params := genParamText(tc)
++	sb.WriteString(text)
++	t.params = params
++	if chance(tc, 30) {
++		for i := n(tc, 1, 2); i > 0; i-- {
++			t.inter = intermediates[n(tc, 0, len(intermediates)-1)]
++			sb.WriteByte(t.inter)
++		}
++	}
++	t.final = genFinal(tc)
++	sb.WriteByte(t.final)
++	t.s = sb.String()
++	return t
++}
++
++// genSGR draws an SGR sequence (CSI … m) built from a random Style; a reset one in five.
++func genSGR(tc hegel.TestCase) tok {
++	var st ansi.Style
++	if !chance(tc, 20) {
++		st, _ = genStyle(tc)
++	}
++	s := st.String()
++	t := tok{kind: kCSI, s: s, final: 'm'}
++	t.params = packParams(s[2 : len(s)-1])
++	return t
++}
++
++func genESC(tc hegel.TestCase) tok {
++	var sb strings.Builder
++	sb.WriteByte(0x1b)
++	t := tok{kind: kESC}
++	ni := n(tc, 0, 2)
++	for i := 0; i < ni; i++ {
++		t.inter = intermediates[n(tc, 0, len(intermediates)-1)]
++		sb.WriteByte(t.inter)
++	}
++	for {
++		t.final = byte(n(tc, 0x30, 0x7e))
++		// Those start other kinds of sequence; the decoder takes them so even after an
++		// intermediate, so they are kept out of the grammar altogether.
++		if strings.IndexByte("[]PX^_\\", t.final) < 0 {
++			break
++		}
++	}
++	sb.WriteByte(t.final)
++	t.s = sb.String()
++	return t
++}
++
++// payloadChars are safe inside OSC/DCS/APC strings: no C0 byte and no 0x9C byte in their UTF-8.
++var payloadChars = []string{" ", "a", "Z", "0", "7", ";", ":", "/", "=", "~", "\u00e9", "\u65e5", "\U0001F600"}
++
++func genPayload(tc hegel.TestCase, ascii bool) string {
++	var sb strings.Builder
++	for i := n(tc, 0, 6); i > 0; i-- {
++		c := pick(tc, payloadChars)
++		if ascii && c[0] >= 0x80 {
++			continue
++		}
++		sb.WriteString(c)
++	}
++	return sb.String()
++}
++
++func genST(tc hegel.TestCase, cfg docCfg, t *tok) string {
++	if cfg.eightBit && chance(tc, 20) {
++		return "\x9c"
++	}
++	t.escST = true
++	return "\x1b\\"
++}
++
++func oscCmd(data string) int {
++	i := 0
++	for i < len(data) && data[i] >= '0' && data[i] <= '9' {
++		i++
++	}
++	if i == 0 {
++		return parser.MissingCommand
++	}
++	v, _ := strconv.Atoi(data[:i])
++	return v
++}
++
++func genOSC(tc hegel.TestCase, cfg docCfg) tok {
++	t := tok{kind: kOSC}
++	var sb strings.Builder
++	if cfg.eightBit && chance(tc, 15) {
++		sb.WriteByte(0x9d)
++	} else {
++		sb.WriteString("\x1b]")
++	}
++	var data strings.Builder
++	if chance(tc, 85) {
++		data.WriteString(strconv.Itoa(n(tc, 0, 999)))
++		if chance(tc, 90) {
++			data.WriteByte(';')
++			data.WriteString(genPayload(tc, false))
++		}
++	} else {
++		data.WriteString(genPayload(tc, false))
++	}
++	t.data = data.String()
++	t.cmd = oscCmd(t.data)
++	sb.WriteString(t.data)
++	switch n(tc, 1, 3) {
++	case 1:
++		sb.WriteByte(0x07)
++	default:
++		sb.WriteString(genST(tc, cfg, &t))
++	}
++	t.s = sb.String()
++	return t
++}
++
++// genHyperlink draws an OSC 8 hyperlink open or close.
++func genHyperlink(tc hegel.TestCase) tok {
++	t := tok{kind: kOSC, cmd: 8}
++	if chance(tc, 50) {
++		t.data = "8;;"
++	} else {
++		t.data = "8;;https://example.com/" + strings.Repeat("x", n(tc, 0, 3))
++	}
++	t.s = "\x1b]" + t.data + "\x1b\\"
++	t.escST = true
++	return t
++}
++
++func genDCS(tc hegel.TestCase, cfg docCfg) tok {
++	t := tok{kind: kDCS}
++	var sb strings.Builder
++	if cfg.eightBit && chance(tc, 15) {
++		sb.WriteByte(0x90)
++	} else {
++		sb.WriteString("\x1bP")
++	}
++	if chance(tc, 30) {
++		t.prefix = prefixes[n(tc, 0, len(prefixes)-1)]
++		sb.WriteByte(t.prefix)
++	}
++	text, params := genParamText(tc)
++	sb.WriteString(text)
++	t.params = params
++	if chance(tc, 30) {
++		t.inter = intermediates[n(tc, 0, len(intermediates)-1)]
++		sb.WriteByte(t.inter)
++	}
++	t.final = genFinal(tc)
++	sb.WriteByte(t.final)
++	t.data = genPayload(tc, false)
++	sb.WriteString(t.data)
++	sb.WriteString(genST(tc, cfg, &t))
++	t.s = sb.String()
++	return t
++}
++
++func genStr(tc hegel.TestCase, cfg docCfg) tok {
++	t := tok{kind: kStr}
++	var sb strings.Builder
++	t.cmd = int(pick(tc, []byte{'_', '^', 'X'}))
++	if cfg.eightBit && chance(tc, 15) {
++		sb.WriteByte(map[int]byte{'_': 0x9f, '^': 0x9e, 'X': 0x98}[t.cmd])
++	} else {
++		sb.WriteByte(0x1b)
++		sb.WriteByte(byte(t.cmd))
++	}
++	// The table-driven parser lets a UTF-8 character break out of these strings (x-ansi/18).
++	t.data = genPayload(tc, true)
++	sb.WriteString(t.data)
++	sb.WriteString(genST(tc, cfg, &t))
++	t.s = sb.String()
++	return t
++}
++
++func genSeq(tc hegel.TestCase, cfg docCfg) tok {
++	if cfg.sgrOnly {
++		if chance(tc, 80) {
++			return genSGR(tc)
++		}
++		return genHyperlink(tc)
++	}
++	switch n(tc, 1, 10) {
++	case 1, 2, 3:
++		return genCSI(tc, cfg)
++	case 4, 5:
++		return genSGR(tc)
++	case 6:
++		return genESC(tc)
++	case 7, 8:
++		return genOSC(tc, cfg)
++	case 9:
++		return genDCS(tc, cfg)
++	default:
++		return genStr(tc, cfg)
++	}
++}
++
++func genDoc(tc hegel.TestCase, cfg docCfg) []tok {
++	var toks []tok
++	for i := n(tc, 0, 12); i > 0; i-- {
++		r := n(tc, 1, 100)
++		switch {
++		case cfg.seqs && r <= 25:
++			toks = append(toks, genSeq(tc, cfg))
++		case cfg.spaces && r <= 40:
++			toks = append(toks, tok{kind: kText, s: spaceCl.s, w: 1, wc: 1})
++		case cfg.newlines && r <= 48:
++			toks = append(toks, tok{kind: kCtrl, s: "\n"})
++		case cfg.ctrls && r <= 53:
++			toks = append(toks, tok{kind: kCtrl, s: pick(tc, []string{"\r", "\t", "\a", "\b"})})
++		case cfg.hyphen && r <= 60:
++			toks = append(toks, tok{kind: kText, s: hyphenCl.s, w: 1, wc: 1})
++		default:
++			toks = append(toks, genCluster(tc, cfg))
++		}
++	}
++	return toks
++}
++
++func join(toks []tok) string {
++	var sb strings.Builder
++	for _, t := range toks {
++		sb.WriteString(t.s)
++	}
++	return sb.String()
++}
++
++func (t tok) isSeq() bool { return t.kind >= kCSI }
++
++func (t tok) width(m ansi.Method) int {
++	if t.kind != kText {
++		return 0
++	}
++	if m == ansi.WcWidth {
++		return t.wc
++	}
++	return t.w
++}
++
++func totalWidth(toks []tok, m ansi.Method) int {
++	w := 0
++	for _, t := range toks {
++		w += t.width(m)
++	}
++	return w
++}
++
++func maxCluster(toks []tok, m ansi.Method) int {
++	w := 0
++	for _, t := range toks {
++		if t.kind == kText && t.width(m) > w {
++			w = t.width(m)
++		}
++	}
++	return w
++}
++
++func paramsOf(ps ansi.Params) []int {
++	if len(ps) == 0 {
++		return nil
++	}
++	out := make([]int, len(ps))
++	for i, p := range ps {
++		out[i] = int(p)
++	}
++	return out
++}
++
++func paramsText(ps []int) string {
++	var parts []string
++	for _, p := range ps {
++		v := ansi.Param(p)
++		s := "-"
++		if v.Param(-1) >= 0 {
++			s = strconv.Itoa(v.Param(-1))
++		}
++		if v.HasMore() {
++			s += ":"
++		}
++		parts = append(parts, s)
++	}
++	return "[" + strings.Join(parts, " ") + "]"
++}
++
++// ---------------------------------------------------------------- the decoder
++
++type piece struct {
++	s      string
++	w      int
++	state  byte
++	cmd    int
++	params []int
++	data   string
++}
++
++func decodeAll(s string, m ansi.Method) []piece {
++	p := ansi.NewParser()
++	var out []piece
++	state := ansi.NormalState
++	for len(s) > 0 {
++		seq, w, k, ns := m.DecodeSequenceInString(s, state, p)
++		if k <= 0 {
++			panic("DecodeSequence made no progress")
++		}
++		out = append(out, piece{s: seq, w: w, state: ns, cmd: p.Command(), params: paramsOf(p.Params()), data: string(p.Data())})
++		s = s[k:]
++		state = ns
++	}
++	return out
++}
++
++func TestHegelDecodeSequenceFollowsTheGrammar(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		m := pick(ht, []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth})
++		cfg := docCfg{seqs: true, spaces: true, newlines: true, ctrls: true, hyphen: true, nbsp: true, eightBit: true, twoMarks: true}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		note(ht, "method %d input %q", m, s)
++		pieces := decodeAll(s, m)
++		if len(pieces) != len(toks) {
++			var got []string
++			for _, p := range pieces {
++				got = append(got, fmt.Sprintf("%q", p.s))
++			}
++			fail(ht, "decoded %d pieces for %d tokens:\n%s", len(pieces), len(toks), strings.Join(got, " "))
++		}
++		for i, p := range pieces {
++			tk := toks[i]
++			if p.s != tk.s {
++				fail(ht, "piece %d = %q, token %q", i, p.s, tk.s)
++			}
++			if p.state != ansi.NormalState {
++				fail(ht, "piece %d %q left state %d", i, p.s, p.state)
++			}
++			if p.w != tk.width(m) {
++				fail(ht, "piece %d %q width %d, want %d", i, p.s, p.w, tk.width(m))
++			}
++			switch tk.kind {
++			case kCSI, kDCS, kESC:
++				want := ansi.Command(tk.prefix, tk.inter, tk.final)
++				if p.cmd != want {
++					fail(ht, "piece %d %q cmd %#x, want %#x", i, p.s, p.cmd, want)
++				}
++				if tk.kind != kESC && !reflect.DeepEqual(p.params, tk.params) {
++					fail(ht, "piece %d %q params %s, want %s", i, p.s, paramsText(p.params), paramsText(tk.params))
++				}
++				if tk.kind == kDCS && p.data != tk.data {
++					fail(ht, "piece %d %q data %q, want %q", i, p.s, p.data, tk.data)
++				}
++			case kOSC:
++				if p.cmd != tk.cmd {
++					fail(ht, "piece %d %q OSC cmd %d, want %d", i, p.s, p.cmd, tk.cmd)
++				}
++				if p.data != tk.data {
++					fail(ht, "piece %d %q OSC data %q, want %q", i, p.s, p.data, tk.data)
++				}
++			case kStr:
++				if p.cmd != parser.MissingCommand {
++					fail(ht, "piece %d %q cmd %d, want none", i, p.s, p.cmd)
++				}
++				if p.data != tk.data {
++					fail(ht, "piece %d %q data %q, want %q", i, p.s, p.data, tk.data)
++				}
++			}
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- the state machine
++
++func parseEvents(s string) []string {
++	var ev []string
++	p := ansi.NewParser()
++	p.SetHandler(ansi.Handler{
++		Print:   func(r rune) { ev = append(ev, "print "+string(r)) },
++		Execute: func(b byte) { ev = append(ev, fmt.Sprintf("exec %#x", b)) },
++		HandleCsi: func(c ansi.Cmd, ps ansi.Params) {
++			ev = append(ev, fmt.Sprintf("csi %#x %s", int(c), paramsText(paramsOf(ps))))
++		},
++		HandleEsc: func(c ansi.Cmd) { ev = append(ev, fmt.Sprintf("esc %#x", int(c))) },
++		HandleDcs: func(c ansi.Cmd, ps ansi.Params, d []byte) {
++			ev = append(ev, fmt.Sprintf("dcs %#x %s %q", int(c), paramsText(paramsOf(ps)), d))
++		},
++		HandleOsc: func(cmd int, d []byte) { ev = append(ev, fmt.Sprintf("osc %d %q", cmd, d)) },
++		HandleApc: func(d []byte) { ev = append(ev, fmt.Sprintf("apc %q", d)) },
++		HandlePm:  func(d []byte) { ev = append(ev, fmt.Sprintf("pm %q", d)) },
++		HandleSos: func(d []byte) { ev = append(ev, fmt.Sprintf("sos %q", d)) },
++	})
++	for i := 0; i < len(s); i++ {
++		p.Advance(s[i])
++	}
++	return ev
++}
++
++func expectedEvents(toks []tok) []string {
++	var ev []string
++	for _, tk := range toks {
++		switch tk.kind {
++		case kText:
++			for _, r := range tk.s {
++				ev = append(ev, "print "+string(r))
++			}
++		case kCtrl:
++			ev = append(ev, fmt.Sprintf("exec %#x", tk.s[0]))
++		case kCSI:
++			ev = append(ev, fmt.Sprintf("csi %#x %s", ansi.Command(tk.prefix, tk.inter, tk.final), paramsText(tk.params)))
++		case kESC:
++			ev = append(ev, fmt.Sprintf("esc %#x", ansi.Command(0, tk.inter, tk.final)))
++		case kDCS:
++			ev = append(ev, fmt.Sprintf("dcs %#x %s %q", ansi.Command(tk.prefix, tk.inter, tk.final), paramsText(tk.params), tk.data))
++		case kOSC:
++			ev = append(ev, fmt.Sprintf("osc %d %q", tk.cmd, tk.data))
++		case kStr:
++			ev = append(ev, fmt.Sprintf("%s %q", map[int]string{'_': "apc", '^': "pm", 'X': "sos"}[tk.cmd], tk.data))
++		}
++		if tk.escST {
++			// ESC \ is itself an escape sequence to a VT parser: the string is dispatched at
++			// the ESC and the ST at the backslash.
++			ev = append(ev, fmt.Sprintf("esc %#x", int('\\')))
++		}
++	}
++	return ev
++}
++
++func TestHegelParserReportsTheGrammarsEvents(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		cfg := docCfg{seqs: true, spaces: true, newlines: true, ctrls: true, hyphen: true, nbsp: true, eightBit: true}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		note(ht, "input %q", s)
++		got := parseEvents(s)
++		want := expectedEvents(toks)
++		if !reflect.DeepEqual(got, want) {
++			fail(ht, "parser events for %q:\n got %q\nwant %q", s, got, want)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- Strip and the widths
++
++func TestHegelStripAndWidthsFollowTheTokens(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		cfg := docCfg{seqs: true, spaces: true, newlines: true, ctrls: true, hyphen: true, nbsp: true, eightBit: true}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		note(ht, "input %q", s)
++		var plain strings.Builder
++		for _, tk := range toks {
++			if !tk.isSeq() {
++				plain.WriteString(tk.s)
++			}
++		}
++		if got := ansi.Strip(s); got != plain.String() {
++			fail(ht, "Strip(%q) = %q, want %q", s, got, plain.String())
++		}
++		if got, want := ansi.StringWidth(s), totalWidth(toks, ansi.GraphemeWidth); got != want {
++			fail(ht, "StringWidth(%q) = %d, want %d", s, got, want)
++		}
++		if got, want := ansi.StringWidthWc(s), totalWidth(toks, ansi.WcWidth); got != want {
++			fail(ht, "StringWidthWc(%q) = %d, want %d", s, got, want)
++		}
++		if got, want := ansi.GraphemeWidth.StringWidth(s), ansi.StringWidth(s); got != want {
++			fail(ht, "GraphemeWidth.StringWidth(%q) = %d, StringWidth %d", s, got, want)
++		}
++		if got, want := ansi.WcWidth.StringWidth(s), ansi.StringWidthWc(s); got != want {
++			fail(ht, "WcWidth.StringWidth(%q) = %d, StringWidthWc %d", s, got, want)
++		}
++		// Additive at token boundaries.
++		k := n(ht, 0, len(toks))
++		a, b := join(toks[:k]), join(toks[k:])
++		if got, want := ansi.StringWidth(a)+ansi.StringWidth(b), ansi.StringWidth(s); got != want {
++			fail(ht, "StringWidth(%q)+StringWidth(%q) = %d, whole %d", a, b, got, want)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- truncation
++
++// truncateModel follows the documentation of Truncate: unchanged when it fits; otherwise the
++// clusters that fit in length - width(tail) cells, the tail where the first one does not, and
++// every escape sequence of the input in place (so styles are closed); controls after the cut
++// are dropped.
++func truncateModel(toks []tok, m ansi.Method, length int, tail string) string {
++	if totalWidth(toks, m) <= length {
++		return join(toks)
++	}
++	limit := length - ansi.StringWidth(tail)
++	if limit < 0 {
++		return ""
++	}
++	var sb strings.Builder
++	cur, ignoring := 0, false
++	for _, tk := range toks {
++		switch {
++		case tk.isSeq():
++			sb.WriteString(tk.s)
++		case ignoring:
++		case tk.kind == kCtrl:
++			sb.WriteString(tk.s)
++		case cur+tk.w > limit && m == ansi.GraphemeWidth, cur+tk.wc > limit && m == ansi.WcWidth:
++			sb.WriteString(tail)
++			ignoring = true
++		default:
++			sb.WriteString(tk.s)
++			cur += tk.width(m)
++		}
++	}
++	return sb.String()
++}
++
++// truncateLeftModel: the first n cells are removed (a cluster straddling the boundary is kept
++// whole, as the documentation's examples have it), escape sequences before the cut are kept,
++// controls before it dropped, and the prefix goes where the kept text starts.
++func truncateLeftModel(toks []tok, m ansi.Method, nn int, prefix string) string {
++	if nn <= 0 {
++		return join(toks)
++	}
++	var sb strings.Builder
++	cur, ignoring := 0, true
++	for _, tk := range toks {
++		switch {
++		case !ignoring:
++			sb.WriteString(tk.s)
++		case tk.isSeq():
++			sb.WriteString(tk.s)
++		case tk.kind == kCtrl:
++		default:
++			cur += tk.width(m)
++			if cur > nn {
++				sb.WriteString(prefix)
++				sb.WriteString(tk.s)
++				ignoring = false
++			}
++		}
++	}
++	return sb.String()
++}
++
++// retokenize splits a string the models produced back into tokens, using the token list it
++// came from (the pieces are all substrings of the input's tokens, in order).
++func retokenize(toks []tok, s string) []tok {
++	var out []tok
++	for _, tk := range toks {
++		if strings.HasPrefix(s, tk.s) {
++			out = append(out, tk)
++			s = s[len(tk.s):]
++		}
++	}
++	return out
++}
++
++var tails = []string{"", ".", "\u2026", "..", "\u65e5"}
++
++func TestHegelTruncateFollowsItsModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		m := pick(ht, []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth})
++		cfg := docCfg{seqs: true, spaces: true, newlines: true, nbsp: true, wcSafe: m == ansi.WcWidth}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		length := n(ht, 0, 8)
++		tail := pick(ht, tails)
++		note(ht, "method %d input %q length %d tail %q", m, s, length, tail)
++
++		got := m.Truncate(s, length, tail)
++		if want := truncateModel(toks, m, length, tail); got != want {
++			fail(ht, "Truncate(%q, %d, %q) = %q, want %q", s, length, tail, got, want)
++		}
++		if ansi.StringWidth(tail) <= length && m.StringWidth(got) > length {
++			fail(ht, "Truncate(%q, %d, %q) = %q is %d cells wide", s, length, tail, got, m.StringWidth(got))
++		}
++		if m == ansi.GraphemeWidth {
++			if g2 := ansi.Truncate(s, length, tail); g2 != got {
++				fail(ht, "ansi.Truncate and GraphemeWidth.Truncate differ on %q: %q vs %q", s, g2, got)
++			}
++		} else if g2 := ansi.TruncateWc(s, length, tail); g2 != got {
++			fail(ht, "ansi.TruncateWc and WcWidth.Truncate differ on %q: %q vs %q", s, g2, got)
++		}
++
++		prefix := pick(ht, tails)
++		left := n(ht, 0, 8)
++		gotL := m.TruncateLeft(s, left, prefix)
++		if want := truncateLeftModel(toks, m, left, prefix); gotL != want {
++			fail(ht, "TruncateLeft(%q, %d, %q) = %q, want %q", s, left, prefix, gotL, want)
++		}
++		if m == ansi.GraphemeWidth {
++			if g2 := ansi.TruncateLeft(s, left, prefix); g2 != gotL {
++				fail(ht, "ansi.TruncateLeft and GraphemeWidth.TruncateLeft differ on %q", s)
++			}
++		} else if g2 := ansi.TruncateLeftWc(s, left, prefix); g2 != gotL {
++			fail(ht, "ansi.TruncateLeftWc and WcWidth.TruncateLeft differ on %q", s)
++		}
++
++		// Cut is a Truncate followed by a TruncateLeft.
++		l, r := n(ht, 0, 6), n(ht, 0, 8)
++		want := ""
++		if r > l {
++			cutR := truncateModel(toks, m, r, "")
++			want = truncateLeftModel(retokenize(toks, cutR), m, l, "")
++		}
++		if m == ansi.WcWidth && l > 0 {
++			count("cutwc-left-skipped") // x-ansi/7
++		} else if gotC := m.Cut(s, l, r); gotC != want {
++			fail(ht, "Cut(%q, %d, %d) = %q, want %q", s, l, r, gotC, want)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- hard wrapping
++
++// hardwrapModel: clusters are laid out greedily, a cluster that would exceed the limit starts a
++// new line, an explicit newline starts one too, escape sequences are transparent, and unless
++// preserveSpace is set a space at the start of a line the wrap created is dropped.
++func hardwrapModel(toks []tok, m ansi.Method, limit int, preserveSpace bool) string {
++	if limit < 1 {
++		return join(toks)
++	}
++	var sb strings.Builder
++	cur, forced := 0, false
++	for _, tk := range toks {
++		switch {
++		case tk.isSeq():
++			sb.WriteString(tk.s)
++		case tk.kind == kCtrl: // "\n" only in this property
++			sb.WriteByte('\n')
++			cur, forced = 0, false
++		default:
++			w := tk.width(m)
++			if cur > 0 && cur+w > limit {
++				sb.WriteByte('\n')
++				cur, forced = 0, true
++			}
++			if cur == 0 {
++				if !preserveSpace && forced && tk.s == " " {
++					continue
++				}
++				forced = false
++			}
++			sb.WriteString(tk.s)
++			cur += w
++		}
++	}
++	return sb.String()
++}
++
++func TestHegelHardwrapFollowsTheGreedyModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		m := pick(ht, []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth})
++		cfg := docCfg{seqs: true, spaces: true, newlines: true, hyphen: true}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		limit := n(ht, 0, 6)
++		preserve := chance(ht, 40)
++		note(ht, "method %d input %q limit %d preserveSpace %v", m, s, limit, preserve)
++		if limit >= 1 && maxCluster(toks, m) > limit {
++			count("cluster-wider-than-limit") // x-ansi/12
++			return
++		}
++		got := m.Hardwrap(s, limit, preserve)
++		if want := hardwrapModel(toks, m, limit, preserve); got != want {
++			fail(ht, "Hardwrap(%q, %d, %v) = %q, want %q", s, limit, preserve, got, want)
++		}
++		if m == ansi.GraphemeWidth {
++			if g2 := ansi.Hardwrap(s, limit, preserve); g2 != got {
++				fail(ht, "ansi.Hardwrap and GraphemeWidth.Hardwrap differ on %q", s)
++			}
++		} else if g2 := ansi.HardwrapWc(s, limit, preserve); g2 != got {
++			fail(ht, "ansi.HardwrapWc and WcWidth.Hardwrap differ on %q", s)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- the SGR model
++
++// srune is a printable rune with the SGR style in force where it appears: the SGR sequences
++// since the last reset, concatenated. "*" marks a rune whose style is not judged.
++type srune struct {
++	r     rune
++	style string
++}
++
++func isReset(seq string) bool { return seq == "\x1b[m" || seq == "\x1b[0m" }
++
++// styled reads a string with the decoder (checked against the grammar above) and attaches to
++// every printable rune the style in force.
++func styled(s string) []srune {
++	var out []srune
++	style := ""
++	p := ansi.NewParser()
++	state := ansi.NormalState
++	for len(s) > 0 {
++		seq, _, k, ns := ansi.DecodeSequence(s, state, p)
++		if k <= 0 {
++			panic("no progress")
++		}
++		switch {
++		case strings.HasSuffix(seq, "m") && (strings.HasPrefix(seq, "\x1b[") || seq[0] == 0x9b):
++			if isReset(seq) {
++				style = ""
++			} else {
++				style += seq
++			}
++		case seq[0] == 0x1b || seq[0] >= 0x80 && seq[0] < 0xa0:
++			// other sequences: transparent
++		case seq[0] < 0x20 || seq[0] == 0x7f:
++			out = append(out, srune{rune(seq[0]), "*"})
++		default:
++			for _, r := range seq {
++				out = append(out, srune{r, style})
++			}
++		}
++		s = s[k:]
++		state = ns
++	}
++	return out
++}
++
++func isWS(r rune) bool { return r == ' ' || r == '\n' }
++
++func nonSpace(rs []srune) []srune {
++	var out []srune
++	for _, r := range rs {
++		if !isWS(r.r) {
++			out = append(out, r)
++		}
++	}
++	return out
++}
++
++func sameStyled(a, b []srune) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i].r != b[i].r {
++			return false
++		}
++		if a[i].style != b[i].style && a[i].style != "*" && b[i].style != "*" {
++			return false
++		}
++	}
++	return true
++}
++
++func showStyled(rs []srune) string {
++	var sb strings.Builder
++	for _, r := range rs {
++		fmt.Fprintf(&sb, "%q", string(r.r))
++		if r.style != "" {
++			fmt.Fprintf(&sb, "{%q}", r.style)
++		}
++		sb.WriteByte(' ')
++	}
++	return sb.String()
++}
++
++// sequences lists the escape sequences of a string in order.
++func sequences(s string) []string {
++	var out []string
++	p := ansi.NewParser()
++	state := ansi.NormalState
++	for len(s) > 0 {
++		seq, _, k, ns := ansi.DecodeSequence(s, state, p)
++		if k <= 0 {
++			panic("no progress")
++		}
++		if seq[0] == 0x1b || seq[0] >= 0x80 && seq[0] < 0xa0 {
++			out = append(out, seq)
++		}
++		s = s[k:]
++		state = ns
++	}
++	return out
++}
++
++// lastWordWidth is the width of the text after the last space or breakpoint of a line.
++func lastWordWidth(line string, breakpoints string) int {
++	plain := strings.TrimRight(ansi.Strip(line), " ")
++	i := strings.LastIndexAny(plain, " -"+breakpoints)
++	return ansi.StringWidth(plain[i+1:])
++}
++
++// hasLeadingSpace reports whether a line of the input starts with a space (x-ansi/19).
++func hasLeadingSpace(s string) bool {
++	for _, line := range strings.Split(ansi.Strip(s), "\n") {
++		if strings.HasPrefix(line, " ") {
++			return true
++		}
++	}
++	return false
++}
++
++// spaceSequenceSpace reports whether the document has a space followed by escape sequences
++// and then another space or the end of the text: the wrappers flush the pending whitespace
++// when the word buffer holds only sequences, without checking the limit (x-ansi/21).
++func spaceSequenceSpace(toks []tok) bool {
++	for i, t := range toks {
++		if t.s != " " || t.kind != kText {
++			continue
++		}
++		j := i + 1
++		for j < len(toks) && toks[j].isSeq() {
++			j++
++		}
++		if j > i+1 && (j == len(toks) || toks[j].s == " ") {
++			return true
++		}
++	}
++	return false
++}
++
++// ---------------------------------------------------------------- word wrapping
++
++func TestHegelWordwrapKeepsWordsAndStyles(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		m := pick(ht, []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth})
++		cfg := docCfg{seqs: true, sgrOnly: true, spaces: true, newlines: true, hyphen: chance(ht, 40), wcSafe: m == ansi.WcWidth, nbsp: true}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		limit := n(ht, 0, 6)
++		bps := pick(ht, []string{"", "", "Z", "0"})
++		note(ht, "method %d input %q limit %d breakpoints %q", m, s, limit, bps)
++
++		got := m.Wordwrap(s, limit, bps)
++		if m == ansi.GraphemeWidth {
++			if g2 := ansi.Wordwrap(s, limit, bps); g2 != got {
++				fail(ht, "ansi.Wordwrap and GraphemeWidth.Wordwrap differ on %q", s)
++			}
++		} else if g2 := ansi.WordwrapWc(s, limit, bps); g2 != got {
++			fail(ht, "ansi.WordwrapWc and WcWidth.Wordwrap differ on %q", s)
++		}
++		if limit < 1 {
++			if got != s {
++				fail(ht, "Wordwrap(%q, %d) = %q, want the input", s, limit, got)
++			}
++			count("passthrough")
++			return
++		}
++		// Every non-whitespace rune, in order, with its style; every sequence, in order.
++		in, out := nonSpace(styled(s)), nonSpace(styled(got))
++		if !sameStyled(in, out) {
++			fail(ht, "Wordwrap(%q, %d, %q) = %q changes the text or styles:\n in  %s\n out %s", s, limit, bps, got, showStyled(in), showStyled(out))
++		}
++		if !reflect.DeepEqual(sequences(s), sequences(got)) {
++			fail(ht, "Wordwrap(%q, %d, %q) = %q changes the sequences", s, limit, bps, got)
++		}
++		if strings.Count(got, "\n") < strings.Count(s, "\n") {
++			fail(ht, "Wordwrap(%q, %d, %q) = %q loses newlines", s, limit, bps, got)
++		}
++		// Lines within the limit, unless the line ends in a word at least as wide as the
++		// limit (a word is never split; x-ansi/10 for the exact-width case) or holds a
++		// breakpoint (x-ansi/9); lines of the input starting with a space are not judged
++		// (x-ansi/19).
++		if hasLeadingSpace(s) {
++			count("leading-space")
++			return
++		}
++		if spaceSequenceSpace(toks) {
++			count("space-sequence-space") // x-ansi/21
++			return
++		}
++		for _, line := range strings.Split(got, "\n") {
++			w := m.StringWidth(line)
++			if w <= limit {
++				continue
++			}
++			switch {
++			case strings.ContainsAny(ansi.Strip(line), "-"+bps):
++				count("breakpoint-line")
++			case lastWordWidth(line, bps) >= limit:
++				count("long-word")
++			default:
++				fail(ht, "Wordwrap(%q, %d, %q) = %q: line %q is %d cells wide", s, limit, bps, got, line, w)
++			}
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- wrapping
++
++func TestHegelWrapKeepsLinesWithinTheLimit(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		m := pick(ht, []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth})
++		hyphen := chance(ht, 40)
++		spaces := chance(ht, 75)
++		cfg := docCfg{seqs: true, sgrOnly: true, spaces: spaces, newlines: spaces, hyphen: hyphen, wcSafe: m == ansi.WcWidth, nbsp: true}
++		toks := genDoc(ht, cfg)
++		s := join(toks)
++		limit := n(ht, 0, 6)
++		bps := pick(ht, []string{"", "", "Z", "0"})
++		note(ht, "method %d input %q limit %d breakpoints %q", m, s, limit, bps)
++
++		got := m.Wrap(s, limit, bps)
++		if m == ansi.GraphemeWidth {
++			if g2 := ansi.Wrap(s, limit, bps); g2 != got {
++				fail(ht, "ansi.Wrap and GraphemeWidth.Wrap differ on %q", s)
++			}
++		} else if g2 := ansi.WrapWc(s, limit, bps); g2 != got {
++			fail(ht, "ansi.WrapWc and WcWidth.Wrap differ on %q", s)
++		}
++		if limit < 1 {
++			if got != s {
++				fail(ht, "Wrap(%q, %d) = %q, want the input", s, limit, got)
++			}
++			count("passthrough")
++			return
++		}
++		if maxCluster(toks, m) > limit {
++			count("cluster-wider-than-limit") // x-ansi/12
++			return
++		}
++		in, out := nonSpace(styled(s)), nonSpace(styled(got))
++		if !sameStyled(in, out) {
++			fail(ht, "Wrap(%q, %d, %q) = %q changes the text or styles:\n in  %s\n out %s", s, limit, bps, got, showStyled(in), showStyled(out))
++		}
++		if !reflect.DeepEqual(sequences(s), sequences(got)) {
++			fail(ht, "Wrap(%q, %d, %q) = %q changes the sequences", s, limit, bps, got)
++		}
++		if hasLeadingSpace(s) {
++			count("leading-space") // x-ansi/19
++			return
++		}
++		if spaceSequenceSpace(toks) {
++			count("space-sequence-space") // x-ansi/21
++			return
++		}
++		if strings.Count(got, "\n") < strings.Count(s, "\n") {
++			fail(ht, "Wrap(%q, %d, %q) = %q loses newlines", s, limit, bps, got)
++		}
++		lines := strings.Split(got, "\n")
++		for i, line := range lines {
++			w := m.StringWidth(line)
++			if w <= limit {
++				continue
++			}
++			// A breakpoint is written, with the whitespace before it, without checking the
++			// limit (x-ansi/8): the line holds one, or the next non-empty line starts with one.
++			next := ""
++			for j := i + 1; j < len(lines) && next == ""; j++ {
++				next = ansi.Strip(lines[j])
++			}
++			if strings.ContainsAny(ansi.Strip(line), "-"+bps) || next != "" && strings.ContainsAny(next[:1], "-"+bps) {
++				count("breakpoint-line")
++				continue
++			}
++			fail(ht, "Wrap(%q, %d, %q) = %q: line %q is %d cells wide", s, limit, bps, got, line, w)
++		}
++		// Without whitespace or breakpoints, Wrap is a hard wrap.
++		if !spaces && !hyphen && !strings.ContainsAny(ansi.Strip(s), bps+"\u00a0") {
++			hw := m.Hardwrap(s, limit, false)
++			if !sameStyled(styled(got), styled(hw)) {
++				fail(ht, "Wrap(%q, %d) = %q, Hardwrap %q", s, limit, got, hw)
++			}
++			count("hardwrap-equal")
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- styles
++
++type colorKind int
++
++const (
++	cNil colorKind = iota
++	cBasic
++	cIndexed
++	cRGB
++	cTrue
++	cStd
++)
++
++func genColor(tc hegel.TestCase) (ansi.Color, colorKind) {
++	switch n(tc, 0, 5) {
++	case 0:
++		return nil, cNil
++	case 1:
++		return ansi.BasicColor(n(tc, 0, 15)), cBasic
++	case 2:
++		return ansi.IndexedColor(n(tc, 0, 255)), cIndexed
++	case 3:
++		return ansi.RGBColor{R: uint8(n(tc, 0, 255)), G: uint8(n(tc, 0, 255)), B: uint8(n(tc, 0, 255))}, cRGB
++	case 4:
++		return ansi.TrueColor(n(tc, 0, 0xffffff)), cTrue
++	default:
++		return color.RGBA{R: uint8(n(tc, 0, 255)), G: uint8(n(tc, 0, 255)), B: uint8(n(tc, 0, 255)), A: 0xff}, cStd
++	}
++}
++
++func rgb8(c color.Color) (int, int, int) {
++	r, g, b, _ := c.RGBA()
++	return int(r >> 8), int(g >> 8), int(b >> 8)
++}
++
++// colorParams is the SGR parameter text for a colour, from the table: 30-37/90-97 for the basic
++// foregrounds (40-47/100-107 backgrounds), 38;5;n indexed, 38;2;r;g;b direct; underline colours
++// (58) have no basic form and take the indexed one.
++func colorParams(base int, c ansi.Color, k colorKind) string {
++	switch k {
++	case cNil:
++		return strconv.Itoa(base + 1)
++	case cBasic:
++		v := int(c.(ansi.BasicColor))
++		if base == 58 {
++			return "58;5;" + strconv.Itoa(v)
++		}
++		if v < 8 {
++			return strconv.Itoa(base - 8 + v)
++		}
++		return strconv.Itoa(base + 52 + v - 8)
++	case cIndexed:
++		return strconv.Itoa(base) + ";5;" + strconv.Itoa(int(c.(ansi.IndexedColor)))
++	default:
++		r, g, b := rgb8(c)
++		return fmt.Sprintf("%d;2;%d;%d;%d", base, r, g, b)
++	}
++}
++
++type styleStep struct {
++	params string // expected parameter text
++	base   int    // 38/48/58 for a colour step, 0 otherwise
++	color  ansi.Color
++	kind   colorKind
++}
++
++// genStyle builds a Style through its methods and the parameter text each one should append.
++func genStyle(tc hegel.TestCase) (ansi.Style, []styleStep) {
++	st := ansi.Style{}
++	var steps []styleStep
++	for i := n(tc, 1, 5); i > 0; i-- {
++		v := chance(tc, 60)
++		onoff := func(on, off string) string {
++			if v {
++				return on
++			}
++			return off
++		}
++		switch n(tc, 0, 14) {
++		case 0:
++			st = st.Bold()
++			steps = append(steps, styleStep{params: "1"})
++		case 1:
++			st = st.Faint()
++			steps = append(steps, styleStep{params: "2"})
++		case 2:
++			st = st.Italic(v)
++			steps = append(steps, styleStep{params: onoff("3", "23")})
++		case 3:
++			st = st.Underline(v)
++			steps = append(steps, styleStep{params: onoff("4", "24")})
++		case 4:
++			u := ansi.Underline(n(tc, 0, 5))
++			st = st.UnderlineStyle(u)
++			steps = append(steps, styleStep{params: []string{"24", "4", "4:2", "4:3", "4:4", "4:5"}[u]})
++		case 5:
++			st = st.Blink(v)
++			steps = append(steps, styleStep{params: onoff("5", "25")})
++		case 6:
++			st = st.RapidBlink(v)
++			steps = append(steps, styleStep{params: onoff("6", "25")})
++		case 7:
++			st = st.Reverse(v)
++			steps = append(steps, styleStep{params: onoff("7", "27")})
++		case 8:
++			st = st.Conceal(v)
++			steps = append(steps, styleStep{params: onoff("8", "28")})
++		case 9:
++			st = st.Strikethrough(v)
++			steps = append(steps, styleStep{params: onoff("9", "29")})
++		case 10:
++			st = st.Normal()
++			steps = append(steps, styleStep{params: "22"})
++		case 11:
++			st = st.Reset()
++			steps = append(steps, styleStep{params: "0"})
++		case 12:
++			c, k := genColor(tc)
++			st = st.ForegroundColor(c)
++			steps = append(steps, styleStep{params: colorParams(38, c, k), base: 38, color: c, kind: k})
++		case 13:
++			c, k := genColor(tc)
++			st = st.BackgroundColor(c)
++			steps = append(steps, styleStep{params: colorParams(48, c, k), base: 48, color: c, kind: k})
++		default:
++			c, k := genColor(tc)
++			st = st.UnderlineColor(c)
++			steps = append(steps, styleStep{params: colorParams(58, c, k), base: 58, color: c, kind: k})
++		}
++	}
++	return st, steps
++}
++
++func sameColor(a, b color.Color) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	r1, g1, b1, a1 := a.RGBA()
++	r2, g2, b2, a2 := b.RGBA()
++	return r1 == r2 && g1 == g2 && b1 == b2 && a1 == a2
++}
++
++func TestHegelStylesRoundTripThroughTheDecoder(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		st, steps := genStyle(ht)
++		var parts []string
++		for _, s := range steps {
++			parts = append(parts, s.params)
++		}
++		want := "\x1b[" + strings.Join(parts, ";") + "m"
++		got := st.String()
++		note(ht, "style %q", got)
++		if got != want {
++			fail(ht, "Style.String() = %q, want %q", got, want)
++		}
++		text := pick(ht, []string{"", "x", "\u65e5"})
++		if s2 := st.Styled(text); s2 != got+text+ansi.ResetStyle {
++			fail(ht, "Styled(%q) = %q, want %q", text, s2, got+text+ansi.ResetStyle)
++		}
++		// Back through the decoder and ReadStyleColor.
++		p := ansi.NewParser()
++		seq, _, k, _ := ansi.DecodeSequence(got, ansi.NormalState, p)
++		if k != len(got) || seq != got {
++			fail(ht, "decoding %q consumed %d of %d bytes", got, k, len(got))
++		}
++		params := p.Params()
++		i := 0
++		for _, step := range steps {
++			if i >= len(params) {
++				fail(ht, "%q: parameters run out at step %q", got, step.params)
++			}
++			if step.base == 0 || step.kind == cBasic && step.base != 58 {
++				// one attribute, possibly with one sub-parameter
++				v, more := params[i].Param(-1), params[i].HasMore()
++				text := strconv.Itoa(v)
++				i++
++				if more {
++					text += ":" + strconv.Itoa(params[i].Param(-1))
++					i++
++				}
++				if text != step.params {
++					fail(ht, "%q: step %q decoded as %q", got, step.params, text)
++				}
++				continue
++			}
++			if step.kind == cNil {
++				if v := params[i].Param(-1); v != step.base+1 {
++					fail(ht, "%q: default colour decoded as %d", got, v)
++				}
++				i++
++				continue
++			}
++			var c color.Color
++			consumed := ansi.ReadStyleColor(params[i:], &c)
++			wantN := 3
++			if step.kind >= cRGB {
++				wantN = 5
++			}
++			if consumed != wantN {
++				fail(ht, "%q: ReadStyleColor read %d parameters at %s, want %d", got, consumed, paramsText(paramsOf(params[i:])), wantN)
++			}
++			var wantC color.Color
++			switch step.kind {
++			case cBasic, cIndexed:
++				wantC = ansi.IndexedColor(uint8(reflect.ValueOf(step.color).Uint()))
++			default:
++				r, g, b := rgb8(step.color)
++				wantC = color.RGBA{uint8(r), uint8(g), uint8(b), 0xff}
++			}
++			if !sameColor(c, wantC) {
++				fail(ht, "%q: ReadStyleColor at %s gave %v, want %v", got, paramsText(paramsOf(params[i:])), c, wantC)
++			}
++			i += consumed
++		}
++		if i != len(params) {
++			fail(ht, "%q: %d parameters left after the steps", got, len(params)-i)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- ReadStyleColor and T.416
++
++type colorForm struct {
++	text  string
++	n     int
++	color color.Color // nil = untouched
++}
++
++func genColorForm(tc hegel.TestCase) colorForm {
++	t := pick(tc, []int{38, 48, 58})
++	ts := strconv.Itoa(t)
++	v := func() int { return n(tc, 0, 255) }
++	r, g, b, a := v(), v(), v(), v()
++	rgba := color.RGBA{uint8(r), uint8(g), uint8(b), 0xff}
++	cmy := color.CMYK{uint8(r), uint8(g), uint8(b), 0}
++	cs := strconv.Itoa(n(tc, 0, 9))
++	x := strconv.Itoa(n(tc, 0, 99))
++	switch n(tc, 0, 13) {
++	case 0:
++		return colorForm{fmt.Sprintf("%s;5;%d", ts, r), 3, ansi.IndexedColor(r)}
++	case 1:
++		return colorForm{fmt.Sprintf("%s:5:%d", ts, r), 3, ansi.IndexedColor(r)}
++	case 2:
++		return colorForm{fmt.Sprintf("%s;2;%d;%d;%d", ts, r, g, b), 5, rgba}
++	case 3:
++		return colorForm{fmt.Sprintf("%s:2:%d:%d:%d", ts, r, g, b), 5, rgba}
++	case 4:
++		return colorForm{fmt.Sprintf("%s:2::%d:%d:%d", ts, r, g, b), 6, rgba}
++	case 5:
++		return colorForm{fmt.Sprintf("%s:2:%s:%d:%d:%d", ts, cs, r, g, b), 6, rgba}
++	case 6:
++		return colorForm{fmt.Sprintf("%s:2::%d:%d:%d:%s", ts, r, g, b, x), 7, rgba}
++	case 7:
++		return colorForm{fmt.Sprintf("%s:2::%d:%d:%d:%s:%s", ts, r, g, b, x, x), 8, rgba}
++	case 8:
++		return colorForm{fmt.Sprintf("%s:2::%d:%d:%d:%s:%s:%s", ts, r, g, b, x, x, cs), 9, rgba}
++	case 9:
++		return colorForm{fmt.Sprintf("%s:3::%d:%d:%d", ts, r, g, b), 6, cmy}
++	case 10:
++		return colorForm{fmt.Sprintf("%s:4::%d:%d:%d:%d", ts, r, g, b, a), 7, color.CMYK{uint8(r), uint8(g), uint8(b), uint8(a)}}
++	case 11:
++		return colorForm{fmt.Sprintf("%s:6::%d:%d:%d:%d", ts, r, g, b, a), 7, color.RGBA{uint8(r), uint8(g), uint8(b), uint8(a)}}
++	case 12:
++		return colorForm{ts + ":1", 2, color.Transparent}
++	default:
++		return colorForm{ts + ":0", 2, nil}
++	}
++}
++
++func TestHegelReadStyleColorFollowsT416(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		f := genColorForm(ht)
++		text := f.text
++		if chance(ht, 50) {
++			text += ";" + strconv.Itoa(n(ht, 0, 9))
++		}
++		if chance(ht, 30) {
++			text = strconv.Itoa(n(ht, 1, 9)) + ";" + text
++		}
++		note(ht, "params %q", text)
++		p := ansi.NewParser()
++		seq := "\x1b[" + text + "m"
++		if _, _, k, _ := ansi.DecodeSequence(seq, ansi.NormalState, p); k != len(seq) {
++			fail(ht, "decoding %q consumed %d bytes", seq, k)
++		}
++		params := p.Params()
++		start := 0
++		if strings.HasPrefix(text, f.text) {
++			start = 0
++		} else {
++			start = 1
++		}
++		sentinel := color.Gray{Y: 77}
++		var c color.Color = sentinel
++		got := ansi.ReadStyleColor(params[start:], &c)
++		if got != f.n {
++			fail(ht, "ReadStyleColor(%q) read %d parameters, want %d", f.text, got, f.n)
++		}
++		want := f.color
++		if want == nil {
++			want = sentinel
++		}
++		if !reflect.DeepEqual(c, want) {
++			fail(ht, "ReadStyleColor(%q) = %#v, want %#v", f.text, c, want)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- XParseColor
++
++const hexDigits = "0123456789abcdefABCDEF"
++
++// scaleHex is X11's rule: h, hh, hhh and hhhh are fractions of 4, 8, 12 and 16 bits; the
++// 8-bit value is the top byte of the 16-bit scaling.
++func scaleHex(digits string) int {
++	v, _ := strconv.ParseUint(digits, 16, 32)
++	switch len(digits) {
++	case 1:
++		return int(v) * 0x11
++	case 2:
++		return int(v)
++	case 3:
++		return int(v >> 4)
++	default:
++		return int(v >> 8)
++	}
++}
++
++// genHexComponent draws a two-digit component: the one-, three- and four-digit forms are
++// scaled wrongly and invalid components read as zero (x-ansi/14, pinned).
++func genHexComponent(tc hegel.TestCase) string {
++	var sb strings.Builder
++	for i := 2; i > 0; i-- {
++		sb.WriteByte(hexDigits[n(tc, 0, len(hexDigits)-1)])
++	}
++	return sb.String()
++}
++
++func TestHegelXParseColorFollowsX11(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var s string
++		var want []int
++		switch n(ht, 0, 2) {
++		case 0:
++			parts := make([]string, 3)
++			for i := range parts {
++				parts[i] = genHexComponent(ht)
++				want = append(want, scaleHex(parts[i]))
++			}
++			s = "rgb:" + strings.Join(parts, "/")
++			want = append(want, 255)
++		case 1:
++			parts := make([]string, 4)
++			for i := range parts {
++				parts[i] = genHexComponent(ht)
++				want = append(want, scaleHex(parts[i]))
++			}
++			s = "rgba:" + strings.Join(parts, "/")
++		default:
++			d := pick(ht, []int{1, 2})
++			var sb strings.Builder
++			sb.WriteByte('#')
++			for i := 0; i < 3; i++ {
++				var comp strings.Builder
++				for j := 0; j < d; j++ {
++					comp.WriteByte(hexDigits[n(ht, 0, len(hexDigits)-1)])
++				}
++				sb.WriteString(comp.String())
++				want = append(want, scaleHex(comp.String()))
++			}
++			s = sb.String()
++			want = append(want, 255)
++		}
++		note(ht, "XParseColor(%q)", s)
++		got := ansi.XParseColor(s)
++		if got == nil {
++			fail(ht, "XParseColor(%q) = nil, want %v", s, want)
++		}
++		r, g, b, a := got.RGBA()
++		if gotV := []int{int(r >> 8), int(g >> 8), int(b >> 8), int(a >> 8)}; !reflect.DeepEqual(gotV, want) {
++			fail(ht, "XParseColor(%q) = %v (%v), want %v", s, gotV, got, want)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- palette conversions
++
++func paletteRGB(i int) color.RGBA {
++	r, g, b, _ := ansi.IndexedColor(i).RGBA()
++	return color.RGBA{uint8(r >> 8), uint8(g >> 8), uint8(b >> 8), 0xff}
++}
++
++func TestHegelPaletteConversionsRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		i := n(ht, 0, 255)
++		c := paletteRGB(i)
++		note(ht, "palette %d = %v", i, c)
++		if got := ansi.Convert256(ansi.IndexedColor(i)); int(got) != i {
++			fail(ht, "Convert256(IndexedColor(%d)) = %d", i, got)
++		}
++		if i >= 16 {
++			if got := ansi.Convert256(c); int(got) != i {
++				fail(ht, "Convert256(%v) = %d, want %d", c, got, i)
++			}
++		} else {
++			if got := ansi.Convert16(ansi.BasicColor(i)); int(got) != i {
++				fail(ht, "Convert16(BasicColor(%d)) = %d", i, got)
++			}
++			if got := ansi.Convert16(ansi.IndexedColor(i)); int(got) != i {
++				fail(ht, "Convert16(IndexedColor(%d)) = %d", i, got)
++			}
++			if i == 7 || i == 8 {
++				count("basic-7-8-skipped") // x-ansi/17
++			} else if got := ansi.Convert16(c); int(got) != i {
++				fail(ht, "Convert16(%v) = %d, want %d", c, got, i)
++			}
++		}
++		// Any colour lands in the cube or the greys, and Convert16 agrees with the table.
++		rc := color.RGBA{uint8(n(ht, 0, 255)), uint8(n(ht, 0, 255)), uint8(n(ht, 0, 255)), 0xff}
++		c256 := ansi.Convert256(rc)
++		if c256 < 16 {
++			fail(ht, "Convert256(%v) = %d, a basic colour", rc, c256)
++		}
++		if got, want := ansi.Convert16(rc), ansi.Convert16(c256); got != want {
++			fail(ht, "Convert16(%v) = %d, Convert16(Convert256) = %d", rc, got, want)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- arbitrary input
++
++var arbitraryRunes = []rune{
++	0x1b, '[', ']', 'P', '_', '\\', ';', ':', '?', '<', '$', ' ', 'm', 'h', 'q', '0', '1', '9', 'a', 'Z', '~',
++	'\a', '\n', '\r', 0x18, 0x7f, 0x9b, 0x9c, 0x9d, 0x90,
++	'\u00e9', '\u65e5', '\U0001F600', '\u0301', '\u200d', '\ufe0f', '\u20e3', '\u00a0', '\u3000', '-',
++}
++
++// csiParamCount counts the separators of the longest CSI parameter list in s (x-ansi/1 gate).
++func csiParamCount(s string) int {
++	best := 0
++	for i := 0; i < len(s); i++ {
++		if !(s[i] == 0x9b || s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[') {
++			continue
++		}
++		c := 0
++		for j := i + 1; j < len(s) && (s[j] < 0x40 || s[j] > 0x7e); j++ {
++			if s[j] == ';' || s[j] == ':' {
++				c++
++			}
++		}
++		if c > best {
++			best = c
++		}
++	}
++	return best
++}
++
++func TestHegelArbitraryTextIsDecodedWithoutLossOrPanic(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var sb strings.Builder
++		for i := n(ht, 0, 30); i > 0; i-- {
++			sb.WriteRune(pick(ht, arbitraryRunes))
++		}
++		s := sb.String()
++		note(ht, "input %q", s)
++		if csiParamCount(s) >= parser.MaxParamsSize-1 {
++			count("too-many-params") // x-ansi/1
++			return
++		}
++		for _, m := range []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth} {
++			var back strings.Builder
++			width := 0
++			for _, p := range decodeAll(s, m) {
++				back.WriteString(p.s)
++				width += p.w
++			}
++			if back.String() != s {
++				fail(ht, "decoded pieces of %q join to %q", s, back.String())
++			}
++			if !utf8.ValidString(s) {
++				continue
++			}
++			// Widths add up unless a cluster starts with an ASCII character the decoder
++			// takes on its own (x-ansi/5).
++			if w := m.StringWidth(s); w != width {
++				count("split-cluster")
++			}
++		}
++		parseEvents(s)
++		plain := ansi.Strip(s)
++		if ansi.StringWidth(plain) != ansi.StringWidth(s) {
++			count("strip-width-differs")
++		}
++		limit := n(ht, 0, 5)
++		for _, m := range []ansi.Method{ansi.GraphemeWidth, ansi.WcWidth} {
++			m.Truncate(s, limit, ".")
++			m.TruncateLeft(s, limit, ".")
++			m.Cut(s, limit, limit+2)
++			m.Hardwrap(s, limit, false)
++			m.Wordwrap(s, limit, "")
++			m.Wrap(s, limit, "")
++		}
++		ansi.ByteToGraphemeRange(s, n(ht, 0, len(s)), n(ht, 0, len(s)))
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- pins
++
++func csiWithParams(k int) string {
++	parts := make([]string, k)
++	for i := range parts {
++		parts[i] = "1"
++	}
++	return "\x1b[" + strings.Join(parts, ";") + "m"
++}
++
++// x-ansi/1: DecodeSequence indexes past the parser's parameter buffer.
++func TestHegelPinDecodeSequenceWithManyParameters(t *testing.T) {
++	defer guard(t)
++	s := csiWithParams(parser.MaxParamsSize + 1)
++	p := ansi.NewParser()
++	seq, _, k, _ := ansi.DecodeSequence([]byte(s), ansi.NormalState, p)
++	if string(seq) != s || k != len(s) {
++		t.Fatalf("DecodeSequence(%q) = %q, %d", s, seq, k)
++	}
++	if got := len(p.Params()); got != parser.MaxParamsSize {
++		t.Fatalf("%d parameters kept of %d, buffer %d", got, parser.MaxParamsSize+1, parser.MaxParamsSize)
++	}
++}
++
++// x-ansi/2: a sequence with exactly as many parameters as the buffer loses the last one.
++func TestHegelPinParameterBufferSizedSequence(t *testing.T) {
++	defer guard(t)
++	s := csiWithParams(parser.MaxParamsSize)
++	p := ansi.NewParser()
++	ansi.DecodeSequence([]byte(s), ansi.NormalState, p)
++	if got := len(p.Params()); got != parser.MaxParamsSize {
++		t.Errorf("DecodeSequence kept %d of %d parameters", got, parser.MaxParamsSize)
++	}
++	ev := parseEvents(s)
++	want := fmt.Sprintf("csi %#x %s", int('m'), paramsText(packParams(s[2:len(s)-1])))
++	if len(ev) != 1 || ev[0] != want {
++		t.Errorf("Parser events %q, want [%q]", ev, want)
++	}
++}
++
++// x-ansi/3: a 0x9C byte inside a UTF-8 character ends a control string (upstream #848).
++func TestHegelPinControlStringWithUTF8ContainingST(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"\x1b]2;\u00dc\x07", "\x1b]0;\u2733\x1b\\", "\x1bPq\u00dc\x1b\\"} {
++		p := ansi.NewParser()
++		seq, _, k, _ := ansi.DecodeSequence(s, ansi.NormalState, p)
++		if seq != s || k != len(s) {
++			t.Errorf("DecodeSequence(%q) = %q (%d bytes)", s, seq, k)
++		}
++		if got := ansi.Strip(s); got != "" {
++			t.Errorf("Strip(%q) = %q", s, got)
++		}
++		if got := ansi.StringWidth(s); got != 0 {
++			t.Errorf("StringWidth(%q) = %d", s, got)
++		}
++	}
++	ev := parseEvents("\x1b]2;\u00dc\x07x")
++	want := []string{"osc 2 \"2;\\u00dc\"", "print x"}
++	if !reflect.DeepEqual(ev, want) {
++		t.Errorf("Parser events %q, want %q", ev, want)
++	}
++}
++
++// x-ansi/4: a private marker after the parameters: the parser dispatches the sequence, the
++// decoder rejects it and lets "?m" print.
++func TestHegelPinPrivateMarkerAfterParameters(t *testing.T) {
++	defer guard(t)
++	s := "\x1b[1?mx"
++	p := ansi.NewParser()
++	seq, _, k, _ := ansi.DecodeSequence(s, ansi.NormalState, p)
++	ev := parseEvents(s)
++	decoderTookIt := seq == "\x1b[1?m" && k == 5
++	parserTookIt := len(ev) == 2 && strings.HasPrefix(ev[0], "csi")
++	if decoderTookIt != parserTookIt {
++		t.Fatalf("DecodeSequence(%q) = %q (%d bytes) but the Parser reports %q", s, seq, k, ev)
++	}
++}
++
++// x-ansi/5: a grapheme cluster that starts with an ASCII character is split by the decoder,
++// and Truncate returns a keycap wider than the length.
++func TestHegelPinClustersStartingWithASCII(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"e\u0301", "1\ufe0f\u20e3", "#\ufe0f\u20e3"} {
++		seq, _, _, _ := ansi.DecodeSequence(s, ansi.NormalState, nil)
++		if seq != s {
++			t.Errorf("DecodeSequence(%q) = %q, want the whole cluster", s, seq)
++		}
++	}
++	s := "1\ufe0f\u20e3x"
++	if w := ansi.StringWidth(s); w != 3 {
++		t.Fatalf("StringWidth(%q) = %d", s, w)
++	}
++	for _, length := range []int{1, 2} {
++		got := ansi.Truncate(s, length, "")
++		if w := ansi.StringWidth(got); w > length {
++			t.Errorf("Truncate(%q, %d) = %q is %d cells wide", s, length, got, w)
++		}
++	}
++}
++
++// x-ansi/6: TruncateWc decides whether the text fits with grapheme widths.
++func TestHegelPinTruncateWcFitsCheck(t *testing.T) {
++	defer guard(t)
++	fam := "\U0001F468\u200d\U0001F469\u200d\U0001F467"
++	if w := ansi.StringWidthWc(fam); w != 6 {
++		t.Fatalf("StringWidthWc = %d", w)
++	}
++	got := ansi.TruncateWc(fam, 3, "")
++	if w := ansi.StringWidthWc(got); w > 3 {
++		t.Errorf("TruncateWc(%q, 3) = %q is %d cells wide under WcWidth", fam, got, w)
++	}
++}
++
++// x-ansi/7: CutWc truncates to `left` instead of removing `left` cells.
++func TestHegelPinCutWc(t *testing.T) {
++	defer guard(t)
++	if got := ansi.CutWc("abcdef", 2, 4); got != "cd" {
++		t.Errorf("CutWc(%q, 2, 4) = %q, want %q", "abcdef", got, "cd")
++	}
++	if got := ansi.WcWidth.Cut("abcdef", 2, 4); got != "cd" {
++		t.Errorf("WcWidth.Cut(%q, 2, 4) = %q, want %q", "abcdef", got, "cd")
++	}
++}
++
++// x-ansi/8: Wrap keeps a breakpoint on a full line (upstream #785).
++func TestHegelPinWrapBreakpointOnAFullLine(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		s     string
++		limit int
++		bps   string
++	}{{"ab-", 2, ""}, {"foo bar, fo", 7, ","}, {"a-b", 1, ""}, {"a  0b", 1, "0"}} {
++		got := ansi.Wrap(c.s, c.limit, c.bps)
++		for _, line := range strings.Split(got, "\n") {
++			if w := ansi.StringWidth(line); w > c.limit {
++				t.Errorf("Wrap(%q, %d, %q) = %q: line %q is %d cells wide", c.s, c.limit, c.bps, got, line, w)
++			}
++		}
++	}
++}
++
++// x-ansi/9: Wordwrap writes a breakpoint without checking the limit.
++func TestHegelPinWordwrapBreakpointBeyondTheLimit(t *testing.T) {
++	defer guard(t)
++	got := ansi.Wordwrap("ab-cd-ef", 5, "")
++	if want := "ab-\ncd-ef"; got != want {
++		t.Errorf("Wordwrap(%q, 5) = %q, want %q", "ab-cd-ef", got, want)
++	}
++}
++
++// x-ansi/10: a word exactly as wide as the limit is never moved to its own line.
++func TestHegelPinWordwrapWordAsWideAsTheLimit(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct{ s, want string }{{" cdefg", "\ncdefg"}, {"a-bcdef", "a-\nbcdef"}} {
++		if got := ansi.Wordwrap(c.s, 5, ""); got != c.want {
++			t.Errorf("Wordwrap(%q, 5) = %q, want %q", c.s, got, c.want)
++		}
++	}
++}
++
++// x-ansi/11: Wordwrap measures whitespace in bytes.
++func TestHegelPinWordwrapMeasuresSpacesInBytes(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		s     string
++		limit int
++		want  string
++	}{{"a\u3000b\u3000c", 4, "a\u3000b\nc"}, {"a\u2003b\u2003c", 4, "a\u2003b\u2003c"}} {
++		if got := ansi.Wordwrap(c.s, c.limit, ""); got != c.want {
++			t.Errorf("Wordwrap(%q, %d) = %q, want %q", c.s, c.limit, got, c.want)
++		}
++	}
++}
++
++// x-ansi/12: a cluster wider than the limit starts with an empty line.
++func TestHegelPinClusterWiderThanTheLimit(t *testing.T) {
++	defer guard(t)
++	for _, f := range []struct {
++		name string
++		fn   func(string, int) string
++	}{
++		{"Hardwrap", func(s string, l int) string { return ansi.Hardwrap(s, l, false) }},
++		{"Wrap", func(s string, l int) string { return ansi.Wrap(s, l, "") }},
++	} {
++		if got := f.fn("\u65e5", 1); got != "\u65e5" {
++			t.Errorf("%s(%q, 1) = %q", f.name, "\u65e5", got)
++		}
++		if got := f.fn("\u65e5\u65e5", 1); got != "\u65e5\n\u65e5" {
++			t.Errorf("%s(%q, 1) = %q", f.name, "\u65e5\u65e5", got)
++		}
++	}
++}
++
++// x-ansi/13: Hardwrap drops a non-ASCII space at the start of the text but keeps an ASCII one.
++func TestHegelPinHardwrapLeadingNonASCIISpace(t *testing.T) {
++	defer guard(t)
++	if got := ansi.Hardwrap(" foo", 4, false); got != " foo" {
++		t.Fatalf("Hardwrap(%q) = %q", " foo", got)
++	}
++	for _, s := range []string{"\u00a0foo", "\u3000foo", "a\n\u00a0foo"} {
++		if got := ansi.Hardwrap(s, 5, false); got != s {
++			t.Errorf("Hardwrap(%q, 5, false) = %q", s, got)
++		}
++	}
++}
++
++// x-ansi/14: XParseColor scales rgb: components as if they always had two digits, and reads
++// invalid hex as zero.
++func TestHegelPinXParseColorScaling(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		s    string
++		want [3]int
++	}{{"rgb:f/f/f", [3]int{255, 255, 255}}, {"rgb:fff/fff/fff", [3]int{255, 255, 255}}, {"rgb:1/2/3", [3]int{0x11, 0x22, 0x33}}} {
++		got := ansi.XParseColor(c.s)
++		if got == nil {
++			t.Errorf("XParseColor(%q) = nil", c.s)
++			continue
++		}
++		r, g, b := rgb8(got)
++		if [3]int{r, g, b} != c.want {
++			t.Errorf("XParseColor(%q) = %v, want %v", c.s, [3]int{r, g, b}, c.want)
++		}
++	}
++	if got := ansi.XParseColor("rgb:zz/0/0"); got != nil {
++		t.Errorf("XParseColor(%q) = %v, want nil", "rgb:zz/0/0", got)
++	}
++}
++
++// x-ansi/15: ReadStyleColor truncates colour components modulo 256.
++func TestHegelPinReadStyleColorOutOfRange(t *testing.T) {
++	defer guard(t)
++	for _, text := range []string{"38;5;256", "38;2;300;0;0"} {
++		p := ansi.NewParser()
++		ansi.DecodeSequence("\x1b["+text+"m", ansi.NormalState, p)
++		var c color.Color
++		k := ansi.ReadStyleColor(p.Params(), &c)
++		if k != 0 || c != nil {
++			t.Errorf("ReadStyleColor(%q) read %d parameters and gave %v, want a rejection", text, k, c)
++		}
++	}
++}
++
++// x-ansi/16: ByteToGraphemeRange counts escape-sequence bytes and controls as cells.
++func TestHegelPinByteToGraphemeRangeWithSequences(t *testing.T) {
++	defer guard(t)
++	s := "\x1b[31mab"
++	start, stop := ansi.ByteToGraphemeRange(s, 5, 7)
++	if got := ansi.Cut(s, start, stop); ansi.Strip(got) != "ab" {
++		t.Errorf("ByteToGraphemeRange(%q, 5, 7) = %d, %d; Cut gives %q", s, start, stop, got)
++	}
++	s = "a\nb"
++	start, stop = ansi.ByteToGraphemeRange(s, 2, 3)
++	if got := ansi.Cut(s, start, stop); got != "b" {
++		t.Errorf("ByteToGraphemeRange(%q, 2, 3) = %d, %d; Cut gives %q", s, start, stop, got)
++	}
++}
++
++// x-ansi/17: Convert16 does not return the basic colour for the exact RGB of colours 7 and 8.
++func TestHegelPinConvert16BasicGreys(t *testing.T) {
++	defer guard(t)
++	for _, i := range []int{7, 8} {
++		if got := ansi.Convert16(paletteRGB(i)); int(got) != i {
++			t.Errorf("Convert16(%v) = %d, want %d", paletteRGB(i), got, i)
++		}
++	}
++}
++
++// x-ansi/18: a UTF-8 character inside an SOS, PM or APC string ends the string in the
++// table-driven parser (the decoder keeps it).
++func TestHegelPinUTF8InsideSosPmApcStrings(t *testing.T) {
++	defer guard(t)
++	s := "\x1b^a\u00e9b\x1b\\x"
++	if got := ansi.Strip(s); got != "x" {
++		t.Errorf("Strip(%q) = %q", s, got)
++	}
++	if got := ansi.StringWidth(s); got != 1 {
++		t.Errorf("StringWidth(%q) = %d", s, got)
++	}
++	if got := ansi.Truncate(s, 1, ""); got != s {
++		t.Errorf("Truncate(%q, 1) = %q", s, got)
++	}
++	ev := parseEvents(s)
++	want := []string{"pm \"a\u00e9b\"", fmt.Sprintf("esc %#x", int('\\')), "print x"}
++	if !reflect.DeepEqual(ev, want) {
++		t.Errorf("Parser events %q, want %q", ev, want)
++	}
++	if seq, _, k, _ := ansi.DecodeSequence(s, ansi.NormalState, nil); seq != s[:len(s)-1] || k != len(s)-1 {
++		t.Errorf("DecodeSequence(%q) = %q", s, seq)
++	}
++}
++
++// x-ansi/19: leading spaces confuse Wrap and Wordwrap.
++func TestHegelPinWrapLeadingSpaces(t *testing.T) {
++	defer guard(t)
++	if got := ansi.Wrap(" abc", 3, ""); got != " abc" && got != "abc" {
++		t.Errorf("Wrap(%q, 3) = %q", " abc", got)
++	}
++	for _, f := range []struct {
++		name string
++		fn   func(string, int) string
++	}{
++		{"Wrap", func(s string, l int) string { return ansi.Wrap(s, l, "") }},
++		{"Wordwrap", func(s string, l int) string { return ansi.Wordwrap(s, l, "") }},
++	} {
++		if got := f.fn("  ab", 3); strings.HasPrefix(got, "\n") {
++			t.Errorf("%s(%q, 3) = %q starts with an empty line", f.name, "  ab", got)
++		}
++	}
++}
++
++// x-ansi/20: with two private markers the Parser keeps the first, the decoder the last.
++func TestHegelPinTwoPrivateMarkers(t *testing.T) {
++	defer guard(t)
++	s := "\x1b[=>1P"
++	p := ansi.NewParser()
++	ansi.DecodeSequence(s, ansi.NormalState, p)
++	dec := ansi.Cmd(p.Command()).Prefix()
++	ev := parseEvents(s)
++	want := fmt.Sprintf("csi %#x [1]", ansi.Command('>', 0, 'P'))
++	if len(ev) != 1 || ev[0] != want || dec != '>' {
++		t.Errorf("Parser events %q (want [%q]), decoder prefix %q", ev, want, dec)
++	}
++}
++
++// x-ansi/21: whitespace followed by an escape sequence is flushed past the limit: Wordwrap at
++// the end of the text, Wrap when more whitespace follows the sequence.
++func TestHegelPinWhitespaceBeforeASequence(t *testing.T) {
++	defer guard(t)
++	s := "ab \x1b[1m"
++	got := ansi.Wordwrap(s, 2, "")
++	if w := ansi.StringWidth(got); w > 2 {
++		t.Errorf("Wordwrap(%q, 2) = %q is %d cells wide", s, got, w)
++	}
++	s = "a  \x1b[m "
++	got = ansi.Wrap(s, 2, "")
++	for _, line := range strings.Split(got, "\n") {
++		if w := ansi.StringWidth(line); w > 2 {
++			t.Errorf("Wrap(%q, 2) = %q: line %q is %d cells wide", s, got, line, w)
++		}
++	}
++}
++
++// ---------------------------------------------------------------- fixed examples
++
++func TestHegelExamples(t *testing.T) {
++	defer guard(t)
++	for _, c := range clusters {
++		if w := ansi.StringWidth(c.s); w != c.w {
++			t.Errorf("StringWidth(%q) = %d, table %d", c.s, w, c.w)
++		}
++		if w := ansi.StringWidthWc(c.s); w != c.wc {
++			t.Errorf("StringWidthWc(%q) = %d, table %d", c.s, w, c.wc)
++		}
++	}
++	if got := ansi.Truncate("Hello, World!", 5, "\u2026"); got != "Hell\u2026" {
++		t.Errorf("Truncate = %q", got)
++	}
++	if got := ansi.Wordwrap("the quick brown fox", 10, ""); got != "the quick\nbrown fox" {
++		t.Errorf("Wordwrap = %q", got)
++	}
++	if got := ansi.Hardwrap("foobarfoo", 4, true); got != "foob\narfo\no" {
++		t.Errorf("Hardwrap = %q", got)
++	}
++	if got := ansi.NewStyle(ansi.AttrBold, ansi.AttrRedForegroundColor).String(); got != "\x1b[1;31m" {
++		t.Errorf("Style = %q", got)
++	}
++	if got := ansi.Strip("\x1b[1mbold\x1b[m \x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\"); got != "bold link" {
++		t.Errorf("Strip = %q", got)
++	}
++}
