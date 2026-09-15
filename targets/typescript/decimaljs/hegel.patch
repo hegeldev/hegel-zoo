@@ -1,0 +1,1329 @@
+diff --git a/test/hegel-decimal-oracle.py b/test/hegel-decimal-oracle.py
+new file mode 100644
+index 0000000..3ded6c5
+--- /dev/null
++++ b/test/hegel-decimal-oracle.py
+@@ -0,0 +1,479 @@
++#!/usr/bin/env python3
++"""Hegel zoo: Python's decimal module (and fractions) as the oracle for decimal.js, held open by
++the tests over two FIFOs: one JSON request per line on argv[1], one JSON answer per line on argv[2].
++
++Every request carries "fn", "args" (decimal strings as decimal.js would print them, or "NaN",
++"Infinity", "-Infinity"), "prec" (significant digits) and "rm" (decimal.js rounding mode 0-8).
++Answers are {"ok": true, "r": <string or list>} or {"ok": true, "r": null, "undecidable": true}
++(a transcendental result too close to a rounding boundary to decide at the oracle's extra
++precision) or {"ok": false, "error": "..."}.
++
++Rounding modes 7 (ROUND_HALF_CEIL) and 8 (ROUND_HALF_FLOOR) do not exist in Python: the result
++is computed with ROUND_HALF_UP and ROUND_HALF_DOWN and, when they differ (a tie), the one towards
+++Infinity (7) or -Infinity (8) is taken.
++"""
++import decimal
++import json
++import math
++import sys
++from decimal import (ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_DOWN, ROUND_HALF_EVEN,
++                     ROUND_HALF_UP, ROUND_UP, Context, Decimal, Inexact, localcontext)
++from fractions import Fraction
++
++RM = {0: ROUND_UP, 1: ROUND_DOWN, 2: ROUND_CEILING, 3: ROUND_FLOOR, 4: ROUND_HALF_UP,
++      5: ROUND_HALF_DOWN, 6: ROUND_HALF_EVEN}
++EMAX = 9 * 10 ** 15
++BIG = Context(prec=100000, rounding=ROUND_HALF_EVEN, Emin=-EMAX, Emax=EMAX, traps=[])
++decimal.setcontext(BIG)  # scaleb() and the operators round in the current context
++EXTRA = 30  # guard digits for the transcendental functions
++
++
++def ctx(prec, rm):
++    return Context(prec=prec, rounding=RM[rm], Emin=-EMAX, Emax=EMAX, traps=[])
++
++
++def dec(s):
++    return Decimal(s)
++
++
++def is_special(d):
++    return not d.is_finite()
++
++
++def round_to(value, prec, rm):
++    """value (Decimal or Fraction, exact) rounded to prec significant digits with mode rm."""
++    if isinstance(value, Fraction):
++        # exact enough: convert with far more digits than needed, then round once; a Fraction
++        # whose decimal expansion does not terminate gets a sticky digit appended
++        if value == 0:
++            return Decimal(0)
++        c = Context(prec=prec + 5, rounding=ROUND_DOWN, Emin=-EMAX, Emax=EMAX, traps=[])
++        approx = c.divide(Decimal(value.numerator), Decimal(value.denominator))
++        exact = Fraction(approx) == value
++        if not exact:
++            # append a non-zero sticky digit below the guard digits (truncated, so the true
++            # value lies strictly above approx and strictly below approx + 1 unit)
++            sign, digits, exp = approx.as_tuple()
++            approx = Decimal((sign, digits + (5,), exp - 1))
++        value = approx
++    return ctx(prec, rm).plus(value)
++
++
++def with_half_modes(f, rm):
++    """f(mode) for the composite modes 7/8: the two half results, then the one in the direction."""
++    if rm <= 6:
++        return f(rm)
++    up = f(4)
++    down = f(5)
++    if isinstance(up, Decimal) and isinstance(down, Decimal):
++        if up.is_nan() or down.is_nan() or up == down:
++            return up
++        return max(up, down) if rm == 7 else min(up, down)
++    return up if up == down else (max(up, down) if rm == 7 else min(up, down))
++
++
++def round_int(q, rm):
++    """The integer nearest to the exact Fraction q in the direction of decimal.js mode rm (0-9)."""
++    fl = q.numerator // q.denominator
++    frac = q - fl
++    if frac == 0:
++        return fl
++    neg = q < 0
++    if rm == 0:
++        return fl if neg else fl + 1          # away from zero
++    if rm == 1:
++        return fl + 1 if neg else fl          # towards zero
++    if rm == 2:
++        return fl + 1                         # ceil
++    if rm == 3:
++        return fl                             # floor
++    half = Fraction(1, 2)
++    if frac > half:
++        return fl + 1
++    if frac < half:
++        return fl
++    if rm == 4:
++        return fl if neg else fl + 1          # half away from zero
++    if rm == 5:
++        return fl + 1 if neg else fl          # half towards zero
++    if rm == 6:
++        return fl if fl % 2 == 0 else fl + 1  # half even
++    if rm == 7:
++        return fl + 1                         # half ceil
++    if rm == 8:
++        return fl                             # half floor
++    raise ValueError("mode %r" % rm)
++
++
++def boundary_free(d, prec, guard):
++    """Is the (prec + guard)-digit correctly rounded d safely away from every rounding boundary
++    at prec digits (so rounding it again to prec digits gives the correctly rounded result)?"""
++    if not d.is_finite() or d == 0:
++        return True
++    digits = "".join(str(x) for x in d.as_tuple().digits)
++    digits = digits.ljust(prec + guard, "0")
++    tail = digits[prec:prec + guard]
++    for pattern in ("0" * guard, "9" * guard, "5" + "0" * (guard - 1), "4" + "9" * (guard - 1)):
++        if tail[:len(pattern) - 6] == pattern[:len(pattern) - 6]:
++            return False
++    return True
++
++
++def transcendental(compute, prec, rm):
++    """compute(context) at prec + EXTRA digits (correctly rounded there), then round to prec.
++
++    Rounding twice is only wrong when the high-precision value sits within one of its units of
++    a rounding boundary at prec digits. Then the computation is repeated with three times the
++    guard digits; exact results (log2(256) = 8, pow(2, -1) = 0.5) are recognised there by the
++    context's Inexact flag staying clear, and a value still hugging a boundary while inexact is
++    reported as undecidable (None)."""
++    hi = Context(prec=prec + EXTRA, rounding=ROUND_HALF_EVEN, Emin=-EMAX, Emax=EMAX, traps=[])
++    d = compute(hi)
++    if not d.is_finite() or d.is_zero():  # plus() would turn -0 into 0
++        return d
++    if not boundary_free(d, prec, EXTRA):
++        hi = Context(prec=prec + 3 * EXTRA, rounding=ROUND_HALF_EVEN, Emin=-EMAX, Emax=EMAX, traps=[])
++        d = compute(hi)
++        if hi.flags[Inexact] and not boundary_free(d, prec, 3 * EXTRA):
++            return None
++    return with_half_modes(lambda m: ctx(prec, m).plus(d), rm)
++
++
++def exact_sqrt(fx, prec):
++    """sqrt of the positive Fraction fx (a decimal, so with a power-of-ten denominator) as a
++    Decimal of at least prec + 5 digits, with a sticky digit appended when the root is inexact,
++    so that one rounding to prec digits in any mode is the correctly rounded square root."""
++    k = 0
++    while True:
++        n = fx * Fraction(10) ** (2 * k)
++        if n.denominator == 1 and len(str(n.numerator)) >= 2 * (prec + 5):
++            break
++        k += 1
++        if k > 6000:
++            raise ValueError("sqrt: cannot scale")
++    N = n.numerator
++    r = math.isqrt(N)
++    d = Decimal(r)
++    if r * r != N:
++        d = Decimal(r * 10 + 5).scaleb(-1)
++    return d.scaleb(-k)
++
++
++def calc(req):
++    fn = req["fn"]
++    args = [dec(a) for a in req.get("args", [])]
++    prec = int(req.get("prec", 20))
++    rm = int(req.get("rm", 4))
++
++    if fn == "ping":
++        return {"ok": True, "python": sys.version.split()[0]}
++
++    if fn == "sqrt":  # exact integer square root (Python's sqrt always rounds half-even)
++        x = args[0]
++        if x.is_nan() or x < 0:
++            return {"ok": True, "r": "NaN"}
++        if is_special(x) or x.is_zero():
++            return {"ok": True, "r": str(x)}
++        d = exact_sqrt(Fraction(x), prec)
++        return {"ok": True, "r": str(with_half_modes(lambda m: ctx(prec, m).plus(d), rm))}
++
++    if fn in ("add", "sub", "mul", "div", "cmp", "abs", "neg"):
++        def f(m):
++            c = ctx(prec, m)
++            x = args[0]
++            if fn == "add":
++                return c.add(x, args[1])
++            if fn == "sub":
++                return c.subtract(x, args[1])
++            if fn == "mul":
++                return c.multiply(x, args[1])
++            if fn == "div":
++                return c.divide(x, args[1])
++            if fn == "sqrt":
++                return c.sqrt(x)
++            if fn == "abs":
++                return x.copy_abs()  # exact, and -0 -> 0 as in JavaScript
++            if fn == "neg":
++                return x.copy_negate()  # exact, and 0 -> -0 as in JavaScript
++            if fn == "cmp":
++                return x.compare(args[1])
++        r = with_half_modes(f, rm)
++        return {"ok": True, "r": str(r)}
++
++    if fn == "sum":
++        total = Fraction(0)
++        for a in args:
++            if is_special(a):
++                return {"ok": True, "r": str(with_half_modes(lambda m: sum(args[1:], start=ctx(prec, m).plus(args[0])) if False else _sum_special(args, ctx(prec, m)), rm))}
++            total += Fraction(a)
++        if total == 0:
++            # the sign of a zero sum as IEEE 754 / the decimal specification give it for a
++            # sequence of additions: all -0 -> -0, all +0 -> +0, otherwise -0 only under FLOOR
++            if all(a.is_zero() and a.is_signed() for a in args):
++                return {"ok": True, "r": "-0"}
++            if all(a.is_zero() and not a.is_signed() for a in args):
++                return {"ok": True, "r": "0"}
++            return {"ok": True, "r": "-0" if rm == 3 else "0"}
++        return {"ok": True, "r": str(with_half_modes(lambda m: round_to(total, prec, m), rm))}
++
++    if fn == "hypot":
++        total = Fraction(0)
++        for a in args:
++            if a.is_nan():
++                return {"ok": True, "r": "NaN"}
++            if a.is_infinite():
++                return {"ok": True, "r": "Infinity"}
++            total += Fraction(a) * Fraction(a)
++        if total == 0:
++            return {"ok": True, "r": "0"}
++        d = exact_sqrt(total, prec)  # the exact sum of squares, rooted once
++        return {"ok": True, "r": str(with_half_modes(lambda m: ctx(prec, m).plus(d), rm))}
++
++    if fn in ("mod", "divToInt"):
++        x, y = args
++        mode = int(req.get("modulo", 1))
++        if x.is_nan() or y.is_nan():
++            return {"ok": True, "r": "NaN"}
++        opposite = x.is_signed() != y.is_signed()
++        if fn == "divToInt":
++            # the specials of IEEE division (Infinity / 0.1 = Infinity, 5 / -0 = -Infinity)
++            if x.is_infinite():
++                return {"ok": True, "r": "NaN" if y.is_infinite() else ("-Infinity" if opposite else "Infinity")}
++            if y == 0:
++                return {"ok": True, "r": "NaN" if x == 0 else ("-Infinity" if opposite else "Infinity")}
++        elif x.is_infinite() or y == 0:
++            return {"ok": True, "r": "NaN"}
++        if y.is_infinite():
++            if fn == "divToInt":
++                return {"ok": True, "r": "-0" if opposite else "0"}
++            # x mod Infinity = x, rounded to precision like every mod result
++            if x.is_zero():
++                return {"ok": True, "r": str(x)}
++            return {"ok": True, "r": str(with_half_modes(lambda m: ctx(prec, m).plus(x), rm))}
++        q = Fraction(x) / Fraction(y)
++        if fn == "divToInt":
++            qi = round_int(q, 1)
++            r = Fraction(qi)
++            if qi == 0 and ((x < 0 or x.is_signed()) != (y < 0)):
++                return {"ok": True, "r": str(with_half_modes(lambda m: round_to(r, prec, m), rm)).replace("0", "-0", 1)}
++            return {"ok": True, "r": str(with_half_modes(lambda m: round_to(r, prec, m), rm))}
++        if mode == 9:
++            qi = (1 if y > 0 else -1) * (Fraction(x) / abs(Fraction(y))).__floor__()
++        else:
++            qi = round_int(q, mode)
++        r = Fraction(x) - Fraction(y) * qi
++        if r == 0:
++            # the sign of a zero remainder follows the dividend (as JavaScript's %)
++            return {"ok": True, "r": "-0" if x.is_signed() else "0"}
++        return {"ok": True, "r": str(with_half_modes(lambda m: round_to(r, prec, m), rm))}
++
++    if fn in ("exp", "ln", "log10", "log2", "log", "pow"):
++        x = args[0]
++        if fn == "exp":
++            comp = lambda c: c.exp(x)
++        elif fn == "ln":
++            comp = lambda c: c.ln(x)
++        elif fn == "log10":
++            comp = lambda c: c.log10(x)
++        elif fn == "log2":
++            comp = lambda c: c.divide(c.ln(x), c.ln(Decimal(2)))
++        elif fn == "log":
++            base = args[1]
++            if base.is_nan() or base.is_infinite() or base <= 0 or base == 1:
++                return {"ok": True, "r": "NaN"}  # decimal.js: no logarithm to such a base
++            comp = lambda c: c.divide(c.ln(x), c.ln(base))
++        else:
++            y = args[1]
++            if y.is_zero():
++                return {"ok": True, "r": "1"}  # x ** 0 = 1 for every x, as in JavaScript
++            comp = lambda c: c.power(x, y)
++        try:
++            r = transcendental(comp, prec, rm)
++        except Exception as e:  # noqa: BLE001
++            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
++        return {"ok": True, "r": None if r is None else str(r), "undecidable": r is None}
++
++    if fn == "cbrt":
++        x = args[0]
++        if is_special(x) or x == 0:
++            return {"ok": True, "r": str(x)}
++        # exact integer cube root with a sticky digit, then one rounding
++        neg = x < 0
++        fx = abs(Fraction(x))
++        # scale to an integer N = fx * 10^(3k) with at least 3*(prec+5) digits
++        k = 0
++        while True:
++            n = fx * Fraction(10) ** (3 * k)
++            if n.denominator == 1 and len(str(n.numerator)) >= 3 * (prec + 5):
++                break
++            k += 1
++            if k > 4000:
++                return {"ok": False, "error": "cbrt: cannot scale"}
++        N = n.numerator
++        r = icbrt(N)
++        d = Decimal(r)
++        if r ** 3 != N:
++            d = Decimal(r * 10 + 5).scaleb(-1)
++        d = d.scaleb(-k)
++        if neg:
++            d = -d
++        return {"ok": True, "r": str(with_half_modes(lambda m: ctx(prec, m).plus(d), rm))}
++
++    if fn == "toDP":  # args: x, dp -> rounded to dp decimal places (no precision limit)
++        x = args[0]
++        dp = int(req["dp"])
++        if is_special(x):
++            return {"ok": True, "r": str(x)}
++        def f(m):
++            with localcontext(BIG) as c:
++                c.rounding = RM[m]
++                return x.quantize(Decimal(1).scaleb(-dp))
++        r = with_half_modes(f, rm)
++        return {"ok": True, "r": str(r), "fixed": format(r, "f")}
++
++    if fn == "toSD":  # args: x, sd -> rounded to sd significant digits
++        x = args[0]
++        sd = int(req["sd"])
++        if is_special(x) or x.is_zero():  # plus() would turn -0 into 0
++            return {"ok": True, "r": str(x)}
++        r = with_half_modes(lambda m: ctx(sd, m).plus(x), rm)
++        return {"ok": True, "r": str(r)}
++
++    if fn == "integral":  # args: x; rm 0-8 -> whole number
++        x = args[0]
++        if is_special(x):
++            return {"ok": True, "r": str(x)}
++        def f(m):
++            with localcontext(BIG) as c:
++                return x.to_integral_value(rounding=RM[m])
++        return {"ok": True, "r": str(with_half_modes(f, rm))}
++
++    if fn == "toNearest":  # args: x, n; rm -> nearest multiple of n
++        x, nn = args
++        if x.is_nan() or nn.is_nan():
++            return {"ok": True, "r": "NaN"}
++        if x.is_infinite():
++            return {"ok": True, "r": str(x)}
++        if nn == 0:
++            return {"ok": True, "r": "-0" if x.is_signed() else "0"}
++        if nn.is_infinite():
++            # decimal.js returns Infinity with the sign of this (the code's choice; undocumented)
++            return {"ok": True, "r": "-Infinity" if x.is_signed() else "Infinity"}
++        q = Fraction(x) / Fraction(abs(nn))
++        qi = round_int(q, rm)
++        r = Fraction(qi) * Fraction(abs(nn))
++        if r == 0:
++            return {"ok": True, "r": "-0" if x.is_signed() else "0"}
++        return {"ok": True, "r": str(round_to(r, 100000, 6))}
++
++    if fn == "fraction":  # args: x [, maxd] -> [num, den] exact or limited
++        x = args[0]
++        fr = Fraction(x)
++        if len(args) > 1:
++            fr = fr.limit_denominator(int(args[1]))
++        return {"ok": True, "r": [str(fr.numerator), str(fr.denominator)]}
++
++    if fn == "closeness":  # args: x, num, den -> |x - num/den| as an exact decimal string
++        x, num, den = args
++        diff = abs(Fraction(x) - Fraction(int(num), int(den)))
++        return {"ok": True, "r": [str(diff.numerator), str(diff.denominator)]}
++
++    if fn == "parse":  # args: string in decimal.js syntax -> exact value (BigInt/hex/bin/oct)
++        s = req["s"].replace("_", "")
++        neg = s.startswith("-")
++        if neg or s.startswith("+"):
++            s = s[1:]
++        base = 10
++        p = s[:2].lower()
++        if p in ("0x", "0b", "0o"):
++            base = {"0x": 16, "0b": 2, "0o": 8}[p]
++            s = s[2:]
++        expo = 0
++        if base == 10:
++            for sep in ("e", "E"):
++                if sep in s:
++                    s, e = s.split(sep)
++                    expo = int(e)
++        else:
++            for sep in ("p", "P"):
++                if sep in s:
++                    s, e = s.split(sep)
++                    expo = int(e)
++        if "." in s:
++            ip, fp = s.split(".")
++        else:
++            ip, fp = s, ""
++        digits = (ip + fp) or "0"
++        value = Fraction(int(digits, base), base ** len(fp))
++        if base == 10:
++            value *= Fraction(10) ** expo
++        else:
++            value *= Fraction(2) ** expo
++        if neg:
++            value = -value
++        if value == 0:
++            return {"ok": True, "r": "-0" if neg else "0"}
++        return {"ok": True, "r": str(round_to(value, 100000, 6))}
++
++    if fn == "toBase":  # args: x; base, sd, rm -> exact value of x rounded to sd base-b digits
++        x = args[0]
++        b = int(req["base"])
++        sd = int(req["sd"])
++        if is_special(x) or x == 0:
++            return {"ok": True, "r": str(x)}
++        neg = x < 0
++        fx = abs(Fraction(x))
++        # find the exponent: b^e <= fx < b^(e+1)
++        e = 0
++        while fx >= b ** (e + 1):
++            e += 1
++        while fx < Fraction(b) ** e:
++            e -= 1
++        scaled = fx / Fraction(b) ** (e - sd + 1)  # sd digits before the point
++        m = round_int(-scaled if neg else scaled, rm)
++        value = Fraction(m) * Fraction(b) ** (e - sd + 1)
++        if value == 0:
++            return {"ok": True, "r": "-0" if neg else "0"}
++        return {"ok": True, "r": str(round_to(value, 100000, 6))}
++
++    return {"ok": False, "error": "unknown fn " + fn}
++
++
++def _sum_special(args, c):
++    total = c.plus(args[0])
++    for a in args[1:]:
++        total = c.add(total, a)
++    return total
++
++
++def icbrt(n):
++    """floor(cbrt(n)) for a non-negative int."""
++    if n < 2:
++        return n
++    x = 1 << ((n.bit_length() + 2) // 3)
++    while True:
++        y = (2 * x + n // (x * x)) // 3
++        if y >= x:
++            break
++        x = y
++    while x * x * x > n:
++        x -= 1
++    while (x + 1) ** 3 <= n:
++        x += 1
++    return x
++
++
++def main():
++    req_path, resp_path = sys.argv[1], sys.argv[2]
++    with open(req_path, "r", encoding="utf-8") as req, open(resp_path, "w", encoding="utf-8") as resp:
++        for line in req:
++            try:
++                ans = calc(json.loads(line))
++            except Exception as e:  # noqa: BLE001 - every failure is an answer
++                ans = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
++            resp.write(json.dumps(ans, ensure_ascii=True) + "\n")
++            resp.flush()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test/hegel-zoo.mjs b/test/hegel-zoo.mjs
+new file mode 100644
+index 0000000..ef914e1
+--- /dev/null
++++ b/test/hegel-zoo.mjs
+@@ -0,0 +1,138 @@
++// Hegel zoo: the small harness shared by the zoo's TypeScript/JavaScript targets.
++//
++// `property(name, body)` registers a node:test test that runs `body(tc)` under Hegel with
++// HEGEL_TEST_CASES cases (default 100) and the database at HEGEL_DATABASE. With ZOO_COLLECT=1
++// a `fail()` records the mismatch instead of failing, the case ends there, and the counts of
++// mismatches and of the shapes seen (`count(key)`) are printed at the end of the test, so a
++// property can be run over many cases to see every shape at once. `pin(name, body)` is a
++// plain test for one pinned bug: it must fail while the bug is present and pass once it is
++// fixed (the zoo's judge reads an unexpected pass as "fixed upstream?").
++
++import { readFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { test as nodeTest } from "node:test";
++import * as hegel from "@hegeldev/hegel";
++import * as gs from "@hegeldev/hegel/generators";
++
++// The Hegel version these tests were written against (the zoo pins it in zoo.toml and installs
++// it with `npm install --no-save @hegeldev/hegel@<version>`; upstream would add it to
++// devDependencies). Checked at load time so a stray install cannot silently change the engine.
++export const HEGEL_PIN = { "@hegeldev/hegel": "0.4.5" };
++
++{
++  let dir = dirname(fileURLToPath(import.meta.resolve("@hegeldev/hegel")));
++  while (!/[\\/]hegel$/.test(dir) && dir !== dirname(dir)) dir = dirname(dir);
++  const installed = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version;
++  if (installed !== HEGEL_PIN["@hegeldev/hegel"]) {
++    throw new Error(`@hegeldev/hegel ${installed} is installed; these tests pin ${HEGEL_PIN["@hegeldev/hegel"]}`);
++  }
++}
++
++export const collecting = !!process.env.ZOO_COLLECT;
++
++class Collected extends Error {}
++
++let msgs = [];
++let stats = new Map();
++
++/** Report a mismatch: an error normally, a recorded line in collect mode. */
++export function fail(message) {
++  if (collecting) {
++    msgs.push(message);
++    throw new Collected(message);
++  }
++  throw new Error(message);
++}
++
++/** Bump a statistic (the shape of a pinned bug, a generator branch). */
++export function count(key) {
++  stats.set(key, (stats.get(key) || 0) + 1);
++}
++
++function settings() {
++  const s = { testCases: Number(process.env.HEGEL_TEST_CASES) || 100 };
++  if (process.env.HEGEL_DATABASE) {
++    s.database = hegel.Database.fromPath(process.env.HEGEL_DATABASE);
++  }
++  return s;
++}
++
++/** A property: `body(tc)` runs under Hegel; a thrown error (or `fail`) is a failure. */
++export function property(name, body) {
++  nodeTest(name, () => {
++    msgs = [];
++    stats = new Map();
++    hegel.test((tc) => {
++      try {
++        body(tc);
++      } catch (e) {
++        if (collecting && e instanceof Collected) {
++          return;
++        }
++        throw e;
++      }
++    }, settings());
++    if (collecting) {
++      const shapes = [...stats].map(([k, v]) => `${k}=${v}`).join(" ");
++      console.log(`# COLLECT ${name}: ${msgs.length} mismatches; stats ${shapes}`);
++      for (const m of msgs.slice(0, 25)) {
++        console.log(`#   ${m.split("\n").join("\n#   ")}`);
++      }
++    }
++  });
++}
++
++/** A pin: a plain test for one recorded bug. */
++export function pin(name, body) {
++  nodeTest(name, body);
++}
++
++/** An integer in [lo, hi]. */
++export function n(tc, lo, hi) {
++  return tc.draw(gs.integers({ minValue: lo, maxValue: hi }));
++}
++
++/** One of xs. */
++export function pick(tc, xs) {
++  return xs[n(tc, 0, xs.length - 1)];
++}
++
++/** True pct percent of the time. */
++export function chance(tc, pct) {
++  return n(tc, 0, 99) < pct;
++}
++
++/** A string of `len` characters drawn from `alphabet` (an array of strings). */
++export function word(tc, alphabet, lo, hi) {
++  const len = n(tc, lo, hi);
++  let s = "";
++  for (let i = 0; i < len; i++) {
++    s += pick(tc, alphabet);
++  }
++  return s;
++}
++
++/** Structural equality: arrays by position, objects by key set (prototype ignored), else ===. */
++export function same(a, b) {
++  if (Array.isArray(a) || Array.isArray(b)) {
++    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
++      return false;
++    }
++    return a.every((x, i) => same(x, b[i]));
++  }
++  if (a !== null && b !== null && typeof a === "object" && typeof b === "object") {
++    const ka = Object.keys(a).sort();
++    const kb = Object.keys(b).sort();
++    if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) {
++      return false;
++    }
++    return ka.every((k) => same(a[k], b[k]));
++  }
++  return a === b;
++}
++
++/** A compact, unambiguous rendering for messages. */
++export function show(x) {
++  return JSON.stringify(x, (k, v) => (v === undefined ? "<undefined>" : v));
++}
+diff --git a/test/hegel.test.mjs b/test/hegel.test.mjs
+new file mode 100644
+index 0000000..b161f3d
+--- /dev/null
++++ b/test/hegel.test.mjs
+@@ -0,0 +1,694 @@
++// Hegel zoo: property tests for decimal.js (MikeMcl/decimal.js). See the target's README.md.
++// Run with `node --test test/hegel.test.mjs` (needs python3 for the oracle).
++//
++// The oracle is Python's decimal module (correctly rounded arithmetic, sqrt, exp, ln, log10 at
++// any precision and rounding mode) and fractions (exact rational arithmetic for modulo,
++// toNearest, toFraction, radix conversion and the constructor's syntaxes), held open as one
++// child process over two FIFOs (test/hegel-decimal-oracle.py). Formatting is checked against
++// models of the documented rules written out here.
++
++import assert from "node:assert/strict";
++import { execFileSync, spawn, spawnSync } from "node:child_process";
++import { mkdtempSync, openSync, readSync, rmSync, writeSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join } from "node:path";
++import { fileURLToPath, pathToFileURL } from "node:url";
++import Decimal from "../decimal.mjs";
++import { property, pin, fail, count, n, pick, chance, word, show } from "./hegel-zoo.mjs";
++
++// ---------------------------------------------------------------- the oracle bridge
++
++const here = dirname(fileURLToPath(import.meta.url));
++let oracle = null;
++
++function startOracle() {
++  execFileSync("python3", ["-c", "import decimal, fractions"], { stdio: "ignore" });
++  const dir = mkdtempSync(join(tmpdir(), "hegel-decimal-"));
++  const req = join(dir, "req");
++  const resp = join(dir, "resp");
++  execFileSync("mkfifo", [req, resp]);
++  const child = spawn("python3", ["-u", join(here, "hegel-decimal-oracle.py"), req, resp], {
++    stdio: ["ignore", "inherit", "inherit"],
++  });
++  child.unref();
++  const wfd = openSync(req, "w");
++  const rfd = openSync(resp, "r");
++  process.on("exit", () => {
++    try { child.kill(); } catch {}
++    try { rmSync(dir, { recursive: true, force: true }); } catch {}
++  });
++  const buf = Buffer.alloc(1 << 16);
++  let pending = "";
++  return {
++    call(obj) {
++      writeSync(wfd, JSON.stringify(obj) + "\n");
++      for (;;) {
++        const nl = pending.indexOf("\n");
++        if (nl !== -1) {
++          const answer = pending.slice(0, nl);
++          pending = pending.slice(nl + 1);
++          return JSON.parse(answer);
++        }
++        const got = readSync(rfd, buf, 0, buf.length, null);
++        if (got === 0) throw new Error("the decimal oracle went away");
++        pending += buf.toString("utf8", 0, got);
++      }
++    },
++  };
++}
++
++/** The oracle's answer for fn(args) at prec/rm (+ extra fields); throws on an oracle error. */
++function py(fn, args, prec, rm, extra = {}) {
++  oracle ??= startOracle();
++  const r = oracle.call({ fn, args: args.map(String), prec, rm, ...extra });
++  if (!r.ok) {
++    throw new Error(`oracle ${fn}(${args.join(", ")}) failed: ${r.error}`);
++  }
++  return r;
++}
++
++// ---------------------------------------------------------------- value helpers
++
++// A constructor that never rounds on construction (none does) and prints with the default
++// notation thresholds: the canonical string of a value, for comparisons.
++const Canon = Decimal.clone({ defaults: true });
++const canon = (s) => new Canon(s).valueOf();
++
++/** Sign, significant digits (no trailing zeros; "0" for zero) and exponent of a finite Decimal,
++ *  from its documented d/e/s representation. */
++function decompose(x) {
++  let digits = String(x.d[0]);
++  for (let i = 1; i < x.d.length; i++) {
++    digits += String(x.d[i]).padStart(7, "0");
++  }
++  digits = digits.replace(/0+$/, "") || "0";
++  return { neg: x.s < 0, digits, e: x.e };
++}
++
++/** The documented toString rule: exponential iff e <= toExpNeg or e >= toExpPos. */
++function modelToString(x, toExpNeg, toExpPos, signedZero) {
++  if (x.isNaN()) return "NaN";
++  if (!x.isFinite()) return x.s < 0 ? "-Infinity" : "Infinity";
++  const { neg, digits, e } = decompose(x);
++  if (digits === "0") {
++    // a zero has exponent 0 and follows the same rule ("0e+0" once toExpNeg reaches 0)
++    return (neg && signedZero ? "-" : "") + (0 <= toExpNeg || 0 >= toExpPos ? "0e+0" : "0");
++  }
++  let str;
++  if (e <= toExpNeg || e >= toExpPos) {
++    str = digits[0] + (digits.length > 1 ? `.${digits.slice(1)}` : "") + (e < 0 ? "e" : "e+") + e;
++  } else {
++    str = plain(digits, e);
++  }
++  return (neg ? "-" : "") + str;
++}
++
++function plain(digits, e) {
++  if (e < 0) return `0.${"0".repeat(-e - 1)}${digits}`;
++  if (e >= digits.length) return digits + "0".repeat(e + 1 - digits.length);
++  return e + 1 === digits.length ? digits : `${digits.slice(0, e + 1)}.${digits.slice(e + 1)}`;
++}
++
++/** Exponential notation of a value with exactly `sd` significant digits (zero padded). */
++function modelExponential(x, sd) {
++  const { neg, digits, e } = decompose(x);
++  const ds = digits.padEnd(sd, "0");
++  const mant = ds.length > 1 ? `${ds[0]}.${ds.slice(1)}` : ds;
++  return `${neg && digits !== "0" ? "-" : ""}${mant}${e < 0 ? "e" : "e+"}${digits === "0" ? 0 : e}`;
++}
++
++/** Fixed notation of a value with exactly `sd` significant digits shown. */
++function modelPrecisionFixed(x, sd) {
++  const { neg, digits, e } = decompose(x);
++  let str;
++  if (digits === "0") {
++    str = sd > 1 ? `0.${"0".repeat(sd - 1)}` : "0";
++  } else if (e < 0) {
++    str = `0.${"0".repeat(-e - 1)}${digits.padEnd(sd, "0")}`;
++  } else if (e >= digits.length) {
++    str = digits + "0".repeat(e + 1 - digits.length);
++    if (sd - e - 1 > 0) str += `.${"0".repeat(sd - e - 1)}`;
++  } else {
++    const ds = digits.padEnd(sd, "0");
++    str = e + 1 < ds.length ? `${ds.slice(0, e + 1)}.${ds.slice(e + 1)}` : ds;
++  }
++  return (neg && digits !== "0" ? "-" : "") + str;
++}
++
++/** The exact value of a radix string (0b/0o/0x, optional fraction and binary exponent) as a
++ *  decimal string, computed with BigInt. */
++function radixValue(str) {
++  const m = /^([+-]?)0([box])([0-9a-f]*)(?:\.([0-9a-f]*))?(?:p([+-]?\d+))?$/i.exec(str);
++  if (!m) throw new Error(`unparsable radix string ${str}`);
++  const letter = m[2].toLowerCase();
++  const base = { b: 2, o: 8, x: 16 }[letter];
++  const frac = m[4] || "";
++  const digits = (m[3] || "") + frac;
++  const num = digits === "" ? 0n : BigInt(`0${letter}${digits}`);
++  const bits = BigInt(m[5] || 0) - BigInt(frac.length * Math.log2(base));
++  let s;
++  if (bits >= 0n) {
++    s = (num << bits).toString();
++  } else {
++    const k = Number(-bits);
++    const scaled = (num * 5n ** BigInt(k)).toString().padStart(k + 1, "0");
++    s = `${scaled.slice(0, -k)}.${scaled.slice(-k)}`;
++  }
++  return (m[1] === "-" ? "-" : "") + s;
++}
++
++// ---------------------------------------------------------------- generators
++
++const DIGITS = "0123456789".split("");
++
++/** A finite non-zero decimal string: 1-45 significant digits, an exponent mostly in ±40. */
++function genFinite(tc, { maxDigits = 45, maxExp = 40 } = {}) {
++  const len = chance(tc, 30) ? n(tc, 1, 3) : n(tc, 1, maxDigits);
++  let digits = pick(tc, DIGITS.slice(1)) + word(tc, DIGITS, len - 1, len - 1);
++  if (chance(tc, 20)) digits = digits.replace(/.$/, "5"); // ties are the interesting digit
++  if (chance(tc, 10)) digits = digits.slice(0, -1) + pick(tc, ["0", "9"]);
++  const e = chance(tc, 5) ? n(tc, -1000, 1000) : n(tc, -maxExp, maxExp);
++  const sign = chance(tc, 40) ? "-" : "";
++  // render as d.ddd e±X (the constructor accepts it; the value is what matters)
++  const mant = digits.length > 1 ? `${digits[0]}.${digits.slice(1)}` : digits;
++  return `${sign}${mant}e${e}`;
++}
++
++/** Any Decimal value as a string: finite, zero, NaN or ±Infinity. */
++function genValue(tc, opts) {
++  const r = n(tc, 0, 99);
++  if (r < 5) return pick(tc, ["NaN", "Infinity", "-Infinity"]);
++  if (r < 10) return pick(tc, ["0", "-0"]);
++  if (r < 14) return String(pick(tc, [1, -1, 2, 10, 0.5, 0.1, 100, -2, 3, 7, 1e21, 1e-7]));
++  return genFinite(tc, opts);
++}
++
++/** A precision: small ones often (rounding everywhere), up to 40. */
++function genPrec(tc) {
++  return chance(tc, 40) ? n(tc, 1, 6) : n(tc, 1, 40);
++}
++
++const genRm = (tc) => n(tc, 0, 8);
++
++/** A constructor with random precision/rounding/modulo (and default notation thresholds). */
++function genCtor(tc) {
++  const precision = genPrec(tc);
++  const rounding = genRm(tc);
++  const modulo = n(tc, 0, 9);
++  count(`rm:${rounding}`);
++  return { D: Decimal.clone({ defaults: true, precision, rounding, modulo }), precision, rounding, modulo };
++}
++
++/** Compare a decimal.js result with the oracle's string (both canonicalised through the
++ *  constructor, which keeps -0 apart from 0 in valueOf). */
++function differs(got, want) {
++  const g = got && got.d !== undefined ? canon(got.valueOf()) : String(got);
++  const w = typeof want === "string" ? canon(want) : String(want);
++  return g === w ? null : [g, w];
++}
++
++function check(label, got, want, ctx) {
++  const diff = differs(got, want);
++  if (diff) {
++    fail(`${label}: decimal.js ${diff[0]}, oracle ${diff[1]}: ${ctx()}`);
++  }
++}
++
++// ---------------------------------------------------------------- property 1: arithmetic
++
++property("TestHegelArithmeticMatchesPythonDecimal", (tc) => {
++  const { D, precision, rounding, modulo } = genCtor(tc);
++  const op = pick(tc, ["add", "add", "sub", "mul", "mul", "div", "div", "sqrt", "cmp", "abs", "neg", "sum", "hypot", "mod", "mod", "divToInt"]);
++  count(`op:${op}`);
++  const xs = genValue(tc);
++  const ys = genValue(tc);
++  const ctx = () => `precision=${precision} rounding=${rounding} modulo=${modulo} x=${xs} y=${ys} op=${op}`;
++  const x = new D(xs);
++  const y = new D(ys);
++  const before = [x.valueOf(), y.valueOf()];
++  let got;
++  let want;
++  switch (op) {
++    case "add": got = x.plus(y); want = py("add", [xs, ys], precision, rounding).r; check("x.plus(y)", D.add(xs, ys), got.valueOf(), ctx); break;
++    case "sub": got = x.minus(y); want = py("sub", [xs, ys], precision, rounding).r; check("Decimal.sub", D.sub(xs, ys), got.valueOf(), ctx); break;
++    case "mul": got = x.times(y); want = py("mul", [xs, ys], precision, rounding).r; check("Decimal.mul", D.mul(xs, ys), got.valueOf(), ctx); break;
++    case "div": got = x.div(y); want = py("div", [xs, ys], precision, rounding).r; check("Decimal.div", D.div(xs, ys), got.valueOf(), ctx); break;
++    case "sqrt": got = x.sqrt(); want = py("sqrt", [xs], precision, rounding).r; check("Decimal.sqrt", D.sqrt(xs), got.valueOf(), ctx); break;
++    case "abs": got = x.abs(); want = py("abs", [xs], precision, rounding).r; break;
++    case "neg": got = x.neg(); want = py("neg", [xs], precision, rounding).r; break;
++    case "cmp": {
++      got = x.cmp(y);
++      want = py("cmp", [xs, ys], precision, rounding).r;
++      check("cmp", String(got), want === "NaN" ? "NaN" : String(Number(want)), ctx);
++      // the derived comparisons agree with cmp
++      const nan = Number.isNaN(got);
++      if (x.eq(y) !== (got === 0) || x.gt(y) !== (got === 1) || x.gte(y) !== (!nan && got >= 0) ||
++          x.lt(y) !== (got === -1) || x.lte(y) !== (!nan && got <= 0)) {
++        fail(`eq/gt/gte/lt/lte disagree with cmp ${got}: ${ctx()}`);
++      }
++      return;
++    }
++    case "sum": {
++      const more = [];
++      const k = n(tc, 0, 3);
++      for (let i = 0; i < k; i++) more.push(genValue(tc));
++      if (chance(tc, 40)) more.push(new Canon(xs).neg().valueOf()); // cancellation exposes the intermediates
++      got = D.sum(xs, ys, ...more);
++      want = py("sum", [xs, ys, ...more], precision, rounding).r;
++      if (differs(got, want)) {
++        // decimaljs/3: an intermediate addition misplaces an addend lying further below the
++        // running total than the precision; the same sum at a large precision, rounded
++        // afterwards, is right
++        const Wide = D.clone({ precision: 5000 });
++        if (!differs(Wide.sum(xs, ys, ...more).toSD(precision, rounding), want)) {
++          count("known:decimaljs/3");
++          return;
++        }
++      }
++      check("Decimal.sum", got, want, () => `${ctx()} more=${show(more)}`);
++      return;
++    }
++    case "hypot": {
++      const more = chance(tc, 30) ? [genValue(tc)] : [];
++      got = D.hypot(xs, ys, ...more);
++      const r = py("hypot", [xs, ys, ...more], precision, rounding);
++      if (r.undecidable) { count("undecidable"); return; }
++      check("Decimal.hypot", got, r.r, () => `${ctx()} more=${show(more)}`);
++      return;
++    }
++    case "mod": got = x.mod(y); want = py("mod", [xs, ys], precision, rounding, { modulo }).r; check("Decimal.mod", D.mod(xs, ys), got.valueOf(), ctx); break;
++    case "divToInt": got = x.divToInt(y); want = py("divToInt", [xs, ys], precision, rounding).r; break;
++    default: throw new Error(op);
++  }
++  if (op === "mod" && got.isZero() && differs(got, want) && new Canon(want).isZero()) {
++    // decimaljs/5: an exact zero remainder takes the sign of the subtraction rule (+0 unless
++    // ROUND_FLOOR), not the sign of the dividend the docs and JavaScript's % promise
++    count("known:decimaljs/5");
++    return;
++  }
++  check(op, got, want, ctx);
++  if (x.valueOf() !== before[0] || y.valueOf() !== before[1]) {
++    fail(`operands mutated: ${ctx()}`);
++  }
++  // the result is a Decimal of this constructor with at most `precision` digits (except for
++  // the exact methods) and a consistent representation
++  if (got instanceof D === false) {
++    fail(`${op} result is not an instance of the constructor: ${ctx()}`);
++  }
++  if (got.isFinite() && !["abs", "neg"].includes(op) && got.sd() > precision) {
++    fail(`${op} result has ${got.sd()} significant digits: ${ctx()} got=${got.valueOf()}`);
++  }
++});
++
++// ---------------------------------------------------------------- property 2: transcendentals
++
++property("TestHegelTranscendentalsAreCorrectlyRounded", (tc) => {
++  const { D, precision, rounding } = genCtor(tc);
++  const fn = pick(tc, ["exp", "ln", "log10", "log2", "log", "pow", "pow", "cbrt", "sqrt"]);
++  count(`fn:${fn}`);
++  let xs;
++  let ys;
++  switch (fn) {
++    case "exp": xs = chance(tc, 10) ? genValue(tc) : genFinite(tc, { maxDigits: 30, maxExp: 2 }); break;
++    case "pow":
++      xs = chance(tc, 10) ? genValue(tc) : genFinite(tc, { maxDigits: 20, maxExp: 6 });
++      ys = chance(tc, 60) ? String(n(tc, -40, 40)) : chance(tc, 10) ? genValue(tc) : genFinite(tc, { maxDigits: 8, maxExp: 1 });
++      if (!ys.match(/^-?\d+$/) && xs.startsWith("-")) xs = xs.slice(1); // a negative base needs an integer exponent
++      break;
++    case "log": xs = chance(tc, 10) ? genValue(tc) : genFinite(tc); ys = chance(tc, 30) ? pick(tc, ["2", "10", "e", "0.5", "1", "0", "-2", "NaN"]).replace("e", "2.718281828459045") : genFinite(tc, { maxDigits: 10, maxExp: 3 }); break;
++    default: xs = chance(tc, 10) ? genValue(tc) : genFinite(tc); break;
++  }
++  const ctx = () => `precision=${precision} rounding=${rounding} fn=${fn} x=${xs}${ys !== undefined ? ` y=${ys}` : ""}`;
++  const x = new D(xs);
++  let got;
++  let r;
++  switch (fn) {
++    case "exp": got = x.exp(); r = py("exp", [xs], precision, rounding); break;
++    case "ln": got = x.ln(); r = py("ln", [xs], precision, rounding); break;
++    case "log10": got = x.log(); r = py("log10", [xs], precision, rounding); check("Decimal.log10", D.log10(xs), got.valueOf(), ctx); break;
++    case "log2": got = D.log2(xs); r = py("log2", [xs], precision, rounding); break;
++    case "log": got = x.log(ys); r = py("log", [xs, ys], precision, rounding); break;
++    case "pow": got = x.pow(ys); r = py("pow", [xs, ys], precision, rounding); check("Decimal.pow", D.pow(xs, ys), got.valueOf(), ctx); break;
++    case "cbrt": got = x.cbrt(); r = py("cbrt", [xs], precision, rounding); break;
++    case "sqrt": got = x.sqrt(); r = py("sqrt", [xs], precision, rounding); break;
++    default: throw new Error(fn);
++  }
++  if (r.undecidable) {
++    count("undecidable");
++    return;
++  }
++  // the oracle's specials follow Python (ln(-1) = NaN, log of 0 = -Infinity, 0 ** -1 = Infinity)
++  check(fn, got, r.r, ctx);
++});
++
++// ---------------------------------------------------------------- property 3: rounding & formatting
++
++property("TestHegelRoundingAndFormattingMatchTheModels", (tc) => {
++  const { D, precision, rounding } = genCtor(tc);
++  const toExpNeg = chance(tc, 50) ? -7 : n(tc, -12, 0);
++  const toExpPos = chance(tc, 50) ? 21 : n(tc, 0, 25);
++  D.set({ toExpNeg, toExpPos });
++  const xs = genValue(tc, { maxExp: 30 });
++  const x = new D(xs);
++  const rm = chance(tc, 30) ? undefined : genRm(tc);
++  const effRm = rm ?? rounding;
++  const dp = chance(tc, 50) ? n(tc, 0, 5) : n(tc, 0, 40);
++  const sd = chance(tc, 50) ? n(tc, 1, 5) : n(tc, 1, 40);
++  const ctx = () => `precision=${precision} rounding=${rounding} toExpNeg=${toExpNeg} toExpPos=${toExpPos} x=${xs} rm=${rm} dp=${dp} sd=${sd}`;
++
++  // toString / valueOf / toJSON / toFixed() follow the notation rule
++  const str = x.toString();
++  if (str !== modelToString(x, toExpNeg, toExpPos, false)) {
++    fail(`toString ${str} != model ${modelToString(x, toExpNeg, toExpPos, false)}: ${ctx()}`);
++  }
++  if (x.valueOf() !== modelToString(x, toExpNeg, toExpPos, true) || x.toJSON() !== x.valueOf()) {
++    fail(`valueOf ${x.valueOf()} / toJSON ${x.toJSON()} != model: ${ctx()}`);
++  }
++  if (x.isFinite()) {
++    const { neg, digits, e } = decompose(x);
++    const fixed = x.toFixed();
++    const wantFixed = (neg && digits !== "0" ? "-" : "") + (digits === "0" ? "0" : plain(digits, e));
++    if (fixed !== wantFixed) {
++      fail(`toFixed() ${fixed} != ${wantFixed}: ${ctx()}`);
++    }
++    // the string parses back to the same value, whatever the notation
++    if (new D(str).valueOf() !== x.valueOf() && !(x.isZero())) {
++      fail(`toString does not round-trip: ${str}: ${ctx()}`);
++    }
++    // dp / sd / isInt / sign from the digits
++    const wantDp = Math.max(0, digits.length - 1 - e);
++    const wantSd = digits.length;
++    const wantSdZeros = e + 1 > digits.length ? e + 1 : digits.length;
++    if (x.dp() !== wantDp || x.sd() !== wantSd || x.sd(true) !== wantSdZeros || x.isInt() !== (wantDp === 0)) {
++      fail(`dp ${x.dp()} sd ${x.sd()} sd(true) ${x.sd(true)} isInt ${x.isInt()} vs ${wantDp} ${wantSd} ${wantSdZeros}: ${ctx()}`);
++    }
++    if (Object.is(D.sign(x), digits === "0" ? (neg ? -0 : 0) : neg ? -1 : 1) === false) {
++      fail(`sign ${D.sign(x)}: ${ctx()}`);
++    }
++  }
++  // toNumber agrees with JavaScript's own parse of the string
++  const num = x.toNumber();
++  if (!Object.is(num, Number(x.valueOf()))) {
++    fail(`toNumber ${num} != Number(${x.valueOf()}): ${ctx()}`);
++  }
++
++  // toDP / toFixed(dp) / toSD / toPrecision / toExponential against the oracle + the format models
++  const dpr = py("toDP", [xs], precision, effRm, { dp });
++  check(`toDP(${dp}, ${rm})`, x.toDP(dp, rm), dpr.r, ctx);
++  const fixedDp = x.toFixed(dp, rm);
++  if (x.isFinite()) {
++    // like Number#toFixed, the minus sign is kept iff the original value is negative and not zero
++    const wantFixedDp = x.isZero() ? dpr.fixed.replace(/^-/, "") : dpr.fixed;
++    if (fixedDp !== wantFixedDp) {
++      fail(`toFixed(${dp}, ${rm}) ${fixedDp} != ${wantFixedDp}: ${ctx()}`);
++    }
++  } else if (fixedDp !== x.toString()) {
++    fail(`toFixed of a special ${fixedDp}: ${ctx()}`);
++  }
++  const sdr = py("toSD", [xs], precision, effRm, { sd });
++  check(`toSD(${sd}, ${rm})`, x.toSD(sd, rm), sdr.r, ctx);
++  const rounded = new D(sdr.r);
++  const prec = x.toPrecision(sd, rm);
++  if (x.isFinite()) {
++    // (a zero has exponent 0, so "0e+0" once toExpNeg reaches 0, as in toString)
++    const exp = sd <= rounded.e || rounded.e <= toExpNeg;
++    const want = exp ? modelExponential(rounded, sd) : modelPrecisionFixed(rounded, sd);
++    if (prec !== want) {
++      fail(`toPrecision(${sd}, ${rm}) ${prec} != ${want}: ${ctx()} rounded=${rounded.valueOf()}`);
++    }
++    const dpr1 = new D(py("toSD", [xs], precision, effRm, { sd: dp + 1 }).r);
++    const expo = x.toExponential(dp, rm);
++    if (expo !== modelExponential(dpr1, dp + 1)) {
++      fail(`toExponential(${dp}, ${rm}) ${expo} != ${modelExponential(dpr1, dp + 1)}: ${ctx()}`);
++    }
++    if (new D(expo).valueOf() !== dpr1.valueOf() && !dpr1.isZero()) {
++      fail(`toExponential does not parse back: ${expo} vs ${dpr1.valueOf()}: ${ctx()}`);
++    }
++  } else if (prec !== x.toString() || x.toExponential(dp, rm) !== x.toString()) {
++    fail(`toPrecision/toExponential of a special: ${prec}: ${ctx()}`);
++  }
++  // whole-number rounding
++  check("round", x.round(), py("integral", [xs], precision, rounding).r, ctx);
++  check("floor", x.floor(), py("integral", [xs], precision, 3).r, ctx);
++  check("ceil", x.ceil(), py("integral", [xs], precision, 2).r, ctx);
++  check("trunc", x.trunc(), py("integral", [xs], precision, 1).r, ctx);
++  // toNearest
++  const ns = chance(tc, 30) ? pick(tc, ["0.25", "0.5", "1", "2", "10", "0.001", "-0.5", "0", "3", "NaN", "Infinity"]) : genFinite(tc, { maxDigits: 6, maxExp: 6 });
++  const near = py("toNearest", [xs, ns], precision, effRm).r;
++  const nearest = x.toNearest(ns, rm);
++  if (differs(nearest, near) && new Canon(ns).isNeg() && [2, 3, 7, 8].includes(effRm)) {
++    // decimaljs/1: a negative n flips the direction of the directed rounding modes
++    count("known:decimaljs/1");
++  } else {
++    check(`toNearest(${ns}, ${rm})`, nearest, near, ctx);
++  }
++});
++
++// ---------------------------------------------------------------- property 4: parsing, radix, fractions
++
++const HEX = "0123456789abcdefABCDEF".split("");
++
++property("TestHegelConstructorRadixAndFractionsAreExact", (tc) => {
++  const { D, precision, rounding } = genCtor(tc);
++  const kind = pick(tc, ["decimal", "decimal", "radix", "radix", "radixstr", "radixstr", "number", "bigint", "fraction", "fraction"]);
++  count(`kind:${kind}`);
++  if (kind === "fraction") {
++    const xs = genFinite(tc, { maxDigits: 25, maxExp: 12 });
++    const x = new D(xs);
++    const ctx = () => `precision=${precision} x=${xs}`;
++    if (rounding === 3) {
++      // decimaljs/2: toFraction never returns under ROUND_FLOOR (a zero remainder is -0)
++      count("known:decimaljs/2");
++      return;
++    }
++    const exact = x.toFraction();
++    const want = py("fraction", [xs], precision, rounding).r;
++    if (exact.length !== 2 || exact[0].valueOf() !== canon(want[0]) || exact[1].valueOf() !== canon(want[1])) {
++      fail(`toFraction() ${exact.map(String)} != ${want}: ${ctx()}`);
++    }
++    const maxD = chance(tc, 50) ? String(n(tc, 1, 1000)) : genFinite(tc, { maxDigits: 12, maxExp: 0 }).replace(/^-/, "").replace(/\..*e.*$|e.*$/, "") || "1";
++    const md = new Decimal(maxD).trunc().abs();
++    if (md.lt(1)) return;
++    const lim = x.toFraction(md);
++    const [num, den] = lim.map((v) => v.valueOf());
++    if (!lim[1].isInt() || lim[1].lt(1) || lim[1].gt(md) || !lim[0].isInt()) {
++      fail(`toFraction(${md}) gives ${num}/${den}: ${ctx()}`);
++    }
++    // as close as the best approximation (Python's limit_denominator)
++    const best = py("fraction", [xs, md.valueOf()], precision, rounding).r;
++    const mine = py("closeness", [xs, lim[0].toFixed(), lim[1].toFixed()], precision, rounding).r;
++    const theirs = py("closeness", [xs, best[0], best[1]], precision, rounding).r;
++    // compare the two exact distances m0/m1 vs t0/t1: m0*t1 <= t0*m1
++    if (BigInt(mine[0]) * BigInt(theirs[1]) > BigInt(theirs[0]) * BigInt(mine[1])) {
++      fail(`toFraction(${md}) ${num}/${den} is farther from x than ${best.join("/")}: ${ctx()}`);
++    }
++    return;
++  }
++  if (kind === "radix") {
++    const xs = genValue(tc, { maxDigits: 20, maxExp: 12 });
++    const x = new D(xs);
++    const base = pick(tc, [2, 8, 16]);
++    const method = { 2: "toBinary", 8: "toOctal", 16: "toHex" }[base];
++    const prefix = { 2: "0b", 8: "0o", 16: "0x" }[base];
++    const withSd = chance(tc, 60);
++    const sd = withSd ? n(tc, 1, 40) : undefined;
++    const rm = withSd && chance(tc, 60) ? genRm(tc) : undefined;
++    const ctx = () => `precision=${precision} rounding=${rounding} x=${xs} ${method}(${sd}, ${rm})`;
++    const str = withSd ? x[method](sd, rm) : x[method]();
++    if (!x.isFinite()) {
++      if (str !== x.toString()) fail(`${method} of a special: ${str}: ${ctx()}`);
++      return;
++    }
++    const body = str.replace(/^-/, "");
++    if (!body.toLowerCase().startsWith(prefix) || withSd !== /p[+-]\d+$/.test(body)) {
++      fail(`${method} format ${str}: ${ctx()}`);
++    }
++    // with sd the notation is binary-normalised (0x1.26p-31): sd digits there are 1 + (sd - 1)
++    // digits' worth of bits; without, the plain notation is rounded to `precision` digits of the
++    // base itself
++    const want = withSd
++      ? py("toBase", [xs], precision, rm ?? rounding, { base: 2, sd: (sd - 1) * Math.log2(base) + 1 }).r
++      : py("toBase", [xs], precision, rounding, { base, sd: precision }).r;
++    // the string's exact value (read here with BigInt: the constructor's own reading of a
++    // binary exponent is inexact, decimaljs/6) is the correctly rounded one
++    const back = new Canon(radixValue(str));
++    if (back.valueOf() !== canon(want) && !(back.isZero() && new Canon(want).isZero())) {
++      fail(`${method} ${str} = ${back.valueOf()}, expected ${canon(want)}: ${ctx()}`);
++    }
++    return;
++  }
++  // constructor syntaxes: the value is exact
++  let s;
++  let ctorArg;
++  if (kind === "number") {
++    const v = pick(tc, [0.1, -0.1, 1e21, 1e-7, 123456789012345680000, 5e-324, 1.7976931348623157e308, -0, 0, 42, 1 / 3, 2 ** 53, -(2 ** 53) - 2, 0.30000000000000004]);
++    ctorArg = v;
++    s = Object.is(v, -0) ? "-0" : String(v);
++  } else if (kind === "bigint") {
++    const digits = pick(tc, DIGITS.slice(1)) + word(tc, DIGITS, 0, 40);
++    const neg = chance(tc, 40);
++    ctorArg = BigInt((neg ? "-" : "") + digits);
++    s = (neg ? "-" : "") + digits;
++  } else if (kind === "radixstr") {
++    // binary, octal or hexadecimal text with an optional fraction and binary exponent
++    const base = pick(tc, [2, 8, 16]);
++    const alphabet = "0123456789abcdef".slice(0, base).split("");
++    const ip = word(tc, alphabet, 0, 12);
++    const fp = chance(tc, 40) ? "" : word(tc, alphabet, 0, 12);
++    let text = ip + (fp !== "" ? `.${fp}` : "");
++    if (text === "") text = "0";
++    if (chance(tc, 50)) text += `p${pick(tc, ["", "+", "-"])}${n(tc, 0, 60)}`;
++    text = `${pick(tc, ["", "-", "+"])}0${{ 2: "b", 8: "o", 16: "x" }[base]}${text}`;
++    if (chance(tc, 20)) text = text.toUpperCase();
++    s = text;
++    ctorArg = text;
++  } else {
++    // decimal text with underscores, an optional sign, a bare point, upper-case E
++    const ip = chance(tc, 15) ? "" : word(tc, DIGITS, 1, 12);
++    const fp = chance(tc, 30) ? "" : word(tc, DIGITS, 0, 12);
++    let text = ip;
++    if (fp !== "" || (ip !== "" && chance(tc, 20))) text += `.${fp}`;
++    if (text === "" || text === ".") text = "0";
++    if (chance(tc, 40) && ip.length > 1) text = ip.slice(0, 1) + "_" + ip.slice(1) + text.slice(ip.length);
++    if (chance(tc, 40)) text += pick(tc, ["e", "E"]) + pick(tc, ["", "+", "-"]) + n(tc, 0, 40);
++    text = pick(tc, ["", "", "-", "+"]) + text;
++    s = text;
++    ctorArg = text;
++  }
++  const ctx = () => `kind=${kind} input=${show(String(ctorArg))} precision=${precision}`;
++  let x;
++  try {
++    x = new D(ctorArg);
++  } catch (e) {
++    fail(`constructor threw ${e.message}: ${ctx()}`);
++  }
++  const want = py("parse", [], precision, rounding, { s }).r;
++  if (x.valueOf() !== canon(want)) {
++    if (kind === "radixstr" && /p[+-]?\d+$/i.test(s)) {
++      // decimaljs/6: the binary exponent is applied through a 20-digit power of two
++      count("known:decimaljs/6");
++      return;
++    }
++    fail(`new Decimal(${show(s)}) = ${x.valueOf()}, expected ${canon(want)}: ${ctx()}`);
++  }
++  // copies and the static form agree; Decimal.isDecimal knows its own
++  if (new D(x).valueOf() !== x.valueOf() || !D.isDecimal(x) || !Decimal.isDecimal(x) || D.isDecimal(s)) {
++    fail(`copy/isDecimal: ${ctx()}`);
++  }
++  // the constructor does not round, whatever the precision
++  if (x.isFinite() && kind !== "number" && x.sd() > precision && x.sd() !== new Canon(want).sd()) {
++    fail(`constructor rounded to ${x.sd()} digits: ${ctx()}`);
++  }
++});
++
++// ---------------------------------------------------------------- property 5: limits, random, min/max/clamp
++
++property("TestHegelExponentLimitsRandomAndMinMaxClamp", (tc) => {
++  const maxE = n(tc, 0, 60);
++  const minE = -n(tc, 0, 60);
++  const precision = genPrec(tc);
++  const rounding = genRm(tc);
++  const D = Decimal.clone({ defaults: true, precision, rounding, maxE, minE });
++  const xs = genValue(tc, { maxExp: 80 });
++  const ys = genValue(tc, { maxExp: 80 });
++  const ctx = () => `precision=${precision} rounding=${rounding} maxE=${maxE} minE=${minE} x=${xs} y=${ys}`;
++  // construction clamps to the exponent range: above maxE → ±Infinity, below minE → ±0
++  const c = new Canon(xs);
++  const x = new D(xs);
++  if (c.isFinite() && !c.isZero()) {
++    const want = c.e > maxE ? (c.s < 0 ? "-Infinity" : "Infinity") : c.e < minE ? (c.s < 0 ? "-0" : "0") : c.valueOf();
++    if (x.valueOf() !== want) {
++      fail(`new Decimal(${xs}) with limits = ${x.valueOf()}, expected ${want}: ${ctx()}`);
++    }
++  }
++  // an arithmetic result clamps the same way (the oracle's result without limits, then the rule)
++  const y = new D(ys);
++  const prod = x.times(y);
++  const unlimited = new Canon(py("mul", [x.valueOf(), y.valueOf()], precision, rounding).r);
++  if (unlimited.isFinite() && !unlimited.isZero()) {
++    const want = unlimited.e > maxE ? (unlimited.s < 0 ? "-Infinity" : "Infinity") : unlimited.e < minE ? (unlimited.s < 0 ? "-0" : "0") : unlimited.valueOf();
++    if (prod.valueOf() !== want) {
++      fail(`times with limits = ${prod.valueOf()}, expected ${want}: ${ctx()}`);
++    }
++  } else if (prod.valueOf() !== unlimited.valueOf()) {
++    fail(`times with limits = ${prod.valueOf()}, expected ${unlimited.valueOf()}: ${ctx()}`);
++  }
++  // max / min / clamp are cmp-consistent
++  const zs = genValue(tc);
++  const all = [xs, ys, zs];
++  const max = D.max(...all);
++  const min = D.min(...all);
++  const anyNaN = all.some((v) => v === "NaN");
++  if (anyNaN) {
++    if (!max.isNaN() || !min.isNaN()) fail(`max/min with NaN: ${max} ${min}: ${ctx()}`);
++  } else {
++    for (const v of all) {
++      if (max.lt(v) || min.gt(v)) fail(`max ${max} / min ${min} vs ${v}: ${ctx()}`);
++    }
++    if (!all.some((v) => max.eq(v)) || !all.some((v) => min.eq(v))) fail(`max/min not among the arguments: ${ctx()}`);
++    const lo = D.min(ys, zs);
++    const hi = D.max(ys, zs);
++    const clamped = x.clamp(lo, hi);
++    const want = x.isNaN() ? "NaN" : x.lt(lo) ? lo.valueOf() : x.gt(hi) ? hi.valueOf() : x.valueOf();
++    if (clamped.valueOf() !== want) fail(`clamp(${lo}, ${hi}) = ${clamped.valueOf()}, expected ${want}: ${ctx()}`);
++  }
++  // random(dp): in [0, 1) with at most dp decimal places
++  const dp = n(tc, 0, 30);
++  const R = Decimal.clone({ defaults: true, precision, crypto: chance(tc, 50) });
++  const noArg = chance(tc, 30);
++  if (!noArg && dp === 0) {
++    // decimaljs/4: random(0) throws although the docs allow dp = 0
++    count("known:decimaljs/4");
++    return;
++  }
++  const r = noArg ? R.random() : R.random(dp);
++  const limit = noArg ? precision : dp;
++  if (r.lt(0) || r.gte(1) || r.dp() > limit || r.isNeg()) {
++    fail(`random(${dp}) = ${r.valueOf()} (dp ${r.dp()}, precision ${precision}): ${ctx()}`);
++  }
++});
++
++// ---------------------------------------------------------------- pins (bugs.toml)
++
++// decimaljs/1: toNearest rounds the quotient x / n with rm, so a negative n turns ROUND_FLOOR
++// into a rounding up (the docs: the nearest multiple of n "in the direction of rounding mode rm").
++pin("PinDecimaljs1ToNearestNegativeNRoundsTheWrongWay", () => {
++  const got = new Decimal(9.499).toNearest(-0.5, Decimal.ROUND_FLOOR).valueOf();
++  assert.equal(got, "9", `toNearest(-0.5, ROUND_FLOOR) of 9.499 gave ${got}`);
++});
++
++// decimaljs/2: toFraction never returns under ROUND_FLOOR (the exact remainder becomes -0 and
++// the next quotient NaN); run in a child process that is killed after five seconds.
++pin("PinDecimaljs2ToFractionNeverReturnsUnderRoundFloor", () => {
++  const lib = pathToFileURL(join(here, "..", "decimal.mjs")).href;
++  const script = `import D from ${JSON.stringify(lib)}; D.set({ rounding: D.ROUND_FLOOR }); console.log(new D(1.75).toFraction().join("/"));`;
++  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 5000 });
++  assert.equal(r.signal, null, "new Decimal(1.75).toFraction() under ROUND_FLOOR did not return within 5 s");
++  assert.equal(r.stdout.trim(), "7/4");
++});
++
++// decimaljs/3: Decimal.sum misplaces an addend lying more than about precision + 7 digits below
++// the running total, so a later cancellation exposes it (1e40 + 1 - 1e40 = 1e7).
++pin("PinDecimaljs3SumMisplacesAFarSmallerAddend", () => {
++  assert.equal(Decimal.sum("1e40", 1, "-1e40").valueOf(), "1");
++});
++
++// decimaljs/4: random(0) throws although the docs allow 0 decimal places.
++pin("PinDecimaljs4RandomZeroThrows", () => {
++  const r = Decimal.random(0);
++  assert.ok(r.gte(0) && r.lt(1) && r.dp() === 0, `random(0) = ${r}`);
++});
++
++// decimaljs/5: an exact zero remainder is +0 for a negative dividend (the docs: the result has
++// the sign of this and matches JavaScript's %, which gives -0).
++pin("PinDecimaljs5ZeroRemainderLosesTheDividendSign", () => {
++  assert.equal(new Decimal(-6).mod(3).valueOf(), "-0");
++});
++
++// decimaljs/6: a binary exponent in a radix string is applied through a power of two of limited
++// precision (a JavaScript number below 2^54, Decimal.pow at 20 digits above), so the value is
++// inexact whatever the constructor's precision.
++pin("PinDecimaljs6RadixStringBinaryExponentIsInexact", () => {
++  assert.equal(new Decimal("0o1p+104").toFixed(), "20282409603651670423947251286016");
++  assert.equal(new Decimal("0b1p-27").toFixed(), "0.000000007450580596923828125");
++});
