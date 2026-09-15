@@ -60,7 +60,10 @@ a digit before the point (`+.5`, `._5` stay strings there, floats in js-yaml and
 PyYAML writes U+2028/U+2029 (YAML 1.1 line breaks) raw inside quotes and then cannot read
 them back itself; a forced style makes PyYAML write typed scalars as `! "1"`, whose `!` tag
 means "resolve as plain" in 1.1 and `!!str` in 1.2, which js-yaml follows in every schema;
-`noRefs` with a cyclic value recurses until the stack ends (the option asks for exactly that).
+`noRefs` with a cyclic value recurses until the stack ends (the option asks for exactly that);
+an empty `!!binary` as the last entry of a flow collection is written `[!!binary]`, which the
+grammar allows (a tag ends at a flow indicator; eemeli/yaml reads it) but libyaml rejects
+("while scanning a tag") — PyYAML writes `!!binary ""`, which everyone reads.
 
 One divergence deserves a note: for a **top-level** block scalar with an indentation
 indicator, js-yaml counts the indicator from the document's indentation of -1, as the spec's
@@ -73,13 +76,17 @@ skipped (`limit/top-level-indentation-indicator`), not counted against js-yaml.
 
 ## Bugs
 
-Three, js-yaml/1–3 in `bugs.toml`: a flow-mapping key over 1024 characters is written as an
+Four, js-yaml/1–4 in `bugs.toml`: a flow-mapping key over 1024 characters is written as an
 implicit key that libyaml rejects, while the block presenter switches to `? ` (/1); strings
 shaped like YAML 1.1 timestamps with impossible fields ("2001-02-30", "23:59:60", "+25") are
 written plain and 1.1 readers fail or, worse, read another date (/2); a Date outside years
-0000–9999 becomes `!!timestamp '+010000-…'`, which `load` itself rejects (/3). /1 and /2 came
-out of the PyYAML direction of the differential, /3 out of the plain round trip.
+0000–9999 becomes `!!timestamp '+010000-…'`, which `load` itself rejects (/3); a top-level key
+beginning with `--- ` or `... ` is written plain at column 0, where it is a document marker, so
+`load` fails on its own output or silently drops the marker (/4 — values get quoted, keys do
+not). /1, /2 and /4 came out of the PyYAML direction of the differential, /3 out of the plain
+round trip.
 
 ## History
 
-- 2026-09-15: created at 494400bd (5.4.2); 3 bugs.
+- 2026-09-15: created at 494400bd (5.4.2); 3 bugs. Later the same day: js-yaml/4 (document-marker
+  keys), found by the second run of the committed suite.
