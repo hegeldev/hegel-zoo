@@ -77,3 +77,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - 2026-09-15: base bumped 941b557a69d7 → ffc98b158bad (2026-09-14, "Forbid install-action via zizmor (#21682)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped ffc98b158bad → 643950ce49e4 (2026-09-14, "Update Rust crate async-trait to v0.1.92 (#21657)"; 0.0.80); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped 643950ce49e4 → b8aff80900e7 (2026-09-15, "Update dependency astral-sh/uv to v0.12.13 (#21655)"; 0.0.81); 2 bug(s) still reproduce. 53 tests pass.
+- 2026-09-15: base bumped b8aff80900e7 → 000a665b745a (2026-09-15, "Batch HTTP cache writes in blocking tasks (#21675)"; 0.0.81); 2 bug(s) still reproduce. 53 tests pass.

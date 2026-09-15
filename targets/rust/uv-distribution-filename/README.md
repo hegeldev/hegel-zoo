@@ -98,3 +98,4 @@ trailing `.` in a tag component (bug 2), known tags spelled canonically (bug 3),
 - 2026-09-15: base bumped 941b557a69d7 → ffc98b158bad (2026-09-14, "Forbid install-action via zizmor (#21682)"; 0.0.80); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-15: base bumped ffc98b158bad → 6f7795bb4f6e (2026-09-14, "Update Rust crate axoupdater to v0.10.2 (#21658)"; 0.0.80); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-15: base bumped 6f7795bb4f6e → b8aff80900e7 (2026-09-15, "Update dependency astral-sh/uv to v0.12.13 (#21655)"; 0.0.81); 6 bug(s) still reproduce. 55 tests pass.
+- 2026-09-15: base bumped b8aff80900e7 → 000a665b745a (2026-09-15, "Batch HTTP cache writes in blocking tasks (#21675)"; 0.0.81); 6 bug(s) still reproduce. 55 tests pass.
