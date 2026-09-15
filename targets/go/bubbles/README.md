@@ -1,11 +1,13 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Two slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Three slices so far: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
-and `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
-for the wrap grid and the viewport offset), with the shared harness in `internal/zootest`.
-Run with `go test -run TestHegel ./textinput ./textarea`.
+`textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
+for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
+(`viewport/hegel_test.go`, package `viewport`, internal for the highlight index and the
+soft-wrapped rows), with the shared harness in `internal/zootest`.
+Run with `go test -run TestHegel ./textinput ./textarea ./viewport`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -44,6 +46,28 @@ records bugs.
   blank gutter, the row's runes, padding, end-of-buffer rows), the cursor's row must be in the
   viewport and its cell the only reversed one at `gutter + CharOffset`; `Cursor()` and
   `PositionAt` must agree with that cell; `LineInfo` must describe the grid row.
+- **viewport: a scroll model over rows of cells.** A viewport of random size (sometimes with a
+  `NormalBorder` frame, a two-cell gutter, `SoftWrap`, `FillHeight`; the content area is always
+  at least one cell) gets up to eight random lines (wide runes, sometimes tabs or CRLF) and is
+  driven for up to twelve steps with every default binding (j/k/arrows, f/b/space/pgdown/pgup,
+  d/u, h/l/arrows), the mouse wheel (three directions), `SetYOffset`/`SetXOffset`, `GotoTop`/
+  `GotoBottom`, `ScrollDown`/`ScrollUp`, `SetContent`, `SetHeight` and `EnsureVisible`. The
+  model keeps the lines as rows of cells (soft-wrapped greedily at the content width) and the
+  two offsets (down moves stop at the bottom, up moves snap a past-bottom offset back, a page
+  is the content height, a horizontal step is six columns). After each step `YOffset`,
+  `XOffset`, `TotalLineCount`, `AtTop`/`AtBottom`, `ScrollPercent` and the view must follow:
+  the view is parsed into cells row by row and must be exactly `height` rows of `width` cells,
+  each the gutter plus the row's cells in `[x, x+width)` (a wide cell across the right edge is
+  dropped, one across the left edge is kept whole, as `ansi.Cut` does), blank or `~ ` rows
+  below the content.
+- **viewport: highlights.** Random byte ranges of the content (sorted, disjoint, on rune
+  boundaries — a range may start at or run over a newline) are set with `SetHighlights` under
+  a `Reverse` style; `HighlightNext`/`HighlightPrevious` and scrolling are driven and the
+  selected index and the offsets must follow (the nearest match is the first one starting at
+  or below the top row; `EnsureVisible` scrolls only when the match is outside, horizontally
+  to `colstart − 6` when its end is past the width). The reversed cells of every visible row
+  must be exactly the matched cells clipped to the window; a newline counts as one cell after
+  its line's last.
 
 ## Properties
 
@@ -58,6 +82,8 @@ records bugs.
 | `TestHegelViewShowsTheWrappedRows` | the view vs the wrap grid: gutter, rows, padding, EOB rows, the reversed cursor cell |
 | `TestHegelRealCursorAndPositionAtAgree` | `Cursor()` and `PositionAt` vs the virtual cursor's cell |
 | `TestHegelLineInfoDescribesTheWrappedRow` | `LineInfo` vs the wrap grid (row, start, width, offsets) |
+| `TestHegelViewShowsTheScrolledRows` | every scroll binding, wheel, setter, `SetContent`/`SetHeight`/`EnsureVisible` vs the row model: offsets, counts, `AtTop`/`AtBottom`, `ScrollPercent`, the view row by row |
+| `TestHegelHighlightsMarkTheMatches` | `SetHighlights`, next/previous, scrolling: the selected index, the offsets, the reversed cells of every visible row |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -92,6 +118,19 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/24 | low | textarea: ctrl+w on the first word of a line deletes the leading space too |
 | bubbles/25 | low | textarea: Enter ignores CharLimit; Length then exceeds the limit |
 | bubbles/26 | high | textarea: an empty keyboard selection keeps a stale anchor: the next shift+arrow selects from where the cursor was, and if the anchor's line is gone the next edit panics |
+| bubbles/27 | medium | viewport: SetContent keeps a carriage return on every line of CRLF content |
+| bubbles/28 | medium | viewport: tabs count 0 cells for the viewport and 4 for the renderer: rows overflow, are wrapped, and the view is taller than its height |
+| bubbles/29 | medium | viewport: the horizontal scroll limit is longest − Width rather than longest − content width, so with a gutter or a frame the last columns can never be shown |
+| bubbles/30 | medium | viewport: PageDown, PageUp and the half-page moves scroll by Height including the frame, skipping lines in a bordered viewport |
+| bubbles/31 | low | viewport: ScrollPercent ignores the frame: it reaches 100 % before the bottom of a bordered viewport, and is always 100 % when the content is shorter than Height but taller than the content area |
+| bubbles/32 | medium | viewport: a double-width rune on a cut boundary widens the row; lipgloss re-wraps it and the view grows a row — under soft wrap and under horizontal scrolling |
+| bubbles/33 | medium | viewport: under soft wrap EnsureVisible and findNearestMatch take a real line index for a visual offset, so the highlighted match is scrolled off the screen |
+| bubbles/34 | low | viewport: HighlightPrevious with no selected match lands on the second-to-last one |
+| bubbles/35 | low | viewport: highlights of styled content are misplaced: graphemes are walked on the stripped text but newlines looked up in the raw text |
+| bubbles/36 | low | viewport: the selected match is re-styled with SelectedHighlightStyle alone, so with the default (unset) style the current match is the one match not highlighted |
+| bubbles/37 | low | viewport: a Style width smaller than the viewport's caps the render but not the cut, so rows are wrapped and the view grows |
+| bubbles/38 | low | viewport: under soft wrap the gutter of FillHeight's blank rows gets a real-line Index against a visual TotalLines, so they are numbered |
+| bubbles/39 | low | viewport: SetContent clamps the vertical offset to the new content but not the horizontal one, so narrower content stays scrolled off the left |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -106,6 +145,16 @@ anchor the library keeps) turned out to crash the library too. The editing prope
 /13, /17, /20, /21, /24, /25 and /26 by cause, the vertical property /14 (rows of two runes or
 fewer, or ending in a wide rune, around the move), the view and cursor properties /16 (a
 row wider than the width), the LineInfo property /15; each is pinned.
+
+For viewport (765 lines plus `highlight.go`, read in full first) eleven of the thirteen were
+on paper — `SetContent` splitting before the CRLF check, `maxXOffset` against `Width()`,
+`PageDown`/`ScrollPercent` against `Height()`, `EnsureVisible`/`findNearestMatch` in real lines
+under soft wrap, `(hiIdx−1+n)%n` from −1, `parseMatches` indexing the raw content with a
+stripped position, `StyleRanges` replacing the style, tabs at width 0 — and a probe of
+`ansi.Cut` on wide runes gave bubbles/32; the properties found bubbles/38 (numbered fill rows)
+and bubbles/39 (the stale horizontal offset). The view property gates /27, /28, /29, /30, /31,
+/32, /38 and /39 by cause, the highlight property /32, /33 and /34; /35, /36 and /37 need a
+style and are pinned only; each is pinned.
 
 ## Not bugs (modelled as documented)
 
@@ -128,12 +177,20 @@ row wider than the width), the LineInfo property /15; each is pinned.
   not clear a selection; word motions cross line ends (alt+b lands on the previous line's last
   rune first); `InsertString` does not replace a selection (it is only exercised without one).
 - textarea: tabs become four spaces, other control characters and U+FFFD are dropped.
+- viewport: a wide rune across the right edge of the window is dropped and one across the left
+  edge is kept whole (`ansi.Cut`; the widening it causes is bubbles/32); `HalfPageDown` in a
+  one-row viewport is a no-op; a lone `\r` is kept; `SetContent("\n")` is two lines;
+  `SetHeight` may leave the offset past the bottom (documented `PastBottom`) and the next
+  upward move snaps it back; a match that begins at a newline belongs to the line before it,
+  the newline being one cell after its last, and `EnsureVisible` scrolls for that cell.
 
 ## Not covered (yet)
 
-`viewport`, `table`, `list`, `paginator`, `progress`, `tree`, `filepicker`, `help`, `key`,
+`table`, `list`, `paginator`, `progress`, `tree`, `filepicker`, `help`, `key`,
 `timer`/`stopwatch`/`spinner`, `cursor` blinking; textinput's clipboard paste (`Paste` reads the
 system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`MinHeight`,
 `MaxContentHeight`, `SetPromptFunc`, the mouse selection API (`BeginSelection`/`ExtendSelection`/
 `EndSelection`), `CopySelection` (clipboard), the placeholder beyond bubbles/23, `ScrollPercent`,
-styles and the `Base` frame.
+styles and the `Base` frame; viewport's shift+wheel, `StyleLineFunc`, `HorizontalScrollPercent`,
+`YPosition`, gutters of other widths, `Style` width and height beyond bubbles/37,
+`SetHighlights` on styled content beyond bubbles/35.

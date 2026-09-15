@@ -2560,3 +2560,953 @@ index 0000000..5cf9f7e
 +		t.Fatalf("EchoNone field is %d cells wide empty and %d with %q", empty, w, "ab")
 +	}
 +}
+diff --git a/viewport/hegel_test.go b/viewport/hegel_test.go
+new file mode 100644
+index 0000000..456487d
+--- /dev/null
++++ b/viewport/hegel_test.go
+@@ -0,0 +1,944 @@
++package viewport
++
++// Hegel property tests for the viewport bubble: a pager over lines with a
++// vertical (and, without soft wrap, horizontal) scroll position, an optional
++// left gutter and frame style, soft wrapping, and highlighted byte ranges.
++//
++// The model turns the content into visual rows of cells (one row per line,
++// or greedy chunks of the content width under soft wrap) and predicts the
++// scroll offsets of every key, wheel and method; View, parsed into cells,
++// must be exactly height rows of width cells showing gutter + the window of
++// each row. Highlights are modelled as the cells of the matched runes.
++//
++// Set BUBBLES_COLLECT=1 (and HEGEL_TEST_CASES=n) to collect mismatches.
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	"charm.land/bubbles/v2/internal/zootest"
++	tea "charm.land/bubbletea/v2"
++	"charm.land/lipgloss/v2"
++	"hegel.dev/go/hegel"
++)
++
++var (
++	property = zootest.Property
++	fail     = zootest.Fail
++	count    = zootest.Count
++	guard    = zootest.Guard
++	n        = zootest.N
++	chance   = zootest.Chance
++)
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return zootest.Pick(tc, xs) }
++
++func keyOf(code rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: code} }
++func typed(r rune) tea.KeyPressMsg    { return tea.KeyPressMsg{Code: r, Text: string(r)} }
++
++// ---------------------------------------------------------------- generators
++
++func genRune(tc hegel.TestCase) rune {
++	switch {
++	case chance(tc, 55):
++		return rune('a' + n(tc, 0, 25))
++	case chance(tc, 30):
++		return ' '
++	case chance(tc, 30):
++		return pick(tc, []rune("日本語漢字"))
++	case chance(tc, 40):
++		return pick(tc, []rune("0123456789.,-"))
++	default:
++		return pick(tc, []rune("éüñ"))
++	}
++}
++
++func genLine(tc hegel.TestCase, hi int) string {
++	k := n(tc, 0, hi)
++	rs := make([]rune, k)
++	for i := range rs {
++		rs[i] = genRune(tc)
++	}
++	return string(rs)
++}
++
++func genLines(tc hegel.TestCase, lines, width int) []string {
++	var out []string
++	for i := n(tc, 0, lines); i > 0; i-- {
++		out = append(out, genLine(tc, width))
++	}
++	return out
++}
++
++// gutter is a fixed two-cell gutter, as the library's example.
++func gutter(c GutterContext) string {
++	switch {
++	case c.Soft:
++		return "  "
++	case c.Index >= c.TotalLines:
++		return "~ "
++	default:
++		return fmt.Sprintf("%d ", (c.Index+1)%10)
++	}
++}
++
++type setup struct {
++	m                Model
++	width, height    int // the model's
++	frame            int // horizontal = vertical frame size (0 or 2)
++	gutterW          int
++	maxWidth, maxH   int // the content area
++	tabs, cr, gutted bool
++	staleX           bool // SetContent left x past the new content (bubbles/39)
++}
++
++// newVP draws a viewport: size, optional border, optional gutter, soft wrap.
++func newVP(tc hegel.TestCase) *setup {
++	s := &setup{}
++	if chance(tc, 30) {
++		s.frame = 2
++	}
++	if chance(tc, 30) {
++		s.gutterW = 2
++		s.gutted = true
++	}
++	// the content area is at least one cell: a viewport smaller than its
++	// frame and gutter is not modelled
++	s.width, s.height = n(tc, s.frame+s.gutterW+1, 12), n(tc, s.frame+1, 6)
++	s.m = New(WithWidth(s.width), WithHeight(s.height))
++	if s.frame > 0 {
++		s.m.Style = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
++	}
++	if s.gutted {
++		s.m.LeftGutterFunc = gutter
++	}
++	s.m.SoftWrap = chance(tc, 30)
++	s.m.FillHeight = chance(tc, 50)
++	s.maxWidth = max(0, s.width-s.frame-s.gutterW)
++	s.maxH = max(0, s.height-s.frame)
++	return s
++}
++
++// content draws lines for the viewport and returns the text as SetContent
++// would get it (sometimes with CRLF endings or a tab).
++func (s *setup) content(tc hegel.TestCase) (text string, lines []string) {
++	lines = genLines(tc, 8, s.width+4)
++	text = strings.Join(lines, "\n")
++	if chance(tc, 10) && len(lines) > 1 {
++		text = strings.ReplaceAll(text, "\n", "\r\n")
++		s.cr = true
++	}
++	if chance(tc, 8) && len(text) > 0 {
++		rs := []rune(text)
++		i := n(tc, 0, len(rs)-1)
++		if rs[i] != '\n' && rs[i] != '\r' {
++			rs[i] = '\t'
++			s.tabs = true
++			text = string(rs)
++			lines = strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
++		}
++	}
++	return text, lines
++}
++
++// ---------------------------------------------------------------- rows of cells
++
++type row = []zootest.Cell
++
++func cellsOf(line string) row { return zootest.Cells(line) }
++
++func rowWidth(r row) int { return zootest.Width(r) }
++
++// window returns the plain text of the cells of r between columns a and b
++// as ansi.Cut yields it: a wide cell cut by the left edge is kept whole (the
++// row is then one cell wider than the window, bubbles/32), one cut by the
++// right edge is dropped.
++func window(r row, a, b int) string {
++	var sb strings.Builder
++	p := 0
++	for _, c := range r {
++		if p+c.W > a && p < b && (p >= a || c.W > 1) && (p+c.W <= b || p < a) {
++			sb.WriteString(c.S)
++		}
++		p += c.W
++	}
++	return sb.String()
++}
++
++// wrapRows chunks r greedily into rows of at most width cells; a wide cell
++// that does not fit ends the row. It returns the rows and whether a wide
++// cell crossed a width boundary (the library's cell arithmetic, bubbles/32).
++func wrapRows(r row, width int) (rows []row, crossed bool) {
++	if width <= 0 {
++		return []row{r}, false
++	}
++	cur, w := row{}, 0
++	for _, c := range r {
++		if c.W > width {
++			crossed = true
++		}
++		if w+c.W > width && w > 0 {
++			if c.W > 1 && w+c.W > width && w < width {
++				crossed = true
++			}
++			rows = append(rows, cur)
++			cur, w = row{}, 0
++		}
++		cur = append(cur, c)
++		w += c.W
++	}
++	rows = append(rows, cur)
++	return rows, crossed
++}
++
++// visual describes the content as the viewport should show it.
++type visual struct {
++	rows    []row // visual rows (soft wrapped or not)
++	soft    []bool
++	lineIdx []int
++	longest int
++	crossed bool
++}
++
++func (s *setup) visualOf(lines []string) visual {
++	var v visual
++	if len(lines) == 1 && lines[0] == "" {
++		return v // no content, no rows
++	}
++	for i, l := range lines {
++		r := cellsOf(l)
++		v.longest = max(v.longest, rowWidth(r))
++		if !s.m.SoftWrap {
++			v.rows = append(v.rows, r)
++			v.soft = append(v.soft, false)
++			v.lineIdx = append(v.lineIdx, i)
++			continue
++		}
++		rows, crossed := wrapRows(r, s.maxWidth)
++		v.crossed = v.crossed || crossed
++		for k, rr := range rows {
++			v.rows = append(v.rows, rr)
++			v.soft = append(v.soft, k > 0)
++			v.lineIdx = append(v.lineIdx, i)
++		}
++	}
++	return v
++}
++
++// ---------------------------------------------------------------- the scroll model
++
++type scroll struct {
++	y, x int
++}
++
++func (s *setup) maxY(v visual) int { return max(0, len(v.rows)-s.maxH) }
++func (s *setup) maxX(v visual) int {
++	if s.m.SoftWrap {
++		return 0
++	}
++	return max(0, v.longest-s.maxWidth)
++}
++
++func clampInt(v, lo, hi int) int { return min(hi, max(lo, v)) }
++
++// TestHegelViewShowsTheScrolledRows: every key, wheel and method moves the
++// offsets as the model says (page = the content height; the bottom is
++// total − content height; horizontal end = longest − content width) and View
++// is exactly height rows of width cells: frame, gutter and the window of
++// each visual row from the offset, blank rows past the content.
++func TestHegelViewShowsTheScrolledRows(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := newVP(ht)
++		text, lines := s.content(ht)
++		s.m.SetContent(text)
++		v := s.visualOf(lines)
++		sc := scroll{}
++		var log []string
++		steps := n(ht, 0, 12)
++		for i := 0; i <= steps; i++ {
++			if i > 0 {
++				op := pick(ht, []string{"j", "k", "f", "b", "d", "u", "pgdown", "pgup", "space", "down", "up",
++					"left", "right", "h", "l", "wheeldown", "wheelup", "wheelright", "sety", "setx", "top", "bottom",
++					"scrolldown", "scrollup", "setcontent", "setheight", "ensure"})
++				page := s.maxH
++				log = append(log, op)
++				switch op {
++				case "j", "down":
++					s.m, _ = s.m.Update(map[string]tea.KeyPressMsg{"j": typed('j'), "down": keyOf(tea.KeyDown)}[op])
++					if len(lines) > 0 {
++						sc.y = clampInt(sc.y+1, 0, max(sc.y, s.maxY(v)))
++					}
++				case "k", "up":
++					s.m, _ = s.m.Update(map[string]tea.KeyPressMsg{"k": typed('k'), "up": keyOf(tea.KeyUp)}[op])
++					if len(lines) > 0 {
++						sc.y = clampInt(sc.y-1, 0, s.maxY(v)) // up moves snap a past-bottom offset back
++					}
++				case "f", "pgdown", "space":
++					s.m, _ = s.m.Update(map[string]tea.KeyPressMsg{"f": typed('f'), "pgdown": keyOf(tea.KeyPgDown), "space": keyOf(tea.KeySpace)}[op])
++					if sc.y < s.maxY(v) && page > 0 && len(lines) > 0 {
++						sc.y = min(sc.y+page, s.maxY(v))
++					}
++				case "b", "pgup":
++					s.m, _ = s.m.Update(map[string]tea.KeyPressMsg{"b": typed('b'), "pgup": keyOf(tea.KeyPgUp)}[op])
++					if sc.y > 0 && page > 0 && len(lines) > 0 {
++						sc.y = clampInt(sc.y-page, 0, s.maxY(v))
++					}
++				case "d":
++					s.m, _ = s.m.Update(typed('d'))
++					if sc.y < s.maxY(v) && page/2 > 0 && len(lines) > 0 {
++						sc.y = min(sc.y+page/2, s.maxY(v))
++					}
++				case "u":
++					s.m, _ = s.m.Update(typed('u'))
++					if sc.y > 0 && page/2 > 0 && len(lines) > 0 {
++						sc.y = clampInt(sc.y-page/2, 0, s.maxY(v))
++					}
++				case "left", "h":
++					s.m, _ = s.m.Update(map[string]tea.KeyPressMsg{"left": keyOf(tea.KeyLeft), "h": typed('h')}[op])
++					sc.x = clampInt(sc.x-6, 0, s.maxX(v))
++				case "right", "l":
++					s.m, _ = s.m.Update(map[string]tea.KeyPressMsg{"right": keyOf(tea.KeyRight), "l": typed('l')}[op])
++					sc.x = clampInt(sc.x+6, 0, s.maxX(v))
++				case "wheeldown":
++					s.m, _ = s.m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
++					if sc.y < s.maxY(v) && len(lines) > 0 {
++						sc.y = min(sc.y+3, s.maxY(v))
++					}
++				case "wheelup":
++					s.m, _ = s.m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
++					if sc.y > 0 && len(lines) > 0 {
++						sc.y = clampInt(sc.y-3, 0, s.maxY(v))
++					}
++				case "wheelright":
++					s.m, _ = s.m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelRight})
++					sc.x = clampInt(sc.x+6, 0, s.maxX(v))
++				case "sety":
++					k := n(ht, -1, len(v.rows)+1)
++					s.m.SetYOffset(k)
++					sc.y = clampInt(k, 0, s.maxY(v))
++				case "setx":
++					k := n(ht, -1, v.longest+1)
++					s.m.SetXOffset(k)
++					sc.x = clampInt(k, 0, s.maxX(v))
++				case "top":
++					s.m.GotoTop()
++					sc.y = 0
++				case "bottom":
++					s.m.GotoBottom()
++					sc.y = s.maxY(v)
++				case "scrolldown":
++					k := n(ht, 0, 4)
++					s.m.ScrollDown(k)
++					if sc.y < s.maxY(v) && k > 0 && len(lines) > 0 {
++						sc.y = min(sc.y+k, s.maxY(v))
++					}
++				case "scrollup":
++					k := n(ht, 0, 4)
++					s.m.ScrollUp(k)
++					if sc.y > 0 && k > 0 && len(lines) > 0 {
++						sc.y = clampInt(sc.y-k, 0, s.maxY(v))
++					}
++				case "setcontent":
++					text, lines = s.content(ht)
++					s.m.SetContent(text)
++					v = s.visualOf(lines)
++					if sc.y > s.maxY(v) {
++						sc.y = s.maxY(v)
++					}
++					if sc.x > s.maxX(v) {
++						sc.x = s.maxX(v)
++						s.staleX = true
++					}
++				case "setheight":
++					s.height = n(ht, s.frame+1, 6)
++					log[len(log)-1] += fmt.Sprintf("(%d)", s.height)
++					s.m.SetHeight(s.height)
++					s.maxH = max(0, s.height-s.frame)
++					// no clamping: PastBottom is documented
++				case "ensure":
++					if len(lines) == 0 {
++						continue
++					}
++					li := n(ht, 0, len(lines)-1)
++					r := cellsOf(lines[li])
++					a := n(ht, 0, rowWidth(r))
++					b := n(ht, a, rowWidth(r))
++					log[len(log)-1] += fmt.Sprintf("(%d,%d,%d)", li, a, b)
++					s.m.EnsureVisible(li, a, b)
++					if !s.m.SoftWrap {
++						if b <= s.maxWidth {
++							sc.x = 0
++						} else {
++							sc.x = clampInt(a-6, 0, s.maxX(v))
++						}
++					}
++					if li < sc.y || li >= sc.y+s.maxH {
++						sc.y = clampInt(li, 0, s.maxY(v))
++					}
++					if s.m.SoftWrap && len(v.rows) != len(lines) {
++						count("bubbles/33-shape")
++						return
++					}
++				}
++				log[len(log)-1] += fmt.Sprintf("→(%d/%d)", s.m.YOffset(), sc.y)
++			}
++			why := func(what string) string {
++				return fmt.Sprintf("%s\nviewport %dx%d frame %d gutter %d softwrap %v fill %v; lines %q; ops %s",
++					what, s.width, s.height, s.frame, s.gutterW, s.m.SoftWrap, s.m.FillHeight, lines, strings.Join(log, ","))
++			}
++			// a wide cell kept whole at the left edge of the window widens a
++			// visible row past the content width (bubbles/32)
++			over := false
++			if !s.m.SoftWrap && sc.x > 0 {
++				for vi := sc.y; vi < min(len(v.rows), sc.y+s.maxH); vi++ {
++					if rowWidth(cellsOf(window(v.rows[vi], sc.x, sc.x+s.maxWidth))) > s.maxWidth {
++						over = true
++					}
++				}
++			}
++			gate := func() bool {
++				switch {
++				case s.cr:
++					count("bubbles/27-shape")
++				case s.tabs:
++					count("bubbles/28-shape")
++				case (s.m.SoftWrap && v.crossed) || over:
++					count("bubbles/32-shape")
++				case s.staleX:
++					count("bubbles/39-shape")
++				case (s.frame > 0 || s.gutterW > 0) && sc.x > max(0, v.longest-s.width):
++					count("bubbles/29-shape")
++				case s.frame > 0 && sc.y != s.m.YOffset():
++					count("bubbles/30-shape")
++				default:
++					return false
++				}
++				return true
++			}
++			// offsets
++			if s.m.YOffset() != sc.y || s.m.XOffset() != sc.x {
++				if gate() {
++					return
++				}
++				fail(ht, why(fmt.Sprintf("offsets (y %d, x %d), want (%d, %d)", s.m.YOffset(), s.m.XOffset(), sc.y, sc.x)))
++			}
++			if s.m.TotalLineCount() != len(v.rows) {
++				if gate() {
++					return
++				}
++				fail(ht, why(fmt.Sprintf("TotalLineCount %d, want %d", s.m.TotalLineCount(), len(v.rows))))
++			}
++			if s.m.AtTop() != (sc.y <= 0) || s.m.AtBottom() != (sc.y >= s.maxY(v)) {
++				if gate() {
++					return
++				}
++				fail(ht, why(fmt.Sprintf("AtTop %v AtBottom %v at y %d (max %d)", s.m.AtTop(), s.m.AtBottom(), sc.y, s.maxY(v))))
++			}
++			wantPct := 1.0
++			if s.maxY(v) > 0 {
++				wantPct = min(1, float64(sc.y)/float64(s.maxY(v)))
++			}
++			if got := s.m.ScrollPercent(); got != wantPct && (got-wantPct > 1e-9 || wantPct-got > 1e-9) {
++				if s.frame > 0 {
++					count("bubbles/31-shape")
++					return
++				}
++				if gate() {
++					return
++				}
++				fail(ht, why(fmt.Sprintf("ScrollPercent %.3f, want %.3f (y %d, max %d)", got, wantPct, sc.y, s.maxY(v))))
++			}
++			// the view
++			view := s.m.View()
++			if s.width == 0 || s.height == 0 {
++				continue
++			}
++			got := strings.Split(view, "\n")
++			if len(got) != s.height {
++				if gate() {
++					return
++				}
++				fail(ht, why(fmt.Sprintf("view has %d rows, want %d:\n%s", len(got), s.height, view)))
++			}
++			for i, line := range got {
++				cells := cellsOf(line)
++				if rowWidth(cells) != s.width {
++					if gate() {
++						return
++					}
++					fail(ht, why(fmt.Sprintf("row %d is %d cells wide, want %d: %q", i, rowWidth(cells), s.width, zootest.String(cells))))
++				}
++				if s.frame > 0 && (i == 0 || i == s.height-1) {
++					continue // border rows
++				}
++				plain := zootest.Plain(cells)
++				if s.frame > 0 {
++					plain = strings.TrimSuffix(strings.TrimPrefix(plain, "│"), "│")
++				}
++				vi := sc.y + i - s.frame/2
++				want := ""
++				if vi < len(v.rows) {
++					r := v.rows[vi]
++					if s.gutted {
++						want = gutter(GutterContext{Index: v.lineIdx[vi], TotalLines: len(v.rows), Soft: v.soft[vi]})
++					}
++					if s.m.SoftWrap {
++						want += zootest.Plain(r)
++					} else {
++						want += window(r, sc.x, sc.x+s.maxWidth)
++					}
++				} else if s.gutted && s.m.FillHeight && s.maxWidth > 0 {
++					want = gutter(GutterContext{Index: vi, TotalLines: len(v.rows)})
++				}
++				if strings.TrimRight(plain, " ") != strings.TrimRight(want, " ") {
++					if gate() {
++						return
++					}
++					if vi < len(v.rows) && !s.m.SoftWrap && rowWidth(cellsOf(want)) > s.maxWidth+s.gutterW {
++						count("bubbles/32-shape") // a wide cell kept whole at the left edge widens the row
++						return
++					}
++					if vi >= len(v.rows) && s.gutted && s.m.SoftWrap && s.m.FillHeight {
++						count("bubbles/38-shape") // fill rows numbered under soft wrap
++						return
++					}
++					fail(ht, why(fmt.Sprintf("row %d (visual %d) is %q, want %q (y %d x %d)", i, vi, plain, want, sc.y, sc.x)))
++				}
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------- highlights
++
++type match struct {
++	start, end int // byte offsets in the content
++}
++
++// genMatches draws sorted, non-overlapping byte ranges on rune boundaries.
++func genMatches(tc hegel.TestCase, content string) []match {
++	var bounds []int
++	for i := range content {
++		bounds = append(bounds, i)
++	}
++	bounds = append(bounds, len(content))
++	var ms []match
++	i := 0
++	for i < len(bounds)-1 && len(ms) < 4 {
++		a := n(tc, i, len(bounds)-2)
++		b := n(tc, a+1, min(len(bounds)-1, a+6))
++		ms = append(ms, match{bounds[a], bounds[b]})
++		i = b
++		if chance(tc, 30) {
++			break
++		}
++	}
++	return ms
++}
++
++// cellRanges returns, per line, the cell ranges the matches cover.
++func cellRanges(lines []string, ms []match) map[int][][2]int {
++	out := map[int][][2]int{}
++	offset := 0
++	for li, l := range lines {
++		col := 0
++		for _, c := range cellsOf(l) {
++			bstart, bend := offset, offset+len(c.S)
++			for _, m := range ms {
++				if m.start < bend && bstart < m.end {
++					out[li] = append(out[li], [2]int{col, col + c.W})
++					break
++				}
++			}
++			col += c.W
++			offset += len(c.S)
++		}
++		offset++ // the newline
++	}
++	return out
++}
++
++func firstLine(content string, m match) int {
++	return strings.Count(content[:m.start], "\n")
++}
++
++// matchCells returns the first line the match touches and the cell columns
++// it covers there. A line's newline counts as one more cell after its last
++// (the library shows a match on it there and scrolls for it).
++func matchCells(lines []string, m match) (line, colstart, colend int) {
++	offset := 0
++	for li, l := range lines {
++		col, first, last := 0, -1, 0
++		cells := cellsOf(l)
++		if li < len(lines)-1 {
++			cells = append(cells, zootest.Cell{S: "\n", W: 1})
++		}
++		for _, c := range cells {
++			if m.start < offset+len(c.S) && offset < m.end {
++				if first < 0 {
++					first = col
++				}
++				last = col + c.W
++			}
++			col += c.W
++			offset += len(c.S)
++		}
++		if first >= 0 {
++			return li, first, last
++		}
++	}
++	return len(lines) - 1, 0, 0
++}
++
++// TestHegelHighlightsMarkTheMatches: the highlighted cells of each visible
++// line are exactly the cells of the matched runes; SetHighlights selects the
++// first match at or below the top and scrolls it into view; HighlightNext /
++// HighlightPrevious cycle and scroll; scrolling reselects the nearest match.
++func TestHegelHighlightsMarkTheMatches(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		width, height := n(ht, 1, 12), n(ht, 1, 6)
++		m := New(WithWidth(width), WithHeight(height))
++		m.HighlightStyle = lipgloss.NewStyle().Reverse(true)
++		m.SelectedHighlightStyle = lipgloss.NewStyle().Reverse(true)
++		m.SoftWrap = chance(ht, 20)
++		lines := genLines(ht, 6, width+4)
++		content := strings.Join(lines, "\n")
++		if content == "" {
++			return
++		}
++		m.SetContent(content)
++		y0 := n(ht, 0, max(0, m.TotalLineCount()-1))
++		m.SetYOffset(y0)
++		y := m.YOffset()
++		ms := genMatches(ht, content)
++		raw := make([][]int, 0, len(ms))
++		for _, mm := range ms {
++			raw = append(raw, []int{mm.start, mm.end})
++		}
++		want := cellRanges(lines, ms)
++		softShape := m.SoftWrap && m.TotalLineCount() != len(lines)
++
++		// the selected index and the offset after a selection
++		sel := -1
++		nearest := func(y int) int {
++			for i, mm := range ms {
++				if firstLine(content, mm) >= y {
++					return i
++				}
++			}
++			return -1
++		}
++		maxY := max(0, m.TotalLineCount()-height)
++		longest := 0
++		for _, l := range lines {
++			longest = max(longest, rowWidth(cellsOf(l)))
++		}
++		x := 0
++		show := func() {
++			if sel < 0 {
++				return
++			}
++			li, cs, ce := matchCells(lines, ms[sel])
++			if !m.SoftWrap {
++				if ce <= width {
++					x = 0
++				} else {
++					x = clampInt(cs-6, 0, max(0, longest-width))
++				}
++			}
++			if li < y || li >= y+height {
++				y = clampInt(li, 0, maxY)
++			}
++		}
++		sel = nearest(y)
++		m.SetHighlights(raw)
++		show()
++		var log []string
++		for step := n(ht, 0, 5); step >= 0; step-- {
++			if len(log) > 0 || step < n(ht, 0, 5) {
++				op := pick(ht, []string{"next", "prev", "down", "up"})
++				log = append(log, op)
++				switch op {
++				case "next":
++					m.HighlightNext()
++					sel = (sel + 1) % len(ms)
++					show()
++				case "prev":
++					m.HighlightPrevious()
++					if sel < 0 {
++						sel = len(ms) - 1
++					} else {
++						sel = (sel - 1 + len(ms)) % len(ms)
++					}
++					show()
++				case "down":
++					m.ScrollDown(1)
++					if y < maxY {
++						y++
++						sel = nearest(y)
++					}
++				case "up":
++					m.ScrollUp(1)
++					if y > 0 {
++						y--
++						sel = nearest(y)
++					}
++				}
++			}
++			why := func(what string) string {
++				return fmt.Sprintf("%s\nviewport %dx%d softwrap %v lines %q matches %v ops %s", what, width, height, m.SoftWrap, lines, raw, strings.Join(log, ","))
++			}
++			if m.hiIdx != sel || m.YOffset() != y || m.XOffset() != x {
++				switch {
++				case softShape:
++					count("bubbles/33-shape")
++				case len(log) > 0 && log[len(log)-1] == "prev" && m.hiIdx == (sel-1+len(ms))%len(ms) && sel == len(ms)-1:
++					count("bubbles/34-shape")
++				default:
++					fail(ht, why(fmt.Sprintf("selected %d at (y %d, x %d), want %d at (%d, %d)", m.hiIdx, m.YOffset(), m.XOffset(), sel, y, x)))
++				}
++				return
++			}
++			if m.SoftWrap {
++				continue // the rows are checked by the view property; cells here
++			}
++			rows := strings.Split(m.View(), "\n")
++			for i, line := range rows {
++				li := y + i
++				var visible [][2]int // the wanted cells inside the window
++				for _, r := range want[li] {
++					if r[0] >= x && r[1] <= x+width {
++						visible = append(visible, [2]int{r[0] - x, r[1] - x})
++					}
++				}
++				if li < len(lines) && x > 0 && straddles(cellsOf(lines[li]), x) {
++					count("bubbles/32-shape") // a wide cell kept whole at the left edge shifts the row
++					return
++				}
++				var got [][2]int
++				col := 0
++				for _, c := range cellsOf(line) {
++					if c.Rev {
++						got = append(got, [2]int{col, col + c.W})
++					}
++					col += c.W
++				}
++				if fmt.Sprint(got) != fmt.Sprint(visible) {
++					fail(ht, why(fmt.Sprintf("line %d highlighted cells %v, want %v: %q", li, got, visible, zootest.String(cellsOf(line)))))
++				}
++			}
++		}
++	})
++}
++
++// straddles reports whether a wide cell of r sits across column x.
++func straddles(r row, x int) bool {
++	p := 0
++	for _, c := range r {
++		if p < x && x < p+c.W {
++			return true
++		}
++		p += c.W
++	}
++	return false
++}
++
++// ---------------------------------------------------------------- pins
++
++func plainRows(v string) []string {
++	var out []string
++	for _, l := range strings.Split(v, "\n") {
++		out = append(out, zootest.String(zootest.Cells(l)))
++	}
++	return out
++}
++
++// bubbles/27: SetContent splits on "\n" before the CRLF normalisation runs,
++// so CRLF content keeps a "\r" on every line.
++func TestHegelPinSetContentKeepsCarriageReturns(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(3))
++	m.SetContent("a\r\nb\r\nc")
++	if got := m.GetContent(); got != "a\nb\nc" {
++		t.Fatalf("GetContent after SetContent(\"a\\r\\nb\\r\\nc\") = %q, want \"a\\nb\\nc\"", got)
++	}
++}
++
++// bubbles/28: a tab is 0 cells to the viewport and 4 to the renderer: rows
++// overflow the width, are wrapped, and the view is taller than the height.
++func TestHegelPinTabsOverflowTheRow(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(3), WithHeight(1))
++	m.SetContent("a\tb")
++	if rows := strings.Split(m.View(), "\n"); len(rows) != 1 {
++		t.Fatalf("a 1-row viewport of \"a\\tb\" renders %d rows: %q", len(rows), plainRows(m.View()))
++	}
++}
++
++// bubbles/29: the horizontal end is longest − Width, not longest − content
++// width: with a gutter or a frame the last columns can never be shown.
++func TestHegelPinHorizontalScrollStopsShortWithAGutter(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(1))
++	m.LeftGutterFunc = func(GutterContext) string { return "|| " }
++	m.SetContent("0123456789abcdefghij")
++	for i := 0; i < 10; i++ {
++		m.ScrollRight(6)
++	}
++	if v := m.View(); !strings.Contains(v, "j") {
++		t.Fatalf("scrolled fully right (x %d), the line's last column is not shown: %q", m.XOffset(), plainRows(v))
++	}
++}
++
++// bubbles/30: PageDown/PageUp/HalfPage scroll by Height, frame included, so
++// a bordered viewport skips lines.
++func TestHegelPinPageDownSkipsLinesInsideAFrame(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(5))
++	m.Style = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
++	m.SetContent("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10")
++	m.PageDown()
++	if m.YOffset() != 3 {
++		t.Fatalf("PageDown in a bordered viewport showing 3 lines moved to y %d, want 3 (lines l4, l5 skipped)", m.YOffset())
++	}
++}
++
++// bubbles/31: ScrollPercent uses Height, frame included: 100 % before the
++// bottom, and always 100 % when the content is shorter than Height but
++// taller than the content area.
++func TestHegelPinScrollPercentIgnoresTheFrame(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(5))
++	m.Style = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
++	m.SetContent("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10")
++	m.SetYOffset(5)
++	if m.AtBottom() {
++		t.Fatalf("unexpectedly at the bottom at y 5")
++	}
++	if p := m.ScrollPercent(); p >= 1 {
++		t.Fatalf("ScrollPercent %.2f at y 5 of max %d", p, m.maxYOffset())
++	}
++}
++
++// bubbles/32: soft-wrapped rows are counted as ceil(width/content width)
++// but cut by cells, so a wide rune on a boundary widens a row; the renderer
++// wraps it again and the view is taller than the height.
++func TestHegelPinSoftWrapOfWideRunesOverflowsTheHeight(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(3), WithHeight(2))
++	m.SoftWrap = true
++	m.SetContent("日本語")
++	if rows := strings.Split(m.View(), "\n"); len(rows) != 2 {
++		t.Fatalf("a 2-row soft-wrapping viewport of 日本語 renders %d rows (TotalLineCount %d): %q", len(rows), m.TotalLineCount(), plainRows(m.View()))
++	}
++}
++
++// bubbles/33: under soft wrap EnsureVisible and findNearestMatch take a
++// real line index for a visual offset: the highlighted match scrolls off.
++func TestHegelPinSoftWrapScrollsTheHighlightOffScreen(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(4), WithHeight(2))
++	m.SoftWrap = true
++	m.HighlightStyle = lipgloss.NewStyle().Reverse(true)
++	m.SelectedHighlightStyle = m.HighlightStyle
++	content := "aaaabbbbcccc\nl1\nl2\nl3\nl4\nl5\nl6"
++	m.SetContent(content)
++	i := strings.Index(content, "l5")
++	m.SetHighlights([][]int{{i, i + 2}})
++	if v := m.View(); !strings.Contains(v, "l5") {
++		t.Fatalf("after SetHighlights on l5 the view (y %d) shows %q", m.YOffset(), plainRows(v))
++	}
++}
++
++// bubbles/34: HighlightPrevious with no selected match lands on the
++// second-to-last one.
++func TestHegelPinHighlightPreviousFromNoneSkipsTheLast(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(1))
++	m.SetContent("m\nm\nm\nx\nx\nx")
++	m.SetHighlights([][]int{{0, 1}, {2, 3}, {4, 5}})
++	m.SetYOffset(5)
++	m.ScrollDown(1) // no-op at the bottom; reselect by hand as ScrollDown would
++	m.hiIdx = m.findNearestMatch()
++	if m.hiIdx != -1 {
++		t.Fatalf("expected no selected match below the matches, got %d", m.hiIdx)
++	}
++	m.HighlightPrevious()
++	if m.hiIdx != 2 {
++		t.Fatalf("HighlightPrevious from none selected match %d, want 2 (the last)", m.hiIdx)
++	}
++}
++
++// bubbles/35: highlights walk the graphemes of the stripped content but look
++// newlines up in the raw content, so styled content cannot be highlighted
++// with either raw or stripped byte offsets.
++func TestHegelPinStyledContentCannotBeHighlighted(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(2))
++	m.HighlightStyle = lipgloss.NewStyle().Reverse(true)
++	m.SelectedHighlightStyle = m.HighlightStyle
++	m.SetContent("\x1b[31mab\x1b[0m\ncd")
++	m.SetHighlights([][]int{{3, 5}}) // "cd" in the stripped content
++	rows := plainRows(m.View())
++	if !strings.Contains(rows[1], "[c][d]") {
++		m.SetHighlights([][]int{{10, 12}}) // "cd" in the raw content
++		rows2 := plainRows(m.View())
++		if !strings.Contains(rows2[1], "[c][d]") {
++			t.Fatalf("\"cd\" of styled content highlighted neither by stripped offsets %q nor raw ones %q", rows, rows2)
++		}
++	}
++}
++
++// bubbles/36: the selected match is re-styled with SelectedHighlightStyle
++// alone; with the default (unset) style it is the one match not highlighted.
++func TestHegelPinSelectedMatchLosesItsHighlight(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(6), WithHeight(1))
++	m.HighlightStyle = lipgloss.NewStyle().Reverse(true)
++	m.SetContent("ab")
++	m.SetHighlights([][]int{{0, 1}})
++	if v := plainRows(m.View())[0]; !strings.HasPrefix(v, "[a]") {
++		t.Fatalf("the only (selected) match is not highlighted: %q", v)
++	}
++}
++
++// bubbles/38: under soft wrap the gutter of FillHeight's blank rows gets a
++// real-line Index against a visual TotalLines, so they are numbered.
++func TestHegelPinSoftWrapNumbersTheFillRows(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(6), WithHeight(4))
++	m.SoftWrap = true
++	m.FillHeight = true
++	m.LeftGutterFunc = gutter
++	m.SetContent("abcdefgh") // two rows of four
++	rows := plainRows(m.View())
++	if !strings.HasPrefix(rows[2], "~ ") || !strings.HasPrefix(rows[3], "~ ") {
++		t.Fatalf("the fill rows below two soft-wrapped rows are gutted %q and %q, want \"~ \"", rows[2], rows[3])
++	}
++}
++
++// bubbles/39: SetContent clamps the vertical offset to the new content but
++// not the horizontal one, so narrower content stays scrolled off the left.
++func TestHegelPinSetContentKeepsAStaleHorizontalOffset(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(1))
++	m.SetContent("0123456789abcdef")
++	m.ScrollRight(6)
++	m.SetContent("hello")
++	if v := plainRows(m.View())[0]; !strings.HasPrefix(v, "hello") {
++		t.Fatalf("after SetContent(\"hello\") the view is %q (x %d)", v, m.XOffset())
++	}
++}
++
++// bubbles/37: a Style width smaller than the viewport's caps the render but
++// not the cut, so rows are wrapped by the renderer and the view grows.
++func TestHegelPinStyleWidthWrapsTheRows(t *testing.T) {
++	defer guard(t)
++	m := New(WithWidth(10), WithHeight(1))
++	m.Style = lipgloss.NewStyle().Width(4)
++	m.SetContent("0123456789")
++	if rows := strings.Split(m.View(), "\n"); len(rows) != 1 {
++		t.Fatalf("Style.Width(4) on a 1-row viewport renders %d rows: %q", len(rows), plainRows(m.View()))
++	}
++}
