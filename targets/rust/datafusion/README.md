@@ -61,3 +61,4 @@
 - 2026-09-15: base bumped ec97d1c902bf → b376290aad68 (2026-09-15, "fix: map pushed-down filter columns by position instead of by name (#25259)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped b376290aad68 → 7917a9a65a03 (2026-09-15, "bench: cover dictionary group keys with a shared values array (#25198)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-15: base bumped 7917a9a65a03 → a0631edb7748 (2026-09-15, "perf: reuse cached dictionary value hashes in vectorized_append (#25185)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-15: base bumped a0631edb7748 → 22651d24cc81 (2026-09-15, "test: bound merge fan-in in ordered aggregate spill tests (#25252)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.

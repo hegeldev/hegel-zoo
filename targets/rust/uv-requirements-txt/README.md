@@ -83,3 +83,4 @@ crate's `RequirementsTxt`.
 - 2026-09-15: base bumped 694dfd8155ec → ac9201b10433 (2026-09-15, "Allow manually specifying build dependency hashes in configuration (#21467)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-15: base bumped ac9201b10433 → 1f245a625114 (2026-09-15, "Cover packaged editable self-dependency name mismatches (#21714)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-15: base bumped 1f245a625114 → b44bd4561d97 (2026-09-15, "Use a small native extension in system Python tests (#21713)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
+- 2026-09-15: base bumped b44bd4561d97 → bf12c8e61b2d (2026-09-15, "Enable Renovate updates for the release workflow (#21722)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
