@@ -33,3 +33,4 @@
 - 2026-09-14: base bumped 6fff6209289b → 5a4f79868cd6 (2026-09-14, "fix: copy extra fields in raw_copy_file (#955) (#982)"; 9.0.0-pre3); 0 bug(s) still reproduce. 273 tests pass.
 - 2026-09-14: base bumped 5a4f79868cd6 → a543a1fc8f3f (2026-09-14, "fix: Symlink with very large declared size could lead to out-of-memory panic (#984)"; 9.0.0-pre3); 0 bug(s) still reproduce. 277 tests pass.
 - 2026-09-14: base bumped a543a1fc8f3f → 75eec5b61f2e (2026-09-14, "ci(deps): bump release-plz/action from 0.5.132 to 0.5.133 (#987)"; 9.0.0-pre3); 0 bug(s) still reproduce. 277 tests pass.
+- 2026-09-15: base bumped 75eec5b61f2e → d2d05e8eb513 (2026-09-15, "feat: read data descriptor from binary (#990)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.
