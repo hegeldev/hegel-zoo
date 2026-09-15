@@ -1,0 +1,986 @@
+diff --git a/go.mod b/go.mod
+index 6561030..ab5a287 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,11 +1,14 @@
+ module github.com/muesli/termenv
+ 
+-go 1.17
++go 1.26.0
+ 
+ require (
+ 	github.com/aymanbagabas/go-osc52/v2 v2.0.1
+ 	github.com/lucasb-eyer/go-colorful v1.3.0
+ 	github.com/mattn/go-isatty v0.0.20
+ 	github.com/rivo/uniseg v0.4.7
+-	golang.org/x/sys v0.30.0
++	golang.org/x/sys v0.44.0
++	hegel.dev/go/hegel v0.6.33
+ )
++
++require github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..25d3880
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,959 @@
++// Hegel properties for muesli/termenv: colour conversion between profiles, the SGR sequences
++// of colours and styles, Profile.Color's parsing, the template helpers, and Output's reading of
++// the terminal's colours through a fake TTY.
++//
++// Oracles: the xterm 256-colour palette (computed, not copied), the SGR parameter table, the
++// documented conversion algorithm (tmux's colour_find_rgb with the HSLuv tie-break the code
++// chooses), the documented NO_COLOR/CLICOLOR rules, X11's rgb: reply format for OSC 10/11, and
++// a fake terminal that answers the queries. TERMENV_COLLECT=1 turns failures into a tally.
++package termenv_test
++
++import (
++	"bytes"
++	"fmt"
++	"image/color"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"text/template"
++
++	"github.com/lucasb-eyer/go-colorful"
++	"github.com/muesli/termenv"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("TERMENV_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			statsMu.Lock()
++			keys := make([]string, 0, len(stats))
++			for k := range stats {
++				keys = append(keys, k)
++			}
++			sort.Strings(keys)
++			var sb strings.Builder
++			for _, k := range keys {
++				fmt.Fprintf(&sb, " %s=%d", k, stats[k])
++			}
++			stats = map[string]int{}
++			statsMu.Unlock()
++			t.Logf("COLLECT %s: %d mismatches; stats%s", t.Name(), len(collectedMsgs), sb.String())
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++var (
++	statsMu sync.Mutex
++	stats   = map[string]int{}
++)
++
++func count(name string) {
++	statsMu.Lock()
++	stats[name]++
++	statsMu.Unlock()
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---------------------------------------------------------------- the xterm palette
++
++var basic16 = []string{
++	"#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#c0c0c0",
++	"#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
++}
++
++var cubeLevels = [6]int{0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff}
++
++// paletteRGB is the xterm palette: 16 basic colours, the 6x6x6 cube, 24 greys.
++func paletteRGB(i int) (int, int, int) {
++	switch {
++	case i < 16:
++		v, _ := strconv.ParseUint(basic16[i][1:], 16, 32)
++		return int(v >> 16), int(v >> 8 & 0xff), int(v & 0xff)
++	case i < 232:
++		i -= 16
++		return cubeLevels[i/36], cubeLevels[i/6%6], cubeLevels[i%6]
++	default:
++		g := 8 + 10*(i-232)
++		return g, g, g
++	}
++}
++
++func hexOf(r, g, b int) string { return fmt.Sprintf("#%02x%02x%02x", r, g, b) }
++
++func paletteHex(i int) string {
++	r, g, b := paletteRGB(i)
++	return hexOf(r, g, b)
++}
++
++func hsluvDist(r1, g1, b1, r2, g2, b2 int) float64 {
++	a := colorful.Color{R: float64(r1) / 255, G: float64(g1) / 255, B: float64(b1) / 255}
++	b := colorful.Color{R: float64(r2) / 255, G: float64(g2) / 255, B: float64(b2) / 255}
++	return a.DistanceHSLuv(b)
++}
++
++// to256 is the documented conversion (tmux's colour_find_rgb: nearest cube colour, nearest grey
++// from the average of the channels, then the nearer of the two — by HSLuv distance here, as the
++// code chooses).
++func to256(r, g, b int) int {
++	v2ci := func(v int) int {
++		if v < 48 {
++			return 0
++		}
++		if v < 115 {
++			return 1
++		}
++		return (v - 35) / 40
++	}
++	qr, qg, qb := v2ci(r), v2ci(g), v2ci(b)
++	cr, cg, cb := cubeLevels[qr], cubeLevels[qg], cubeLevels[qb]
++	ci := 36*qr + 6*qg + qb
++	avg := (r + g + b) / 3
++	grayIdx := 23
++	if avg <= 238 {
++		grayIdx = (avg - 3) / 10
++		if grayIdx < 0 {
++			grayIdx = 0
++		}
++	}
++	gv := 8 + 10*grayIdx
++	if hsluvDist(r, g, b, cr, cg, cb) <= hsluvDist(r, g, b, gv, gv, gv) {
++		return 16 + ci
++	}
++	return 232 + grayIdx
++}
++
++// to16 is the code's documented rule for 256 → 16: the nearest basic colour by HSLuv distance.
++func to16(i int) int {
++	r, g, b := paletteRGB(i)
++	best, bestD := 0, -1.0
++	for k := 0; k < 16; k++ {
++		kr, kg, kb := paletteRGB(k)
++		if d := hsluvDist(r, g, b, kr, kg, kb); bestD < 0 || d < bestD {
++			best, bestD = k, d
++		}
++	}
++	return best
++}
++
++var profiles = []termenv.Profile{termenv.TrueColor, termenv.ANSI256, termenv.ANSI, termenv.Ascii}
++
++func TestHegelPaletteConversionsRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		i := n(ht, 0, 255)
++		hex := paletteHex(i)
++		note(ht, "palette %d = %s", i, hex)
++		// The library's table agrees with the computed palette.
++		if i < 16 {
++			if got := termenv.ANSIColor(i).String(); got != hex {
++				fail(ht, "ANSIColor(%d).String() = %q, palette %q", i, got, hex)
++			}
++		}
++		if got := termenv.ANSI256Color(i).String(); got != hex {
++			fail(ht, "ANSI256Color(%d).String() = %q, palette %q", i, got, hex)
++		}
++		if got := termenv.ConvertToRGB(termenv.ANSI256Color(i)).Hex(); got != hex {
++			fail(ht, "ConvertToRGB(ANSI256Color(%d)).Hex() = %q, palette %q", i, got, hex)
++		}
++		// Identities.
++		for _, p := range profiles[:3] {
++			if i < 16 {
++				if got := p.Convert(termenv.ANSIColor(i)); got != termenv.ANSIColor(i) {
++					fail(ht, "%s.Convert(ANSIColor(%d)) = %v", p.Name(), i, got)
++				}
++			}
++			want := termenv.Color(termenv.ANSI256Color(i))
++			if p == termenv.ANSI {
++				want = termenv.ANSIColor(to16(i))
++			}
++			if got := p.Convert(termenv.ANSI256Color(i)); got != want {
++				fail(ht, "%s.Convert(ANSI256Color(%d)) = %v, want %v", p.Name(), i, got, want)
++			}
++		}
++		if got := termenv.Ascii.Convert(termenv.ANSI256Color(i)); got != (termenv.NoColor{}) {
++			fail(ht, "Ascii.Convert = %v", got)
++		}
++		// The palette entry's own RGB converts back to its index (greys 233–255: termenv/1).
++		if got := termenv.TrueColor.Convert(termenv.RGBColor(hex)); got != termenv.RGBColor(hex) {
++			fail(ht, "TrueColor.Convert(%q) = %v", hex, got)
++		}
++		if i >= 16 {
++			if i > 232 {
++				count("grey-skipped")
++			} else if got := termenv.ANSI256.Convert(termenv.RGBColor(hex)); got != termenv.ANSI256Color(i) {
++				fail(ht, "ANSI256.Convert(%q) = %v, want ANSI256Color(%d)", hex, got, i)
++			}
++		} else if got := termenv.ANSI.Convert(termenv.RGBColor(hex)); got != termenv.ANSIColor(i) {
++			fail(ht, "ANSI.Convert(%q) = %v, want ANSIColor(%d)", hex, got, i)
++		}
++		count("ok")
++	})
++}
++
++func TestHegelConvertFollowsTheDocumentedAlgorithm(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		r, g, b := n(ht, 0, 255), n(ht, 0, 255), n(ht, 0, 255)
++		if chance(ht, 25) {
++			g, b = r, r // greys are where the algorithm has two candidates
++		}
++		hex := hexOf(r, g, b)
++		c := termenv.RGBColor(hex)
++		note(ht, "colour %s", hex)
++		want := to256(r, g, b)
++		got := termenv.ANSI256.Convert(c)
++		if want >= 232 {
++			// The code averages the cube indices instead of the channels, so its grey
++			// candidate is always #080808 and a grey is (almost) never chosen: termenv/1.
++			count("grey-expected")
++		} else if got == termenv.ANSI256Color(232) {
++			count("grey-232-chosen") // the same defect: #080808 wins over a dark cube colour
++		} else if got != termenv.ANSI256Color(want) {
++			fail(ht, "ANSI256.Convert(%q) = %v, want ANSI256Color(%d) (%s)", hex, got, want, paletteHex(want))
++		}
++		g256, ok := got.(termenv.ANSI256Color)
++		if !ok || g256 < 16 {
++			fail(ht, "ANSI256.Convert(%q) = %v, not a colour in 16–255", hex, got)
++		}
++		// Idempotent, and 16 colours through 256.
++		for _, p := range profiles {
++			once := p.Convert(c)
++			if twice := p.Convert(once); twice != once {
++				fail(ht, "%s.Convert is not idempotent on %q: %v then %v", p.Name(), hex, once, twice)
++			}
++		}
++		if got16, want16 := termenv.ANSI.Convert(c), termenv.ANSI.Convert(got); got16 != want16 {
++			fail(ht, "ANSI.Convert(%q) = %v, but through ANSI256 %v", hex, got16, want16)
++		}
++		a16, ok := termenv.ANSI.Convert(c).(termenv.ANSIColor)
++		if !ok || a16 < 0 || a16 > 15 {
++			fail(ht, "ANSI.Convert(%q) = %v", hex, termenv.ANSI.Convert(c))
++		}
++		// FromColor goes through the hex string.
++		if got := termenv.TrueColor.FromColor(color.RGBA{uint8(r), uint8(g), uint8(b), 0xff}); got != c {
++			fail(ht, "TrueColor.FromColor(%s) = %v", hex, got)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- sequences and styles
++
++// exactChannel reports whether v survives the float round trip in RGBColor.Sequence
++// (termenv/2 for the others).
++func exactChannel(v int) bool {
++	c, _ := colorful.Hex(hexOf(v, v, v))
++	return int(uint8(c.R*255)) == v
++}
++
++func seqOf(c termenv.Color, bg bool) string {
++	off := 0
++	if bg {
++		off = 10
++	}
++	switch v := c.(type) {
++	case termenv.ANSIColor:
++		if v < 8 {
++			return strconv.Itoa(30 + off + int(v))
++		}
++		return strconv.Itoa(90 + off + int(v) - 8)
++	case termenv.ANSI256Color:
++		return fmt.Sprintf("%d;5;%d", 38+off, int(v))
++	case termenv.RGBColor:
++		r, g, b := hexRGB(string(v))
++		return fmt.Sprintf("%d;2;%d;%d;%d", 38+off, r, g, b)
++	}
++	return ""
++}
++
++// hexRGB reads #rrggbb and #rgb.
++func hexRGB(h string) (int, int, int) {
++	h = h[1:]
++	if len(h) == 3 {
++		h = string([]byte{h[0], h[0], h[1], h[1], h[2], h[2]})
++	}
++	v, _ := strconv.ParseUint(h, 16, 32)
++	return int(v >> 16), int(v >> 8 & 0xff), int(v & 0xff)
++}
++
++func genRGBHex(tc hegel.TestCase, exact bool) string {
++	ch := func() int {
++		for {
++			v := n(tc, 0, 255)
++			if !exact || exactChannel(v) {
++				return v
++			}
++		}
++	}
++	if chance(tc, 15) {
++		// #rgb: every channel is v*17, always exact
++		return fmt.Sprintf("#%x%x%x", n(tc, 0, 15), n(tc, 0, 15), n(tc, 0, 15))
++	}
++	return hexOf(ch(), ch(), ch())
++}
++
++func TestHegelColourSequencesFollowTheSGRTable(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		bg := chance(ht, 50)
++		var c termenv.Color
++		switch n(ht, 0, 2) {
++		case 0:
++			c = termenv.ANSIColor(n(ht, 0, 15))
++		case 1:
++			c = termenv.ANSI256Color(n(ht, 0, 255))
++		default:
++			c = termenv.RGBColor(genRGBHex(ht, true))
++		}
++		note(ht, "%T %v bg=%v", c, c, bg)
++		if got, want := c.Sequence(bg), seqOf(c, bg); got != want {
++			fail(ht, "%T(%v).Sequence(%v) = %q, want %q", c, c, bg, got, want)
++		}
++		if rgb, ok := c.(termenv.RGBColor); ok {
++			r, g, b := hexRGB(string(rgb))
++			if got := termenv.ConvertToRGB(rgb).Hex(); got != hexOf(r, g, b) {
++				fail(ht, "ConvertToRGB(%q).Hex() = %q", rgb, got)
++			}
++		}
++		count("ok")
++	})
++}
++
++type styleStep struct {
++	name string
++	seq  string // expected parameter text, "" for none
++}
++
++func genColor(tc hegel.TestCase, allowNoColor bool) (termenv.Color, string) {
++	switch n(tc, 0, 4) {
++	case 0:
++		return nil, ""
++	case 1:
++		c := termenv.ANSIColor(n(tc, 0, 15))
++		return c, "ansi"
++	case 2:
++		c := termenv.ANSI256Color(n(tc, 0, 255))
++		return c, "ansi256"
++	case 3:
++		if allowNoColor && chance(tc, 30) {
++			return termenv.NoColor{}, "nocolor"
++		}
++		return termenv.RGBColor(genRGBHex(tc, true)), "rgb"
++	default:
++		return termenv.RGBColor(genRGBHex(tc, true)), "rgb"
++	}
++}
++
++// genStyle builds a Style through its methods and returns the parameter texts the SGR table
++// gives for each step (a nil colour adds nothing; NoColor is documented as a nop).
++func genStyle(tc hegel.TestCase, p termenv.Profile, text string, allowNoColor bool) (termenv.Style, []string, bool) {
++	st := p.String(text)
++	var seqs []string
++	sawNoColor := false
++	for i := n(tc, 0, 5); i > 0; i-- {
++		switch n(tc, 0, 9) {
++		case 0:
++			st = st.Bold()
++			seqs = append(seqs, "1")
++		case 1:
++			st = st.Faint()
++			seqs = append(seqs, "2")
++		case 2:
++			st = st.Italic()
++			seqs = append(seqs, "3")
++		case 3:
++			st = st.Underline()
++			seqs = append(seqs, "4")
++		case 4:
++			st = st.Overline()
++			seqs = append(seqs, "53")
++		case 5:
++			st = st.Blink()
++			seqs = append(seqs, "5")
++		case 6:
++			st = st.Reverse()
++			seqs = append(seqs, "7")
++		case 7:
++			st = st.CrossOut()
++			seqs = append(seqs, "9")
++		default:
++			c, kind := genColor(tc, allowNoColor)
++			bg := chance(tc, 50)
++			if bg {
++				st = st.Background(c)
++			} else {
++				st = st.Foreground(c)
++			}
++			switch kind {
++			case "":
++			case "nocolor":
++				sawNoColor = true
++			default:
++				seqs = append(seqs, seqOf(c, bg))
++			}
++		}
++	}
++	return st, seqs, sawNoColor
++}
++
++func styledModel(p termenv.Profile, seqs []string, text string) string {
++	if p == termenv.Ascii || len(seqs) == 0 {
++		return text
++	}
++	return "\x1b[" + strings.Join(seqs, ";") + "m" + text + "\x1b[0m"
++}
++
++var texts = []string{"", "x", "hello", "日本", "a b", "\x1b[1m"}
++
++func TestHegelStyledFollowsTheSGRTable(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := pick(ht, profiles)
++		text := pick(ht, texts)
++		st, seqs, sawNoColor := genStyle(ht, p, text, true)
++		note(ht, "profile %s text %q steps %v", p.Name(), text, seqs)
++		got := st.String()
++		if sawNoColor && p != termenv.Ascii {
++			count("nocolor-skipped") // termenv/3
++		} else if want := styledModel(p, seqs, text); got != want {
++			fail(ht, "%s Style %v on %q = %q, want %q", p.Name(), seqs, text, got, want)
++		}
++		if got2 := st.Styled(text); got2 != got {
++			fail(ht, "Styled(%q) = %q, String() = %q", text, got2, got)
++		}
++		// String(a, b) joins with a space; Width is the text's width.
++		parts := []string{pick(ht, texts), pick(ht, texts)}
++		joined := strings.Join(parts, " ")
++		if got := termenv.String(parts...).String(); got != joined {
++			fail(ht, "String(%q) = %q", parts, got)
++		}
++		if w := p.String(text).Width(); w != termenv.String(text).Width() {
++			fail(ht, "Width differs between profiles: %d vs %d", w, termenv.String(text).Width())
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- Profile.Color
++
++func TestHegelProfileColorParsesTheDocumentedForms(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := pick(ht, profiles)
++		var s string
++		var want termenv.Color
++		switch n(ht, 0, 4) {
++		case 0:
++			s = genRGBHex(ht, false)
++			want = p.Convert(termenv.RGBColor(s))
++		case 1:
++			i := n(ht, 0, 15)
++			s = strconv.Itoa(i)
++			want = p.Convert(termenv.ANSIColor(i))
++		case 2:
++			i := n(ht, 16, 255)
++			s = strconv.Itoa(i)
++			want = p.Convert(termenv.ANSI256Color(i))
++		case 3:
++			s = pick(ht, []string{"", "#", "#abcd", "#gggggg", "red", "1e2", "0x10", " 5", "5 ", "#12345", "#1234567", "rgb:00/00/00"})
++			want = nil
++		default:
++			// Out of the documented 0–255 range: nil expected (termenv/4 pinned).
++			count("out-of-range-skipped")
++			return
++		}
++		note(ht, "%s.Color(%q)", p.Name(), s)
++		got := p.Color(s)
++		if want == nil {
++			if p == termenv.Ascii && strings.HasPrefix(s, "#") {
++				want = termenv.NoColor{} // Ascii.Convert does not look at the hex string
++			} else if got != nil {
++				fail(ht, "%s.Color(%q) = %#v, want nil", p.Name(), s, got)
++			}
++		}
++		if want == nil {
++			count("invalid")
++			return
++		}
++		if got != want {
++			fail(ht, "%s.Color(%q) = %#v, want %#v", p.Name(), s, got, want)
++		}
++		if p == termenv.Ascii {
++			if got != (termenv.NoColor{}) {
++				fail(ht, "Ascii.Color(%q) = %#v", s, got)
++			}
++		} else if _, ok := got.(termenv.NoColor); ok {
++			fail(ht, "%s.Color(%q) = NoColor", p.Name(), s)
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- template helpers
++
++func TestHegelTemplateHelpersRenderStyles(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		p := pick(ht, profiles)
++		text := pick(ht, []string{"x", "hello", "日本"})
++		var tpl string
++		var seqs []string
++		switch n(ht, 0, 3) {
++		case 0:
++			name := pick(ht, []string{"Bold", "Faint", "Italic", "Underline", "Overline", "Blink", "Reverse", "CrossOut"})
++			tpl = fmt.Sprintf("{{ %s %q }}", name, text)
++			seqs = []string{map[string]string{"Bold": "1", "Faint": "2", "Italic": "3", "Underline": "4", "Overline": "53", "Blink": "5", "Reverse": "7", "CrossOut": "9"}[name]}
++		case 1:
++			fg := genColorString(ht)
++			tpl = fmt.Sprintf("{{ Foreground %q %q }}", fg, text)
++			if c := p.Color(fg); c != nil {
++				seqs = append(seqs, seqOf(c, false))
++			}
++		case 2:
++			bg := genColorString(ht)
++			tpl = fmt.Sprintf("{{ Background %q %q }}", bg, text)
++			if c := p.Color(bg); c != nil {
++				seqs = append(seqs, seqOf(c, true))
++			}
++		default:
++			fg, bg := genColorString(ht), genColorString(ht)
++			tpl = fmt.Sprintf("{{ Color %q %q %q }}", fg, bg, text)
++			if c := p.Color(fg); c != nil {
++				seqs = append(seqs, seqOf(c, false))
++			}
++			if c := p.Color(bg); c != nil {
++				seqs = append(seqs, seqOf(c, true))
++			}
++		}
++		note(ht, "profile %s template %s", p.Name(), tpl)
++		tmpl, err := template.New("t").Funcs(termenv.TemplateFuncs(p)).Parse(tpl)
++		if err != nil {
++			fail(ht, "parse %s: %v", tpl, err)
++		}
++		var buf bytes.Buffer
++		if err := tmpl.Execute(&buf, nil); err != nil {
++			fail(ht, "execute %s: %v", tpl, err)
++		}
++		if p != termenv.Ascii {
++			for _, s := range seqs {
++				if s == "" {
++					count("nocolor-skipped") // termenv/3 via a Convert to NoColor cannot happen here; kept for symmetry
++					return
++				}
++			}
++		}
++		if got, want := buf.String(), styledModel(p, seqs, text); got != want {
++			fail(ht, "%s %s = %q, want %q", p.Name(), tpl, got, want)
++		}
++		count("ok")
++	})
++}
++
++func genColorString(tc hegel.TestCase) string {
++	switch n(tc, 0, 2) {
++	case 0:
++		return genRGBHex(tc, true)
++	case 1:
++		return strconv.Itoa(n(tc, 0, 255))
++	default:
++		return pick(tc, []string{"", "red", "#abcd"})
++	}
++}
++
++// ---------------------------------------------------------------- the terminal's colours
++
++type fakeEnv map[string]string
++
++func (e fakeEnv) Environ() []string {
++	var out []string
++	for k, v := range e {
++		out = append(out, k+"="+v)
++	}
++	sort.Strings(out)
++	return out
++}
++
++func (e fakeEnv) Getenv(k string) string { return e[k] }
++
++// fakeTTY answers the OSC 10/11 and cursor-position queries with a canned reply.
++type fakeTTY struct {
++	in  *bytes.Buffer
++	out bytes.Buffer
++}
++
++func (f *fakeTTY) Read(p []byte) (int, error)  { return f.in.Read(p) }
++func (f *fakeTTY) Write(p []byte) (int, error) { return f.out.Write(p) }
++func (f *fakeTTY) Fd() uintptr                 { return 0 }
++
++func newOutput(reply string, env fakeEnv) (*termenv.Output, *fakeTTY) {
++	f := &fakeTTY{in: bytes.NewBufferString(reply)}
++	return termenv.NewOutput(f, termenv.WithUnsafe(), termenv.WithTTY(true), termenv.WithEnvironment(env)), f
++}
++
++// x11Reply renders an rgb: reply with four-digit components (the form every terminal sends).
++func x11Reply(osc int, r, g, b int, tail string) string {
++	return fmt.Sprintf("\x1b]%d;rgb:%02x%02x/%02x%02x/%02x%02x%s", osc, r, r, g, g, b, b, tail)
++}
++
++func cursorReply(tc hegel.TestCase) string {
++	return fmt.Sprintf("\x1b[%d;%dR", n(tc, 1, 999), n(tc, 1, 999))
++}
++
++func isDark(hex string) bool {
++	c, _ := colorful.Hex(hex)
++	_, _, l := c.Hsl()
++	return l < 0.5
++}
++
++func TestHegelOutputReadsTheTerminalsColours(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		r, g, b := n(ht, 0, 255), n(ht, 0, 255), n(ht, 0, 255)
++		hex := hexOf(r, g, b)
++		env := fakeEnv{"TERM": pick(ht, []string{"xterm", "xterm-256color", "alacritty", "foot"})}
++		var wantFG, wantBG termenv.Color = termenv.ANSIColor(7), termenv.ANSIColor(0)
++		if chance(ht, 50) {
++			f, bb := n(ht, 0, 15), n(ht, 0, 15)
++			env["COLORFGBG"] = fmt.Sprintf("%d;%d", f, bb)
++			if chance(ht, 30) {
++				env["COLORFGBG"] = fmt.Sprintf("%d;default;%d", f, bb)
++			}
++			wantFG, wantBG = termenv.ANSIColor(f), termenv.ANSIColor(bb)
++		}
++		answers := chance(ht, 70)
++		tail := pick(ht, []string{"\a", "\x1b\\"})
++		junk := ""
++		if chance(ht, 20) {
++			junk = pick(ht, []string{"x", "\r\n", "junk"})
++		}
++		queryFG := chance(ht, 50)
++		osc := 11
++		if queryFG {
++			osc = 10
++		}
++		reply := junk
++		if answers {
++			reply += x11Reply(osc, r, g, b, tail)
++		}
++		reply += cursorReply(ht)
++		note(ht, "env %v reply %q", env.Environ(), reply)
++
++		o, f := newOutput(reply, env)
++		var got termenv.Color
++		if queryFG {
++			got = o.ForegroundColor()
++		} else {
++			got = o.BackgroundColor()
++		}
++		want := wantBG
++		if queryFG {
++			want = wantFG
++		}
++		if answers {
++			want = termenv.RGBColor(hex)
++		}
++		if got != want {
++			fail(ht, "colour from reply %q with %v = %#v, want %#v", reply, env.Environ(), got, want)
++		}
++		if wantQ := fmt.Sprintf("\x1b]%d;?\x1b\\\x1b[6n", osc); f.out.String() != wantQ {
++			fail(ht, "queries written %q, want %q", f.out.String(), wantQ)
++		}
++		if f.in.Len() != 0 {
++			fail(ht, "%d bytes of the reply %q left unread", f.in.Len(), reply)
++		}
++		if !queryFG {
++			// HasDarkBackground re-queries; give it the same reply.
++			o2, _ := newOutput(reply, env)
++			wantDark := isDark(termenv.ConvertToRGB(want).Hex())
++			if dark := o2.HasDarkBackground(); dark != wantDark {
++				fail(ht, "HasDarkBackground with %#v = %v, want %v", want, dark, wantDark)
++			}
++		}
++		// A multiplexer or dumb terminal is never queried.
++		env2 := fakeEnv{"TERM": pick(ht, []string{"screen", "screen-256color", "tmux-256color", "dumb"})}
++		for k, v := range env {
++			if k != "TERM" {
++				env2[k] = v
++			}
++		}
++		o3, f3 := newOutput(reply, env2)
++		if got := o3.ForegroundColor(); got != wantFG || f3.out.Len() != 0 {
++			fail(ht, "%s: ForegroundColor = %#v (want %#v), wrote %q", env2["TERM"], got, wantFG, f3.out.String())
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- the environment rules
++
++func TestHegelEnvColorProfileFollowsNoColorAndCliColor(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		env := fakeEnv{"TERM": pick(ht, []string{"xterm-256color", "xterm", "dumb", "linux", "alacritty", "screen"})}
++		if chance(ht, 30) {
++			env["COLORTERM"] = pick(ht, []string{"truecolor", "24bit", "yes", "no"})
++		}
++		if chance(ht, 30) {
++			env["NO_COLOR"] = pick(ht, []string{"1", "true", "0", ""})
++		}
++		if chance(ht, 30) {
++			env["CLICOLOR"] = pick(ht, []string{"0", "1", ""})
++		}
++		if chance(ht, 30) {
++			env["CLICOLOR_FORCE"] = pick(ht, []string{"0", "1", "true", ""})
++		}
++		tty := chance(ht, 80)
++		note(ht, "env %v tty %v", env.Environ(), tty)
++		f := &fakeTTY{in: new(bytes.Buffer)}
++		o := termenv.NewOutput(f, termenv.WithTTY(tty), termenv.WithEnvironment(env))
++		base := o.ColorProfile()
++		if !tty && base != termenv.Ascii {
++			fail(ht, "ColorProfile without a TTY = %s", base.Name())
++		}
++		if !tty {
++			count("no-tty")
++		}
++		forced := env["CLICOLOR_FORCE"] != "" && env["CLICOLOR_FORCE"] != "0"
++		noColor := env["NO_COLOR"] != "" || env["CLICOLOR"] == "0" && !forced
++		if got := o.EnvNoColor(); got != noColor {
++			fail(ht, "EnvNoColor with %v = %v, want %v", env.Environ(), got, noColor)
++		}
++		want := base
++		switch {
++		case noColor:
++			want = termenv.Ascii
++		case forced && base == termenv.Ascii:
++			want = termenv.ANSI
++		}
++		if got := o.EnvColorProfile(); got != want {
++			fail(ht, "EnvColorProfile with %v = %s, want %s", env.Environ(), got.Name(), want.Name())
++		}
++		if o.Profile != want {
++			fail(ht, "NewOutput's profile = %s, EnvColorProfile %s", o.Profile.Name(), want.Name())
++		}
++		// Spot rules the comments state.
++		if tty {
++			ct := strings.ToLower(env["COLORTERM"])
++			switch {
++			case (ct == "truecolor" || ct == "24bit") && !strings.HasPrefix(env["TERM"], "screen"):
++				if base != termenv.TrueColor {
++					fail(ht, "COLORTERM=%s TERM=%s: %s", env["COLORTERM"], env["TERM"], base.Name())
++				}
++			case ct == "yes" || ct == "true":
++				if base != termenv.ANSI256 {
++					fail(ht, "COLORTERM=%s: %s", env["COLORTERM"], base.Name())
++				}
++			case env["TERM"] == "dumb":
++				if base != termenv.Ascii {
++					fail(ht, "TERM=dumb: %s", base.Name())
++				}
++			case strings.Contains(env["TERM"], "256color"):
++				if base != termenv.ANSI256 {
++					fail(ht, "TERM=%s: %s", env["TERM"], base.Name())
++				}
++			}
++		}
++		count("ok")
++	})
++}
++
++// ---------------------------------------------------------------- pins
++
++// termenv/1: the grey candidate of the 256-colour conversion averages cube indices.
++func TestHegelPinConvertGreys(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		hex  string
++		want int
++	}{{"#808080", 244}, {"#bcbcbc", 250}, {"#121212", 233}, {"#eeeeee", 255}} {
++		if got := termenv.ANSI256.Convert(termenv.RGBColor(c.hex)); got != termenv.ANSI256Color(c.want) {
++			t.Errorf("ANSI256.Convert(%q) = %v, want ANSI256Color(%d)", c.hex, got, c.want)
++		}
++	}
++}
++
++// termenv/2: RGBColor.Sequence truncates a channel by one for 24 of the 256 values (upstream #217).
++func TestHegelPinRGBSequenceTruncation(t *testing.T) {
++	defer guard(t)
++	if got, want := termenv.RGBColor("#657084").Sequence(false), "38;2;101;112;132"; got != want {
++		t.Errorf("RGBColor(%q).Sequence(false) = %q, want %q", "#657084", got, want)
++	}
++	bad := 0
++	for v := 0; v < 256; v++ {
++		if got, want := termenv.RGBColor(hexOf(v, 0, 0)).Sequence(false), fmt.Sprintf("38;2;%d;0;0", v); got != want {
++			bad++
++		}
++	}
++	if bad != 0 {
++		t.Errorf("%d of 256 channel values come out one too low", bad)
++	}
++}
++
++// termenv/3: a NoColor (or invalid RGBColor) in a style adds an empty SGR parameter, a reset.
++func TestHegelPinNoColorInAStyle(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		got, want string
++	}{
++		{termenv.String("x").Bold().Foreground(termenv.NoColor{}).String(), "\x1b[1mx\x1b[0m"},
++		{termenv.String("x").Foreground(termenv.NoColor{}).Bold().String(), "\x1b[1mx\x1b[0m"},
++		{termenv.String("x").Foreground(termenv.Ascii.Convert(termenv.ANSIColor(1))).Underline().String(), "\x1b[4mx\x1b[0m"},
++		{termenv.String("x").Bold().Background(termenv.RGBColor("#zz")).String(), "\x1b[1mx\x1b[0m"},
++	} {
++		if c.got != c.want {
++			t.Errorf("styled = %q, want %q", c.got, c.want)
++		}
++	}
++}
++
++// termenv/4: Profile.Color accepts numbers outside 0–255, and the colour then panics.
++func TestHegelPinProfileColorOutOfRange(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"256", "300", "-1", "99999"} {
++		c := termenv.TrueColor.Color(s)
++		if c == nil {
++			continue
++		}
++		t.Errorf("TrueColor.Color(%q) = %#v (sequence %q), want nil", s, c, c.Sequence(false))
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					t.Errorf("TrueColor.Color(%q).String() panics: %v", s, r)
++				}
++			}()
++			_ = c.(fmt.Stringer).String()
++		}()
++	}
++}
++
++// termenv/5: COLORFGBG with a number outside 0–15 becomes an ANSIColor that panics in
++// HasDarkBackground.
++func TestHegelPinColorFGBGOutOfRange(t *testing.T) {
++	defer guard(t)
++	o, _ := newOutput("\x1b[1;1R", fakeEnv{"TERM": "xterm", "COLORFGBG": "7;300"})
++	bg := o.BackgroundColor()
++	if bg != termenv.ANSIColor(0) && bg != termenv.ANSIColor(7) {
++		t.Errorf("BackgroundColor with COLORFGBG=7;300 = %#v, want a default", bg)
++	}
++	o2, _ := newOutput("\x1b[1;1R", fakeEnv{"TERM": "xterm", "COLORFGBG": "7;300"})
++	_ = o2.HasDarkBackground()
++}
++
++// termenv/6: a malformed colour reply of the right length panics the parser (upstream #144).
++func TestHegelPinMalformedColourReplyPanics(t *testing.T) {
++	defer guard(t)
++	for _, reply := range []string{"\x1b]10;rgb:111111111111111\a", "\x1b]10;rgb:1/11111111111/1\a", "\x1b]10;rgb:11111111111/1111\a"} {
++		o, _ := newOutput(reply+"\x1b[1;1R", fakeEnv{"TERM": "xterm", "COLORFGBG": "15;0"})
++		if got := o.ForegroundColor(); got != termenv.ANSIColor(15) {
++			t.Errorf("ForegroundColor with reply %q = %#v, want the COLORFGBG fallback", reply, got)
++		}
++	}
++}
++
++// termenv/7: colour replies are judged by byte length: two-digit and rgba: replies are
++// rejected, five- and three-digit components accepted.
++func TestHegelPinColourReplyComponentWidths(t *testing.T) {
++	defer guard(t)
++	for _, c := range []struct {
++		reply string
++		want  termenv.Color
++	}{
++		{"\x1b]11;rgb:12/34/56\a", termenv.RGBColor("#123456")},
++		{"\x1b]11;rgb:1/3/5\a", termenv.RGBColor("#113355")},
++		{"\x1b]11;rgba:1212/3434/5656/ffff\a", termenv.RGBColor("#123456")},
++		{"\x1b]11;rgb:12121/3434/565\a", termenv.ANSIColor(0)},
++	} {
++		o, _ := newOutput(c.reply+"\x1b[1;1R", fakeEnv{"TERM": "xterm"})
++		if got := o.BackgroundColor(); got != c.want {
++			t.Errorf("BackgroundColor with reply %q = %#v, want %#v", c.reply, got, c.want)
++		}
++	}
++}
++
++// ---------------------------------------------------------------- fixed examples
++
++func TestHegelExamples(t *testing.T) {
++	defer guard(t)
++	if got := termenv.String("Hello").Bold().Foreground(termenv.ANSI256.Color("#ff0000")).String(); got != "\x1b[1;38;5;196mHello\x1b[0m" {
++		t.Errorf("styled = %q", got)
++	}
++	if got := termenv.ANSI.Convert(termenv.RGBColor("#ff0000")); got != termenv.ANSIColor(9) {
++		t.Errorf("ANSI.Convert(red) = %v", got)
++	}
++	if got := termenv.TrueColor.Color("#abcdef").Sequence(true); got != "48;2;171;205;239" {
++		t.Errorf("sequence = %q", got)
++	}
++	for i := 0; i < 256; i++ {
++		if got := termenv.ANSI256Color(i).String(); got != paletteHex(i) {
++			t.Errorf("palette %d: %s vs %s", i, got, paletteHex(i))
++		}
++	}
++}
