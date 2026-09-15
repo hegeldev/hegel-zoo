@@ -119,3 +119,4 @@ segment (the crate's documented deviation, below).
 - 2026-09-15: base bumped 000a665b745a → fd89f638d15f (2026-09-15, "Add regression test for symlinks inside install directory (#21693)"; 0.0.81); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped fd89f638d15f → a064ab2f6761 (2026-09-15, "Add regression test for `--target .` (#21695)"; 0.0.81); 6 bug(s) still reproduce. 126 tests pass.
 - 2026-09-15: base bumped a064ab2f6761 → 2c35bb31de15 (2026-09-15, "Use Packse scenarios to speed up tool tests (#21634)"; 0.0.81); 6 bug(s) still reproduce. 126 tests pass.
+- 2026-09-15: base bumped 2c35bb31de15 → ad552557b635 (2026-09-15, "Preserve local path intent when merging dependency metadata (#20631)"; 0.0.82); 6 bug(s) still reproduce. 127 tests pass.
