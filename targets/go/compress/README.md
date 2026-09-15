@@ -109,3 +109,4 @@ offset); the frame-header probe written before the zstd properties (the canned z
 - Not covered: the `huff0`/`fse` primitives, `zip`, `zstd`'s skippable frames and `BuildDict`,
   S2's index and `--long`-style options, the `flate.NewReaderOpts` callbacks (`WithEobCallback`,
   `WithResumeFrom`, `WithPartialBlock`).
+- 2026-09-15: base bumped a1c49c64983e → de8f55df9fb3 (2026-09-15, "ossfuzz: include zstd seqdec path tests (#1222)"; v1.20.0+); 4 bug(s) still reproduce. 9 tests pass.
