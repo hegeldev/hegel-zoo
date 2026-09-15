@@ -1,7 +1,7 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`, `filepicker`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`, `filepicker`, `tree`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Nine slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Ten slices so far: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
 `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
 for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
@@ -11,10 +11,11 @@ soft-wrapped rows), `paginator` (`paginator/hegel_test.go`) and `table`
 `list` (`list/hegel_test.go`), `help` (`help/hegel_test.go`) and `progress`
 (`progress/hegel_test.go`, package `progress`, internal for the frame messages and the shown
 percentage) and `filepicker` (`filepicker/hegel_test.go`, package `filepicker`, internal for
-the window indices; it builds its directory trees under the system temp directory), with the
+the window indices; it builds its directory trees under the system temp directory) and `tree`
+(`tree/hegel_test.go`, package `tree`, internal for the viewport and the help view), with the
 shared harness in `internal/zootest`.
 Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table ./list
-./help ./progress ./filepicker`.
+./help ./progress ./filepicker ./tree`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -141,6 +142,20 @@ records bugs.
   the selection and neither more rows than the height nor fewer than the entries allow, and
   after an enter `DidSelectFile`/`DidSelectDisabledFile` must report the entry it was pressed
   on per the allowed flags and types.
+- **tree: a random tree and a mirror of the selection, the offsets and the scroll.** Each case
+  generates a tree three levels deep (leaves and `Root` nodes, some closed, values from a
+  word list with a few multi-line, empty and over-wide ones), a width and a height, and
+  sometimes a scroll-off, hidden help, another cursor character, other open/closed characters
+  or the rounded enumerator, then drives the model for up to 45 steps: every default binding
+  through `Update` (each of its keys), `SetYOffset`, `SetSize`/`SetHeight`/`SetWidth`,
+  `SetScrollOff`, `SetShowHelp`, `SetNodes`, `SetCursorCharacter`. The mirror lays the visible
+  nodes out in DFS order with their node and line offsets and their rendered rows (indents,
+  enumerators, indicators, continuation lines), keeps the selection with the library's clamp,
+  the viewport height as `SetSize` computes it, and the viewport offset with the scroll-off
+  rule mirrored line for line; after each step `YOffset`, `Size`, `NodeAtCurrentOffset`,
+  `Node(i)`, every visible node's `YOffset`/`LineOffset`/`IsSelected`, `Width`/`Height`, the
+  viewport's height and offset, the number of lines of `View` and each row of the viewport
+  window must match, and the selected node's line must be inside the window.
 
 ## Properties
 
@@ -164,6 +179,7 @@ records bugs.
 | `TestHegelProgressDrawsTheModel` | `ViewAs` rune by rune vs the options model: fill and empty runes, the solid, blend, scaled and colour-function colours, the percentage text, the width |
 | `TestHegelProgressSettles` | the setters' clamping and commands, stale and foreign frames ignored, the spring driven to equilibrium |
 | `TestHegelFilepickerFollowsTheModel` | every binding, resize and setter over a random directory tree vs the listing/window/selection mirror: the paths, the indices, the lines of `View`, the window invariants, the `DidSelect` reports |
+| `TestHegelTreeFollowsTheModel` | every binding and setter over a random tree vs the layout/selection/scroll mirror: the offsets of every node, the selection, the viewport height and offset, the rows of `View`, the selection in view |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -246,6 +262,22 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/72 | medium | filepicker: after enter selects a directory the picker has already entered it, so DidSelectFile looks at the new listing's first entry and a directory holding only files, or nothing, is never reported |
 | bubbles/73 | low | filepicker: Back restores the parent's saved window verbatim, so after a resize inside a subdirectory the parent shows the old window: more rows than the height, or fewer |
 | bubbles/74 | low | filepicker: a negative height (AutoHeight from a terminal under six rows) is accepted and added by the page keys, so PageUp moves down and PageDown up, off the listing |
+| bubbles/75 | medium | tree: SetNodes(nil) panics, though New(nil) and the other methods accept a nil root |
+| bubbles/76 | medium | tree: hidden nodes keep their offsets, so the selection lands on them, the cursor drifts down and reaches past the rendered lines and panics |
+| bubbles/77 | medium | tree: toggling the full help with ? does not resize the viewport, so the view grows by the extra help lines past Height |
+| bubbles/78 | medium | tree: SetSize does not scroll the viewport, so a smaller height leaves the selected node out of view |
+| bubbles/79 | medium | tree: a node wider than the width is word-wrapped by the tree style, so every row below it shifts and the cursor is drawn on the wrong line |
+| bubbles/80 | low | tree: Node.SetValue on a child changes GivenValue but not what is drawn |
+| bubbles/81 | low | tree: Root().Value() renders the open/closed indicator twice |
+| bubbles/82 | low | tree: New(nil) and NewNode() draw the root as <nil> |
+| bubbles/83 | low | tree: a TreeStyle with a top frame shifts the cursor up by the frame's height |
+| bubbles/84 | low | tree: a TreeStyle border loses its right edge: the width leaves no room for it and MaxWidth cuts it |
+| bubbles/85 | low | tree: a node style with vertical padding breaks the line offsets, so the cursor is drawn on the padding rows |
+| bubbles/86 | medium | tree: the children of a multi-line node have line offsets short by its extra rows, so the cursor lands on the parent's continuation line |
+| bubbles/87 | low | tree: the spacebar page-down binding is a plain space, but a v2 key press reports space by name, so it never fires |
+| bubbles/88 | low | tree: an open node with an empty value counts one line too few, so its later siblings' offsets and cursor are off by one |
+| bubbles/89 | low | tree: SetSize measures the help before giving it the new width, so with the full help a width change sizes the viewport by the old help height |
+| bubbles/90 | low | tree: a SetNodes that clamps the selection to the root of a smaller tree does not scroll, so the root is selected but out of view |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -325,6 +357,25 @@ counted before an Open with the selection out of range, /72 as a `DidSelect` rep
 /69, /70 and /71 are pinned only (readable trees, absolute paths, the trailing newline
 modelled); each is pinned.
 
+For tree (744 lines plus the node's 400, read in full first, with lipgloss's tree renderer
+beside it) eleven of the sixteen were on paper or found by a probe file — the unguarded
+`setYOffsets` in `SetNodes`, hidden children still counted, `?` without a `SetSize`, `SetSize`
+without a scroll, the `TreeStyle.Width` wrap, the child `SetValue`, the doubled indicator,
+`<nil>`, the frame and the border, the padded node style — and the property found bubbles/86
+(children of a multi-line node), /87 (the spacebar), /88 (an empty-valued parent) and /89
+(the help measured at the old width) and /90 (the early return after `SetNodes`). The mirror computes the correct line offsets and
+scrolls by the library's (short by the multi-line ancestors' rows), so /86 and /88 are counted
+per node and the view check skipped while the selected node is under a multi-line ancestor;
+/77 is counted as a view taller than the height while `ShowAll` differs from its value at the
+last `SetSize`, /89 while the help's height differed before and after that call, /78 as the
+selected line outside the window after a resize with no scroll since, /90 as the same after an
+update that took the early return with the offset past the root, /79 whenever a rendered
+row is wider than the width (the scroll is then taken from the library until the content is
+re-rendered), /87 by sending the spacebar and expecting nothing; /75, /76 and /80–/85 are
+pinned only (no nil root, no hidden nodes, no `SetValue`, no styles in the property); each is
+pinned. Hiding any child but the first also panics inside lipgloss's renderer (lipgloss/30,
+recorded in `go/lipgloss`).
+
 ## Not bugs (modelled as documented)
 
 - Tab keeps the typed prefix's case and appends the suggestion's remainder (`bb` + `BbAa` →
@@ -376,11 +427,21 @@ modelled); each is pinned.
   styled as a symlink, not a directory; a broken symlink does nothing on Open or enter and
   shows an empty target; `AllowedTypes` are suffixes (`e` matches `file`); `Path` keeps the
   last selection across navigation; the empty-directory message is padded to the height.
+- tree: `PageDown`/`PageUp` move by the viewport's height in nodes, not lines, and by a
+  negative height when the help is taller than the component (so they move the other way);
+  the scroll-off is `min(SetScrollOff, height/2)` and only one side is corrected per move;
+  a leaf toggled reports `IsOpen`; an empty root value
+  with empty indicator characters draws a blank first row; a root value of type string has
+  its ANSI stripped while children keep theirs; `SetNodes` re-applies the enumerator and the
+  indenter; values wider than the width but not wider than the width minus the cursor column
+  are cut, not wrapped.
 
 ## Not covered (yet)
 
-`tree`, `key`,
-`timer`/`stopwatch`/`spinner`, `cursor` blinking; help's styles; progress's `PercentageStyle`
+`key`,
+`timer`/`stopwatch`/`spinner`, `cursor` blinking; tree's styles beyond the pinned frames and
+paddings (the selected/parent/root colours), custom indenters and multi-line enumerators,
+`SetViewportYOffset`, `Node.Close`/`Open` on a node other than the selected one, help's styles; progress's `PercentageStyle`
 and springs outside frequency 1–60 / damping 0.1–2; filepicker's styles, a custom `Cursor`,
 directories that change underneath it beyond `ShowHidden`, `IsHidden` on Windows; textinput's clipboard paste (`Paste` reads the
 system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`MinHeight`,

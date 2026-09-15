@@ -5694,6 +5694,838 @@ index 0000000..5cf9f7e
 +		t.Fatalf("EchoNone field is %d cells wide empty and %d with %q", empty, w, "ab")
 +	}
 +}
+diff --git a/tree/hegel_test.go b/tree/hegel_test.go
+new file mode 100644
+index 0000000..0ed8288
+--- /dev/null
++++ b/tree/hegel_test.go
+@@ -0,0 +1,826 @@
++package tree
++
++// Hegel zoo: properties of the tree component against a mirror of its
++// selection, its line offsets, its viewport scroll and its rendered rows.
++//
++// Run with BUBBLES_COLLECT=1 to record mismatches instead of failing.
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	tea "charm.land/bubbletea/v2"
++	"charm.land/lipgloss/v2"
++	ltree "charm.land/lipgloss/v2/tree"
++	"github.com/charmbracelet/x/ansi"
++	"hegel.dev/go/hegel"
++
++	"charm.land/bubbles/v2/internal/zootest"
++)
++
++// ---------------------------------------------------------------- the model
++
++// tn mirrors one node: its value, whether it was made with Root (and so
++// carries an open/closed indicator), its open state and its children.
++type tn struct {
++	val  string
++	rows []string
++	sub  bool
++	open bool
++	kids []*tn
++	node *Node
++
++	// filled by layout
++	parent *tn
++	last   bool
++	pre    string // the ancestors' indents
++	y      int    // offset in nodes
++	line   int    // offset in rendered lines
++	shift  int    // lines the library's offset is short by (bubbles/86)
++}
++
++var words = []string{"a", "bb", "ccc", "dddd", "emacs", "zsh", "go.mod", "x", "README", "tools", "img.png", "b2", "q"}
++
++func genValue(tc hegel.TestCase) string {
++	switch {
++	case zootest.Chance(tc, 3):
++		return ""
++	case zootest.Chance(tc, 2):
++		zootest.Count("gen-wide")
++		return strings.Repeat(zootest.Pick(tc, words)+"-", zootest.N(tc, 8, 14))
++	case zootest.Chance(tc, 10):
++		n := zootest.N(tc, 2, 3)
++		rows := make([]string, n)
++		for i := range rows {
++			rows[i] = zootest.Pick(tc, words)
++		}
++		zootest.Count("gen-multiline")
++		return strings.Join(rows, "\n")
++	}
++	return zootest.Pick(tc, words)
++}
++
++func genTree(tc hegel.TestCase, depth int) *tn {
++	n := &tn{val: genValue(tc)}
++	n.rows = strings.Split(n.val, "\n")
++	if depth == 0 || zootest.Chance(tc, 45) {
++		return n // a leaf
++	}
++	n.sub = true
++	n.open = !zootest.Chance(tc, 25)
++	k := zootest.N(tc, 0, 4)
++	for i := 0; i < k; i++ {
++		n.kids = append(n.kids, genTree(tc, depth-1))
++	}
++	return n
++}
++
++// build makes the library's nodes for the mirror (and remembers them).
++func build(n *tn) *Node {
++	if !n.sub {
++		return nil // leaves are added to the parent as strings
++	}
++	root := Root(n.val)
++	for _, k := range n.kids {
++		if k.sub {
++			root.Child(build(k))
++		} else {
++			root.Child(k.val)
++		}
++	}
++	n.node = root
++	kids := root.ChildNodes()
++	for i, k := range n.kids {
++		if !k.sub {
++			k.node = kids[i]
++		}
++	}
++	if !n.open {
++		root.Close()
++	}
++	return root
++}
++
++// tm mirrors the model: the tree, the selection, the sizes and the viewport.
++type tm struct {
++	root     *tn
++	vis      []*tn
++	total    int
++	sel      int
++	w, h     int
++	vh       int // the viewport's height (h minus the help at the last SetSize)
++	vpY      int
++	so       int
++	showHelp bool
++	showAll  bool
++	sizedAll bool // ShowAll at the last SetSize
++	lastEnum string
++	openCh   string
++	closedCh string
++	cursor   string
++
++	// the content as rendered at the last updateViewport
++	rows    []string
++	wide    bool
++	renderW int
++
++	sized     bool // a resize since the last scroll fix (bubbles/78)
++	helpStale bool // the viewport was sized by the help at the old width (bubbles/89)
++	rootStale bool // the selection was clamped to the root without a scroll (bubbles/90)
++}
++
++func (s *tm) layout() {
++	s.vis = s.vis[:0]
++	s.total = 0
++	s.walk(s.root, nil, false, "", 0)
++}
++
++func (s *tm) walk(n *tn, parent *tn, last bool, pre string, shift int) {
++	n.parent, n.last, n.pre, n.shift = parent, last, pre, shift
++	n.y = len(s.vis)
++	n.line = s.total
++	s.vis = append(s.vis, n)
++	s.total += len(n.rows)
++	if !n.open {
++		return
++	}
++	// The library's line offsets are short by the extra rows of every
++	// multi-line ancestor (bubbles/86) and by one for every earlier sibling
++	// (of the node or of an ancestor) that is an open, empty-valued node
++	// with children, whose own rendering drops its root line (bubbles/88).
++	short := 0
++	for i, k := range n.kids {
++		kpre := pre
++		if parent != nil { // the root's children carry no indent
++			if last {
++				kpre += "   "
++			} else {
++				kpre += "│  "
++			}
++		}
++		s.walk(k, n, i == len(n.kids)-1, kpre, shift+len(n.rows)-1+short)
++		if k.sub && k.val == "" && k.open && len(k.kids) > 0 {
++			short++
++		}
++	}
++}
++
++func (s *tm) indicator(n *tn) string {
++	if !n.sub {
++		return ""
++	}
++	ch := s.closedCh
++	if n.open {
++		ch = s.openCh
++	}
++	if ch != "" {
++		ch += " "
++	}
++	return ch
++}
++
++// nodeRows are the rendered lines of one node, without the cursor column.
++func (s *tm) nodeRows(n *tn) []string {
++	ind := s.indicator(n)
++	pad := strings.Repeat(" ", ansi.StringWidth(ind))
++	var out []string
++	if n.parent == nil {
++		out = append(out, ind+n.rows[0])
++		for _, r := range n.rows[1:] {
++			out = append(out, pad+r)
++		}
++		return out
++	}
++	enum := "├──"
++	indent := "│  "
++	if n.last {
++		enum = s.lastEnum
++		indent = "   "
++	}
++	out = append(out, n.pre+enum+ind+n.rows[0])
++	for _, r := range n.rows[1:] {
++		out = append(out, n.pre+indent+pad+r)
++	}
++	return out
++}
++
++// render mirrors updateViewport's SetContent: the cursor column joined to
++// the tree's rows, and whether any row is wider than the width (bubbles/79).
++func (s *tm) render() {
++	s.rows = s.rows[:0]
++	s.wide = false
++	s.renderW = s.w
++	cw := ansi.StringWidth(s.cursor)
++	blank := strings.Repeat(" ", cw) + " "
++	for i, n := range s.vis {
++		for j, r := range s.nodeRows(n) {
++			row := r
++			if s.cursor != "" {
++				if i == s.sel && j == 0 {
++					row = s.cursor + " " + r
++				} else {
++					row = blank + r
++				}
++			}
++			if ansi.StringWidth(row) > s.w {
++				s.wide = true
++			}
++			s.rows = append(s.rows, row)
++		}
++	}
++}
++
++func (s *tm) maxY() int { return max(0, s.total-s.vh) }
++
++func (s *tm) setContent() {
++	if s.vpY > s.maxY() {
++		s.vpY = s.maxY()
++	}
++}
++
++// update mirrors Model.updateViewport(movement).
++func (s *tm) update(movement int) {
++	s.sel = max(min(len(s.vis)-1, s.sel+movement), 0)
++	s.render()
++	s.setContent()
++	if s.sel == 0 && movement == 0 {
++		// The "initial render" early return: no scroll, whatever the
++		// viewport's offset (bubbles/90 when it is past the root).
++		s.rootStale = s.vpY > 0
++		return
++	}
++	s.sized = false
++	s.rootStale = false
++	// The library scrolls by its own line offset, short by the extra
++	// rows of multi-line ancestors (bubbles/86).
++	line := s.vis[s.sel].line - s.vis[s.sel].shift
++	height := max(0, min(s.vh, s.total-s.vpY)) // VisibleLineCount
++	if s.vh <= 0 {
++		height = 0
++	}
++	so := min(s.so, height/2)
++	minTop := max(line-so, 0)
++	minBottom := min(s.total-1, line+so)
++	if s.vpY > minTop {
++		s.vpY = min(max(minTop, 0), s.maxY())
++	} else if s.vpY+height < minBottom+1 {
++		s.vpY = min(max(minBottom-height+1, 0), s.maxY())
++	}
++}
++
++// setSize mirrors SetSize; before is the help's height as it was before the
++// call (SetSize measures it before giving the help its new width, bubbles/89).
++func (s *tm) setSize(m *Model, w, h int, before int) {
++	s.w, s.h = w, h
++	hv, now := 0, 0
++	if s.showHelp {
++		hv = before
++		now = lipgloss.Height(m.helpView())
++	}
++	s.vh = h - hv
++	s.helpStale = hv != now
++	s.sizedAll = s.showAll
++	s.sized = true
++}
++
++// helpHeight is the help view's height as the library measures it now.
++func helpHeight(m *Model) int { return lipgloss.Height(m.helpView()) }
++
++func (s *tm) toggle(open bool) {
++	n := s.vis[s.sel]
++	n.open = open
++	s.layout()
++	s.update(0)
++}
++
++// ---------------------------------------------------------------- keys
++
++func keyOf(tc hegel.TestCase, op string) tea.KeyPressMsg {
++	pick := func(ks ...tea.KeyPressMsg) tea.KeyPressMsg { return zootest.Pick(tc, ks) }
++	ch := func(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Text: string(r)} }
++	ctrl := func(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Code: r, Mod: tea.ModCtrl} }
++	switch op {
++	case "down":
++		return pick(tea.KeyPressMsg{Code: tea.KeyDown}, ch('j'), ctrl('n'))
++	case "up":
++		return pick(tea.KeyPressMsg{Code: tea.KeyUp}, ch('k'), ctrl('p'))
++	case "pgdown":
++		return pick(tea.KeyPressMsg{Code: tea.KeyPgDown}, tea.KeyPressMsg{Code: tea.KeySpace, Text: " "}, ch('f'))
++	case "pgup":
++		return pick(tea.KeyPressMsg{Code: tea.KeyPgUp}, ch('b'))
++	case "halfdown":
++		return pick(ch('d'), ctrl('d'))
++	case "halfup":
++		return pick(ch('u'), ctrl('u'))
++	case "top":
++		return pick(ch('g'), tea.KeyPressMsg{Code: tea.KeyHome})
++	case "bottom":
++		return pick(ch('G'), tea.KeyPressMsg{Code: tea.KeyEnd})
++	case "toggle":
++		return tea.KeyPressMsg{Code: tea.KeyEnter}
++	case "open":
++		return pick(ch('l'), tea.KeyPressMsg{Code: tea.KeyRight})
++	case "close":
++		return pick(ch('h'), tea.KeyPressMsg{Code: tea.KeyLeft})
++	case "help":
++		return ch('?')
++	}
++	panic(op)
++}
++
++var treeOps = []string{
++	"down", "down", "down", "down", "down", "down", "down", "down",
++	"up", "up", "up", "up", "up", "up",
++	"pgdown", "pgdown", "pgdown", "pgup", "pgup", "pgup",
++	"halfdown", "halfdown", "halfup", "halfup",
++	"top", "top", "bottom", "bottom",
++	"toggle", "toggle", "toggle", "toggle", "toggle", "toggle",
++	"open", "open", "open", "close", "close", "close",
++	"help", "help",
++	"setyoffset", "setyoffset",
++	"setsize", "setsize", "setsize", "setheight", "setheight", "setwidth",
++	"setscrolloff", "setscrolloff", "setshowhelp", "setshowhelp",
++	"setnodes", "setcursor",
++}
++
++// ---------------------------------------------------------------- property
++
++func TestHegelTreeFollowsTheModel(t *testing.T) {
++	zootest.Property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		s := &tm{lastEnum: "└──", openCh: "▼", closedCh: "▶", cursor: "→", so: 5, showHelp: true}
++
++		// The tree: always a Root at the top.
++		s.root = genTree(tc, 3)
++		s.root.sub = true
++		s.root.open = !zootest.Chance(tc, 10)
++		if len(s.root.kids) == 0 {
++			s.root.kids = append(s.root.kids, genTree(tc, 2))
++		}
++		root := build(s.root)
++
++		w := zootest.N(tc, 24, 60)
++		if zootest.Chance(tc, 3) {
++			w = zootest.N(tc, 6, 23)
++		}
++		h := zootest.N(tc, 3, 18)
++		if zootest.Chance(tc, 5) {
++			h = zootest.N(tc, 0, 2)
++		}
++		m := New(root, w, h)
++		if zootest.Chance(tc, 40) {
++			s.so = zootest.N(tc, 0, 8)
++			m.SetScrollOff(s.so)
++		}
++		if zootest.Chance(tc, 20) {
++			s.showHelp = false
++			m.SetShowHelp(false)
++		}
++		switch {
++		case zootest.Chance(tc, 10):
++			s.cursor = ""
++			m.SetCursorCharacter("")
++		case zootest.Chance(tc, 10):
++			s.cursor = "👉"
++			m.SetCursorCharacter("👉")
++		}
++		switch {
++		case zootest.Chance(tc, 10):
++			s.openCh, s.closedCh = "-", "+"
++			m.SetOpenCharacter("-")
++			m.SetClosedCharacter("+")
++		case zootest.Chance(tc, 5):
++			s.openCh, s.closedCh = "", ""
++			m.SetOpenCharacter("")
++			m.SetClosedCharacter("")
++		}
++		if zootest.Chance(tc, 20) {
++			s.lastEnum = "╰──"
++			m.Enumerator(ltree.RoundedEnumerator)
++		}
++		hb := helpHeight(&m)
++		m.SetSize(w, h)
++		s.setSize(&m, w, h, hb)
++		m.SetNodes(root) // renders with every option applied
++		s.layout()
++		s.update(0)
++
++		var trail []string
++		nops := zootest.N(tc, 1, 45)
++		for step := 0; step < nops; step++ {
++			op := zootest.Pick(tc, treeOps)
++			desc := op
++			switch op {
++			case "down", "up", "pgdown", "pgup", "halfdown", "halfup", "top", "bottom", "toggle", "open", "close", "help":
++				k := keyOf(tc, op)
++				desc = fmt.Sprintf("%s(%s)", op, k.String())
++				var cmd tea.Cmd
++				m, cmd = m.Update(k)
++				if cmd != nil {
++					if msg := cmd(); msg != nil {
++						m, _ = m.Update(msg)
++					}
++				}
++				switch op {
++				case "down":
++					s.update(1)
++				case "up":
++					s.update(-1)
++				case "pgdown":
++					if k.Code == tea.KeySpace {
++						zootest.Count("bubbles/87") // bound as " ", reported as "space"
++					} else {
++						s.update(s.vh)
++					}
++				case "pgup":
++					s.update(-s.vh)
++				case "halfdown":
++					s.update(s.vh / 2)
++				case "halfup":
++					s.update(-s.vh / 2)
++				case "top":
++					s.update(-s.sel)
++				case "bottom":
++					s.update(len(s.vis))
++				case "toggle":
++					s.toggle(!s.vis[s.sel].open)
++				case "open":
++					s.toggle(true)
++				case "close":
++					s.toggle(false)
++				case "help":
++					s.showAll = !s.showAll
++				}
++			case "setyoffset":
++				y := zootest.N(tc, -1, len(s.vis)+1)
++				desc = fmt.Sprintf("setyoffset(%d)", y)
++				m.SetYOffset(y)
++				s.update(y - s.sel)
++			case "setsize", "setheight", "setwidth":
++				nw, nh := s.w, s.h
++				if op != "setheight" {
++					nw = zootest.N(tc, 24, 60)
++					if zootest.Chance(tc, 10) {
++						nw = zootest.N(tc, 6, 23)
++					}
++				}
++				if op != "setwidth" {
++					nh = zootest.N(tc, 3, 18)
++					if zootest.Chance(tc, 10) {
++						nh = zootest.N(tc, 0, 2)
++					}
++				}
++				desc = fmt.Sprintf("%s(%d,%d)", op, nw, nh)
++				hb := helpHeight(&m)
++				switch op {
++				case "setsize":
++					m.SetSize(nw, nh)
++				case "setheight":
++					m.SetHeight(nh)
++				case "setwidth":
++					m.SetWidth(nw)
++				}
++				s.setSize(&m, nw, nh, hb)
++			case "setscrolloff":
++				s.so = zootest.N(tc, 0, 8)
++				desc = fmt.Sprintf("setscrolloff(%d)", s.so)
++				m.SetScrollOff(s.so)
++			case "setshowhelp":
++				s.showHelp = zootest.Chance(tc, 50)
++				desc = fmt.Sprintf("setshowhelp(%v)", s.showHelp)
++				hb := helpHeight(&m)
++				m.SetShowHelp(s.showHelp)
++				s.setSize(&m, s.w, s.h, hb)
++			case "setnodes":
++				s.root = genTree(tc, 3)
++				s.root.sub = true
++				s.root.open = !zootest.Chance(tc, 10)
++				root = build(s.root)
++				m.SetNodes(root)
++				s.layout()
++				s.update(0)
++			case "setcursor":
++				s.cursor = zootest.Pick(tc, []string{"→", ">", "", "👉", "»"})
++				desc = fmt.Sprintf("setcursor(%q)", s.cursor)
++				m.SetCursorCharacter(s.cursor)
++				hb := helpHeight(&m)
++				m.SetSize(s.w, s.h)
++				s.setSize(&m, s.w, s.h, hb)
++			}
++			trail = append(trail, desc)
++			ctx := func() string {
++				return fmt.Sprintf("after %v\nsel=%d of %d, total=%d lines, vpY=%d, w=%d h=%d vh=%d so=%d help=%v/%v cursor=%q",
++					trail, s.sel, len(s.vis), s.total, s.vpY, s.w, s.h, s.vh, s.so, s.showHelp, s.showAll, s.cursor)
++			}
++
++			// The selection and the offsets.
++			if m.YOffset() != s.sel {
++				zootest.Fail(ht, "YOffset %d, want %d\n%s", m.YOffset(), s.sel, ctx())
++			}
++			if m.Root().Size() != len(s.vis) {
++				zootest.Fail(ht, "Size %d, want %d\n%s", m.Root().Size(), len(s.vis), ctx())
++			}
++			if m.NodeAtCurrentOffset() != s.vis[s.sel].node {
++				zootest.Fail(ht, "NodeAtCurrentOffset is %v, want %q\n%s", m.NodeAtCurrentOffset().GivenValue(), s.vis[s.sel].val, ctx())
++			}
++			for i, n := range s.vis {
++				if n.node.YOffset() != i {
++					zootest.Fail(ht, "node %q at y=%d, want y=%d\n%s", n.val, n.node.YOffset(), i, ctx())
++				}
++				if n.shift > 0 {
++					zootest.Count("bubbles/86")
++				} else if n.node.LineOffset() != n.line {
++					zootest.Fail(ht, "node %q at line=%d, want line=%d\n%s", n.val, n.node.LineOffset(), n.line, ctx())
++				}
++				if n.node.IsSelected() != (i == s.sel) {
++					zootest.Fail(ht, "node %q IsSelected %v at y=%d (selected %d)\n%s", n.val, n.node.IsSelected(), i, s.sel, ctx())
++				}
++				if m.Node(i) != n.node {
++					zootest.Fail(ht, "Node(%d) is not %q\n%s", i, n.val, ctx())
++				}
++			}
++			if m.Node(len(s.vis)) != nil {
++				zootest.Fail(ht, "Node(%d) past the end is %v\n%s", len(s.vis), m.Node(len(s.vis)).GivenValue(), ctx())
++			}
++			if m.Width() != s.w || m.Height() != s.h {
++				zootest.Fail(ht, "size %dx%d, want %dx%d\n%s", m.Width(), m.Height(), s.w, s.h, ctx())
++			}
++			if m.viewport.Height() != s.vh {
++				zootest.Fail(ht, "viewport height %d, want %d\n%s", m.viewport.Height(), s.vh, ctx())
++			}
++			if s.wide {
++				// A row wider than the width is wrapped by the tree style,
++				// so the content has more lines than the model: the scroll
++				// is the library's while that lasts (bubbles/79).
++				zootest.Count("bubbles/79")
++				s.vpY = m.ViewportYOffset()
++				continue
++			}
++			if m.ViewportYOffset() != s.vpY {
++				zootest.Fail(ht, "viewport YOffset %d, want %d\n%s", m.ViewportYOffset(), s.vpY, ctx())
++			}
++
++			// The selection is in view (bubbles/78 after a resize).
++			if s.vh >= 1 {
++				line := s.vis[s.sel].line
++				if line < s.vpY || line >= s.vpY+s.vh {
++					if s.sized {
++						zootest.Count("bubbles/78")
++					} else if s.rootStale {
++						zootest.Count("bubbles/90")
++					} else if s.vis[s.sel].shift > 0 {
++						zootest.Count("bubbles/86")
++					} else {
++						zootest.Fail(ht, "selected line %d outside the window [%d,%d)\n%s", line, s.vpY, s.vpY+s.vh, ctx())
++					}
++				}
++			}
++
++			// The view.
++			if s.vis[s.sel].shift > 0 {
++				zootest.Count("bubbles/86") // the cursor is drawn on the library's line
++				continue
++			}
++			view := strings.Split(ansi.Strip(m.View()), "\n")
++			hv := 0
++			if s.showHelp {
++				hv = lipgloss.Height(m.helpView())
++			}
++			want := max(s.vh, 1) + hv
++			if len(view) != want {
++				zootest.Fail(ht, "view has %d lines, want %d\n%s\n%s", len(view), want, ctx(), strings.Join(view, "\n"))
++			}
++			if s.vh >= 1 && want != s.h {
++				if s.showAll != s.sizedAll {
++					zootest.Count("bubbles/77")
++				} else if s.helpStale {
++					zootest.Count("bubbles/89")
++				} else {
++					zootest.Fail(ht, "view has %d lines for a height of %d\n%s", want, s.h, ctx())
++				}
++			}
++			if s.vh >= 1 && s.w >= 1 {
++				for i := 0; i < s.vh; i++ {
++					exp := ""
++					if idx := s.vpY + i; idx < len(s.rows) {
++						exp = s.rows[idx]
++					}
++					exp = strings.TrimRight(ansi.Truncate(exp, s.w, ""), " ")
++					got := strings.TrimRight(view[i], " ")
++					if got != exp {
++						zootest.Fail(ht, "row %d is %q, want %q\n%s\n%s", i, got, exp, ctx(), strings.Join(view, "\n"))
++					}
++				}
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------- pins
++
++func pinTree(children ...any) Model {
++	return New(Root("root").Child(children...), 30, 8)
++}
++
++// cursorRow is the stripped view row carrying the cursor, or "".
++func cursorRow(m Model) string {
++	for _, l := range strings.Split(ansi.Strip(m.View()), "\n") {
++		if strings.HasPrefix(l, "→") {
++			return l
++		}
++	}
++	return ""
++}
++
++// bubbles/75
++func TestHegelPinTreeSetNodesNilPanics(t *testing.T) {
++	defer zootest.Guard(t)
++	m := pinTree("a")
++	m.SetNodes(nil)
++	if m.Root() != nil {
++		t.Fatalf("root %v after SetNodes(nil)", m.Root().GivenValue())
++	}
++}
++
++// bubbles/76
++func TestHegelPinTreeHiddenNodeStaysNavigable(t *testing.T) {
++	defer zootest.Guard(t)
++	r := Root("root").Child("h", "a", "b")
++	m := New(r, 30, 8)
++	r.ChildNodes()[0].SetHidden(true)
++	m.SetNodes(r)
++	if got := m.Root().Size(); got != 3 {
++		t.Errorf("Size %d with one of three children hidden, want 3", got)
++	}
++	m.Down()
++	if n := m.NodeAtCurrentOffset(); n.Hidden() {
++		t.Errorf("Down selects the hidden node %q", n.GivenValue())
++	}
++	m.Down()
++	m.Down() // the last node: its line offset indexes past the rendered lines
++	if got := cursorRow(m); !strings.Contains(got, "b") {
++		t.Errorf("cursor row %q, want the row of b", got)
++	}
++}
++
++// bubbles/77
++func TestHegelPinTreeFullHelpOverflowsTheHeight(t *testing.T) {
++	m := New(Root("root").Child("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"), 40, 8)
++	m, _ = m.Update(tea.KeyPressMsg{Code: '?', Text: "?"})
++	if got := lipgloss.Height(m.View()); got != 8 {
++		t.Fatalf("view is %d lines after ? for a height of 8", got)
++	}
++}
++
++// bubbles/78
++func TestHegelPinTreeShrinkHidesTheSelection(t *testing.T) {
++	m := New(Root("root").Child("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"), 40, 12)
++	for i := 0; i < 8; i++ {
++		m.Down()
++	}
++	m.SetHeight(6)
++	line := m.NodeAtCurrentOffset().LineOffset()
++	top, vh := m.ViewportYOffset(), m.viewport.Height()
++	if line < top || line >= top+vh {
++		t.Fatalf("selected line %d outside the window [%d,%d) after SetHeight(6); view:\n%s", line, top, top+vh, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/79
++func TestHegelPinTreeWideValueWrapsTheCursor(t *testing.T) {
++	m := New(Root("root").Child("a", "this is a rather long value that will not fit", "c", "d"), 20, 10)
++	m.Down()
++	m.Down()
++	m.Down()
++	if got := cursorRow(m); !strings.Contains(got, "c") {
++		t.Fatalf("cursor row %q with c selected; view:\n%s", got, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/80
++func TestHegelPinTreeChildSetValueIsNotShown(t *testing.T) {
++	r := Root("root").Child("a", "b")
++	m := New(r, 30, 6)
++	r.ChildNodes()[0].SetValue("A2")
++	m.SetNodes(r)
++	if v := ansi.Strip(m.View()); !strings.Contains(v, "A2") {
++		t.Fatalf("view after SetValue(\"A2\") on a child:\n%s", v)
++	}
++}
++
++// bubbles/81
++func TestHegelPinTreeRootValueDoublesTheIndicator(t *testing.T) {
++	m := pinTree("a")
++	if got := ansi.Strip(m.Root().Value()); got != "▼ root" {
++		t.Fatalf("Root().Value() = %q", got)
++	}
++}
++
++// bubbles/82
++func TestHegelPinTreeNilRootShowsNil(t *testing.T) {
++	m := New(nil, 30, 6)
++	if v := ansi.Strip(m.View()); strings.Contains(v, "<nil>") {
++		t.Fatalf("New(nil) renders:\n%s", v)
++	}
++}
++
++// bubbles/83
++func TestHegelPinTreeTopPaddingShiftsTheCursor(t *testing.T) {
++	m := pinTree("a", "b", "c")
++	s := m.styles
++	s.TreeStyle = lipgloss.NewStyle().PaddingTop(1)
++	m.SetStyles(s)
++	m.Down()
++	m.Down()
++	if got := cursorRow(m); !strings.Contains(got, "b") {
++		t.Fatalf("cursor row %q with b selected; view:\n%s", got, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/84
++func TestHegelPinTreeBorderLosesItsRightEdge(t *testing.T) {
++	m := pinTree("a", "b", "c")
++	s := m.styles
++	s.TreeStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
++	m.SetStyles(s)
++	top := strings.Split(ansi.Strip(m.View()), "\n")[0]
++	if !strings.Contains(top, "┐") {
++		t.Fatalf("top border row %q has no right corner", top)
++	}
++}
++
++// bubbles/85
++func TestHegelPinTreeNodePaddingBreaksTheOffsets(t *testing.T) {
++	m := New(Root("root").Child("a", "b", "c"), 30, 12)
++	s := m.styles
++	s.NodeStyle = lipgloss.NewStyle().PaddingBottom(1)
++	m.SetStyles(s)
++	m.Down()
++	m.Down()
++	if got := cursorRow(m); !strings.Contains(got, "b") {
++		t.Fatalf("cursor row %q with b selected; view:\n%s", got, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/86
++func TestHegelPinTreeMultiLineParentShiftsItsChildren(t *testing.T) {
++	m := New(Root("root").Child(Root("two\nlines").Child("x", "y"), "b"), 30, 12)
++	m.SetYOffset(2)
++	if got := m.NodeAtCurrentOffset().LineOffset(); got != 3 {
++		t.Errorf("x has line offset %d, want 3 (root, two, lines above it)", got)
++	}
++	if got := cursorRow(m); !strings.Contains(got, "x") {
++		t.Errorf("cursor row %q with x selected; view:\n%s", got, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/87
++func TestHegelPinTreeSpacebarDoesNotPageDown(t *testing.T) {
++	m := pinTree("a", "b", "c", "d", "e", "f", "g", "h")
++	m, _ = m.Update(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
++	if m.YOffset() == 0 {
++		t.Fatalf("the spacebar (%q) did not page down", tea.KeyPressMsg{Code: tea.KeySpace, Text: " "}.String())
++	}
++}
++
++// bubbles/88
++func TestHegelPinTreeEmptyParentShiftsItsSiblings(t *testing.T) {
++	m := New(Root("root").Child(Root("").Child("x", "y"), "b"), 30, 12)
++	m.SetYOffset(4)
++	if got := m.NodeAtCurrentOffset().LineOffset(); got != 4 {
++		t.Errorf("b has line offset %d, want 4", got)
++	}
++	if got := cursorRow(m); !strings.Contains(got, "b") {
++		t.Errorf("cursor row %q with b selected; view:\n%s", got, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/89
++func TestHegelPinTreeSetSizeMeasuresTheHelpAtTheOldWidth(t *testing.T) {
++	m := New(Root("root").Child("a", "b", "c"), 60, 12)
++	m, _ = m.Update(tea.KeyPressMsg{Code: '?', Text: "?"})
++	m.SetSize(60, 12)
++	if got := lipgloss.Height(m.View()); got != 12 {
++		t.Fatalf("view is %d lines at 60x12 with the full help", got)
++	}
++	m.SetSize(7, 12)
++	if got := lipgloss.Height(m.View()); got != 12 {
++		t.Fatalf("view is %d lines after SetSize(7, 12); view:\n%s", got, ansi.Strip(m.View()))
++	}
++}
++
++// bubbles/90
++func TestHegelPinTreeSetNodesLeavesTheRootScrolledOff(t *testing.T) {
++	m := New(Root("root").Child("a", "b", "c", "d", "e", "f", "g", "h", "i", "j"), 30, 4)
++	for i := 0; i < 8; i++ {
++		m.Down()
++	}
++	m.SetNodes(Root("r\n2\n3").Child("a").Close())
++	if m.YOffset() != 0 {
++		t.Fatalf("YOffset %d after SetNodes", m.YOffset())
++	}
++	if top := m.ViewportYOffset(); top != 0 {
++		t.Fatalf("the root is selected but the viewport starts at line %d; view:\n%s", top, ansi.Strip(m.View()))
++	}
++}
 diff --git a/viewport/hegel_test.go b/viewport/hegel_test.go
 new file mode 100644
 index 0000000..456487d
