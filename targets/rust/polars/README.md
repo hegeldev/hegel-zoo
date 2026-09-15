@@ -40,3 +40,4 @@
 - 2026-09-15: base bumped 5267819479ed → 1bcbd4fef4ff (2026-09-15, "fix: Resolve arithmetic `Struct` supertypes per-field (#29261)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 1bcbd4fef4ff → d68e93010fed (2026-09-15, "fix(rust): Fix musl Python build (#29306)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped d68e93010fed → 07988fc518f2 (2026-09-15, "perf: Use HTTP suffix range for Parquet size and footer (#29308)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-15: base bumped 07988fc518f2 → 5dcf491ab638 (2026-09-15, "fix(python): Fix panic in scan_iceberg for snapshot_id before a schema change (#28895)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
