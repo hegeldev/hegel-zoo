@@ -1,6 +1,6 @@
-# go/ultraviolet — charmbracelet/ultraviolet (input decoder, cell buffer, renderer)
+# go/ultraviolet — charmbracelet/ultraviolet (input decoder, cell buffer, renderer, layout)
 
-The terminal primitives under Bubble Tea v2, in two slices. **Input**: `EventDecoder` (bytes →
+The terminal primitives under Bubble Tea v2, in three slices. **Input**: `EventDecoder` (bytes →
 key, mouse, paste, focus and report events; the successor of charmbracelet/x/input's parser),
 `eventScanner` (the read loop behind `TerminalReader` and `Terminal`: whole-read key-table
 lookup, bracketed paste, waiting for incomplete sequences across reads), the key table
@@ -15,7 +15,11 @@ CONTRIBUTING/AGENTS/AI policy (checked 2026-09-15). The tests live in package `u
 (`hegel_test.go`, `hegel_buffer_test.go`) to reach `eventScanner`, `buildKeysTable`, the legacy
 flag constants and the renderer's current buffer; the renderer differential is in package
 `uv_test` (`hegel_render_test.go`) because x/vt imports ultraviolet, and reaches the harness
-through exported `…T` bridges. Open slices: win32 input mode, the layout solver, `Terminal`.
+through exported `…T` bridges. **Layout**: the `layout` subpackage (a translation of
+ratatui's Cassowary-based `Layout`: `Len`/`Percent`/`Ratio`/`Min`/`Max`/`Fill` constraints,
+seven `Flex` modes, spacing, padding, the split cache) in `layout/hegel_test.go` (package
+`layout_test`), checked against the documented invariants and against ratatui itself. Open
+slices: win32 input mode, `Terminal`.
 
 ## Oracles
 
@@ -59,6 +63,18 @@ Output:
   each frame the emulator's screen must equal the frame, the renderer's current buffer must
   equal the frame, and the renderer's cursor model must agree with the emulator's cursor.
 
+Layout — **ratatui** (the Rust original the package is "roughly a 1:1 translation" of): a
+40-line Rust program in `zoo/rtoracle` (ratatui 0.30, `default-features = false`) reads one
+layout per line (direction, area, flex, spacing, constraints) and prints
+`Layout::split_with_spacers`; `[run] setup` builds it with cargo and the differential skips
+itself when it is not there. Padding is applied on the Go side (ratatui has none) and the
+inner area handed over. Alongside it, the documented invariants: the segments tile the padded
+area in order with the spacers between them; the inner spacers are exactly the spacing in
+the fixed modes and the outer ones empty where the mode says so; `Max` is never exceeded;
+`Min`, `Len`, `Percent`, `Ratio` and `Max` are honoured (proportional ones within a cell,
+since positions are rounded) whenever everything asked for fits in the area; Legacy covers
+the area exactly; the cache returns what a fresh solve returns.
+
 ## Properties
 
 | Test | What it checks | Gates |
@@ -82,6 +98,9 @@ failures into a tally per property (`UV_STACK=1` adds stacks to panics). Pin /12
 `tmux`, `screen` and `xterm` terminfo entries (ncurses-base); it fails either way. Bold, faint,
 italic, blink and the foreground colour are not compared on blank cells: the renderer erases
 runs of such blanks with EL and terminals keep only the background of erased cells.
+| `LayoutSplitsTileTheArea` | random layouts (0–6 constraints, 7 flex modes, spacing −3..5, padding, areas up to 60) satisfy the invariants above | Legacy and single-segment SpaceBetween give the surplus to a segment regardless of its constraint (documented); negative spacing makes every segment at least the overlap |
+| `LayoutCacheIsTransparent` | the same layout split twice, through `Split` and `SplitWithSpacers`, and with a nudged constraint against a fresh solve, agrees | over-constrained layouts (/26) |
+| `LayoutAgreesWithRatatui` | `SplitWithSpacers` equals ratatui's `split_with_spacers` for the same layout | over-constrained layouts and Legacy surplus ties, where equally good solutions exist |
 
 ## Bugs
 
@@ -112,6 +131,7 @@ runs of such blanks with EL and terminals keep only the background of erased cel
 | ultraviolet/23 | low | `InsertLineArea`/`DeleteLineArea` tear a wide cell straddling the area's edge |
 | ultraviolet/24 | medium | the renderer resets the terminal's hyperlink on a row change but keeps it in its pen: the next linked cell is drawn without its link |
 | ultraviolet/25 | high | the scroll optimisation moves a row the new frame did not touch and never paints it back: a blank on the terminal where the frame has the row, and the renderer's record agrees with the terminal |
+| ultraviolet/26 | medium | layout: the solver picks among equally good splits at random (Go map iteration in `internal/casso`), so an over-constrained layout changes from call to call |
 
 Fixed here relative to charmbracelet/x/input (held as examples): x-input/2 (event types on
 `CSI n;mod:ev ~`), x-input/3 (num lock text), x-input/4 (URxvt `$` rewrote the caller's
@@ -124,6 +144,14 @@ lines with wide cells are repainted whole), cellbuf/16 (equal styles diff to a r
 cellbuf/17 (multi-line scroll without SU), cellbuf/18 (IRM without the cells).
 
 ## Not bugs (or not ultraviolet's)
+
+- Layout, faithful to ratatui: with `FlexSpaceAround` every spacer is at least the spacing
+  and the outer two are half the inner ones, so the inner gaps are at least *twice* the
+  spacing; `FlexLegacy`, and `FlexSpaceBetween` with a single segment, hand the surplus to
+  a segment whatever its constraint (`Max(20)` alone takes the whole area, as documented);
+  a negative spacing (overlap) forces every segment to be at least the overlap; and when
+  the constraints ask for more than the area holds, several splits are equally good and
+  ratatui's choice is one of them (the Go solver's is random — /26).
 
 - `CSI 1;mod R` is both a modified F3 and a cursor position report on row 1; the decoder
   returns both (documented), the generators expect both.
