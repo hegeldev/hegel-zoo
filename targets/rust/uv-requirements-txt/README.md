@@ -70,3 +70,4 @@ crate's `RequirementsTxt`.
 - 2026-09-14: base bumped 83d556d712c7 → c40e652bc385 (2026-09-14, "Exclude backports-zstd from the Sentry PGO corpus (#21678)"; 0.0.80); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-14: base bumped c40e652bc385 → 85f73f491d4c (2026-09-14, "Use cargo nextest via astral-dev-toolchain (#21676)"; 0.0.80); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-14: base bumped 85f73f491d4c → 85fe61435fe5 (2026-09-14, "Use cargo bloat via astral-dev-toolchain (#21681)"; 0.0.80); 4 bug(s) still reproduce. 55 tests pass.
+- 2026-09-15: base bumped 85fe61435fe5 → 941b557a69d7 (2026-09-14, "Remove unused Serde derives from index locations (#21685)"; 0.0.80); 4 bug(s) still reproduce. 55 tests pass.
