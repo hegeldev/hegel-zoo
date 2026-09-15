@@ -1,13 +1,15 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Three slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Five slices so far: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
 `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
 for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
 (`viewport/hegel_test.go`, package `viewport`, internal for the highlight index and the
-soft-wrapped rows), with the shared harness in `internal/zootest`.
-Run with `go test -run TestHegel ./textinput ./textarea ./viewport`.
+soft-wrapped rows), `paginator` (`paginator/hegel_test.go`) and `table`
+(`table/hegel_test.go`, package `table`, internal for the rendered window's first row), with
+the shared harness in `internal/zootest`.
+Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -68,6 +70,19 @@ records bugs.
   to `colstart − 6` when its end is past the width). The reversed cells of every visible row
   must be exactly the matched cells clipped to the window; a newline counts as one cell after
   its line's last.
+- **paginator: pages over a slice.** `PerPage` 1–5 and 1–40 items; the default bindings and
+  `NextPage`/`PrevPage` move the page by one within `[0, pages−1]`, `SetTotalPages` recomputes
+  `ceil(items / PerPage)`, `GetSliceBounds`/`ItemsOnPage` are the page's slice, `View` is the
+  dots or the Arabic format for the page.
+- **table: the selection in view.** Random columns (1–4, widths 0–7, titles), rows of that
+  many fields (letters, spaces, wide runes; sometimes a row with one field too many), a height
+  of 2–9 and a width of 8–50, the styles set to `Reverse` for the selection and the default
+  paddings. Every default binding, `MoveUp`/`MoveDown` by any count, `SetCursor`, `SetRows`,
+  `SetColumns`, `SetHeight`, `SetWidth`, `GotoTop`/`GotoBottom`, `Blur`/`Focus` and
+  `FromValues` are driven against a cursor clamped to the rows; `Cursor` and `SelectedRow`
+  must agree with it, `View` must be the header (each title truncated with `…` and padded to
+  its column, between one space each side) over `Height` consecutive rows rendered the same
+  way and cut to the width, the cursor's row must be shown and be the only reversed line.
 
 ## Properties
 
@@ -84,6 +99,8 @@ records bugs.
 | `TestHegelLineInfoDescribesTheWrappedRow` | `LineInfo` vs the wrap grid (row, start, width, offsets) |
 | `TestHegelViewShowsTheScrolledRows` | every scroll binding, wheel, setter, `SetContent`/`SetHeight`/`EnsureVisible` vs the row model: offsets, counts, `AtTop`/`AtBottom`, `ScrollPercent`, the view row by row |
 | `TestHegelHighlightsMarkTheMatches` | `SetHighlights`, next/previous, scrolling: the selected index, the offsets, the reversed cells of every visible row |
+| `TestHegelPaginatorFollowsTheModel` | bindings, helpers and `SetTotalPages` vs the page model: `Page`, the first/last flags, the slice bounds, `View` |
+| `TestHegelTableShowsTheSelectedRow` | every binding and setter vs the cursor model: `Cursor`, `SelectedRow`, the header and the rows of `View`, the selection shown and reversed |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -131,6 +148,15 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/37 | low | viewport: a Style width smaller than the viewport's caps the render but not the cut, so rows are wrapped and the view grows |
 | bubbles/38 | low | viewport: under soft wrap the gutter of FillHeight's blank rows gets a real-line Index against a visual TotalLines, so they are numbered |
 | bubbles/39 | low | viewport: SetContent clamps the vertical offset to the new content but not the horizontal one, so narrower content stays scrolled off the left |
+| bubbles/40 | medium | paginator: Page is never clamped: when SetTotalPages shrinks the count below it, OnLastPage is false, NextPage keeps counting up and GetSliceBounds returns a start past the end |
+| bubbles/41 | low | paginator: SetTotalPages with fewer than one item keeps the previous page count, so an emptied list still shows its old pages |
+| bubbles/42 | high | table: a row with more fields than there are columns panics in renderRow as soon as it is within a page of the cursor (a stray separator in FromValues is enough) |
+| bubbles/43 | medium | table: SetCursor and SetHeight (and the other setters) do not scroll the selection into view; after SetCursor(50) in a hundred rows the view shows rows 45–49 |
+| bubbles/44 | medium | table: MoveUp never scrolls down to a selection below the view, so one hidden by a setter stays hidden through every up move |
+| bubbles/45 | medium | table: a move on an empty table sets the cursor to −1, and SetRows only clamps downwards, so with rows back there is no selected row and one row fewer is rendered |
+| bubbles/46 | low | table: the header line is not cut to the table's width while the rows are, so a wide header overhangs the table |
+| bubbles/47 | low | table: a height under two is not clamped: at 0 Height() is −1, at 1 the viewport is empty, and View has two lines either way |
+| bubbles/48 | low | table: a tab in a cell value is truncated at width 0 and rendered at width 4, so a<TAB>b in a five-wide column shows a alone |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -155,6 +181,17 @@ stripped position, `StyleRanges` replacing the style, tabs at width 0 — and a 
 and bubbles/39 (the stale horizontal offset). The view property gates /27, /28, /29, /30, /31,
 /32, /38 and /39 by cause, the highlight property /32, /33 and /34; /35, /36 and /37 need a
 style and are pinned only; each is pinned.
+
+For paginator (200 lines) and table (453 lines), both read in full first, seven of the nine were
+on paper — the unclamped page, the early return for no items, `renderRow` indexing the columns
+by the row's fields, the offset untouched by the setters, `MoveUp`'s cases, the `−1` cursor of an
+empty table, the header outside the viewport — and a probe of cell contents gave bubbles/48;
+the property showed that bubbles/42 fires only once the long row is within a page of the cursor
+and that bubbles/44 is every up move, not just the first. The table property gates /42 (a panic
+on the op that brings the row into the window), /43 (a setter that leaves the selection out of
+view), /44 (an up move while it is out), /45 (a negative cursor with rows) and /46 (a header
+wider than the width) by cause; the paginator property /40 and /41; /47 and /48 are pinned only
+(heights are drawn from 2 and values carry no tabs); each is pinned.
 
 ## Not bugs (modelled as documented)
 
@@ -183,14 +220,20 @@ style and are pinned only; each is pinned.
   `SetHeight` may leave the offset past the bottom (documented `PastBottom`) and the next
   upward move snaps it back; a match that begins at a newline belongs to the line before it,
   the newline being one cell after its last, and `EnsureVisible` scrolls for that cell.
+- table: keys are ignored while blurred; a row with fewer fields than columns just has fewer
+  cells; columns of width 0 are skipped in the header and the rows; a cell's newline is dropped
+  (`Inline`) after truncation; `SetRows` keeps the offset, so a shrunk table may show the
+  selection lower than before.
+- paginator: `SetTotalPages` returns the count it set; a fresh paginator has one page.
 
 ## Not covered (yet)
 
-`table`, `list`, `paginator`, `progress`, `tree`, `filepicker`, `help`, `key`,
+`list`, `progress`, `tree`, `filepicker`, `help`, `key`,
 `timer`/`stopwatch`/`spinner`, `cursor` blinking; textinput's clipboard paste (`Paste` reads the
 system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`MinHeight`,
 `MaxContentHeight`, `SetPromptFunc`, the mouse selection API (`BeginSelection`/`ExtendSelection`/
 `EndSelection`), `CopySelection` (clipboard), the placeholder beyond bubbles/23, `ScrollPercent`,
 styles and the `Base` frame; viewport's shift+wheel, `StyleLineFunc`, `HorizontalScrollPercent`,
 `YPosition`, gutters of other widths, `Style` width and height beyond bubbles/37,
-`SetHighlights` on styled content beyond bubbles/35.
+`SetHighlights` on styled content beyond bubbles/35; table's `HelpView`, custom key maps and
+styles with their own paddings; paginator's `PerPage` of 0 (a division by zero).
