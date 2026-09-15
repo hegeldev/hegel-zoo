@@ -90,6 +90,7 @@ in the repository; not archived, active. Checked 2026-09-15. The harness lives i
 | x-ansi/19 | medium | Leading spaces confuse Wrap and Wordwrap: an empty first line, or a line one space too wide |
 | x-ansi/20 | low | With two private markers the Parser keeps the first and DecodeSequence the last |
 | x-ansi/21 | low | Whitespace followed by an escape sequence is flushed past the limit by Wordwrap and Wrap |
+| x-ansi/22 | medium | MouseX10 encodes its payload bytes as runes: coordinates from 95 upwards become two UTF-8 bytes |
 
 ## Not bugs
 
