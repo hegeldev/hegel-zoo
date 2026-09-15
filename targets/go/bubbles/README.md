@@ -1,15 +1,18 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Six slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Eight slices so far: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
 `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
 for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
 (`viewport/hegel_test.go`, package `viewport`, internal for the highlight index and the
 soft-wrapped rows), `paginator` (`paginator/hegel_test.go`) and `table`
 (`table/hegel_test.go`, package `table`, internal for the rendered window's first row) and
-`list` (`list/hegel_test.go`), with the shared harness in `internal/zootest`.
-Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table ./list`.
+`list` (`list/hegel_test.go`), `help` (`help/hegel_test.go`) and `progress`
+(`progress/hegel_test.go`, package `progress`, internal for the frame messages and the shown
+percentage), with the shared harness in `internal/zootest`.
+Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table ./list
+./help ./progress`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -98,6 +101,28 @@ records bugs.
   `VisibleItems`, `FilterState`/`FilterValue` and the lines of `View` (the title or filter
   line, the status text, the page's items with the selected one marked by the border, the
   pagination dots or `p/n`) must agree.
+- **help: a layout model.** Up to six bindings (keys and descriptions from a small set of words
+  — empty, `?`, `ctrl+c`, `↑/k`, `move down`, a wide `全角` — 15 % of them disabled), up to
+  four groups of up to three (some nil), the separators and the ellipsis changed some of the
+  time, a width of 1–40 or none. `ShortHelpView` must be the enabled items `key desc` joined by
+  the separator; `FullHelpView` one column per group with an enabled binding — the separator on
+  the first line, keys and descriptions each padded to the widest, columns joined at the top;
+  with a width, both must stop before the first item or column that does not fit and end in
+  ` …` when it fits, so the output is never wider than the width. `View` follows `ShowAll`.
+- **progress: a cell model with colours.** Up to five options in random order (`WithColors`
+  with none, one, two or three colours, `WithDefaultBlend`, `WithColorFunc`, `WithScaled`,
+  `WithFillCharacters` — sometimes wide runes — `WithoutPercentage`, `WithWidth`), then
+  `SetWidth`, `PercentFormat` and `EmptyColor` some of the time. `ViewAs(p)` for p in −0.1…1.1
+  is parsed into runes with their SGR foreground and background and must be round(tw·p) full
+  runes, tw − fw empty runes and the percentage text, tw = Width − text width; the colours
+  follow the documented option semantics — the solid colour, `Blend1D` over the bar or (scaled)
+  the filled part with two steps per half block (foreground and background), the colour
+  function at i/tw and, for the half block's background, i/tw + 1/2tw, the empty colour. The
+  animation property draws a spring (frequency 1–60, damping 0.1–2.0) and one to three
+  `SetPercent`/`IncrPercent`/`DecrPercent`, checks the clamped target and that stale or
+  foreign frames are ignored, then feeds frame messages until `IsAnimating` is false: the shown
+  percentage must be within 0.001 of the target with a settled velocity, `View` must be
+  `ViewAs` of it throughout, and a frame after that must be a no-op.
 
 ## Properties
 
@@ -117,6 +142,9 @@ records bugs.
 | `TestHegelPaginatorFollowsTheModel` | bindings, helpers and `SetTotalPages` vs the page model: `Page`, the first/last flags, the slice bounds, `View` |
 | `TestHegelTableShowsTheSelectedRow` | every binding and setter vs the cursor model: `Cursor`, `SelectedRow`, the header and the rows of `View`, the selection shown and reversed |
 | `TestHegelListFollowsTheModel` | bindings, filter input, setters and messages vs the item/filter/selection model: the indices, the paginator, `VisibleItems`, `SelectedItem`, the lines of `View` |
+| `TestHegelHelpFitsTheWidth` | `ShortHelpView`, `FullHelpView` and `View` vs the layout model: enabled items, separators, aligned columns, the width and the ellipsis |
+| `TestHegelProgressDrawsTheModel` | `ViewAs` rune by rune vs the options model: fill and empty runes, the solid, blend, scaled and colour-function colours, the percentage text, the width |
+| `TestHegelProgressSettles` | the setters' clamping and commands, stale and foreign frames ignored, the spring driven to equilibrium |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -181,6 +209,13 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/54 | medium | list: New does not size the help or the filter input (only SetSize does), so a fresh list renders its help line at full width and every line is padded to it |
 | bubbles/55 | medium | list: the chrome is not fitted to the width: the status bar is never truncated, the help and the pagination are fitted before their two-cell padding and the title bar to width−1 before its own, so the view is wider than its width |
 | bubbles/56 | low | list: the key bindings fall out of step with the items and pages: RemoveItem and the section toggles do not refresh them, cancelling a filter re-enables / on an empty list, and accepting one refreshes them before the pagination, so the page keys can stay dead |
+| bubbles/57 | medium | help: when the next item does not fit and the ellipsis does not fit either, the item is added anyway, so ShortHelpView and FullHelpView overflow their width |
+| bubbles/58 | low | help: an ellipsis that would end exactly at the width is dropped: the room test is strict, so at width 11 the short help writes all three items instead of a b • c d … |
+| bubbles/59 | medium | progress: IsAnimating compares the signed velocity with 0.01, so a bar animating downward stops dead the first time it passes near the target, while the same spring animating upward bounces to rest |
+| bubbles/60 | low | progress: WithColors with two or more colours sets the blend but leaves an earlier colour function in place (with one colour or none it is cleared), so the options depend on their order |
+| bubbles/61 | low | progress: the bar counts runes, not cells, so wide fill characters render twice the width |
+| bubbles/62 | low | progress: ViewAs passes its argument to the colour function unclamped, so total is 1.7 or −0.3 while the bar and the text are clamped |
+| bubbles/63 | low | progress: SetPercent clamps with math.Max/math.Min, which pass NaN through, so IncrPercent(NaN) leaves Percent() NaN and an animation that never reaches equilibrium |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -232,6 +267,18 @@ nil with the index past the end), /55 (a chrome line wider than the width, count
 carried on) and /56 (a page key or `/` pressed while the mirror and the truth differ); /54 is
 avoided by `SetSize` after `New` and pinned; each is pinned.
 
+For help (253 lines) and progress (438 lines), both read in full first, help's two were in
+`shouldAddItem` on paper and confirmed by a width sweep; of progress's five, four were on paper
+— the signed velocity, `WithColors` without the reset, the raw total, the NaN through the clamp
+— and the wide runes came from asking what the width contract covers. The properties found
+nothing new in either bubble but made a known bug visible: every blend step next to a black
+stop renders a bright spike in a zero channel — lipgloss/28, x/ansi's channel shift, counted
+under that id (`lipgloss/28`) and not as a bubbles bug. The help property gates /58 (a tail
+that would end exactly at the width) before /57 (an output wider than the width); the progress
+draw property /60 (a colour function surviving `WithColors`), /61 (wide runes: only the width
+check) and /62 (a total other than clamp(p)), the settle property /59 (|velocity| ≥ 0.01 at
+the stop); /63 is pinned only (NaN is not drawn); each is pinned.
+
 ## Not bugs (modelled as documented)
 
 - Tab keeps the typed prefix's case and appends the suggestion's remainder (`bb` + `BbAa` →
@@ -270,11 +317,20 @@ avoided by `SetSize` after `New` and pinned; each is pinned.
   items`, `No items.`); a list too short for its chrome plus one item still shows one item and
   is taller than its height; the up/down keys accept a filter being typed; the dots of the
   active and inactive pages are the same character in different colours.
+- help: an enabled binding with empty help renders as a lone space between separators; the
+  separator of the full view is on the first line only (a one-line block joined at the top);
+  keys or descriptions with newlines are not aligned between the columns.
+- progress: a width below the percentage text (five cells) renders the text alone, wider than
+  `Width()` (the text cannot be cut); the text rounds half to even (`%3.0f`) while the fill
+  rounds half away from zero (`math.Round`); `Blend1D` with fewer steps than stops is a prefix
+  of the stops (lipgloss's own rule); `Percent()` is the target, not the shown percentage; a
+  stale frame (an older tag) is dropped, so two quick setters animate from the second.
 
 ## Not covered (yet)
 
-`progress`, `tree`, `filepicker`, `help`, `key`,
-`timer`/`stopwatch`/`spinner`, `cursor` blinking; textinput's clipboard paste (`Paste` reads the
+`tree`, `filepicker`, `key`,
+`timer`/`stopwatch`/`spinner`, `cursor` blinking; help's styles; progress's `PercentageStyle`
+and springs outside frequency 1–60 / damping 0.1–2; textinput's clipboard paste (`Paste` reads the
 system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`MinHeight`,
 `MaxContentHeight`, `SetPromptFunc`, the mouse selection API (`BeginSelection`/`ExtendSelection`/
 `EndSelection`), `CopySelection` (clipboard), the placeholder beyond bubbles/23, `ScrollPercent`,
