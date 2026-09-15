@@ -1,7 +1,7 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`, `help`, `progress`, `filepicker`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Eight slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Nine slices so far: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
 `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
 for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
@@ -10,9 +10,11 @@ soft-wrapped rows), `paginator` (`paginator/hegel_test.go`) and `table`
 (`table/hegel_test.go`, package `table`, internal for the rendered window's first row) and
 `list` (`list/hegel_test.go`), `help` (`help/hegel_test.go`) and `progress`
 (`progress/hegel_test.go`, package `progress`, internal for the frame messages and the shown
-percentage), with the shared harness in `internal/zootest`.
+percentage) and `filepicker` (`filepicker/hegel_test.go`, package `filepicker`, internal for
+the window indices; it builds its directory trees under the system temp directory), with the
+shared harness in `internal/zootest`.
 Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table ./list
-./help ./progress`.
+./help ./progress ./filepicker`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -123,6 +125,22 @@ records bugs.
   foreign frames are ignored, then feeds frame messages until `IsAnimating` is false: the shown
   percentage must be within 0.001 of the target with a settled velocity, `View` must be
   `ViewAs` of it throughout, and a frame after that must be a no-op.
+- **filepicker: a directory tree and a window mirror.** Each case builds a random tree in a
+  fresh temporary directory (files of a few extensions, some hidden; one level of
+  subdirectories; sometimes symlinks to a file, a directory or nowhere), sets a height (or
+  none), `ShowHidden`, `AutoHeight`, the permission/size columns, `FileAllowed`/`DirAllowed`
+  and `AllowedTypes`, and drives the picker for up to 25 steps: every default binding (g, G,
+  j/k/arrows/ctrl+n/ctrl+p, J/K/pgup/pgdown, h/backspace/left/esc, l/right, enter),
+  `WindowSizeMsg`, `SetHeight`, toggling `ShowHidden`, changing the allowed flags and types;
+  the commands are run and their messages fed back. The model keeps the listing as `readDir`
+  defines it (directories first, names ascending, hidden names filtered), the selection, the
+  window with the library's own arithmetic (mirrored line for line, since the shapes that break
+  it are the bugs) and the view stack; after each step `CurrentDirectory`, `Path`,
+  `HighlightedPath`, the internal indices and the lines of `View` (cursor, mode, size, name,
+  symlink target; the padding; the empty-directory message) must match, the window must hold
+  the selection and neither more rows than the height nor fewer than the entries allow, and
+  after an enter `DidSelectFile`/`DidSelectDisabledFile` must report the entry it was pressed
+  on per the allowed flags and types.
 
 ## Properties
 
@@ -145,6 +163,7 @@ records bugs.
 | `TestHegelHelpFitsTheWidth` | `ShortHelpView`, `FullHelpView` and `View` vs the layout model: enabled items, separators, aligned columns, the width and the ellipsis |
 | `TestHegelProgressDrawsTheModel` | `ViewAs` rune by rune vs the options model: fill and empty runes, the solid, blend, scaled and colour-function colours, the percentage text, the width |
 | `TestHegelProgressSettles` | the setters' clamping and commands, stale and foreign frames ignored, the spring driven to equilibrium |
+| `TestHegelFilepickerFollowsTheModel` | every binding, resize and setter over a random directory tree vs the listing/window/selection mirror: the paths, the indices, the lines of `View`, the window invariants, the `DidSelect` reports |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -216,6 +235,17 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/61 | low | progress: the bar counts runes, not cells, so wide fill characters render twice the width |
 | bubbles/62 | low | progress: ViewAs passes its argument to the colour function unclamped, so total is 1.7 or −0.3 while the bar and the text are clamped |
 | bubbles/63 | low | progress: SetPercent clamps with math.Max/math.Min, which pass NaN through, so IncrPercent(NaN) leaves Percent() NaN and an animation that never reaches equilibrium |
+| bubbles/64 | medium | filepicker: when PageDown or PageUp clamps at an end of the listing the window is set to Height+1 entries, so the view shows one row more than the height |
+| bubbles/65 | medium | filepicker: a smaller height cuts the window from its top, so a selection near the bottom falls out of view and no cursor is drawn |
+| bubbles/66 | medium | filepicker: without a height G sets minIdx to len(files), so the view is empty and stays so through Up moves |
+| bubbles/67 | low | filepicker: a larger height does not fill the window: SetHeight keeps the old bottom and a WindowSizeMsg the old top, so rows stay blank while entries are hidden |
+| bubbles/68 | medium | filepicker: the selection is never clamped to a re-read listing, so after ShowHidden is turned off inside a directory Back restores a selection past the end of the parent and Open panics |
+| bubbles/69 | medium | filepicker: an unreadable directory is entered anyway: CurrentDirectory changes before the read and a read error is ignored, so the parent's entries are shown under the new path |
+| bubbles/70 | low | filepicker: Back from the default directory . goes nowhere, since filepath.Dir(.) is . |
+| bubbles/71 | low | filepicker: the view of a non-empty directory ends in a newline after its Height lines, one line taller than Height and than the empty directory's view |
+| bubbles/72 | medium | filepicker: after enter selects a directory the picker has already entered it, so DidSelectFile looks at the new listing's first entry and a directory holding only files, or nothing, is never reported |
+| bubbles/73 | low | filepicker: Back restores the parent's saved window verbatim, so after a resize inside a subdirectory the parent shows the old window: more rows than the height, or fewer |
+| bubbles/74 | low | filepicker: a negative height (AutoHeight from a terminal under six rows) is accepted and added by the page keys, so PageUp moves down and PageDown up, off the listing |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -279,6 +309,22 @@ draw property /60 (a colour function surviving `WithColors`), /61 (wide runes: o
 check) and /62 (a total other than clamp(p)), the settle property /59 (|velocity| ≥ 0.01 at
 the stop); /63 is pinned only (NaN is not drawn); each is pinned.
 
+For filepicker (539 lines, read in full first) eight of the eleven were on paper — the page
+keys' `maxIdx − Height`, the resize handlers without `selected`, `G`'s `len − 0`, `SetHeight`'s
+index-against-count test, the `readDirMsg` handler without a clamp, the missing `errorMsg`
+case, `Dir(".")`, the padding loop's newline — and confirmed by one probe file; the property
+found bubbles/72 (the selection report after entering a directory), bubbles/73 (the restored
+window under another height) and bubbles/74 (the negative height). The window's invariants —
+the selection inside it, no more rows than the height, no fewer than the entries allow — are
+checked on the library's indices with a sticky cause per invariant: a resize (/65, /67), `G`
+without a height (/66), a page key (/64, or /74 once a page key was pressed at a negative
+height), a `Back` whose listing changed (/68) or whose height changed (/73) or whose saved
+window already carried a shape, and a page key from a window already oversized (it inherits
+that window's cause: the library's page arithmetic strands the selection); /68 is also
+counted before an Open with the selection out of range, /72 as a `DidSelect` report differing right after an enter that entered a directory;
+/69, /70 and /71 are pinned only (readable trees, absolute paths, the trailing newline
+modelled); each is pinned.
+
 ## Not bugs (modelled as documented)
 
 - Tab keeps the typed prefix's case and appends the suggestion's remainder (`bb` + `BbAa` →
@@ -325,12 +371,18 @@ the stop); /63 is pinned only (NaN is not drawn); each is pinned.
   rounds half away from zero (`math.Round`); `Blend1D` with fewer steps than stops is a prefix
   of the stops (lipgloss's own rule); `Percent()` is the target, not the shown percentage; a
   stale frame (an older tag) is dropped, so two quick setters animate from the second.
+- filepicker: enter on a directory with `DirAllowed` both selects and enters it; a symlink to
+  a directory is entered through its own path (`Back` returns to the link's directory) and is
+  styled as a symlink, not a directory; a broken symlink does nothing on Open or enter and
+  shows an empty target; `AllowedTypes` are suffixes (`e` matches `file`); `Path` keeps the
+  last selection across navigation; the empty-directory message is padded to the height.
 
 ## Not covered (yet)
 
-`tree`, `filepicker`, `key`,
+`tree`, `key`,
 `timer`/`stopwatch`/`spinner`, `cursor` blinking; help's styles; progress's `PercentageStyle`
-and springs outside frequency 1–60 / damping 0.1–2; textinput's clipboard paste (`Paste` reads the
+and springs outside frequency 1–60 / damping 0.1–2; filepicker's styles, a custom `Cursor`,
+directories that change underneath it beyond `ShowHidden`, `IsHidden` on Windows; textinput's clipboard paste (`Paste` reads the
 system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`MinHeight`,
 `MaxContentHeight`, `SetPromptFunc`, the mouse selection API (`BeginSelection`/`ExtendSelection`/
 `EndSelection`), `CopySelection` (clipboard), the placeholder beyond bubbles/23, `ScrollPercent`,
