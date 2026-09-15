@@ -79,3 +79,4 @@ does for pip.
 - 2026-09-15: base bumped cdabfcedb50b → 2c35bb31de15 (2026-09-15, "Use Packse scenarios to speed up tool tests (#21634)"; 0.0.81); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-15: base bumped 2c35bb31de15 → ad552557b635 (2026-09-15, "Preserve local path intent when merging dependency metadata (#20631)"; 0.0.82); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-15: base bumped ad552557b635 → 694dfd8155ec (2026-09-15, "Verify distribution hashes (#21562)"; 0.0.82); 2 bug(s) still reproduce. 12 tests pass.
+- 2026-09-15: base bumped 694dfd8155ec → ac9201b10433 (2026-09-15, "Allow manually specifying build dependency hashes in configuration (#21467)"; 0.0.82); 2 bug(s) still reproduce. 12 tests pass.
