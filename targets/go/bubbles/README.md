@@ -1,15 +1,15 @@
-# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`)
+# go/bubbles — charmbracelet/bubbles v2 (`textinput`, `textarea`, `viewport`, `paginator`, `table`, `list`)
 
 Hegel property tests for `charm.land/bubbles/v2`, the component library of Bubble Tea, pinned
-at `0a69b19b` (main, 2026-09-01). Five slices so far: `textinput`, the single-line editor
+at `0a69b19b` (main, 2026-09-01). Six slices so far: `textinput`, the single-line editor
 (`textinput/hegel_test.go`, package `textinput`, internal so the window offsets are readable),
 `textarea`, the multi-line editor (`textarea/hegel_test.go`, package `textarea`, internal
 for the wrap grid and the viewport offset), and `viewport`, the scrolling pager
 (`viewport/hegel_test.go`, package `viewport`, internal for the highlight index and the
 soft-wrapped rows), `paginator` (`paginator/hegel_test.go`) and `table`
-(`table/hegel_test.go`, package `table`, internal for the rendered window's first row), with
-the shared harness in `internal/zootest`.
-Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table`.
+(`table/hegel_test.go`, package `table`, internal for the rendered window's first row) and
+`list` (`list/hegel_test.go`), with the shared harness in `internal/zootest`.
+Run with `go test -run TestHegel ./textinput ./textarea ./viewport ./paginator ./table ./list`.
 No AI-contribution policy is published in the repository (checked 2026-09-15); the zoo only
 records bugs.
 
@@ -83,6 +83,21 @@ records bugs.
   must agree with it, `View` must be the header (each title truncated with `…` and padded to
   its column, between one space each side) over `Height` consecutive rows rendered the same
   way and cut to the width, the cursor's row must be shown and be the only reversed line.
+- **list: items, filter and selection.** Up to 25 items titled `wNN` plus one to five letters
+  from `a`–`e` (so fuzzy terms of one to three such letters match some of them), a width of
+  20–60 and a height of 12–30, the default delegate with or without descriptions. The model
+  keeps the items, the filter state and term, the visible indices (all items, or
+  `DefaultFilter`'s ranks — the library's own filter is the oracle for the order; the list's
+  bookkeeping around it is what is tested), the selection index and a mirror of the paginator
+  (`PerPage` from the height minus the chrome, the page count as the library last computed
+  it). Every default binding, the filter input (typing, backspace, enter/down to accept, esc),
+  `Select`, `SetItems`, `SetItem`, `InsertItem`, `RemoveItem`, `SetSize`, the section toggles,
+  `SetFilterText`, `ResetFilter`, the page/end methods and `InfiniteScrolling` are driven;
+  the commands `Update` returns are run at once and their messages fed back. After each step
+  `Index`, `Cursor`, `Page`, `TotalPages`, `PerPage`, `SelectedItem`, `GlobalIndex`,
+  `VisibleItems`, `FilterState`/`FilterValue` and the lines of `View` (the title or filter
+  line, the status text, the page's items with the selected one marked by the border, the
+  pagination dots or `p/n`) must agree.
 
 ## Properties
 
@@ -101,6 +116,7 @@ records bugs.
 | `TestHegelHighlightsMarkTheMatches` | `SetHighlights`, next/previous, scrolling: the selected index, the offsets, the reversed cells of every visible row |
 | `TestHegelPaginatorFollowsTheModel` | bindings, helpers and `SetTotalPages` vs the page model: `Page`, the first/last flags, the slice bounds, `View` |
 | `TestHegelTableShowsTheSelectedRow` | every binding and setter vs the cursor model: `Cursor`, `SelectedRow`, the header and the rows of `View`, the selection shown and reversed |
+| `TestHegelListFollowsTheModel` | bindings, filter input, setters and messages vs the item/filter/selection model: the indices, the paginator, `VisibleItems`, `SelectedItem`, the lines of `View` |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
 instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
@@ -157,6 +173,14 @@ instead of failing at the first one; shapes of pinned bugs are counted as `bubbl
 | bubbles/46 | low | table: the header line is not cut to the table's width while the rows are, so a wide header overhangs the table |
 | bubbles/47 | low | table: a height under two is not clamped: at 0 Height() is −1, at 1 the viewport is empty, and View has two lines either way |
 | bubbles/48 | low | table: a tab in a cell value is truncated at width 0 and rendered at width 4, so a<TAB>b in a five-wide column shows a alone |
+| bubbles/49 | medium | list: with an empty filter every visible item carries index 0, so GlobalIndex is 0 whatever is selected |
+| bubbles/50 | high | list: RemoveItem under a filter removes filteredItems[index] instead of the match for that item, so a removed item stays visible and the later matches' global indices are stale |
+| bubbles/51 | low | list: RemoveItem with a negative index panics, though the doc says an index out of bounds is a no-op |
+| bubbles/52 | high | list: the FilterMatchesMsg handler does not update the pagination, so after SetItems, SetItem or InsertItem under a filter the page count is stale — the list is stuck on one page, or items at the end are unreachable |
+| bubbles/53 | medium | list: SetItems and RemoveItem keep the cursor's position on the clamped page, past the end of a shorter list, so SelectedItem is nil and no item is marked until the next message |
+| bubbles/54 | medium | list: New does not size the help or the filter input (only SetSize does), so a fresh list renders its help line at full width and every line is padded to it |
+| bubbles/55 | medium | list: the chrome is not fitted to the width: the status bar is never truncated, the help and the pagination are fitted before their two-cell padding and the title bar to width−1 before its own, so the view is wider than its width |
+| bubbles/56 | low | list: the key bindings fall out of step with the items and pages: RemoveItem and the section toggles do not refresh them, cancelling a filter re-enables / on an empty list, and accepting one refreshes them before the pagination, so the page keys can stay dead |
 
 Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
 thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
@@ -193,6 +217,21 @@ view), /44 (an up move while it is out), /45 (a negative cursor with rows) and /
 wider than the width) by cause; the paginator property /40 and /41; /47 and /48 are pinned only
 (heights are drawn from 2 and values carry no tabs); each is pinned.
 
+For list (1 321 lines plus the delegate, keys and styles, read in full first) six of the eight
+were on paper — `itemsAsFilterItems` without indices, `RemoveItem`'s one index for two slices,
+the `FilterMatchesMsg` handler returning before `updatePagination`, the cursor left by the
+index restore, `New` without the `SetWidth` calls, the paddings outside the truncations — the
+probe of a negative `RemoveItem` gave bubbles/51, and the property found bubbles/56 (`/`
+opening the filter on an emptied list; the page keys dead after a toggle). The property
+mirrors the bindings as `updateKeybindings` last set them and gates /49 (a zero
+`GlobalIndex` under an empty term, counted and carried on), /50 (a divergence right after
+`RemoveItem` under a filter, or a stale `GlobalIndex` after one), /51 (the panic), /52 (a
+page count differing from the matches under an applied filter — the model mirrors the stale
+count while a term is typed, where the navigation keys are disabled), /53 (`SelectedItem`
+nil with the index past the end), /55 (a chrome line wider than the width, counted and
+carried on) and /56 (a page key or `/` pressed while the mirror and the truth differ); /54 is
+avoided by `SetSize` after `New` and pinned; each is pinned.
+
 ## Not bugs (modelled as documented)
 
 - Tab keeps the typed prefix's case and appends the suggestion's remainder (`bb` + `BbAa` →
@@ -225,10 +264,16 @@ wider than the width) by cause; the paginator property /40 and /41; /47 and /48 
   (`Inline`) after truncation; `SetRows` keeps the offset, so a shrunk table may show the
   selection lower than before.
 - paginator: `SetTotalPages` returns the count it set; a fresh paginator has one page.
+- list: `/` moves the selection to the first item and esc/cancel does not restore it; the
+  filter is re-run from the setters' commands, not synchronously (the tests run the commands);
+  `SetFilterText` of a term matching nothing leaves an applied filter over nothing (`“zz” 0
+  items`, `No items.`); a list too short for its chrome plus one item still shows one item and
+  is taller than its height; the up/down keys accept a filter being typed; the dots of the
+  active and inactive pages are the same character in different colours.
 
 ## Not covered (yet)
 
-`list`, `progress`, `tree`, `filepicker`, `help`, `key`,
+`progress`, `tree`, `filepicker`, `help`, `key`,
 `timer`/`stopwatch`/`spinner`, `cursor` blinking; textinput's clipboard paste (`Paste` reads the
 system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`MinHeight`,
 `MaxContentHeight`, `SetPromptFunc`, the mouse selection API (`BeginSelection`/`ExtendSelection`/
@@ -236,4 +281,7 @@ system clipboard) and its styles; textarea's PageUp/PageDown, `DynamicHeight`/`M
 styles and the `Base` frame; viewport's shift+wheel, `StyleLineFunc`, `HorizontalScrollPercent`,
 `YPosition`, gutters of other widths, `Style` width and height beyond bubbles/37,
 `SetHighlights` on styled content beyond bubbles/35; table's `HelpView`, custom key maps and
-styles with their own paddings; paginator's `PerPage` of 0 (a division by zero).
+styles with their own paddings; paginator's `PerPage` of 0 (a division by zero); list's
+spinner, status messages (timers), full help (`?`), `SetShowFilter`/`SetFilteringEnabled`,
+delegates other than the default, `UnsortedFilter`, the delegate's spacing 0 (its pagination
+margin) and `Select` past the end (bubbles/40's shape).
