@@ -1,0 +1,683 @@
+diff --git a/go.mod b/go.mod
+index f46d761..a41e959 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,13 @@
+ module al.essio.dev/pkg/shellescape
+ 
+-go 1.18
++go 1.26.0
+ 
+-require github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
++require (
++	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..b5a5ef0
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,657 @@
++package shellescape_test
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode"
++	"unicode/utf8"
++
++	"al.essio.dev/pkg/shellescape"
++	"hegel.dev/go/hegel"
++)
++
++// Property-based tests for alessio/shellescape. The oracles: bash 5.2, dash and
++// busybox ash for Quote's and QuoteCommand's contract ("can safely be used as
++// one token in a shell command line" — the shell must read the original string
++// back); Python's shlex.quote, the algorithm the package says it was inspired
++// by, held open as a child; the documented safe-character rule as a model;
++// Go's unicode tables for StripUnsafe and StripSpaces; a split model for
++// ScanTokens; and the escargs command built from cmd/escargs, run on generated
++// input. Collect mode (SHELLESCAPE_COLLECT=1) prints every disagreement
++// instead of failing.
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++type collected struct{}
++
++var (
++	collecting    = os.Getenv("SHELLESCAPE_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ------------------------------------------------------------------ shells
++
++type shell struct {
++	name string
++	argv []string
++}
++
++var (
++	bashShell = shell{"bash", []string{"bash", "-c"}}
++	dashShell = shell{"dash", []string{"dash", "-c"}}
++	ashShell  = shell{"busybox sh", []string{"busybox", "sh", "-c"}}
++	allShells = []shell{bashShell, dashShell, ashShell}
++)
++
++// shellWords splits line the way the shell does, with globbing (and, in bash,
++// brace expansion) turned off: bash reads it as the body of `a=( … )`, the
++// POSIX shells as the operands of `set --`. A non-zero exit is an error.
++func shellWords(sh shell, line string) ([]string, error) {
++	var script string
++	if sh.name == "bash" {
++		script = "set -f\nset +B\na=(" + line + "\n)\nprintf '%s\\n' \"${#a[@]}\"\nif ((${#a[@]})); then printf '%s\\0' \"${a[@]}\"; fi\n"
++	} else {
++		script = "set -f\nset -- " + line + "\nprintf '%s\\n' \"$#\"\nif [ \"$#\" -gt 0 ]; then printf '%s\\0' \"$@\"; fi\n"
++	}
++	cmd := exec.Command(sh.argv[0], append(sh.argv[1:], script)...)
++	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "LC_ALL=C.UTF-8"}
++	var out, stderr bytes.Buffer
++	cmd.Stdout = &out
++	cmd.Stderr = &stderr
++	if err := cmd.Run(); err != nil {
++		return nil, fmt.Errorf("%s: %v: %s", sh.name, err, strings.TrimSpace(stderr.String()))
++	}
++	head, rest, ok := bytes.Cut(out.Bytes(), []byte{'\n'})
++	if !ok {
++		return nil, fmt.Errorf("%s: no output", sh.name)
++	}
++	count, err := strconv.Atoi(string(head))
++	if err != nil {
++		return nil, fmt.Errorf("%s: bad count %q", sh.name, head)
++	}
++	words := []string{}
++	if count > 0 {
++		parts := bytes.Split(rest, []byte{0})
++		if len(parts) != count+1 || len(parts[count]) != 0 {
++			return nil, fmt.Errorf("%s: %d words announced, output %q", sh.name, count, rest)
++		}
++		for _, p := range parts[:count] {
++			words = append(words, string(p))
++		}
++	}
++	return words, nil
++}
++
++// ------------------------------------------------------------ Python child
++
++const pyScript = `
++import json, shlex, sys
++for line in sys.stdin:
++    req = json.loads(line)
++    s = bytes(req["b"]).decode("utf-8", "surrogateescape")
++    q = shlex.quote(s).encode("utf-8", "surrogateescape")
++    sys.stdout.write(json.dumps({"q": list(q)}) + "\n")
++    sys.stdout.flush()
++`
++
++type pyChild struct {
++	mu  sync.Mutex
++	in  *bufio.Writer
++	out *bufio.Reader
++	cmd *exec.Cmd
++	err error
++}
++
++var (
++	py     *pyChild
++	pyOnce sync.Once
++)
++
++func python(t testing.TB) *pyChild {
++	pyOnce.Do(func() {
++		c := &pyChild{}
++		c.cmd = exec.Command("python3", "-c", pyScript)
++		stdin, err := c.cmd.StdinPipe()
++		if err != nil {
++			c.err = err
++			py = c
++			return
++		}
++		stdout, err := c.cmd.StdoutPipe()
++		if err != nil {
++			c.err = err
++			py = c
++			return
++		}
++		c.cmd.Stderr = os.Stderr
++		if err := c.cmd.Start(); err != nil {
++			c.err = err
++			py = c
++			return
++		}
++		c.in = bufio.NewWriter(stdin)
++		c.out = bufio.NewReader(stdout)
++		py = c
++	})
++	if py.err != nil {
++		t.Fatalf("python3 child: %v", py.err)
++	}
++	return py
++}
++
++// shlexQuote is Python's shlex.quote over the bytes of s (invalid UTF-8 travels
++// as surrogate escapes and comes back byte for byte).
++func shlexQuote(t testing.TB, s string) string {
++	c := python(t)
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	b := make([]int, len(s))
++	for i := 0; i < len(s); i++ {
++		b[i] = int(s[i])
++	}
++	req, _ := json.Marshal(map[string]any{"b": b})
++	c.in.Write(req)
++	c.in.WriteByte('\n')
++	if err := c.in.Flush(); err != nil {
++		t.Fatalf("python3 child write: %v", err)
++	}
++	line, err := c.out.ReadBytes('\n')
++	if err != nil {
++		t.Fatalf("python3 child read: %v", err)
++	}
++	var res struct {
++		Q []byte `json:"q"`
++	}
++	var raw struct {
++		Q []int `json:"q"`
++	}
++	if err := json.Unmarshal(line, &raw); err != nil {
++		t.Fatalf("python3 child: bad reply %q: %v", line, err)
++	}
++	res.Q = make([]byte, len(raw.Q))
++	for i, v := range raw.Q {
++		res.Q[i] = byte(v)
++	}
++	return string(res.Q)
++}
++
++// ---------------------------------------------------------------- escargs
++
++// TestMain removes the escargs binary built for the tests.
++func TestMain(m *testing.M) {
++	code := m.Run()
++	if escargsPath != "" {
++		os.RemoveAll(filepath.Dir(escargsPath))
++	}
++	os.Exit(code)
++}
++
++var (
++	escargsPath string
++	escargsOnce sync.Once
++	escargsErr  error
++)
++
++func escargs(t testing.TB) string {
++	escargsOnce.Do(func() {
++		dir, err := os.MkdirTemp("", "hegel-escargs-")
++		if err != nil {
++			escargsErr = err
++			return
++		}
++		escargsPath = filepath.Join(dir, "escargs")
++		cmd := exec.Command("go", "build", "-o", escargsPath, "./cmd/escargs")
++		if out, err := cmd.CombinedOutput(); err != nil {
++			escargsErr = fmt.Errorf("go build: %v: %s", err, out)
++		}
++	})
++	if escargsErr != nil {
++		t.Fatalf("escargs: %v", escargsErr)
++	}
++	return escargsPath
++}
++
++func runEscargs(t testing.TB, stdin string, args ...string) (string, string, int) {
++	cmd := exec.Command(escargs(t), args...)
++	cmd.Stdin = strings.NewReader(stdin)
++	var out, stderr bytes.Buffer
++	cmd.Stdout = &out
++	cmd.Stderr = &stderr
++	err := cmd.Run()
++	code := 0
++	if err != nil {
++		if ee, ok := err.(*exec.ExitError); ok {
++			code = ee.ExitCode()
++		} else {
++			t.Fatalf("escargs: %v", err)
++		}
++	}
++	return out.String(), stderr.String(), code
++}
++
++// ------------------------------------------------------------- generators
++
++// The documented safe set: [\w@%+=:,./-] with an ASCII \w (Go's RE2 and
++// Python's re.ASCII agree).
++func isSafe(r rune) bool {
++	return r == '_' || r == '@' || r == '%' || r == '+' || r == '=' || r == ':' || r == ',' || r == '.' || r == '/' || r == '-' ||
++		(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
++}
++
++var (
++	safeRunes     = []rune("abcxyzABZ019_@%+=:,./-")
++	unsafeASCII   = []rune("!\"#$&'()*;<>?[\\]^`{|}~ \t")
++	controlRunes  = []rune{'\n', '\r', 0x0b, 0x0c, 0x1b, 0x7f, 0x01}
++	nonASCIIRunes = []rune{'\u00e4', '\u00df', '\u00e9', '\u65e5', '\u672c', '\u00a0', '\u2028', '\u2029', '\u0085', '\u0301', '\u200b', '\u200d', '\ufeff', '\U0001F600', '\ufffd', '\u3000'}
++	invalidBytes  = []string{"\xff", "\xc3", "\xe3\x81", "\xc0\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80"}
++)
++
++// genString draws a string of 0–24 pieces from the pools above; NUL only when
++// nul is set (a shell cannot carry it in an argument).
++func genString(tc hegel.TestCase, nul bool) string {
++	var sb strings.Builder
++	k := n(tc, 0, 24)
++	for i := 0; i < k; i++ {
++		switch n(tc, 0, 9) {
++		case 0, 1, 2, 3:
++			sb.WriteRune(pick(tc, safeRunes))
++		case 4, 5:
++			sb.WriteRune(pick(tc, unsafeASCII))
++		case 6:
++			sb.WriteRune(pick(tc, controlRunes))
++		case 7:
++			sb.WriteRune(pick(tc, nonASCIIRunes))
++		case 8:
++			sb.WriteString(pick(tc, invalidBytes))
++		case 9:
++			if nul && chance(tc, 30) {
++				sb.WriteByte(0)
++			} else {
++				sb.WriteRune('\'')
++			}
++		}
++	}
++	return sb.String()
++}
++
++func genArgs(tc hegel.TestCase, nul bool) []string {
++	k := n(tc, 0, 5)
++	args := make([]string, k)
++	for i := range args {
++		args[i] = genString(tc, nul)
++	}
++	return args
++}
++
++// ------------------------------------------------------------- properties
++
++// TestHegelQuoteRoundTripsThroughTheShells: bash, dash and busybox ash read
++// Quote(s) back as exactly the one word s, and QuoteCommand(args) as exactly
++// args (no NUL: no shell can carry one in an argument, see the README).
++func TestHegelQuoteRoundTripsThroughTheShells(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		sh := pick(ht, allShells)
++		args := genArgs(ht, false)
++		var line string
++		if chance(ht, 50) && len(args) > 0 {
++			line = shellescape.Quote(args[0])
++			args = args[:1]
++		} else {
++			line = shellescape.QuoteCommand(args)
++		}
++		note(ht, "shell=%s args=%q line=%q", sh.name, args, line)
++		got, err := shellWords(sh, line)
++		if err != nil {
++			fail(ht, "%s rejects %q (from %q): %v", sh.name, line, args, err)
++		}
++		if !reflect.DeepEqual(got, args) {
++			fail(ht, "%s reads %q (from %q) as %q", sh.name, line, args, got)
++		}
++	})
++}
++
++// TestHegelQuoteMatchesShlexQuoteAndTheDocumentedRule: Quote(s) is byte for
++// byte Python's shlex.quote(s) (the algorithm the package derives from), and
++// follows the rule: "" → ”, a non-empty string of safe characters → itself,
++// anything else → single-quoted with each ' spelled '"'"'.
++func TestHegelQuoteMatchesShlexQuoteAndTheDocumentedRule(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genString(ht, true)
++		got := shellescape.Quote(s)
++		if want := shlexQuote(ht, s); got != want {
++			fail(ht, "Quote(%q) = %q, shlex.quote gives %q", s, got, want)
++		}
++		safe := s != "" && utf8.ValidString(s)
++		if safe {
++			for _, r := range s {
++				if !isSafe(r) {
++					safe = false
++					break
++				}
++			}
++		}
++		var want string
++		switch {
++		case s == "":
++			want = "''"
++		case safe:
++			want = s
++		default:
++			want = "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
++		}
++		if got != want {
++			fail(ht, "Quote(%q) = %q, the documented rule gives %q", s, got, want)
++		}
++		// QuoteCommand is the space-joined Quotes.
++		args := genArgs(ht, true)
++		parts := make([]string, len(args))
++		for i, a := range args {
++			parts[i] = shellescape.Quote(a)
++		}
++		if got, want := shellescape.QuoteCommand(args), strings.Join(parts, " "); got != want {
++			fail(ht, "QuoteCommand(%q) = %q, want %q", args, got, want)
++		}
++	})
++}
++
++// filterRunes keeps the runes of s that keep says to (valid UTF-8 only).
++func filterRunes(s string, keep func(rune) bool) string {
++	var sb strings.Builder
++	for _, r := range s {
++		if keep(r) {
++			sb.WriteRune(r)
++		}
++	}
++	return sb.String()
++}
++
++// TestHegelStripFunctionsFollowTheUnicodeTables: on valid UTF-8, StripUnsafe
++// keeps exactly the runes unicode.IsPrint accepts and StripSpaces drops exactly
++// those unicode.IsSpace accepts; both are idempotent and commute; on strings
++// with invalid bytes only the pinned shape is skipped (shellescape/1).
++func TestHegelStripFunctionsFollowTheUnicodeTables(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		s := genString(ht, true)
++		u, sp := shellescape.StripUnsafe(s), shellescape.StripSpaces(s)
++		if !utf8.ValidString(s) {
++			note(ht, "invalid UTF-8 in %q: only idempotence judged (shellescape/1)", s)
++		} else {
++			if want := filterRunes(s, unicode.IsPrint); u != want {
++				fail(ht, "StripUnsafe(%q) = %q, want %q", s, u, want)
++			}
++			if want := filterRunes(s, func(r rune) bool { return !unicode.IsSpace(r) }); sp != want {
++				fail(ht, "StripSpaces(%q) = %q, want %q", s, sp, want)
++			}
++			if a, b := shellescape.StripUnsafe(sp), shellescape.StripSpaces(u); a != b {
++				fail(ht, "StripUnsafe∘StripSpaces(%q) = %q but StripSpaces∘StripUnsafe = %q", s, a, b)
++			}
++		}
++		if again := shellescape.StripUnsafe(u); again != u {
++			fail(ht, "StripUnsafe is not idempotent on %q: %q then %q", s, u, again)
++		}
++		if again := shellescape.StripSpaces(sp); again != sp {
++			fail(ht, "StripSpaces is not idempotent on %q: %q then %q", s, sp, again)
++		}
++		for _, r := range sp {
++			if unicode.IsSpace(r) {
++				fail(ht, "StripSpaces(%q) = %q still holds the space %U", s, sp, r)
++			}
++		}
++	})
++}
++
++// splitNUL is the documented ScanTokens contract: the words between NULs, a
++// final unterminated word included, no empty word after a final NUL.
++func splitNUL(d string) []string {
++	if d == "" {
++		return []string{}
++	}
++	parts := strings.Split(d, "\x00")
++	if strings.HasSuffix(d, "\x00") {
++		parts = parts[:len(parts)-1]
++	}
++	return parts
++}
++
++// TestHegelScanTokensSplitsOnNUL: a bufio.Scanner with ScanTokens, fed through
++// buffers of random size, yields exactly splitNUL(data).
++func TestHegelScanTokensSplitsOnNUL(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var sb strings.Builder
++		for i, k := 0, n(ht, 0, 8); i < k; i++ {
++			sb.WriteString(genString(ht, false))
++			if chance(ht, 70) {
++				sb.WriteByte(0)
++			}
++		}
++		d := sb.String()
++		sc := bufio.NewScanner(strings.NewReader(d))
++		sc.Buffer(make([]byte, 0, n(ht, 1, 64)), 1<<16)
++		sc.Split(shellescape.ScanTokens)
++		got := []string{}
++		for sc.Scan() {
++			got = append(got, sc.Text())
++		}
++		if err := sc.Err(); err != nil {
++			fail(ht, "scanning %q: %v", d, err)
++		}
++		if want := splitNUL(d); !reflect.DeepEqual(got, want) {
++			fail(ht, "ScanTokens over %q gives %q, want %q", d, got, want)
++		}
++	})
++}
++
++// scanLines is bufio.ScanLines' contract: split on \n, drop one trailing \r
++// per line, a final unterminated line counts, no empty line after a final \n.
++func scanLines(d string) []string {
++	if d == "" {
++		return []string{}
++	}
++	parts := strings.Split(d, "\n")
++	if strings.HasSuffix(d, "\n") {
++		parts = parts[:len(parts)-1]
++	}
++	for i, p := range parts {
++		parts[i] = strings.TrimSuffix(p, "\r")
++	}
++	return parts
++}
++
++// TestHegelEscargsQuotesEveryInputLine: escargs prints Quote of each input
++// item joined by single spaces, items being lines (or NUL-terminated words with
++// -0), blank items kept unless -D; exit status 0; nothing on stderr.
++func TestHegelEscargsQuotesEveryInputLine(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		nul := chance(ht, 30)
++		discard := chance(ht, 30)
++		var sb strings.Builder
++		for i, k := 0, n(ht, 0, 6); i < k; i++ {
++			sb.WriteString(strings.ReplaceAll(genString(ht, false), "\n", "\\n"))
++			if chance(ht, 80) {
++				if nul {
++					sb.WriteByte(0)
++				} else if chance(ht, 20) {
++					sb.WriteString("\r\n")
++				} else {
++					sb.WriteByte('\n')
++				}
++			}
++		}
++		input := sb.String()
++		var items []string
++		var args []string
++		if nul {
++			items = splitNUL(input)
++			args = append(args, "-0")
++		} else {
++			items = scanLines(input)
++		}
++		if discard {
++			args = append(args, "-D")
++			kept := []string{}
++			for _, it := range items {
++				if it != "" {
++					kept = append(kept, it)
++				}
++			}
++			items = kept
++		}
++		useFile := chance(ht, 20)
++		if useFile {
++			f := filepath.Join(t.TempDir(), "args")
++			if err := os.WriteFile(f, []byte(input), 0o644); err != nil {
++				ht.Fatalf("write: %v", err)
++			}
++			args = append(args, "-a", f)
++		}
++		note(ht, "args=%q input=%q", args, input)
++		var out, stderr string
++		var code int
++		if useFile {
++			out, stderr, code = runEscargs(ht, "", args...)
++		} else {
++			out, stderr, code = runEscargs(ht, input, args...)
++		}
++		want := shellescape.QuoteCommand(items)
++		if code != 0 || stderr != "" {
++			fail(ht, "escargs %q on %q: exit %d, stderr %q", args, input, code, stderr)
++		}
++		if out != want {
++			fail(ht, "escargs %q on %q printed %q, want %q", args, input, out, want)
++		}
++	})
++}
++
++// ---------------------------------------------------------------- pins
++
++// TestHegelPinStripFunctionsRemoveInvalidBytes pins shellescape/1: an invalid
++// UTF-8 byte is not a printable rune, yet StripUnsafe (and StripSpaces) replace
++// each one with U+FFFD instead of dropping or keeping it.
++func TestHegelPinStripFunctionsRemoveInvalidBytes(t *testing.T) {
++	defer guard(t)
++	for _, s := range []string{"\xff", "a\xffb", "\xc3", "a\xe3\x81 b"} {
++		if got := shellescape.StripUnsafe(s); strings.ContainsRune(got, utf8.RuneError) {
++			t.Errorf("StripUnsafe(%q) = %q: an invalid byte became U+FFFD", s, got)
++		}
++		if got := shellescape.StripSpaces(s); strings.ContainsRune(got, utf8.RuneError) {
++			t.Errorf("StripSpaces(%q) = %q: an invalid byte became U+FFFD", s, got)
++		}
++	}
++}
++
++// TestHegelPinEscargsReportsAnInputItTruncates pins shellescape/2: a line
++// longer than bufio.Scanner's 64 KiB limit stops the scan; escargs prints what
++// it has, exits 0 and says nothing.
++func TestHegelPinEscargsReportsAnInputItTruncates(t *testing.T) {
++	defer guard(t)
++	long := strings.Repeat("x", 70000)
++	for _, tt := range []struct{ in, want string }{
++		{long + "\nshort\n", long + " short"},
++		{"ok\n" + long + "\nshort\n", "ok " + long + " short"},
++	} {
++		out, stderr, code := runEscargs(t, tt.in)
++		if out != tt.want && (code == 0 && stderr == "") {
++			t.Errorf("escargs on a %d-byte input printed %d bytes (%.20q…), exit %d, stderr %q: the input was truncated silently", len(tt.in), len(out), out, code, stderr)
++		}
++	}
++}
++
++// ---------------------------------------------------------------- examples
++
++func TestHegelExamples(t *testing.T) {
++	for _, tt := range []struct{ in, want string }{
++		{"", "''"},
++		{"abc", "abc"},
++		{"a b", "'a b'"},
++		{"it's", `'it'"'"'s'`},
++		{"ä", "'ä'"},
++	} {
++		if got := shellescape.Quote(tt.in); got != tt.want {
++			t.Errorf("Quote(%q) = %q, want %q", tt.in, got, tt.want)
++		}
++	}
++	if got := shellescape.QuoteCommand([]string{"ls", "-l", "my file"}); got != "ls -l 'my file'" {
++		t.Errorf("QuoteCommand = %q", got)
++	}
++}
