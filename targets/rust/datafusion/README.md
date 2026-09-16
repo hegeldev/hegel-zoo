@@ -69,3 +69,4 @@
 - 2026-09-16: base bumped 5a4490502d53 → 86ba5e05fccc (2026-09-16, "docs(physical-optimizer): warn that wrapper rules must forward schema_check (#25357)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped 86ba5e05fccc → 606ae0f69738 (2026-09-16, "dev: include security auditing in the local lint suite (#25359)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped 606ae0f69738 → b0b547136fbe (2026-09-16, "refactor: exhaustively destructure dynamic filter and scalar subquery proto hooks (#25178)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-16: base bumped b0b547136fbe → 140c7c5a4cbd (2026-09-16, "fix: Handle nulls correctly when extracting nested arrays from nullable struct/map (#25122)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
