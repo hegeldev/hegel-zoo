@@ -43,3 +43,4 @@
 - 2026-09-15: base bumped 07988fc518f2 → 5dcf491ab638 (2026-09-15, "fix(python): Fix panic in scan_iceberg for snapshot_id before a schema change (#28895)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 5dcf491ab638 → 2dacb0d42f9a (2026-09-15, "chore(rust): Remove unused `utf8_to_timestamp_scalar` (#29264)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-15: base bumped 2dacb0d42f9a → f0551e00194a (2026-09-15, "chore: Bump object_store crate to 0.14.2 (#29317)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-16: base bumped f0551e00194a → b3e18daed873 (2026-09-16, "fix: Incorrect height in multi-input GroupBy (#29332)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
