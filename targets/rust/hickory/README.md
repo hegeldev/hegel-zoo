@@ -43,3 +43,4 @@
 - 2026-09-14: base bumped 5276716c9f4b → 1b1084e2a0b4 (2026-09-14, "Update rustls"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 291 tests pass.
 - 2026-09-14: base bumped 1b1084e2a0b4 → 96469219f3a3 (2026-09-14, "SVCB: Reject extra data in SvcParamValue"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.
 - 2026-09-15: base bumped 96469219f3a3 → 0a67a39db05f (2026-09-15, "Fix disabling optional server timeouts"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.
+- 2026-09-16: base bumped 0a67a39db05f → a0b6fecbdf09 (2026-09-16, "`NoConnections` error no longer hides useful io errors"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.
