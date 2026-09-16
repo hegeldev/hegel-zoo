@@ -70,3 +70,4 @@
 - 2026-09-16: base bumped 86ba5e05fccc → 606ae0f69738 (2026-09-16, "dev: include security auditing in the local lint suite (#25359)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped 606ae0f69738 → b0b547136fbe (2026-09-16, "refactor: exhaustively destructure dynamic filter and scalar subquery proto hooks (#25178)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped b0b547136fbe → 140c7c5a4cbd (2026-09-16, "fix: Handle nulls correctly when extracting nested arrays from nullable struct/map (#25122)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-16: base bumped 140c7c5a4cbd → e3163d46affb (2026-09-16, "feat: Support lazy per-file Parquet Arrow schema derivation (#25343)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
