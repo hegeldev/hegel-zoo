@@ -46,3 +46,4 @@
 - 2026-09-16: base bumped f0551e00194a → b3e18daed873 (2026-09-16, "fix: Incorrect height in multi-input GroupBy (#29332)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-16: base bumped b3e18daed873 → 77cc5fac18b0 (2026-09-16, "chore: Mark test as slow (#29336)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-16: base bumped 77cc5fac18b0 → 9c4d5e09e694 (2026-09-16, "chore!: Deprecate cut/qcut (#29329)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-16: base bumped 9c4d5e09e694 → fb9dbf7dd1f5 (2026-09-16, "fix(rust): Fix Arrow C interop offset for sliced `UnionArray` imports (#29328)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
