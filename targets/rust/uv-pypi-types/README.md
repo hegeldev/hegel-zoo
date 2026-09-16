@@ -92,3 +92,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - 2026-09-15: base bumped a265915acf9e → 27e80c1498d9 (2026-09-15, "renovate: update uv hashes correctly with setup-uv (#21724)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped 27e80c1498d9 → b9df2d1d1ac7 (2026-09-15, "Move default-group selection onto project and workspace types (#21689)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
 - 2026-09-15: base bumped b9df2d1d1ac7 → 9d8d76f4a13d (2026-09-15, "Use cargo-deny from toolchain (#21730)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
+- 2026-09-16: base bumped 9d8d76f4a13d → c202b35405f1 (2026-09-15, "Encapsulate resolver metadata requests (#21735)"; 0.0.82); 2 bug(s) still reproduce. 53 tests pass.
