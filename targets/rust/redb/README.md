@@ -29,3 +29,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped fe0141159c73 → 8f08680d3d40 (2026-09-12, "Update changelog"; 4.2.0); 0 bug(s) still reproduce. 450 tests pass. The patch's `use redb::backends::InMemoryBackend;` was dropped because upstream's test file now imports it at the top.
 - 2026-09-15: base bumped 8f08680d3d40 → 2de02fa48d1b (2026-09-14, "Bump version to 4.3.0"; 4.3.0); 0 bug(s) still reproduce. 450 tests pass.
+- 2026-09-16: base bumped 2de02fa48d1b → 5677e5d90f7f (2026-09-16, "Shrink database files when write transactions abort"; 4.3.0); 0 bug(s) still reproduce. 459 tests pass.
