@@ -35,3 +35,4 @@
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped d00f0f7a2382 → 6d43a32c8de1 (2026-09-06, "CHANGELOG: Add Unreleased section"; 0.19.1); 1 bug(s) still reproduce; add/add conflicts in tests/matching.rs resolved by keeping both sides. 640 tests pass.
 - 2026-09-13: base bumped 6d43a32c8de1 → e2684857abcf (2026-09-13, "Version 0.19.2"; 0.19.2); 1 bug(s) still reproduce; add/add conflicts in tests/common/mod.rs, tests/matching.rs resolved by keeping both sides. 657 tests pass.
+- 2026-09-16: base bumped e2684857abcf → b4ba488d23da (2026-09-16, "Merge pull request #282 from Keats/giallo-changes"; 0.19.2); 1 bug(s) still reproduce. 662 tests pass.

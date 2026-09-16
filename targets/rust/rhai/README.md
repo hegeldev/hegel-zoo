@@ -53,3 +53,4 @@
 - 2026-09-14: base bumped 9ff002f33f6f → c7848752c2c8 (2026-09-14, "Use walk API to detect `break` in loops."; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
 - 2026-09-15: base bumped c7848752c2c8 → 354ba7407f38 (2026-09-15, "Show source error line when running Grain bytecodes"; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
 - 2026-09-15: base bumped 354ba7407f38 → 2925e069f89e (2026-09-15, "Fix errors under no_ast."; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
+- 2026-09-16: base bumped 2925e069f89e → 847a842affb9 (2026-09-16, "Merge pull request #1170 from schungx/master"; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
