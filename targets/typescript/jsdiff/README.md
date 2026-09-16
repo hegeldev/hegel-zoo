@@ -106,3 +106,4 @@ Five, all recorded in `bugs.toml` with a pin each:
 ## History
 
 - 2026-09-15: created at 87c5152b (9.0.0); five bugs (jsdiff/1–5).
+- 2026-09-16: base bumped 87c5152b9b39 → b9d516f36378 (2026-09-16, "Quote the Index line like the other file-name headers (#705)"; 9.0.0); 5 bug(s) still reproduce. 5 tests pass.

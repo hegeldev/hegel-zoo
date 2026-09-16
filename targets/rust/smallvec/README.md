@@ -31,3 +31,4 @@
 - 2026-09-14: base bumped 053f1a7b71b4 → aefeac3d090a (2026-09-14, "refactor: remove deprecated usage in bench (#611)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass.
 - 2026-09-14: base bumped aefeac3d090a → ed4b23aa0191 (2026-09-14, "fix: overflow on length on not-64-bit (#616)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass.
 - 2026-09-16: base bumped ed4b23aa0191 → 9ffad8d54139 (2026-09-16, "Refactor the benchmark suite (#619)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass.
+- 2026-09-16: base bumped 9ffad8d54139 → 1a1db06bc483 (2026-09-16, "chore: bump version (#615)"; 2.0.0-beta.1); 0 bug(s) still reproduce. 90 tests pass.
