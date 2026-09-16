@@ -82,3 +82,4 @@ instantiation, nesting-limit behaviour.
   class), while `toJson` writes the same value and `fromJson` reads it back.
 
 All three are pinned (`pin…` tests) and recorded in `bugs.toml`.
+- 2026-09-16: base bumped 8fe077819b2c → 698ba9ebfdbf (2026-09-15, "use the runtime type for a wildcard element type (#3112)"; 2.14.1-SNAPSHOT); 3 bug(s) still reproduce. 8 tests pass.
