@@ -83,3 +83,4 @@ instantiation, nesting-limit behaviour.
 
 All three are pinned (`pin…` tests) and recorded in `bugs.toml`.
 - 2026-09-16: base bumped 8fe077819b2c → 698ba9ebfdbf (2026-09-15, "use the runtime type for a wildcard element type (#3112)"; 2.14.1-SNAPSHOT); 3 bug(s) still reproduce. 8 tests pass.
+- 2026-09-16: base bumped 698ba9ebfdbf → 854c8255b625 (2026-09-16, "Simplify key removal in `LegacyProtoTypeAdapterFactoryTest` (#3124)"; 2.14.1-SNAPSHOT); 3 bug(s) still reproduce. 8 tests pass.
