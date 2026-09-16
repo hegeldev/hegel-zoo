@@ -89,3 +89,4 @@ parser accepts an object's trailing comma without the feature when the brace com
 Known upstream and skipped, not counted: mangled numbers inside containers such as `[123true]` are
 not reported (core#1557, `tofix` tests in the repository); the mutation property's root-value model
 only applies jackson's separator rule at the root.
+- 2026-09-16: base bumped 104aab73ca89 → 6f505ccb2e77 (2026-09-15, "Add `StreamReadConstraints.getMaxBigIntegerScale()` (#1715)"; 3.3.0-SNAPSHOT); 12 bug(s) still reproduce. 8 tests pass.

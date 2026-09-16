@@ -37,3 +37,4 @@
 - 2026-09-14: base bumped c9aecfd21249 → 108ffc75ea24 (2026-09-14, "Run the focused Miri suite in GitHub CI (#239)"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 988 tests pass.
 - 2026-09-14: base bumped 108ffc75ea24 → 59d371e92bf2 (2026-09-14, "Suppress unreachable-code warnings in UnpackValue derive"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 988 tests pass.
 - 2026-09-15: base bumped 59d371e92bf2 → 241c58d0e441 (2026-09-15, "Hoist the stack write-back out of the branches in `repr_stack_push`"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 989 tests pass.
+- 2026-09-16: base bumped 241c58d0e441 → fc7a4188d112 (2026-09-15, "Stop overflowing the chunk size for a heap with many chunks"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 990 tests pass.
