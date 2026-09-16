@@ -48,3 +48,4 @@
 - 2026-09-16: base bumped 77cc5fac18b0 → 9c4d5e09e694 (2026-09-16, "chore!: Deprecate cut/qcut (#29329)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-16: base bumped 9c4d5e09e694 → fb9dbf7dd1f5 (2026-09-16, "fix(rust): Fix Arrow C interop offset for sliced `UnionArray` imports (#29328)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-16: base bumped fb9dbf7dd1f5 → 10f67c8ddb0f (2026-09-16, "fix: Correlation of constant column returning non-NaN for larger inputs (#29319)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-16: base bumped 10f67c8ddb0f → 83d4c9d1bb62 (2026-09-16, "refactor(rust): Remove dependency on polars-ops from polars-plan (#29341)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
