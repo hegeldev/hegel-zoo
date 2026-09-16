@@ -119,3 +119,4 @@ trailing `.` in a tag component (bug 2), known tags spelled canonically (bug 3),
 - 2026-09-16: base bumped f018faac8db2 → f67344d87d2a (2026-09-16, "Skip `uv_build` fast path when pinned version differs (#21742)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-16: base bumped f67344d87d2a → 3977dafee977 (2026-09-16, "Remove unused reqwest blocking feature from tests (#21749)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-16: base bumped 3977dafee977 → bafbff9f631e (2026-09-16, "Respect artifact compatibility when initializing platform coverage (#21753)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
+- 2026-09-16: base bumped bafbff9f631e → 108a3587b857 (2026-09-16, "Refactor HashDigest APIs (#21139)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
