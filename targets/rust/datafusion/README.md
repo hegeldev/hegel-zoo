@@ -65,3 +65,4 @@
 - 2026-09-15: base bumped 22651d24cc81 → 8bd6629db689 (2026-09-15, "chore(deps): bump taiki-e/install-action from 2.87.6 to 2.87.12 (#25321)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped 8bd6629db689 → be5a96e76df9 (2026-09-16, "fix: prune row groups when file statistics collapse the predicate to a constant (#24770)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped be5a96e76df9 → 62dc7ac37b31 (2026-09-16, "Support INSERT OVERWRITE for MemTable (#24969)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-16: base bumped 62dc7ac37b31 → 5a4490502d53 (2026-09-16, "dev: include ASF status checks in the local lint suite (#25313)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
