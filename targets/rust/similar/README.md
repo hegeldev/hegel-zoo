@@ -33,3 +33,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-12: base bumped 0210f53830cc → 45136acfc28a (2026-08-30, "fix(merge): keep conflict marker labels on one line (#102)"; 3.2.0); 0 bug(s) still reproduce; fixed upstream: similar/1. 146 tests pass. The fix is upstream's own (3.2.0 reworked the algorithms; `lcs.rs` returns early when both inputs are empty), not traced to an issue.
 - 2026-09-15: base bumped 45136acfc28a → 157037b12a62 (2026-09-15, "Add similar-rs to Related Projects (#103)"; 3.2.0); 0 bug(s) still reproduce. 148 tests pass.
+- 2026-09-16: base bumped 157037b12a62 → 1c6428040122 (2026-09-16, "docs(changelog): describe diff performance and memory improvements"; 3.2.0); 0 bug(s) still reproduce. 160 tests pass.
