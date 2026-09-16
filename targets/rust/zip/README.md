@@ -35,3 +35,4 @@
 - 2026-09-14: base bumped a543a1fc8f3f → 75eec5b61f2e (2026-09-14, "ci(deps): bump release-plz/action from 0.5.132 to 0.5.133 (#987)"; 9.0.0-pre3); 0 bug(s) still reproduce. 277 tests pass.
 - 2026-09-15: base bumped 75eec5b61f2e → d2d05e8eb513 (2026-09-15, "feat: read data descriptor from binary (#990)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.
 - 2026-09-15: base bumped d2d05e8eb513 → 80447c5e9071 (2026-09-15, "ci(deps): bump release-plz/action from 0.5.133 to 0.5.134 (#993)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.
+- 2026-09-16: base bumped 80447c5e9071 → 8b4991288b79 (2026-09-16, "fix: don't pre-allocate the declared size in the legacy decoders (#991)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.

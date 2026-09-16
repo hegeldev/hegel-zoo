@@ -56,3 +56,4 @@ what `std::fmt` itself does for every spec without the `0` flag. The properties:
 - `{x:0=1}` on a string that needs no padding is accepted while `{x:0=5}` is refused — the `=`
   alignment is Python's, not std::fmt's; not compared.
 - Exponent output is Rust's (`4.24e1`), not Python's: the number text is `write!`'s by design.
+- 2026-09-16: base bumped 1948f91e5dc5 → 8d316a256cfd (2026-09-15, "Support u128 & i128 (#42)"; 0.2.5); 7 bug(s) still reproduce. 42 tests pass.

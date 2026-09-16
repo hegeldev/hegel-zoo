@@ -26,3 +26,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/rustfft.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 4758ab0dd6f2 → 960afba58a87 (2026-09-07, "Use pastey as a dependency instead of paste (#174)"; 6.4.1); 0 bug(s) still reproduce. 214 tests pass.
+- 2026-09-16: base bumped 960afba58a87 → f7b62e968366 (2026-09-15, "Clarify output order (#175)"; 6.4.1); 0 bug(s) still reproduce. 214 tests pass.
