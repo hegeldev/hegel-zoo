@@ -31,7 +31,9 @@ default ~1 KiB chunks short texts never leave a single leaf. Only the crate's un
   intermittent (needs the byte-range form and an end between CR and LF).
 - `byte_slices_count_lines_like_char_slices`: a slice by byte range equals the slice by the same
   char range in every respect, with the range end aimed at CRs followed by LF. KNOWN FAILURE
-  ropey/1.
+  ropey/1, intermittent (a CI run passed it); the deterministic pin is
+  `pin_byte_slice_ending_in_a_split_crlf_counts_the_cr` (a 3 KB text sliced by byte range up to
+  a CR).
 - `comparisons_and_hash_match_strings`: `==`, `Ord` (byte-wise like `str`) and `Hash` on ropes
   and slices agree with the strings whatever the chunk structure (the same text built two ways),
   including comparisons with `&str`/`String`/`Cow` in both directions, rope vs slice, prefix

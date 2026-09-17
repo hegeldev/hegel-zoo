@@ -45,7 +45,11 @@ words and mixtures, release, meta), a Mess generator, and a soup with junk.
   `versioning_comparison_is_a_total_order` (versions/3),
   `versioning_orders_version_texts_like_version_does` (versions/4), `messes_order_totally`
   (versions/5), `to_mess_builds_what_mess_parsing_builds` (versions/6), `to_mess_keeps_the_metadata`
-  (versions/7), `versions_order_totally` (versions/8).
+  (versions/7), `versions_order_totally` (versions/8). The two order properties reach their bugs
+  only on some runs (a CI run passed both), so they are marked intermittent and each bug also has
+  a deterministic pin: `pin_semver_orders_below_a_release_candidate_of_the_same_number`
+  (`1.2.3rc1` vs `1.2.3`, versions/4) and `pin_version_equality_ignores_the_metadata_like_its_ordering`
+  (`1.2.3+a` vs `1.2.3+b`, versions/8).
 
 ## Oracles
 
