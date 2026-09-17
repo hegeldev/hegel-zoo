@@ -73,3 +73,4 @@ so the documented KDF example derives two identical keys (3); strict quoted-prin
   tests assert it, so the property accepts it.
 - Whitespace-separated Base45 is rejected (RFC 9285 has no whitespace), `' '` is data; the
   property follows the documents.
+- 2026-09-17: base bumped f49b96388c2d → eec585d1e821 (2026-09-17, "Fix Blake3 KDF example and clarify finalization semantics"; 1.23.0-SNAPSHOT); 7 bug(s) still reproduce. 21 tests pass.

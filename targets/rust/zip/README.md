@@ -39,3 +39,4 @@
 - 2026-09-16: base bumped 8b4991288b79 → 68b3e3b69804 (2026-09-16, "ci(deps): bump github/codeql-action/upload-sarif from 4.37.9 to 4.38.0 (#997)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.
 - 2026-09-17: base bumped 68b3e3b69804 → 8abd89514424 (2026-09-17, "ci(deps): bump release-plz/action from 0.5.135 to 0.5.136 (#999)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.
 - 2026-09-17: base bumped 8abd89514424 → 09c030eab56e (2026-09-17, "Merge commit from fork"; 9.0.0-pre3); 0 bug(s) still reproduce. 291 tests pass.
+- 2026-09-17: base bumped 09c030eab56e → 57fad8231ed4 (2026-09-17, "Fix: some permissions tests can only run on Unix (#1000)"; 9.0.0-pre3); 0 bug(s) still reproduce. 291 tests pass.

@@ -107,3 +107,4 @@ crate's `RequirementsTxt`.
 - 2026-09-17: base bumped 5d64ede21e9e → 7bc36767ae3e (2026-09-17, "Avoid warning when both `native-tls` and `system-certs` are configured (#21806)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-17: base bumped 7bc36767ae3e → 6dffe7e03898 (2026-09-17, "Ignore `UV_NATIVE_TLS` when `UV_SYSTEM_CERTS` is set (#21805)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-17: base bumped 6dffe7e03898 → a2f820ad0ceb (2026-09-17, "Assign release pull requests to the workflow initiator (#21808)"; 0.0.82); 4 bug(s) still reproduce. 55 tests pass.
+- 2026-09-17: base bumped a2f820ad0ceb → 761ff1379b3b (2026-09-17, "Bump version to 0.12.16 (#21809)"; 0.0.83); 4 bug(s) still reproduce. 55 tests pass.
