@@ -73,3 +73,4 @@
 - 2026-09-16: base bumped 140c7c5a4cbd → e3163d46affb (2026-09-16, "feat: Support lazy per-file Parquet Arrow schema derivation (#25343)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-16: base bumped e3163d46affb → 4e907557ad7e (2026-09-16, "perf: Unify, optimize `map[k]` and `map_extract(key)` (#25201)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 4e907557ad7e → dcd385e3e177 (2026-09-17, "perf: reuse one StatisticsContext across ensure_distribution (#25098)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped dcd385e3e177 → 0bef032a4a42 (2026-09-17, "fix(physical-plan): CoalescePartitionsExec panic on wasm32-unknown-unknown (#24890)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.

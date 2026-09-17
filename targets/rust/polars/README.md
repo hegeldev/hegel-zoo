@@ -50,3 +50,4 @@
 - 2026-09-16: base bumped fb9dbf7dd1f5 → 10f67c8ddb0f (2026-09-16, "fix: Correlation of constant column returning non-NaN for larger inputs (#29319)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-16: base bumped 10f67c8ddb0f → 83d4c9d1bb62 (2026-09-16, "refactor(rust): Remove dependency on polars-ops from polars-plan (#29341)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-16: base bumped 83d4c9d1bb62 → 3127ec9c82e0 (2026-09-16, "perf: Rechunk a frame sorted in place only for several keys (#29343)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-17: base bumped 3127ec9c82e0 → 473ca8efde86 (2026-09-17, "perf: Disable system certificates for `CloudScheme::Http` sources (#29284)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
