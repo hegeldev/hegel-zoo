@@ -105,3 +105,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - 2026-09-17: base bumped ec2783923893 → aa324fd49753 (2026-09-17, "Fix `uv check` without a workspace (#21777)"; 0.0.82); 2 bug(s) still reproduce. 56 tests pass.
 - 2026-09-17: base bumped aa324fd49753 → 5e2ad786d5ae (2026-09-17, "Use astral-dev-toolchain for cargo-xwin (#21316)"; 0.0.82); 2 bug(s) still reproduce. 56 tests pass.
 - 2026-09-17: base bumped 5e2ad786d5ae → 6dbe16aa4c1c (2026-09-17, "Reject unsupported Git URL schemes in lockfiles (#21779)"; 0.0.82); 2 bug(s) still reproduce. 56 tests pass.
+- 2026-09-17: base bumped 6dbe16aa4c1c → 7cfd935f89de (2026-09-17, "Reject proxy URLs without a host (#21781)"; 0.0.82); 2 bug(s) still reproduce. 56 tests pass.

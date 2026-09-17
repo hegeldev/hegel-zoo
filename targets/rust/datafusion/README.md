@@ -82,3 +82,4 @@
 - 2026-09-17: base bumped 0f8f3b9d8bb0 → 56361282fcf1 (2026-09-17, "docs: Add SKILL.md for designing benchmark (#25285)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 56361282fcf1 → a2b809331f70 (2026-09-17, "feat: simplify contradicting and redundant predicates on a column (#25207)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped a2b809331f70 → c4f72bad3424 (2026-09-17, "bench: SQL benchmark suite for null-aware (NOT IN) joins (#25386)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped c4f72bad3424 → 22f9a921781c (2026-09-17, "perf(range): avoid eager ok_or in gen_range_timestamp (#25308)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
