@@ -129,3 +129,4 @@ turns panics into test-case failures; `GOJQ_COLLECT=1` makes the differential pr
 disagreement (`MISMATCH …`), status (`STATUS …`) and slow case (`SLOW …`) instead of failing
 — a triage mode. Both implementations run under a 5 s timeout; a case where jq times out (or
 gojq times out while jq took over 2 s) is skipped with a note.
+- 2026-09-17: base bumped c32933425cc6 → d3fe03ca462e (2026-09-18, "fix date and time functions against fractional epoch timestamps"; v0.12.19+); 7 bug(s) still reproduce. 69 tests pass.
