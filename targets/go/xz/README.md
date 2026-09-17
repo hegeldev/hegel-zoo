@@ -62,7 +62,7 @@ check is suppressed: the xz-forking properties take over a second per case on a 
 and the check then fails the run (hegel-go reports a run-level error with no message — the first
 clean `zoo test` failed that way while five bumps were building in parallel).
 
-## Bugs (7; details in bugs.toml)
+## Bugs (8; details in bugs.toml)
 
 | id | summary | severity |
 |----|---------|----------|
@@ -73,6 +73,7 @@ clean `zoo test` failed that way while five bumps were building in parallel).
 | xz/5 | `Writer2.Close` returns nil when the flush fails | medium |
 | xz/6 | lzma.Writer accepts Write and Close after Close, appending to the finished stream | low |
 | xz/7 | `lzma.Reader.Read` with an empty buffer returns `io.EOF` while output is still buffered | low |
+| xz/8 | an LZMA2 chunk's compressed-size field is never verified: overstated, the stream decodes as if correct (xz: "Compressed data is corrupt"); understated on an unchecked stream, a clean EOF with the data missing | medium |
 
 How they were found: the first round (150 cases) showed "insufficient space" in the xz-tool and
 LZMA2 properties (xz/2, isolated by a probe over write sizes: 65552 bytes pass, 65553 fail with
@@ -86,7 +87,10 @@ than the failure limit). The classic property's early clean EOFs (11 of 512 byte
 BinaryTree matcher (xz/3; a 300-case round then showed it in the .xz path too) and the empty
 explicit size (xz/4). The round-trip property first hung
 for minutes: `BlockSize: 1` with the default 8 MiB dictionary builds a fresh dictionary and
-BinaryTree per one-byte block (the generator now keeps blocks ≤ 64; see below).
+BinaryTree per one-byte block (the generator now keeps blocks ≤ 64; see below). xz/8 came from CI (2026-09-17): the corruption
+property failed on the runner on a flip the local runs had not drawn; a local hunt of the
+property alone (≈10 s a run) reproduced it in the second run, and a probe over the
+compressed-size bytes of a single-block stream showed both directions.
 
 ## Accepted differences (not bugs)
 
