@@ -20,7 +20,10 @@ reference for acceptance and for the tree: a generated Java 21 program that java
 accepted by JavaParser, and both trees, rendered into one canonical S-expression (`Shape` for JavaParser's
 AST, `JavacShape` for javac's `CompilationUnitTree`), must be equal. The rendering normalises the two
 models' known differences: modifiers are sorted keyword sets, types are white-space-free text, javac's
-folding of `-` into a decimal literal and of `"a" + "b"` into one literal is undone or mirrored, javac's
+folding of `-` into a decimal literal and of `"a" + "b"` into one literal is undone or mirrored (javac folds
+adjacent string literals and text blocks of a `+` chain only when that chain is the top of its run of binary
+operators — `"a" + "b" <= x` keeps both, `x + "a" + "b"` becomes `x + "ab"`; `Shape` follows
+`JavacParser.foldStrings` exactly), javac's
 `this(…)`/`super(…)` invocations become constructor calls, `new int[] {…}` ranks are reconciled,
 enum constants and record components are recognised by javac's flags, and empty enum constant bodies are
 ignored on javac's side (bug 18). Literal values are compared as values (`asInt`/`asDouble`/`asString`…
@@ -78,7 +81,10 @@ and the clone check ignores pattern types (16).
 The symbol solver, `ParserConfiguration` options other than the language level, comment attribution and
 Javadoc parsing, language levels below 21 and preview features, `ConcreteSyntaxModel`/`PrettyPrinter`
 beyond `toString()`, the `Node` observer/`LexicalPreservingPrinter` after edits, the metamodel and
-visitors, module declarations, `Position`/`Range` arithmetic, `TokenRange`s.
+visitors, module declarations, `Position`/`Range` arithmetic, `TokenRange`s. Programs outside the JLS
+grammar that javac's parser nevertheless accepts are not generated: a cast to a primitive array type in
+front of a unary `+`/`-` (`(int[]) -x`; JLS 15.16 allows only a UnaryExpressionNotPlusMinus after a
+reference-type cast, and JavaParser rightly rejects it).
 
 ## Bugs found
 
