@@ -98,3 +98,4 @@ candidates). Four `pep440_rs` pins hold here as regular properties, since the fo
 - 2026-09-17: base bumped 5e2ad786d5ae → 6dbe16aa4c1c (2026-09-17, "Reject unsupported Git URL schemes in lockfiles (#21779)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-17: base bumped 6dbe16aa4c1c → 7cfd935f89de (2026-09-17, "Reject proxy URLs without a host (#21781)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-17: base bumped 7cfd935f89de → ef1e0689b461 (2026-09-17, "Make Git stamping opt-in for development builds (#21750)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.
+- 2026-09-17: base bumped ef1e0689b461 → 5d64ede21e9e (2026-09-17, "Remove Hash API (#21786)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.

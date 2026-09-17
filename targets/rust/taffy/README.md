@@ -37,3 +37,4 @@
 - 2026-09-17: base bumped 887a847484ab → 46c4e9cdf05b (2026-09-17, "Add `Position::Static`, `Position::Fixed` and `Position::Sticky`. Make `Static` default. (#1140)"; 0.14.0); 2 bug(s) still reproduce; add/add conflicts in tests/hand_written.rs resolved by keeping both sides. 6370 tests pass.
 - 2026-09-17: base bumped 46c4e9cdf05b → a742a46959a5 (2026-09-17, "gentest: Use computed `position. Measure out-of-flow boxes against their containing block. (#1192)"; 0.14.0); 2 bug(s) still reproduce. 6370 tests pass.
 - 2026-09-17: base bumped a742a46959a5 → 996b1c0f2186 (2026-09-17, "flexbox: resolve relative inset at item generation (#1195)"; 0.14.0); 2 bug(s) still reproduce. 6370 tests pass.
+- 2026-09-17: base bumped 996b1c0f2186 → dc2fe8bd1ad9 (2026-09-17, "Implement out-of-flow (`absolute`/`fixed`) hoisting (#1194)"; 0.14.0); 2 bug(s) still reproduce. 6404 tests pass.

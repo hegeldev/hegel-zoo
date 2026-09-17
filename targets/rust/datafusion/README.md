@@ -85,3 +85,4 @@
 - 2026-09-17: base bumped c4f72bad3424 → 22f9a921781c (2026-09-17, "perf(range): avoid eager ok_or in gen_range_timestamp (#25308)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 22f9a921781c → 62f039f0d958 (2026-09-17, "dev: include dependency checks in the local lint suite (#25399)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 62f039f0d958 → bf67e970ba95 (2026-09-17, "Avoid normalizing hidden values in sliced list set operations (#25300)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped bf67e970ba95 → 3ab72e61e382 (2026-09-17, "fix: leave memory for aggregate spill replay (#25383)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.

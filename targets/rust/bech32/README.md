@@ -38,3 +38,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-12: base bumped 162cff91760a → db709c498f86 (2026-09-11, "Merge rust-bitcoin/rust-bech32#301: Automated daily update to rustc (to nightly-2026-09-04)"; 0.12.0); 0 bug(s) still reproduce. 265 tests pass.
 - 2026-09-16: base bumped db709c498f86 → 69ec69951358 (2026-09-16, "Merge rust-bitcoin/rust-bech32#305: hrp: add Panics doc to Hrp::parse_unchecked"; 0.12.0); 0 bug(s) still reproduce. 265 tests pass.
+- 2026-09-17: base bumped 69ec69951358 → 0e12a9c76a65 (2026-09-17, "Merge rust-bitcoin/rust-bech32#306: field: add a "large odd field" unit test and fix a pile of bugs it exhibits"; 0.12.0); 0 bug(s) still reproduce. 284 tests pass.
