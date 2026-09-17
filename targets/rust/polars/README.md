@@ -56,3 +56,4 @@
 - 2026-09-17: base bumped 8c514b134c80 → f65fa33c5c3f (2026-09-17, "refactor(rust): Rename big_idx to bigidx for consistency (#29351)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-17: base bumped f65fa33c5c3f → b6ba8c9cd596 (2026-09-17, "perf: Evaluate a pushed parquet predicate sequentially per conjuct (#29352)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-17: base bumped b6ba8c9cd596 → 9447f2ad9fcb (2026-09-17, "refactor(rust): Rename arrow(-format) to polars-arrow(-format) (#29356)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass. Harness: `use arrow::offset::OffsetsBuffer` became `polars_arrow::…` with upstream's crate rename (#29356).
+- 2026-09-17: base bumped 9447f2ad9fcb → 2ddc4d580e5b (2026-09-17, "feat: Add `APPROX_QUANTILE` to the SQL frontend (#29288)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.

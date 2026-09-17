@@ -124,3 +124,4 @@ trailing `.` in a tag component (bug 2), known tags spelled canonically (bug 3),
 - 2026-09-16: base bumped cc6880fd22c2 → 6b40d9e51d24 (2026-09-16, "Enforce non-staleness of cargo deny's `bans.build` list (#21756)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-17: base bumped 6b40d9e51d24 → ec2783923893 (2026-09-17, "Add regression test for uv#21773 (#21775)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-17: base bumped ec2783923893 → f69944bcc9a1 (2026-09-17, "Respect configured index credentials in `uv upgrade` (#21776)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
+- 2026-09-17: base bumped f69944bcc9a1 → 5e2ad786d5ae (2026-09-17, "Use astral-dev-toolchain for cargo-xwin (#21316)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
