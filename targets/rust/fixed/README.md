@@ -41,3 +41,4 @@
 - 2026-03-20: predecessor base commit `7afb5bf760e7` (version 1.31.0).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/fixed.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-17: base bumped 7afb5bf760e7 → 78d4346c78cf (2026-09-17, "Merge branch 'fix-wrapping-cast-warning' into 'master'"; 1.31.0); 1 bug(s) still reproduce. 3851 tests pass.

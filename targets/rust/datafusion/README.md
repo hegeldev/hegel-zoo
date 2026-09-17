@@ -78,3 +78,4 @@
 - 2026-09-17: base bumped 16ecdc9bdff1 → b300cea226af (2026-09-17, "fix: preserve UPPER and LOWER input nullability (#25381)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped b300cea226af → e5469e157079 (2026-09-17, "chore(docs): Fix the documentation for TableProvider::scan()'s `limit` argument (#25397)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped e5469e157079 → 902ee8a67e68 (2026-09-17, "feat: push dynamic filters through nested loop joins (#25030)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped 902ee8a67e68 → 0f8f3b9d8bb0 (2026-09-17, "perf: optimize `levenshtein` (#23543)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
