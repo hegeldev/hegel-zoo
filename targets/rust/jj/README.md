@@ -46,3 +46,4 @@
 - 2026-09-14: base bumped aa729d0f8b9d → 629be9ecdedc (2026-09-14, "cargo: bump the cargo-dependencies group with 5 updates"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
 - 2026-09-15: base bumped 629be9ecdedc → 9b42f79e5d7b (2026-09-15, "templates: expose resolved tree values"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
 - 2026-09-15: base bumped 9b42f79e5d7b → e6dd2c0d60f2 (2026-09-15, "git colocation: release the repo before moving the Git directory"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
+- 2026-09-17: base bumped e6dd2c0d60f2 → f9588f37ec00 (2026-09-17, "revset: drop 'index lifetime from evaluate_revset()"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.

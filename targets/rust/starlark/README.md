@@ -40,3 +40,4 @@
 - 2026-09-16: base bumped 241c58d0e441 → fc7a4188d112 (2026-09-15, "Stop overflowing the chunk size for a heap with many chunks"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 990 tests pass.
 - 2026-09-16: base bumped fc7a4188d112 → cc22bd69390f (2026-09-15, "Split the Starlark wait-for graph's hot map out from its lock"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 992 tests pass.
 - 2026-09-17: base bumped cc22bd69390f → 5d1aa66b7870 (2026-09-17, "lifetimes: Comments stop contrasting with the unbranded world"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 992 tests pass.
+- 2026-09-17: base bumped 5d1aa66b7870 → 5a27850a2fe7 (2026-09-17, "lifetimes: `frozen_only` asks nothing of the fields"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 992 tests pass.

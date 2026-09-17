@@ -74,3 +74,4 @@ accuracy (1e-8), which is checked as written. Observed accuracy is far better th
 - mpmath's own `betainc(a, b, x, 1)` cancels catastrophically near x = 1: the oracle computes complements as
   I_(1−x)(b, a), which the library matches to 15 digits.
 - 2026-09-17: base bumped a2e57b960e2a → ce344cbafdd8 (2026-09-17, "Update commons-parent 104 to 105"; 1.4-SNAPSHOT); 17 bug(s) still reproduce. 17 tests pass.
+- 2026-09-17: base bumped ce344cbafdd8 → 21fa3accb0e4 (2026-09-17, "Checkstyle: Remove unnecessary parentheses"; 1.4-SNAPSHOT); 17 bug(s) still reproduce. 17 tests pass.
