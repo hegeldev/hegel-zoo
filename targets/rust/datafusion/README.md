@@ -75,3 +75,4 @@
 - 2026-09-17: base bumped 4e907557ad7e → dcd385e3e177 (2026-09-17, "perf: reuse one StatisticsContext across ensure_distribution (#25098)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped dcd385e3e177 → 0bef032a4a42 (2026-09-17, "fix(physical-plan): CoalescePartitionsExec panic on wasm32-unknown-unknown (#24890)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 0bef032a4a42 → 16ecdc9bdff1 (2026-09-17, "docs: move misplaced upgrade notes to DataFusion 55 (#25331)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped 16ecdc9bdff1 → b300cea226af (2026-09-17, "fix: preserve UPPER and LOWER input nullability (#25381)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.

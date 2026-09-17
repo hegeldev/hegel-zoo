@@ -111,3 +111,4 @@ with v1.8.6.
 Footnotes, definition lists, attributes (`WithAttribute`), typographer quotes inside markup,
 East Asian line breaking, CJK options, the `text` package's readers directly, and the
 `Renderer`/`Parser` option plumbing beyond what the configurations above exercise.
+- 2026-09-17: base bumped 710cc2656aa3 → c4c7034e4ff2 (2026-09-17, "chore: delete debug print"; v2.1.3); 29 bug(s) still reproduce. 36 tests pass.
