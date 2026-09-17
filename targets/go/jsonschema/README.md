@@ -17,7 +17,7 @@ seven properties) and `hegel_pins_test.go` (seven pins). `go get
 hegel.dev/go/hegel` raises the `go` directive to 1.26; the tests run with
 `GOWORK=off` because the repository's `go.work` pins an older Go.
 **Needs `python3` with the `jsonschema` package (4.x, with `referencing`)**;
-the CI Go job installs it with pip. The whole run takes about a second at
+the CI Go job installs `jsonschema>=4.26` in a venv put first on `PATH` (the runner image's own copy is too old: no `referencing`, `$recursiveRef` ignored, so `check_schema` accepts `additionalProperties: []` in 2019-09). The oracle greets with its version and the tests refuse anything below 4.18. The whole run takes about a second at
 the default case count; `HEGEL_TEST_CASES=2000` about 5 s.
 
 ## Oracles
