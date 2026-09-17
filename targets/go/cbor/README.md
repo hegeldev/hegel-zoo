@@ -99,6 +99,10 @@ omits it, as `encoding/json` does), and the model's own duplicate keys under
   the cbor2 oracle.
 - Duplicate-key detection compares decoded Go values: two `NaN` keys are never equal, and
   `1` and `1.0` are different CBOR keys (different major types) as well as different Go keys.
+- The Encoder state-machine model writes whatever pairs the random sequence gives, so an
+  indefinite-length map may repeat a key; its output is read back into `map[any]any` under the
+  default `DupMapKeyQuiet`, which keeps the last value, and the model does the same (a CI run of
+  the whole zoo caught the model keeping the first).
 - `DupMapKeyQuiet` into a struct keeps the first value of a key (documented "keep first or
   keep last depending on the Go type"); with `FieldNameMatchingPreferCaseSensitive` a later
   exact-case key does not displace an earlier case-insensitive match.
