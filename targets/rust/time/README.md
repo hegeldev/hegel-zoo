@@ -105,3 +105,4 @@ separators outside 0..=9999 (a signed extended-range year reads up to six digits
   adjustment is used for both), time/2 (`saturating_sub` saturates the wrong way for a zero
   seconds field), time/3 (RFC 2822 `-00mm` offsets lose their sign — the fix for #522 in 0.3.18
   never reached the RFC 2822 parser).
+- 2026-09-17: base bumped 4784b0a65b36 → de903d8df4b9 (2026-09-17, "Check year bounds when converting ODT on Windows"; 0.3.55); 3 bug(s) still reproduce. 7501 tests pass.
