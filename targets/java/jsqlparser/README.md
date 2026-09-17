@@ -118,3 +118,4 @@ COLLATE NOCASE` and `a IS TRUE COLLATE NOCASE` rejected (16).
 - 2026-09-16: created (turn 175) at 6312f9e5ea5d (5.5-SNAPSHOT); 16 bugs.
 - 2026-09-17: base bumped 6312f9e5ea5d → dec8f5def498 (2026-09-17, "doc: Update changelog"; 5.5-SNAPSHOT); 16 bug(s) still reproduce. 5 tests pass.
 - 2026-09-17: base bumped dec8f5def498 → c945986f1824 (2026-09-17, "Support DuckDB syntax: FROM-first, SEMI/ANTI joins, COPY, ATTACH, MACRO, PRAGMA and DuckDB 2.0 additions (#2643)"; 5.5-SNAPSHOT); 16 bug(s) still reproduce. 5 tests pass.
+- 2026-09-17: base bumped c945986f1824 → 0036c7558ce5 (2026-09-17, "feat: support ClickHouse WITH expression aliases including lambdas (#2644)"; 5.5-SNAPSHOT); 16 bug(s) still reproduce; fixed upstream: jsqlparser/4. 5 tests pass.

@@ -105,3 +105,4 @@ anything multi-threaded (`unblock`, broadcast buffers, concurrent array queues, 
 
 - 2026-09-16: created (turn 178) at 6a57dd3df11c (2.7.0-SNAPSHOT of 2026-08-31); 4 bugs.
 - 2026-09-17: base bumped 6a57dd3df11c → b4858542512f (2026-09-17, "ExpandableRingBuffer align bug (#370)"; 2.7.0-SNAPSHOT); 3 bug(s) still reproduce; fixed upstream: agrona/3. 15 tests pass.
+- 2026-09-17: base bumped b4858542512f → 093748e1cfa6 (2026-09-17, "post release bump"; 2.7.0-SNAPSHOT); 3 bug(s) still reproduce. 16 tests pass.

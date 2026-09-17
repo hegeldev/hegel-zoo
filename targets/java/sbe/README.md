@@ -130,3 +130,4 @@ behaviour; `IrDecoder` on hand-crafted IR frames.
 ## History
 
 - 2026-09-16: created (turn 177) at 89bb53644fad (1.41.0-SNAPSHOT of 2026-09-09); 10 bugs.
+- 2026-09-17: base bumped 89bb53644fad → 1c38f620763e (2026-09-17, "post release bump"; 1.41.0-SNAPSHOT); 10 bug(s) still reproduce. 6 tests pass.
