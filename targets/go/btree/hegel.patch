@@ -1,0 +1,1581 @@
+diff --git a/go.mod b/go.mod
+index 4792969..e5d5365 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/tidwall/btree
+ 
+-go 1.20
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_pins_test.go b/hegel_pins_test.go
+new file mode 100644
+index 0000000..8b55a75
+--- /dev/null
++++ b/hegel_pins_test.go
+@@ -0,0 +1,86 @@
++package btree_test
++
++// One plain test per recorded bug (see bugs.toml). Each asserts the
++// documented behaviour and fails while the bug is open; target.toml lists
++// them as expected failures. The tests run under the race detector.
++
++import (
++	"sync"
++	"testing"
++
++	"github.com/tidwall/btree"
++)
++
++// btree/1: BTreeG is documented thread-safe, but Len reads the item count
++// without taking the tree's lock, which the race detector reports when a
++// writer runs at the same time.
++func TestHegelPinLenIsThreadSafe(t *testing.T) {
++	tr := btree.NewBTreeG(byK)
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 2000; i++ {
++			tr.Set(item{K: i})
++		}
++	}()
++	go func() {
++		defer wg.Done()
++		for i := 0; i < 2000; i++ {
++			if n := tr.Len(); n < 0 || n > 2000 {
++				t.Errorf("Len = %d", n)
++			}
++		}
++	}()
++	wg.Wait()
++	if tr.Len() != 2000 {
++		t.Errorf("Len = %d after 2000 inserts", tr.Len())
++	}
++}
++
++// btree/2: Seek repositions the iterator, so after a Seek that finds nothing
++// the iterator is at the end and Next must return false (Next's contract),
++// whatever happened before the Seek.
++func TestHegelPinSeekRepositions(t *testing.T) {
++	var m btree.Map[int, string]
++	for _, k := range []int{1, 2, 3} {
++		m.Set(k, "v")
++	}
++	it := m.Iter()
++	if !it.First() || it.Prev() {
++		t.Fatal("First then Prev on the first item should give true, false")
++	}
++	if it.Seek(10) {
++		t.Fatal("Seek(10) found an item")
++	}
++	if it.Next() {
++		t.Errorf("Next after a Seek past the end returned true with key %d (a fresh iterator gives false)", it.Key())
++	}
++	// The mirror image: Next fails at the end, Seek finds the first item,
++	// Prev fails at the beginning; a second Prev must still return false.
++	it = m.Iter()
++	it.Last()
++	if it.Next() {
++		t.Fatal("Next after Last returned true")
++	}
++	if !it.Seek(1) || it.Prev() {
++		t.Fatal("Seek(1) then Prev should give true, false")
++	}
++	if it.Prev() {
++		t.Errorf("a second Prev at the beginning returned true with key %d", it.Key())
++	}
++	g := btree.NewBTreeG(byK)
++	for _, k := range []int{1, 2, 3} {
++		g.Set(item{K: k})
++	}
++	gi := g.Iter()
++	defer gi.Release()
++	gi.First()
++	gi.Prev()
++	if gi.Seek(item{K: 10}) {
++		t.Fatal("Seek(10) found an item")
++	}
++	if gi.Next() {
++		t.Errorf("BTreeG: Next after a Seek past the end returned true with %v", gi.Item())
++	}
++}
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..5554e4d
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1467 @@
++package btree_test
++
++// Hegel property tests for github.com/tidwall/btree: Map, Set, BTreeG (with
++// path hints, DeleteRange, DeleteAscend, copy-on-write copies) and the
++// interface{}-typed BTree, all against a sorted-slice model, and the
++// iterators against a cursor model written from their documentation.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/tidwall/btree"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Harness
++
++var collecting = os.Getenv("BTREE_COLLECT") != ""
++
++var (
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++	lastNote      string
++)
++
++type collected struct{}
++
++func hegelOpts() []hegel.Option {
++	var opts []hegel.Option
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			opts = append(opts, hegel.WithTestCases(n))
++		}
++	}
++	if os.Getenv("HEGEL_VERBOSE") != "" {
++		opts = append(opts, hegel.WithVerbosity(hegel.VerbosityVerbose))
++	}
++	opts = append(opts, hegel.SuppressHealthCheck(hegel.TooSlow))
++	return opts
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 40 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		lastNote = ""
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			if collecting {
++				collectedMu.Lock()
++				collectedMsgs = append(collectedMsgs, fmt.Sprintf("panic in the code under test: %v\n  case: %s", r, lastNote))
++				collectedMu.Unlock()
++				return
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) {
++	s := fmt.Sprintf(format, args...)
++	lastNote += "\n  " + s
++	ht.Logf("%s", s)
++}
++
++func fail(ht *hegel.T, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, msg+"\n  case: "+lastNote)
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// Known bugs (see bugs.toml); each switch makes the properties avoid one.
++var Known = struct {
++	lenUnlocked   bool // btree/1: BTreeG.Len reads the count without the lock
++	seekKeepsFlag bool // btree/2: Seek and Last leave the flags of an earlier failed Prev/Next behind, so a later failed step is followed by a wrong item
++}{lenUnlocked: true, seekKeepsFlag: true}
++
++// ---------------------------------------------------------------------------
++// The sorted-map model
++
++type model struct {
++	keys []int
++	vals map[int]string
++}
++
++func newModel() *model { return &model{vals: map[int]string{}} }
++
++func (m *model) clone() *model {
++	c := newModel()
++	c.keys = append([]int(nil), m.keys...)
++	for k, v := range m.vals {
++		c.vals[k] = v
++	}
++	return c
++}
++
++// lower is the index of the first key >= k.
++func (m *model) lower(k int) int {
++	return sort.SearchInts(m.keys, k)
++}
++
++func (m *model) has(k int) bool {
++	i := m.lower(k)
++	return i < len(m.keys) && m.keys[i] == k
++}
++
++func (m *model) set(k int, v string) (string, bool) {
++	if old, ok := m.vals[k]; ok {
++		m.vals[k] = v
++		return old, true
++	}
++	i := m.lower(k)
++	m.keys = append(m.keys, 0)
++	copy(m.keys[i+1:], m.keys[i:])
++	m.keys[i] = k
++	m.vals[k] = v
++	return "", false
++}
++
++func (m *model) get(k int) (string, bool) {
++	v, ok := m.vals[k]
++	return v, ok
++}
++
++func (m *model) del(k int) (string, bool) {
++	old, ok := m.vals[k]
++	if !ok {
++		return "", false
++	}
++	i := m.lower(k)
++	m.keys = append(m.keys[:i], m.keys[i+1:]...)
++	delete(m.vals, k)
++	return old, true
++}
++
++func (m *model) deleteAt(i int) (int, string, bool) {
++	if i < 0 || i >= len(m.keys) {
++		return 0, "", false
++	}
++	k := m.keys[i]
++	v, _ := m.del(k)
++	return k, v, true
++}
++
++func (m *model) at(i int) (int, string, bool) {
++	if i < 0 || i >= len(m.keys) {
++		return 0, "", false
++	}
++	return m.keys[i], m.vals[m.keys[i]], true
++}
++
++func (m *model) ascend(pivot int) []int { return m.keys[m.lower(pivot):] }
++
++func (m *model) descend(pivot int) []int {
++	i := sort.Search(len(m.keys), func(i int) bool { return m.keys[i] > pivot })
++	out := make([]int, 0, i)
++	for j := i - 1; j >= 0; j-- {
++		out = append(out, m.keys[j])
++	}
++	return out
++}
++
++func (m *model) values() []string {
++	out := make([]string, len(m.keys))
++	for i, k := range m.keys {
++		out[i] = m.vals[k]
++	}
++	return out
++}
++
++// deleteRange removes [lo, hi) or [lo, hi] and returns the removed keys.
++func (m *model) deleteRange(lo, hi int, inclusive bool) []int {
++	var out []int
++	for _, k := range append([]int(nil), m.keys...) {
++		if k >= lo && (k < hi || (inclusive && k == hi)) {
++			out = append(out, k)
++			m.del(k)
++		}
++	}
++	return out
++}
++
++func genKey(ht *hegel.T) int {
++	switch n(ht, 1, 10) {
++	case 1:
++		return n(ht, -1000000, 1000000)
++	case 2:
++		return pick(ht, -2147483648, 2147483647, 0, -1, 1)
++	default:
++		return n(ht, 0, 60)
++	}
++}
++
++func genVal(ht *hegel.T) string {
++	return pick(ht, "", "a", "b", "c", "x", "y", "hello", "0", "1")
++}
++
++func eqInts(a, b []int) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func eqStrs(a, b []string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func log2ceil(n int) int {
++	h := 0
++	for v := 1; v < n; v *= 2 {
++		h++
++	}
++	return h
++}
++
++// ---------------------------------------------------------------------------
++// Map
++
++type mapPair struct {
++	tr *btree.Map[int, string]
++	m  *model
++}
++
++func newMapTree(ht *hegel.T) *btree.Map[int, string] {
++	deg := pick(ht, 0, 0, 1, 2, 3, 4, 5, 8, 32)
++	note(ht, "Map degree %d", deg)
++	if deg == 0 && chance(ht, 50) {
++		var m btree.Map[int, string] // the zero value is usable
++		return &m
++	}
++	return btree.NewMap[int, string](deg)
++}
++
++// checkMap compares the whole tree with the model.
++func checkMap(ht *hegel.T, tr *btree.Map[int, string], m *model, what string) {
++	if tr.Len() != len(m.keys) {
++		fail(ht, "%s: Len = %d, want %d", what, tr.Len(), len(m.keys))
++	}
++	if keys := tr.Keys(); !eqInts(keys, m.keys) {
++		fail(ht, "%s: Keys = %v, want %v", what, keys, m.keys)
++	}
++	if vals := tr.Values(); !eqStrs(vals, m.values()) {
++		fail(ht, "%s: Values = %q, want %q", what, vals, m.values())
++	}
++	ks, vs := tr.KeyValues()
++	if !eqInts(ks, m.keys) || !eqStrs(vs, m.values()) {
++		fail(ht, "%s: KeyValues = %v %q, want %v %q", what, ks, vs, m.keys, m.values())
++	}
++	var scanned []int
++	tr.Scan(func(k int, v string) bool {
++		scanned = append(scanned, k)
++		if m.vals[k] != v {
++			fail(ht, "%s: Scan gives %d=%q, want %q", what, k, v, m.vals[k])
++		}
++		return true
++	})
++	if !eqInts(scanned, m.keys) {
++		fail(ht, "%s: Scan = %v, want %v", what, scanned, m.keys)
++	}
++	var reversed []int
++	tr.Reverse(func(k int, v string) bool {
++		reversed = append(reversed, k)
++		return true
++	})
++	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
++		reversed[i], reversed[j] = reversed[j], reversed[i]
++	}
++	if !eqInts(reversed, m.keys) {
++		fail(ht, "%s: Reverse = %v (reversed), want %v", what, reversed, m.keys)
++	}
++	h := tr.Height()
++	if (h == 0) != (len(m.keys) == 0) {
++		fail(ht, "%s: Height = %d with %d items", what, h, len(m.keys))
++	}
++	if len(m.keys) > 0 && h > log2ceil(len(m.keys)+1)+1 {
++		fail(ht, "%s: Height = %d for %d items (every node has at least two children)", what, h, len(m.keys))
++	}
++	k, v, ok := tr.Min()
++	if ok != (len(m.keys) > 0) || (ok && (k != m.keys[0] || v != m.vals[k])) {
++		fail(ht, "%s: Min = %d %q %v, model %v", what, k, v, ok, m.keys)
++	}
++	k, v, ok = tr.Max()
++	if ok != (len(m.keys) > 0) || (ok && (k != m.keys[len(m.keys)-1] || v != m.vals[k])) {
++		fail(ht, "%s: Max = %d %q %v, model %v", what, k, v, ok, m.keys)
++	}
++	for i := -1; i <= len(m.keys); i++ {
++		k, v, ok := tr.GetAt(i)
++		mk, mv, mok := m.at(i)
++		if ok != mok || k != mk || v != mv {
++			fail(ht, "%s: GetAt(%d) = %d %q %v, want %d %q %v", what, i, k, v, ok, mk, mv, mok)
++		}
++	}
++}
++
++func TestHegelMapModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		pairs := []mapPair{{newMapTree(ht), newModel()}}
++		// Optionally bulk-load a sorted prefix.
++		if chance(ht, 40) {
++			cnt := n(ht, 0, 40)
++			k := n(ht, -50, 0)
++			for i := 0; i < cnt; i++ {
++				k += n(ht, 1, 3)
++				if chance(ht, 10) {
++					k -= n(ht, 0, 5) // not sorted after all: Load must fall back
++				}
++				v := genVal(ht)
++				prev, replaced := pairs[0].tr.Load(k, v)
++				mprev, mreplaced := pairs[0].m.set(k, v)
++				if replaced != mreplaced || prev != mprev {
++					fail(ht, "Load(%d, %q) = %q %v, want %q %v", k, v, prev, replaced, mprev, mreplaced)
++				}
++			}
++			note(ht, "loaded %d keys", cnt)
++		}
++		if chance(ht, 30) {
++			// A bulk of random keys first, so that the tree is several levels deep.
++			cnt := n(ht, 50, 600)
++			span := pick(ht, 100, 1000, 1000000)
++			for i := 0; i < cnt; i++ {
++				k, v := n(ht, -span, span), genVal(ht)
++				pairs[0].tr.Set(k, v)
++				pairs[0].m.set(k, v)
++			}
++			note(ht, "bulk of %d random keys in [-%d, %d]", cnt, span, span)
++		}
++		steps := n(ht, 1, 80)
++		for step := 0; step < steps; step++ {
++			p := pairs[n(ht, 0, len(pairs)-1)]
++			tr, m := p.tr, p.m
++			switch n(ht, 1, 16) {
++			case 1, 2, 3, 4:
++				k, v := genKey(ht), genVal(ht)
++				prev, replaced := tr.Set(k, v)
++				mprev, mreplaced := m.set(k, v)
++				note(ht, "Set(%d, %q)", k, v)
++				if replaced != mreplaced || prev != mprev {
++					fail(ht, "Set(%d, %q) = %q %v, want %q %v", k, v, prev, replaced, mprev, mreplaced)
++				}
++			case 5, 6:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				prev, ok := tr.Delete(k)
++				mprev, mok := m.del(k)
++				note(ht, "Delete(%d)", k)
++				if ok != mok || prev != mprev {
++					fail(ht, "Delete(%d) = %q %v, want %q %v", k, prev, ok, mprev, mok)
++				}
++			case 7:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				v, ok := tr.Get(k)
++				mv, mok := m.get(k)
++				if ok != mok || v != mv {
++					fail(ht, "Get(%d) = %q %v, want %q %v", k, v, ok, mv, mok)
++				}
++				v, ok = tr.GetMut(k)
++				if ok != mok || v != mv {
++					fail(ht, "GetMut(%d) = %q %v, want %q %v", k, v, ok, mv, mok)
++				}
++			case 8:
++				i := n(ht, -1, len(m.keys)+1)
++				k, v, ok := tr.DeleteAt(i)
++				mk, mv, mok := m.deleteAt(i)
++				note(ht, "DeleteAt(%d)", i)
++				if ok != mok || k != mk || v != mv {
++					fail(ht, "DeleteAt(%d) = %d %q %v, want %d %q %v", i, k, v, ok, mk, mv, mok)
++				}
++			case 9:
++				k, v, ok := tr.PopMin()
++				mk, mv, mok := m.deleteAt(0)
++				note(ht, "PopMin")
++				if ok != mok || k != mk || v != mv {
++					fail(ht, "PopMin = %d %q %v, want %d %q %v", k, v, ok, mk, mv, mok)
++				}
++			case 10:
++				k, v, ok := tr.PopMax()
++				mk, mv, mok := m.deleteAt(len(m.keys) - 1)
++				note(ht, "PopMax")
++				if ok != mok || k != mk || v != mv {
++					fail(ht, "PopMax = %d %q %v, want %d %q %v", k, v, ok, mk, mv, mok)
++				}
++			case 11:
++				pivot := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 50) {
++					pivot = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				limit := n(ht, 0, len(m.keys)+1)
++				var got []int
++				tr.Ascend(pivot, func(k int, v string) bool {
++					got = append(got, k)
++					if m.vals[k] != v {
++						fail(ht, "Ascend(%d) gives %d=%q, want %q", pivot, k, v, m.vals[k])
++					}
++					return len(got) < limit
++				})
++				want := m.ascend(pivot)
++				if limit == 0 && len(want) > 0 {
++					want = want[:1] // the first item is delivered before the stop
++				} else if len(want) > limit {
++					want = want[:limit]
++				}
++				if !eqInts(got, want) {
++					fail(ht, "Ascend(%d) stopping after %d = %v, want %v (model %v)", pivot, limit, got, want, m.keys)
++				}
++			case 12:
++				pivot := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 50) {
++					pivot = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				limit := n(ht, 0, len(m.keys)+1)
++				var got []int
++				tr.Descend(pivot, func(k int, v string) bool {
++					got = append(got, k)
++					return len(got) < limit
++				})
++				want := m.descend(pivot)
++				if limit == 0 && len(want) > 0 {
++					want = want[:1]
++				} else if len(want) > limit {
++					want = want[:limit]
++				}
++				if !eqInts(got, want) {
++					fail(ht, "Descend(%d) stopping after %d = %v, want %v (model %v)", pivot, limit, got, want, m.keys)
++				}
++			case 13:
++				if len(pairs) < 4 {
++					var c *btree.Map[int, string]
++					if chance(ht, 50) {
++						c = tr.Copy()
++					} else {
++						c = tr.IsoCopy()
++					}
++					pairs = append(pairs, mapPair{c, m.clone()})
++					note(ht, "Copy -> tree %d", len(pairs)-1)
++					checkMap(ht, c, m, "the fresh copy")
++				}
++			case 14:
++				if chance(ht, 20) {
++					tr.Clear()
++					m.keys, m.vals = nil, map[int]string{}
++					note(ht, "Clear")
++				} else if len(m.keys) > 0 {
++					// A burst of deletions of existing keys.
++					cnt := n(ht, 1, len(m.keys))
++					for i := 0; i < cnt && len(m.keys) > 0; i++ {
++						k := m.keys[n(ht, 0, len(m.keys)-1)]
++						prev, ok := tr.Delete(k)
++						mprev, mok := m.del(k)
++						if ok != mok || prev != mprev {
++							fail(ht, "Delete(%d) in a burst = %q %v, want %q %v", k, prev, ok, mprev, mok)
++						}
++					}
++					note(ht, "burst of %d deletions", cnt)
++				}
++			case 15:
++				k, v := genKey(ht), genVal(ht)
++				prev, replaced := tr.Load(k, v)
++				mprev, mreplaced := m.set(k, v)
++				note(ht, "Load(%d, %q)", k, v)
++				if replaced != mreplaced || prev != mprev {
++					fail(ht, "Load(%d, %q) = %q %v, want %q %v", k, v, prev, replaced, mprev, mreplaced)
++				}
++			case 16:
++				checkMap(ht, tr, m, fmt.Sprintf("tree %d after step %d", indexOf(pairs, tr), step))
++			}
++			if tr.Len() != len(m.keys) {
++				fail(ht, "after step %d: Len = %d, want %d", step, tr.Len(), len(m.keys))
++			}
++		}
++		for i, p := range pairs {
++			checkMap(ht, p.tr, p.m, fmt.Sprintf("tree %d at the end", i))
++		}
++	})
++}
++
++func indexOf(pairs []mapPair, tr *btree.Map[int, string]) int {
++	for i, p := range pairs {
++		if p.tr == tr {
++			return i
++		}
++	}
++	return -1
++}
++
++// ---------------------------------------------------------------------------
++// Iterators: a cursor model written from the documentation and the tests
++// (a step that fails leaves the cursor where it was).
++
++type cursor struct {
++	n       int
++	seeked  bool
++	off     bool // the position was lost by a failed step (or never set)
++	atstart bool // a Prev failed at the first item since the last repositioning
++	atend   bool // a Next failed at the last item since the last repositioning
++	pos     int
++	item    int // index of the item Key() reports
++	hasItem bool
++	// The flags as the implementation keeps them: cleared by First only
++	// (btree/2); where they differ from the documented ones the property
++	// stops.
++	staleStart, staleEnd bool
++}
++
++func (c *cursor) first() bool {
++	c.seeked = true
++	c.atstart, c.atend = false, false
++	c.staleStart, c.staleEnd = false, false
++	c.off = true
++	if c.n == 0 {
++		return false
++	}
++	c.pos, c.off = 0, false
++	c.item, c.hasItem = 0, true
++	return true
++}
++
++func (c *cursor) last() bool {
++	c.seeked = true
++	c.atstart, c.atend = false, false // Last repositions
++	c.off = true
++	if c.n == 0 {
++		return false
++	}
++	c.pos, c.off = c.n-1, false
++	c.item, c.hasItem = c.n-1, true
++	return true
++}
++
++func (c *cursor) seek(i int) bool { // i = lower-bound index of the key
++	c.seeked = true
++	c.off = true
++	c.atstart, c.atend = false, false // Seek repositions: nothing of the old position survives
++	if c.n == 0 {
++		return false
++	}
++	if i < c.n {
++		c.pos, c.off = i, false
++		c.item, c.hasItem = i, true
++		return true
++	}
++	c.atend, c.staleEnd = true, true
++	return false
++}
++
++// staleFlags reports whether the implementation's leftover flags differ
++// from the documented state in a way the next step would show (btree/2).
++func (c *cursor) staleFlags() bool {
++	return c.off && (c.staleStart != c.atstart || c.staleEnd != c.atend)
++}
++
++func (c *cursor) next() bool {
++	if !c.seeked {
++		return c.first()
++	}
++	if c.off {
++		if c.atstart {
++			return c.first() && c.next()
++		}
++		return false
++	}
++	if c.pos < c.n-1 {
++		c.pos++
++		c.item = c.pos
++		return true
++	}
++	c.off, c.atend, c.staleEnd = true, true, true
++	return false
++}
++
++func (c *cursor) prev() bool {
++	if !c.seeked {
++		return false
++	}
++	if c.off {
++		if c.atend {
++			return c.last() && c.prev()
++		}
++		return false
++	}
++	if c.pos > 0 {
++		c.pos--
++		c.item = c.pos
++		return true
++	}
++	c.off, c.atstart, c.staleStart = true, true, true
++	return false
++}
++
++func TestHegelMapIterator(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tr := newMapTree(ht)
++		m := newModel()
++		cnt := n(ht, 0, 70)
++		for i := 0; i < cnt; i++ {
++			k, v := genKey(ht), genVal(ht)
++			tr.Set(k, v)
++			m.set(k, v)
++		}
++		note(ht, "keys = %v", m.keys)
++		// Copy-on-write: a copy mutated afterwards must not disturb the
++		// iterated tree, whichever of the two is iterated.
++		if chance(ht, 50) {
++			other := tr.Copy()
++			if chance(ht, 50) {
++				tr, other = other, tr
++			}
++			muts := n(ht, 1, 30)
++			for i := 0; i < muts; i++ {
++				if chance(ht, 60) {
++					other.Set(genKey(ht), genVal(ht))
++				} else if len(m.keys) > 0 {
++					other.Delete(m.keys[n(ht, 0, len(m.keys)-1)])
++				}
++			}
++			note(ht, "iterating a tree whose copy took %d mutations", muts)
++		}
++		var it btree.MapIter[int, string]
++		if chance(ht, 50) {
++			it = tr.Iter()
++		} else {
++			it = tr.IterMut()
++		}
++		c := &cursor{n: len(m.keys)}
++		steps := n(ht, 1, 40)
++		for step := 0; step < steps; step++ {
++			var got, want bool
++			var op string
++			switch n(ht, 1, 7) {
++			case 1:
++				op = "First"
++				got, want = it.First(), c.first()
++			case 2:
++				op = "Last"
++				got, want = it.Last(), c.last()
++			case 3:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 50) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)] + pick(ht, 0, 0, 1, -1)
++				}
++				op = fmt.Sprintf("Seek(%d)", k)
++				got, want = it.Seek(k), c.seek(m.lower(k))
++			case 4, 5:
++				op = "Next"
++				if Known.seekKeepsFlag && c.staleFlags() {
++					return
++				}
++				got, want = it.Next(), c.next()
++			case 6, 7:
++				op = "Prev"
++				if Known.seekKeepsFlag && c.staleFlags() {
++					return
++				}
++				got, want = it.Prev(), c.prev()
++			}
++			note(ht, "%s -> %v", op, got)
++			if got != want {
++				fail(ht, "step %d: %s = %v, want %v (cursor %+v)", step, op, got, want, *c)
++			}
++			if c.hasItem {
++				k := m.keys[c.item]
++				if it.Key() != k || it.Value() != m.vals[k] {
++					fail(ht, "step %d after %s: Key/Value = %d %q, want %d %q", step, op, it.Key(), it.Value(), k, m.vals[k])
++				}
++			}
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Set
++
++func TestHegelSetModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tr btree.Set[int]
++		m := newModel()
++		steps := n(ht, 1, 80)
++		for step := 0; step < steps; step++ {
++			switch n(ht, 1, 12) {
++			case 1, 2, 3, 4:
++				k := genKey(ht)
++				tr.Insert(k)
++				m.set(k, "")
++				note(ht, "Insert(%d)", k)
++			case 5, 6:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				tr.Delete(k)
++				m.del(k)
++				note(ht, "Delete(%d)", k)
++			case 7:
++				k := genKey(ht)
++				if tr.Contains(k) != m.has(k) {
++					fail(ht, "Contains(%d) = %v, model %v", k, tr.Contains(k), m.keys)
++				}
++			case 8:
++				i := n(ht, -1, len(m.keys)+1)
++				k, ok := tr.DeleteAt(i)
++				mk, _, mok := m.deleteAt(i)
++				note(ht, "DeleteAt(%d)", i)
++				if ok != mok || k != mk {
++					fail(ht, "DeleteAt(%d) = %d %v, want %d %v", i, k, ok, mk, mok)
++				}
++			case 9:
++				k, ok := tr.PopMin()
++				mk, _, mok := m.deleteAt(0)
++				note(ht, "PopMin")
++				if ok != mok || k != mk {
++					fail(ht, "PopMin = %d %v, want %d %v", k, ok, mk, mok)
++				}
++			case 10:
++				k, ok := tr.PopMax()
++				mk, _, mok := m.deleteAt(len(m.keys) - 1)
++				note(ht, "PopMax")
++				if ok != mok || k != mk {
++					fail(ht, "PopMax = %d %v, want %d %v", k, ok, mk, mok)
++				}
++			case 11:
++				k := genKey(ht)
++				tr.Load(k)
++				m.set(k, "")
++				note(ht, "Load(%d)", k)
++			case 12:
++				pivot := genKey(ht)
++				var asc, desc []int
++				tr.Ascend(pivot, func(k int) bool { asc = append(asc, k); return true })
++				tr.Descend(pivot, func(k int) bool { desc = append(desc, k); return true })
++				if !eqInts(asc, m.ascend(pivot)) {
++					fail(ht, "Ascend(%d) = %v, want %v", pivot, asc, m.ascend(pivot))
++				}
++				if !eqInts(desc, m.descend(pivot)) {
++					fail(ht, "Descend(%d) = %v, want %v", pivot, desc, m.descend(pivot))
++				}
++			}
++			if tr.Len() != len(m.keys) {
++				fail(ht, "after step %d: Len = %d, want %d", step, tr.Len(), len(m.keys))
++			}
++		}
++		if keys := tr.Keys(); !eqInts(keys, m.keys) {
++			fail(ht, "Keys = %v, want %v", keys, m.keys)
++		}
++		var scanned, reversed []int
++		tr.Scan(func(k int) bool { scanned = append(scanned, k); return true })
++		tr.Reverse(func(k int) bool { reversed = append([]int{k}, reversed...); return true })
++		if !eqInts(scanned, m.keys) || !eqInts(reversed, m.keys) {
++			fail(ht, "Scan = %v, Reverse = %v, want %v", scanned, reversed, m.keys)
++		}
++		for i := -1; i <= len(m.keys); i++ {
++			k, ok := tr.GetAt(i)
++			mk, _, mok := m.at(i)
++			if ok != mok || k != mk {
++				fail(ht, "GetAt(%d) = %d %v, want %d %v", i, k, ok, mk, mok)
++			}
++		}
++		k, ok := tr.Min()
++		if ok != (len(m.keys) > 0) || (ok && k != m.keys[0]) {
++			fail(ht, "Min = %d %v, model %v", k, ok, m.keys)
++		}
++		k, ok = tr.Max()
++		if ok != (len(m.keys) > 0) || (ok && k != m.keys[len(m.keys)-1]) {
++			fail(ht, "Max = %d %v, model %v", k, ok, m.keys)
++		}
++		if (tr.Height() == 0) != (len(m.keys) == 0) {
++			fail(ht, "Height = %d with %d items", tr.Height(), len(m.keys))
++		}
++		// The iterator walks the same keys.
++		it := tr.Iter()
++		var walked []int
++		for ok := it.First(); ok; ok = it.Next() {
++			walked = append(walked, it.Key())
++		}
++		if !eqInts(walked, m.keys) {
++			fail(ht, "Iter First/Next = %v, want %v", walked, m.keys)
++		}
++		c := tr.Copy()
++		tr.Clear()
++		if keys := c.Keys(); !eqInts(keys, m.keys) {
++			fail(ht, "the copy after Clear on the original: Keys = %v, want %v", keys, m.keys)
++		}
++		if tr.Len() != 0 {
++			fail(ht, "Len after Clear = %d", tr.Len())
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// BTreeG with a custom comparator, hints, range deletion and copies
++
++type item struct {
++	K int
++	V string
++}
++
++func byK(a, b item) bool { return a.K < b.K }
++
++type gPair struct {
++	tr   *btree.BTreeG[item]
++	m    *model
++	hint *btree.PathHint
++}
++
++func newG(ht *hegel.T) *btree.BTreeG[item] {
++	deg := pick(ht, 0, 0, 1, 2, 3, 4, 5, 8, 32)
++	nolocks := chance(ht, 50)
++	note(ht, "BTreeG degree %d, NoLocks %v", deg, nolocks)
++	if deg == 0 && !nolocks && chance(ht, 50) {
++		return btree.NewBTreeG(byK)
++	}
++	return btree.NewBTreeGOptions(byK, btree.Options{Degree: deg, NoLocks: nolocks})
++}
++
++func checkG(ht *hegel.T, tr *btree.BTreeG[item], m *model, what string) {
++	if tr.Len() != len(m.keys) {
++		fail(ht, "%s: Len = %d, want %d", what, tr.Len(), len(m.keys))
++	}
++	items := tr.Items()
++	keys := make([]int, len(items))
++	for i, it := range items {
++		keys[i] = it.K
++		if m.vals[it.K] != it.V {
++			fail(ht, "%s: Items has %d=%q, want %q", what, it.K, it.V, m.vals[it.K])
++		}
++	}
++	if !eqInts(keys, m.keys) {
++		fail(ht, "%s: Items keys = %v, want %v", what, keys, m.keys)
++	}
++	var walked []int
++	tr.Walk(func(its []item) bool {
++		if len(its) == 0 {
++			fail(ht, "%s: Walk delivered an empty slice", what)
++		}
++		for _, it := range its {
++			walked = append(walked, it.K)
++		}
++		return true
++	})
++	if !eqInts(walked, m.keys) {
++		fail(ht, "%s: Walk = %v, want %v", what, walked, m.keys)
++	}
++	var scanned, reversed []int
++	tr.Scan(func(it item) bool { scanned = append(scanned, it.K); return true })
++	tr.Reverse(func(it item) bool { reversed = append([]int{it.K}, reversed...); return true })
++	if !eqInts(scanned, m.keys) || !eqInts(reversed, m.keys) {
++		fail(ht, "%s: Scan = %v, Reverse = %v, want %v", what, scanned, reversed, m.keys)
++	}
++	h := tr.Height()
++	if (h == 0) != (len(m.keys) == 0) || (len(m.keys) > 0 && h > log2ceil(len(m.keys)+1)+1) {
++		fail(ht, "%s: Height = %d for %d items", what, h, len(m.keys))
++	}
++	it, ok := tr.Min()
++	if ok != (len(m.keys) > 0) || (ok && it.K != m.keys[0]) {
++		fail(ht, "%s: Min = %v %v, model %v", what, it, ok, m.keys)
++	}
++	it, ok = tr.Max()
++	if ok != (len(m.keys) > 0) || (ok && it.K != m.keys[len(m.keys)-1]) {
++		fail(ht, "%s: Max = %v %v, model %v", what, it, ok, m.keys)
++	}
++	for i := -1; i <= len(m.keys); i++ {
++		it, ok := tr.GetAt(i)
++		mk, mv, mok := m.at(i)
++		if ok != mok || (ok && (it.K != mk || it.V != mv)) {
++			fail(ht, "%s: GetAt(%d) = %v %v, want %d %q %v", what, i, it, ok, mk, mv, mok)
++		}
++	}
++	// The iterator agrees with Items.
++	iter := tr.Iter()
++	var iterated []int
++	for ok := iter.First(); ok; ok = iter.Next() {
++		iterated = append(iterated, iter.Item().K)
++	}
++	iter.Release()
++	if !eqInts(iterated, m.keys) {
++		fail(ht, "%s: Iter = %v, want %v", what, iterated, m.keys)
++	}
++}
++
++func TestHegelBTreeGModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		pairs := []gPair{{newG(ht), newModel(), &btree.PathHint{}}}
++		if chance(ht, 40) {
++			cnt := n(ht, 0, 40)
++			k := n(ht, -50, 0)
++			for i := 0; i < cnt; i++ {
++				k += n(ht, 1, 3)
++				if chance(ht, 10) {
++					k -= n(ht, 0, 5)
++				}
++				v := genVal(ht)
++				prev, replaced := pairs[0].tr.Load(item{k, v})
++				mprev, mreplaced := pairs[0].m.set(k, v)
++				if replaced != mreplaced || (replaced && prev.V != mprev) {
++					fail(ht, "Load(%d, %q) = %v %v, want %q %v", k, v, prev, replaced, mprev, mreplaced)
++				}
++			}
++			note(ht, "loaded %d keys", cnt)
++		}
++		if chance(ht, 30) {
++			cnt := n(ht, 50, 600)
++			span := pick(ht, 100, 1000, 1000000)
++			for i := 0; i < cnt; i++ {
++				k, v := n(ht, -span, span), genVal(ht)
++				pairs[0].tr.Set(item{k, v})
++				pairs[0].m.set(k, v)
++			}
++			note(ht, "bulk of %d random keys in [-%d, %d]", cnt, span, span)
++		}
++		steps := n(ht, 1, 80)
++		for step := 0; step < steps; step++ {
++			p := pairs[n(ht, 0, len(pairs)-1)]
++			tr, m, hint := p.tr, p.m, p.hint
++			switch n(ht, 1, 18) {
++			case 1, 2, 3, 4:
++				k, v := genKey(ht), genVal(ht)
++				var prev item
++				var replaced bool
++				if chance(ht, 50) {
++					prev, replaced = tr.Set(item{k, v})
++					note(ht, "Set(%d, %q)", k, v)
++				} else {
++					prev, replaced = tr.SetHint(item{k, v}, hint)
++					note(ht, "SetHint(%d, %q)", k, v)
++				}
++				mprev, mreplaced := m.set(k, v)
++				if replaced != mreplaced || (replaced && (prev.K != k || prev.V != mprev)) {
++					fail(ht, "Set(%d, %q) = %v %v, want %q %v", k, v, prev, replaced, mprev, mreplaced)
++				}
++			case 5, 6:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				var prev item
++				var ok bool
++				if chance(ht, 50) {
++					prev, ok = tr.Delete(item{K: k})
++					note(ht, "Delete(%d)", k)
++				} else {
++					prev, ok = tr.DeleteHint(item{K: k}, hint)
++					note(ht, "DeleteHint(%d)", k)
++				}
++				mprev, mok := m.del(k)
++				if ok != mok || (ok && (prev.K != k || prev.V != mprev)) {
++					fail(ht, "Delete(%d) = %v %v, want %q %v", k, prev, ok, mprev, mok)
++				}
++			case 7:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				mv, mok := m.get(k)
++				for _, f := range []struct {
++					name string
++					get  func() (item, bool)
++				}{
++					{"Get", func() (item, bool) { return tr.Get(item{K: k}) }},
++					{"GetMut", func() (item, bool) { return tr.GetMut(item{K: k}) }},
++					{"GetHint", func() (item, bool) { return tr.GetHint(item{K: k}, hint) }},
++					{"GetHintMut", func() (item, bool) { return tr.GetHintMut(item{K: k}, hint) }},
++				} {
++					it, ok := f.get()
++					if ok != mok || (ok && (it.K != k || it.V != mv)) {
++						fail(ht, "%s(%d) = %v %v, want %q %v", f.name, k, it, ok, mv, mok)
++					}
++				}
++			case 8:
++				i := n(ht, -1, len(m.keys)+1)
++				it, ok := tr.DeleteAt(i)
++				mk, mv, mok := m.deleteAt(i)
++				note(ht, "DeleteAt(%d)", i)
++				if ok != mok || (ok && (it.K != mk || it.V != mv)) {
++					fail(ht, "DeleteAt(%d) = %v %v, want %d %q %v", i, it, ok, mk, mv, mok)
++				}
++			case 9:
++				it, ok := tr.PopMin()
++				mk, mv, mok := m.deleteAt(0)
++				note(ht, "PopMin")
++				if ok != mok || (ok && (it.K != mk || it.V != mv)) {
++					fail(ht, "PopMin = %v %v, want %d %q %v", it, ok, mk, mv, mok)
++				}
++			case 10:
++				it, ok := tr.PopMax()
++				mk, mv, mok := m.deleteAt(len(m.keys) - 1)
++				note(ht, "PopMax")
++				if ok != mok || (ok && (it.K != mk || it.V != mv)) {
++					fail(ht, "PopMax = %v %v, want %d %q %v", it, ok, mk, mv, mok)
++				}
++			case 11:
++				pivot := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 50) {
++					pivot = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				limit := n(ht, 0, len(m.keys)+1)
++				var asc, desc []int
++				if chance(ht, 50) {
++					tr.Ascend(item{K: pivot}, func(it item) bool { asc = append(asc, it.K); return len(asc) < limit })
++					tr.Descend(item{K: pivot}, func(it item) bool { desc = append(desc, it.K); return len(desc) < limit })
++				} else {
++					tr.AscendHint(item{K: pivot}, func(it item) bool { asc = append(asc, it.K); return len(asc) < limit }, hint)
++					tr.DescendHint(item{K: pivot}, func(it item) bool { desc = append(desc, it.K); return len(desc) < limit }, hint)
++				}
++				wantA, wantD := m.ascend(pivot), m.descend(pivot)
++				cut := func(xs []int) []int {
++					if limit == 0 && len(xs) > 0 {
++						return xs[:1]
++					}
++					if len(xs) > limit {
++						return xs[:limit]
++					}
++					return xs
++				}
++				if !eqInts(asc, cut(wantA)) || !eqInts(desc, cut(wantD)) {
++					fail(ht, "Ascend/Descend(%d) stopping after %d = %v / %v, want %v / %v", pivot, limit, asc, desc, cut(wantA), cut(wantD))
++				}
++			case 12:
++				if len(pairs) < 4 {
++					var c *btree.BTreeG[item]
++					if chance(ht, 50) {
++						c = tr.Copy()
++					} else {
++						c = tr.IsoCopy()
++					}
++					pairs = append(pairs, gPair{c, m.clone(), &btree.PathHint{}})
++					note(ht, "Copy -> tree %d", len(pairs)-1)
++					checkG(ht, c, m, "the fresh copy")
++				}
++			case 13:
++				lo, hi := genKey(ht), genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 60) {
++					lo = m.keys[n(ht, 0, len(m.keys)-1)] + pick(ht, 0, 0, -1, 1)
++					hi = m.keys[n(ht, 0, len(m.keys)-1)] + pick(ht, 0, 0, -1, 1)
++				}
++				if lo > hi && chance(ht, 80) {
++					lo, hi = hi, lo
++				}
++				var opts *btree.DeleteRangeOptions
++				incl, noret := false, false
++				if chance(ht, 60) {
++					incl, noret = chance(ht, 50), chance(ht, 30)
++					opts = &btree.DeleteRangeOptions{MaxInclusive: incl, NoReturn: noret}
++				}
++				note(ht, "DeleteRange(%d, %d, inclusive %v, noreturn %v)", lo, hi, incl, noret)
++				var list btree.List[item]
++				if chance(ht, 50) {
++					list = tr.DeleteRange(item{K: lo}, item{K: hi}, opts)
++				} else {
++					list = tr.DeleteRangeReuse(item{K: lo}, item{K: hi}, opts, &list)
++				}
++				want := m.deleteRange(lo, hi, incl)
++				if noret {
++					if list.Len() != 0 {
++						fail(ht, "DeleteRange with NoReturn returned %d items", list.Len())
++					}
++				} else {
++					var got []int
++					list.Scan(func(it item) bool {
++						got = append(got, it.K)
++						if m.vals[it.K] != "" && false {
++							return false
++						}
++						return true
++					})
++					if list.Len() != len(want) || !eqInts(got, want) {
++						fail(ht, "DeleteRange(%d, %d, inclusive %v) deleted %v (Len %d), want %v", lo, hi, incl, got, list.Len(), want)
++					}
++					// Scanning twice gives the same list.
++					var again []int
++					list.Scan(func(it item) bool { again = append(again, it.K); return true })
++					if !eqInts(again, want) {
++						fail(ht, "the second Scan of the deleted list = %v, want %v", again, want)
++					}
++				}
++			case 14:
++				pivot := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 60) {
++					pivot = m.keys[n(ht, 0, len(m.keys)-1)] + pick(ht, 0, 0, -1)
++				}
++				// A random action per visited item; the model visits every
++				// item >= pivot in order until a Stop.
++				plan := map[int]btree.Action{}
++				var visited []int
++				stopped := false
++				tr.DeleteAscend(item{K: pivot}, func(it item) btree.Action {
++					visited = append(visited, it.K)
++					if stopped {
++						return btree.Stop
++					}
++					act := pick(ht, btree.Delete, btree.Delete, btree.Keep, btree.Keep, btree.Stop)
++					plan[it.K] = act
++					if act == btree.Stop {
++						stopped = true
++					}
++					return act
++				})
++				note(ht, "DeleteAscend(%d): visited %v", pivot, visited)
++				var want []int
++				for _, k := range m.ascend(pivot) {
++					want = append(want, k)
++					if plan[k] == btree.Stop {
++						break
++					}
++				}
++				if !eqInts(visited, want) {
++					fail(ht, "DeleteAscend(%d) visited %v, want %v (model %v)", pivot, visited, want, m.keys)
++				}
++				for _, k := range visited {
++					if plan[k] == btree.Delete {
++						m.del(k)
++					}
++				}
++			case 15:
++				if chance(ht, 20) {
++					tr.Clear()
++					m.keys, m.vals = nil, map[int]string{}
++					note(ht, "Clear")
++				}
++			case 16:
++				k, v := genKey(ht), genVal(ht)
++				prev, replaced := tr.Load(item{k, v})
++				mprev, mreplaced := m.set(k, v)
++				note(ht, "Load(%d, %q)", k, v)
++				if replaced != mreplaced || (replaced && prev.V != mprev) {
++					fail(ht, "Load(%d, %q) = %v %v, want %q %v", k, v, prev, replaced, mprev, mreplaced)
++				}
++			case 17:
++				// Iterator with a hinted seek, then a few steps.
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 50) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)] + pick(ht, 0, 0, 1, -1)
++				}
++				iter := tr.Iter()
++				c := &cursor{n: len(m.keys)}
++				var got, want bool
++				if chance(ht, 50) {
++					got, want = iter.SeekHint(item{K: k}, hint), c.seek(m.lower(k))
++				} else {
++					got, want = iter.Seek(item{K: k}), c.seek(m.lower(k))
++				} // a fresh iterator: no stale flag (btree/2) can be involved
++				if got != want {
++					fail(ht, "Iter.Seek(%d) = %v, want %v (model %v)", k, got, want, m.keys)
++				}
++				for j := 0; j < 6; j++ {
++					if Known.seekKeepsFlag && c.staleFlags() {
++						break
++					}
++					if chance(ht, 50) {
++						got, want = iter.Next(), c.next()
++					} else {
++						got, want = iter.Prev(), c.prev()
++					}
++					if got != want {
++						fail(ht, "Iter step after Seek(%d) = %v, want %v (cursor %+v)", k, got, want, *c)
++					}
++					if c.hasItem && iter.Item().K != m.keys[c.item] {
++						fail(ht, "Iter.Item = %v, want key %d", iter.Item(), m.keys[c.item])
++					}
++				}
++				iter.Release()
++				// Re-use the released iterator on the tree.
++				iter.Init(tr, false)
++				var again []int
++				for ok := iter.First(); ok; ok = iter.Next() {
++					again = append(again, iter.Item().K)
++				}
++				iter.Release()
++				if !eqInts(again, m.keys) {
++					fail(ht, "the re-initialised iterator walks %v, want %v", again, m.keys)
++				}
++			case 18:
++				checkG(ht, tr, m, fmt.Sprintf("tree after step %d", step))
++			}
++			if tr.Len() != len(m.keys) {
++				fail(ht, "after step %d: Len = %d, want %d", step, tr.Len(), len(m.keys))
++			}
++		}
++		for i, p := range pairs {
++			checkG(ht, p.tr, p.m, fmt.Sprintf("tree %d at the end", i))
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// The interface{}-typed BTree
++
++func anyLess(a, b any) bool { return a.(item).K < b.(item).K }
++
++func TestHegelAnyBTree(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tr *btree.BTree
++		switch n(ht, 1, 3) {
++		case 1:
++			tr = btree.New(anyLess)
++		case 2:
++			tr = btree.NewNonConcurrent(anyLess)
++		default:
++			deg := pick(ht, 0, 1, 2, 3, 5, 16)
++			note(ht, "degree %d", deg)
++			tr = btree.NewOptions(anyLess, btree.Options{Degree: deg, NoLocks: chance(ht, 50)})
++		}
++		m := newModel()
++		var hint btree.PathHint
++		steps := n(ht, 1, 70)
++		for step := 0; step < steps; step++ {
++			switch n(ht, 1, 12) {
++			case 1, 2, 3, 4:
++				k, v := genKey(ht), genVal(ht)
++				var prev any
++				if chance(ht, 50) {
++					prev = tr.Set(item{k, v})
++				} else {
++					prev = tr.SetHint(item{k, v}, &hint)
++				}
++				mprev, mreplaced := m.set(k, v)
++				note(ht, "Set(%d, %q)", k, v)
++				if mreplaced {
++					if prev == nil || prev.(item).V != mprev {
++						fail(ht, "Set(%d, %q) = %v, want the replaced %q", k, v, prev, mprev)
++					}
++				} else if prev != nil {
++					fail(ht, "Set(%d, %q) of a new key = %v, want nil", k, v, prev)
++				}
++			case 5, 6:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				var prev any
++				if chance(ht, 50) {
++					prev = tr.Delete(item{K: k})
++				} else {
++					prev = tr.DeleteHint(item{K: k}, &hint)
++				}
++				mprev, mok := m.del(k)
++				note(ht, "Delete(%d)", k)
++				if mok != (prev != nil) || (mok && prev.(item).V != mprev) {
++					fail(ht, "Delete(%d) = %v, want %q %v", k, prev, mprev, mok)
++				}
++			case 7:
++				k := genKey(ht)
++				if len(m.keys) > 0 && chance(ht, 70) {
++					k = m.keys[n(ht, 0, len(m.keys)-1)]
++				}
++				mv, mok := m.get(k)
++				for _, g := range []any{tr.Get(item{K: k}), tr.GetHint(item{K: k}, &hint), tr.GetMut(item{K: k})} {
++					if mok != (g != nil) || (mok && g.(item).V != mv) {
++						fail(ht, "Get(%d) = %v, want %q %v", k, g, mv, mok)
++					}
++				}
++				// Seek finds the first item >= k.
++				res, ok := tr.Seek(item{K: k})
++				i := m.lower(k)
++				if ok != (i < len(m.keys)) || (ok && res.(item).K != m.keys[i]) {
++					fail(ht, "Seek(%d) = %v %v, want key %v (model %v)", k, res, ok, m.ascend(k), m.keys)
++				}
++			case 8:
++				i := n(ht, -1, len(m.keys)+1)
++				got := tr.DeleteAt(i)
++				mk, mv, mok := m.deleteAt(i)
++				note(ht, "DeleteAt(%d)", i)
++				if mok != (got != nil) || (mok && (got.(item).K != mk || got.(item).V != mv)) {
++					fail(ht, "DeleteAt(%d) = %v, want %d %q %v", i, got, mk, mv, mok)
++				}
++			case 9:
++				got := tr.PopMin()
++				mk, mv, mok := m.deleteAt(0)
++				note(ht, "PopMin")
++				if mok != (got != nil) || (mok && (got.(item).K != mk || got.(item).V != mv)) {
++					fail(ht, "PopMin = %v, want %d %q %v", got, mk, mv, mok)
++				}
++			case 10:
++				got := tr.PopMax()
++				mk, mv, mok := m.deleteAt(len(m.keys) - 1)
++				note(ht, "PopMax")
++				if mok != (got != nil) || (mok && (got.(item).K != mk || got.(item).V != mv)) {
++					fail(ht, "PopMax = %v, want %d %q %v", got, mk, mv, mok)
++				}
++			case 11:
++				k, v := genKey(ht), genVal(ht)
++				prev := tr.Load(item{k, v})
++				mprev, mreplaced := m.set(k, v)
++				note(ht, "Load(%d, %q)", k, v)
++				if mreplaced != (prev != nil) || (mreplaced && prev.(item).V != mprev) {
++					fail(ht, "Load(%d, %q) = %v, want %q %v", k, v, prev, mprev, mreplaced)
++				}
++			case 12:
++				pivot := genKey(ht)
++				var asc, desc []int
++				tr.Ascend(item{K: pivot}, func(it any) bool { asc = append(asc, it.(item).K); return true })
++				tr.DescendHint(item{K: pivot}, func(it any) bool { desc = append(desc, it.(item).K); return true }, &hint)
++				if !eqInts(asc, m.ascend(pivot)) || !eqInts(desc, m.descend(pivot)) {
++					fail(ht, "Ascend/Descend(%d) = %v / %v, want %v / %v", pivot, asc, desc, m.ascend(pivot), m.descend(pivot))
++				}
++			}
++			if tr.Len() != len(m.keys) {
++				fail(ht, "after step %d: Len = %d, want %d", step, tr.Len(), len(m.keys))
++			}
++		}
++		var scanned, walked []int
++		tr.Ascend(nil, func(it any) bool { scanned = append(scanned, it.(item).K); return true })
++		tr.Walk(func(its []any) {
++			for _, it := range its {
++				walked = append(walked, it.(item).K)
++			}
++		})
++		if !eqInts(scanned, m.keys) || !eqInts(walked, m.keys) {
++			fail(ht, "Ascend(nil) = %v, Walk = %v, want %v", scanned, walked, m.keys)
++		}
++		if mn := tr.Min(); (mn == nil) != (len(m.keys) == 0) || (mn != nil && mn.(item).K != m.keys[0]) {
++			fail(ht, "Min = %v, model %v", mn, m.keys)
++		}
++		if mx := tr.Max(); (mx == nil) != (len(m.keys) == 0) || (mx != nil && mx.(item).K != m.keys[len(m.keys)-1]) {
++			fail(ht, "Max = %v, model %v", mx, m.keys)
++		}
++		for i := -1; i <= len(m.keys); i++ {
++			got := tr.GetAt(i)
++			mk, _, mok := m.at(i)
++			if mok != (got != nil) || (mok && got.(item).K != mk) {
++				fail(ht, "GetAt(%d) = %v, want %d %v", i, got, mk, mok)
++			}
++		}
++		c := tr.Copy()
++		tr.Clear()
++		var copied []int
++		c.Ascend(nil, func(it any) bool { copied = append(copied, it.(item).K); return true })
++		if !eqInts(copied, m.keys) || tr.Len() != 0 || c.Len() != len(m.keys) {
++			fail(ht, "after Clear on the original the copy holds %v (Len %d), want %v; original Len %d", copied, c.Len(), m.keys, tr.Len())
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// Concurrency: BTreeG and BTree are documented thread-safe unless NoLocks.
++
++func TestHegelConcurrentWriters(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tr := btree.NewBTreeG(byK)
++		workers := n(ht, 2, 6)
++		per := n(ht, 1, 200)
++		readers := n(ht, 0, 3)
++		note(ht, "%d writers x %d keys, %d readers", workers, per, readers)
++		var wg sync.WaitGroup
++		for w := 0; w < workers; w++ {
++			wg.Add(1)
++			go func(w int) {
++				defer wg.Done()
++				var hint btree.PathHint
++				for i := 0; i < per; i++ {
++					k := i*workers + w
++					if i%2 == 0 {
++						tr.SetHint(item{k, "w"}, &hint)
++					} else {
++						tr.Set(item{k, "w"})
++					}
++					if i%7 == 3 {
++						tr.Delete(item{K: k - 2*workers}) // one of its own earlier keys
++					}
++				}
++			}(w)
++		}
++		for r := 0; r < readers; r++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				for i := 0; i < 20; i++ {
++					last := -1
++					tr.Scan(func(it item) bool {
++						if it.K <= last {
++							panic(fmt.Sprintf("Scan out of order under concurrent writes: %d after %d", it.K, last))
++						}
++						last = it.K
++						return true
++					})
++					iter := tr.Iter()
++					for ok := iter.First(); ok; ok = iter.Next() {
++					}
++					iter.Release()
++					if !Known.lenUnlocked {
++						tr.Len()
++					}
++					tr.Min()
++					tr.Max()
++					tr.Height()
++					tr.GetAt(i)
++					tr.Get(item{K: i})
++					tr.Items()
++				}
++			}()
++		}
++		wg.Wait()
++		m := newModel()
++		for w := 0; w < workers; w++ {
++			for i := 0; i < per; i++ {
++				m.set(i*workers+w, "w")
++			}
++			for i := 0; i < per; i++ {
++				if i%7 == 3 && i >= 2 {
++					m.del((i-2)*workers + w)
++				}
++			}
++		}
++		checkG(ht, tr, m, "after the concurrent writers")
++	})
++}
