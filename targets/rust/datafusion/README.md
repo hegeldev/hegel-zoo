@@ -84,3 +84,4 @@
 - 2026-09-17: base bumped a2b809331f70 → c4f72bad3424 (2026-09-17, "bench: SQL benchmark suite for null-aware (NOT IN) joins (#25386)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped c4f72bad3424 → 22f9a921781c (2026-09-17, "perf(range): avoid eager ok_or in gen_range_timestamp (#25308)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 22f9a921781c → 62f039f0d958 (2026-09-17, "dev: include dependency checks in the local lint suite (#25399)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped 62f039f0d958 → bf67e970ba95 (2026-09-17, "Avoid normalizing hidden values in sliced list set operations (#25300)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
