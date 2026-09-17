@@ -100,3 +100,4 @@ candidates). Four `pep440_rs` pins hold here as regular properties, since the fo
 - 2026-09-17: base bumped 7cfd935f89de → ef1e0689b461 (2026-09-17, "Make Git stamping opt-in for development builds (#21750)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-17: base bumped ef1e0689b461 → 5d64ede21e9e (2026-09-17, "Remove Hash API (#21786)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-17: base bumped 5d64ede21e9e → 7bc36767ae3e (2026-09-17, "Avoid warning when both `native-tls` and `system-certs` are configured (#21806)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.
+- 2026-09-17: base bumped 7bc36767ae3e → 6dffe7e03898 (2026-09-17, "Ignore `UV_NATIVE_TLS` when `UV_SYSTEM_CERTS` is set (#21805)"; 0.0.82); 5 bug(s) still reproduce. 83 tests pass.

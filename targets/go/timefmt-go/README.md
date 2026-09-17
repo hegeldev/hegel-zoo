@@ -88,3 +88,4 @@ the pinned shapes out (`-` with a width below the default; `%j` next to `%m`/`%d
 External test package with a dot import; `HEGEL_TEST_CASES` via `hegelOpts`; `property()`
 turns panics into test-case failures; the oracle child is started once per process
 (`sync.Once`) and serialised with a mutex.
+- 2026-09-17: base bumped 53188ffdc7cd → d13d369fb520 (2026-09-18, "add allocation tests of parsing and appending formatted time"; v0.1.8+); 2 bug(s) still reproduce. 20 tests pass.

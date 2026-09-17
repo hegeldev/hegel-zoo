@@ -84,6 +84,8 @@ remainders in `BigBytes`).
 
 ## Not bugs (documented, asserted upstream, or lenient by design)
 
+- Since 40736da3 (Fix #105) `CommafWithDigits(f, d)` pads the fraction with zeros to exactly
+  `d` digits (`CommafWithDigits(1000, 2)` is `1,000.00`); the model pads the same way.
 - `CommafWithDigits`, `FtoaWithDigits` and `SIWithDigits` truncate rather than round ("limits
   the resulting string to the given number of decimal places"; the documented example
   834142.32, 1 → 834,142.3 is consistent with both). Modelled as truncation.
@@ -115,3 +117,4 @@ remainders in `BigBytes`).
 - 2026-09-17: base bumped 4d1d9082551e → ca34c6147821 (2026-09-17, "Bump actions/setup-go from 6.1.0 to 6.3.0"; v1.0.1+); 6 bug(s) still reproduce; fixed upstream: go-humanize/4, go-humanize/6, go-humanize/7. 43 tests pass.
 - 2026-09-17: base bumped ca34c6147821 → 0509d5bf3e4a (2026-09-17, "feat: add ParseComma and ParseCommaf with doc comments and epsilon test"; v1.0.1+); 6 bug(s) still reproduce. 51 tests pass.
 - 2026-09-17: base bumped 0509d5bf3e4a → 2ccb40ff4026 (2026-09-17, "Fix #103"; v1.0.1+); 5 bug(s) still reproduce; fixed upstream: go-humanize/2. 51 tests pass.
+- 2026-09-17: base bumped 2ccb40ff4026 → 40736da3e8ed (2026-09-17, "Fix #105"; v1.0.1+); 5 bug(s) still reproduce. 53 tests pass.
