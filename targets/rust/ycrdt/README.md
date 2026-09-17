@@ -48,3 +48,4 @@
 - 2026-09-13: base bumped 67b0513fe6cf → 37dfed7eaeed (2026-09-09, "Merge pull request #644 from weironz/harden-untrusted-decode"; 0.27.4); 0 bug(s) still reproduce. 399 tests pass.
 - 2026-09-17: base bumped 37dfed7eaeed → ba8f2d3eab9e (2026-09-17, "Merge pull request #658 from Horusiath/fix/branch-by-val-eq"; 0.27.4); 0 bug(s) still reproduce. 399 tests pass.
 - 2026-09-17: base bumped ba8f2d3eab9e → 22890d631a1c (2026-09-17, "Merge pull request #659 from kavinsood/fix/ywasm-utf16-offset-docs"; 0.27.4); 0 bug(s) still reproduce. 399 tests pass.
+- 2026-09-17: base bumped 22890d631a1c → 1610ff2b1714 (2026-09-17, "Merge pull request #663 from y-crdt/release-v0.28.0"; 0.28.0); 1 bug(s) still reproduce. 400 tests pass.
