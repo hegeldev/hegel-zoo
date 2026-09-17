@@ -178,3 +178,4 @@ modified built-in prototypes.
 ## History
 
 - 2026-09-17: target added at 60fe20d3 (1.52.0), 8 properties, 42 bugs.
+- 2026-09-17: base bumped 60fe20d333e6 → 82ce4af4f35e (2026-09-17, "docs(contributing): limit compat fixes to inputs Lodash's types allow or real code passes (#2108)"; 1.52.0); 42 bug(s) still reproduce. 8 tests pass.
