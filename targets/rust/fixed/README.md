@@ -42,3 +42,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/fixed.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-17: base bumped 7afb5bf760e7 → 78d4346c78cf (2026-09-17, "Merge branch 'fix-wrapping-cast-warning' into 'master'"; 1.31.0); 1 bug(s) still reproduce. 3851 tests pass.
+- 2026-09-17: base bumped 78d4346c78cf → c3a503b48a82 (2026-09-17, "`f64::EPSILON` -> `<f64>::EPSILON` to avoid using core::f64::EPSILON"; 1.31.0); 1 bug(s) still reproduce. 3851 tests pass.

@@ -80,3 +80,4 @@
 - 2026-09-17: base bumped e5469e157079 → 902ee8a67e68 (2026-09-17, "feat: push dynamic filters through nested loop joins (#25030)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 902ee8a67e68 → 0f8f3b9d8bb0 (2026-09-17, "perf: optimize `levenshtein` (#23543)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-17: base bumped 0f8f3b9d8bb0 → 56361282fcf1 (2026-09-17, "docs: Add SKILL.md for designing benchmark (#25285)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-17: base bumped 56361282fcf1 → a2b809331f70 (2026-09-17, "feat: simplify contradicting and redundant predicates on a column (#25207)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
