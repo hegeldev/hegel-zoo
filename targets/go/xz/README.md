@@ -66,7 +66,7 @@ clean `zoo test` failed that way while five bumps were building in parallel).
 
 | id | summary | severity |
 |----|---------|----------|
-| xz/1 | a truncated stream decodes with a clean `io.EOF` when the cut falls in a block header, between blocks, or (no check) inside block data — 66 of 299 prefixes of a 3-block stream | high |
+| xz/1 | a truncated stream decodes with a clean `io.EOF` when the cut falls in a block header, between blocks, or (no check) inside block data — 66 of 299 prefixes of a 3-block stream; also reached by a flip that turns the index indicator into a block-header size byte | high |
 | xz/2 | Writer/Writer2 fail with "insufficient space" on incompressible data when DictCap < 64 KiB (uncompressed chunk copied from a dictionary that no longer holds it) | medium |
 | xz/3 | `Matcher: BinaryTree` writes undecodable streams, classic and LZMA2 ("distance out of range" in lzma.Reader, "corrupt" for xz); known in upstream's TODO | medium |
 | xz/4 | `SizeInHeader` with `Size: 0` writes an unknown-size header without an EOS marker: the empty stream is unreadable | medium |
