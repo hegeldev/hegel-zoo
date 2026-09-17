@@ -35,3 +35,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped bb351fcc056c → 887a847484ab (2026-09-13, "round_layout: round positions in cumulative coordinates to avoid 1px gaps (#1189)"; 0.14.0); 2 bug(s) still reproduce. 6368 tests pass.
 - 2026-09-17: base bumped 887a847484ab → 46c4e9cdf05b (2026-09-17, "Add `Position::Static`, `Position::Fixed` and `Position::Sticky`. Make `Static` default. (#1140)"; 0.14.0); 2 bug(s) still reproduce; add/add conflicts in tests/hand_written.rs resolved by keeping both sides. 6370 tests pass.
+- 2026-09-17: base bumped 46c4e9cdf05b → a742a46959a5 (2026-09-17, "gentest: Use computed `position. Measure out-of-flow boxes against their containing block. (#1192)"; 0.14.0); 2 bug(s) still reproduce. 6370 tests pass.
