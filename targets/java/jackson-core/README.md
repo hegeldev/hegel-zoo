@@ -73,7 +73,7 @@ shortcuts, `JsonPointer.forPath` with `includeRoot`.
 
 ## Bugs
 
-Twelve, all pinned (`pin…` tests) and recorded in `bugs.toml`: the DataInput parser fails on a root
+Thirteen, all pinned (`pin…` tests) and recorded in `bugs.toml`: the DataInput parser fails on a root
 number/literal at the end of input and on an empty document (jackson-core/1); `getNumberValueExact()`
 turns lossy after `getNumberType()` (/2); the byte-based parsers reject a lone-surrogate `\u` escape
 in a property name that the UTF-8 generator writes (/3); the non-blocking parser drops the sign of
@@ -84,7 +84,10 @@ in a property name that the UTF-8 generator writes (/3); the non-blocking parser
 under `ALLOW_BACKSLASH_ESCAPING_ANY_CHARACTER` the byte parsers truncate an escaped 4-byte character
 (/9) and the non-blocking parser fails on any escaped multi-byte character (/10); an escaped
 surrogate pair in a name split between feeds stalls the non-blocking parser (/11); the non-blocking
-parser accepts an object's trailing comma without the feature when the brace comes in a later feed (/12).
+parser accepts an object's trailing comma without the feature when the brace comes in a later feed (/12);
+the DataInput parser skips C0 control characters between tokens (`<0x01> []` reads as `[]`) where
+every other parser throws "Illegal character (CTRL-CHAR)" (/13, found 2026-09-17 by the mutation
+property; the property skips that shape for the DataInput source until it is fixed).
 
 Known upstream and skipped, not counted: mangled numbers inside containers such as `[123true]` are
 not reported (core#1557, `tofix` tests in the repository); the mutation property's root-value model
