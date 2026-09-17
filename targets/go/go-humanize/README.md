@@ -112,3 +112,4 @@ remainders in `BigBytes`).
   0..10^9.
 - `RelTime` at exactly 18 months says "2 years", a month is 30 days and a year 360 days: the
   documented table.
+- 2026-09-17: base bumped 4d1d9082551e → ca34c6147821 (2026-09-17, "Bump actions/setup-go from 6.1.0 to 6.3.0"; v1.0.1+); 6 bug(s) still reproduce; fixed upstream: go-humanize/4, go-humanize/6, go-humanize/7. 43 tests pass.
