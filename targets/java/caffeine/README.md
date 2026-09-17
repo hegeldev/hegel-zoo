@@ -99,3 +99,4 @@ documented behaviours the models replicate:
 - `getAllPresent` records a read on an in-flight async entry where `getIfPresent` deliberately does not (an
   asymmetry that heals when the future completes; not pinned, no observable effect was found).
 - 2026-09-17: base bumped 09f5ed51cf73 → 5283c96dce60 (2026-09-16, "make CLOCK-Pro's cold hand a setting"; 3.3.0-SNAPSHOT); 1 bug(s) still reproduce. 10 tests pass.
+- 2026-09-17: base bumped 5283c96dce60 → c0edd00bb606 (2026-09-17, "restore coverage lost to recent fixes"; 3.3.0-SNAPSHOT); 1 bug(s) still reproduce. 10 tests pass.
