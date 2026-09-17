@@ -320,3 +320,4 @@ its own pinned test asserting dpkg's behaviour.
   (`let p: deb822_fast::Paragraph = r.to_paragraph()`); `Also-Bugs`/`Also-WNPP` are not modelled,
   so a round trip through the struct drops them (a lossy struct — noted, not recorded). The general
   generator writes list fields with the first entry on the key line; dak's layout is the pin.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.3.14); 40 bug(s) still reproduce. 401 tests pass.

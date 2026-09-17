@@ -77,3 +77,4 @@ All seven bugs in `bugs.toml` are zoo-original (found 2026-09-13 at 4dc04da):
 * dpkg unescapes a continuation line of two or more dots (` ..` → `.`), so
   generated values contain no dot runs; dpkg's ` .` → empty line is undone
   before comparing.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.2.3); 7 bug(s) still reproduce. 72 tests pass.

@@ -87,3 +87,4 @@ oracles' behaviour.
   the crate reads them like python-debian does. The generator avoids these shapes.
 - A lone `\r` is not a Debian line ending; texts containing one are not sent to dpkg.
 - An empty paragraph (its last field removed) has no text; the edit property drops it from the model.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.5.18); 11 bug(s) still reproduce; fixed upstream: deb822-lossless/3. 186 tests pass.

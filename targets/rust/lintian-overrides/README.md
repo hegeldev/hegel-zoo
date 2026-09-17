@@ -98,3 +98,4 @@ Rewriters and builder:
   / `try_iter_overrides` (filesystem).
 * The Perl child needs lintian's library (`/usr/share/lintian/lib`), Moo,
   Regexp::Wildcards and JSON::PP — all pulled in by the `lintian` package.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.1.7); 11 bug(s) still reproduce. 56 tests pass.

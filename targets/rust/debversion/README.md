@@ -67,3 +67,4 @@ has its own pinned test asserting dpkg's behaviour.
   parser refusing those is the right direction (texts with whitespace are not compared).
 - Epochs print as numbers (`01:1.0` displays as `1:1.0`).
 - Texts starting with `-` cannot be handed to the dpkg command line and are not validated.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.5.3); 10 bug(s) still reproduce. 58 tests pass.

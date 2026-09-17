@@ -92,3 +92,4 @@ its own pinned test asserting dpkg's behaviour.
   (the generator does not produce it) and `Urgency: unknown` for a missing urgency.
 - Tab-indented change lines (`\t* x`) are change data for dpkg (`\s{2,}`) but not for the crate;
   policy says spaces, so they are not generated.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.2.24); 13 bug(s) still reproduce. 267 tests pass.

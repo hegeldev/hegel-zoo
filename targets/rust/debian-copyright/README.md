@@ -87,3 +87,4 @@ All eight bugs in `bugs.toml` are zoo-original (found 2026-09-13 at 4dc04da):
   trailing blank line of the text; the lossy `Header` only carries Format,
   Files-Excluded, Source and Upstream-Contact, so its `Display` drops the
   other header fields by design; header field order changes on lossy Display.
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.1.55); 7 bug(s) still reproduce; fixed upstream: debian-copyright/3. 209 tests pass.

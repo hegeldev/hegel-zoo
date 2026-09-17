@@ -95,3 +95,4 @@ The line-based parser and editor:
   and `set_script` only replace an existing field (the edits model follows
   that); `format_url` unwraps `Url::parse`, so it panics on an entry whose
   first field is not a URL (e.g. the `#foo` entry of bug 11).
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.4.12); 13 bug(s) still reproduce. 265 tests pass.

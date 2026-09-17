@@ -83,3 +83,4 @@ All eight bugs in `bugs.toml` are zoo-original (found 2026-09-14 at
   non-URL `Bug` where the lossless one returns `None` (strictness, not a
   disagreement on valid input); the dpatch `# Field:` comment form is not
   supported (dpatch is gone from Debian).
+- 2026-09-17: base bumped 4dc04da82229 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.2.4); 8 bug(s) still reproduce. 42 tests pass.
