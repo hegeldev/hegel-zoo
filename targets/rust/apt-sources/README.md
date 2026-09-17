@@ -81,3 +81,4 @@ Round trips and the deb822 side:
   `Display` is not deterministic across processes; `Url` normalises URIs
   (`http://a` → `http://a/`), which APT does not mind.
 - 2026-09-17: base bumped 4dc04da82229 → 3caf83edab73 (2026-09-17, "Merge pull request #474 from jelmer/issue-471"; 0.3.0); 11 bug(s) still reproduce. 63 tests pass.
+- 2026-09-17: base bumped 3caf83edab73 → b1568f26a9e5 (2026-09-17, "Merge pull request #475 from jelmer/drop-minimal-versions"; 0.3.0); 11 bug(s) still reproduce. 63 tests pass.
