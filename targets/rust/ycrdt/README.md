@@ -46,3 +46,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/ycrdt.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 67b0513fe6cf → 37dfed7eaeed (2026-09-09, "Merge pull request #644 from weironz/harden-untrusted-decode"; 0.27.4); 0 bug(s) still reproduce. 399 tests pass.
+- 2026-09-17: base bumped 37dfed7eaeed → ba8f2d3eab9e (2026-09-17, "Merge pull request #658 from Horusiath/fix/branch-by-val-eq"; 0.27.4); 0 bug(s) still reproduce. 399 tests pass.
