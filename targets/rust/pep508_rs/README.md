@@ -41,8 +41,10 @@ zoo at 0.9.2 (HEAD `b50980e`, 2026-02-02); tests in `tests/hegel.rs`.
   the same parts for `packaging`.
 - **Syntax near misses** (`requirement_syntax_agrees_with_packaging`): 1–2 random insertions,
   deletions or replacements in a valid requirement are accepted or rejected alike, for the
-  plain name/extras/specifier shapes the grammar clearly decides (URLs, markers and trailing
-  commas are where `packaging` is knowingly lenient).
+  plain name/extras/specifier shapes the grammar clearly decides (URLs, markers, trailing
+  commas and names ending in `_` — `aa_`, which `packaging`'s `\b`-delimited IDENTIFIER token
+  passes against the spec's name grammar — are where `packaging` is knowingly lenient; the
+  last showed up as a rare CI failure on 2026-09-17).
 - `python_version_compares_with_three_component_versions`: `python_version <op> '3.X.Y'`
   agrees with `packaging` for the six comparison operators.
 
