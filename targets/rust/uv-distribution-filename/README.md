@@ -122,3 +122,4 @@ trailing `.` in a tag component (bug 2), known tags spelled canonically (bug 3),
 - 2026-09-16: base bumped bafbff9f631e → 108a3587b857 (2026-09-16, "Refactor HashDigest APIs (#21139)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-16: base bumped 108a3587b857 → cc6880fd22c2 (2026-09-16, "Show captured publish test failures (#21757)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-16: base bumped cc6880fd22c2 → 6b40d9e51d24 (2026-09-16, "Enforce non-staleness of cargo deny's `bans.build` list (#21756)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
+- 2026-09-17: base bumped 6b40d9e51d24 → ec2783923893 (2026-09-17, "Add regression test for uv#21773 (#21775)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.

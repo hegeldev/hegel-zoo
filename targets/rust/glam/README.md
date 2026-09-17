@@ -50,3 +50,4 @@
 - 2026-09-15: base bumped 15971997d7a9 → 104058313a3a (2026-09-16, "docs(mat): mat row and col method consistency pass (#843)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
 - 2026-09-16: base bumped 104058313a3a → 296329c1dd4b (2026-09-16, "docs: hide deref helper types from rustdoc (#851)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
 - 2026-09-17: base bumped 296329c1dd4b → 3ccb58c04d04 (2026-09-17, "chore(bench): fold throughput into bench macros and document benchmarking (#852)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
+- 2026-09-17: base bumped 3ccb58c04d04 → d75cec20529b (2026-09-17, "perf(simd): broadcast dot product without an extra shuffle (#833)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.

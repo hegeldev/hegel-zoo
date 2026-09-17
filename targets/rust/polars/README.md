@@ -53,3 +53,4 @@
 - 2026-09-17: base bumped 3127ec9c82e0 → 473ca8efde86 (2026-09-17, "perf: Disable system certificates for `CloudScheme::Http` sources (#29284)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-17: base bumped 473ca8efde86 → 0af4264600b9 (2026-09-17, "feat!: Read Parquet ENUM type as pl.String (#29331)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-17: base bumped 0af4264600b9 → 8c514b134c80 (2026-09-17, "fix: Decimal Parquet statistics for decimal/i128/f16 (#29350)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-17: base bumped 8c514b134c80 → f65fa33c5c3f (2026-09-17, "refactor(rust): Rename big_idx to bigidx for consistency (#29351)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
