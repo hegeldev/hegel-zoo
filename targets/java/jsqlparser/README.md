@@ -116,3 +116,4 @@ COLLATE NOCASE` and `a IS TRUE COLLATE NOCASE` rejected (16).
 ## History
 
 - 2026-09-16: created (turn 175) at 6312f9e5ea5d (5.5-SNAPSHOT); 16 bugs.
+- 2026-09-17: base bumped 6312f9e5ea5d → dec8f5def498 (2026-09-17, "doc: Update changelog"; 5.5-SNAPSHOT); 16 bug(s) still reproduce. 5 tests pass.
