@@ -1,17 +1,22 @@
 # Hegel zoo
 
-A collection of (hopefully) high-quality property-based tests for open-source projects, in every language
-[Hegel](https://github.com/hegeldev) supports.
+A collection of property-based tests for open-source projects, in every language
+[Hegel](https://github.com/hegeldev) supports. We aim for these to be high quality tests,
+but this is definitely not currently fully achieved.
 
 These are fully LLM generated, and are primarily for our own evaluation of Hegel. Where possible,
 we report bugs upstream, but in order to be respectful of maintainer time we don't do that without
 a human review step to ensure the bug report is good and welcome, and the agent is working continuously
-to write new tests and find new bugs. As a result, there are likely a number of bugs here that have
+to write new tests and find new bugs. As a result, there are a large number of bugs here that have
 not yet been reported.
 
 If you find your project in the zoo and would like help getting the hegel tests integrated into it,
 or you would like our help triaging any bugs found in it, please get in touch and we'd be very happy
 to help you with any of this.
+
+We have been careful to not include any projects that have said that AI contributions are unwelcome,
+but if you would like us to remove your project from here for this or any other reason, please also let us know,
+and we would be happy to do so.
 
 ## Layout
 
