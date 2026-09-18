@@ -68,7 +68,7 @@ GFM autolink literals, single-tilde strikethrough, a pipeless header row, `~~` t
 Each shape was shrunk by hand (line-drop, character-drop, character-replace) with the gates of the
 test file applied, so the pins are minimal.
 
-## Bugs (15)
+## Bugs (16)
 
 All wrong-result, all still open at the pin. The parser is spec-exact on the ordinary paths — the
 spec fixtures pass and random documents agree with commonmark.js — and the bugs sit where two
@@ -76,7 +76,9 @@ mechanisms meet: containers and tabs (4, 11, 12), containers and lazy lines (10,
 reference rule taking definitions out of the paragraph flow (10, 13), the table rule running
 before the container rules (9), unclosed fences at boundaries (3, 8), the URL normaliser (6, 14),
 renderer rules that bypass `renderToken` (7), inline parsing on stripped-but-not-quite content
-(5, 15), and the two decoding paths for entities (2). Medium: 4, 8, 9, 10, 12, 15.
+(5, 15), the two decoding paths for entities (2), and the GFM strikethrough rule cutting a run of
+three or more tildes into `~~` pairs where GFM has text (16, found by the micromark differential
+on CI). Medium: 4, 8, 9, 10, 12, 15.
 
 ## Not tested
 
@@ -87,3 +89,5 @@ long as the rule), the CLI, source maps, the browser bundles.
 ## History
 
 - 2026-09-17: created at 15.0.2 (`3c51991`); 15 bugs.
+- 2026-09-18: markdown-it/16 (tilde runs of three or more), found by the CI run of the micromark
+  differential; gate `known-long-tilde-run`.
