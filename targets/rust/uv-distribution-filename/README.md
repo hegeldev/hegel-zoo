@@ -134,3 +134,4 @@ trailing `.` in a tag component (bug 2), known tags spelled canonically (bug 3),
 - 2026-09-17: base bumped 6dffe7e03898 → a2f820ad0ceb (2026-09-17, "Assign release pull requests to the workflow initiator (#21808)"; 0.0.82); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-17: base bumped a2f820ad0ceb → 761ff1379b3b (2026-09-17, "Bump version to 0.12.16 (#21809)"; 0.0.83); 6 bug(s) still reproduce. 55 tests pass.
 - 2026-09-18: base bumped 761ff1379b3b → 6e093a90d45a (2026-09-17, "Avoid allocations for duplicate OnceMap registrations (#21810)"; 0.0.83); 6 bug(s) still reproduce. 55 tests pass.
+- 2026-09-18: base bumped 6e093a90d45a → 46184d04b02e (2026-09-17, "Represent resolver package node kinds with an enum (#21802)"; 0.0.83); 6 bug(s) still reproduce. 55 tests pass.
