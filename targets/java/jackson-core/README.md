@@ -95,3 +95,4 @@ only applies jackson's separator rule at the root.
 - 2026-09-16: base bumped 104aab73ca89 → 6f505ccb2e77 (2026-09-15, "Add `StreamReadConstraints.getMaxBigIntegerScale()` (#1715)"; 3.3.0-SNAPSHOT); 12 bug(s) still reproduce. 8 tests pass.
 - 2026-09-17: base bumped 6f505ccb2e77 → 917360f2b0a0 (2026-09-16, "Merge branch '3.2' into 3.x"; 3.3.0-SNAPSHOT); 12 bug(s) still reproduce. 8 tests pass.
 - 2026-09-17: base bumped 917360f2b0a0 → 6c2090cda7a8 (2026-09-16, "Merge branch '3.2' into 3.x"; 3.3.0-SNAPSHOT); 12 bug(s) still reproduce. 8 tests pass.
+- 2026-09-18: base bumped 6c2090cda7a8 → fa07beee3b21 (2026-09-17, "Merge branch '3.2' into 3.x"; 3.3.0-SNAPSHOT); 13 bug(s) still reproduce. 8 tests pass.
