@@ -22,3 +22,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 81eeedbae691 → 66513d259f85 (2026-09-05, "bump version to 2.9.1 (#1199)"; 2.9.1); 1 bug(s) still reproduce; fixed upstream: pest/1; 1 ignored reproducer(s) not run. 378 tests pass. pest/1 was fixed upstream in 2.9.1 (`clear_snapshot` merges into the parent snapshot; upstream's regression test `nested_snapshot_pop_clear_restore` is the zoo's exact sequence), and the pin now passes.
 - 2026-09-17: base bumped 66513d259f85 → a055d816ef9d (2026-09-17, "update to unicode 18 (#1202)"; 2.9.1); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 379 tests pass.
+- 2026-09-18: base bumped a055d816ef9d → 8f5bc844f314 (2026-09-18, "ci: add permissions to fuzzing workflow (#1204)"; 2.9.1); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 379 tests pass.

@@ -53,3 +53,4 @@
 - 2026-09-15: base bumped 65c3d167b50e → 54094270ede0 (2026-09-15, "change: errors: report discarded client-write entries"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.
 - 2026-09-17: base bumped 54094270ede0 → ff31db46c5c3 (2026-09-17, "test: jepsen: use thread-safe libfaketime"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.
 - 2026-09-17: base bumped ff31db46c5c3 → c717fe98a286 (2026-09-17, "test: membership: wait for recovery term and membership"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.
+- 2026-09-18: base bumped c717fe98a286 → f1a2ec636416 (2026-09-18, "docs: openraft: document v0.10 feature flag migration"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.

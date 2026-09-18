@@ -156,3 +156,4 @@ inherits them — candidates for a `snakeyaml-engine` target):
 ## History
 
 - 2026-09-16: created (turn 172); 11 bugs.
+- 2026-09-18: base bumped b5b62c9b30b8 → 87b33f8d4e82 (2026-09-17, "Bump actions/setup-java from 6.0.0 to 6.0.1 (#732)"; 3.3.0-SNAPSHOT); 11 bug(s) still reproduce. 5 tests pass.
