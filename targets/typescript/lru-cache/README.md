@@ -68,3 +68,4 @@ arrays), the TypeScript types.
 ## History
 
 - 2026-09-17: created at 16b3a91 (v11.5.2), 4 properties, 4 bugs.
+- 2026-09-18: base bumped 16b3a916662a → 7e71a1f3babd (2026-09-18, "11.5.3"; 11.5.3); 4 bug(s) still reproduce. 4 tests pass.
