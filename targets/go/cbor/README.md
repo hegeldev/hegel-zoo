@@ -67,12 +67,13 @@ one disagree). With them on, the fourteen properties run clean at 500 cases (abo
 `HEGEL_VERBOSE=1` turns on the engine's log). Hegel's too-slow health check is suppressed for
 the cbor2 property, which forks a Python interpreter per case.
 
-## Bugs (2; details in bugs.toml)
+## Bugs (3; details in bugs.toml)
 
 | id | summary | severity |
 |----|---------|----------|
 | cbor/1 | `TimeUnixMicro` computes the float from `t.UnixNano()`, undefined outside 1678–2262: year 1000 encodes as 2169, year 9999 as 1816 (`TimeUnixDynamic` beside it is right) | medium |
 | cbor/2 | `MaxNestedLevels` does not count a tag unless its parent is a tag: `[37([37([37([37(0)])])])]` (8 levels) passes a limit of 4 | low |
+| cbor/3 | `TagsForbidden` does not stop `Marshal` writing bignum tags for a `big.Int` (`BigIntConvertNone`, or `Shortest` beyond 64 bits); the `TagsForbidden` decoder rejects the output | medium |
 
 How they were found: hand probes of the time modes before writing the time property showed
 the year-1000 and year-9999 round trips landing in 2169 and 1816 (cbor/1); the decoding-options
