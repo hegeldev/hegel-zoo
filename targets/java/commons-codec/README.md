@@ -17,8 +17,11 @@ Java targets (case counts from `HEGEL_TEST_CASES`, a collect mode under `ZOO_COL
 - `BinaryTest` — RFC 4648 bit-accumulator models for Base64 (standard, URL-safe, chunked with
   custom line lengths and separators; also checked against `java.util.Base64`), Base32 (both
   alphabets, custom pads, unpadded decoding), Base16 (both cases, and `Hex`); RFC 9285's formula
-  for Base45; a BigInteger model for Base58; the lenient/strict decoding contract (noise before the
-  pad, extra padding, dirty trailing bits, dangling characters); the input and output streams
+  for Base45; a BigInteger model for Base58; the lenient/strict decoding contract (lenient: noise
+  before the pad, missing or extra padding, dangling characters; strict, since upstream 8b506a1:
+  exactly the canonical form of the instance's own encoder — alphabet, padding, line length and
+  separator — with dirty trailing bits, missing padding and another configuration's output
+  rejected); the input and output streams
   against the one-shot codecs with random read and write sizes; `BinaryCodec` and
   `Base64.encodeInteger/decodeInteger`.
 - `DigestTest` — `Crypt`/`UnixCrypt`/`Md5Crypt`/`Sha2Crypt` against libc's crypt(3) through a
@@ -74,3 +77,4 @@ so the documented KDF example derives two identical keys (3); strict quoted-prin
 - Whitespace-separated Base45 is rejected (RFC 9285 has no whitespace), `' '` is data; the
   property follows the documents.
 - 2026-09-17: base bumped f49b96388c2d → eec585d1e821 (2026-09-17, "Fix Blake3 KDF example and clarify finalization semantics"; 1.23.0-SNAPSHOT); 7 bug(s) still reproduce. 21 tests pass.
+- 2026-09-18: base bumped eec585d1e821 → 8b506a1ce5f6 (2026-09-17, "Base32 and Base64 STRICT decoding now require the encoder's canonical alphabet, padding, and line separators, and validate streams through EOF. Use LENIENT to retain permissive decoding."; 1.23.0-SNAPSHOT); 7 bug(s) still reproduce. 21 tests pass.
