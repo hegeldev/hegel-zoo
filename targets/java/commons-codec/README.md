@@ -22,8 +22,9 @@ Java targets (case counts from `HEGEL_TEST_CASES`, a collect mode under `ZOO_COL
   exactly the canonical form of the instance's own encoder — alphabet, padding, line length and
   separator — with dirty trailing bits, missing padding and another configuration's output
   rejected); the input and output streams
-  against the one-shot codecs with random read and write sizes; `BinaryCodec` and
-  `Base64.encodeInteger/decodeInteger`.
+  against the one-shot codecs with random read and write sizes; `BinaryCodec` (since upstream
+  7bc15f1 `fromAscii` rejects any character other than `0`/`1` and drops leading bits that do not
+  fill a byte) and `Base64.encodeInteger/decodeInteger`.
 - `DigestTest` — `Crypt`/`UnixCrypt`/`Md5Crypt`/`Sha2Crypt` against libc's crypt(3) through a
   Python coprocess (skipped when `python3` or its `crypt` module is missing; the documented salt
   grammar, output format, verification with a stored hash, rounds clamping and key zeroing are
@@ -78,3 +79,4 @@ so the documented KDF example derives two identical keys (3); strict quoted-prin
   property follows the documents.
 - 2026-09-17: base bumped f49b96388c2d → eec585d1e821 (2026-09-17, "Fix Blake3 KDF example and clarify finalization semantics"; 1.23.0-SNAPSHOT); 7 bug(s) still reproduce. 21 tests pass.
 - 2026-09-18: base bumped eec585d1e821 → 8b506a1ce5f6 (2026-09-17, "Base32 and Base64 STRICT decoding now require the encoder's canonical alphabet, padding, and line separators, and validate streams through EOF. Use LENIENT to retain permissive decoding."; 1.23.0-SNAPSHOT); 7 bug(s) still reproduce. 21 tests pass.
+- 2026-09-18: base bumped 8b506a1ce5f6 → 7bc15f1cb49e (2026-09-18, "Reject oversized Beider-Morse input before language guessing"; 1.23.0-SNAPSHOT); 6 bug(s) still reproduce; fixed upstream: commons-codec/1. 21 tests pass.

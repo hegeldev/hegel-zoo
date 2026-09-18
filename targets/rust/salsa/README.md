@@ -40,3 +40,4 @@
 - 2026-09-14: base bumped c6ae3973824d → 0cb8e0d0916a (2026-09-14, "chore: Update taiki-e/install-action action to v2.87.7 (#1313)"; 0.28.2); 1 bug(s) still reproduce. 223 tests pass.
 - 2026-09-15: base bumped 0cb8e0d0916a → c1cbe6292b0f (2026-09-15, "chore: Update Rust crate trybuild to v1.0.121 (#1317)"; 0.28.2); 1 bug(s) still reproduce. 223 tests pass.
 - 2026-09-15: base bumped c1cbe6292b0f → 22d6cc724f06 (2026-09-15, "chore: Update actions/deploy-pages digest to 368f825 (#1312)"; 0.28.2); 1 bug(s) still reproduce. 223 tests pass.
+- 2026-09-18: base bumped 22d6cc724f06 → 5d8eaf1fa372 (2026-09-18, "chore: release v0.28.4 (#1323)"; 0.28.4); 1 bug(s) still reproduce; add/add conflicts in tests/interned-structs.rs resolved by keeping both sides. 223 tests pass.

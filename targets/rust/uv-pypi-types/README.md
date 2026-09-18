@@ -116,3 +116,4 @@ and the PEP 621 reference **`pyproject_metadata.StandardMetadata.from_pyproject`
 - 2026-09-18: base bumped 6e093a90d45a → 46184d04b02e (2026-09-17, "Represent resolver package node kinds with an enum (#21802)"; 0.0.83); 2 bug(s) still reproduce. 56 tests pass.
 - 2026-09-18: base bumped 46184d04b02e → d88bb84e7bd4 (2026-09-17, "Skip CI on `uv-security/main` (#21815)"; 0.0.83); 2 bug(s) still reproduce. 56 tests pass.
 - 2026-09-18: base bumped d88bb84e7bd4 → a5a0b62c4912 (2026-09-18, "Remove guidance to add changelog introductions (#21818)"; 0.0.83); 2 bug(s) still reproduce. 56 tests pass.
+- 2026-09-18: base bumped a5a0b62c4912 → b28593f9a5c6 (2026-09-18, "fix docs publication to astral-sh/docs (#21832)"; 0.0.84); 2 bug(s) still reproduce. 56 tests pass.

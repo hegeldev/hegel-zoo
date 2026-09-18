@@ -130,3 +130,4 @@ disagreement (`MISMATCH …`), status (`STATUS …`) and slow case (`SLOW …`) 
 — a triage mode. Both implementations run under a 5 s timeout; a case where jq times out (or
 gojq times out while jq took over 2 s) is skipped with a note.
 - 2026-09-17: base bumped c32933425cc6 → d3fe03ca462e (2026-09-18, "fix date and time functions against fractional epoch timestamps"; v0.12.19+); 7 bug(s) still reproduce. 69 tests pass.
+- 2026-09-18: base bumped d3fe03ca462e → 8b5e03a42da9 (2026-09-18, "update go-yaml and fix error handling using the load error API"; v0.12.19+); 6 bug(s) still reproduce; fixed upstream: gojq/4. 69 tests pass.

@@ -55,3 +55,4 @@
 - 2026-09-15: base bumped 354ba7407f38 → 2925e069f89e (2026-09-15, "Fix errors under no_ast."; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
 - 2026-09-16: base bumped 2925e069f89e → 847a842affb9 (2026-09-16, "Merge pull request #1170 from schungx/master"; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
 - 2026-09-18: base bumped 847a842affb9 → 285a9fd0ef73 (2026-09-18, "Merge pull request #1171 from rhaiscript/vm-clean-up-docs"; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.
+- 2026-09-18: base bumped 285a9fd0ef73 → 41d233cea0b9 (2026-09-18, "Use atomic counter to enable updating operations count after scripted function callback from native function."; 1.26.1); 0 bug(s) still reproduce. 390 tests pass.

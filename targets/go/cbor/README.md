@@ -121,3 +121,4 @@ transcoding modes, `ByteSliceLaterFormat`/`ByteStringExpectedFormat` (tags 21–
 `SimpleValueRegistry`, `DefaultMapType`/`DefaultByteStringType`, field-name matching modes
 beyond the probe, `UnrecognizedTagToAny`/`TimeTagToAny`, `MarshalToBuffer`, JSON
 interoperability.
+- 2026-09-18: base bumped d1789e88328a → fbaed3060e68 (2026-09-18, "Merge pull request #822 from fxamacker/fxamacker/skip-data-on-struct-tag-error"; v2.9.4+); 3 bug(s) still reproduce. 13 tests pass.

@@ -32,3 +32,4 @@
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped bef86dd6826e → b5950628a53d (2026-09-10, "Add NOTICE file (#2496)"; 0.63.0); 1 bug(s) still reproduce. 1528 tests pass.
 - 2026-09-14: base bumped b5950628a53d → 9296011a1c2b (2026-09-14, "Databricks: support INSERT BY NAME (#2403)"; 0.63.0); 1 bug(s) still reproduce; add/add conflicts in tests/sqlparser_common.rs resolved by keeping both sides. 1531 tests pass.
+- 2026-09-18: base bumped 9296011a1c2b → 1195239663b4 (2026-09-18, "Fuzz: Replace honggfuzz harness with cargo-fuzz (#2520)"; 0.63.0); 1 bug(s) still reproduce. 1531 tests pass.

@@ -34,3 +34,4 @@
 - 2025-11-02: predecessor base commit `576ae0b1407d` (Merge pull request #116 from musicinmybrain/license).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/unicode-normalization.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-09-18: base bumped 576ae0b1407d → b77212b847ea (2026-09-18, "fmt"; 0.1.25); 0 bug(s) still reproduce. 40 tests pass.

@@ -88,3 +88,4 @@ and custom syntaxes (`parser`/`stringifier`/`syntax` options), `Result.warn`/`me
 ## History
 
 - 2026-09-17: created against 15471986 (8.5.28); 7 bugs.
+- 2026-09-18: base bumped 15471986e7e9 → 57d6401ccca6 (2026-09-18, "Speed up source map cleaning"; 8.5.28); 7 bug(s) still reproduce. 5 tests pass.

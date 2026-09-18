@@ -90,3 +90,4 @@
 - 2026-09-17: base bumped c4f5a9e0f202 → edc936f38b74 (2026-09-17, "fix: `NOT IN (subquery)` with a constant value ignores NULLs in the subquery (#25348)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-18: base bumped edc936f38b74 → 3a647e49dd79 (2026-09-18, "ci: skip queue-verified Dev and Dependencies jobs on pushes to main (#25443)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-18: base bumped 3a647e49dd79 → 3b16a3d0eef7 (2026-09-18, "fix: preserve MERGE target qualifier bindings (#24429)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
+- 2026-09-18: base bumped 3b16a3d0eef7 → 6e4d9bae3c63 (2026-09-18, "fix: Spark `map_from_arrays`, `map_from_entries` for sliced lists (#25431)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.

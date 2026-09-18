@@ -103,3 +103,4 @@ commas, alternative number spellings (`7.0`, `7e0`, `7E+0`, `70e-1`) and string 
   parent of type array" (the words are swapped, edit.ts:138); `tabSize: 0` formats with 4
   (`options.tabSize || 4`); `modify(text, [], undefined)` throws "Can not delete in empty
   document" whatever the document.
+- 2026-09-18: base bumped ca66b23b9126 → dba435654808 (2026-09-18, "chore: run npm audit fix (#132)"; 4.0.0-next.2); 9 bug(s) still reproduce. 8 tests pass.

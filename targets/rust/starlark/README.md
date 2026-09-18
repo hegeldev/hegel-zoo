@@ -42,3 +42,4 @@
 - 2026-09-17: base bumped cc22bd69390f → 5d1aa66b7870 (2026-09-17, "lifetimes: Comments stop contrasting with the unbranded world"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 992 tests pass.
 - 2026-09-17: base bumped 5d1aa66b7870 → 5a27850a2fe7 (2026-09-17, "lifetimes: `frozen_only` asks nothing of the fields"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 992 tests pass.
 - 2026-09-18: base bumped 5a27850a2fe7 → 7d466fd5005b (2026-09-17, "Bump syn 3.0.5 -> 3.0.6"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 992 tests pass.
+- 2026-09-18: base bumped 7d466fd5005b → 8ba55a9904c8 (2026-09-18, "Clear debugger locals from module slots"; 0.14.2); 0 bug(s) still reproduce; 2 ignored reproducer(s) not run. 994 tests pass.

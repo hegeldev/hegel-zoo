@@ -46,3 +46,4 @@
 - 2026-09-16: base bumped 0a67a39db05f → a0b6fecbdf09 (2026-09-16, "`NoConnections` error no longer hides useful io errors"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.
 - 2026-09-16: base bumped a0b6fecbdf09 → e4badc73e07a (2026-09-16, "recursor: return SERVFAIL on CNAME loops"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.
 - 2026-09-17: base bumped e4badc73e07a → a98052bc8186 (2026-09-17, "build(deps): bump quinn from 0.11.11 to 0.11.12"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.
+- 2026-09-18: base bumped a98052bc8186 → e5d7fbe3f58a (2026-09-18, "build(deps): bump console from 0.16.4 to 0.16.6"; 0.27.0-alpha.1); 1 bug(s) still reproduce. 292 tests pass.

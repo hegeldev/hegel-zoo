@@ -106,3 +106,4 @@ not produce them.
 ## History
 
 - 2026-09-16: created (turn 174); 19 bugs.
+- 2026-09-18: base bumped a99f4dc25b72 → 554c6f70674f (2026-09-18, "fix: resolve qualified nested types against members only (fixes #5140)"; 3.29.0-SNAPSHOT); 19 bug(s) still reproduce. 7 tests pass.

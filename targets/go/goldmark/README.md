@@ -112,3 +112,4 @@ Footnotes, definition lists, attributes (`WithAttribute`), typographer quotes in
 East Asian line breaking, CJK options, the `text` package's readers directly, and the
 `Renderer`/`Parser` option plumbing beyond what the configurations above exercise.
 - 2026-09-17: base bumped 710cc2656aa3 → c4c7034e4ff2 (2026-09-17, "chore: delete debug print"; v2.1.3); 29 bug(s) still reproduce. 36 tests pass.
+- 2026-09-18: base bumped c4c7034e4ff2 → dcdeda312dc8 (2026-09-19, "fix(text): ForceNewLine breaks original source bytes"; v2.1.4); 29 bug(s) still reproduce. 36 tests pass.

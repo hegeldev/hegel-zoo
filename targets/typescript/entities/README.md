@@ -68,3 +68,4 @@ browser bundle, the TypeScript types.
 ## History
 
 - 2026-09-17: created at 0b16899 (v8.1.0), 4 properties, 2 bugs.
+- 2026-09-18: base bumped 0b16899dc04e → a3b8b1c46533 (2026-09-18, "build(deps-dev): bump @types/node from 26.5.1 to 26.6.0 (#2364)"; 8.1.0); 2 bug(s) still reproduce. 4 tests pass.

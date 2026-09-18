@@ -105,3 +105,4 @@ still reproduce.
 ## History
 
 - 2026-09-16: created at 5e2e5b98 (4.18-SNAPSHOT); bugs /1–/11.
+- 2026-09-18: base bumped 5e2e5b981533 → 06438525cfb1 (2026-09-19, "upgraded release plugin"; 4.18-SNAPSHOT); 10 bug(s) still reproduce; fixed upstream: java-diff-utils/3. 6 tests pass.

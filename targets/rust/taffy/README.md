@@ -39,3 +39,4 @@
 - 2026-09-17: base bumped a742a46959a5 → 996b1c0f2186 (2026-09-17, "flexbox: resolve relative inset at item generation (#1195)"; 0.14.0); 2 bug(s) still reproduce. 6370 tests pass.
 - 2026-09-17: base bumped 996b1c0f2186 → dc2fe8bd1ad9 (2026-09-17, "Implement out-of-flow (`absolute`/`fixed`) hoisting (#1194)"; 0.14.0); 2 bug(s) still reproduce. 6404 tests pass.
 - 2026-09-17: base bumped dc2fe8bd1ad9 → 4863877b9cab (2026-09-18, "Remove the heapless (no-alloc) build mode (#1199)"; 0.14.0); 2 bug(s) still reproduce. 6404 tests pass.
+- 2026-09-18: base bumped 4863877b9cab → e661b35980d9 (2026-09-18, "Grid: create `GridItem`s once before placement (#1200)"; 0.14.0); 2 bug(s) still reproduce. 6404 tests pass.

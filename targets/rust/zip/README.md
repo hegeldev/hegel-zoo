@@ -40,3 +40,4 @@
 - 2026-09-17: base bumped 68b3e3b69804 → 8abd89514424 (2026-09-17, "ci(deps): bump release-plz/action from 0.5.135 to 0.5.136 (#999)"; 9.0.0-pre3); 0 bug(s) still reproduce. 278 tests pass.
 - 2026-09-17: base bumped 8abd89514424 → 09c030eab56e (2026-09-17, "Merge commit from fork"; 9.0.0-pre3); 0 bug(s) still reproduce. 291 tests pass.
 - 2026-09-17: base bumped 09c030eab56e → 57fad8231ed4 (2026-09-17, "Fix: some permissions tests can only run on Unix (#1000)"; 9.0.0-pre3); 0 bug(s) still reproduce. 291 tests pass.
+- 2026-09-18: base bumped 57fad8231ed4 → b56344970080 (2026-09-18, "fix: parse the central header of the extended timestamp (#1002)"; 9.0.0-pre3); 0 bug(s) still reproduce. 297 tests pass.
