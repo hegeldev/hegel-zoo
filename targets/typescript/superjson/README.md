@@ -50,7 +50,7 @@ with causes; with `share` repeated references and cycles).
 | `TestHegelTypedArraysRoundTrip` | all eleven typed-array kinds, subarrays, NaN/±Infinity/-0 elements |
 | `TestHegelNodeBuffersRoundTrip` | a Node `Buffer` comes back with its bytes |
 | `TestHegelDatesRoundTrip` | Dates over the whole range, invalid ones included, as values and Map keys |
-| `TestHegelNestingAsDeepAsJsonStringify` | every depth `JSON.stringify` and `structuredClone` handle, superjson handles |
+| `TestHegelNestingAsDeepAsJsonStringify` | up to three quarters of the depth `JSON.stringify` handles in this process (measured, since stack limits move with the host and the JIT), superjson handles |
 | `TestHegelHostilePayloadsNeverPollutePrototypes` | random payloads with `__proto__`/`constructor`/`prototype` paths, bogus annotations and bad references: `deserialize` returns or throws an Error and no built-in prototype changes |
 
 `TestHegelPin…` are plain tests, one per bug in `bugs.toml`. The properties that are not about
@@ -68,8 +68,8 @@ a first occurrence when the representative is a later, shorter path — `user.po
 comes back `null` (5, high); NaN is tracked as a shared reference, which deletes a NaN-keyed Map
 entry when another NaN exists (6); an invalid Date becomes `null` (7); `-0` in float typed
 arrays becomes `0` (8); a Node `Buffer` serialises but cannot be deserialised (9); an anonymous
-class or a description-less symbol is registered and ignored (10); depth 2000 overflows where
-`JSON.stringify` handles 3000 (11); deserialized Errors gain own enumerable `name` and
+class or a description-less symbol is registered and ignored (10); the walker overflows at a
+third to a half of the depth `JSON.stringify` handles (11); deserialized Errors gain own enumerable `name` and
 allowed-prop properties (12).
 
 ## Notes
