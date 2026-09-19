@@ -5,7 +5,7 @@ tools (~30M weekly downloads). It promises a CSS Syntax Level 3 tokenizer, a det
 source positions, a `generate` that writes an equivalent style sheet back, a walker over that AST
 and a lexer that matches property values against the mdn-data value grammars. The patch checks
 those promises against a second spec tokenizer, against each other and against the grammars over a
-structured CSS generator, and pins 15 bugs.
+structured CSS generator, and pins 16 bugs.
 
 ## How it is built
 
@@ -48,10 +48,11 @@ grammars (definition-syntax AST), and a third builds random definition-syntax AS
 
 ## Bugs
 
-See `bugs.toml` (css-tree/1–15): tokenizer deviations from CSS Syntax 3 (bad-string swallows the
+See `bugs.toml` (css-tree/1–16): tokenizer deviations from CSS Syntax 3 (bad-string swallows the
 newline, backslash at EOF, NUL not replaced, bad-url remnants skip the code point after an escape,
 an escaped `url(` name is not a url token),
-`url.decode` of whitespace-only and escaped-trailing-space urls, `generate` not idempotent on a
+`url.decode` of whitespace-only and escaped-trailing-space urls, `string.encode`/`url.encode` inserting a
+space after a NUL that follows a hex escape, `generate` not idempotent on a
 backslash-newline and writing `-- >` as a CDC token, the walker's `visit: 'Declaration'` missing
 @supports conditions, `property()` descriptors not shared across spellings, the descendant combinator
 without `loc`, `onParseError` fired for valid nested conditions, and two CSS Nesting gaps (relaxed
@@ -85,4 +86,5 @@ Source map output (`generate(ast, {sourceMap: true})`), the `TokenStream` class,
 
 ## History
 
-- 2026-09-19: created at f898015 (3.2.1, 2026-09-16) with 9 properties and 15 bugs.
+- 2026-09-19: created at f898015 (3.2.1, 2026-09-16) with 9 properties and 15 bugs; the first CI run found
+  css-tree/16 (100 cases hit a control character followed by NUL), gated and pinned the same day.
