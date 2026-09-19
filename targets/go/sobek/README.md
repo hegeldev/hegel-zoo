@@ -10,7 +10,7 @@ The patch is goja's harness with the module and package renamed: `hegel.dev/go/h
 and six test files at the module root (package `sobek_test`): `hegel_test.go` (plumbing, the `Known`
 gates), `hegel_gen_test.go` (the program generator, the early-error list), `hegel_probes_test.go`
 (fixed probe programs), `hegel_oracle_test.go` (the reference engine as a child process, the shared
-value serialiser), `hegel_props_test.go` (the properties) and `hegel_pins_test.go` (thirty-eight
+value serialiser), `hegel_props_test.go` (the properties) and `hegel_pins_test.go` (forty
 pins). **Needs `node` (the reference JavaScript engine; Node 22 was used) on PATH**: one process per
 `go test`, fed a small driver that compiles each program as a function body in a fresh `vm` context
 with a five-second timeout and prints its result, or the kind of error, in a canonical form; the
@@ -36,7 +36,7 @@ Date Time String Format, transcendental `Math` and `**` with fractional operands
 of a fraction, the time-zone name, error messages and `stack`, the escaping of `/` in
 `RegExp.prototype.source`, the JSON.parse surrogate caveat).
 
-Thirty-seven bugs are recorded in `bugs.toml`, every one of them shared with goja at 793a2a6
+Thirty-nine bugs are recorded in `bugs.toml`, every one of them shared with goja at 793a2a6
 (the twenty-eight pins ported from `go/goja` all fail at this commit; the two engines are two days
 apart and the fork merges upstream regularly): eight crashes of the Go process (`Array.from({length:
 2}, String)` dereferencing a nil pointer, 35; `replaceAll` with an
@@ -49,12 +49,14 @@ iterator stack when the `try` catches, 33;
 swallowing the source, 18), right-associative relational operators (21), `delete (v++)` not
 evaluating its operand (26), `delete new Set()` throwing (13), property escapes never matching with
 the `u` flag (15), dropped empty global matches (16), `-5 * 0` being +0 (14), and the rest as in
-goja's `bugs.toml`; and seven more found the same day in the fork's rounds and goja's alike: `\b`/`\B`
+goja's `bugs.toml`; and nine more found the same day in the fork's rounds and goja's alike: `\b`/`\B`
 without the `u` flag counting é or Σ as word characters (29), `let` at the end of a line before
 `return` being a SyntaxError instead of the identifier `let` (30), `setUTCMilliseconds` on a Date
 before the epoch (31), JSON indentation after an empty `[]`/`{}` (32), an invalid regexp literal
 being a SyntaxError only when evaluated (34), `String.fromCodePoint(-0)` throwing (36),
-`BigInt.prototype` carrying a function's `name` and `length` (37). Rounds of 1500, 3000, 3000,
+`BigInt.prototype` carrying a function's `name` and `length` (37), a `finally` block reading a
+variable only the never-run `catch` block assigns (38), a surrogate class inside a lookaround
+never matching (39). Rounds of 1500, 3000, 3000,
 20000 and six of 10000 generated cases plus thirty-five
 probes of the fork's own code (`Object.freeze`/`seal` on accessors, arrays, typed arrays and
 proxies, `hasOwnProperty` on indices, symbols and proxies, `arguments` in constructors,
