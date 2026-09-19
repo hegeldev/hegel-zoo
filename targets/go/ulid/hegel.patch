@@ -1,0 +1,827 @@
+diff --git a/go.mod b/go.mod
+index 80bb31e..39fc4d1 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,13 @@
+ module github.com/oklog/ulid/v2
+ 
+-go 1.15
++go 1.26.0
+ 
+-require github.com/pborman/getopt v0.0.0-20170112200414-7148bc3a4c30
++require (
++	github.com/pborman/getopt v0.0.0-20170112200414-7148bc3a4c30
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..8fb317d
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,801 @@
++// Hegel property tests for github.com/oklog/ulid/v2: the text encoding against a big.Int
++// Crockford base32 model, strict and lenient parsing against the documented error contract,
++// the lexicographic/chronological ordering, the millisecond time arithmetic, the binary, SQL
++// and JSON encodings, and the monotonic entropy sources against their documentation.
++package ulid_test
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"math/big"
++	"math/rand"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/oklog/ulid/v2"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func count(ht *hegel.T, what string) { ht.Note(what) }
++
++// Known bugs, gated so the properties pass while the pins fail (see bugs.toml).
++var known = struct {
++	readerIncrementNeverOne bool // ulid/1: the io.Reader path of MonotonicEntropy increments by 2..inc, never 1
++	wrapAfterOverflow       bool // ulid/2: after ErrMonotonicOverflow the entropy has wrapped, so the next read in the same ms is lower
++	biasedIncrements        bool // ulid/3: the io.Reader path masks the little-endian low byte, so increments are biased and entropy-hungry
++}{true, true, true}
++
++// plainReader hides a *rand.Rand's Int63n so that MonotonicEntropy takes its io.Reader path.
++type plainReader struct{ r io.Reader }
++
++func (p plainReader) Read(b []byte) (int, error) { return p.r.Read(b) }
++
++// ---- the model -----------------------------------------------------------------------------
++
++const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
++
++// encode is Crockford base32 of the 128-bit big-endian number, 26 characters.
++func encode(id [16]byte) string {
++	x := new(big.Int).SetBytes(id[:])
++	out := make([]byte, 26)
++	thirtyTwo := big.NewInt(32)
++	m := new(big.Int)
++	for i := 25; i >= 0; i-- {
++		x.DivMod(x, thirtyTwo, m)
++		out[i] = alphabet[m.Int64()]
++	}
++	return string(out)
++}
++
++// decode is the inverse for a string of 26 alphabet characters (either case) whose value fits
++// in 128 bits; ok is false otherwise.
++func decode(s string) (id [16]byte, ok bool) {
++	if len(s) != 26 {
++		return id, false
++	}
++	x := new(big.Int)
++	for i := 0; i < 26; i++ {
++		c := s[i]
++		if c >= 'a' && c <= 'z' {
++			c -= 'a' - 'A'
++		}
++		k := strings.IndexByte(alphabet, c)
++		if k < 0 {
++			return id, false
++		}
++		x.Mul(x, big.NewInt(32))
++		x.Add(x, big.NewInt(int64(k)))
++	}
++	if x.BitLen() > 128 {
++		return id, false
++	}
++	x.FillBytes(id[:])
++	return id, true
++}
++
++func randomID(tc hegel.TestCase) ulid.ULID {
++	var id ulid.ULID
++	switch n(tc, 0, 5) {
++	case 0:
++		return ulid.Zero
++	case 1:
++		for i := range id {
++			id[i] = 0xFF
++		}
++		if chance(tc, 50) {
++			id[0] = 0x7F
++		}
++		return id
++	default:
++		for i := range id {
++			id[i] = byte(n(tc, 0, 255))
++		}
++		if chance(tc, 30) {
++			for i := 0; i < 6; i++ {
++				id[i] = byte(pick(tc, []int{0, 0, 1, 255, n(tc, 0, 255)}))
++			}
++		}
++	}
++	return id
++}
++
++func msOf(tc hegel.TestCase) uint64 {
++	return uint64(pick(tc, []int64{0, 1, int64(n(tc, 0, 1000000)), time.Now().UnixMilli(), int64(ulid.MaxTime()), int64(ulid.MaxTime()) - int64(n(tc, 0, 1000)), int64(n(tc, 0, 1<<30)) * int64(n(tc, 1, 1<<17))}))
++}
++
++// ---- 1. text and binary encodings -----------------------------------------------------------
++
++func TestHegelTextEncodingIsCrockfordBase32(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		id := randomID(tc)
++		want := encode(id)
++		if s := id.String(); s != want {
++			ht.Fatalf("%x.String() = %q, the model gives %q", id[:], s, want)
++		}
++		text, err := id.MarshalText()
++		if err != nil || string(text) != want {
++			ht.Fatalf("MarshalText of %x = %q, %v", id[:], text, err)
++		}
++		buf := make([]byte, n(tc, 0, 30))
++		if err := id.MarshalTextTo(buf); (len(buf) == 26) != (err == nil) || (err != nil && !errors.Is(err, ulid.ErrBufferSize)) {
++			ht.Fatalf("MarshalTextTo a %d-byte buffer: %v", len(buf), err)
++		} else if err == nil && string(buf) != want {
++			ht.Fatalf("MarshalTextTo wrote %q, want %q", buf, want)
++		}
++		// the text decodes back, in either case, by every reader
++		in := want
++		if chance(tc, 30) {
++			in = strings.ToLower(in)
++		} else if chance(tc, 20) {
++			b := []byte(in)
++			for i := range b {
++				if chance(tc, 50) && b[i] >= 'A' && b[i] <= 'Z' {
++					b[i] += 'a' - 'A'
++				}
++			}
++			in = string(b)
++		}
++		p1, err1 := ulid.Parse(in)
++		p2, err2 := ulid.ParseStrict(in)
++		var p3, p4 ulid.ULID
++		err3 := p3.UnmarshalText([]byte(in))
++		err4 := p4.Scan(in)
++		var p5 ulid.ULID
++		err5 := p5.Scan([]byte(in))
++		if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil || p1 != id || p2 != id || p3 != id || p4 != id || p5 != id {
++			ht.Fatalf("parsing %q back: %x %v / %x %v / %x %v / %x %v / %x %v, want %x", in, p1[:], err1, p2[:], err2, p3[:], err3, p4[:], err4, p5[:], err5, id[:])
++		}
++		if ulid.MustParse(in) != id || ulid.MustParseStrict(in) != id {
++			ht.Fatalf("MustParse(%q) differs", in)
++		}
++		// binary
++		bin, err := id.MarshalBinary()
++		if err != nil || !bytes.Equal(bin, id[:]) || !bytes.Equal(id.Bytes(), id[:]) {
++			ht.Fatalf("MarshalBinary of %x = %x, %v", id[:], bin, err)
++		}
++		bbuf := make([]byte, n(tc, 0, 20))
++		if err := id.MarshalBinaryTo(bbuf); (len(bbuf) == 16) != (err == nil) || (err != nil && !errors.Is(err, ulid.ErrBufferSize)) {
++			ht.Fatalf("MarshalBinaryTo a %d-byte buffer: %v", len(bbuf), err)
++		}
++		var b1, b2 ulid.ULID
++		if err := b1.UnmarshalBinary(bin); err != nil || b1 != id {
++			ht.Fatalf("UnmarshalBinary(%x) = %x, %v", bin, b1[:], err)
++		}
++		if err := b2.Scan(bin); err != nil || b2 != id {
++			ht.Fatalf("Scan(%x) = %x, %v", bin, b2[:], err)
++		}
++		short := make([]byte, pick(tc, []int{0, 1, 15, 17, 25, 27, 32}))
++		var b3 ulid.ULID
++		if err := b3.UnmarshalBinary(short); !errors.Is(err, ulid.ErrDataSize) {
++			ht.Fatalf("UnmarshalBinary of %d bytes: %v", len(short), err)
++		}
++		if err := b3.Scan(short); !errors.Is(err, ulid.ErrDataSize) {
++			ht.Fatalf("Scan of %d bytes: %v", len(short), err)
++		}
++		// SQL
++		v, err := id.Value()
++		if err != nil || !bytes.Equal(v.([]byte), id[:]) {
++			ht.Fatalf("Value of %x = %v, %v", id[:], v, err)
++		}
++		before := b2
++		if err := b2.Scan(nil); err != nil || b2 != before {
++			ht.Fatalf("Scan(nil) changed the id or failed: %x, %v", b2[:], err)
++		}
++		if err := b2.Scan(n(tc, 0, 100)); !errors.Is(err, ulid.ErrScanValue) {
++			ht.Fatalf("Scan(int) = %v, want ErrScanValue", err)
++		}
++		// JSON goes through the text encoding
++		js, err := json.Marshal(id)
++		if err != nil || string(js) != strconv.Quote(want) {
++			ht.Fatalf("json.Marshal(%x) = %s, %v", id[:], js, err)
++		}
++		var back ulid.ULID
++		if err := json.Unmarshal([]byte(strconv.Quote(in)), &back); err != nil || back != id {
++			ht.Fatalf("json.Unmarshal(%q) = %x, %v", in, back[:], err)
++		}
++		// entropy and time accessors split the bytes
++		if e := id.Entropy(); !bytes.Equal(e, id[6:]) {
++			ht.Fatalf("Entropy of %x = %x", id[:], e)
++		}
++		if id.IsZero() != (id == ulid.Zero) {
++			ht.Fatalf("IsZero of %x = %v", id[:], id.IsZero())
++		}
++		var e2 ulid.ULID
++		e2.SetTime(0)
++		if err := e2.SetEntropy(id[6:]); err != nil || !bytes.Equal(e2[6:], id[6:]) || !bytes.Equal(e2[:6], make([]byte, 6)) {
++			ht.Fatalf("SetEntropy: %x, %v", e2[:], err)
++		}
++		if err := e2.SetEntropy(id[:n(tc, 0, 9)]); !errors.Is(err, ulid.ErrDataSize) {
++			ht.Fatalf("SetEntropy with a short slice: %v", err)
++		}
++		count(ht, "ok")
++	})
++}
++
++// ---- 2. parsing errors ----------------------------------------------------------------------
++
++func TestHegelParsingReportsTheDocumentedErrors(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		var s string
++		switch n(tc, 0, 3) {
++		case 0: // valid, maybe with an overflowing first character
++			id := randomID(tc)
++			s = encode(id)
++			if chance(tc, 30) {
++				s = string("89ABCDEFGHJKMNPQRSTVWXYZ"[n(tc, 0, 23)]) + s[1:]
++			}
++		case 1: // a valid string with some characters replaced
++			s = encode(randomID(tc))
++			pool := "0123456789ABCDEFGHJKMNPQRSTVWXYZabcdefghjkmnpqrstvwxyzILOUilou-_ ./:=~!\x00\x7f\xff"
++			b := []byte(s)
++			for k := n(tc, 1, 3); k > 0; k-- {
++				b[n(tc, 0, 25)] = pool[n(tc, 0, len(pool)-1)]
++			}
++			s = string(b)
++		case 2: // wrong length
++			s = encode(randomID(tc))
++			s = s[:n(tc, 0, 26)]
++			if chance(tc, 50) {
++				s += strings.Repeat("0", n(tc, 0, 3))
++			}
++		default: // arbitrary bytes
++			b := make([]byte, pick(tc, []int{26, 26, 26, n(tc, 0, 30)}))
++			for i := range b {
++				b[i] = byte(n(tc, 0, 255))
++			}
++			s = string(b)
++		}
++		// the model
++		var wantStrict, wantLenient error
++		var wantID [16]byte
++		valid := true
++		if len(s) != 26 {
++			wantStrict, wantLenient = ulid.ErrDataSize, ulid.ErrDataSize
++			valid = false
++		} else {
++			bad := false
++			for i := 0; i < 26; i++ {
++				c := s[i]
++				if c >= 'a' && c <= 'z' {
++					c -= 'a' - 'A'
++				}
++				if strings.IndexByte(alphabet, c) < 0 {
++					bad = true
++				}
++			}
++			switch {
++			case bad:
++				wantStrict = ulid.ErrInvalidCharacters
++				valid = false
++				if s[0] > '7' {
++					wantLenient = ulid.ErrOverflow
++				} else {
++					wantLenient = nil // "Invalid encodings produce undefined ULIDs"
++				}
++			case s[0] > '7':
++				wantStrict, wantLenient = ulid.ErrOverflow, ulid.ErrOverflow
++				valid = false
++			default:
++				wantID, _ = decode(s)
++			}
++		}
++		got, err := ulid.ParseStrict(s)
++		if !errors.Is(err, wantStrict) || (err == nil && wantStrict != nil) {
++			ht.Fatalf("ParseStrict(%q) = %x, %v; the model expects %v", s, got[:], err, wantStrict)
++		}
++		lenient, lerr := ulid.Parse(s)
++		if !errors.Is(lerr, wantLenient) || (lerr == nil && wantLenient != nil) {
++			ht.Fatalf("Parse(%q) = %x, %v; the model expects %v", s, lenient[:], lerr, wantLenient)
++		}
++		var viaText ulid.ULID
++		terr := viaText.UnmarshalText([]byte(s))
++		if !errors.Is(terr, wantLenient) || (terr == nil && wantLenient != nil) || viaText != lenient {
++			ht.Fatalf("UnmarshalText(%q) = %x, %v; Parse gives %x, %v", s, viaText[:], terr, lenient[:], lerr)
++		}
++		if valid {
++			if got != ulid.ULID(wantID) || lenient != got {
++				ht.Fatalf("ParseStrict(%q) = %x, the model decodes %x (lenient %x)", s, got[:], wantID[:], lenient[:])
++			}
++			count(ht, "valid")
++		} else {
++			count(ht, fmt.Sprintf("invalid: %v", wantStrict))
++		}
++		// Must* panic exactly when the plain versions fail
++		func() {
++			defer func() {
++				r := recover()
++				if (r != nil) != (err != nil) {
++					ht.Fatalf("MustParseStrict(%q) panicked=%v while ParseStrict gave %v", s, r != nil, err)
++				}
++			}()
++			ulid.MustParseStrict(s)
++		}()
++		// Scan of the string is UnmarshalText; of a []byte of length 26 too
++		var sc ulid.ULID
++		serr := sc.Scan(s)
++		if !errors.Is(serr, wantLenient) || (serr == nil && wantLenient != nil) || sc != lenient {
++			ht.Fatalf("Scan(%q) = %x, %v; Parse gives %x, %v", s, sc[:], serr, lenient[:], lerr)
++		}
++		var sb ulid.ULID
++		berr := sb.Scan([]byte(s))
++		switch len(s) {
++		case 26:
++			if !errors.Is(berr, wantLenient) || (berr == nil && wantLenient != nil) || sb != lenient {
++				ht.Fatalf("Scan([]byte(%q)) = %x, %v; Parse gives %x, %v", s, sb[:], berr, lenient[:], lerr)
++			}
++		case 16:
++			if berr != nil || !bytes.Equal(sb[:], []byte(s)) {
++				ht.Fatalf("Scan of 16 bytes %x = %x, %v", s, sb[:], berr)
++			}
++		default:
++			if !errors.Is(berr, ulid.ErrDataSize) {
++				ht.Fatalf("Scan of %d bytes = %v, want ErrDataSize", len(s), berr)
++			}
++		}
++	})
++}
++
++// ---- 3. ordering ----------------------------------------------------------------------------
++
++func TestHegelOrderIsLexicographicAndChronological(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		k := n(tc, 1, 12)
++		ids := make([]ulid.ULID, k)
++		for i := range ids {
++			ids[i] = randomID(tc)
++			if i > 0 && chance(tc, 30) { // share a time with a neighbour
++				copy(ids[i][:6], ids[i-1][:6])
++			}
++			if i > 0 && chance(tc, 10) {
++				ids[i] = ids[i-1]
++			}
++		}
++		for _, a := range ids {
++			for _, b := range ids {
++				c := a.Compare(b)
++				if c != bytes.Compare(a[:], b[:]) || c != strings.Compare(a.String(), b.String()) {
++					ht.Fatalf("Compare(%s, %s) = %d, bytes %d, strings %d", a, b, c, bytes.Compare(a[:], b[:]), strings.Compare(a.String(), b.String()))
++				}
++				// time first, then entropy
++				want := 0
++				switch {
++				case a.Time() < b.Time():
++					want = -1
++				case a.Time() > b.Time():
++					want = 1
++				default:
++					want = bytes.Compare(a.Entropy(), b.Entropy())
++				}
++				if c != want {
++					ht.Fatalf("Compare(%s, %s) = %d, (time, entropy) order gives %d", a, b, c, want)
++				}
++				if (c == 0) != (a == b) {
++					ht.Fatalf("Compare(%s, %s) = %d but equality is %v", a, b, c, a == b)
++				}
++			}
++		}
++		sorted := append([]ulid.ULID(nil), ids...)
++		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Compare(sorted[j]) < 0 })
++		strs := make([]string, k)
++		for i, id := range ids {
++			strs[i] = strings.ToLower(id.String())
++		}
++		sort.Strings(strs)
++		for i := range sorted {
++			if strings.ToLower(sorted[i].String()) != strs[i] {
++				ht.Fatalf("sorting ULIDs and sorting their (lower-case) strings differ at %d: %s vs %s", i, sorted[i], strs[i])
++			}
++			if i > 0 && sorted[i].Time() < sorted[i-1].Time() {
++				ht.Fatalf("sorted ULIDs are not chronological at %d", i)
++			}
++		}
++		count(ht, "ok")
++	})
++}
++
++// ---- 4. time --------------------------------------------------------------------------------
++
++type shortReader struct{ n int }
++
++func (r *shortReader) Read(p []byte) (int, error) {
++	if r.n <= 0 {
++		return 0, io.EOF
++	}
++	k := len(p)
++	if k > r.n {
++		k = r.n
++	}
++	for i := 0; i < k; i++ {
++		p[i] = 0xAB
++	}
++	r.n -= k
++	return k, nil
++}
++
++func TestHegelTimestampsRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		if ulid.MaxTime() != 1<<48-1 {
++			ht.Fatalf("MaxTime = %d", ulid.MaxTime())
++		}
++		ms := msOf(tc)
++		// New with nil entropy: the time bytes, zero entropy
++		id, err := ulid.New(ms, nil)
++		if err != nil || id.Time() != ms || !bytes.Equal(id.Entropy(), make([]byte, 10)) {
++			ht.Fatalf("New(%d, nil) = %x, %v (Time %d)", ms, id[:], err, id.Time())
++		}
++		var manual ulid.ULID
++		if err := manual.SetTime(ms); err != nil || manual != id {
++			ht.Fatalf("SetTime(%d) = %x, %v; New gives %x", ms, manual[:], err, id[:])
++		}
++		// big-endian 48 bits
++		for i := 0; i < 6; i++ {
++			if id[i] != byte(ms>>(40-8*uint(i))) {
++				ht.Fatalf("byte %d of New(%d) is %02x", i, ms, id[i])
++			}
++		}
++		// Time and Timestamp are inverse
++		tm := ulid.Time(ms)
++		if ulid.Timestamp(tm) != ms || uint64(tm.UnixMilli()) != ms {
++			ht.Fatalf("Timestamp(Time(%d)) = %d (UnixMilli %d)", ms, ulid.Timestamp(tm), tm.UnixMilli())
++		}
++		if !id.Timestamp().Equal(tm) {
++			ht.Fatalf("id.Timestamp() = %s, Time(%d) = %s", id.Timestamp(), ms, tm)
++		}
++		// a time.Time with sub-millisecond digits truncates
++		extra := time.Duration(n(tc, 0, 999999))
++		tm2 := tm.Add(extra)
++		if ulid.Timestamp(tm2) != ms {
++			ht.Fatalf("Timestamp(%s + %v) = %d, want %d", tm, extra, ulid.Timestamp(tm2), ms)
++		}
++		if ulid.Timestamp(time.UnixMilli(int64(ms)).In(time.FixedZone("x", 3600))) != ms {
++			ht.Fatalf("Timestamp depends on the location")
++		}
++		// beyond the maximum
++		big := ulid.MaxTime() + 1 + uint64(n(tc, 0, 1<<20))
++		if _, err := ulid.New(big, nil); !errors.Is(err, ulid.ErrBigTime) {
++			ht.Fatalf("New(%d) = %v, want ErrBigTime", big, err)
++		}
++		if err := manual.SetTime(big); !errors.Is(err, ulid.ErrBigTime) || manual != id {
++			ht.Fatalf("SetTime(%d) = %v and left %x", big, err, manual[:])
++		}
++		func() {
++			defer func() {
++				if recover() == nil {
++					ht.Fatalf("MustNew(%d, nil) did not panic", big)
++				}
++			}()
++			ulid.MustNew(big, nil)
++		}()
++		// entropy comes from the reader, exactly 10 bytes
++		payload := make([]byte, n(tc, 10, 40))
++		for i := range payload {
++			payload[i] = byte(n(tc, 0, 255))
++		}
++		rd := bytes.NewReader(payload)
++		id2, err := ulid.New(ms, rd)
++		if err != nil || !bytes.Equal(id2.Entropy(), payload[:10]) || id2.Time() != ms || rd.Len() != len(payload)-10 {
++			ht.Fatalf("New(%d, reader) = %x, %v; %d bytes left of %d", ms, id2[:], err, rd.Len(), len(payload))
++		}
++		k := n(tc, 0, 9)
++		if _, err := ulid.New(ms, &shortReader{k}); err == nil {
++			ht.Fatalf("New with a %d-byte entropy source succeeded", k)
++		} else if k > 0 && !errors.Is(err, io.ErrUnexpectedEOF) {
++			ht.Fatalf("New with a %d-byte entropy source: %v", k, err)
++		}
++		// the default and Make produce the current millisecond
++		before := ulid.Now()
++		made := ulid.Make()
++		def := ulid.MustNewDefault(time.Now())
++		after := ulid.Now()
++		if made.Time() < before || made.Time() > after || def.Time() < before || def.Time() > after {
++			ht.Fatalf("Make/MustNewDefault times %d, %d outside [%d, %d]", made.Time(), def.Time(), before, after)
++		}
++		if made.Compare(def) >= 0 {
++			ht.Fatalf("Make() = %s is not below the later MustNewDefault %s", made, def)
++		}
++		count(ht, "ok")
++	})
++}
++
++// ---- 5. monotonic entropy -------------------------------------------------------------------
++
++func entropyValue(e []byte) *big.Int { return new(big.Int).SetBytes(e) }
++
++func TestHegelMonotonicEntropyIncreasesWithinAMillisecond(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		inc := uint64(pick(tc, []int{0, 1, 2, 3, 10, 255, 256, 1000, 1 << 20, 1 << 32, 1<<40 + 7}))
++		effective := inc
++		if effective == 0 {
++			effective = 1<<32 - 1
++		}
++		// the source: a math/rand Rand (fast path) or a plain reader of random bytes
++		useRng := chance(tc, 50)
++		seed := int64(n(tc, 0, 1<<30))
++		var src io.Reader
++		if useRng {
++			src = rand.New(rand.NewSource(seed))
++		} else {
++			src = plainReader{rand.New(rand.NewSource(seed))}
++			if chance(tc, 20) { // start near the top of the 80-bit range to provoke overflow
++				prefix := make([]byte, 10)
++				for i := 0; i < 9; i++ {
++					prefix[i] = 0xFF
++				}
++				prefix[9] = byte(256 - n(tc, 1, 200))
++				src = io.MultiReader(bytes.NewReader(prefix), src)
++			}
++		}
++		var mono ulid.MonotonicReader = ulid.Monotonic(src, inc)
++		if chance(tc, 30) {
++			mono = &ulid.LockedMonotonicReader{MonotonicReader: mono}
++		}
++		ms := msOf(tc)
++		if ms > ulid.MaxTime()-1000 {
++			ms = ulid.MaxTime() - 1000
++		}
++		var prev *big.Int
++		var prevMs uint64
++		steps := n(tc, 1, 40)
++		overflowed := false
++		for i := 0; i < steps; i++ {
++			switch n(tc, 0, 9) {
++			case 0:
++				ms++
++			case 1:
++				ms += uint64(n(tc, 2, 1000))
++			case 2:
++				if ms > 5 {
++					ms -= uint64(n(tc, 1, 5))
++				}
++			}
++			if ms > ulid.MaxTime()-1000 {
++				ms = ulid.MaxTime() - 1000
++			}
++			id, err := ulid.New(ms, mono)
++			if overflowed {
++				if prevMs == ms && !errors.Is(err, ulid.ErrMonotonicOverflow) {
++					ht.Fatalf("after an overflow, another read in ms %d gives %v", ms, err)
++				}
++				if prevMs != ms && err != nil {
++					ht.Fatalf("a new millisecond after an overflow fails: %v", err)
++				}
++				if err != nil {
++					continue
++				}
++				overflowed = false
++				prev, prevMs = entropyValue(id.Entropy()), ms
++				continue
++			}
++			if err != nil {
++				if errors.Is(err, ulid.ErrMonotonicOverflow) && prev != nil && prevMs == ms {
++					limit := new(big.Int).Lsh(big.NewInt(1), 80)
++					room := new(big.Int).Sub(limit, prev)
++					if room.Cmp(new(big.Int).SetUint64(effective)) > 0 {
++						ht.Fatalf("ErrMonotonicOverflow with %s of room and inc %d", room, effective)
++					}
++					count(ht, "overflow")
++					if known.wrapAfterOverflow {
++						count(ht, "known ulid/2 (entropy wraps after an overflow)")
++						return
++					}
++					overflowed = true
++					continue
++				}
++				ht.Fatalf("New(%d, monotonic) failed: %v", ms, err)
++			}
++			if id.Time() != ms {
++				ht.Fatalf("New(%d, monotonic) has time %d", ms, id.Time())
++			}
++			cur := entropyValue(id.Entropy())
++			if prev != nil && prevMs == ms {
++				diff := new(big.Int).Sub(cur, prev)
++				if diff.Sign() <= 0 {
++					ht.Fatalf("entropy did not increase within ms %d: %x then %x", ms, prev, cur)
++				}
++				if diff.Cmp(new(big.Int).SetUint64(effective)) > 0 {
++					ht.Fatalf("entropy increased by %s in ms %d, more than inc %d", diff, ms, effective)
++				}
++				if effective == 1 && diff.Cmp(big.NewInt(1)) != 0 {
++					ht.Fatalf("inc 1 incremented by %s", diff)
++				}
++				count(ht, fmt.Sprintf("increment by 1: %v", diff.Cmp(big.NewInt(1)) == 0))
++			} else {
++				count(ht, "fresh entropy")
++			}
++			prev, prevMs = cur, ms
++		}
++		count(ht, fmt.Sprintf("rng=%v inc=%d", useRng, inc))
++	})
++}
++
++// the documented increment range is 1..inc inclusive; the io.Reader path never produces 1
++func TestHegelMonotonicIncrementsCoverTheDocumentedRange(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		inc := uint64(pick(tc, []int{2, 3, 4, 1000, 1 << 20}))
++		useRng := chance(tc, 50)
++		seed := int64(n(tc, 0, 1<<30))
++		var src io.Reader
++		if useRng {
++			src = rand.New(rand.NewSource(seed))
++		} else {
++			src = plainReader{rand.New(rand.NewSource(seed))}
++		}
++		mono := ulid.Monotonic(src, inc)
++		ms := uint64(n(tc, 1, 1<<40))
++		seen := map[uint64]int{}
++		lowBytes := map[byte]bool{}
++		var prev *big.Int
++		for i := 0; i < 200; i++ {
++			id, err := ulid.New(ms, mono)
++			if err != nil {
++				ht.Fatalf("read %d: %v", i, err)
++			}
++			cur := entropyValue(id.Entropy())
++			if prev != nil {
++				d := new(big.Int).Sub(cur, prev).Uint64()
++				seen[d]++
++				lowBytes[byte(d-1)] = true
++			}
++			prev = cur
++		}
++		if inc >= 1000 {
++			// 199 increments drawn from 1..inc: the low byte of (increment - 1) should take many
++			// values (the chance that at most 16 of 256 appear is negligible)
++			if len(lowBytes) <= 16 {
++				if !useRng && known.biasedIncrements {
++					count(ht, "known ulid/3 (biased increments)")
++					return
++				}
++				ht.Fatalf("with inc %d the increments' low bytes took only %d values in 199 reads (rng %v): %v", inc, len(lowBytes), useRng, seen)
++			}
++			count(ht, fmt.Sprintf("rng=%v inc=%d distinct low bytes=%d", useRng, inc, len(lowBytes)))
++			return
++		}
++		if !useRng && known.readerIncrementNeverOne {
++			if seen[1] != 0 {
++				ht.Fatalf("the reader path produced an increment of 1 (%v): ulid/1 fixed?", seen)
++			}
++			count(ht, "known ulid/1 (reader path never increments by 1)")
++			return
++		}
++		// 199 draws from 1..inc (inc <= 4): every value appears (probability of a miss < 1e-24)
++		for d := uint64(1); d <= inc; d++ {
++			if seen[d] == 0 {
++				ht.Fatalf("increment %d never appeared in 199 reads with inc %d (rng %v): %v", d, inc, useRng, seen)
++			}
++		}
++		count(ht, fmt.Sprintf("rng=%v inc=%d", useRng, inc))
++	})
++}
++
++// ---- pins: one plain test per recorded bug --------------------------------------------------
++
++func fixedBytes(seed int64, size int) []byte {
++	b := make([]byte, size)
++	rand.New(rand.NewSource(seed)).Read(b)
++	return b
++}
++
++// ulid/1: with an io.Reader entropy source the monotonic increment is drawn from 2..inc, never 1,
++// although Monotonic documents "a random number between 1 and inc inclusive" (and the *rand.Rand
++// path does produce 1).
++func TestHegelPinReaderIncrementsCanBeOne(t *testing.T) {
++	mono := ulid.Monotonic(bytes.NewReader(fixedBytes(1, 1<<16)), 2)
++	var prev *big.Int
++	for i := 0; i < 300; i++ {
++		id, err := ulid.New(1000, mono)
++		if err != nil {
++			t.Fatalf("read %d: %v", i, err)
++		}
++		cur := new(big.Int).SetBytes(id.Entropy())
++		if prev != nil && new(big.Int).Sub(cur, prev).Cmp(big.NewInt(1)) == 0 {
++			return
++		}
++		prev = cur
++	}
++	t.Fatalf("299 monotonic increments with inc = 2 from an io.Reader were all 2; the documented range is 1..2")
++}
++
++// ulid/2: MonotonicRead adds the increment before checking for overflow, so after
++// ErrMonotonicOverflow the entropy has wrapped around and the next read in the same millisecond
++// returns a ULID below the last one that succeeded.
++func TestHegelPinReadsAfterOverflowStayMonotonic(t *testing.T) {
++	prefix := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0}
++	mono := ulid.Monotonic(io.MultiReader(bytes.NewReader(prefix), bytes.NewReader(fixedBytes(2, 1<<16))), 100)
++	first, err := ulid.New(1000, mono)
++	if err != nil {
++		t.Fatalf("first read: %v", err)
++	}
++	var last ulid.ULID = first
++	overflowed := false
++	for i := 0; i < 50; i++ {
++		id, err := ulid.New(1000, mono)
++		if errors.Is(err, ulid.ErrMonotonicOverflow) {
++			overflowed = true
++			continue
++		}
++		if err != nil {
++			t.Fatalf("read %d: %v", i, err)
++		}
++		if id.Compare(last) <= 0 {
++			t.Fatalf("read %d in the same millisecond gave %s after %s (overflow seen: %v)", i, id, last, overflowed)
++		}
++		last = id
++	}
++	if !overflowed {
++		t.Fatalf("no overflow was provoked")
++	}
++}
++
++// ulid/3: random() clears the high bits of m.rand[0] but decodes m.rand little-endian, so the mask
++// lands on the least significant byte: with inc = 1000 the increment - 1 always has a low byte
++// below 4 (16 distinct increments in all) and larger inc values reject most candidates.
++func TestHegelPinReaderIncrementsAreNotBiased(t *testing.T) {
++	mono := ulid.Monotonic(bytes.NewReader(fixedBytes(3, 1<<16)), 1000)
++	var prev *big.Int
++	lowBytes := map[byte]bool{}
++	for i := 0; i < 300; i++ {
++		id, err := ulid.New(1000, mono)
++		if err != nil {
++			t.Fatalf("read %d: %v", i, err)
++		}
++		cur := new(big.Int).SetBytes(id.Entropy())
++		if prev != nil {
++			d := new(big.Int).Sub(cur, prev).Uint64()
++			lowBytes[byte(d-1)] = true
++		}
++		prev = cur
++	}
++	if len(lowBytes) <= 16 {
++		t.Fatalf("299 increments with inc = 1000 had only %d distinct low bytes of (increment - 1): %v", len(lowBytes), lowBytes)
++	}
++}
