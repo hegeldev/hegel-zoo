@@ -41,8 +41,17 @@ idempotence); the BOM policies of UTF-16/32 as documented; the HTML and IANA nam
   equivalences of `IgnoreCase`/`IgnoreDiacritics`/`IgnoreWidth`/`Numeric`; `search` hits being rune-aligned
   spans `Equal` to the pattern; `Matcher.Match` returning a supported tag with the desired `-u` extension
   and `MatchStrings` agreeing; `currency` codes, roundings, `FromRegion`/`FromTag`.
+- `hegel_cases_test.go` - `cases.Upper`/`Lower`/`Fold`/`Title` against Python's `upper`/`lower`/`casefold`/`title`
+  (title only on words of cased letters), idempotence, `Span` prefixes, streaming; the Turkish/Azeri i rules,
+  Dutch `ij`, unsupported languages equal `und`; `width` kinds against `east_asian_width`, `Folded`/`Narrow`/
+  `Wide` against each other and NFKC, the three transformers rune by rune and streamed; `bidi` classes against
+  `bidirectional`, brackets mirrored, `ReverseString` an involution keeping marks on their base, `Paragraph`
+  runs partitioning the first paragraph with strong characters in runs of their direction, `RunAt`;
+  `bidirule.Valid`/`Direction`/`Transformer` against RFC 5893 written out on the classes; the four PRECIS
+  profiles against RFC 8265/8266 written out (mapping steps, class, Bidi Rule on RTL strings, no empty
+  result), `String`/`Bytes`/`Append`, `Compare` as key equality.
 
-## Known bugs (24, see bugs.toml)
+## Known bugs (35, see bugs.toml)
 
 Normalization: the forms insert a CGJ into runs of more than 30 non-starters, undocumented (1), and `Iter`
 places it differently from `String` (2). Encodings: the HZ-GB2312 encoder stays in GB mode after an
@@ -55,9 +64,17 @@ say `Low` for `No` (23). Collation: `-u-ka-shifted` compares everything equal (8
 (9); `Force` is not in the key (10); `fr-u-kb` is ignored, and has no `TypeForKey` (11); `IgnoreDiacritics`
 alone leaves the marks' tertiary weights, so `o != ö` (24). Search: `WholeWord` and `Exact` are nil and
 panic (12); `Backwards` panics (13); `Equal` is not reflexive on empty or mark-only strings (14); Danish
-`Aarhus` is not matched (15). Currency: `FromTag` ignores `-u-rg-` (20). Bugs 6-23 came from a source review
-with probe programs (`work/x-text-audit-c.md` in the zoo's notes); the language, collation, search, matcher
-and currency properties reach 6, 8-11, 14, 16-20 and 24, the rest are carried by pins.
+`Aarhus` is not matched (15). Currency: `FromTag` ignores `-u-rg-` (20). Casing: `Fold` maps the Cherokee capitals to the small letters, so
+folding is not idempotent (32); `Lower`/`Title` lose the final-sigma context at a `Transform` call boundary
+(33). Bidi: `ReverseString` puts a mark before its base (25); `RunAt` returns the last run (28); `Direction` is
+the first run's, never `Mixed`/`Neutral` (29); `Paragraph.Direction` panics before `Order`, and on an empty
+paragraph (30); `Order` runs past the paragraph separator (31); the `bidirule.Transformer` fails a valid label
+at a chunk ending in ES/CS/ET/ON/BN (34); `bidirule.Valid` accepts surrogates and code points past U+10FFFF
+(35). PRECIS: the username profiles accept the empty string (26) and apply the Bidi Rule to non-ASCII strings
+without RTL characters while ASCII ones skip it (27). Bugs 6-23 came from a source review with probe programs
+(`work/x-text-audit-c.md` in the zoo's notes); the language, collation, search, matcher and currency
+properties reach 6, 8-11, 14, 16-20 and 24, the casing, width, bidi and PRECIS properties 25-29 and 31-35, the
+rest are carried by pins.
 
 ## Conventions followed, not recorded
 
@@ -71,6 +88,14 @@ legacy codecs differ from the WHATWG tables on undefined bytes; the `MIB` index 
 variants come out in the registry's canonical order (`valencia-1994`), not sorted; `posix` is a `-u-va-`
 type, not a variant; `MatchStrings` returns the plain default tag when nothing matched (confidence `No`);
 `Force` and `-u-ks-identic` undo the `Ignore*` equivalences as documented; `currency.Query` can yield a unit
-under another table index than `ParseISO`, so units are compared by code. A probe
+under another table index than `ParseISO`, so units are compared by code. Go 1.27's tables are Unicode 17: a
+case mapping to a rune Unicode 15 lacks (U+0264 -> U+A7CB) and the Tai Xuan Jing symbols' width are counted,
+not compared; `Title` is compared with Python only on words of cased letters (Python's `str.title` restarts a
+word at every uncased character); the Greek, Lithuanian and Afrikaans casers are not modelled; the casers are
+stateful and are `Reset` before `Span` (as `String` does); the won sign U+20A9 is halfwidth by fiat with no
+`Folded`; `width.Fold` is the width decomposition alone (a halfwidth Hangul letter folds to the compatibility
+jamo, which NFKC decomposes further); ill-formed UTF-8 never conforms to the Bidi Rule; a paragraph that is
+just its separator has no runs; PRECIS strings with CONTEXTJ/CONTEXTO runes (RFC 5892 appendix A) are
+skipped, since `Allowed()` excludes them while the enforcement accepts them in context. A probe
 saw `Collator.SortStrings` retain about 240 bytes per call (`sorter.buf` is never reset), but the same loop
 under `go test` retains nothing measurable, so it is not recorded.
