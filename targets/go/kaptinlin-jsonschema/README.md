@@ -11,7 +11,7 @@ The patch adds the `hegel.dev/go/hegel` requirement to `go.mod` and eight test f
 schemas valid by construction for their draft, guided and random instances, a schema mutator),
 `hegel_oracle_test.go` (the Python oracle process), `hegel_props_test.go`, `hegel_refs_test.go`,
 `hegel_more_test.go`, `hegel_defaults_test.go` (the ten properties) and `hegel_pins_test.go`
-(seven pins). The generator, the oracle and the format and number models are those of the
+(eight pins). The generator, the oracle and the format and number models are those of the
 `go/jsonschema` target (santhosh-tekuri), adapted to this API. **Needs `python3` with the
 `jsonschema` package (4.26, with `referencing` and `jsonschema_specifications`) on PATH**: it
 is the validation oracle, and the 2019-09 and 2020-12 meta-schemas that `ValidateSchema` loads
@@ -35,12 +35,13 @@ tests run in the same `go test`.
 
 ## Bugs
 
-Seven, see `bugs.toml`: a plain-name fragment `$id` (`"#A"`, drafts 4-7) breaks the references
+Eight, see `bugs.toml`: a plain-name fragment `$id` (`"#A"`, drafts 4-7) breaks the references
 inside its subschema (1); output paths name the normalised keywords for legacy tuple `items`,
 `additionalItems` and `dependencies` (2); `schemaLocation` reads `...schema##/...` when the
 resource id ends in `#` (3); `ipv4`, `time` and `date-time` accept a signed field (4); `duration`
 rejects `P1Y1D` and `PT1H1S` (5); `maxLength`/`minLength`/`maxContains`/`minContains` at or
-beyond 2^63 are misread (6); output locations do not escape `~` and `/` in property names (7).
+beyond 2^63 are misread (6); output locations do not escape `~` and `/` in property names (7);
+a missing required property produces a `properties/<name>` unit located at the absent member (8).
 
 ## Notes
 
@@ -49,8 +50,10 @@ beyond 2^63 are misread (6); output locations do not escape `~` and `/` in prope
   relative to the enclosing unit; per-member applicators append the instance key or index
   (`/properties/p`, `/patternProperties/<name>`, `/additionalProperties/<name>`,
   `/propertyNames/<name>`, `/items/<i>` also for a single `items` schema, `/prefixItems/<i>`,
-  `/dependentSchemas/<name>`); the subschema reached through `$ref`, `then` or `else` is an
-  intermediate unit with empty paths. The well-formedness property models that convention.
+  `/dependentSchemas/<name>`, whose details are nevertheless evaluated against the whole object,
+  and `/propertyNames/<name>`, evaluated against the name); the subschema reached through `$ref`,
+  `then` or `else` is an intermediate unit with empty paths. The well-formedness property models
+  that convention.
 - Accepted differences with Python noted from the santhosh-tekuri target still hold here:
   Python crashes on some legacy-anchor schemas (no verdict), and only notices an unresolvable
   `$ref` when validation reaches it.
