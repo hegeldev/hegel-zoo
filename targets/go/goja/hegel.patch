@@ -1,0 +1,2734 @@
+diff --git a/go.mod b/go.mod
+index 2ee5824..3dd9113 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,6 +1,6 @@
+ module github.com/dop251/goja
+ 
+-go 1.25.0
++go 1.26.0
+ 
+ require (
+ 	github.com/Masterminds/semver/v3 v3.5.0
+@@ -10,4 +10,10 @@ require (
+ 	github.com/goccy/go-yaml v1.19.2
+ 	github.com/google/pprof v0.0.0-20230207041349-798e818bf904
+ 	golang.org/x/text v0.3.8
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
+ )
+diff --git a/hegel_gen_test.go b/hegel_gen_test.go
+new file mode 100644
+index 0000000..a366df3
+--- /dev/null
++++ b/hegel_gen_test.go
+@@ -0,0 +1,1844 @@
++package goja_test
++
++// A generator of JavaScript programs: the body of a function, built from
++// typed expressions (numbers, strings, booleans, arrays, objects, anything)
++// and statements over a scope of variables, ending in a return of the
++// visible values. Everything it produces is deterministic, bounded (every
++// loop has a fixed or guarded count, recursion is not generated, strings and
++// arrays stay small) and stays away from behaviour the specification leaves
++// to the implementation (Math's transcendental functions and ** beyond small
++// integers, toString of a fraction with a radix, locale-sensitive methods,
++// Function.prototype.toString, error messages, promise job timing, Date
++// parsing of non-ISO strings, local time).
++
++import (
++	"fmt"
++	"regexp"
++	"strings"
++
++	"hegel.dev/go/hegel"
++)
++
++type kind int
++
++const (
++	kAny kind = iota
++	kNum
++	kStr
++	kBool
++	kArr
++	kObj
++	kFunc
++)
++
++// Precedences (higher binds tighter).
++const (
++	commaPrec  = 1
++	assignPrec = 2
++	condPrec   = 3
++	nullPrec   = 4
++	orPrec     = 5
++	andPrec    = 6
++	bitOrPrec  = 7
++	bitXorPrec = 8
++	bitAndPrec = 9
++	eqPrec     = 10
++	relPrec    = 11
++	shiftPrec  = 12
++	addPrec    = 13
++	mulPrec    = 14
++	expPrec    = 15
++	unaryPrec  = 16
++	postPrec   = 17
++	callPrec   = 18
++	atomPrec   = 19
++)
++
++type ex struct {
++	s    string
++	prec int
++}
++
++func atom(s string) ex { return ex{s, atomPrec} }
++
++type variable struct {
++	name  string
++	k     kind
++	elem  kind // for arrays: the element kind (kAny if mixed)
++	seq   bool // an array without holes whose length is known to both engines
++	konst bool // declared with const: not assignable
++}
++
++type gen struct {
++	ht      *hegel.T
++	vars    []variable
++	depth   int
++	budget  int
++	counter int
++	loops   int // enclosing loops (break/continue allowed)
++	funcs   int // enclosing generated functions (return allowed)
++	labels  []string
++
++	lastReEmpty bool // the last regexLit can match the empty string
++}
++
++func newGen(ht *hegel.T) *gen { return &gen{ht: ht, budget: 60} }
++
++func (g *gen) tick() bool {
++	g.budget--
++	return g.budget > 0
++}
++
++func (g *gen) fresh(prefix string) string {
++	g.counter++
++	return fmt.Sprintf("%s%d", prefix, g.counter)
++}
++
++func (g *gen) visible(k kind) []variable {
++	var out []variable
++	for _, v := range g.vars {
++		if k == kAny || v.k == k {
++			out = append(out, v)
++		}
++	}
++	return out
++}
++
++func (g *gen) paren(x ex) ex {
++	if x.prec >= atomPrec {
++		return x
++	}
++	return atom("(" + x.s + ")")
++}
++
++// operand parenthesises x when it binds looser than an operator of prec on
++// the side it is on.
++func (g *gen) operand(x ex, prec int, strict bool) string {
++	if x.prec < prec || (strict && x.prec == prec) {
++		return "(" + x.s + ")"
++	}
++	return x.s
++}
++
++func (g *gen) binary(op string, l, r ex, prec int, rightAssoc bool) ex {
++	ls := g.operand(l, prec, rightAssoc)
++	rs := g.operand(r, prec, !rightAssoc)
++	if op == "**" && l.prec == unaryPrec {
++		ls = "(" + l.s + ")" // a unary operand of ** must be parenthesised
++	}
++	if Known.relationalChain && prec == relPrec && l.prec == relPrec {
++		ls = "(" + l.s + ")" // goja/21: no relational chains
++	}
++	return ex{ls + " " + op + " " + rs, prec}
++}
++
++func (g *gen) unary(op string, x ex) ex {
++	s := g.operand(x, unaryPrec, false)
++	if strings.HasPrefix(s, op[len(op)-1:]) && (op == "-" || op == "+") {
++		s = " " + s // - -x, not --x
++	}
++	return ex{op + s, unaryPrec}
++}
++
++func (g *gen) call(fn string, args ...string) ex {
++	return ex{fn + "(" + strings.Join(args, ", ") + ")", callPrec}
++}
++
++func (g *gen) member(x ex, name string) ex {
++	s := g.operand(x, callPrec, false)
++	if x.prec == atomPrec && isNumLit(x.s) {
++		s = "(" + x.s + ")" // 1.toFixed is a syntax error
++	}
++	return ex{s + "." + name, callPrec}
++}
++
++func isNumLit(s string) bool {
++	if s == "" {
++		return false
++	}
++	c := s[0]
++	return c >= '0' && c <= '9' || c == '.'
++}
++
++// ---------------------------------------------------------------------------
++// Literals.
++
++func (g *gen) numLit() string {
++	switch n(g.ht, 1, 14) {
++	case 1, 2, 3:
++		return fmt.Sprint(n(g.ht, 0, 12))
++	case 4:
++		return fmt.Sprint(n(g.ht, 0, 1000000))
++	case 5:
++		return pick(g.ht, "0.5", "1.5", "0.1", "0.2", "0.3", "2.25", "1e3", "1e21", "1e-7", "123.456", "5e-324", "1.7976931348623157e308", ".5", "5.", "0.000001", "1e300")
++	case 6:
++		return pick(g.ht, "0x1F", "0xff", "0b101", "0o17", "0X10", "0B11", "0O7", "0xFFFFFFFF", "0x20000000000000")
++	case 7:
++		return pick(g.ht, "NaN", "Infinity", "-Infinity", "-0", "Number.MAX_SAFE_INTEGER", "Number.EPSILON", "Number.MIN_VALUE", "Number.MAX_VALUE", "2147483647", "2147483648", "4294967295", "4294967296", "9007199254740993")
++	case 8:
++		return pick(g.ht, "1_000", "0x1_0", "1_0.5_0", "1e1_0")
++	default:
++		return fmt.Sprint(n(g.ht, -20, 20))
++	}
++}
++
++var strAtoms = []string{"", "a", "b", "abc", "Hello", "hello world", " x ", "1", "12", "-3", "0x10", "1e2", " 42 ", "3.5", "true", "null", "undefined", "NaN", "Infinity", "a,b,c", "A-B", "aaa", "\\n", "\\t", "\\\\", "\\u00e9", "\\u00C9", "caf\\u00e9", "\\u{1F600}", "\\uD83D\\uDE00", "\\u0130", "\\u00df", "\\u03a3\\u03c2", "\\x41", "\\0", "\\u2028", "\\uFEFF", "%", "$1", "$&", "$$", "\\u0000", "\\u00A0", "\\r\\n", "[a]", "(x)", "a.b", "a*b", "\\u0041\\u030A", "\\u00C5", "\\u212B"}
++
++// strAtom is the body of a string literal.
++func (g *gen) strAtom() string {
++	s := pick(g.ht, strAtoms...)
++	if Known.regexLineTerminators && (strings.Contains(s, "\\u2028") || strings.Contains(s, "\\r")) {
++		s = "\\n" // U+2028 and \r are not line terminators for goja's regexps: goja/5
++	}
++	if Known.nbspToNumber && (strings.Contains(s, "\\u00A0") || strings.Contains(s, "\\uFEFF")) {
++		s = " " // goja/24: no non-ASCII white space in strings
++	}
++	return s
++}
++
++func (g *gen) strLit() string {
++	switch n(g.ht, 1, 10) {
++	case 1, 2, 3, 4, 5:
++		return "'" + g.strAtom() + "'"
++	case 6, 7:
++		return "\"" + g.strAtom() + "\""
++	case 8:
++		return "`" + strings.ReplaceAll(g.strAtom(), "$", "$$") + "`"
++	case 9:
++		a, b := g.strAtom(), g.strAtom()
++		if Known.strictOctalEscape && strings.HasSuffix(a, "\\0") && b != "" && b[0] >= '0' && b[0] <= '9' {
++			a = strings.TrimSuffix(a, "\\0") + "\\x00" // \0 followed by a digit is a legacy octal escape: goja/2
++		}
++		return "'" + a + b + "'"
++	default:
++		octal := "'\\101\\102'"
++		if Known.strictOctalEscape {
++			octal = "'\\x41\\x42'" // a legacy octal escape under 'use strict': goja/2
++		}
++		return pick(g.ht, "'it\\'s'", "\"say \\\"hi\\\"\"", "'line1\\\nline2'", octal, "'\\a\\c'", "`back\\`tick`", "'\\u{41}\\u{1f600}'", "'\\v\\f\\b'")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Expressions.
++
++func (g *gen) expr(k kind, d int) ex {
++	if !g.tick() {
++		d = 0
++	}
++	switch k {
++	case kNum:
++		return g.numExpr(d)
++	case kStr:
++		return g.strExpr(d)
++	case kBool:
++		return g.boolExpr(d)
++	case kArr:
++		return g.arrExpr(d)
++	case kObj:
++		return g.objExpr(d)
++	case kFunc:
++		return g.funcExpr(d)
++	}
++	return g.anyExpr(d)
++}
++
++func (g *gen) varOf(k kind) (ex, bool) {
++	vs := g.visible(k)
++	if len(vs) == 0 || !chance(g.ht, 60) {
++		return ex{}, false
++	}
++	return atom(pick(g.ht, vs...).name), true
++}
++
++func (g *gen) anyExpr(d int) ex {
++	switch n(g.ht, 1, 16) {
++	case 1, 2, 3:
++		return g.numExpr(d)
++	case 4, 5, 6:
++		return g.strExpr(d)
++	case 7, 8:
++		return g.boolExpr(d)
++	case 9, 10:
++		return g.arrExpr(d)
++	case 11, 12:
++		return g.objExpr(d)
++	case 13:
++		return atom(pick(g.ht, "undefined", "null", "void 0", "Symbol.iterator", "Symbol('s')", "10n", "-5n", "0n", "/a+/g", "new RegExp('b', 'i')", "new Map()", "new Set([1, 2, 2])", "new Map([[1, 'a'], ['1', 'b']])", "new Set(['x', 'x'])", "new Number(3)", "new String('s')", "new Boolean(false)", "Object(1n)", "new Error('e')", "new RangeError('r')", "[].values()", "new Date(NaN)")) // no valid dates: Date.prototype.toString spells the time zone the engine's way
++	case 14:
++		return g.funcExpr(d)
++	case 15:
++		if d <= 0 {
++			return atom("undefined")
++		}
++		c := g.expr(kBool, d-1)
++		a := g.expr(kAny, d-1)
++		b := g.expr(kAny, d-1)
++		return ex{g.operand(c, condPrec, true) + " ? " + g.operand(a, assignPrec, false) + " : " + g.operand(b, assignPrec, false), condPrec}
++	default:
++		if v, ok := g.varOf(kAny); ok {
++			return v
++		}
++		return atom("undefined")
++	}
++}
++
++func (g *gen) numExpr(d int) ex {
++	if v, ok := g.varOf(kNum); ok && chance(g.ht, 50) {
++		return v
++	}
++	if d <= 0 {
++		return atom(g.numLit())
++	}
++	switch n(g.ht, 1, 22) {
++	case 1, 2:
++		return atom(g.numLit())
++	case 3, 4, 5:
++		op := pick(g.ht, "+", "-", "*", "/", "%", "+", "-", "*")
++		x := g.binary(op, g.expr(kNum, d-1), g.expr(kNum, d-1), map[string]int{"+": addPrec, "-": addPrec, "*": mulPrec, "/": mulPrec, "%": mulPrec}[op], false)
++		if op == "*" && Known.mulNegZero {
++			x = g.binary("+", x, atom("0"), addPrec, false) // the sign of a zero product: goja/14
++		}
++		return x
++	case 6:
++		// ** is implementation-approximated beyond small integers: keep it exact
++		return g.binary("**", atom(pick(g.ht, "2", "3", "-2", "10", "0", "1", "0.5", "4")), atom(pick(g.ht, "2", "3", "0", "1", "10", "-1", "-2")), expPrec, true)
++	case 7:
++		op := pick(g.ht, "|", "&", "^", "<<", ">>", ">>>")
++		return g.binary(op, g.i32(g.expr(kNum, d-1)), g.i32(g.expr(kNum, d-1)), map[string]int{"|": bitOrPrec, "&": bitAndPrec, "^": bitXorPrec, "<<": shiftPrec, ">>": shiftPrec, ">>>": shiftPrec}[op], false)
++	case 8:
++		op := pick(g.ht, "-", "+", "~", "-", "+")
++		x := g.expr(pick(g.ht, kNum, kNum, kStr, kBool, kAny), d-1)
++		if op == "~" {
++			x = g.i32(x)
++		}
++		return g.unary(op, x)
++	case 9:
++		f := pick(g.ht, "Math.floor", "Math.ceil", "Math.round", "Math.trunc", "Math.abs", "Math.sign", "Math.sqrt", "Math.fround", "Math.clz32", "Math.max", "Math.min", "Math.hypot", "Math.cbrt")
++		switch f {
++		case "Math.max", "Math.min", "Math.hypot":
++			k := n(g.ht, 0, 3)
++			args := make([]string, k)
++			for i := range args {
++				args[i] = g.expr(kNum, d-1).s
++			}
++			if f == "Math.hypot" {
++				args = []string{pick(g.ht, "3", "0", "-4", "5", "Infinity", "NaN"), pick(g.ht, "4", "0", "12", "-0")} // exact cases
++			}
++			return g.call(f, args...)
++		case "Math.sqrt":
++			return g.call(f, pick(g.ht, "4", "2", "0", "-1", "-0", "0.25", "1e10", "NaN", "Infinity", "144", g.expr(kNum, d-1).s))
++		case "Math.cbrt":
++			return g.call(f, pick(g.ht, "27", "-8", "0", "-0", "1", "NaN", "Infinity"))
++		}
++		if f == "Math.clz32" {
++			return g.call(f, g.i32(g.expr(kNum, d-1)).s)
++		}
++		return g.call(f, g.expr(kNum, d-1).s)
++	case 10:
++		return g.call("Math.imul", g.i32(g.expr(kNum, d-1)).s, g.i32(g.expr(kNum, d-1)).s)
++	case 11:
++		f := pick(g.ht, "parseInt", "parseFloat", "Number", "Number.parseInt", "Number.parseFloat")
++		var c ex
++		if strings.HasSuffix(f, "parseInt") && chance(g.ht, 50) {
++			c = g.call(f, g.expr(kStr, d-1).s, pick(g.ht, "10", "16", "2", "36", "8", "0", "37", "1", "undefined", "'16'", "3.9"))
++		} else {
++			c = g.call(f, g.expr(pick(g.ht, kStr, kStr, kAny), d-1).s)
++		}
++		if Known.parseIntNegZero && strings.HasSuffix(f, "parseInt") {
++			return g.binary("+", c, atom("0"), addPrec, false) // -0 + 0 is 0 on both sides: goja/3
++		}
++		return c
++	case 12:
++		return g.member(g.expr(pick(g.ht, kStr, kArr), d-1), "length")
++	case 13:
++		s := g.expr(kStr, d-1)
++		m := pick(g.ht, "indexOf", "lastIndexOf", "charCodeAt", "codePointAt", "search", "localeCompare")
++		switch m {
++		case "charCodeAt", "codePointAt":
++			return g.call(g.member(s, m).s, pick(g.ht, "0", "1", "2", "-1", "100", "1.5", "undefined", g.expr(kNum, d-1).s))
++		case "search":
++			return g.call(g.member(s, m).s, g.regexLit())
++		case "localeCompare":
++			return g.call("Math.sign", g.call(g.member(s, m).s, pick(g.ht, "'a'", "'b'", "'B'", "''", "'abc'")).s) // only the sign of an ASCII comparison is portable
++		}
++		return g.call(g.member(s, m).s, g.expr(kStr, d-1).s, pick(g.ht, "", "0", "1", "-1", "100", "NaN", "undefined"))
++	case 14:
++		a := g.expr(kArr, d-1)
++		m := pick(g.ht, "indexOf", "lastIndexOf", "findIndex", "findLastIndex", "push", "unshift")
++		switch m {
++		case "findIndex", "findLastIndex":
++			return g.call(g.member(a, m).s, g.predicate(d-1))
++		case "push", "unshift":
++			return g.call(g.member(g.paren(a), m).s, g.expr(kAny, d-1).s)
++		}
++		return g.call(g.member(a, m).s, g.expr(kAny, d-1).s)
++	case 15:
++		c := g.expr(kBool, d-1)
++		return ex{g.operand(c, condPrec, true) + " ? " + g.operand(g.expr(kNum, d-1), assignPrec, false) + " : " + g.operand(g.expr(kNum, d-1), assignPrec, false), condPrec}
++	case 16:
++		if v := g.visible(kNum); len(v) > 0 {
++			x := pick(g.ht, v...)
++			if !x.konst {
++				e := ex{pick(g.ht, x.name+"++", x.name+"--", "++"+x.name, "--"+x.name, x.name+" += "+g.operand(g.expr(kNum, d-1), assignPrec, false), x.name+" *= 2", x.name+" -= 1", x.name+" |= 1", x.name+" **= 2", x.name+" >>>= 1", x.name+" %= 3"), assignPrec}
++				if Known.toInt32Large && (strings.Contains(e.s, "|=") || strings.Contains(e.s, ">>>=")) {
++					return ex{x.name + " += 1", assignPrec} // goja/7
++				}
++				return e
++			}
++		}
++		return atom(g.numLit())
++	case 17:
++		return g.call(fmt.Sprintf("(function (a, b) { return %s; })", pick(g.ht, "a + b", "a - b", "a * b + 0", "arguments.length", "a", "b", "this === undefined ? 1 : 2", "(a || 0) + (b || 0)")), g.expr(kNum, d-1).s, g.expr(kNum, d-1).s)
++	case 18:
++		return g.call(pick(g.ht, "((a, b) => a + b)", "((a, b = 5) => a * b + 0)", "((...r) => r.length)", "((a, b) => a % b)"), g.expr(kNum, d-1).s, g.expr(kNum, d-1).s)
++	case 19:
++		// dates: UTC only (local time is the machine's)
++		switch n(g.ht, 1, 5) {
++		case 1:
++			return g.call("Date.UTC", pick(g.ht, "2000", "1970", "99", "0", "2024", "-1", "275760", "1e10"), pick(g.ht, "0", "1", "11", "12", "-1", "1.5"), pick(g.ht, "1", "29", "31", "0", "32"))
++		case 2:
++			return g.call(g.member(atom("new Date("+g.expr(kNum, d-1).s+")"), pick(g.ht, "getTime", "getUTCFullYear", "getUTCMonth", "getUTCDate", "getUTCDay", "getUTCHours", "getUTCMinutes", "getUTCSeconds", "getUTCMilliseconds", "valueOf")).s)
++		case 3:
++			// only strings in the specification's format: anything else falls back to the implementation
++			return g.call("Date.parse", pick(g.ht, "'2000-01-01'", "'2000-01-01T00:00:00Z'", "'2000-01-01T00:00:00.123Z'", "'2000-01-01T12:30'", "'2000-01-01T12:30:00+01:00'", "'+010000-01-01T00:00:00Z'", "'-000001-01-01T00:00:00Z'", "'2000-01-01T24:00:00Z'", "''", "'2000'", "'2000-06'", "'2000-01-01T00:00Z'", "'+275760-09-13T00:00:00Z'", "'-271821-04-20T00:00:00Z'", "'2000-01-01T00:00:00-05:30'"))
++		case 4:
++			return g.call(g.member(atom("new Date("+g.expr(kNum, d-1).s+")"), pick(g.ht, "setUTCHours", "setUTCDate", "setUTCMonth", "setUTCFullYear", "setUTCMinutes", "setUTCSeconds", "setUTCMilliseconds", "setTime")).s, g.expr(kNum, d-1).s)
++		default:
++			return g.call("Date.UTC", pick(g.ht, "2000", "1970", "2024"), pick(g.ht, "0", "1", "11"), pick(g.ht, "1", "29"), pick(g.ht, "0", "23", "24", "-1"), pick(g.ht, "0", "59", "60"), pick(g.ht, "0", "59", "60"), pick(g.ht, "0", "999", "1000", "-1"))
++		}
++	case 20:
++		return g.call(pick(g.ht, "Number", "Math.abs", "Math.floor", "Math.trunc"), g.expr(pick(g.ht, kBool, kArr, kObj, kAny, kStr), d-1).s)
++	case 21:
++		x := g.i32(g.expr(kNum, d-1))
++		return ex{g.operand(x, bitOrPrec, false) + " | 0", bitOrPrec}
++	default:
++		return g.call(pick(g.ht, "Object.keys", "Object.values", "Object.entries", "Object.getOwnPropertyNames", "Reflect.ownKeys"), g.expr(pick(g.ht, kObj, kArr, kStr), d-1).s).length()
++	}
++}
++
++func (e ex) length() ex { return ex{e.s + ".length", callPrec} }
++
++// i32 is x as an operand of a bitwise operator: while goja/7 is open, the
++// value is first reduced modulo 2^32 (which does not change ToInt32 of it),
++// since goja gives 0 for a magnitude of 2^63 or more.
++func (g *gen) i32(x ex) ex {
++	if Known.toInt32Large {
++		return ex{g.operand(x, mulPrec, false) + " % 4294967296", mulPrec}
++	}
++	return x
++}
++
++// predicate is a one-argument arrow function returning a boolean.
++func (g *gen) predicate(d int) string {
++	return pick(g.ht, "x => x", "x => !x", "x => typeof x === 'number'", "x => typeof x === 'string'", "x => x > 2", "x => x == 1", "(x, i) => i % 2 === 0", "x => x !== x", "x => x === undefined", "x => x === null", "x => Array.isArray(x)", "x => x && x.length > 1", "(x, i, a) => a.indexOf(x) !== i", "function (x) { return x < 3; }")
++}
++
++func (g *gen) regexLit() string {
++	atoms := []string{"a", "b", "c", ".", "\\d", "\\w", "\\s", "\\D", "\\W", "\\S", "[abc]", "[^a]", "[a-c]", "[0-9]", "\\b", "\\B", "^", "$", "(a|b)", "(?:a|bc)", "(a)(b)?", "a*", "a+", "a?", "a{2}", "a{1,2}", "a*?", "a+?", "(?=a)", "(?!a)", "(?<=a)", "(?<!a)", "(?<x>a)", "\\1", "\\k<x>", "[\\u00e9]", "\\u00e9", "\\u{1F600}", "\\x41", "\\cJ", "\\n", " ", "\\.", "\\*", "[\\s\\S]", "[.]", "(a)+", "((a))", "\\0", "[a-z]+", "\\p{L}", "\\p{Lu}", "[\\d-x]", "a|", "|", "()", "(?:)", "\\/", "[]", "[^]", "\\-", "[\\b]", "\\u0130", "\\uD83D", "\\uDE00", "\\w+", ".*", "[A-Z]", "\\t", "\\v"}
++	if Known.unicodeProperty {
++		atoms = atoms[:len(atoms):len(atoms)]
++		var kept []string
++		for _, a := range atoms {
++			if !strings.HasPrefix(a, "\\p{") {
++				kept = append(kept, a) // goja/15: no property escapes
++			}
++		}
++		atoms = kept
++	}
++	// atoms that can match the empty string: a pattern of these alone can
++	emptyAtoms := map[string]bool{"\\b": true, "\\B": true, "^": true, "$": true, "a*": true, "a?": true, "a*?": true, "(?=a)": true, "(?!a)": true, "(?<=a)": true, "(?<!a)": true, "a|": true, "|": true, "()": true, "(?:)": true, ".*": true}
++	k := n(g.ht, 1, 4)
++	var b strings.Builder
++	mayEmpty := true
++	for i := 0; i < k; i++ {
++		a := pick(g.ht, atoms...)
++		if !emptyAtoms[a] {
++			mayEmpty = false
++		}
++		b.WriteString(a)
++	}
++	g.lastReEmpty = mayEmpty
++	// the d (hasIndices) and v (unicodeSets) flags are features goja does not have
++	flagSets := []string{"", "", "", "g", "i", "gi", "m", "s", "u", "y", "gu", "iu", "gm", "gy", "ig", "us"}
++	src := b.String()
++	flags := pick(g.ht, flagSets...)
++	if strings.Contains(src, "\\p{") || strings.Contains(src, "\\u{") {
++		flags = pick(g.ht, "u", "u", "gu", "iu")
++	}
++	if Known.asciiCaseFold && strings.Contains(flags, "i") && !strings.Contains(flags, "u") {
++		flags += "u" // goja/22: case-insensitive only with Unicode case folding
++	}
++	if Known.unicodeRegexpSyntax && strings.Contains(flags, "u") {
++		// goja/9: only patterns valid with the u flag
++		src = strings.ReplaceAll(src, "\\-", "-")
++		src = strings.ReplaceAll(src, "[\\d-x]", "[\\dx]")
++		if !strings.Contains(src, "(a)") && !strings.Contains(src, "(?<x>a)") {
++			src = strings.ReplaceAll(src, "\\1", "a")
++		}
++		if !strings.Contains(src, "(?<x>a)") {
++			src = strings.ReplaceAll(src, "\\k<x>", "k")
++		}
++	}
++	if Known.duplicateGroupNames && strings.Count(src, "(?<x>a)") > 1 {
++		src = strings.Replace(src, "(?<x>a)", "(?:a)", 1) // goja/10
++	}
++	return "/" + src + "/" + flags
++}
++
++// nonEmptyGlobal is re for match/replace: while goja/16 is open a regexp
++// that can match the empty string loses its g flag.
++func (g *gen) nonEmptyGlobal(re string) string {
++	if !Known.globalEmptyMatch || !g.lastReEmpty {
++		return re
++	}
++	i := strings.LastIndex(re, "/")
++	return re[:i+1] + strings.ReplaceAll(re[i+1:], "g", "")
++}
++
++func (g *gen) strExpr(d int) ex {
++	if v, ok := g.varOf(kStr); ok && chance(g.ht, 50) {
++		return v
++	}
++	if d <= 0 {
++		return atom(g.strLit())
++	}
++	switch n(g.ht, 1, 24) {
++	case 1, 2, 3:
++		return atom(g.strLit())
++	case 4, 5:
++		return g.binary("+", g.expr(pick(g.ht, kStr, kStr, kAny, kNum), d-1), g.expr(pick(g.ht, kStr, kStr, kAny, kNum, kArr), d-1), addPrec, false)
++	case 6:
++		return g.call(pick(g.ht, "String", "String", "JSON.stringify", "Object.prototype.toString.call", "encodeURIComponent", "encodeURI"), g.expr(kAny, d-1).s)
++	case 7:
++		x := g.expr(kNum, d-1)
++		switch n(g.ht, 1, 5) {
++		case 1:
++			return g.call(g.member(g.paren(x), "toString").s, pick(g.ht, "", "10", "16", "2", "36", "8", "1", "37"))
++		case 2:
++			return g.call(g.member(g.paren(x), "toFixed").s, pick(g.ht, "", "0", "1", "2", "5", "20", "100", "101", "-1", "1.9"))
++		case 3:
++			return g.call(g.member(g.paren(x), "toPrecision").s, pick(g.ht, "", "1", "2", "5", "17", "21", "100", "101", "0"))
++		case 4:
++			return g.call(g.member(g.paren(x), "toExponential").s, pick(g.ht, "", "0", "1", "3", "20", "100", "101", "-1"))
++		}
++		return g.call("String", x.s)
++	case 8, 9:
++		s := g.expr(kStr, d-1)
++		m := pick(g.ht, "slice", "substring", "substr", "charAt", "at", "toUpperCase", "toLowerCase", "trim", "trimStart", "trimEnd", "padStart", "padEnd", "repeat", "concat", "normalize")
++		if Known.loneSurrogateCase && (m == "toUpperCase" || m == "toLowerCase" || m == "normalize") {
++			s = g.call(g.member(g.paren(s), "replace").s, "/[\\uD800-\\uDFFF]/g", "''") // no surrogates: goja/6
++		}
++		switch m {
++		case "slice", "substring", "substr":
++			return g.call(g.member(s, m).s, g.idx(d-1), pick(g.ht, "", g.idx(d-1)))
++		case "charAt", "at":
++			return g.call(g.member(s, m).s, pick(g.ht, "", g.idx(d-1)))
++		case "toUpperCase", "toLowerCase", "trim", "trimStart", "trimEnd":
++			return g.call(g.member(s, m).s)
++		case "normalize":
++			return g.call(g.member(s, m).s, pick(g.ht, "", "'NFC'", "'NFD'", "'NFKC'", "'NFKD'"))
++		case "padStart", "padEnd":
++			return g.call(g.member(s, m).s, pick(g.ht, "0", "5", "10", "30", "-1", "NaN", "3.5"), pick(g.ht, "", "'ab'", "''", "'\\u00e9'", "' '", g.expr(kStr, d-1).s))
++		case "repeat":
++			return g.call(g.member(s, m).s, pick(g.ht, "0", "1", "2", "5", "20", "2.9", "-0", "NaN", "'2'"))
++		}
++		return g.call(g.member(s, m).s, g.expr(kAny, d-1).s, g.expr(kStr, d-1).s)
++	case 10:
++		s := g.expr(kStr, d-1)
++		re := g.regexLit()
++		switch n(g.ht, 1, 4) {
++		case 1:
++			return g.call(g.member(s, pick(g.ht, "replace", "replaceAll")).s, g.nonEmptyGlobal(re), pick(g.ht, "'X'", "'$1'", "'$&'", "'$$'", "'$`'", "\"$'\"", "'[$1$2]'", "'$<x>'", "'$0'", "'$10'", "'$01'", "(m) => m.toUpperCase()", "(m, p1) => String(p1)", "(...a) => a.length", "(m, ...r) => JSON.stringify(r.slice(-2))", "''"))
++		case 2:
++			return g.call(g.member(s, "replace").s, g.expr(kStr, d-1).s, pick(g.ht, "'X'", "'$&$&'", "'$$'", "(m) => m + m", "''"))
++		case 3:
++			return g.call(g.member(s, "replaceAll").s, g.expr(kStr, d-1).s, pick(g.ht, "'X'", "'$&'", "''"))
++		}
++		return g.call(g.member(g.call(g.member(s, "split").s, pick(g.ht, re, g.expr(kStr, d-1).s, "''", "','", "undefined"), pick(g.ht, "", "0", "1", "2", "undefined")), "join").s, pick(g.ht, "'|'", "''", "','", ""))
++	case 11:
++		return g.call(g.member(g.expr(kArr, d-1), "join").s, pick(g.ht, "", "'-'", "''", "', '", "undefined", "null", "1"))
++	case 12:
++		return ex{"typeof " + g.operand(g.expr(kAny, d-1), unaryPrec, false), unaryPrec}
++	case 13:
++		k := n(g.ht, 0, 4)
++		args := make([]string, k)
++		for i := range args {
++			args[i] = pick(g.ht, "65", "97", "0x1F600", "0xD83D", "0xDE00", "233", "0", "65.5", "-1", "65601", "0x10FFFF", "0x110000", g.expr(kNum, d-1).s)
++		}
++		return g.call(pick(g.ht, "String.fromCharCode", "String.fromCodePoint"), args...)
++	case 14:
++		return ex{"`" + g.tplPart(d-1) + "${" + g.expr(kAny, d-1).s + "}" + g.tplPart(d-1) + "`", atomPrec}
++	case 15:
++		ms := g.expr(kNum, d-1).s
++		if Known.isoExtendedYear {
++			ms = "Math.abs(" + ms + ") % 2e14" // years 1970..8309 only: goja/4
++		}
++		return g.call(g.member(atom("new Date("+ms+")"), pick(g.ht, "toISOString", "toJSON", "toUTCString")).s)
++	case 16:
++		return g.call("JSON.stringify", g.expr(kAny, d-1).s, pick(g.ht, "null", "undefined", "['a', 'b', 0]", "(k, v) => typeof v === 'number' ? v * 2 : v", "(k, v) => v === undefined ? null : v"), pick(g.ht, "", "2", "'\\t'", "0", "20", "'          x'", "-1"))
++	case 17:
++		x := g.expr(kStr, d-1)
++		return ex{g.operand(x, callPrec, false) + "[" + g.idx(d-1) + "]", callPrec}
++	case 18:
++		s := g.expr(kStr, d-1)
++		m := pick(g.ht, "match", "matchAll")
++		if m == "matchAll" {
++			return g.call("JSON.stringify", g.call("Array.from", g.call(g.member(s, m).s, strings.TrimSuffix(strings.TrimSuffix(g.regexLit(), "i"), "u")+"g").s).s)
++		}
++		return g.call("JSON.stringify", g.call(g.member(s, m).s, g.nonEmptyGlobal(g.regexLit())).s)
++	case 19:
++		return g.call("JSON.stringify", g.call(g.member(atom(g.regexLit()), "exec").s, g.expr(kStr, d-1).s).s)
++	case 20:
++		return g.call(g.member(g.expr(kAny, d-1), "toString").s)
++	case 21:
++		return g.call(pick(g.ht, "decodeURIComponent", "decodeURI"), pick(g.ht, "'%41'", "'%E2%82%AC'", "'a%20b'", "'%'", "'%F0%9F%98%80'", "'%C3%A9'", "'%ZZ'", "'%25'", "'%2F'", "'%C0%80'", "'%ED%A0%80'"))
++	case 22:
++		jsonHuge := "'1e400'"
++		if Known.jsonNumberRange {
++			jsonHuge = "'1e300'" // goja/12
++		}
++		return g.call("JSON.stringify", g.call("JSON.parse", pick(g.ht, "'{\"a\":1,\"b\":[1,2,{\"c\":null}]}'", "'[1e2, -0, 1.5e-3]'", "'\"\\\\u0041\"'", "'\"\\\\ud83d\\\\ude00\"'", "' 1 '", "'{\"__proto__\": 1}'", "'{\"a\":1,\"a\":2}'", "'[1,]'", "'01'", "'\"\\t\"'", "'{\"1\":1,\"b\":2,\"0\":3}'", jsonHuge, "'-1e-400'", "'123456789012345678901234567890'", "'{\"\\\\u0000\":1}'", "'true'", "'nul'")).s)
++	case 23:
++		c := g.expr(kBool, d-1)
++		return ex{g.operand(c, condPrec, true) + " ? " + g.operand(g.expr(kStr, d-1), assignPrec, false) + " : " + g.operand(g.expr(kStr, d-1), assignPrec, false), condPrec}
++	default:
++		return g.call("String", g.expr(kAny, d-1).s)
++	}
++}
++
++func (g *gen) tplPart(d int) string {
++	return pick(g.ht, "", "a", " - ", "x\\ny", "\\u00e9", "$", "\\`", "{", "}", "\\${1}", "  ")
++}
++
++// idx is an index argument: small, negative, fractional, huge or not a number.
++func (g *gen) idx(d int) string {
++	switch n(g.ht, 1, 8) {
++	case 1, 2, 3:
++		return fmt.Sprint(n(g.ht, 0, 6))
++	case 4:
++		return fmt.Sprint(n(g.ht, -6, -1))
++	case 5:
++		return pick(g.ht, "1.5", "-0.5", "NaN", "Infinity", "-Infinity", "100", "'2'", "undefined", "null", "true", "2.9", "1e21", "-1e21")
++	case 6:
++		return g.expr(kNum, d).s
++	default:
++		return fmt.Sprint(n(g.ht, 0, 3))
++	}
++}
++
++func (g *gen) boolExpr(d int) ex {
++	if v, ok := g.varOf(kBool); ok && chance(g.ht, 40) {
++		return v
++	}
++	if d <= 0 {
++		return atom(pick(g.ht, "true", "false"))
++	}
++	switch n(g.ht, 1, 16) {
++	case 1:
++		return atom(pick(g.ht, "true", "false"))
++	case 2, 3, 4, 5:
++		op := pick(g.ht, "<", "<=", ">", ">=", "==", "!=", "===", "!==", "==", "===")
++		ka := pick(g.ht, kNum, kNum, kStr, kStr, kBool, kAny, kArr, kObj)
++		kb := pick(g.ht, kNum, kStr, kAny, ka, ka)
++		prec := relPrec
++		if strings.Contains(op, "=") && !strings.ContainsAny(op, "<>") {
++			prec = eqPrec
++		}
++		return g.binary(op, g.expr(ka, d-1), g.expr(kb, d-1), prec, false)
++	case 6:
++		return g.unary("!", g.expr(kAny, d-1))
++	case 7:
++		op := pick(g.ht, "&&", "||")
++		prec := andPrec
++		if op == "||" {
++			prec = orPrec
++		}
++		return g.binary(op, g.expr(kBool, d-1), g.expr(kBool, d-1), prec, false)
++	case 8:
++		return g.binary("in", g.expr(pick(g.ht, kStr, kNum, kAny), d-1), g.expr(pick(g.ht, kObj, kArr), d-1), relPrec, false)
++	case 9:
++		return g.binary("instanceof", g.expr(kAny, d-1), atom(pick(g.ht, "Object", "Array", "Function", "Number", "String", "RegExp", "Date", "Error", "Map", "Boolean")), relPrec, false)
++	case 10:
++		f := pick(g.ht, "Array.isArray", "isNaN", "Number.isNaN", "Number.isInteger", "Number.isSafeInteger", "Number.isFinite", "isFinite", "Boolean", "Object.isFrozen", "Object.isExtensible")
++		return g.call(f, g.expr(kAny, d-1).s)
++	case 11:
++		s := g.expr(kStr, d-1)
++		return g.call(g.member(s, pick(g.ht, "startsWith", "endsWith", "includes")).s, g.expr(kStr, d-1).s, pick(g.ht, "", g.idx(d-1)))
++	case 12:
++		a := g.expr(kArr, d-1)
++		m := pick(g.ht, "includes", "some", "every")
++		if m == "includes" {
++			return g.call(g.member(a, m).s, g.expr(kAny, d-1).s, pick(g.ht, "", g.idx(d-1)))
++		}
++		return g.call(g.member(a, m).s, g.predicate(d-1))
++	case 13:
++		return g.call("Object.is", g.expr(kAny, d-1).s, g.expr(kAny, d-1).s)
++	case 14:
++		return g.call(g.member(atom(g.regexLit()), "test").s, g.expr(kStr, d-1).s)
++	case 15:
++		return g.call(g.member(g.expr(pick(g.ht, kObj, kArr), d-1), "hasOwnProperty").s, g.expr(pick(g.ht, kStr, kNum), d-1).s)
++	default:
++		op := g.operand(g.expr(kAny, d-1), unaryPrec, false)
++		if Known.deleteNew && strings.HasPrefix(strings.TrimLeft(op, "("), "new ") {
++			op = "[" + op + "]" // goja/13
++		}
++		if Known.deleteNoEval {
++			// goja/26: evaluate the operand apart, delete a literal
++			return ex{"(void " + op + ", delete 0)", atomPrec}
++		}
++		return ex{"delete " + op, unaryPrec}
++	}
++}
++
++func (g *gen) arrExpr(d int) ex {
++	if v, ok := g.varOf(kArr); ok && chance(g.ht, 50) {
++		return v
++	}
++	if d <= 0 {
++		return atom("[" + g.elems(0, n(g.ht, 0, 3), false) + "]")
++	}
++	switch n(g.ht, 1, 16) {
++	case 1, 2, 3:
++		return atom("[" + g.elems(d-1, n(g.ht, 0, 5), chance(g.ht, 30)) + "]")
++	case 4:
++		a := g.expr(kArr, d-1)
++		m := pick(g.ht, "map", "filter", "slice", "concat", "reverse", "flat", "fill", "sort", "splice", "toSorted", "toReversed", "with", "flatMap", "copyWithin", "toSpliced")
++		switch m {
++		case "map":
++			return g.call(g.member(a, m).s, pick(g.ht, "x => x", "x => x * 2", "(x, i) => i", "x => typeof x", "x => [x]", "String", "Number", "x => x + ''", "(x, i, a) => a.length", "Boolean"))
++		case "filter":
++			return g.call(g.member(a, m).s, g.predicate(d-1))
++		case "slice", "splice", "toSpliced", "copyWithin":
++			return g.call(g.member(a, m).s, g.idx(d-1), pick(g.ht, "", g.idx(d-1)))
++		case "concat":
++			return g.call(g.member(a, m).s, g.expr(pick(g.ht, kArr, kAny), d-1).s)
++		case "flat":
++			return g.call(g.member(a, m).s, pick(g.ht, "", "0", "1", "2", "Infinity", "-1"))
++		case "fill":
++			return g.call(g.member(a, m).s, g.expr(kAny, d-1).s, pick(g.ht, "", g.idx(d-1)))
++		case "sort", "toSorted":
++			return g.call(g.member(a, m).s, pick(g.ht, "", "", "(a, b) => a - b", "(a, b) => b - a", "(a, b) => String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0", "(a, b) => (a > b) - (a < b)"))
++		case "with":
++			return g.call(g.member(a, m).s, g.idx(d-1), g.expr(kAny, d-1).s)
++		case "flatMap":
++			return g.call(g.member(a, m).s, pick(g.ht, "x => [x, x]", "x => x", "x => []", "(x, i) => [i]"))
++		}
++		return g.call(g.member(a, m).s)
++	case 5:
++		return g.call(g.member(g.expr(kStr, d-1), "split").s, pick(g.ht, "''", "','", "' '", "'a'", g.regexLit(), "undefined", "'\\u00e9'"), pick(g.ht, "", "0", "1", "2", "-1", "undefined", "4294967296"))
++	case 6:
++		fn := pick(g.ht, "Object.keys", "Object.values", "Object.entries", "Object.getOwnPropertyNames", "Reflect.ownKeys")
++		k := pick(g.ht, kObj, kArr, kStr, kAny)
++		if k == kAny && (fn == "Object.getOwnPropertyNames" || fn == "Reflect.ownKeys") {
++			k = kObj // no functions: V8's own arguments/caller, and goja/27
++		}
++		return g.call(fn, g.expr(k, d-1).s)
++	case 7:
++		return g.call("Array.from", g.expr(pick(g.ht, kArr, kStr, kObj), d-1).s, pick(g.ht, "", "x => x", "(x, i) => i", "String"))
++	case 8:
++		return g.call(pick(g.ht, "Array.of", "Array", "new Array"), g.elems(d-1, n(g.ht, 0, 3), false))
++	case 9:
++		return atom("[..." + g.operand(g.expr(pick(g.ht, kArr, kStr), d-1), assignPrec, false) + ", " + g.elems(d-1, n(g.ht, 0, 2), false) + "]")
++	case 10:
++		return g.call(g.member(g.expr(kStr, d-1), "match").s, strings.TrimSuffix(g.regexLit(), "y")+"g")
++	case 11:
++		return atom("Array(" + pick(g.ht, "0", "1", "3", "10", "'3'", "2.5", "-1", "4294967296", "1e10", "NaN") + ")")
++	case 12:
++		return g.call("[].concat", g.expr(kAny, d-1).s, g.expr(kArr, d-1).s)
++	case 13:
++		return atom("[" + g.expr(kAny, d-1).s + "].concat(" + g.expr(kArr, d-1).s + ")")
++	case 14:
++		return g.call("Array.from", "{length: "+pick(g.ht, "3", "0", "-1", "2.5", "'2'")+", 0: 'a', 1: 'b', 5: 'x'}")
++	case 15:
++		return g.call("Array.from", g.expr(kArr, d-1).s+".entries()")
++	default:
++		return atom("[" + g.elems(d-1, n(g.ht, 0, 3), false) + "]")
++	}
++}
++
++func (g *gen) elems(d, k int, holes bool) string {
++	parts := make([]string, k)
++	for i := range parts {
++		if holes && chance(g.ht, 30) {
++			parts[i] = ""
++		} else if chance(g.ht, 15) {
++			parts[i] = "..." + g.operand(g.expr(pick(g.ht, kArr, kStr), d), assignPrec, false)
++		} else {
++			parts[i] = g.expr(pick(g.ht, kNum, kNum, kStr, kStr, kBool, kAny, kArr, kObj), d).s
++		}
++	}
++	s := strings.Join(parts, ", ")
++	if holes && k > 0 && chance(g.ht, 30) {
++		s += "," // trailing comma: no extra element
++	}
++	return s
++}
++
++func (g *gen) key(d int) string {
++	switch n(g.ht, 1, 12) {
++	case 1, 2, 3, 4:
++		return pick(g.ht, "a", "b", "c", "x", "y", "length", "constructor", "toString", "valueOf", "hasOwnProperty", "__proto__", "$", "_", "if", "class", "await")
++	case 5, 6:
++		return fmt.Sprint(n(g.ht, 0, 12))
++	case 7:
++		return pick(g.ht, "'1'", "'01'", "'-0'", "'1.0'", "'1e3'", "'4294967295'", "'4294967296'", "'a b'", "''", "'\\u00e9'", "'\\u{1F600}'", "'__proto__'", "'-1'", "'0.5'")
++	case 8:
++		return "[" + g.expr(pick(g.ht, kStr, kNum, kAny), d).s + "]"
++	case 9:
++		return pick(g.ht, "1.5", "0x10", "1e3", "0.0", "-0", "1e21", "010", "0.1e1", "00")
++	case 10:
++		return "[Symbol.iterator]"
++	default:
++		return pick(g.ht, "a", "b", "1", "2")
++	}
++}
++
++func (g *gen) objExpr(d int) ex {
++	if v, ok := g.varOf(kObj); ok && chance(g.ht, 50) {
++		return v
++	}
++	if d <= 0 {
++		return atom("{}")
++	}
++	switch n(g.ht, 1, 12) {
++	case 1, 2, 3, 4:
++		return atom(g.objLit(d - 1))
++	case 5:
++		return g.call("Object.assign", g.expr(kObj, d-1).s, g.expr(pick(g.ht, kObj, kArr, kStr, kAny), d-1).s)
++	case 6:
++		from := pick(g.ht, "Object.entries", "Array.from", "Object.entries")
++		if Known.fromEntriesPanic {
++			from = "Object.entries" // goja/20: entries are always pairs
++		}
++		return g.call("Object.fromEntries", g.call(from, g.expr(pick(g.ht, kObj, kArr), d-1).s).s)
++	case 7:
++		return g.call("JSON.parse", g.call("JSON.stringify", g.expr(pick(g.ht, kObj, kArr, kAny), d-1).s).s)
++	case 8:
++		return atom("{..." + g.operand(g.expr(pick(g.ht, kObj, kArr, kStr, kAny), d-1), assignPrec, false) + ", " + g.key(d-1) + ": " + g.expr(kAny, d-1).s + "}")
++	case 9:
++		return g.call("Object.create", pick(g.ht, "null", "{inherited: 1}", "Object.prototype", "Array.prototype"))
++	case 10:
++		return atom("new (class { constructor(v) { this.v = v; this[1] = 2; } get w() { return this.v; } })(" + g.expr(kAny, d-1).s + ")")
++	case 11:
++		return g.call("Object.defineProperty", g.expr(kObj, d-1).s, g.expr(kStr, d-1).s, pick(g.ht, "{value: 1, enumerable: true}", "{value: 1}", "{get() { return 7; }, enumerable: true}", "{value: 2, writable: false, enumerable: true, configurable: false}", "{set(v) {}, enumerable: true}"))
++	default:
++		return atom(g.objLit(d - 1))
++	}
++}
++
++func (g *gen) objLit(d int) string {
++	k := n(g.ht, 0, 4)
++	parts := make([]string, k)
++	for i := range parts {
++		switch n(g.ht, 1, 12) {
++		case 1, 2, 3, 4, 5, 6:
++			parts[i] = g.key(d) + ": " + g.expr(pick(g.ht, kNum, kStr, kBool, kAny, kArr, kObj), d).s
++		case 7:
++			if vs := g.visible(kAny); len(vs) > 0 {
++				parts[i] = pick(g.ht, vs...).name // shorthand
++			} else {
++				parts[i] = "z: 0"
++			}
++		case 8:
++			parts[i] = "get " + pick(g.ht, "a", "b", "g") + "() { return " + g.expr(kAny, d).s + "; }"
++		case 9:
++			parts[i] = pick(g.ht, "a", "m", "1") + "(" + pick(g.ht, "", "x", "x, y", "...r") + ") { return " + g.expr(kAny, d).s + "; }"
++		case 10:
++			parts[i] = "..." + g.operand(g.expr(pick(g.ht, kObj, kArr, kStr, kAny), d), assignPrec, false)
++		case 11:
++			parts[i] = "set " + pick(g.ht, "a", "b") + "(v) { this._v = v; }"
++		default:
++			parts[i] = "__proto__: " + pick(g.ht, "null", "{p: 1}", "[]", "1")
++		}
++	}
++	// V8 lists accessors after data properties when the literal has a
++	// spread (off the specification's creation order): never both.
++	spread := false
++	for _, p := range parts {
++		spread = spread || strings.HasPrefix(p, "...")
++	}
++	if spread {
++		for i, p := range parts {
++			if strings.HasPrefix(p, "get ") || strings.HasPrefix(p, "set ") {
++				parts[i] = p[4:5] + ": 1"
++			}
++		}
++	}
++	return "{" + strings.Join(parts, ", ") + "}"
++}
++
++func (g *gen) funcExpr(d int) ex {
++	if v, ok := g.varOf(kFunc); ok && chance(g.ht, 50) {
++		return v
++	}
++	body := "undefined"
++	if d > 0 {
++		body = g.expr(kAny, d-1).s
++	}
++	switch n(g.ht, 1, 8) {
++	case 1, 2:
++		return atom("function (" + pick(g.ht, "", "a", "a, b", "a, b = 1", "...r", "a, ...r", "{a, b}", "[a, b]") + ") { return " + body + "; }")
++	case 3, 4:
++		return atom("(" + pick(g.ht, "", "a", "a, b", "a = 2", "...r") + ") => " + g.operand(ex{body, assignPrec}, assignPrec, false))
++	case 5:
++		return atom("function* () { yield 1; yield " + body + "; }")
++	case 6:
++		return atom(pick(g.ht, "Math.max", "String", "Number", "Array.isArray", "Object.keys", "parseInt", "JSON.stringify", "Boolean", "Symbol", "Object", "Array", "Date.UTC", "isNaN", "encodeURIComponent"))
++	case 7:
++		return atom("class { static s = 1; constructor(a) { this.a = a; } m() { return " + body + "; } }")
++	default:
++		return atom("(function () { return function () { return " + body + "; }; })()")
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Statements.
++
++func (g *gen) indent() string { return strings.Repeat("  ", g.depth) }
++
++func (g *gen) block(d, k int) string {
++	saved := g.vars
++	g.depth++
++	var lines []string
++	for i := 0; i < k && g.tick(); i++ {
++		if s := g.stmt(d); s != "" {
++			lines = append(lines, g.indent()+s)
++		}
++	}
++	g.depth--
++	g.vars = saved
++	if len(lines) == 0 {
++		return ""
++	}
++	return strings.Join(lines, "\n") + "\n"
++}
++
++func (g *gen) declare(k kind, d int) string {
++	name := g.fresh("v")
++	kw := pick(g.ht, "let", "let", "const", "var")
++	v := variable{name: name, k: k, elem: kAny, konst: kw == "const"}
++	x := g.expr(k, d)
++	if k == kArr && strings.HasPrefix(x.s, "[") && !strings.Contains(x.s, "...") && !strings.Contains(x.s, ",,") && !strings.Contains(x.s, ", ,") && !strings.HasSuffix(x.s, ",]") {
++		v.seq = true
++	}
++	g.vars = append(g.vars, v)
++	return fmt.Sprintf("%s %s = %s;", kw, name, x.s)
++}
++
++func (g *gen) stmt(d int) string {
++	switch n(g.ht, 1, 30) {
++	case 1, 2, 3, 4, 5, 6:
++		return g.declare(pick(g.ht, kNum, kNum, kStr, kStr, kBool, kArr, kArr, kObj, kObj, kAny, kFunc), d)
++	case 7, 8:
++		if vs := g.visible(kAny); len(vs) > 0 {
++			v := pick(g.ht, vs...)
++			if !v.konst {
++				k := v.k
++				if chance(g.ht, 15) {
++					k = kAny // changes the kind: the registry keeps the old one, fine for a differential
++				}
++				return fmt.Sprintf("%s %s %s;", v.name, pick(g.ht, "=", "=", "=", "+=", "-=", "||=", "&&=", "??="), g.expr(k, d).s)
++			}
++		}
++		return g.declare(kNum, d)
++	case 9, 10:
++		s := fmt.Sprintf("if (%s) {\n%s%s}", g.expr(pick(g.ht, kBool, kAny), d).s, g.block(d-1, n(g.ht, 0, 3)), g.indent())
++		if chance(g.ht, 40) {
++			s += fmt.Sprintf(" else {\n%s%s}", g.block(d-1, n(g.ht, 0, 3)), g.indent())
++		}
++		return s
++	case 11, 12:
++		return g.loop(d)
++	case 13:
++		return g.forIn(d)
++	case 14:
++		return g.tryStmt(d)
++	case 15, 16:
++		return g.funcDecl(d)
++	case 17:
++		if v := g.visible(kArr); len(v) > 0 {
++			a := pick(g.ht, v...)
++			m := pick(g.ht, "push", "pop", "shift", "unshift", "reverse", "sort", "splice", "fill")
++			switch m {
++			case "push", "unshift":
++				return fmt.Sprintf("%s.%s(%s);", a.name, m, g.elems(d, n(g.ht, 0, 3), false))
++			case "splice":
++				return fmt.Sprintf("%s.splice(%s, %s%s);", a.name, g.idx(d), g.idx(d), pick(g.ht, "", ", "+g.expr(kAny, d).s))
++			case "fill":
++				return fmt.Sprintf("%s.fill(%s, %s);", a.name, g.expr(kAny, d).s, g.idx(d))
++			case "sort":
++				return fmt.Sprintf("%s.sort(%s);", a.name, pick(g.ht, "", "(a, b) => a - b", "(a, b) => String(b) < String(a) ? -1 : String(a) < String(b) ? 1 : 0"))
++			}
++			return fmt.Sprintf("%s.%s();", a.name, m)
++		}
++		return g.declare(kArr, d)
++	case 18:
++		if v := g.visible(kObj); len(v) > 0 {
++			o := pick(g.ht, v...)
++			switch n(g.ht, 1, 5) {
++			case 1, 2:
++				return fmt.Sprintf("%s[%s] = %s;", o.name, g.expr(pick(g.ht, kStr, kNum, kAny), d).s, g.expr(kAny, d).s)
++			case 3:
++				return fmt.Sprintf("%s.%s = %s;", o.name, pick(g.ht, "a", "b", "c", "x", "length", "0", "toString"), g.expr(kAny, d).s)
++			case 4:
++				return fmt.Sprintf("delete %s[%s];", o.name, g.expr(pick(g.ht, kStr, kNum), d).s)
++			}
++			return fmt.Sprintf("Object.%s(%s);", pick(g.ht, "freeze", "seal", "preventExtensions"), o.name)
++		}
++		return g.declare(kObj, d)
++	case 19:
++		if v := g.visible(kArr); len(v) > 0 {
++			a := pick(g.ht, v...)
++			switch n(g.ht, 1, 3) {
++			case 1:
++				return fmt.Sprintf("%s[%s] = %s;", a.name, g.idx(d), g.expr(kAny, d).s)
++			case 2:
++				return fmt.Sprintf("%s.length = %s;", a.name, pick(g.ht, "0", "1", "2", "5", "10", "'3'", "1.5", "-1", "4294967296"))
++			}
++			return fmt.Sprintf("%s[%s] = %s;", a.name, pick(g.ht, "'x'", "'1'", "'-1'", "'01'", "1e3", "'4294967295'", "4294967295"), g.expr(kAny, d).s)
++		}
++		return g.declare(kArr, d)
++	case 20:
++		return g.switchStmt(d)
++	case 21:
++		return g.destructure(d)
++	case 22:
++		if g.loops > 0 && chance(g.ht, 50) {
++			kw := pick(g.ht, "break", "continue")
++			cond := g.expr(kBool, d).s
++			if Known.constantContinue {
++				cond = "Boolean(" + cond + ")" // goja/19: never a constant condition
++			}
++			if len(g.labels) > 0 && chance(g.ht, 40) {
++				return fmt.Sprintf("if (%s) %s %s;", cond, kw, pick(g.ht, g.labels...))
++			}
++			return fmt.Sprintf("if (%s) %s;", cond, kw)
++		}
++		return fmt.Sprintf("%s;", g.expr(kAny, d).s)
++	case 23:
++		return g.classDecl(d)
++	case 24:
++		return fmt.Sprintf("{\n%s%s}", g.block(d-1, n(g.ht, 1, 3)), g.indent())
++	case 25:
++		return g.labeled(d)
++	case 26:
++		name := g.fresh("v")
++		g.vars = append(g.vars, variable{name: name, k: kAny})
++		return fmt.Sprintf("let %s = (() => { try { return %s; } catch (e) { return e instanceof Error ? e.name : e; } })();", name, g.expr(kAny, d).s)
++	case 27:
++		return g.generatorStmt(d)
++	case 28:
++		if v := g.visible(kNum); len(v) > 0 {
++			x := pick(g.ht, v...)
++			if !x.konst {
++				if Known.toInt32Large {
++					return pick(g.ht, x.name+"++;", x.name+"--;", "++"+x.name+";", x.name+" = -"+x.name+";") // goja/7
++				}
++				return pick(g.ht, x.name+"++;", x.name+"--;", "++"+x.name+";", x.name+" = -"+x.name+";", x.name+" = "+x.name+" | 0;", x.name+" >>>= 0;", x.name+" = ~~"+x.name+";")
++			}
++		}
++		return g.declare(kNum, d)
++	default:
++		return fmt.Sprintf("%s;", g.expr(kAny, d).s)
++	}
++}
++
++func (g *gen) loop(d int) string {
++	i := g.fresh("i")
++	saved := g.vars
++	g.loops++
++	defer func() { g.loops--; g.vars = saved }()
++	switch n(g.ht, 1, 5) {
++	case 1, 2:
++		g.vars = append(g.vars, variable{name: i, k: kNum, konst: true})
++		return fmt.Sprintf("for (let %s = %d; %s < %d; %s%s) {\n%s%s}", i, n(g.ht, -1, 2), i, n(g.ht, 0, 6), i, pick(g.ht, "++", " += 1", " += 2", "++"), g.block(d-1, n(g.ht, 0, 3)), g.indent())
++	case 3:
++		g.vars = append(g.vars, variable{name: i, k: kNum, konst: true})
++		return fmt.Sprintf("let %s = 0;\n%swhile (%s && %s++ < %d) {\n%s%s}", i, g.indent(), g.operand(g.expr(kBool, d), andPrec, false), i, n(g.ht, 0, 6), g.block(d-1, n(g.ht, 0, 3)), g.indent())
++	case 4:
++		g.vars = append(g.vars, variable{name: i, k: kNum, konst: true})
++		return fmt.Sprintf("let %s = 0;\n%sdo {\n%s%s} while (%s++ < %d && %s);", i, g.indent(), g.block(d-1, n(g.ht, 0, 3)), g.indent(), i, n(g.ht, 0, 4), g.operand(g.expr(kBool, d), andPrec, false))
++	default:
++		x := g.fresh("e")
++		src := g.expr(pick(g.ht, kArr, kArr, kStr), d)
++		g.vars = append(g.vars, variable{name: x, k: kAny, konst: true})
++		return fmt.Sprintf("for (%s %s of %s) {\n%s%s}", pick(g.ht, "const", "let", "var"), x, g.operand(src, assignPrec, false), g.block(d-1, n(g.ht, 0, 3)), g.indent())
++	}
++}
++
++func (g *gen) forIn(d int) string {
++	k := g.fresh("k")
++	saved := g.vars
++	g.loops++
++	defer func() { g.loops--; g.vars = saved }()
++	src := g.expr(pick(g.ht, kObj, kArr, kStr, kAny), d)
++	g.vars = append(g.vars, variable{name: k, k: kStr, konst: true})
++	acc := g.fresh("v")
++	body := g.block(d-1, n(g.ht, 0, 2))
++	s := fmt.Sprintf("const %s = [];\n%sfor (const %s in %s) {\n%s  %s.push(%s);\n%s%s}", acc, g.indent(), k, g.operand(src, assignPrec, false), g.indent(), acc, k, body, g.indent())
++	g.vars = append(saved, variable{name: acc, k: kArr, elem: kStr, seq: true, konst: true})
++	saved = g.vars
++	return s
++}
++
++func (g *gen) tryStmt(d int) string {
++	res := g.fresh("v")
++	saved := g.vars
++	body := g.block(d-1, n(g.ht, 0, 3))
++	g.vars = saved
++	var thrown string
++	switch n(g.ht, 1, 6) {
++	case 1:
++		thrown = fmt.Sprintf("throw %s;", g.expr(kAny, d).s)
++	case 2:
++		thrown = fmt.Sprintf("throw new %s(%s);", pick(g.ht, "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError"), g.expr(kStr, d).s)
++	case 3:
++		thrown = pick(g.ht, "null.x;", "undefined();", "(void 0).a.b;", "new Array(-1);", "(1).toFixed(101);", "'a'.repeat(-1);", "JSON.parse('{');", "new RegExp('(');", "decodeURIComponent('%');", "BigInt(1.5);", "1n + 1;", "Symbol() + '';", "[].reduce((a, b) => a);", "Object.defineProperty(1, 'x', {});", "new (() => {})();", "x.y;", "(function f() { 'use strict'; f = 1; })();", "Object.freeze([1]).push(2);", "'use strict'; undefinedVariable = 1;", "({}).x.y;", "[...1];", "new Symbol();", "Object.setPrototypeOf(Object.preventExtensions({}), {});", "(class A extends null {}, new (class A extends null {})());", "String.fromCodePoint(-1);", "'x'.normalize('bad');", "(1).toString(1);", "new Date(NaN).toISOString();", "structuredClone;", "Reflect.ownKeys(1);", "new Proxy({}, {get() { return 1; }}).x.y.z;")
++	case 4:
++		thrown = fmt.Sprintf("%s;", g.expr(kAny, d).s)
++	default:
++		thrown = ""
++	}
++	g.vars = saved
++	catchBody := g.block(d-1, n(g.ht, 0, 2))
++	g.vars = saved
++	fin := ""
++	if chance(g.ht, 40) {
++		fin = fmt.Sprintf(" finally {\n%s  %s = [%s, 'f'];\n%s}", g.indent(), res, res, g.indent())
++	}
++	g.vars = append(saved, variable{name: res, k: kAny})
++	param := pick(g.ht, "e", "{name, message}", "[a] = [1]", "e = 1")
++	ev := map[string]string{"{name, message}": "name", "[a] = [1]": "a"}[param]
++	if ev == "" {
++		ev = "e"
++	}
++	return fmt.Sprintf("let %s;\n%stry {\n%s%s  %s\n%s} catch (%s) {\n%s  %s = %s instanceof Error ? %s.name : %s;\n%s%s}%s", res, g.indent(), body, g.indent(), thrown, g.indent(), param, g.indent(), res, ev, ev, ev, catchBody, g.indent(), fin)
++}
++
++func (g *gen) funcDecl(d int) string {
++	name := g.fresh("f")
++	saved := g.vars
++	params := pick(g.ht, "", "a", "a, b", "a, b = 1", "...r", "a, ...r", "{a, b} = {}", "[a, b] = []", "a, b, c")
++	g.vars = nil
++	for _, p := range []string{"a", "b", "c", "r"} {
++		if strings.Contains(params, p) {
++			g.vars = append(g.vars, variable{name: p, k: kAny})
++		}
++	}
++	g.funcs++
++	g.depth++
++	body := g.block(d-1, n(g.ht, 0, 3))
++	ret := fmt.Sprintf("%sreturn %s;\n", g.indent(), g.retList())
++	g.depth--
++	g.funcs--
++	g.vars = saved
++	g.vars = append(g.vars, variable{name: name, k: kFunc})
++	kw := pick(g.ht, "function", "function", "function*")
++	s := fmt.Sprintf("%s %s(%s) {\n%s%s%s}", kw, name, params, body, ret, g.indent())
++	// call it and keep the result, so that the body runs
++	res := g.fresh("v")
++	callArgs := g.elems(d, n(g.ht, 0, 3), false)
++	call := fmt.Sprintf("%s(%s)", name, callArgs)
++	if kw == "function*" {
++		call = "[..." + call + "]"
++	} else if chance(g.ht, 30) {
++		call = fmt.Sprintf("%s.%s(%s)", name, pick(g.ht, "call", "apply", "bind"), pick(g.ht, "null", "{}", "1", "undefined"))
++		if strings.Contains(call, "bind") {
++			call += "()"
++		}
++	}
++	g.vars = append(g.vars, variable{name: res, k: kAny})
++	return fmt.Sprintf("%s\n%slet %s = %s;", s, g.indent(), res, call)
++}
++
++func (g *gen) retList() string {
++	vs := g.visible(kAny)
++	if len(vs) == 0 {
++		return g.expr(kAny, 1).s
++	}
++	if len(vs) > 4 {
++		vs = vs[len(vs)-4:]
++	}
++	names := make([]string, len(vs))
++	for i, v := range vs {
++		names[i] = v.name
++	}
++	return "[" + strings.Join(names, ", ") + "]"
++}
++
++func (g *gen) switchStmt(d int) string {
++	res := g.fresh("v")
++	x := g.expr(pick(g.ht, kNum, kStr, kAny), d)
++	var cases []string
++	k := n(g.ht, 1, 4)
++	for i := 0; i < k; i++ {
++		lbl := pick(g.ht, "1", "2", "'a'", "'1'", "true", "undefined", "null", "NaN", "0", "-0", "'b'", g.expr(kAny, d-1).s)
++		body := pick(g.ht, fmt.Sprintf("%s = %d; break;", res, i), fmt.Sprintf("%s += %d;", res, i), fmt.Sprintf("%s = %d;", res, i), "break;", "")
++		cases = append(cases, fmt.Sprintf("%s  case %s: %s", g.indent(), lbl, body))
++	}
++	if chance(g.ht, 50) {
++		pos := n(g.ht, 0, len(cases))
++		def := fmt.Sprintf("%s  default: %s = 'd';%s", g.indent(), res, pick(g.ht, "", " break;"))
++		cases = append(cases[:pos], append([]string{def}, cases[pos:]...)...)
++	}
++	g.vars = append(g.vars, variable{name: res, k: kAny})
++	return fmt.Sprintf("let %s = 0;\n%sswitch (%s) {\n%s\n%s}", res, g.indent(), x.s, strings.Join(cases, "\n"), g.indent())
++}
++
++func (g *gen) destructure(d int) string {
++	a, b, c := g.fresh("d"), g.fresh("d"), g.fresh("d")
++	for _, v := range []string{a, b, c} {
++		g.vars = append(g.vars, variable{name: v, k: kAny})
++	}
++	switch n(g.ht, 1, 6) {
++	case 1:
++		return fmt.Sprintf("let [%s, %s = %s, ...%s] = %s;", a, b, g.expr(kAny, d).s, c, g.operand(g.expr(pick(g.ht, kArr, kStr), d), assignPrec, false))
++	case 2:
++		return fmt.Sprintf("let {%s, %s: %s = %s, ...%s} = %s;", a, pick(g.ht, "a", "b", "length", "0", "x"), b, g.expr(kAny, d).s, c, g.operand(g.expr(pick(g.ht, kObj, kArr, kStr), d), assignPrec, false))
++	case 3:
++		return fmt.Sprintf("let %s, %s, %s;\n%s[%s, [%s] = [], {%s = 3} = {}] = %s;", a, b, c, g.indent(), a, b, c, g.operand(g.expr(kArr, d), assignPrec, false))
++	case 4:
++		return fmt.Sprintf("let %s = %s, %s = %s, %s;\n%s[%s, %s] = [%s, %s]; %s = [%s, %s];", a, g.expr(kAny, d).s, b, g.expr(kAny, d).s, c, g.indent(), a, b, b, a, c, a, b)
++	case 5:
++		return fmt.Sprintf("let {[%s]: %s, %s = 1, %s} = %s;", g.expr(kStr, d).s, a, b, c, g.operand(g.expr(kObj, d), assignPrec, false))
++	default:
++		return fmt.Sprintf("let [%s, , %s, %s] = %s;", a, b, c, pick(g.ht, "'abc'", "'\\u{1F600}x'", "[1, 2, 3]", "new Set([1, 1, 2, 3])", "new Map([[1, 2], [3, 4]])", "[1, 2, 3].entries()", "(function* () { yield 1; yield 2; })()"))
++	}
++}
++
++func (g *gen) classDecl(d int) string {
++	name := g.fresh("C")
++	res := g.fresh("v")
++	saved := g.vars
++	g.vars = nil
++	val := g.expr(kAny, d-1).s
++	g.vars = saved
++	extra := pick(g.ht, "", " extends Array", " extends Error", " extends Object", " extends (class { constructor() { this.base = 1; } })")
++	body := []string{
++		"constructor(...a) { " + pick(g.ht, "", "super(...a); ", "super(); ") + "this.a = a.length; this.v = " + val + "; }",
++		"m() { return this.a; }",
++		"get g() { return this.v; }",
++		"static s() { return " + pick(g.ht, "1", "this.name", "typeof this", "new this(1, 2).a") + "; }",
++		"[Symbol.toPrimitive](h) { return h; }",
++		"toString() { return 'C'; }",
++		"static #p = 1; static p() { return " + name + ".#p; }",
++		"f = 5;",
++		"static sf = 6;",
++		"['c' + 1]() { return 1; }",
++	}
++	if extra == "" && strings.Contains(body[0], "super") {
++		body[0] = "constructor(...a) { this.a = a.length; this.v = " + val + "; }"
++	}
++	if extra != "" && !strings.Contains(body[0], "super") {
++		body[0] = "constructor(...a) { super(...a); this.a = a.length; this.v = " + val + "; }"
++	}
++	k := n(g.ht, 1, 5)
++	chosen := []string{body[0]}
++	for i := 0; i < k; i++ {
++		c := pick(g.ht, body[1:]...)
++		dup := false
++		for _, x := range chosen {
++			if x == c {
++				dup = true
++			}
++		}
++		if !dup {
++			chosen = append(chosen, c)
++		}
++	}
++	g.vars = append(g.vars, variable{name: name, k: kFunc, konst: true})
++	g.vars = append(g.vars, variable{name: res, k: kAny})
++	inst := fmt.Sprintf("new %s(%s)", name, g.elems(d-1, n(g.ht, 0, 2), false))
++	use := pick(g.ht, inst+".a", inst+".v", inst+".g", "typeof "+inst+".m", "["+inst+" instanceof "+name+", Object.getPrototypeOf("+inst+") === "+name+".prototype]", name+".name", "Object.getOwnPropertyNames("+name+".prototype)", "Object.keys("+inst+")", "String("+inst+")", "typeof "+name, inst+".constructor === "+name, "Object.getOwnPropertyNames("+name+")", "Object.getPrototypeOf("+name+") === Function.prototype", inst+".length", "JSON.stringify("+inst+")", "Array.isArray("+inst+")", inst+" instanceof Error")
++	return fmt.Sprintf("class %s%s {\n%s  %s\n%s}\n%slet %s = (() => { try { return %s; } catch (e) { return e instanceof Error ? e.name : e; } })();", name, extra, g.indent(), strings.Join(chosen, "\n"+g.indent()+"  "), g.indent(), g.indent(), res, use)
++}
++
++func (g *gen) labeled(d int) string {
++	lbl := g.fresh("L")
++	g.labels = append(g.labels, lbl)
++	defer func() { g.labels = g.labels[:len(g.labels)-1] }()
++	return lbl + ": " + g.loop(d)
++}
++
++func (g *gen) generatorStmt(d int) string {
++	res := g.fresh("v")
++	saved := g.vars
++	a, b := g.expr(kAny, d-1).s, g.expr(kAny, d-1).s
++	g.vars = saved
++	g.vars = append(g.vars, variable{name: res, k: kAny})
++	switch n(g.ht, 1, 5) {
++	case 1:
++		return fmt.Sprintf("const %s = (() => { function* gen() { const x = yield %s; yield x; return %s; } const it = gen(); return [it.next(1), it.next(2), it.next(3), it.next(4)]; })();", res, a, b)
++	case 2:
++		return fmt.Sprintf("const %s = [...(function* () { yield* [%s, %s]; yield* '%s'; })()];", res, a, b, pick(g.ht, "ab", "", "\\u00e9"))
++	case 3:
++		return fmt.Sprintf("const %s = (() => { const it = [%s, %s][Symbol.iterator](); return [it.next(), it.next(), it.next(), typeof it[Symbol.iterator]]; })();", res, a, b)
++	case 4:
++		return fmt.Sprintf("const %s = (() => { const o = {*[Symbol.iterator]() { yield %s; yield %s; }}; return [Array.from(o), [...o].length, Math.max(...o.length === undefined ? [1] : [2])]; })();", res, a, b)
++	default:
++		return fmt.Sprintf("const %s = (() => { function* g() { try { yield %s; yield 2; } finally { return %s; } } const it = g(); return [it.next(), it.return(9), it.next()]; })();", res, a, b)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Programs.
++
++// program is a function body: statements, then a return of the visible
++// values.
++func (g *gen) program() string {
++	k := n(g.ht, 0, 7)
++	var lines []string
++	if chance(g.ht, 20) {
++		lines = append(lines, "'use strict';")
++	}
++	for i := 0; i < k && g.tick(); i++ {
++		if s := g.stmt(2); s != "" {
++			lines = append(lines, s)
++		}
++	}
++	vs := g.visible(kAny)
++	var rets []string
++	for _, v := range vs {
++		rets = append(rets, v.name)
++	}
++	if len(rets) > 8 {
++		rets = rets[len(rets)-8:]
++	}
++	ret := "return [" + strings.Join(rets, ", ") + "];"
++	if chance(g.ht, 25) {
++		ret = "return " + g.expr(kAny, 2).s + ";"
++	}
++	lines = append(lines, ret)
++	return strings.Join(lines, "\n")
++}
++
++// wrong is a program that is probably invalid: a valid one with a token
++// removed, inserted or swapped, or a program built around an early error.
++// Both engines must reject it, or both accept it and agree on the result.
++func (g *gen) wrong() string {
++	if chance(g.ht, 50) {
++		return g.earlyError()
++	}
++	src := g.program()
++	m := g.mutate(src)
++	if Known.strictOctalEscape && strings.Contains(m, "'use strict'") && octalEscape.MatchString(m) {
++		return src // goja/2: a mutation may turn \u212B into \212B
++	}
++	if Known.unterminatedClass {
++		// goja/18: no line with a [ left open after a /
++		for _, line := range strings.Split(m, "\n") {
++			if strings.Contains(line, "/") && strings.Count(line, "[") > strings.Count(line, "]") {
++				return src
++			}
++		}
++	}
++	return m
++}
++
++var octalEscape = regexp.MustCompile(`\\[0-9]`)
++
++// mutate applies one small change to src.
++func (g *gen) mutate(src string) string {
++	switch n(g.ht, 1, 6) {
++	case 1:
++		// drop a character
++		if len(src) > 1 {
++			i := n(g.ht, 0, len(src)-1)
++			return src[:i] + src[i+1:]
++		}
++	case 2:
++		// insert a token
++		i := n(g.ht, 0, len(src))
++		return src[:i] + pick(g.ht, ")", "(", "{", "}", "[", "]", ";", ",", "=", "==", "+", "return ", "let ", "const ", "'", "\"", "`", "${", "/", "*/", "/*", "//", "\n", "...", "=>", "?", ":", "else ", "case 1:", "\\", "0", "x", "await ", "yield ", "new ", "typeof ", "in ", "of ", "async ", "#", "@", "\\u0041", "\u00a0", "\u2028", "\ufeff") + src[i:]
++	case 3:
++		// swap two characters
++		if len(src) > 2 {
++			i := n(g.ht, 0, len(src)-2)
++			return src[:i] + src[i+1:i+2] + src[i:i+1] + src[i+2:]
++		}
++	case 4:
++		// duplicate a line
++		lines := strings.Split(src, "\n")
++		i := n(g.ht, 0, len(lines)-1)
++		lines = append(lines[:i+1], lines[i:]...)
++		return strings.Join(lines, "\n")
++	case 5:
++		// replace a keyword
++		for _, kw := range []string{"let ", "const ", "function ", "return ", "class ", "for ", "if ", "else ", "try ", "catch ", "while ", "switch ", "case "} {
++			if strings.Contains(src, kw) {
++				return strings.Replace(src, kw, pick(g.ht, "let ", "const ", "var ", "function ", "return ", "class ", "for ", "if ", "else ", "try ", "catch ", "while ", "switch ", "case ", "yield ", "await ", "async ", "static ", "enum ", "import ", "export ", "with ", "debugger ", "", "let\n", "new.target ", "super ", "arguments "), 1)
++			}
++		}
++	}
++	return src
++}
++
++// earlyError picks a program from earlyErrors, avoiding the open bugs.
++func (g *gen) earlyError() string {
++	for {
++		s := pick(g.ht, earlyErrors...)
++		switch {
++		case Known.arrowArguments && strings.Contains(s, "(() => arguments"):
++		case Known.labelledFunction && strings.HasPrefix(s, "L: function f() {} return"):
++		case Known.unicodeRegexpSyntax && strings.Contains(s, "/u") && (strings.Contains(s, "\\-") || strings.Contains(s, "\\1") || strings.Contains(s, "[\\d-z]") || strings.Contains(s, "a{,2}") || strings.Contains(s, "]/u") || strings.Contains(s, "}/u") || strings.Contains(s, "(?=a)+") || strings.Contains(s, "\\k<a>/u") || strings.Contains(s, "Bogus")):
++		case Known.duplicateGroupNames && strings.Contains(s, "(?<a>x)(?<a>y)"):
++		case Known.quantifiedLookbehind && strings.Contains(s, "(?<=a)+"):
++		case Known.jsonNumberRange && strings.Contains(s, "1e400"):
++		case Known.unicodeProperty && strings.Contains(s, "\\p{L}/u"):
++		case Known.execKeyOrder && strings.Contains(s, ".exec('a');"):
++		case Known.unterminatedClass && strings.Contains(s, "/[/"):
++		case Known.restParamUseStrict && strings.Contains(s, "(...a) { 'use strict'; }"):
++		case Known.codePointEscapePanic && strings.Contains(s, "u{10FFFF}'"):
++		case Known.codePointEscapePanic && strings.Contains(s, "u{10FFFF}`"):
++		case Known.strictOctalEscape && strings.Contains(s, "'use strict'") && (strings.Contains(s, "'\\1'") || strings.Contains(s, "'\\08'")):
++		default:
++			return s
++		}
++	}
++}
++
++// earlyErrors are programs around the early errors of the specification,
++// and a few that look wrong but are valid: both engines must agree on
++// whether they compile.
++var earlyErrors = []string{
++	"let x = 1; let x = 2; return x;",
++	"let x = 1; var x = 2; return x;",
++	"var x = 1; var x = 2; return x;",
++	"const x; return x;",
++	"const x = 1; x = 2; return x;",
++	"break;",
++	"continue;",
++	"L: L: return 1;",
++	"L: { break L; } return 1;",
++	"L: { continue L; } return 1;",
++	"L: for (;;) { break L; } return 2;",
++	"for (;;) { if (true) break; } return 3;",
++	"'use strict'; function f(a, a) { return a; } return f(1, 2);",
++	"function f(a, a) { return a; } return f(1, 2);",
++	"'use strict'; var eval = 1; return eval;",
++	"'use strict'; var arguments = 1; return arguments;",
++	"'use strict'; return '\\08';",
++	"'use strict'; return '\\0';",
++	"'use strict'; return '\\1';",
++	"return '\\1';",
++	"return `\\1`;",
++	"return `\\01`;",
++	"return String.raw`\\01`;",
++	"'use strict'; with ({}) {} return 1;",
++	"with ({a: 1}) { return a; }",
++	"'use strict'; delete x; return 1;",
++	"var x; 'use strict'; delete x; return 1;",
++	"'use strict'; delete (x); return 1;",
++	"'use strict'; delete ((x)); return 1;",
++	"return new.target;",
++	"function f() { return new.target; } return [f(), typeof new f()];",
++	"return () => new.target;",
++	"return function* () { yield: 1; };",
++	"return function* () { var yield = 1; };",
++	"return function () { var yield = 1; return yield; }();",
++	"'use strict'; return function () { var yield = 1; };",
++	"return async function () { var await = 1; };",
++	"return function () { var await = 1; return await; }();",
++	"return await 1;",
++	"return async () => await 1;",
++	"return async (x = await 1) => x;",
++	"return function* (x = yield) {};",
++	"return ({a: 1} = {});",
++	"({a} = {a: 1}); return a;",
++	"var a; ({a} = {a: 1}); return a;",
++	"return 1 = 2;",
++	"return ++1;",
++	"return 1++;",
++	"return a?.b = 1;",
++	"var a; a?.b++; return 1;",
++	"var a; return a?.b.c;",
++	"var a; return a?.[0];",
++	"var a = {}; return a?.();",
++	"var a; return a ?? 1 || 2;",
++	"var a; return (a ?? 1) || 2;",
++	"var a; return a || 1 ?? 2;",
++	"return -2 ** 2;",
++	"return (-2) ** 2;",
++	"return 2 ** -2;",
++	"return typeof 2 ** 2;",
++	"return 2 ** typeof 2;",
++	"for (let i, j of []) {} return 1;",
++	"for (let i = 0 of []) {} return 1;",
++	"for (let i = 0 in {}) {} return 1;",
++	"for (let of of []) {} return 1;",
++	"for (let of []) {} return 1;",
++	"for (let in {}) {} return 1;",
++	"for (async of []) {} return 1;",
++	"for (async of => 1; false;) {} return 1;",
++	"let let = 1; return let;",
++	"var let = 1; return let;",
++	"let [a] = [1]; return a;",
++	"let\n[a] = [1]; return a;",
++	"var let; let\n[a] = [1]; return a;",
++	"class A { constructor() {} constructor() {} } return 1;",
++	"class A { constructor() {} 'constructor'() {} } return 1;",
++	"class A { static constructor() {} constructor() {} } return typeof A.constructor;",
++	"class A { get constructor() {} } return 1;",
++	"class A { static prototype() {} } return 1;",
++	"class A { static 'prototype' = 1; } return 1;",
++	"class A { prototype() {} } return typeof A.prototype.prototype;",
++	"class A { #x; #x; } return 1;",
++	"class A { #x; m() { return this.#y; } } return 1;",
++	"class A { #x = 1; static m(o) { return #x in o; } } return [A.m(new A()), A.m({})];",
++	"class A { m() { return super.x; } } return new A().m();",
++	"class A { m() { super(); } } return 1;",
++	"class A extends Object { constructor() { super(); super(); } } return 1;",
++	"class A extends Object { constructor() { } } return new A();",
++	"class A { constructor() { super(); } } return 1;",
++	"function f() { super.x; } return 1;",
++	"return { m() { return super.x; } }.m();",
++	"return { m: function () { return super.x; } };",
++	"class A { static m() { return super.toString === Function.prototype.toString; } } return A.m();",
++	"return /(/;",
++	"return /a/gg;",
++	"return /a/x;",
++	"return /[/;",
++	"return /\\u{110000}/u;",
++	"return /\\u{10FFFF}/u.source;",
++	"return /\\1/.test('\\u0001');",
++	"return /\\1(a)/.exec('a');",
++	"return /(?<a>x)(?<a>y)/;",
++	"return /\\p{L}/.test('a');",
++	"return /\\p{L}/u.test('a');",
++	"return /\\p{Bogus}/u;",
++	"return /[\\d-z]/.test('-');",
++	"return /[\\d-z]/u;",
++	"return /a{2,1}/;",
++	"return /a{,2}/.test('a{,2}');",
++	"return /a{,2}/u;",
++	"return /\\-/u.test('-');",
++	"return /\\-/.test('-');",
++	"return /]/.test(']');",
++	"return /]/u;",
++	"return /{/.test('{');",
++	"return /}/u;",
++	"return /(?=a)+/.test('a');",
++	"return /(?=a)+/u;",
++	"return /(?<=a)+/;",
++	"return /\\k<a>/.test('k<a>');",
++	"return /\\k<a>/u;",
++	"return /\\k<a>(?<a>x)/.exec('x').length;",
++	"return /(?<a>x)\\k<b>/;",
++	"return new RegExp('a', 'gg');",
++	"return new RegExp('(', 'g');",
++	"return new RegExp('\\\\', '');",
++	"return new RegExp('').source;",
++	"return new RegExp('\\n').source;",
++	"return RegExp('a', undefined).flags;",
++	"return new RegExp(/a/g, 'i').flags;",
++	"return new RegExp(/a/g).flags;",
++	"return '\\u{110000}';",
++	"return '\\u{10FFFF}'.length;",
++	"return '\\u{}';",
++	"return '\\u{0000000041}';",
++	"return '\\x4';",
++	"return '\\u004';",
++	"return 'a\nb';",
++	"return 'a\\\nb';",
++	"return 'a\\\r\nb'.length;",
++	"return 'a\u2028b'.length;",
++	"return 'a\u2029b'.length;",
++	"return 0.5.toString();",
++	"return 1.toString();",
++	"return 1..toString();",
++	"return 1 .toString();",
++	"return 0x;",
++	"return 0b2;",
++	"return 0o8;",
++	"return 1_;",
++	"return 1__0;",
++	"return 0_1;",
++	"return 1_.5;",
++	"return 1._5;",
++	"return 1e_1;",
++	"return 0x_1;",
++	"return 1n_0;",
++	"return 1.5n;",
++	"return 1e3n;",
++	"return 01n;",
++	"return 0n;",
++	"return 0x1fn;",
++	"return 00n;",
++	"return 3in [];",
++	"return 3 in [];",
++	"return 1in [1, 2];",
++	"return 1.e1;",
++	"return .1e1;",
++	"return 1e;",
++	"return 1e+;",
++	"return 1a;",
++	"return 1\\u0061;",
++	"var \\u0061 = 1; return a;",
++	"var \\u{61} = 1; return a;",
++	"var a\\u200c = 1; return a\u200c;",
++	"var \\u0030 = 1;",
++	"var v\\u0061r = 1; return var;",
++	"var \\u0076ar = 1;",
++	"var v\\u{61}r = 1; return 1;",
++	"return typeof \\u0074his;",
++	"return { \\u0061: 1 }.a;",
++	"return { \\u{61}: 1 }.a;",
++	"var \u2118 = 1; return \u2118;",
++	"var a\u00b7 = 1; return a\u00b7;",
++	"var \u00b7 = 1;",
++	"var _\u200d = 1; return _\u200d;",
++	"var \u1885 = 1; return \u1885;",
++	"var \u212e = 1; return \u212e;",
++	"return\n1;",
++	"return 1\n+ 2;",
++	"var a = 1\n(function () {})\nreturn a;",
++	"var a = 1\n[1, 2].length\nreturn a;",
++	"var a = 1\n`x`\nreturn a;",
++	"var a = 1, b = 2\na\n++b\nreturn [a, b];",
++	"var a = 1, b = 2\na\n--\nb\nreturn [a, b];",
++	"var x = 1; x\n++\nreturn x;",
++	"var x = 1\nx\n++x\nreturn x;",
++	"let x = 1; x\n++\nx; return x;",
++	"var f = function () { return 1 }\n/1/g.test('1')\nreturn f;",
++	"var a = 1\n/2/\nreturn a;",
++	"var a = 1\n/ 2 /\n1\nreturn a;",
++	"'use strict'; if (true) function f() {} return 1;",
++	"if (true) let x = 1; return 1;",
++	"if (true) const x = 1; return 1;",
++	"if (true) var x = 1; return x;",
++	"if (true) class A {} return 1;",
++	"while (false) function f() {} return 1;",
++	"L: function f() {} return typeof f;",
++	"'use strict'; L: function f() {} return 1;",
++	"L: function* f() {} return 1;",
++	"L: class A {} return 1;",
++	"L: let x = 1; return 1;",
++	"L: let\nx = 1; return x;",
++	"L: async function f() {} return 1;",
++	"do function f() {} while (false); return 1;",
++	"do ; while (false) return 1;",
++	"do ; while (false); return 1;",
++	"do {} while (false) return 1;",
++	"do x = 1; while (false) var x; return x;",
++	"switch (1) { case 1: let x = 1; case 2: let x = 2; } return 1;",
++	"switch (1) { default: default: } return 1;",
++	"switch (1) { case 1: function f() {} case 2: function f() {} } return typeof f;",
++	"'use strict'; switch (1) { case 1: function f() {} case 2: function f() {} } return 1;",
++	"switch (1) { case 1: let f; case 2: function f() {} } return 1;",
++	"try {} catch (e) { let e; } return 1;",
++	"try {} catch ([e]) { var e; } return 1;",
++	"try {} catch (e) { for (var e of []) {} } return 1;",
++	"try {} catch (e) { for (var e in {}) {} } return 1;",
++	"try {} catch (e) { for (var e;;) { break; } } return 1;",
++	"try {} catch {} return 1;",
++	"try {} catch { let e = 1; return e; }",
++	"try {} finally {} return 1;",
++	"try {} return 1;",
++	"try { return 1; } finally { return 2; }",
++	"try { throw 1; } finally { return 2; }",
++	"try { return 1; } finally { }",
++	"L: try { break L; } finally { return 2; }",
++	"function f() { L: try { return 1; } finally { break L; } return 2; } return f();",
++	"function f() { for (var i = 0; i < 2; i++) { try { return i; } finally { continue; } } return 9; } return f();",
++	"function f() { try { throw 1; } catch (e) { return e; } finally { e = 2; } } return f();",
++	"return typeof (() => arguments)();",
++	"return (function () { return typeof (() => arguments)(); })();",
++	"return (function () { return (() => arguments)(1, 2).length; })(3, 4, 5);",
++	"return (function () { return (() => this)(); }).call(7);",
++	"return (function () { 'use strict'; return typeof this; }).call(undefined);",
++	"return (function () { return typeof this; }).call(undefined);",
++	"return (function () { return typeof this; }).call(1);",
++	"return (function () { 'use strict'; return typeof this; }).call(1);",
++	"function f() { 'use strict'; return this; } return f.call(null);",
++	"'use strict'; return (function () { return this; })();",
++	"'use strict'; return typeof (function () { return this; }).call(2);",
++	"return (() => { 'use strict'; return this; })() === this;",
++	"function f(a = 1) { 'use strict'; } return 1;",
++	"function f({a}) { 'use strict'; } return 1;",
++	"function f(...a) { 'use strict'; } return 1;",
++	"function f(a) { 'use strict'; return a; } return f(1);",
++	"var f = (a, a) => 1; return f();",
++	"var f = (a, ...a) => 1;",
++	"var f = (...a, b) => 1;",
++	"var f = (...a,) => 1;",
++	"var f = (a,) => a; return f(1);",
++	"var f = (,) => 1;",
++	"var f = () => {}; return f.prototype;",
++	"var f = () => {}; return new f();",
++	"var f = async () => {}; return typeof f.prototype;",
++	"var f = function* () {}; return typeof f.prototype;",
++	"var f = function* () {}; return new f();",
++	"var f = { m() {} }.m; return new f();",
++	"var f = { get m() {} }; return Object.getOwnPropertyDescriptor(f, 'm').get.prototype;",
++	"class A {} return new A;",
++	"class A {} return A();",
++	"class A {} A = 1; return 1;",
++	"class A { m() { A = 1; } } new A().m(); return 1;",
++	"const A = class B { m() { return B; } }; return new A().m() === A;",
++	"const A = class B { m() { B = 1; } }; new A().m(); return 1;",
++	"var f = function g() { g = 1; return typeof g; }; return f();",
++	"var f = function g() { 'use strict'; g = 1; }; return f();",
++	"function f() { f = 1; return typeof f; } return f();",
++	"return typeof f; function f() {}",
++	"return f(); function f() { return 2; }",
++	"return typeof g; var g = 1;",
++	"return x; let x = 1;",
++	"return typeof x; let x = 1;",
++	"'use strict'; { function f() { return 1; } } return typeof f;",
++	"{ let f = 1; { function f() {} } } return 1;",
++	"{ function f() {} let f; } return 1;",
++	"{ function f() {} function f() {} } return 1;",
++	"'use strict'; { function f() {} function f() {} } return 1;",
++	"function f() {} function f() {} return 1;",
++	"{ function f() {} var f; } return 1;",
++	"function f() {} var f; return typeof f;",
++	"function f() {} let f; return 1;",
++	"var f; function f() {} return typeof f;",
++	"{ let x; var x; } return 1;",
++	"{ var x; let x; } return 1;",
++	"{ var x; } let x; return 1;",
++	"function g(x) { var x; return x; } return g(1);",
++	"function g(x) { let x; return x; } return 1;",
++	"function g(x) { { let x = 2; } return x; } return g(1);",
++	"function g(x = y, y) { return x; } return g();",
++	"function g(x = y, y) { return x; } return g(1, 2);",
++	"function g(a = eval('var z = 1; z')) { return a; } return g();",
++	"function g(a = () => b, b) { return a(); } return g(undefined, 2);",
++	"function g(a, b = a) { var a = 3; return [a, b]; } return g(1);",
++	"function g(a, b = arguments.length) { return b; } return g(1, undefined, 3);",
++	"function g(a = 1) { return arguments.length; } return g();",
++	"function g() { return arguments.length; } return g(...[1, 2], ...'ab');",
++	"function g(a, b) { arguments[0] = 9; return a; } return g(1, 2);",
++	"function g(a, b = 0) { arguments[0] = 9; return a; } return g(1, 2);",
++	"function g(a, b) { 'use strict'; arguments[0] = 9; return a; } return g(1, 2);",
++	"function g(a, b) { a = 9; return arguments[0]; } return g(1, 2);",
++	"function g(a) { a = 9; return arguments[0]; } return g();",
++	"function g(a) { delete arguments[0]; a = 9; return arguments[0]; } return g(1);",
++	"function g() { return arguments.callee === g; } return g();",
++	"function g() { 'use strict'; return arguments.callee; } return g();",
++	"function g() { return typeof arguments.caller; } return g();",
++	"function g() { return Object.prototype.toString.call(arguments); } return g();",
++	"function g() { return arguments[Symbol.iterator] === Array.prototype.values; } return g();",
++	"function g() { return [...arguments]; } return g(1, 2);",
++	"function g() { return Object.keys(arguments); } return g(1, 2);",
++	"function g() { return JSON.stringify(arguments); } return g(1, 2);",
++	"function g() { return arguments.length; } return g.length;",
++	"return ((a, b = 1, c) => 0).length;",
++	"return ((a, ...b) => 0).length;",
++	"return (function ({a}, [b]) {}).length;",
++	"return Math.max.length;",
++	"return [].reduce.length;",
++	"return Array.prototype.concat.length;",
++	"return Object.assign.length;",
++	"return String.prototype.replace.length;",
++	"return Function.prototype.call.length;",
++	"return Function.prototype.apply.length;",
++	"return Function.prototype.bind.length;",
++	"return Array.from.length;",
++	"return Date.UTC.length;",
++	"return parseInt.length;",
++	"return JSON.stringify.length;",
++	"return Math.hypot.length;",
++	"return String.fromCharCode.length;",
++	"return Symbol.length;",
++	"return Promise.length;",
++	"return Map.length;",
++	"return Proxy.length;",
++	"return Reflect.apply.length;",
++	"return Object.getOwnPropertyNames(() => 1).sort();",
++	"return Object.getOwnPropertyNames(class {}).sort();",
++	"return Object.getOwnPropertyNames(function* () {}).sort();",
++	"return Object.getOwnPropertyNames(Math.max).sort();",
++	"return Object.getOwnPropertyNames((function () {}).bind()).sort();",
++	"return (function () {}).bind().name;",
++	"return (function f() {}).bind().name;",
++	"return (() => 1).name;",
++	"var f = () => 1; return f.name;",
++	"var o = { f: () => 1, ['x' + 1]: function () {}, [Symbol('s')]: () => 0, 1: () => 0 }; return [o.f.name, o.x1.name, o[1].name, o[Object.getOwnPropertySymbols(o)[0]].name];",
++	"var o = { get a() {}, set a(v) {} }; var d = Object.getOwnPropertyDescriptor(o, 'a'); return [d.get.name, d.set.name];",
++	"class A { static m() {} get g() {} #p() {} static q() { return new A().#p.name; } } return [A.m.name, A.name, Object.getOwnPropertyDescriptor(A.prototype, 'g').get.name, A.q()];",
++	"var A = class {}; var B = class C {}; return [A.name, B.name, (class {}).name, (class { static name = 'x'; }).name, (class { static name() {} }).name.length];",
++	"var f = function () {}; var g = f; return [f.name, g.name, (0, function () {}).name, [function () {}][0].name];",
++	"var [f = function () {}] = []; var {g = () => 0} = {}; return [f.name, g.name];",
++	"var f; f = function () {}; var g; g ??= () => 0; var h; h ||= class {}; return [f.name, g.name, h.name];",
++	"var o = {}; o.f = function () {}; o['g'] = () => 0; return [o.f.name, o.g.name];",
++	"return Object.getOwnPropertyDescriptor(function f() {}, 'name');",
++	"return Object.getOwnPropertyDescriptor(function f() {}, 'length');",
++	"return Object.getOwnPropertyDescriptor(function f() {}, 'prototype');",
++	"return Object.getOwnPropertyDescriptor(class {}, 'prototype');",
++	"return Object.getOwnPropertyDescriptor((class {}).prototype, 'constructor');",
++	"return Object.getOwnPropertyDescriptor(Math, 'PI');",
++	"return Object.getOwnPropertyDescriptor(Array.prototype, 'length');",
++	"return Object.getOwnPropertyDescriptor([1, 2], 'length');",
++	"return Object.getOwnPropertyDescriptor('ab', 'length');",
++	"return Object.getOwnPropertyDescriptor('ab', '0');",
++	"return Object.getOwnPropertyDescriptor('ab', 1);",
++	"return Object.getOwnPropertyDescriptor(/a/g, 'lastIndex');",
++	"return Object.getOwnPropertyDescriptor(Symbol, 'iterator');",
++	"return Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get.name;",
++	"return Object.getOwnPropertyDescriptor(Object.prototype, '__proto__').set.name;",
++	"return Object.getOwnPropertyDescriptor(Array.prototype, Symbol.unscopables).value.flat;",
++	"return Object.getOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance);",
++	"return Object.getOwnPropertyNames(Function.prototype).sort();",
++	"return Object.getOwnPropertyNames(Array.prototype).sort();",
++	"return Object.getOwnPropertyNames(Number.prototype).sort();",
++	"return Object.getOwnPropertyNames(Reflect).sort();",
++	"return Object.getOwnPropertyNames(Number).sort();",
++	"return Object.getOwnPropertyNames(String).sort();",
++	"return Object.getOwnPropertyNames(Map.prototype).sort();",
++	"return Object.getOwnPropertyNames(Error.prototype).sort();",
++	"return Object.getOwnPropertyNames(Object.getPrototypeOf(function* () {})).sort();",
++	"return Object.getOwnPropertyNames(Object.getPrototypeOf([][Symbol.iterator]())).sort();",
++	"return Object.getOwnPropertyNames(Object.getPrototypeOf(''[Symbol.iterator]())).sort();",
++	"return Object.getOwnPropertyNames(Object.getPrototypeOf(new Map().entries())).sort();",
++	"return typeof globalThis;",
++	"return typeof globalThis.globalThis;",
++	"return this === globalThis;",
++	"return typeof this;",
++	"'use strict'; return typeof this;",
++	"return typeof escape;",
++	"return typeof unescape;",
++	"return escape('a b\\u00e9\\u{1F600}+/@*_-.');",
++	"return unescape('%u00e9%41%zz%');",
++	"return typeof String.prototype.substr;",
++	"return typeof RegExp.prototype.compile;",
++	"return typeof Array.prototype.at;",
++	"return typeof Array.prototype.findLast;",
++	"return typeof Array.prototype.toSorted;",
++	"return typeof Array.prototype.with;",
++	"return typeof String.prototype.at;",
++	"return typeof String.prototype.replaceAll;",
++	"return typeof String.prototype.matchAll;",
++	"return typeof Promise.any;",
++	"return typeof Promise.allSettled;",
++	"return typeof Object.hasOwn;",
++	"return typeof Object.fromEntries;",
++	"return Object.keys(new Error('x'));",
++	"return new Error('x', {cause: 0}).cause;",
++	"return 'cause' in new Error('x', {cause: undefined});",
++	"return 'cause' in new Error('x', {});",
++	"return new Error(undefined).hasOwnProperty('message');",
++	"return new Error().hasOwnProperty('message');",
++	"return new Error('').hasOwnProperty('message');",
++	"return Error('x') instanceof Error;",
++	"return Error.prototype.name;",
++	"return Error.prototype.message;",
++	"return TypeError.prototype.name;",
++	"return Object.getPrototypeOf(TypeError) === Error;",
++	"return Object.getPrototypeOf(TypeError.prototype) === Error.prototype;",
++	"return Object.prototype.toString.call(new TypeError());",
++	"return Object.prototype.toString.call(TypeError.prototype);",
++	"return Object.prototype.toString.call(Error.prototype);",
++	"return new TypeError('m').toString();",
++	"return Error.prototype.toString.call({name: 'N', message: 'M'});",
++	"return Error.prototype.toString.call({name: undefined, message: undefined});",
++	"return Error.prototype.toString.call({name: '', message: 'M'});",
++	"return Error.prototype.toString.call({name: 'N', message: ''});",
++	"return Error.prototype.toString.call(1);",
++	"return AggregateError.prototype.name;",
++	"return new AggregateError([1, 2], 'm').errors;",
++	"return new AggregateError('ab').errors;",
++	"return new AggregateError([]).message;",
++	"return Object.getPrototypeOf(AggregateError) === Error;",
++}
+diff --git a/hegel_oracle_test.go b/hegel_oracle_test.go
+new file mode 100644
+index 0000000..464c2e7
+--- /dev/null
++++ b/hegel_oracle_test.go
+@@ -0,0 +1,381 @@
++package goja_test
++
++// The reference engine (node) as a child process running a small driver:
++// one program per request (a line with the byte length, then the bytes),
++// one reply per program (a status line - ok, compile, throw or timeout -
++// then a line with the byte length of the payload and the payload). Each
++// program is the body of a function run in a fresh context; the payload is
++// the value it returns (or throws), serialised by serSrc, a piece of plain
++// ES5 that both engines run in the same fresh context before the program:
++//
++//	undefined, null, true, false; numbers by Number.prototype.toString
++//	(spec-exact), with -0 kept; strings quoted with every code unit outside
++//	printable ASCII escaped as \uXXXX; arrays as [a,b,<hole>] plus their
++//	other own enumerable keys; objects as {"k":v,...} in own-key order
++//	(spec-defined); errors by name only (messages are the engine's own);
++//	dates by their time value; regexps by source, flags and lastIndex;
++//	maps and sets by contents in insertion order; wrapper objects by tag
++//	and value; functions by their length; <cycle> and <deep> for the rest.
++
++import (
++	"bufio"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"runtime/debug"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/dop251/goja"
++)
++
++const serSrc = `var __ser = (function () {
++  'use strict';
++  var toStr = Object.prototype.toString, hasOwn = Object.prototype.hasOwnProperty, keysOf = Object.keys,
++      isArray = Array.isArray, numToStr = Number.prototype.toString, charCode = String.prototype.charCodeAt,
++      strSlice = String.prototype.slice, arrJoin = Array.prototype.join, arrPush = Array.prototype.push,
++      arrIndexOf = Array.prototype.indexOf, getTime = Date.prototype.getTime, Str = String,
++      mapForEach = typeof Map === 'function' ? Map.prototype.forEach : null,
++      setForEach = typeof Set === 'function' ? Set.prototype.forEach : null,
++      numValue = Number.prototype.valueOf, strValue = String.prototype.valueOf, boolValue = Boolean.prototype.valueOf;
++  function fmtNum(n) {
++    if (n !== n) return 'NaN';
++    if (n === 0 && 1 / n < 0) return '-0';
++    return numToStr.call(n);
++  }
++  function fmtStr(s) {
++    var out = '"';
++    for (var i = 0; i < s.length; i++) {
++      var c = charCode.call(s, i);
++      if (c < 32 || c > 126 || c === 34 || c === 92) {
++        out += '\\u' + strSlice.call('0000' + numToStr.call(c, 16), -4);
++      } else {
++        out += s[i];
++      }
++    }
++    return out + '"';
++  }
++  function isIndex(k, len) {
++    if (k.length === 0 || k.length > 10) return false;
++    for (var i = 0; i < k.length; i++) {
++      var c = charCode.call(k, i);
++      if (c < 48 || c > 57) return false;
++    }
++    if (k.length > 1 && k[0] === '0') return false;
++    return +k < len;
++  }
++  function ser(v, seen, depth) {
++    switch (typeof v) {
++      case 'undefined': return 'undefined';
++      case 'boolean': return v ? 'true' : 'false';
++      case 'number': return fmtNum(v);
++      case 'string': return fmtStr(v);
++      case 'bigint': return Str(v) + 'n';
++      case 'symbol': return '<symbol ' + fmtStr(Str(v)) + '>';
++      case 'function': return '<function ' + fmtNum(v.length) + '>';
++    }
++    if (v === null) return 'null';
++    if (arrIndexOf.call(seen, v) >= 0) return '<cycle>';
++    if (depth > 6) return '<deep>';
++    arrPush.call(seen, v);
++    var tag = toStr.call(v), out, parts = [], i, keys;
++    if (isArray(v)) {
++      for (i = 0; i < v.length; i++) {
++        arrPush.call(parts, hasOwn.call(v, i) ? prop(v, i, seen, depth) : '<hole>');
++      }
++      keys = keysOf(v);
++      for (i = 0; i < keys.length; i++) {
++        if (!isIndex(keys[i], v.length)) arrPush.call(parts, fmtStr(keys[i]) + ':' + prop(v, keys[i], seen, depth));
++      }
++      out = '[' + arrJoin.call(parts, ',') + ']';
++    } else if (tag === '[object Error]') {
++      out = '<Error ' + fmtStr(Str(v.name)) + '>';
++    } else if (tag === '[object Date]') {
++      out = '<date ' + fmtNum(getTime.call(v)) + '>';
++    } else if (tag === '[object RegExp]') {
++      out = '<regexp ' + fmtStr(Str(v.source)) + ' ' + fmtStr(Str(v.flags)) + ' ' + fmtNum(v.lastIndex) + '>';
++    } else if (tag === '[object Map]') {
++      mapForEach.call(v, function (val, key) { arrPush.call(parts, ser(key, seen, depth + 1) + '=>' + ser(val, seen, depth + 1)); });
++      out = '<map ' + arrJoin.call(parts, ',') + '>';
++    } else if (tag === '[object Set]') {
++      setForEach.call(v, function (val) { arrPush.call(parts, ser(val, seen, depth + 1)); });
++      out = '<set ' + arrJoin.call(parts, ',') + '>';
++    } else if (tag === '[object Number]') {
++      out = '<Number ' + fmtNum(numValue.call(v)) + '>';
++    } else if (tag === '[object String]') {
++      out = '<String ' + fmtStr(strValue.call(v)) + '>';
++    } else if (tag === '[object Boolean]') {
++      out = '<Boolean ' + (boolValue.call(v) ? 'true' : 'false') + '>';
++    } else {
++      keys = keysOf(v);
++      for (i = 0; i < keys.length; i++) {
++        arrPush.call(parts, fmtStr(keys[i]) + ':' + prop(v, keys[i], seen, depth));
++      }
++      out = (tag === '[object Object]' || tag === '[object Arguments]' ? '' : '<' + tag + '>') + '{' + arrJoin.call(parts, ',') + '}';
++    }
++    seen.length--;
++    return out;
++  }
++  // prop is ser of v[k]; a getter that throws gives <throws "Name">.
++  function prop(v, k, seen, depth) {
++    var x;
++    try {
++      x = v[k];
++    } catch (e) {
++      return '<throws ' + fmtStr(Str(e && e.name)) + '>';
++    }
++    return ser(x, seen, depth + 1);
++  }
++  return function (v) { return ser(v, [], 0); };
++})();
++`
++
++const nodeDriver = `'use strict';
++const vm = require('vm');
++const SER = process.env.HEGEL_SER_SRC;
++let buf = Buffer.alloc(0);
++function reply(status, payload) {
++  process.stdout.write(status + '\n' + Buffer.byteLength(payload) + '\n' + payload);
++}
++function run(src) {
++  const ctx = vm.createContext({});
++  vm.runInContext(SER, ctx, { filename: 'ser' });
++  let script;
++  try {
++    script = new vm.Script('(function () {\n' + src + '\n})()', { filename: 'snip' });
++  } catch (e) {
++    reply('compile', '<Error ' + JSON.stringify(String(e && e.name)) + '>');
++    return;
++  }
++  const ser = ctx.__ser;
++  let v;
++  try {
++    v = script.runInContext(ctx, { timeout: 5000 });
++  } catch (e) {
++    if (e && e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
++      reply('timeout', '');
++      return;
++    }
++    let p;
++    try { p = ser(e); } catch (e2) { p = '<unserialisable>'; }
++    reply('throw', p);
++    return;
++  }
++  let p;
++  try { p = ser(v); } catch (e2) { p = '<unserialisable>'; }
++  reply('ok', p);
++}
++function pump() {
++  for (;;) {
++    const nl = buf.indexOf(10);
++    if (nl < 0) return;
++    const len = parseInt(buf.slice(0, nl).toString('latin1'), 10);
++    if (buf.length < nl + 1 + len) return;
++    const src = buf.slice(nl + 1, nl + 1 + len).toString('utf8');
++    buf = buf.slice(nl + 1 + len);
++    run(src);
++  }
++}
++process.stdout.write('node driver ' + process.version + '\n');
++process.stdin.on('data', (d) => { buf = Buffer.concat([buf, d]); pump(); });
++process.stdin.on('end', () => process.exit(0));
++`
++
++type jsResult struct {
++	Status  string // ok, compile, throw, timeout (and, for goja, panic)
++	Payload string
++}
++
++var (
++	oracleOnce   sync.Once
++	oracleMu     sync.Mutex
++	oracleIn     io.WriteCloser
++	oracleOut    *bufio.Reader
++	oracleErr    error
++	oracleBanner string
++	oracleCmd    *exec.Cmd
++	oracleStderr strings.Builder
++)
++
++func startOracle() {
++	cmd := exec.Command("node", "-e", nodeDriver)
++	cmd.Env = append(os.Environ(), "HEGEL_SER_SRC="+serSrc, "TZ=UTC")
++	stdin, err := cmd.StdinPipe()
++	if err != nil {
++		oracleErr = err
++		return
++	}
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		oracleErr = err
++		return
++	}
++	cmd.Stderr = &oracleStderr
++	oracleCmd = cmd
++	if err := cmd.Start(); err != nil {
++		oracleErr = fmt.Errorf("starting node: %v", err)
++		return
++	}
++	oracleIn = stdin
++	oracleOut = bufio.NewReaderSize(stdout, 1<<20)
++	banner, err := oracleOut.ReadString('\n')
++	if err != nil {
++		_ = cmd.Wait()
++		oracleErr = fmt.Errorf("node driver did not start (node needed on PATH): %v: %s", err, oracleStderr.String())
++		return
++	}
++	oracleBanner = strings.TrimSpace(banner)
++}
++
++// nodeRun runs one program (a function body) in the reference engine.
++func nodeRun(t testing.TB, src string) jsResult {
++	oracleOnce.Do(startOracle)
++	if oracleErr != nil {
++		t.Fatalf("oracle: %v", oracleErr)
++	}
++	oracleMu.Lock()
++	defer oracleMu.Unlock()
++	if _, err := fmt.Fprintf(oracleIn, "%d\n%s", len(src), src); err != nil {
++		_ = oracleCmd.Wait()
++		t.Fatalf("oracle write: %v\nstderr: %s", err, oracleStderr.String())
++	}
++	readLine := func() string {
++		line, err := oracleOut.ReadString('\n')
++		if err != nil {
++			_ = oracleCmd.Wait()
++			t.Fatalf("oracle died: %v\nprogram: %q\nstderr: %s", err, src, oracleStderr.String())
++		}
++		return strings.TrimSuffix(line, "\n")
++	}
++	status := readLine()
++	size, err := strconv.Atoi(readLine())
++	if err != nil {
++		t.Fatalf("oracle reply: bad length: %v", err)
++	}
++	buf := make([]byte, size)
++	if _, err := io.ReadFull(oracleOut, buf); err != nil {
++		t.Fatalf("oracle payload: %v", err)
++	}
++	return jsResult{Status: status, Payload: string(buf)}
++}
++
++// ---------------------------------------------------------------------------
++// goja side.
++
++// shortStack keeps the goja frames of a panic's stack.
++func shortStack(b []byte) string {
++	var keep []string
++	lines := strings.Split(string(b), "\n")
++	for i := 0; i+1 < len(lines); i++ {
++		if strings.Contains(lines[i], "goja.") && !strings.Contains(lines[i], "_test.") {
++			keep = append(keep, strings.TrimSpace(lines[i])+" "+strings.TrimSpace(lines[i+1]))
++		}
++		if len(keep) == 6 {
++			break
++		}
++	}
++	return strings.Join(keep, "\n")
++}
++
++// traceFile, when HEGEL_TRACE names a file, receives every program before
++// it runs in goja: the last one written is the one that killed the process
++// when it dies without a stack (out of memory).
++var traceFile = func() *os.File {
++	if p := os.Getenv("HEGEL_TRACE"); p != "" {
++		f, _ := os.Create(p)
++		return f
++	}
++	return nil
++}()
++
++func fmtErrName(name string) string { return `<Error "` + name + `">` }
++
++// gojaRun runs one program (a function body) in a fresh goja runtime, the
++// same way the driver does. A panic in goja gives the status "panic" with
++// the message and stack as the payload; a run that does not finish within
++// the deadline gives "timeout".
++func gojaRun(src string) (res jsResult) {
++	if traceFile != nil {
++		traceFile.Truncate(0)
++		traceFile.Seek(0, 0)
++		traceFile.WriteString(src)
++		traceFile.Sync()
++	}
++	defer func() {
++		if r := recover(); r != nil {
++			res = jsResult{Status: "panic", Payload: fmt.Sprintf("%v\n%s", r, shortStack(debug.Stack()))}
++		}
++	}()
++	rt := goja.New()
++	if _, err := rt.RunScript("ser", serSrc); err != nil {
++		panic("serialiser: " + err.Error())
++	}
++	serFn, ok := goja.AssertFunction(rt.Get("__ser"))
++	if !ok {
++		panic("serialiser is not a function")
++	}
++	ser := func(v goja.Value) string {
++		out, err := serFn(goja.Undefined(), v)
++		if err != nil {
++			return "<unserialisable>"
++		}
++		return out.String()
++	}
++	prg, err := goja.Compile("snip", "(function () {\n"+src+"\n})()", false)
++	if err != nil {
++		name := "SyntaxError"
++		if _, ok := err.(*goja.CompilerReferenceError); ok {
++			name = "ReferenceError"
++		}
++		return jsResult{Status: "compile", Payload: fmtErrName(name)}
++	}
++	timer := time.AfterFunc(10*time.Second, func() { rt.Interrupt("timeout") })
++	v, err := rt.RunProgram(prg)
++	timer.Stop()
++	if err != nil {
++		switch e := err.(type) {
++		case *goja.InterruptedError:
++			return jsResult{Status: "timeout", Payload: ""}
++		case *goja.Exception:
++			return jsResult{Status: "throw", Payload: ser(e.Value())}
++		case *goja.StackOverflowError:
++			return jsResult{Status: "throw", Payload: ser(e.Value())}
++		}
++		return jsResult{Status: "throw", Payload: "<go error " + err.Error() + ">"}
++	}
++	return jsResult{Status: "ok", Payload: ser(v)}
++}
++
++func TestHegelOracleVersion(t *testing.T) {
++	const smoke = `var o = {b: 1, 2: "two", a: [1, , -0, 1e21, 0.1 + 0.2]}; o.self = o; return [o, "aé\"", null, undefined, new Date(0), /x+/gi, new Map([[1, {}]]), 10n ** 20n, function (a, b) {}]`
++	r := nodeRun(t, smoke)
++	t.Logf("%s", oracleBanner)
++	if !strings.Contains(oracleBanner, "node driver v") {
++		t.Fatalf("the oracle should be node: %s", oracleBanner)
++	}
++	want := `[{"2":"two","b":1,"a":[1,<hole>,-0,1e+21,0.30000000000000004],"self":<cycle>},"a\u00e9\u0022",null,undefined,<date 0>,<regexp "x+" "gi" 0>,<map 1=>{}>,100000000000000000000n,<function 2>]`
++	if r.Status != "ok" || r.Payload != want {
++		t.Fatalf("oracle smoke test: %+v", r)
++	}
++	g := gojaRun(smoke)
++	if g.Status != "ok" || g.Payload != want {
++		t.Fatalf("goja smoke test: %+v", g)
++	}
++	for _, p := range []struct{ src, status, payload string }{
++		{"return }", "compile", `<Error "SyntaxError">`},
++		{"throw new TypeError('x')", "throw", `<Error "TypeError">`},
++		{"return [][0].x", "throw", `<Error "TypeError">`},
++		{"throw 5", "throw", "5"},
++	} {
++		if r := nodeRun(t, p.src); r.Status != p.status || r.Payload != p.payload {
++			t.Errorf("node %q: %+v", p.src, r)
++		}
++		if g := gojaRun(p.src); g.Status != p.status || g.Payload != p.payload {
++			t.Errorf("goja %q: %+v", p.src, g)
++		}
++	}
++}
+diff --git a/hegel_pins_test.go b/hegel_pins_test.go
+new file mode 100644
+index 0000000..4912df8
+--- /dev/null
++++ b/hegel_pins_test.go
+@@ -0,0 +1,159 @@
++package goja_test
++
++// One plain test per recorded bug (bugs.toml): each fails at the pinned
++// commit and passes once the bug is fixed.
++
++import "testing"
++
++// pin runs a program in goja and in node and fails on any difference.
++func pin(t *testing.T, src string) {
++	t.Helper()
++	g := gojaRun(src)
++	r := nodeRun(t, src)
++	if g.Status != r.Status || g.Payload != r.Payload {
++		t.Fatalf("program:\n%s\ngoja: %s %s\nnode: %s %s", src, g.Status, cut(g.Payload), r.Status, cut(r.Payload))
++	}
++}
++
++// goja/1
++func TestHegelPinArrowArguments(t *testing.T) {
++	pin(t, `return (function () { return (() => arguments)(1, 2).length; })(3, 4, 5);`)
++}
++
++// goja/1 (the crash)
++func TestHegelPinArrowArgumentsPanics(t *testing.T) {
++	pin(t, `return (function () { return (() => arguments.length)(); })(3, 4, 5);`)
++}
++
++// goja/2
++func TestHegelPinStrictOctalEscape(t *testing.T) {
++	pin(t, `'use strict'; return ['\1', '\101', '\08', '\8'];`)
++}
++
++// goja/3
++func TestHegelPinParseIntNegativeZero(t *testing.T) {
++	pin(t, `return [1 / parseInt('-0'), 1 / parseInt('-0', 10), 1 / parseInt(' -00 '), 1 / parseInt('-0x0')];`)
++}
++
++// goja/4
++func TestHegelPinISOExtendedYear(t *testing.T) {
++	pin(t, `return [new Date(Date.UTC(-1, 0)).toISOString(), new Date(Date.UTC(10000, 0)).toJSON(), new Date(Date.UTC(99999, 0)).toISOString(), new Date(Date.UTC(-100000, 0)).toISOString()];`)
++}
++
++// goja/5
++func TestHegelPinRegExpLineTerminators(t *testing.T) {
++	pin(t, `return ['a b'.replace(/./g, 'x'), /./.test(' '), /^b/m.test('a\rb'), /^b/m.test('a b'), /a$/m.test('a b'), 'a b'.split(/^/m)];`)
++}
++
++// goja/6
++func TestHegelPinLoneSurrogateCase(t *testing.T) {
++	pin(t, `return ['\uD800'.toUpperCase().charCodeAt(0), '\uDC00'.toLowerCase().charCodeAt(0), 'a\uD800b'.toUpperCase(), '\uD800'.normalize().charCodeAt(0), '\uDE00\uD83D'.toUpperCase().charCodeAt(0)];`)
++}
++
++// goja/7
++func TestHegelPinToInt32Large(t *testing.T) {
++	pin(t, `return [1e21 | 0, ~1e21, 1e21 >>> 0, 1e19 | 0, -1e21 | 0, 9.3e18 | 0, 1e21 & 0xff, Math.imul(1e21, 1), Math.clz32(1e21), 1e21 >> 0];`)
++}
++
++// goja/8
++func TestHegelPinLabelledFunction(t *testing.T) {
++	pin(t, `L: function f() { return 1; } return f();`)
++}
++
++// goja/9
++func TestHegelPinUnicodeRegExpSyntax(t *testing.T) {
++	pin(t, `var r = []; for (var p of ['\\-', '\\a', '\\_', '\\1', '(a)\\2', 'a{', ']', '[\\d-z]', '\\x4', '\\u004', '\\00', '(?=a)+', '\\p{Bogus}']) { try { new RegExp(p, 'u'); r.push('ok'); } catch (e) { r.push(e.name); } } return r;`)
++}
++
++// goja/10
++func TestHegelPinDuplicateGroupNames(t *testing.T) {
++	pin(t, `var r = []; for (var f of ['', 'u']) { try { new RegExp('(?<a>x)(?<a>y)', f); r.push('ok'); } catch (e) { r.push(e.name); } } return r;`)
++}
++
++// goja/11
++func TestHegelPinQuantifiedLookbehind(t *testing.T) {
++	pin(t, `var r = []; for (var f of ['', 'u']) { try { new RegExp('(?<=a)+', f); r.push('ok'); } catch (e) { r.push(e.name); } } return r;`)
++}
++
++// goja/13
++func TestHegelPinDeleteNew(t *testing.T) {
++	pin(t, `return [delete new Set([1]), delete new Map(), delete (new Object()), typeof (delete new Set())];`)
++}
++
++// goja/14
++func TestHegelPinMulNegZero(t *testing.T) {
++	pin(t, `var z = 0, m = -5, v = 0; v *= -5; return [1 / (-5 * 0), 1 / (-5 * z), 1 / (z * -5), 1 / (m * z), 1 / (-2 * 0), 1 / (0 * -1e10), 1 / v, Object.is(-5 * z, -0), Math.atan2(-5 * z, -1), 1 / (-1 * 0), 1 / (-5.5 * z)];`)
++}
++
++// goja/15
++func TestHegelPinUnicodeProperty(t *testing.T) {
++	pin(t, `return [/\p{L}/u.test('a'), /\p{Lu}/u.test('H'), /\p{Lu}/u.exec('Hello'), 'Hello'.match(/\p{Lu}/gu), /\p{N}/u.test('1'), /\P{L}/u.test('1'), /\p{Script=Greek}/u.test('α'), /[\p{Lu}]/u.test('H'), /^\p{Lu}$/u.test('H'), 'Hello'.replace(/\p{Ll}/gu, '_')];`)
++}
++
++// goja/16
++func TestHegelPinGlobalEmptyMatch(t *testing.T) {
++	pin(t, `return ['ab'.match(/a|/g), 'xa'.match(/a|/g), 'aXa'.match(/a?/g), 'aXa'.match(/a*/g), 'ab'.replace(/a|/g, '-'), 'ab'.replaceAll(/a*/g, '-'), 'xa'.replace(/a|/g, '-'), 'abc'.match(/b?/g), 'ab'.match(/(?:)/g), [...'ab'.matchAll(/a|/g)].length];`)
++}
++
++// goja/17
++func TestHegelPinExecKeyOrder(t *testing.T) {
++	pin(t, `return [Object.keys(/a/.exec('a')), Object.keys('a'.match(/a/)), Object.keys(/(?<n>a)/.exec('a')), Object.keys(/a/.exec('a')).join()];`)
++}
++
++// goja/18
++func TestHegelPinUnterminatedClass(t *testing.T) {
++	pin(t, "var r = /[/; return typeof r;")
++}
++
++// goja/19 (the "Compiler bug" SyntaxError inside a function; at the top
++// level of a script the plain `for (const a of 'x') { if (false) continue; }`
++// panics, and the hanging shape, a while loop inside the for-of, cannot be
++// pinned)
++func TestHegelPinConstantContinue(t *testing.T) {
++	pin(t, `for (const a in 'x') { if (false) { for (const b of a) { { let c; } if (false) continue; } } } return 1;`)
++}
++
++// goja/20
++func TestHegelPinFromEntriesPanic(t *testing.T) {
++	pin(t, `try { return [Object.fromEntries([[]]), Object.fromEntries([{}]), Object.fromEntries([[1]])]; } catch (e) { return e.name; }`)
++}
++
++// goja/22
++func TestHegelPinASCIICaseFold(t *testing.T) {
++	pin(t, `return [/\u212A/i.test('k'), /k/i.test('\u212A'), /\u017F/i.test('s'), /s/i.test('\u017F'), /\u1E9E/i.test('\u00DF'), /\u212B/i.test('\u00E5'), /[a-z]/i.test('\u212A'), /[\s\S]()\u0130/ig.test('undefined')];`)
++}
++
++// goja/21
++func TestHegelPinRelationalChain(t *testing.T) {
++	pin(t, `var r = [3 > 2 > 1, 1 < 2 < 3, 1 < 2 > 0, 2 > 1 in {}]; try { r.push(1 in {} in {}, [] instanceof Array instanceof Boolean); } catch (e) { r.push(e.name); } return r;`)
++}
++
++// goja/23
++func TestHegelPinCodePointEscapePanic(t *testing.T) {
++	pin(t, `return ['\u{10FFFF}'.length, '\u{10FFFF}'.codePointAt(0), '\u{10FFFE}'.length];`)
++}
++
++// goja/24
++func TestHegelPinNonASCIIWhiteSpaceToNumber(t *testing.T) {
++	pin(t, `return ['\u00A0' == 0, '\uFEFF' == 0, '\u00A01' == 1, Math.trunc('\u00A0'), Math.trunc(['\u00A0']), Math.max('\u2003'), isNaN('\u00A0'), Math.floor('\u3000'), Math.trunc('\u2028'), Number('\u00A0'), +'\u00A0'];`)
++}
++
++// goja/25
++func TestHegelPinRestParamUseStrict(t *testing.T) {
++	pin(t, `function f(...a) { 'use strict'; return a; } return f(1);`)
++}
++
++// goja/26
++func TestHegelPinDeleteNoEval(t *testing.T) {
++	pin(t, `var v = 1, w = 0; var o = {a: 1}; var d = [delete (v++), delete (w = 5), delete (o.a += 1), delete [v++], delete (0, v++)]; return [v, w, o.a, d];`)
++}
++
++// goja/27
++func TestHegelPinFunctionKeyOrder(t *testing.T) {
++	pin(t, `'use strict'; return [Object.getOwnPropertyNames(function (a) {}), Reflect.ownKeys(function* () {}), Object.getOwnPropertyNames(class {})];`)
++}
++
++// goja/12
++func TestHegelPinJSONNumberRange(t *testing.T) {
++	pin(t, `var r = []; for (var s of ['1e400', '-1e400', '[1e400]', '1.7976931348623159e308', '{"a": 1e999}']) { try { r.push(JSON.parse(s)); } catch (e) { r.push(e.name); } } return r;`)
++}
+diff --git a/hegel_probes_test.go b/hegel_probes_test.go
+new file mode 100644
+index 0000000..0885b95
+--- /dev/null
++++ b/hegel_probes_test.go
+@@ -0,0 +1,50 @@
++package goja_test
++
++// probes are fixed programs over the corners of the language and the
++// built-ins; each must give the same result in goja and in node.
++var probes = []string{
++	"return [0.1 + 0.2, 1 / 3, 1e21, 1e-7, 123456789012345680000, 0.000001, 1e300 * 10, -1e-323, 5e-324 / 2, 2 ** 53 + 1, 0.1 * 3, 100 / 3, 1 / 7, 4.35 * 100, 1.005 * 1000];",
++	"return [(0.1).toFixed(20), (1e21).toFixed(2), (1.005).toFixed(2), (0.5).toFixed(0), (1.5).toFixed(0), (2.5).toFixed(0), (-0).toFixed(2), (1e-10).toFixed(3), (123.456).toFixed(1), (0.000001).toFixed(7), (25).toFixed(-0), (1.45).toFixed(1), (8.345).toFixed(2)];",
++	"return [(123.456).toPrecision(4), (0.00001).toPrecision(1), (1e21).toPrecision(3), (0).toPrecision(5), (-1.5).toPrecision(1), (123456).toPrecision(2), (1.5).toPrecision(1), (2.5).toPrecision(1), (99.99).toPrecision(3), (1e-7).toPrecision(2)];",
++	"return [(123.456).toExponential(2), (0).toExponential(), (0).toExponential(2), (1e21).toExponential(), (-1.5).toExponential(0), (2.5).toExponential(0), (12345).toExponential(), (0.00015).toExponential(1), (1.25).toExponential(1), (1.35).toExponential(1)];",
++	"return [(255).toString(16), (255).toString(2), (-255).toString(36), (0).toString(2), (1e21).toString(16), (2 ** 53).toString(36), (-0).toString(2), (35).toString(36), (1e100).toString(2).length, (123456789).toString(8)];",
++	"return [Number(''), Number(' '), Number('0x10'), Number('0b11'), Number('0o7'), Number('1e3'), Number('1_000'), Number('+1'), Number('-0'), Number('Infinity'), Number('-Infinity'), Number('infinity'), Number('1e'), Number('.5'), Number('5.'), Number('0x'), Number('1 2'), Number('\\u00a01\\u2028'), Number('\\n1\\t'), Number(null), Number(undefined), Number([]), Number([5]), Number([1, 2]), Number({}), Number(true), Number('12e-2'), Number('00'), Number('08'), Number('-0x10'), Number('1n')];",
++	"return [parseInt('0x10'), parseInt('0x10', 10), parseInt('10', 16), parseInt('  12px'), parseInt('1e3'), parseInt('0b11'), parseInt('9007199254740993'), parseInt('123', 1), parseInt('123', 37), parseInt('123', 0), parseInt('zz', 36), parseInt(''), parseInt('-'), parseInt('0x'), parseInt('0.0000005'), parseInt(0.0000005), parseInt(1e21), parseInt('123', 4294967306), parseInt('11', 2.9), parseInt('\\u00a0 7'), parseInt('٣')];",
++	"return [parseFloat('1e3x'), parseFloat('.5.5'), parseFloat('-.5'), parseFloat('Infinityx'), parseFloat('-Infinity'), parseFloat('infinity'), parseFloat('0x10'), parseFloat('1_0'), parseFloat(''), parseFloat('  +1.5e-3abc'), parseFloat('1e'), parseFloat('1e+'), parseFloat('5.'), parseFloat('.'), parseFloat('1.7976931348623159e308'), parseFloat('2.4703282292062328e-324'), parseFloat('2.4703282292062327e-324')];",
++	"return [1 + '2', '3' - 1, '3' * '4', true + 1, null + 1, undefined + 1, [] + [], [] + {}, {} + [], [1, 2] + 1, '5' / '2', 'a' * 1, +'', +' ', +[], +[1], +[1, 2], +{}, +null, +undefined, +true, -'', -null, ~'5', ~~'7.9', !'', !'0', !!NaN, 1 + null + '1', '1' + null + 1, 1 - - 1, typeof (1 + 1n === 2)];",
++	"return [1 == '1', 0 == '', 0 == '0', '' == '0', null == undefined, null == 0, undefined == 0, NaN == NaN, [] == false, [] == '', [0] == false, [1] == true, [1, 2] == '1,2', ({}) == '[object Object]', 1 == [1], 'a' < 'b', 'a' < 'B', '10' < '9', 10 < '9', '10' < 9, null < 1, undefined < 1, NaN < NaN, [2] > 1, 'b' > ['a'], 1n == 1, 1n === 1, 2n > 1, '2' > 1n, 1n < 1.5, 0n == '', 1n == '1', 1n == 'x', 0n == false, null >= 0, null > 0, undefined >= 0, Symbol.iterator == Symbol.iterator];",
++	"var a = [1, 2, 3, 4, 5]; return [a.slice(-2), a.slice(1, -1), a.slice(3, 1), a.slice(NaN, 2), a.slice(undefined, undefined), a.slice(-10), a.slice(1.9), a.slice('2'), a.slice(Infinity), a.slice(-Infinity, 1), a.slice(0, 1e21), a.slice(0, -1e21)];",
++	"var a = [1, 2, 3]; return [a.splice(1), a, [1, 2, 3].splice(-1, 1, 'x', 'y'), [1, 2, 3].splice(0, undefined), [1, 2, 3].splice(), [1, 2, 3].splice(undefined), [1, 2, 3].splice(1, -1), [1, 2, 3].splice(1, 'a', 9), (function () { var b = [1, 2, 3]; b.splice(1, 1); return b; })()];",
++	"return [[3, 1, 10, 2].sort(), [3, 1, 10, 2].sort((a, b) => a - b), ['b', 'a', 'B', 'A', '10', '9', undefined, 'é', 'e'].sort(), [undefined, 3, , 1].sort(), [1, , 3].sort().length, Object.keys([1, , 3].sort()), [null, undefined, 1, 'a', true, false, NaN, -0, 0].sort(), [3, 2, 1].sort(() => 0), [1, 2, 3].sort(undefined), [1, 2, 3].sort((a, b) => b - a), ['\\u{1F600}', '\\uFFFF', 'z'].sort(), [1e21, 2, 100].sort(), [-1, -0, 0, 1].sort().map(x => 1 / x), [2, 1].sort((a, b) => a < b), [5, 1, 4].sort((a, b) => a > b ? 1 : -1)];",
++	"var a = [1, 2, 3]; a[5] = 6; return [a, a.length, Object.keys(a), a.indexOf(undefined), a.includes(undefined), a.map(x => x * 2), a.filter(() => true), a.join('-'), JSON.stringify(a), a.flat(), [...a], Array.from(a), a.reduce((s, x) => s + x, 0), a.some(x => x === undefined), a.every(x => x !== undefined), a.find(x => x === undefined), a.findIndex(x => x === undefined), a.lastIndexOf(6, -1), a.reverse(), a.fill(0, 4).length, a.concat([, 1]).length, Object.keys(a.concat([, 1])), a.entries().next(), a.toString(), a.forEach(x => x) === undefined, a.at(-1), a.at(-7), a.copyWithin(0, 3), a.keys().next()];",
++	"var a = []; a[4294967294] = 1; a.length = 0; var b = []; b['4294967295'] = 1; var c = []; c[-1] = 1; var d = []; d['1e3'] = 1; var e = []; e[1.5] = 1; var f = []; f['01'] = 1; var g = []; g[' 1'] = 1; return [a.length, b.length, Object.keys(b), c.length, Object.keys(c), d.length, Object.keys(d), e.length, Object.keys(e), f.length, Object.keys(f), g.length, Object.keys(g)];",
++	"var a = [1, 2, 3]; a.length = 1; var b = [1, 2, 3]; b.length = '2'; var r = (function () { try { [].length = -1; } catch (e) { return e.name; } })(); var r2 = (function () { try { [].length = 1.5; } catch (e) { return e.name; } })(); var r3 = (function () { try { [].length = 4294967296; } catch (e) { return e.name; } })(); var c = [1, 2, 3]; c.length = 4294967295; c.length = 5; var d = [1, 2]; d.length = { valueOf() { return 1; } }; var e = [1, 2]; e.length = '0x1'; return [a, b, r, r2, r3, c.length, d, e, [].length = 0];",
++	"return [[1, [2, [3, [4]]]].flat(), [1, [2, [3, [4]]]].flat(Infinity), [1, [2, [3, [4]]]].flat(0), [1, [2, [3, [4]]]].flat(-1), [1, [2, [3, [4]]]].flat('2'), [[, 1], , 2].flat(), [1, 2].flatMap(x => [x, [x]]), [1, 2].flatMap(x => x), Object.keys([[, 1]].flat()), [].flat(1e21)];",
++	"var o = {b: 1, a: 2, 1: 3, 0: 4, '-1': 5, 1.5: 6, '01': 7, 4294967295: 8, 4294967294: 9, [Symbol('s')]: 10, '1e3': 11, '': 12, 2147483648: 13, '-0': 14}; return [Object.keys(o), JSON.stringify(o), Object.getOwnPropertyNames(o), Reflect.ownKeys(o).length, Object.entries(o).length, (function () { var ks = []; for (var k in o) ks.push(k); return ks; })(), Object.assign({}, o), {...o}, Object.values(o)];",
++	"var o = {}; o.b = 1; o[2] = 2; o.a = 3; o[1] = 4; delete o.b; o.b = 5; o[0] = 6; return [Object.keys(o), JSON.stringify(o), Object.keys(Object.assign({z: 1}, o)), Object.keys({...o, ...{c: 0, 1: 9}}), Object.keys(Object.fromEntries(Object.entries(o).reverse())), Object.entries(o), Object.keys(JSON.parse(JSON.stringify(o)))];",
++	"var a = []; a.x = 1; a[2] = 2; a[0] = 0; a.y = 3; a[1] = 1; return [Object.keys(a), JSON.stringify(a), (function () { var ks = []; for (var k in a) ks.push(k); return ks; })(), Object.getOwnPropertyNames(a), Object.assign({}, a), {...a}, Object.entries(a)];",
++	"var s = 'abc'; return [Object.keys(s), Object.getOwnPropertyNames(s), Object.keys(new String('ab')), Object.getOwnPropertyNames(new String('ab')), Object.assign({}, 'ab'), {...'ab'}, {...123}, {...null}, {...undefined}, {...true}, {...[1, 2]}, Object.entries('ab'), Object.keys(1), Object.keys(true), Object.keys(Symbol()), Object.keys(1n), Object.keys(function f(a) {}), Object.keys(class { static x = 1; static #p = 2; }), Object.keys(() => 1), Object.keys(/a/), Object.keys(new Date(0)), Object.keys(new Map([[1, 2]])), Object.keys(new Error('x')), Object.keys(new Proxy({a: 1}, {}))];",
++	"var o = {a: 1, get b() { return this.a + 1; }, set b(v) { this.a = v; }, c: undefined, d: null, e: NaN, f: Infinity, g: -0, h: [undefined, function () {}, Symbol()], i: new Date(0), j: /re/g, k: 1n === 1n, l: new Map([[1, 2]]), m: new Set([1]), n: Object(1), p: Object('s'), q: Object(true), r: () => 1, s: {toJSON() { return 'J'; }}, t: new Number(NaN), u: new Date(NaN), v: Symbol('x'), w: '\\u2028\\u2029\\ud800\\udc00\\udc00\\ud800\\u0000\\u001f\\u007f\\u0080'}; o.b = 5; return [JSON.stringify(o), JSON.stringify(o, null, 2), JSON.stringify(o, ['a', 'b', 'x']), JSON.stringify(o, (k, v) => typeof v === 'number' ? v + 1 : v), JSON.stringify([undefined, function () {}, Symbol()]), JSON.stringify(undefined), JSON.stringify(function () {}), JSON.stringify(Symbol()), JSON.stringify(null), JSON.stringify('\\u{1F600}\\uD83D'), JSON.stringify(1n === 1n), JSON.stringify({a: [1, {b: 2}]}, null, '--'), JSON.stringify({a: 1}, null, 20), JSON.stringify({a: 1}, null, 'abcdefghijklmnop'), JSON.stringify({a: 1}, null, new Number(3)), JSON.stringify({a: 1}, null, new String('x')), JSON.stringify({a: 1}, null, 1.9), JSON.stringify({a: 1}, null, -1), JSON.stringify({a: 1}, null, '')];",
++	"var r = []; try { JSON.stringify(1n); } catch (e) { r.push(e.name); } try { var c = {}; c.c = c; JSON.stringify(c); } catch (e) { r.push(e.name); } try { JSON.stringify({toJSON() { throw new RangeError('x'); }}); } catch (e) { r.push(e.name); } try { JSON.parse(''); } catch (e) { r.push(e.name); } try { JSON.parse('{\"a\":1,}'); } catch (e) { r.push(e.name); } try { JSON.parse(\"'a'\"); } catch (e) { r.push(e.name); } try { JSON.parse('[1] x'); } catch (e) { r.push(e.name); } try { JSON.parse('\\u00a01'); } catch (e) { r.push(e.name); } try { JSON.parse('\"\\t\"'); } catch (e) { r.push(e.name); } try { JSON.parse('\"\\\\v\"'); } catch (e) { r.push(e.name); } try { JSON.parse('NaN'); } catch (e) { r.push(e.name); } try { JSON.parse('+1'); } catch (e) { r.push(e.name); } try { JSON.parse('.5'); } catch (e) { r.push(e.name); } try { JSON.parse('1.'); } catch (e) { r.push(e.name); } try { JSON.parse('0x1'); } catch (e) { r.push(e.name); } try { JSON.parse('\"\\\\u00zz\"'); } catch (e) { r.push(e.name); } try { JSON.parse(undefined); } catch (e) { r.push(e.name); } return [r, JSON.parse(' \\t\\r\\n1 '), JSON.parse('1e2'), JSON.parse('-0'), 1 / JSON.parse('-0'), JSON.parse('1E-2'), JSON.parse('\"\\\\/\\\\b\\\\f\\\\n\\\\r\\\\t\\\\\"\\\\\\\\\"'), JSON.parse('[]'), JSON.parse('{}'), JSON.parse('{\"a\":1,\"a\":2}'), Object.keys(JSON.parse('{\"b\":1,\"a\":2,\"1\":3}')), JSON.parse('{\"__proto__\":{\"x\":1}}').x, Object.keys(JSON.parse('{\"__proto__\":1}')), JSON.parse('[1,2]', (k, v) => Array.isArray(v) ? v : v * 2), JSON.parse('{\"a\":{\"b\":1}}', function (k, v) { return k === 'b' ? undefined : v; }), JSON.parse('null'), JSON.parse(1), JSON.parse(true), JSON.parse('\"\\ud83d\\ude00\"').length];",
++	"return ['abc'.slice(-2), 'abc'.substring(2, 0), 'abc'.substr(-2, 1), 'abc'.substr(1), 'abc'.charAt(5), 'abc'.charAt(-1), 'abc'.at(-1), 'abc'.at(3), 'abc'[3], 'abc'[-1], 'abc'['1'], 'abc'[1.0], 'abc'['01'], 'abc'.slice(1, 1e21), 'abc'.substring(NaN, 2), 'abc'.substr(NaN, NaN), 'abc'.substr(0, -1), 'abc'.substr(1, Infinity), 'abc'.slice('1', '2'), 'abc'.at('1'), 'abc'.at(1.9), 'abc'.at(-0), 'abc'.at(NaN), 'abc'.at(Infinity), 'abc'.at(), 'abc'.charAt(), 'abc'.charAt(NaN), 'abc'.charAt(0.9), 'abc'.charAt(true), 'abc'.charAt(null)];",
++	"return ['Abc'.toUpperCase(), 'ABC'.toLowerCase(), 'ß'.toUpperCase(), 'İ'.toLowerCase(), 'İ'.toLowerCase().length, 'ΣΑΣ'.toLowerCase(), 'ς'.toUpperCase(), 'ﬁ'.toUpperCase(), 'ŉ'.toUpperCase(), 'ǰ'.toUpperCase(), 'ΐ'.toUpperCase(), 'Ａ'.toLowerCase(), '\\u0130'.toLowerCase().charCodeAt(1), '\\u1E9E'.toLowerCase(), '\\u2126'.toLowerCase(), '\\u212B'.toLowerCase(), 'ǅ'.toUpperCase(), 'ǅ'.toLowerCase(), '\\uD801\\uDC00'.toLowerCase(), '\\uD801\\uDC28'.toUpperCase(), 'ᾈ'.toLowerCase(), 'ᾀ'.toUpperCase(), 'ᾀ'.toUpperCase().length, '\\u0345'.toUpperCase(), 'i̇'.toUpperCase(), 'ꭰ'.toUpperCase(), 'Ꭰ'.toLowerCase(), '\\u{1E900}'.toLowerCase(), 'ſ'.toUpperCase(), 'ſ'.toLowerCase(), 'K'.toLowerCase(), 'µ'.toUpperCase(), 'ÿ'.toUpperCase()];",
++	"return ['  a b  '.trim(), '\\u00a0\\ufeff\\u2028a\\u2029\\u3000'.trim(), '\\u200ba'.trim().length, '\\u180ea'.trim().length, '\\v\\f\\ta\\r\\n'.trim(), ' a '.trimStart(), ' a '.trimEnd(), 'a'.padStart(5, 'xy'), 'a'.padEnd(5, ''), 'a'.padStart(5), 'abc'.padStart(2), 'a'.padStart(4, '\\u{1F600}'), 'a'.padStart(NaN, 'x'), 'a'.padStart('3', 1), 'a'.padStart(3, null), 'a'.padStart(3, undefined), 'a'.padStart(3, 0), 'a'.padEnd(1e2).length, 'ab'.repeat(0), 'ab'.repeat(3), 'ab'.repeat(2.9), 'ab'.repeat('2'), 'ab'.repeat(true), 'ab'.repeat(null), ''.repeat(1e9), 'a'.concat(1, null, undefined, [1, 2], {}, true), 'abc'.split(''), 'a,b,,c'.split(','), 'abc'.split('', 2), 'abc'.split(), 'abc'.split(undefined), 'abc'.split(undefined, 0), 'abc'.split('b', undefined), 'abc'.split('', -1), 'abc'.split('', 4294967296), 'abc'.split('', 4294967297), 'a\\u{1F600}b'.split(''), 'a1b2c'.split(/\\d/), 'a1b2c'.split(/(\\d)/), 'abc'.split(/(?:)/), 'abc'.split(/b*/), 'abc'.split(/(b)*/), ''.split(''), ''.split('a'), ''.split(/a/), ''.split(/(?:)/), 'ab'.split(/a?/), 'test'.split(/(?=t)/), 'abc'.split(/$/), 'abc'.split(/^/), 'a\\nb'.split(/^/m), 'abc'.split(/(?:)/u), '\\u{1F600}'.split(/(?:)/u), 'aXbxc'.split(/x/i), 'abc'.split(/b/y), 'abc'.split(/(b)|(z)/)];",
++	"return ['aaa'.replace('a', 'b'), 'aaa'.replaceAll('a', 'b'), 'aaa'.replace(/a/g, '$&$&'), 'abc'.replace(/(b)/, '[$1][$2][$0][$01][$10][$`][$\\'][$$][$]'), 'abc'.replace(/(?<x>b)/, '[$<x>][$<y>][$<]'), 'abc'.replace(/b/, '[$<x>]'), 'abc'.replace(/(b)/, (m, p1, off, str) => [m, p1, off, str].join('|')), 'abc'.replace(/(?<x>b)/, (...a) => JSON.stringify(a)), 'abc'.replace(/(b)(z)?/, (...a) => JSON.stringify(a)), 'aaa'.replace(/a/gy, 'b'), 'baa'.replace(/a/gy, 'b'), 'aaa'.replace(/a/y, 'b'), 'abc'.replace(/x*/g, '-'), 'abc'.replace(/x*/, '-'), 'a\\u{1F600}b'.replace(/x*/g, '-'), 'a\\u{1F600}b'.replace(/x*/gu, '-'), 'abc'.replace('', '-'), 'abc'.replaceAll('', '-'), 'abc'.replaceAll(/b/g, '$&$&'), 'abc'.replace(/./g, (m) => m.charCodeAt(0)), 'abc'.replace(/b/, () => undefined), 'abc'.replace(/b/, () => null), 'abc'.replace(/b/, 1), 'abc'.replace(/b/, {toString() { return 'X'; }}), 'abc'.replace(/(b)/, '$11'), 'a'.replace(/(a)(a)?(a)?(a)?(a)?(a)?(a)?(a)?(a)?(a)?(a)?(a)?/, '[$12][$1$2][$13][$012]'), 'abc'.replace(/b/g, '$'), 'abc'.replace(/b/g, '$$$'), 'abc'.replace('b', '$`$\\'$&$$$'), 'abc'.replace('b', '$1'), 'abc'.replace(/b/, '\\\\'), 'aBc'.replace(/b/i, 'x'), 'a.c'.replace('.', 'x'), 'a.c'.replace(/./, 'x'), 'a\\nb'.replace(/./g, 'x'), 'a\\nb'.replace(/./gs, 'x')];",
++	"var view = m => m && typeof m === 'object' ? [m.index, m.input, m.groups, ...m] : m; var r = /(a)(?<n>b)?c/g; var s = 'ac abc ABC'; var out = []; var m; while ((m = r.exec(s)) !== null) { out.push([m[0], m[1], m[2], m.index, m.groups && m.groups.n, r.lastIndex, m.input, Object.keys(m).sort()]); } return [out, /a/y.exec('ba'), /a/y.exec('ab'), (function () { var y = /a/y; y.lastIndex = 1; return [y.exec('ba'), y.lastIndex]; })(), (function () { var g = /a/g; g.lastIndex = 5; return [g.exec('a'), g.lastIndex]; })(), (function () { var g = /a/g; g.lastIndex = -1; return [g.test('a'), g.lastIndex]; })(), (function () { var g = /a/g; g.lastIndex = '1'; return [g.test('ba'), g.lastIndex]; })(), /a/.exec('ba').index, /(?:)/.exec('abc'), /$/.exec('abc').index, /(?<a>x)|(?<b>y)/.exec('y').groups, JSON.stringify(/(?<a>x)|(?<b>y)/.exec('y').groups), Object.getPrototypeOf(/(?<a>x)/.exec('x').groups), 'groups' in /a/.exec('a'), /a/.exec('a').groups, /(a)|(b)/.exec('b'), /(a)|(b)/.exec('b').length, /(a)|(b)/.exec('b')[1], 1 in /(a)|(b)/.exec('b'), /\\u{1F600}/u.exec('x\\u{1F600}').index, /./u.exec('\\u{1F600}')[0].length, /./.exec('\\u{1F600}')[0].length, /^.$/.test('\\u{1F600}'), /^.$/u.test('\\u{1F600}'), /^[\\u{1F600}]$/u.test('\\u{1F600}'), /\\udf00/.test('\\u{1F600}'), /\\udf00/u.test('\\u{1F600}'), /[^x]/u.exec('\\u{1F600}')[0].length].map(view);",
++	"return [/\\bfoo\\b/.test('a foo b'), /\\Bfoo/.test('afoo'), /^a$/m.test('b\\na'), /^a$/.test('b\\na'), /a.c/s.test('a\\nc'), /a.c/.test('a\\nc'), /a.c/.test('a\\u2028c'), /a.c/.test('a\\rc'), /a.c/.test('a\\u0085c'), /[\\s]/.test('\\ufeff'), /\\s/.test('\\u00a0'), /\\s/.test('\\u180e'), /\\s/.test('\\u200b'), /\\S/.test('\\u3000'), /\\w/.test('é'), /\\w/i.test('ſ'), /\\w/iu.test('ſ'), /\\w/iu.test('\\u212a'), /[\\w]/iu.test('\\u212a'), /\\W/iu.test('\\u212a'), /[^\\W]/iu.test('\\u212a'), /\\d/.test('٣'), /\\d/u.test('٣'), /[a-z]/i.test('K'), /k/i.test('\\u212a'), /k/iu.test('\\u212a'), /\\u212a/i.test('k'), /\\u212a/iu.test('k'), /ß/i.test('ẞ'), /ß/iu.test('ẞ'), /ss/i.test('ß'), /Σ/i.test('ς'), /σ/i.test('ς'), /σ/iu.test('ς'), /[Σ]/i.test('ς'), /İ/i.test('i'), /i/i.test('İ'), /i/iu.test('İ'), /ı/i.test('I'), /ı/iu.test('I'), /\\u0130/iu.test('i\\u0307'), /[^a]/i.test('A'), /[^a]/iu.test('A'), /[a-a]/.test('a'), /[\\b]/.test('\\b'), /\\cJ/.test('\\n'), /\\c1/.test('\\\\c1'), /\\c/.test('\\\\c'), /[\\c1]/.test('\\u0011'), /[\\c_]/.test('\\u001f'), /\\0/.test('\\0'), /\\00/.test('\\0'), /[\\00]/.test('0'), /\\8/.test('8'), /\\9/.test('9'), /(a)\\1/.test('aa'), /\\1(a)/.test('a'), /(a)\\2/.test('a\\u0002'), /(a)\\2/.test('a2'), /\\z/.test('z'), /\\a/.test('a'), /[\\a]/.test('a'), /\\-/.test('-'), /[\\-]/.test('-'), /\\_/.test('_'), /\\ /.test(' '), /\\//.test('/'), /a{/.test('a{'), /a{1/.test('a{1'), /a{1,/.test('a{1,'), /a{,}/.test('a{,}'), /x{2,1}?/.test('x') === undefined, /]/.test(']'), /}/.test('}'), /\\p{L}/.test('p{L}'), /\\P/.test('P'), /\\k/.test('k'), /\\k<a>/.test('k<a>'), /(?<a>.)\\k<a>/.test('aa'), /\\u{61}/.test('u'.repeat(61)), /\\u{61}/u.test('a'), /\\x4/.test('x4'), /\\x4g/.test('x4g'), /\\u004/.test('u004'), /[\\u004]/.test('4'), /\\uD83D\\uDE00/u.test('\\u{1F600}'), /[\\uD83D\\uDE00]/u.test('\\u{1F600}'), /[\\uD83D\\uDE00]/.test('\\uDE00'), /^\\uD83D/u.test('\\u{1F600}'), /^\\uD83D/.test('\\u{1F600}'), /\\uDE00$/.test('\\u{1F600}'), /\\uDE00$/u.test('\\u{1F600}')];",
++	"var view = m => m && typeof m === 'object' ? [m.index, m.input, m.groups, ...m] : m; return [/(a*)*/.exec('b'), /(a*)+/.exec('b'), /(a|ab)(c|bcd)(d*)/.exec('abcd'), /(?:(a)|b)+/.exec('ab'), /((a)|b)+/.exec('ab'), /(a)|b/.exec('b'), /(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac'), /(?=(a+))/.exec('baaabac'), /(?=(a+))a*b\\1/.exec('baaabac'), /(.*?)a(?!(a+)b\\2c)\\2(.*)/.exec('baaabaac'), /a*?/.exec('aaa'), /a??/.exec('a'), /(a??)a/.exec('aa'), /(?:a|())*/.exec('aaa'), /(?:()|a)*/.exec('aaa'), /(a)|\\1b/.exec('b'), /(?:(?=(a))a)+/.exec('aa'), /(?<=(\\d+)(\\d+))$/.exec('1053'), /(?<=\\1(a))b/.exec('aab'), /(?<=(a)\\1)b/.exec('aab'), /(?<!a)b/.exec('ab'), /(?<!a)b/.exec('cb'), /(?<=^|,)a/.exec(',a'), /\\b/.exec('').index, /$/.exec('').index, /(?:)/.exec('')[0], /a{0}/.exec('a')[0], /(a{0})*/.exec('a'), /(a)?(a)?/.exec('a'), /(?:a?)*?b/.exec('aab'), /^(?:a+?)+$/.exec('aaa'), /^(a+)\\1$/.exec('aaaa'), /^(a+)\\1$/.exec('aaa'), /(a)\\1{2}/.exec('aaa'), /(.)(?!\\1)./.exec('aab'), /[^]/.exec('\\n'), /[]/.exec('a'), /[^]*/.exec('ab\\ncd')[0].length, /a|/.exec('b'), /|a/.exec('a'), /(|a)*/.exec('aa'), /(a|)*/.exec('aa'), /\\u{1F600}+/u.exec('\\u{1F600}\\u{1F600}')[0].length, /(?:\\uD83D\\uDE00)+/.exec('\\u{1F600}\\u{1F600}')[0].length, /^[\\u{1F600}-\\u{1F64F}]$/u.test('\\u{1F601}'), /^[\\uD83D\\uDE00-\\uD83D\\uDE4F]$/.test('\\u{1F601}'), /[[a-z]--b]/v.test('b')].map(view);",
++	"var r = []; for (var f of ['toString', 'source', 'flags', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'sticky']) { r.push([f, /a/[f] === undefined ? 'u' : typeof /a/[f] === 'function' ? /a/[f]() : /a/[f]]); } return [r, String(/a\\/b/), String(new RegExp('\\n')), String(new RegExp('')), String(new RegExp('\\\\/')), new RegExp('\\\\/').source, new RegExp('a', 'g').lastIndex, RegExp.prototype.flags, RegExp.prototype.source, RegExp.prototype.global, String(RegExp.prototype), Object.prototype.toString.call(RegExp.prototype), RegExp.prototype.toString.call({source: 's', flags: 'f'}), typeof RegExp.prototype.exec, RegExp.prototype.exec.name, /a/[Symbol.replace]('bab', 'x'), /a/[Symbol.split]('bab'), [.../a/[Symbol.match]('bab')], /a/[Symbol.search]('bab'), [...'bab'.matchAll(/a/g)].length, (function () { try { 'bab'.matchAll(/a/); } catch (e) { return e.name; } })(), (function () { try { 'bab'.replaceAll(/a/, 'x'); } catch (e) { return e.name; } })(), 'bab'.replaceAll(/a/g, 'x'), /a/ instanceof RegExp, RegExp(/a/g) !== /a/g, (function () { var re = /a/; return RegExp(re) === re; })(), (function () { var re = /a/; return new RegExp(re) === re; })(), (function () { var re = /a/; return RegExp(re, 'g') === re; })(), RegExp('a', 'y').sticky, RegExp(undefined).source, RegExp(null).source, RegExp('').source, RegExp(1).source, RegExp({source: 'x', flags: 'g', [Symbol.match]: true}).flags, RegExp[Symbol.species] === RegExp, /a/.compile === undefined, (function () { var re = /a/g; re.compile('b', 'i'); return [String(re), re.lastIndex]; })(), Object.getOwnPropertyNames(/a/), Object.getOwnPropertyDescriptor(/a/, 'lastIndex')];",
++	"return [new Date(0).toISOString(), new Date(-1).toISOString(), new Date(8.64e15).toISOString(), new Date(-8.64e15).toISOString(), new Date(Date.UTC(99, 0)).toISOString(), new Date(Date.UTC(1999, 0)).getUTCFullYear(), Date.UTC(2000), Date.UTC(), Date.UTC(2000, 12), Date.UTC(2000, -1), Date.UTC(2000, 1, 30), Date.UTC(2000, 0, 1, 24), Date.UTC(2000, 0, 1, 0, 60), Date.UTC(2000, 0, 1, 0, 0, 0, 1000), Date.UTC(2000, 0, 1, 0, 0, 0, 0.9), Date.UTC(2000, 0, 1, 0, 0, 0, -0.9), Date.UTC(2000.9, 0.9, 1.9), Date.UTC(1e10), Date.UTC(275760, 8, 13), Date.UTC(275760, 8, 13, 0, 0, 0, 1), Date.UTC(-271821, 3, 20), Date.UTC(-271821, 3, 19, 23, 59, 59, 999), Date.UTC(NaN), Date.UTC(2000, NaN), Date.UTC(2000, 0, Infinity), Date.UTC(2000, 0, 1, 80063993375, 29, 1), new Date(8.64e15 + 1).getTime(), new Date(-8.64e15 - 1).getTime(), new Date(1.5).getTime(), new Date(-1.5).getTime(), new Date(-0).getTime(), 1 / new Date(-0).getTime(), new Date('2000-01-01').getTime(), new Date('2000-01-01T00:00').getTime(), new Date('2000-01-01T00:00Z').getTime(), new Date('2000-01-01T00:00:00.000+05:30').getTime(), new Date('2000-01-01T00:00:00.5Z').getTime(), new Date('2000-01-01T24:00:00Z').getTime(), new Date('+002000-01-01T00:00:00Z').getTime(), new Date('+000000-01-01T00:00:00Z').getTime(), new Date('2000-01').getTime(), new Date('2000').getTime(), new Date('2000-01-01T00:00:00+23:59').getTime(), new Date('2000-01-01T00:00:00-00:00').getTime(), new Date('+275760-09-13T00:00:00.001Z').getTime(), new Date('-271821-04-20T00:00:00Z').getTime(), new Date('-271821-04-19T23:59:59.999Z').getTime(), new Date(2000, 0).getTimezoneOffset(), new Date(0).getTimezoneOffset()];",
++	"var d = new Date(Date.UTC(2020, 1, 29, 12, 34, 56, 789)); return [d.toISOString(), d.toJSON(), d.toUTCString(), d.getUTCDay(), d.getTime(), d.valueOf(), +d, d - 0, d + 0 === d.toString() + 0, typeof (d + 1), d[Symbol.toPrimitive]('number'), d[Symbol.toPrimitive]('default') === d.toString(), d[Symbol.toPrimitive]('string') === d.toString(), (function () { try { d[Symbol.toPrimitive]('x'); } catch (e) { return e.name; } })(), (function () { try { Date.prototype[Symbol.toPrimitive].call(1, 'number'); } catch (e) { return e.name; } })(), JSON.stringify(d), JSON.stringify(new Date(NaN)), new Date(NaN).toJSON(), (function () { try { new Date(NaN).toISOString(); } catch (e) { return e.name; } })(), String(new Date(NaN)), new Date(NaN).toUTCString(), new Date(NaN).getUTCDay(), new Date(NaN).getTime(), isNaN(new Date('x')), new Date(d).getTime() === d.getTime(), new Date(d.toISOString()).getTime() === d.getTime(), new Date(2020, 1, 29).getFullYear(), new Date(99, 0).getFullYear(), new Date(100, 0).getFullYear(), new Date(-1, 0).getFullYear(), new Date(2020, 0, 1, 0, 0, 0, 0).getMonth(), (function () { var x = new Date(0); x.setUTCFullYear(2000); return x.getTime(); })(), (function () { var x = new Date(0); x.setUTCMonth(12); return x.toISOString(); })(), (function () { var x = new Date(0); x.setUTCDate(0); return x.toISOString(); })(), (function () { var x = new Date(0); x.setUTCHours(24, 60, 60, 1000); return x.toISOString(); })(), (function () { var x = new Date(0); return [x.setUTCHours(), x.getTime()]; })(), (function () { var x = new Date(0); return [x.setTime(), x.getTime(), x.setTime('5'), x.setTime(1.9)]; })(), (function () { var x = new Date(NaN); x.setUTCFullYear(2000); return x.toISOString(); })(), (function () { var x = new Date(NaN); x.setUTCMonth(1); return x.getTime(); })(), (function () { var x = new Date(0); return x.setUTCMilliseconds(8.64e15 + 1); })(), Date.prototype.toISOString.name, Date.prototype[Symbol.toPrimitive].name, Object.getOwnPropertyDescriptor(Date.prototype, Symbol.toPrimitive).writable, typeof Date.now(), Date.length, new Date(2000, 0, 1, 0, 0, 0, 0, 99).getFullYear(), new Date(undefined).getTime(), new Date(null).getTime(), new Date(true).getTime(), new Date('').getTime(), new Date([]).getTime(), new Date({valueOf() { return 5; }}).getTime(), new Date({toString() { return '2000-01-01T00:00:00Z'; }, valueOf() { return {}; }}).getTime(), new Date(new Number(7)).getTime(), new Date('7').getTime() === new Date(7).getTime(), new Date(2000, 0, 1).getDate(), Date(0) === String(new Date()) || typeof Date(0)];",
++	"var m = new Map([[1, 'a'], ['1', 'b'], [NaN, 'c'], [-0, 'd'], [{}, 'e']]); m.set(0, 'f'); m.set(NaN, 'g'); m.delete('1'); m.set('1', 'h'); return [[...m.keys()], [...m.values()], m.size, m.get(0), m.get(-0), m.get(NaN), m.has({}), m.get(1), [...m].length, [...m.entries()][0], m[Symbol.iterator] === m.entries, Map.prototype[Symbol.toStringTag], String(m), m.forEach.length, (function () { var r = []; m.forEach((v, k, mm) => r.push([k, v, mm === m])); return r; })(), 1 / [...new Map([[-0, 1]]).keys()][0], new Map([[1, 2]]).get(1), (function () { try { new Map([1]); } catch (e) { return e.name; } })(), (function () { try { new Map(1); } catch (e) { return e.name; } })(), new Map(null).size, new Map(undefined).size, new Map('').size, (function () { try { new Map('ab'); } catch (e) { return e.name; } })(), (function () { try { Map(); } catch (e) { return e.name; } })(), (function () { var mm = new Map([[1, 1], [2, 2], [3, 3]]); var r = []; for (var [k] of mm) { r.push(k); if (k === 1) { mm.delete(2); mm.set(4, 4); } } return r; })(), (function () { var mm = new Map([[1, 1]]); var it = mm.keys(); mm.clear(); mm.set(9, 9); return [...it]; })(), (function () { var mm = new Map([[1, 1]]); var it = mm.keys(); it.next(); mm.set(2, 2); return it.next(); })(), Object.getOwnPropertyNames(Map.prototype).sort()];",
++	"var s = new Set([1, '1', NaN, NaN, -0, 0, {}, {}]); return [s.size, [...s], s.has(0), s.has(-0), s.has(NaN), 1 / [...s][3], s.add(2) === s, s.delete(1), s.delete(1), [...s.entries()][0], [...s.keys()].length, s.values === s.keys, s[Symbol.iterator] === s.values, String(s), Set.prototype.union === undefined ? 'u' : [...new Set([1, 2]).union(new Set([2, 3]))], Set.prototype.intersection === undefined ? 'u' : [...new Set([1, 2]).intersection(new Set([2, 3]))], Set.prototype.difference === undefined ? 'u' : [...new Set([1, 2]).difference(new Set([2, 3]))], Set.prototype.symmetricDifference === undefined ? 'u' : [...new Set([1, 2]).symmetricDifference(new Set([2, 3]))], Set.prototype.isSubsetOf === undefined ? 'u' : new Set([1]).isSubsetOf(new Set([1, 2])), Set.prototype.isSupersetOf === undefined ? 'u' : new Set([1]).isSupersetOf(new Set([1, 2])), Set.prototype.isDisjointFrom === undefined ? 'u' : new Set([1]).isDisjointFrom(new Set([2])), Set.prototype.union === undefined ? 'u' : (function () { try { new Set([1]).union([1]); } catch (e) { return e.name; } })(), Set.prototype.union === undefined ? 'u' : [...new Set([1]).union({size: 1, has() { return true; }, keys() { return [5][Symbol.iterator](); }})], (function () { var ss = new Set([1, 2, 3]); var r = []; for (var x of ss) { r.push(x); if (x === 1) { ss.delete(2); ss.add(4); } if (x === 4) ss.add(1); } return r; })(), new Set('aba').size, new Set([[1], [1]]).size, (function () { try { new Set(1); } catch (e) { return e.name; } })(), new Set(null).size, Object.getOwnPropertyNames(Set.prototype).sort()];",
++	"var w = new WeakMap(); var k = {}; w.set(k, 1); var ws = new WeakSet([k]); var r = []; try { w.set(1, 1); } catch (e) { r.push(e.name); } try { ws.add('s'); } catch (e) { r.push(e.name); } return [w.get(k), w.has(k), w.has({}), w.get(1), w.delete(1), ws.has(k), ws.delete(k), ws.has(k), r, String(w), String(ws), Object.getOwnPropertyNames(WeakMap.prototype).sort(), Object.getOwnPropertyNames(WeakSet.prototype).sort()];",
++	"var sym = Symbol('desc'); var o = {[sym]: 1, a: 2}; return [typeof sym, sym.toString(), sym.description, Symbol().description, Symbol('').description, Symbol(undefined).description, Symbol(null).description, Symbol(1).toString(), Symbol({}).toString(), Symbol.for('x') === Symbol.for('x'), Symbol.keyFor(Symbol.for('x')), Symbol.keyFor(sym), Symbol.keyFor(Symbol.iterator), Symbol.iterator.toString(), Symbol.iterator.description, Object.keys(o), Object.getOwnPropertySymbols(o).length, Reflect.ownKeys(o).length, Reflect.ownKeys(o)[0], JSON.stringify(o), o[sym], sym in o, sym.valueOf() === sym, Object(sym) == sym, Object(sym) === sym, typeof Object(sym), Object(sym) instanceof Symbol, sym instanceof Symbol, Object.prototype.toString.call(sym), Object.prototype.toString.call(Object(sym)), Object(sym).description, Symbol.prototype.toString.call(Object(sym)), (function () { try { return Symbol.prototype.toString.call('s'); } catch (e) { return e.name; } })(), (function () { try { return sym + ''; } catch (e) { return e.name; } })(), (function () { try { return `${sym}`; } catch (e) { return e.name; } })(), (function () { try { return +sym; } catch (e) { return e.name; } })(), (function () { try { return sym * 1; } catch (e) { return e.name; } })(), (function () { try { return new Symbol(); } catch (e) { return e.name; } })(), (function () { try { return Symbol.keyFor('x'); } catch (e) { return e.name; } })(), String(sym), sym == 'Symbol(desc)', !!sym, !!Symbol(), Boolean(Symbol()), [sym].indexOf(sym), [sym].includes(sym), [sym].join === undefined ? 'u' : (function () { try { return [sym].join(); } catch (e) { return e.name; } })(), (function () { try { return [sym].toString(); } catch (e) { return e.name; } })(), (function () { try { return String([sym]); } catch (e) { return e.name; } })(), Object.getOwnPropertyNames(Symbol.prototype).sort(), Symbol.prototype[Symbol.toStringTag], Symbol.prototype[Symbol.toPrimitive].name, Symbol.hasInstance.description];",
++	"return [typeof 1n, 1n + 2n, 2n ** 64n, -(2n ** 63n), 7n / 2n, -7n / 2n, 7n % -2n, -7n % 2n, 0n === -0n, 1n << 70n, -1n >> 1n, 1n & -1n, ~0n, -(-1n), (function () { try { return 1n >>> 0n; } catch (e) { return e.name; } })(), (function () { try { return 1n + 1; } catch (e) { return e.name; } })(), (function () { try { return +1n; } catch (e) { return e.name; } })(), (function () { try { return 1n / 0n; } catch (e) { return e.name; } })(), (function () { try { return 2n ** -1n; } catch (e) { return e.name; } })(), (function () { try { return BigInt(1.5); } catch (e) { return e.name; } })(), (function () { try { return BigInt('1.5'); } catch (e) { return e.name; } })(), (function () { try { return BigInt('x'); } catch (e) { return e.name; } })(), (function () { try { return BigInt(); } catch (e) { return e.name; } })(), (function () { try { return new BigInt(1); } catch (e) { return e.name; } })(), (function () { try { return Math.max(1n); } catch (e) { return e.name; } })(), (function () { try { return 1n < undefined; } catch (e) { return e.name; } })(), BigInt('0x1f'), BigInt('0b11'), BigInt(' 12 '), BigInt(''), BigInt('-0'), BigInt(true), BigInt(-0), BigInt(Number.MAX_SAFE_INTEGER) + 2n, BigInt(1e21), BigInt('1e3') === undefined ? 'u' : 'x', 1n == 1, 1n < 2, 2 > 1n, 1n == '1', 1n < '2', 1n == true, 0n == false, 0n == '', 0n ? 1 : 0, !!0n, !!1n, typeof Object(1n), Object(1n) == 1n, 1n.toString(), (255n).toString(16), (-255n).toString(2), BigInt.asUintN(8, 257n), BigInt.asIntN(8, 255n), BigInt.asIntN(64, 2n ** 63n), BigInt.asUintN(0, 5n), BigInt.asUintN(64, -1n), (function () { try { return BigInt.asUintN(-1, 1n); } catch (e) { return e.name; } })(), (function () { try { return BigInt.asUintN(2 ** 53, 1n); } catch (e) { return e.name; } })(), 1n.toLocaleString === undefined, BigInt.prototype.valueOf.call(Object(3n)), (function () { try { return BigInt.prototype.valueOf.call(3); } catch (e) { return e.name; } })(), String(1n), `${2n}`, 1n + '', [1n].join(), JSON.stringify({toJSON() { return 1n; }}) === undefined ? 'u' : 'x', (function () { try { return JSON.stringify(1n); } catch (e) { return e.name; } })(), Number(2n ** 64n), Number(-1n), parseInt('1n'), Number('1n'), 2n ** 1000n > 1e300, (2n ** 1000n).toString().length, (10n ** 30n).toString(36), (-(2n ** 100n)).toString(16), BigInt(2 ** 53) === 2n ** 53n, BigInt(-(2 ** 1023) * 2) === undefined ? 'u' : 'x', Object.is(0n, -0n), [0n, 1n].indexOf(0n), [0n].includes(-0n), new Set([0n, -0n]).size, new Map([[1n, 1]]).get(1n), Object.keys({[1n]: 1}), ({1: 'a'})[1n], [][0n], 'ab'[1n], Array(2n) === undefined ? 'u' : 'x'];",
++	"var r = []; function t(f) { try { r.push(f()); } catch (e) { r.push(e.name); } } t(() => Array(2n)); t(() => [].length = 1n); t(() => 'a'.repeat(2n)); t(() => (1).toFixed(2n)); t(() => Math.abs(1n)); t(() => new Date(1n)); t(() => [1, 2].at(1n)); t(() => 1n ** 2); t(() => -1n ** 2n); t(() => (-1n) ** 2n); t(() => 1n * 1.5); t(() => isNaN(1n)); t(() => Number.isNaN(1n)); t(() => Number.isInteger(1n)); t(() => parseFloat(1n)); t(() => BigInt(NaN)); t(() => BigInt(Infinity)); t(() => BigInt(-0)); t(() => BigInt(null)); t(() => BigInt(undefined)); t(() => BigInt(Symbol())); t(() => BigInt([])); t(() => BigInt([1])); t(() => BigInt({})); t(() => BigInt('  ')); t(() => BigInt('0o7')); t(() => BigInt('-0x1')); t(() => BigInt('+1')); t(() => BigInt('1_0')); t(() => BigInt('\\u00a01')); t(() => BigInt('Infinity')); t(() => 1n / 2n * 2n); t(() => 5n % 0n); t(() => 0n ** 0n); t(() => (-8n) / 3n); t(() => (-8n) % 3n); t(() => 8n >> -1n); t(() => -8n >> 1n); t(() => -8n >> 100n); t(() => 8n >> 100n); t(() => 8n << -100n); t(() => (-9n) & 5n); t(() => (-9n) | 5n); t(() => (-9n) ^ 5n); t(() => ~(-9n)); t(() => 1n == 1.5); t(() => 3n > 2.5); t(() => 3n <= 3); t(() => 3n < NaN); t(() => 3n >= NaN); t(() => 3n == NaN); t(() => 3n != Infinity); t(() => 3n < Infinity); t(() => 3n < '4'); t(() => 3n < 'x'); t(() => 3n == 'x'); t(() => 3n < [4]); t(() => 3n < ['4']); t(() => 3n == [3]); t(() => 3n == {valueOf() { return 3; }}); t(() => 3n == {valueOf() { return 3n; }}); t(() => 3n + {valueOf() { return 3n; }}); t(() => 3n + {valueOf() { return 3; }}); t(() => 3n + {toString() { return '3'; }}); t(() => typeof (3n + {toString() { return '3'; }})); t(() => 2n ** 3n ** 2n); t(() => (2n ** 3n) ** 2n); t(() => 10n ** 100n === 10n ** 100n); t(() => 10n ** 100n == 1e100); t(() => 10n ** 100n < 1e100 + 1e84); t(() => 2n ** 1023n * 2n < Infinity); t(() => 2n ** 1024n > Number.MAX_VALUE); t(() => Number(2n ** 1024n)); t(() => Number(2n ** 1023n * 2n - 1n)); t(() => Number((2n ** 53n) + 1n)); t(() => Number((2n ** 53n) + 3n)); t(() => Number(2n ** 53n * 2n + 2n)); t(() => Number(-(2n ** 53n) - 1n)); t(() => Number(2n ** 1024n - 2n ** 970n)); t(() => Number(2n ** 1024n - 2n ** 970n - 1n)); t(() => Number(2n ** 1024n - 2n ** 971n)); t(() => Number(1n << 63n) === 2 ** 63); t(() => BigInt(Number.MAX_VALUE) === 2n ** 1024n - 2n ** 971n); return r;",
++	"var r = []; var o = {valueOf() { r.push('v'); return 1; }, toString() { r.push('s'); return '2'; }}; var n1 = o + 1, n2 = `${o}`, n3 = o * 2, n4 = String(o), n5 = o == 1, n6 = o < 2, n7 = [o] + '', n8 = o + '', n9 = Number(o), n10 = new Date(o).getTime(), n11 = {[o]: 1}, n12 = 'x'[o], n13 = o in {1: 1}, n14 = JSON.stringify({o}), n15 = o == '2', n16 = o === 1, n17 = isNaN(o), n18 = ~o, n19 = -o, n20 = !o, n21 = o ? 1 : 0, n22 = typeof o, n23 = o + o, n24 = [1, 2].indexOf(o), n25 = 'abc'.charAt(o), n26 = 'abc'.slice(o), n27 = [1, 2, 3][o], n28 = Math.max(o, 0), n29 = parseInt(o), n30 = (5).toFixed(o), n31 = 'x'.repeat(o), n32 = new Array(o).length, n33 = Symbol(o).description, n34 = o >>> 0, n35 = Object.keys({[o]: 1, [String(o)]: 2}), n36 = o.toString(), n37 = o.valueOf(); return [r, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19, n20, n21, n22, n23, n24, n25, n26, n27, n28, n29, n30, n31, n32, n33, n34, n35, n36, n37];",
++	"var r = []; var o = {[Symbol.toPrimitive](hint) { r.push(hint); return hint === 'number' ? 42 : hint === 'string' ? 'str' : 'def'; }}; var a = [o + 1, `${o}`, o * 2, String(o), o == 'def', o < 50, [o] + '', Number(o), new Date(o).getTime(), {[o]: 1}, JSON.stringify({o}), o in {def: 1}, +o, -o, o++ === undefined ? 'u' : 'x']; var bad = {[Symbol.toPrimitive]() { return {}; }}; try { String(bad); } catch (e) { r.push(e.name); } try { bad + 1; } catch (e) { r.push(e.name); } var bad2 = {[Symbol.toPrimitive]: 1}; try { String(bad2); } catch (e) { r.push(e.name); } var bad3 = {[Symbol.toPrimitive]: undefined, toString() { return 'ts'; }}; r.push(String(bad3)); var bad4 = {[Symbol.toPrimitive]: null, toString() { return 'ts'; }}; r.push(String(bad4)); var bad5 = {valueOf() { return {}; }, toString() { return {}; }}; try { String(bad5); } catch (e) { r.push(e.name); } try { bad5 + 1; } catch (e) { r.push(e.name); } var d = {valueOf: 1, toString() { return '7'; }}; r.push(d + 1, +d); var d2 = {valueOf: null, toString: null}; try { d2 + 1; } catch (e) { r.push(e.name); } var d3 = Object.create(null); try { String(d3); } catch (e) { r.push(e.name); } try { d3 + ''; } catch (e) { r.push(e.name); } try { `${d3}`; } catch (e) { r.push(e.name); } try { d3 == 1; } catch (e) { r.push(e.name); } r.push(d3 == d3, d3 === d3, typeof d3, d3 instanceof Object); try { r.push(String(Object.setPrototypeOf({}, null))); } catch (e) { r.push(e.name); } return [r, a];",
++	"var r = []; function t(f) { try { r.push(f()); } catch (e) { r.push(e.name); } } t(() => 'abc'.localeCompare('abd') < 0); t(() => 'a'.localeCompare('a')); t(() => Math.sign('B'.localeCompare('a'))); t(() => 'a'.localeCompare()); t(() => ''.localeCompare('')); t(() => 'a'.normalize()); t(() => '\\u0041\\u030A'.normalize('NFC')); t(() => '\\u00C5'.normalize('NFD').length); t(() => '\\u212B'.normalize('NFC')); t(() => '\\u212B'.normalize('NFKC')); t(() => 'ﬁ'.normalize('NFKD')); t(() => '\\u1E9B\\u0323'.normalize('NFC')); t(() => '\\u1E9B\\u0323'.normalize('NFD')); t(() => '\\u1E9B\\u0323'.normalize('NFKC')); t(() => '\\u1E9B\\u0323'.normalize('NFKD')); t(() => '\\uD800'.normalize()); t(() => '\\uD800'.normalize().charCodeAt(0)); t(() => 'a'.normalize('nfc')); t(() => 'a'.normalize(undefined)); t(() => 'a'.normalize(null)); t(() => '\\u0301a'.normalize('NFC')); t(() => '\\u0041\\u0301\\u0323'.normalize('NFC') === '\\u0041\\u0323\\u0301'.normalize('NFC')); t(() => '\\u0041\\u0301\\u0323'.normalize('NFD')); t(() => '\\u1100\\u1161\\u11A8'.normalize('NFC')); t(() => '\\uAC01'.normalize('NFD').length); t(() => '\\u2126'.normalize('NFC')); t(() => '\\uFB01'.normalize('NFC')); t(() => '\\u00BD'.normalize('NFKC')); t(() => '\\u2460'.normalize('NFKD')); t(() => 'a\\u{1F600}'.normalize('NFD')); t(() => 'a'.isWellFormed === undefined ? 'u' : ['a\\uD800'.isWellFormed(), 'a\\uD800\\uDC00'.isWellFormed(), 'a\\uD800'.toWellFormed().charCodeAt(1), '\\uDC00\\uD800'.toWellFormed()]); t(() => 'ab'.codePointAt(0)); t(() => '\\u{1F600}'.codePointAt(0)); t(() => '\\u{1F600}'.codePointAt(1)); t(() => '\\u{1F600}'.codePointAt(2)); t(() => '\\uD83D'.codePointAt(0)); t(() => '\\uDE00\\uD83D'.codePointAt(0)); t(() => 'a'.codePointAt(-1)); t(() => 'a'.codePointAt(NaN)); t(() => 'a'.codePointAt('0')); t(() => String.fromCodePoint(0x1F600)); t(() => String.fromCodePoint(0x1F600).length); t(() => String.fromCodePoint(0xD800, 0xDC00)); t(() => String.fromCodePoint(0x110000)); t(() => String.fromCodePoint(-1)); t(() => String.fromCodePoint(1.5)); t(() => String.fromCodePoint('65')); t(() => String.fromCodePoint('0x41')); t(() => String.fromCodePoint(NaN)); t(() => String.fromCodePoint()); t(() => String.fromCodePoint(65, 66, 67)); t(() => String.fromCharCode(0x1F600)); t(() => String.fromCharCode(65.9, -1, 65537, NaN, Infinity, '66', null, true)); t(() => String.fromCharCode()); t(() => String.raw`a\\n${1}b\\u0041`); t(() => String.raw({raw: ['x', 'y', 'z']}, 1, 2, 3)); t(() => String.raw({raw: 'abc'}, 1, 2)); t(() => String.raw({raw: {length: 0}})); t(() => String.raw({raw: {length: -1}})); t(() => String.raw({})); t(() => (function (s) { return [s.raw, s.length, s[0], Object.isFrozen(s), Object.isFrozen(s.raw)]; })`a${1}b`); t(() => (function (s) { return [s[0], s.raw[0]]; })`\\unicode`); t(() => (function (s) { return [s[0], s.raw[0]]; })`\\01`); t(() => (function (s) { return [s[0], s.raw[0]]; })`\\xg`); t(() => (function (s) { return s[0]; })`\\u{110000}`); t(() => (function (s) { return s.raw[0]; })`a\\\r\nb`); t(() => (function (s) { return s.raw[0].length; })`a\r\nb`); t(() => (function (s) { return s[0].length; })`a\r\nb`); t(() => (function (s) { return s.raw[0]; })`\\`); t(() => (function (s) { return s[0]; })`a\u2028b`.length); t(() => { function tag(s) { return s; } var a = tag`x`, b = tag`x`; return [a === b, (() => tag`x`)() === (() => tag`x`)(), (function f() { return tag`y`; })() === (function f() { return tag`y`; })()]; }); t(() => { function tag(s) { return s; } function f() { return tag`z`; } return f() === f(); }); t(() => { function tag(s) { return s; } var f = () => tag`w`; return f() === f(); }); t(() => `a${1}${2}b${`c${3}`}`); t(() => `${[1, 2]}${{}}${null}${undefined}${true}${-0}${1n}${Symbol.iterator.description}`); t(() => `\\u{1F600}`.length); t(() => `\\${1}`); t(() => `${'`'}`); t(() => `a\\\nb`); t(() => `a\nb`.length); t(() => `${1}${'${2}'}`); t(() => (`${{toString() { return 'T'; }, valueOf() { return 'V'; }}}`)); t(() => (`${Object.create(null)}`)); return r;",
++	"var r = []; function t(f) { try { r.push(f()); } catch (e) { r.push(e.name); } } t(() => 5 % 3); t(() => -5 % 3); t(() => 5 % -3); t(() => 5.5 % 2); t(() => -0 % 5); t(() => 1 / (-0 % 5)); t(() => 1 / (0 % -5)); t(() => 5 % 0); t(() => 5 % Infinity); t(() => Infinity % 5); t(() => 1e308 % 1e-308); t(() => 2 ** 53 % 3); t(() => 0.3 % 0.1); t(() => 1 / (-1 % 1)); t(() => 1 / (-4 % 2)); t(() => (-2) ** 2); t(() => 2 ** -1); t(() => 0 ** 0); t(() => NaN ** 0); t(() => 1 ** Infinity); t(() => (-1) ** Infinity); t(() => 1 ** NaN); t(() => (-8) ** (1 / 3)); t(() => 2 ** 0.5 === Math.SQRT2); t(() => 10 ** 21); t(() => 10 ** -7); t(() => 2 ** 1024); t(() => (-2) ** 1023); t(() => 2 ** -1075); t(() => 2 ** -1074); t(() => 1.5 ** 2); t(() => 0.1 ** 2); t(() => 10 ** 15); t(() => 10 ** 16); t(() => 10 ** 22); t(() => 10 ** 23); t(() => 5 ** 3); t(() => 7 ** 2); t(() => 3 ** 33); t(() => 3 ** 34); t(() => 2 ** 62); t(() => 2 ** 63); t(() => (-0) ** -1); t(() => (-0) ** -2); t(() => 0 ** -1); t(() => (-0) ** 3); t(() => 1 / (-0) ** 3); t(() => Infinity ** -1); t(() => (-Infinity) ** 3); t(() => (-Infinity) ** 2); t(() => (-Infinity) ** -3); t(() => 1 / (-Infinity) ** -3); t(() => 4 ** 0.5); t(() => 9 ** 0.5); t(() => 1e10 ** 2); t(() => 1e200 ** 2); t(() => Math.pow(2, 10)); t(() => Math.pow(-8, 1 / 3)); t(() => Math.pow(1, Infinity)); t(() => Math.pow(NaN, 0)); t(() => Math.pow()); t(() => Math.pow(2)); t(() => Math.pow(2, '3')); t(() => 7 / 2 | 0); t(() => -7 / 2 | 0); t(() => 2 ** 32 | 0); t(() => 2 ** 31 | 0); t(() => -(2 ** 31) | 0); t(() => 2 ** 53 | 0); t(() => 1e100 | 0); t(() => NaN | 0); t(() => Infinity | 0); t(() => -0 | 0); t(() => 1 / (-0 | 0)); t(() => 0.9 | 0); t(() => -0.9 | 0); t(() => 1 / (-0.9 | 0)); t(() => 2 ** 32 >>> 0); t(() => -1 >>> 0); t(() => -1 >>> 32); t(() => 1 << 32); t(() => 1 << 31); t(() => 1 << -1); t(() => 1 << 33); t(() => -8 >> 1); t(() => -8 >>> 1); t(() => 8 >> 33); t(() => 1 << 1.9); t(() => 1 << '2'); t(() => 5 & 3.9); t(() => 5 | -3.9); t(() => 5 ^ 4294967297); t(() => ~4294967296); t(() => ~2147483648); t(() => ~-2147483649); t(() => ~NaN); t(() => ~'x'); t(() => ~'0x10'); t(() => ~~1e10); t(() => Math.imul(2 ** 31, 2)); t(() => Math.imul(0xffffffff, 5)); t(() => Math.imul(-5, 12)); t(() => Math.imul(1.9, 2.9)); t(() => Math.imul()); t(() => Math.imul(2 ** 53, 2 ** 53)); t(() => Math.clz32(0)); t(() => Math.clz32(1)); t(() => Math.clz32(-1)); t(() => Math.clz32(2 ** 32)); t(() => Math.clz32(0.5)); t(() => Math.clz32(NaN)); t(() => Math.clz32()); t(() => Math.fround(5.5)); t(() => Math.fround(5.05)); t(() => Math.fround(2 ** 128)); t(() => Math.fround(-(2 ** 128))); t(() => Math.fround(1e-46)); t(() => Math.fround(1.4e-45)); t(() => Math.fround(NaN)); t(() => Math.fround(-0)); t(() => 1 / Math.fround(-0)); t(() => Math.fround(16777217)); t(() => Math.fround(0.1)); t(() => Math.trunc(-0.5)); t(() => 1 / Math.trunc(-0.5)); t(() => Math.trunc(1e21)); t(() => Math.round(-0.5)); t(() => 1 / Math.round(-0.5)); t(() => Math.round(0.5)); t(() => Math.round(1.5)); t(() => Math.round(2.5)); t(() => Math.round(-1.5)); t(() => Math.round(-2.5)); t(() => Math.round(0.49999999999999994)); t(() => Math.round(-0.49999999999999994)); t(() => 1 / Math.round(-0.49999999999999994)); t(() => Math.round(2 ** 52 + 0.5)); t(() => Math.round(4503599627370497)); t(() => Math.round(-4503599627370497)); t(() => Math.round(1e21)); t(() => Math.round(NaN)); t(() => Math.round(-Infinity)); t(() => 1 / Math.round(-0)); t(() => 1 / Math.round(-0.2)); t(() => Math.ceil(-0.5)); t(() => 1 / Math.ceil(-0.5)); t(() => Math.floor(-0)); t(() => 1 / Math.floor(-0)); t(() => Math.floor(1e300)); t(() => Math.floor(2 ** 53 - 0.5)); t(() => Math.ceil(2 ** 53 - 0.5)); t(() => Math.abs(-0)); t(() => 1 / Math.abs(-0)); t(() => Math.abs('-1')); t(() => Math.abs()); t(() => Math.abs(null)); t(() => Math.abs([])); t(() => Math.abs([-2])); t(() => Math.abs({})); t(() => Math.sign(-0)); t(() => 1 / Math.sign(-0)); t(() => Math.sign(-3)); t(() => Math.sign('5')); t(() => Math.sign(NaN)); t(() => Math.sqrt(-0)); t(() => 1 / Math.sqrt(-0)); t(() => Math.sqrt(-1)); t(() => Math.sqrt(2) ** 2); t(() => Math.sqrt(1e-320)); t(() => Math.sqrt(2 ** 1023 * 2 - 2 ** 970)); t(() => Math.cbrt(-8)); t(() => Math.cbrt(27)); t(() => Math.cbrt(-0)); t(() => Math.hypot()); t(() => Math.hypot(3, 4)); t(() => Math.hypot(-0)); t(() => 1 / Math.hypot(-0)); t(() => Math.hypot(NaN, Infinity)); t(() => Math.hypot(1e200, 1e200)); t(() => Math.hypot(3, 4, 12)); t(() => Math.hypot(1e-200, 1e-200)); t(() => Math.hypot('3', [4])); t(() => Math.max()); t(() => Math.min()); t(() => Math.max(-0, 0)); t(() => 1 / Math.max(-0, 0)); t(() => 1 / Math.min(0, -0)); t(() => 1 / Math.max(-0, -0)); t(() => Math.max(NaN, 1)); t(() => Math.max(1, NaN)); t(() => Math.max('3', 2)); t(() => Math.max(1, 'x')); t(() => Math.max(1, {valueOf() { return 5; }})); t(() => Math.max(null, -1)); t(() => Math.max(undefined, 1)); t(() => Math.max(1, ...[2, 3])); t(() => Math.max([1, 2])); t(() => Math.max([5])); t(() => Math.max('')); t(() => Math.max(true, false)); t(() => Math.min(1, 1n)); return r;",
++	"var r = []; function t(f) { try { r.push(f()); } catch (e) { r.push(e.name); } } t(() => String(1e21)); t(() => String(1e-7)); t(() => String(123456789012345680000)); t(() => String(0.000001)); t(() => String(1.5e-7)); t(() => String(-1e-7)); t(() => String(5e-324)); t(() => String(1.7976931348623157e308)); t(() => String(2 ** 53)); t(() => String(2 ** 53 + 2)); t(() => String(0.1 + 0.7)); t(() => String(1 / 3)); t(() => String(2 / 3)); t(() => String(100 / 3)); t(() => String(1e15 + 0.3)); t(() => String(123456789.12345678)); t(() => String(4.35)); t(() => String(0.1 * 0.2)); t(() => String(1.1 * 1.1)); t(() => String(9.95)); t(() => String(1.005)); t(() => String(-0)); t(() => String(0.5e-6)); t(() => String(1e6)); t(() => String(1.2345e6)); t(() => String(1e20)); t(() => String(1.2345678901234567e20)); t(() => String(1.2345678901234567e21)); t(() => String(123e-9)); t(() => String(1.23e-6)); t(() => String(1.23e-7)); t(() => String(2 ** 70)); t(() => String(2 ** -30)); t(() => String(2 ** -20)); t(() => String(1 / 1024)); t(() => String(1 / 3 * 3)); t(() => String(5e-7 + 5e-7)); t(() => String(9007199254740993)); t(() => String(4.9406564584124654e-324)); t(() => String(2.2250738585072014e-308)); t(() => String(2.2250738585072011e-308)); t(() => String(8.98846567431158e307)); t(() => String(1.7976931348623158e308)); t(() => String(1.7976931348623159e308)); t(() => String(1e23)); t(() => String(1e22)); t(() => String(9.999999999999999e22)); t(() => String(1.0000000000000001e23)); t(() => String(8.41e21)); t(() => String(1e21 - 1)); t(() => String(1e21 + 65536)); t(() => String(999999999999999900000)); t(() => String(0.000001 - 1e-15)); t(() => String(1e-6 * 0.9999999)); t(() => String(0.1 - 0.3)); t(() => String(100 * 1.1)); t(() => String(3 * 1.1)); t(() => String(1.15 * 100)); t(() => String(1.15 * 3)); t(() => String(4.7 - 4.3)); t(() => String(5.0000000000000001)); t(() => String(0.30000000000000004)); t(() => String(0.3000000000000001)); t(() => String(0.29999999999999993)); t(() => String(1.7976931348623157e308 / 10)); t(() => String(2 ** 31)); t(() => String(-(2 ** 31))); t(() => String(2 ** 32)); t(() => String(4294967295)); t(() => String(4294967296.5)); t(() => String(-4294967296.5)); t(() => String(0xffffffffffffffff)); t(() => String(0x1fffffffffffff)); t(() => String(0x20000000000001)); t(() => String(0o777777777777777777777)); t(() => String(0b1111111111111111111111111111111111111111111111111111111)); t(() => String(1e400)); t(() => String(-1e400)); t(() => String(1e-400)); t(() => 1 / Number('-1e-400')); t(() => String(.1e1)); t(() => String(1.e1)); t(() => String(5e1)); t(() => String(5E1)); t(() => String(5e+1)); t(() => String(5e-1)); t(() => String(5e-01)); t(() => String(0.0000005)); t(() => String(0.000000499999)); t(() => String(1234567890123456789)); t(() => String(12345678901234567890)); t(() => String(123456789012345678901)); t(() => String(1234567890123456789012)); t(() => (12345678901234567890).toFixed(0)); t(() => (1e21).toFixed(0)); t(() => (999999999999999900000).toFixed(0)); t(() => (0.1).toFixed(1)); t(() => (0.15).toFixed(1)); t(() => (0.25).toFixed(1)); t(() => (0.35).toFixed(1)); t(() => (1.45).toFixed(1)); t(() => (1.55).toFixed(1)); t(() => (2.5).toFixed(0)); t(() => (3.5).toFixed(0)); t(() => (-2.5).toFixed(0)); t(() => (1e-7).toFixed(10)); t(() => (5e-324).toFixed(100).length); t(() => (1.7976931348623157e308).toFixed(2)); t(() => (123.456).toFixed()); t(() => (0).toFixed(100)); t(() => (-0).toFixed(0)); t(() => (-0.0001).toFixed(2)); t(() => (-0.5).toFixed(0)); t(() => (-1.5).toFixed(0)); t(() => (0.5).toFixed()); t(() => (NaN).toFixed(2)); t(() => (Infinity).toFixed(2)); t(() => (-Infinity).toFixed(2)); t(() => (1).toFixed(NaN)); t(() => (1).toFixed('2')); t(() => (1).toFixed(2.9)); t(() => (1).toFixed(-0.5)); t(() => (1).toFixed(100.5)); t(() => (1).toFixed(Infinity)); t(() => (1).toFixed(101)); t(() => (1).toFixed(-1)); t(() => (1.005).toFixed(2)); t(() => (1.0049999999999999).toFixed(2)); t(() => (8.575).toFixed(2)); t(() => (1.255).toFixed(2)); t(() => (10.235).toFixed(2)); t(() => (2.345).toFixed(2)); t(() => (2.5).toPrecision(1)); t(() => (3.5).toPrecision(1)); t(() => (0.5).toPrecision(1)); t(() => (1.5).toPrecision(1)); t(() => (25).toPrecision(1)); t(() => (35).toPrecision(1)); t(() => (45).toPrecision(1)); t(() => (5e-7).toPrecision(1)); t(() => (5e-7).toPrecision(2)); t(() => (123456).toPrecision(3)); t(() => (0.000123).toPrecision(2)); t(() => (1e21).toPrecision(1)); t(() => (1e21).toPrecision(22)); t(() => (1e-7).toPrecision(1)); t(() => (1e-6).toPrecision(1)); t(() => (0.00001).toPrecision(1)); t(() => (0.000001).toPrecision(1)); t(() => (0.0000001).toPrecision(1)); t(() => (123).toPrecision(2)); t(() => (129).toPrecision(2)); t(() => (999).toPrecision(2)); t(() => (9.99).toPrecision(2)); t(() => (0.0999).toPrecision(2)); t(() => (1).toPrecision(100)); t(() => (1).toPrecision(101)); t(() => (1).toPrecision(0)); t(() => (1).toPrecision(1.9)); t(() => (1).toPrecision(NaN)); t(() => (1).toPrecision('3')); t(() => (NaN).toPrecision(1)); t(() => (Infinity).toPrecision(1)); t(() => (-0).toPrecision(2)); t(() => (0).toPrecision(1)); t(() => (5e-324).toPrecision(1)); t(() => (5e-324).toPrecision(17)); t(() => (1.7976931348623157e308).toPrecision(21)); t(() => (2.5).toExponential(0)); t(() => (3.5).toExponential(0)); t(() => (0.5).toExponential(0)); t(() => (25).toExponential(0)); t(() => (35).toExponential(0)); t(() => (1.25).toExponential(1)); t(() => (1.35).toExponential(1)); t(() => (1.45).toExponential(1)); t(() => (0).toExponential()); t(() => (0).toExponential(0)); t(() => (0).toExponential(5)); t(() => (-0).toExponential(1)); t(() => (1).toExponential()); t(() => (1).toExponential(0)); t(() => (123456).toExponential()); t(() => (123456).toExponential(1)); t(() => (123456).toExponential(2)); t(() => (0.000123).toExponential()); t(() => (0.000123).toExponential(1)); t(() => (1e21).toExponential()); t(() => (1e21).toExponential(1)); t(() => (1e-7).toExponential()); t(() => (1e-7).toExponential(0)); t(() => (1e-7).toExponential(2)); t(() => (5e-324).toExponential()); t(() => (5e-324).toExponential(0)); t(() => (5e-324).toExponential(100).length); t(() => (1.7976931348623157e308).toExponential()); t(() => (1.7976931348623157e308).toExponential(20)); t(() => (123).toExponential(100)); t(() => (1).toExponential(101)); t(() => (1).toExponential(-1)); t(() => (1).toExponential(NaN)); t(() => (1).toExponential('2')); t(() => (1).toExponential(1.9)); t(() => (NaN).toExponential(1)); t(() => (NaN).toExponential(-1)); t(() => (Infinity).toExponential(101)); t(() => (-Infinity).toExponential(1)); t(() => (1).toExponential(undefined)); t(() => (1.5).toExponential(undefined)); t(() => (0.1 + 0.2).toExponential()); t(() => (0.1 + 0.2).toExponential(16)); t(() => (0.1 + 0.2).toExponential(17)); t(() => (0.1 + 0.2).toExponential(20)); t(() => (0.1 + 0.2).toFixed(20)); t(() => (0.1 + 0.2).toPrecision(20)); t(() => (0.1 + 0.2).toPrecision(21)); t(() => (0.1 + 0.2).toPrecision(17)); t(() => (1 / 3).toFixed(20)); t(() => (1 / 3).toPrecision(21)); t(() => (2 / 3).toExponential(20)); t(() => (1e-10).toFixed(20)); t(() => (123.456e-10).toFixed(20)); t(() => (1e20).toFixed(2)); t(() => (1e20 + 0.5).toFixed(2)); t(() => (123456789012345.67).toFixed(2)); t(() => (1234567890123456.7).toFixed(2)); t(() => (0.1).toFixed(25)); t(() => (0.1).toFixed(30)); t(() => (0.1).toFixed(55)); t(() => (0.1).toFixed(56)); t(() => (0.1).toFixed(100)); t(() => (1e-20).toFixed(30)); t(() => (123.456).toString(16)); t(() => (0.5).toString(2)); t(() => (0.1).toString(2)); t(() => (0.1).toString(3)); t(() => (1 / 3).toString(3)); t(() => (255.5).toString(16)); t(() => (-255.5).toString(16)); t(() => (1e-7).toString(2)); t(() => (5e-324).toString(2)); t(() => (2 ** 53 + 2).toString(2)); t(() => (123.456).toString(10)); t(() => (123.456).toString(undefined)); t(() => (NaN).toString(2)); t(() => (Infinity).toString(16)); t(() => (-Infinity).toString(2)); t(() => (-0).toString(16)); t(() => (1).toString(1)); t(() => (1).toString(37)); t(() => (1).toString(0)); t(() => (1).toString(NaN)); t(() => (1).toString('16')); t(() => (1).toString(16.9)); t(() => (1).toString(null)); t(() => (0.000001).toString(10)); t(() => (1e-7).toString(10)); t(() => (0.1).toString(16)); t(() => (0.1).toString(36)); t(() => (3.14159).toString(8)); t(() => (1 / 7).toString(7)); t(() => (2 ** -1074).toString(16)); t(() => (2 ** 1023).toString(2).length); t(() => (0.5 + 2 ** -53).toString(2)); t(() => (1 - 2 ** -53).toString(2)); t(() => (1 - 2 ** -53).toString(16)); t(() => (1 + 2 ** -52).toString(16)); t(() => (1e15 + 0.5).toString(16)); t(() => (1e16).toString(16)); t(() => (123456789.123456789).toString(36)); t(() => Number.prototype.toString.call(Object(5), 2)); t(() => Number.prototype.toString.call('5')); t(() => Number.prototype.toString.call(5n)); t(() => Number.prototype.toFixed.call(true, 1)); return r;",
++}
+diff --git a/hegel_props_test.go b/hegel_props_test.go
+new file mode 100644
+index 0000000..3d2c699
+--- /dev/null
++++ b/hegel_props_test.go
+@@ -0,0 +1,73 @@
++package goja_test
++
++import (
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// compare judges goja's result against the reference engine's for one
++// program: both compile, run and return the same value, or both fail at the
++// same stage (compiling, or running) with the same kind of error. Error
++// messages are not compared (the serialiser keeps an error's name only);
++// any other thrown value must be the same.
++func compare(ht *hegel.T, src string, g, r jsResult) {
++	if r.Status == "timeout" {
++		fail(ht, "node does not finish (the generator must bound every loop)\nprogram:\n%s\ngoja: %s %s", src, g.Status, cut(g.Payload))
++	}
++	switch g.Status {
++	case "panic":
++		fail(ht, "goja panics\nprogram:\n%s\n%s", src, g.Payload)
++	case "timeout":
++		fail(ht, "goja does not finish\nprogram:\n%s\nnode: %s %s", src, r.Status, cut(r.Payload))
++	}
++	if g.Status != r.Status {
++		fail(ht, "goja %s, node %s\nprogram:\n%s\ngoja: %s\nnode: %s", g.Status, r.Status, src, cut(g.Payload), cut(r.Payload))
++	}
++	if g.Payload != r.Payload {
++		fail(ht, "%s differ\nprogram:\n%s\ngoja: %s\nnode: %s", map[string]string{"ok": "results", "throw": "thrown values", "compile": "compile errors"}[g.Status], src, cut(g.Payload), cut(r.Payload))
++	}
++}
++
++func cut(s string) string {
++	if len(s) > 600 {
++		return s[:600] + "..."
++	}
++	return s
++}
++
++// TestHegelRunAgreesWithNode: a generated program (literals of every kind,
++// variables, assignments, the control statements, closures, arrays and
++// objects, classes, the operators with their precedence and coercions,
++// exceptions, the built-in objects' methods) returns the same value in goja
++// and in node, or fails in both at the same stage with the same kind of
++// error; the probes (fixed programs over the language's and the built-ins'
++// corners) likewise.
++func TestHegelRunAgreesWithNode(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		k := n(ht, 1, 3)
++		for i := 0; i < k; i++ {
++			g := newGen(ht)
++			var src string
++			if chance(ht, 20) {
++				src = g.wrong()
++			} else {
++				src = g.program()
++			}
++			note(ht, "program:\n%s", src)
++			gr := gojaRun(src)
++			nr := nodeRun(ht, src)
++			compare(ht, src, gr, nr)
++		}
++	})
++}
++
++// TestHegelProbesAgreeWithNode: the fixed probe programs, one property case
++// each so that a failing probe is reported on its own.
++func TestHegelProbesAgreeWithNode(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		src := pick(ht, probes...)
++		note(ht, "program:\n%s", src)
++		compare(ht, src, gojaRun(src), nodeRun(ht, src))
++	})
++}
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..6b32143
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,168 @@
++package goja_test
++
++// Generated JavaScript programs run by goja and by the reference engine
++// (node, as a child process) must agree: the same programs compile, run
++// and return the same values, or fail at the same stage with the same kind
++// of error.
++//
++// Needs node on PATH.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Plumbing.
++
++var (
++	collecting    = os.Getenv("HEGEL_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++type collected struct{}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 400 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if err, ok := r.(error); ok && strings.Contains(err.Error(), "hegel_") {
++				panic(r) // libhegel control flow
++			}
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			fail(ht, "panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func hegelOpts() []hegel.Option {
++	// A case is a batch of programs through the oracle: large and slow by
++	// hegel's defaults.
++	opts := []hegel.Option{hegel.SuppressHealthCheck(hegel.TooSlow, hegel.TestCasesTooLarge, hegel.LargeInitialTestCase)}
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			opts = append(opts, hegel.WithTestCases(n))
++		}
++	}
++	return opts
++}
++
++// fail reports a property failure; in collect mode it records the message
++// and moves on to the next case.
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// ---------------------------------------------------------------------------
++// Known bugs (see bugs.toml). Each gate keeps the generator away from a
++// shape that is known to differ from the reference engine while the bug is
++// open; the pins in hegel_pins_test.go fail while it is.
++
++var Known = struct {
++	arrowArguments       bool // arguments inside an arrow function inside a function is undefined, or a Go panic (index out of range), instead of the enclosing function's arguments
++	strictOctalEscape    bool // legacy octal escapes ('\1', '\101', '\08', '\8') are accepted in strict mode code
++	parseIntNegZero      bool // parseInt('-0') is +0, not -0
++	isoExtendedYear      bool // toISOString/toJSON print a year outside 0..9999 with as few digits as it has (+10000, -0001) instead of six
++	regexLineTerminators bool // in a regexp, . matches U+2028/U+2029 and ^/$ with the m flag do not see \r, U+2028 or U+2029 as line terminators
++	loneSurrogateCase    bool // toUpperCase, toLowerCase and normalize turn a lone surrogate into U+FFFD
++	toInt32Large         bool // ToInt32/ToUint32 of a number of magnitude 2^63 or more give 0 (1e21 | 0, ~1e21, 1e21 >>> 0, Math.imul, Math.clz32) instead of the value modulo 2^32
++	labelledFunction     bool // a labelled function declaration (L: function f() {}) is a SyntaxError in sloppy mode
++	unicodeRegexpSyntax  bool // with the u flag, invalid patterns are accepted (identity escapes such as \-, incomplete escapes, a backreference to a missing group, a lone ] or a{, a class range with a class escape, a quantified lookahead, an unknown property name)
++	duplicateGroupNames  bool // a regexp with two groups of the same name in one alternative ((?<a>x)(?<a>y)) is accepted
++	quantifiedLookbehind bool // a quantified lookbehind ((?<=a)+) is accepted (no generator shape: quantifiers never follow an assertion)
++	jsonNumberRange      bool // JSON.parse of a number beyond the double range (1e400) throws a SyntaxError instead of giving Infinity
++	deleteNew            bool // delete new X() throws a TypeError instead of giving true
++	mulNegZero           bool // a product of integer-valued numbers that should be -0 is +0 (-5 * 0, 0 * -5, x *= -5)
++	unicodeProperty      bool // a \p{...} or \P{...} property escape with the u flag never matches
++	globalEmptyMatch     bool // match and replace with a g regexp drop an empty match right after a non-empty one ('ab'.match(/a|/g) lacks one "")
++	execKeyOrder         bool // a match result's own keys come as input, index, groups instead of index, input, groups
++	unterminatedClass    bool // a regexp literal whose character class is not closed (/[/) is accepted and swallows the rest of the source
++	constantContinue     bool // continue or break under a constant-false condition in a for-of/for-in/for-let loop: the compiler panics (index out of range), reports a "Compiler bug" SyntaxError, or loops forever
++	fromEntriesPanic     bool // Object.fromEntries panics (nil pointer dereference) on an entry object without a "0" property ([[]], [{}])
++	relationalChain      bool // a instanceof B instanceof C throws a TypeError: the chain is evaluated right to left
++	asciiCaseFold        bool // without the u flag, the i flag folds non-ASCII characters onto ASCII ones and uses simple case folding (K matches k, long s matches s, Angstrom sign matches a-ring, capital sharp s matches sharp s)
++	codePointEscapePanic bool // the escape \u{10FFFF} in a string or template literal panics the parser ("unexpected unicode length")
++	nbspToNumber         bool // the implicit string-to-number conversion of == and of an object's string value does not trim U+00A0 or U+FEFF ('\u00A0' == 0 is false, Math.trunc(['\u00A0']) is NaN), while Number() does
++	restParamUseStrict   bool // a 'use strict' directive in a function with a rest parameter is accepted (a SyntaxError: non-simple parameter list)
++	deleteNoEval         bool // delete of an expression that is not a reference (or a call) does not evaluate it: delete (v++) leaves v unchanged
++	funcKeyOrder         bool // the own keys of a function come as prototype, length, name instead of length, name, prototype
++}{
++	arrowArguments:       true,
++	strictOctalEscape:    true,
++	parseIntNegZero:      true,
++	isoExtendedYear:      true,
++	regexLineTerminators: true,
++	loneSurrogateCase:    true,
++	toInt32Large:         true,
++	labelledFunction:     true,
++	unicodeRegexpSyntax:  true,
++	duplicateGroupNames:  true,
++	quantifiedLookbehind: true,
++	jsonNumberRange:      true,
++	deleteNew:            true,
++	mulNegZero:           true,
++	unicodeProperty:      true,
++	globalEmptyMatch:     true,
++	execKeyOrder:         true,
++	unterminatedClass:    true,
++	constantContinue:     true,
++	fromEntriesPanic:     true,
++	relationalChain:      true,
++	asciiCaseFold:        true,
++	codePointEscapePanic: true,
++	nbspToNumber:         true,
++	restParamUseStrict:   true,
++	deleteNoEval:         true,
++	funcKeyOrder:         true,
++}
