@@ -11,7 +11,7 @@ The patch adds the `hegel.dev/go/hegel` requirement to `go.mod` and six test fil
 root (package `goja_test`): `hegel_test.go` (plumbing, the `Known` gates), `hegel_gen_test.go` (the
 program generator, the early-error list), `hegel_probes_test.go` (fixed probe programs),
 `hegel_oracle_test.go` (the reference engine as a child process, the shared value serialiser),
-`hegel_props_test.go` (the properties) and `hegel_pins_test.go` (twenty-eight pins). **Needs `node`
+`hegel_props_test.go` (the properties) and `hegel_pins_test.go` (thirty-eight pins). **Needs `node`
 (the reference JavaScript engine; Node 22 was used) on PATH**: one process per `go test`, fed a
 small driver that compiles each program as a function body in a fresh `vm` context with a
 five-second timeout and prints its result, or the kind of error, in a canonical form. The
@@ -39,7 +39,11 @@ the String HTML methods, `__defineGetter__`, `08`/`08.5` numerals, `for (var i =
 comments, block-level function hoisting to the function scope); the reference being behind the
 specification (a repeated group name across alternatives, `Error.isError`, `Uint8Array.fromBase64`) or
 off it (V8 lists the accessor properties of an object literal that also has a spread after its data
-properties: `Object.keys({...{}, get g() {}, x: 1})` is `x, g` in node; the generator does not mix the two);
+properties: `Object.keys({...{}, get g() {}, x: 1})` is `x, g` in node; the generator does not mix the two;
+V8 lets `\B` and a negative lookbehind match between the two halves of a surrogate pair under the `u`
+flag, `'A\u{1F600}'.replace(/\B/ug, '|')` splitting the emoji, where RegExpBuiltinExec never visits
+that index; and V8 follows Annex B in making a call the target of `++`, `--` or an assignment a
+runtime ReferenceError where goja has the early SyntaxError of the main text);
 and what the specification leaves to the implementation: Date strings not in the Date Time String
 Format, `Math` transcendental functions and `**` with fractional operands (the generator keeps `**` to
 small integer exponents), `toString(radix)` of a non-integer or of a number beyond 2^53, the
@@ -47,13 +51,29 @@ time-zone name in `Date.prototype.toString` (the generator returns no valid Date
 `arguments`/`caller` properties on sloppy functions, error messages and `stack`, the way `/` is
 escaped in `RegExp.prototype.source`, and the documented JSON.parse surrogate caveat.
 
-Twenty-seven bugs are recorded in `bugs.toml`. Five are crashes of the Go process: `arguments`
+Thirty-seven bugs are recorded in `bugs.toml`. Eight are crashes of the Go process:
+`Array.from({length: 2}, String)` - a native function mapping an array-like with missing elements -
+dereferences a nil pointer (35); `replaceAll`
+with an empty search string on a string holding a non-ASCII character (`'\u00e9'.replaceAll('',
+'-')`) never returns and eats memory until the runtime dies out of memory (28); a `break` or
+`continue` in the never-taken branch of an `if` with a constant condition, inside a `try` inside a
+`for-in`/`for-of`, when that branch also declares a class or reads the loop variable, makes the VM
+pop an empty iterator stack once the `try` catches (33: `for (const k in [1]) { try { if (true) {}
+else { class C {} break; } throw 1; } catch (e) {} }`); `arguments`
 inside an arrow function inside a function is undefined, or an index out of range (1); `continue`
 or `break` under a constant-false condition in a `for` loop with a `let`/`const` binding panics the
 compiler, or makes it loop forever with a `while` in between (19: `for (const a of 'x') { if (false)
 continue; }` at the top level of a script); `Object.fromEntries([[]])` dereferences a nil pointer
 (20); the escape `\u{10FFFF}` in a string literal panics the parser (23); and a regexp literal
 whose character class is not closed swallows the rest of the source (18, a SyntaxError in node).
+Seven more came the same day from the rounds of `go/sobek`, goja's fork, and goja's own: `\b` and `\B`
+without the `u` flag count é or Σ as word characters (29), `let` at the end of a line before a token
+that cannot start a binding is a SyntaxError where the specification sees the identifier `let` (30),
+`new Date(-4).setUTCMilliseconds(2)` is 2 instead of -998 (31), and `JSON.stringify` with a gap
+indents a container one level too deep after an empty `[]` or `{}` (32), and an invalid regexp literal
+is a SyntaxError when evaluated rather than when the script is compiled, so `if (false) { /(/; }`
+runs (34), `String.fromCodePoint(-0)` throws a RangeError (36), and `BigInt.prototype` carries a
+function's `length` and `name`, so `10n.name` is "BigInt" (37).
 Three are the parser or compiler getting the language wrong: relational operators associate to the
 right, so `3 > 2 > 1` is true and `1 in {} in {}` throws (21); `delete` of anything that is not a
 reference skips evaluating it, so `delete (v++)` leaves `v` unchanged (26); and `delete new Set()`
