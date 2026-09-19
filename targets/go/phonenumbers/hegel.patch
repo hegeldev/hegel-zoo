@@ -1,0 +1,1154 @@
+diff --git a/go.mod b/go.mod
+index 517000f..5f5030f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,15 +1,18 @@
+ module github.com/nyaruka/phonenumbers/v2
+ 
+-go 1.24.0
++go 1.26.0
+ 
+ require (
+ 	github.com/stretchr/testify v1.11.1
+ 	golang.org/x/text v0.34.0
+ 	google.golang.org/protobuf v1.36.11
++	hegel.dev/go/hegel v0.6.33
+ )
+ 
+ require (
+ 	github.com/davecgh/go-spew v1.1.1 // indirect
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
+ 	github.com/pmezard/go-difflib v1.0.0 // indirect
++	golang.org/x/sys v0.44.0 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ )
+diff --git a/hegel_oracle_test.go b/hegel_oracle_test.go
+new file mode 100644
+index 0000000..1f3150a
+--- /dev/null
++++ b/hegel_oracle_test.go
+@@ -0,0 +1,286 @@
++package phonenumbers_test
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"sync"
++	"testing"
++)
++
++// ---- the oracle: Python's phonenumbers (the libphonenumber port that ships the same metadata) ----
++//
++// One JSON request per line on stdin, one JSON answer per line on stdout. Enumerations travel as
++// their libphonenumber names so that the two ports' differing numeric values do not matter.
++
++const pyScript = `
++import sys, json
++import phonenumbers as P
++import phonenumbers.shortnumberinfo as S
++import phonenumbers.timezone as TZ
++import phonenumbers.carrier as CA
++import phonenumbers.geocoder as GE
++from phonenumbers import PhoneNumber, NumberParseException, PhoneNumberFormat as F, PhoneNumberType as T, ValidationResult as V, MatchType as M, Leniency as L
++from phonenumbers.shortnumberinfo import ShortNumberCost as C
++
++# python's matcher compares an x-less extension with None where Java compares with "" (a Java
++# number without extension has getExtension() == ""), so "12 34 56 78 ext" is not VALID for python
++# but is for Java and this port; patch the oracle to Java's reading.
++import phonenumbers.phonenumbermatcher as PM
++def _contains_only_valid_x_chars(numobj, candidate):
++    ii = 0
++    while ii < len(candidate) - 1:
++        if candidate[ii] in 'xX':
++            next_char = candidate[ii + 1]
++            if next_char in 'xX':
++                ii += 1
++                if P.is_number_match(numobj, candidate[ii:]) != M.NSN_MATCH:
++                    return False
++            elif P.normalize_digits_only(candidate[ii:]) != (numobj.extension or ''):
++                return False
++        ii += 1
++    return True
++PM._contains_only_valid_x_chars = _contains_only_valid_x_chars
++
++TYPES = {getattr(T, k): k for k in dir(T) if k.isupper()}
++TYPE_BY_NAME = {v: k for k, v in TYPES.items()}
++RESULTS = {getattr(V, k): k for k in dir(V) if k.isupper()}
++MATCHES = {getattr(M, k): k for k in dir(M) if k.isupper()}
++COSTS = {getattr(C, k): k for k in dir(C) if k.isupper()}
++ERRORS = {NumberParseException.INVALID_COUNTRY_CODE: 'INVALID_COUNTRY_CODE', NumberParseException.NOT_A_NUMBER: 'NOT_A_NUMBER',
++          NumberParseException.TOO_SHORT_AFTER_IDD: 'TOO_SHORT_AFTER_IDD', NumberParseException.TOO_SHORT_NSN: 'TOO_SHORT_NSN', NumberParseException.TOO_LONG: 'TOO_LONG'}
++FORMATS = [F.E164, F.INTERNATIONAL, F.NATIONAL, F.RFC3966]
++
++def num_out(n):
++    if n is None:
++        return None
++    return {'cc': n.country_code or 0, 'nn': n.national_number or 0, 'ext': n.extension or '',
++            'ilz': bool(n.italian_leading_zero), 'nlz': 1 if n.number_of_leading_zeros is None else n.number_of_leading_zeros,
++            'nlzSet': n.number_of_leading_zeros is not None,
++            'raw': n.raw_input or '', 'ccs': n.country_code_source or 0, 'pdcc': n.preferred_domestic_carrier_code or ''}
++
++def num_in(d):
++    return PhoneNumber(country_code=d['cc'], national_number=d['nn'], extension=d['ext'] or None,
++                       italian_leading_zero=True if d['ilz'] else None,
++                       number_of_leading_zeros=d['nlz'] if d.get('nlzSet') else None,
++                       raw_input=d['raw'] or None, country_code_source=d['ccs'] or 0,
++                       preferred_domestic_carrier_code=d['pdcc'] or None)
++
++def parse(req):
++    try:
++        n = P.parse(req['number'], req['region'] or None, keep_raw_input=req['keepRaw'])
++        return {'ok': True, 'num': num_out(n)}
++    except NumberParseException as e:
++        return {'ok': False, 'err': ERRORS.get(e.error_type, str(e.error_type))}
++
++def info(req):
++    n = num_in(req['num'])
++    region = req['region']
++    lang = req['lang']
++    t = P.number_type(n)
++    trunc = PhoneNumber()
++    trunc.merge_from(n)
++    truncated = P.truncate_too_long_number(trunc)
++    ex_type = TYPE_BY_NAME[req['type']]
++    try:
++        tz = list(TZ.time_zones_for_number(n))
++    except Exception as e:
++        tz = ['error: ' + type(e).__name__]
++    res = {
++        'valid': P.is_valid_number(n),
++        'validForRegion': P.is_valid_number_for_region(n, region),
++        'possible': P.is_possible_number(n),
++        'possibleReason': RESULTS[P.is_possible_number_with_reason(n)],
++        'possibleForType': P.is_possible_number_for_type(n, ex_type),
++        'possibleForTypeReason': RESULTS[P.is_possible_number_for_type_with_reason(n, ex_type)],
++        'type': TYPES[t],
++        'regionCode': P.region_code_for_number(n) or '',
++        'formats': [P.format_number(n, f) for f in FORMATS],
++        'outOfCountry': P.format_out_of_country_calling_number(n, region),
++        'outOfCountryAlpha': P.format_out_of_country_keeping_alpha_chars(n, region),
++        'original': P.format_in_original_format(n, region),
++        'carrierCode': P.format_national_number_with_carrier_code(n, req['carrier']),
++        'preferredCarrier': P.format_national_number_with_preferred_carrier_code(n, req['carrier']),
++        'mobileDialing': P.format_number_for_mobile_dialing(n, region, True),
++        'mobileDialingPlain': P.format_number_for_mobile_dialing(n, region, False),
++        'areaCodeLength': P.length_of_geographical_area_code(n),
++        'ndcLength': P.length_of_national_destination_code(n),
++        'geographical': P.is_number_geographical(n),
++        'intlDiallable': P.can_be_internationally_dialled(n),
++        'truncated': truncated,
++        'truncatedNum': num_out(trunc),
++        'nsn': P.national_significant_number(n),
++        'matchOther': MATCHES[P.is_number_match(n, req['other'])],
++        'matchNum': MATCHES[P.is_number_match(n, num_in(req['otherNum']))],
++        'timezones': tz,
++        'carrier': CA.name_for_number(n, lang),
++        'carrierValid': CA.name_for_valid_number(n, lang),
++        'countryName': GE.country_name_for_number(n, lang),
++        'description': GE.description_for_number(n, lang),
++        'descriptionValid': GE.description_for_valid_number(n, lang),
++        'descriptionUser': GE.description_for_number(n, lang, region=region),
++        'possibleShort': S.is_possible_short_number(n),
++        'possibleShortForRegion': S.is_possible_short_number_for_region(n, region),
++        'validShort': S.is_valid_short_number(n),
++        'validShortForRegion': S.is_valid_short_number_for_region(n, region),
++        'cost': COSTS[S.expected_cost(n)],
++        'costForRegion': COSTS[S.expected_cost_for_region(n, region)],
++        'carrierSpecific': S.is_carrier_specific(n),
++        'carrierSpecificForRegion': S.is_carrier_specific_for_region(n, region),
++        'smsService': S.is_sms_service_for_region(n, region),
++    }
++    return res
++
++def region(req):
++    r = req['region']
++    ex = P.example_number(r)
++    ext = P.example_number_for_type(r, TYPE_BY_NAME[req['type']])
++    cc = req['cc']
++    return {
++        'countryCode': P.country_code_for_region(r),
++        'ndd': P.ndd_prefix_for_region(r, False) or '',
++        'nddDigits': P.ndd_prefix_for_region(r, True) or '',
++        'nanpa': P.is_nanpa_country(r),
++        'portable': P.is_mobile_number_portable_region(r),
++        'example': num_out(ex),
++        'exampleForType': num_out(ext),
++        'types': sorted(TYPES[t] for t in P.supported_types_for_region(r)),
++        'regionForCC': P.region_code_for_country_code(cc),
++        'regionsForCC': list(P.region_codes_for_country_code(cc)),
++        'mobileToken': P.country_mobile_token(cc),
++        'exampleNonGeo': num_out(P.example_number_for_non_geo_entity(cc)),
++        'typesNonGeo': sorted(TYPES[t] for t in P.supported_types_for_non_geo_entity(cc)),
++        'invalidExample': num_out(P.invalid_example_number(r)) if hasattr(P, 'invalid_example_number') else None,
++    }
++
++def text(req):
++    s = req['text']
++    r = req['region']
++    return {
++        'alpha': P.is_alpha_number(s),
++        'converted': P.convert_alpha_characters_in_number(s),
++        'digits': P.normalize_digits_only(s),
++        'diallable': P.normalize_diallable_chars_only(s),
++        'emergency': S.is_emergency_number(s, r),
++        'connectsEmergency': S.connects_to_emergency_number(s, r),
++        'possibleString': P.is_possible_number_string(s, r or None),
++        'match': MATCHES[P.is_number_match(s, req['other'])],
++    }
++
++def aytf(req):
++    f = P.AsYouTypeFormatter(req['region'])
++    out = []
++    for i, ch in enumerate(req['chars']):
++        if i == req['remember']:
++            out.append(f.input_digit(ch, remember_position=True))
++        else:
++            out.append(f.input_digit(ch))
++    pos = f.get_remembered_position()
++    f.clear()
++    return {'out': out, 'pos': pos, 'afterClear': f.input_digit(req['chars'][0]) if req['chars'] else ''}
++
++def matcher(req):
++    lens = [L.POSSIBLE, L.VALID, L.STRICT_GROUPING, L.EXACT_GROUPING][req['leniency']]
++    ms = []
++    for m in P.PhoneNumberMatcher(req['text'], req['region'] or None, leniency=lens, max_tries=req['maxTries']):
++        ms.append({'start': m.start, 'end': m.end, 'raw': m.raw_string, 'num': num_out(m.number)})
++    return {'matches': ms}
++
++OPS = {'parse': parse, 'info': info, 'region': region, 'text': text, 'aytf': aytf, 'matcher': matcher}
++for line in sys.stdin:
++    req = json.loads(line)
++    try:
++        res = OPS[req['op']](req)
++    except Exception as e:
++        res = {'error': type(e).__name__ + ': ' + str(e)[:300]}
++    sys.stdout.write(json.dumps(res) + '\n')
++    sys.stdout.flush()
++`
++
++// pyNumber is a PhoneNumber's fields as both sides describe them.
++type pyNumber struct {
++	CC     int    `json:"cc"`
++	NN     uint64 `json:"nn"`
++	Ext    string `json:"ext"`
++	ILZ    bool   `json:"ilz"`
++	NLZ    int    `json:"nlz"`
++	NLZSet bool   `json:"nlzSet"`
++	Raw    string `json:"raw"`
++	CCS    int    `json:"ccs"`
++	PDCC   string `json:"pdcc"`
++}
++
++func (p pyNumber) String() string {
++	return fmt.Sprintf("{cc %d nn %d ext %q ilz %v nlz %d(set %v) raw %q ccs %d pdcc %q}", p.CC, p.NN, p.Ext, p.ILZ, p.NLZ, p.NLZSet, p.Raw, p.CCS, p.PDCC)
++}
++
++type python struct {
++	mu  sync.Mutex
++	cmd *exec.Cmd
++	in  *bufio.Writer
++	out *bufio.Scanner
++}
++
++var (
++	pyOnce  sync.Once
++	pyChild *python
++	pyErr   error
++)
++
++func oracle(t *testing.T) *python {
++	pyOnce.Do(func() {
++		cmd := exec.Command("python3", "-c", pyScript)
++		cmd.Stderr = os.Stderr
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			pyErr = err
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			pyErr = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			pyErr = err
++			return
++		}
++		sc := bufio.NewScanner(stdout)
++		sc.Buffer(make([]byte, 1<<16), 1<<24)
++		pyChild = &python{cmd: cmd, in: bufio.NewWriter(stdin), out: sc}
++	})
++	if pyErr != nil {
++		t.Fatalf("cannot start the python phonenumbers oracle: %v", pyErr)
++	}
++	return pyChild
++}
++
++func (g *python) call(t *testing.T, req map[string]any, res any) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	b, err := json.Marshal(req)
++	if err != nil {
++		t.Fatalf("oracle request: %v", err)
++	}
++	if _, err := g.in.Write(append(b, '\n')); err != nil {
++		t.Fatalf("oracle write: %v", err)
++	}
++	if err := g.in.Flush(); err != nil {
++		t.Fatalf("oracle flush: %v", err)
++	}
++	if !g.out.Scan() {
++		t.Fatalf("the python oracle died: %v (is the phonenumbers package installed?)", g.out.Err())
++	}
++	line := g.out.Bytes()
++	var probe struct {
++		Error string `json:"error"`
++	}
++	if json.Unmarshal(line, &probe) == nil && probe.Error != "" {
++		t.Fatalf("oracle: %s for %s", probe.Error, b)
++	}
++	if err := json.Unmarshal(line, res); err != nil {
++		t.Fatalf("oracle answer %q: %v", line, err)
++	}
++}
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..7d2b8ab
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,832 @@
++package phonenumbers_test
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++
++	. "github.com/nyaruka/phonenumbers/v2"
++	"github.com/nyaruka/phonenumbers/v2/carrier"
++	"github.com/nyaruka/phonenumbers/v2/geocoding"
++	"github.com/nyaruka/phonenumbers/v2/timezone"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			fail(ht, "panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// fail reports a mismatch; under ZOO_COLLECT=1 it prints a COLLECT line once per distinct message
++// and lets the test case go on, so one run shows every kind of mismatch.
++var collect = os.Getenv("ZOO_COLLECT") != ""
++var seen = map[string]bool{}
++
++func fail(ht *hegel.T, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collect {
++		key := msg
++		if len(key) > 200 {
++			key = key[:200]
++		}
++		if !seen[key] {
++			seen[key] = true
++			fmt.Println("COLLECT " + strings.ReplaceAll(msg, "\n", " "))
++		}
++		return
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// Findings recorded in bugs.toml; each gate keeps a property from re-reporting one.
++var known = struct {
++	// Bug 2: FormatOutOfCountryKeepingAlphaChars keeps "+" and "*" from the raw input.
++	keepsPlusAndStar func(raw string) bool
++}{
++	keepsPlusAndStar: func(raw string) bool { return strings.ContainsAny(raw, "+*\uFF0B") },
++}
++
++// Where the oracle has data upstream libphonenumber 9.0.38 does not ship (python's phonenumbers
++// keeps older prefix files): geocoding for France, Malaysia, Latvia and Estonia in English, South
++// Korea in other languages, and carrier names under 549 (Argentina mobile).
++var oracleGap = struct {
++	geocodingData func(cc int) bool
++	carrierData   func(cc int) bool
++}{
++	geocodingData: func(cc int) bool { return cc == 33 || cc == 60 || cc == 371 || cc == 372 || cc == 82 },
++	carrierData:   func(cc int) bool { return cc == 54 },
++}
++
++// ---- names shared with the oracle -----------------------------------------------------------
++
++var typeNames = map[PhoneNumberType]string{
++	FIXED_LINE: "FIXED_LINE", MOBILE: "MOBILE", FIXED_LINE_OR_MOBILE: "FIXED_LINE_OR_MOBILE", TOLL_FREE: "TOLL_FREE",
++	PREMIUM_RATE: "PREMIUM_RATE", SHARED_COST: "SHARED_COST", VOIP: "VOIP", PERSONAL_NUMBER: "PERSONAL_NUMBER",
++	PAGER: "PAGER", UAN: "UAN", VOICEMAIL: "VOICEMAIL", UNKNOWN: "UNKNOWN",
++}
++
++var allTypes = []PhoneNumberType{FIXED_LINE, MOBILE, FIXED_LINE_OR_MOBILE, TOLL_FREE, PREMIUM_RATE, SHARED_COST, VOIP, PERSONAL_NUMBER, PAGER, UAN, VOICEMAIL, UNKNOWN}
++
++var resultNames = map[ValidationResult]string{
++	IS_POSSIBLE: "IS_POSSIBLE", IS_POSSIBLE_LOCAL_ONLY: "IS_POSSIBLE_LOCAL_ONLY", INVALID_COUNTRY_CODE: "INVALID_COUNTRY_CODE",
++	TOO_SHORT: "TOO_SHORT", INVALID_LENGTH: "INVALID_LENGTH", TOO_LONG: "TOO_LONG",
++}
++
++var matchNames = map[MatchType]string{
++	NOT_A_NUMBER: "NOT_A_NUMBER", NO_MATCH: "NO_MATCH", SHORT_NSN_MATCH: "SHORT_NSN_MATCH", NSN_MATCH: "NSN_MATCH", EXACT_MATCH: "EXACT_MATCH",
++}
++
++var costNames = map[ShortNumberCost]string{
++	TOLL_FREE_COST: "TOLL_FREE", STANDARD_RATE_COST: "STANDARD_RATE", PREMIUM_RATE_COST: "PREMIUM_RATE", UNKNOWN_COST: "UNKNOWN_COST",
++}
++
++func errName(err error) string {
++	switch {
++	case err == nil:
++		return ""
++	case errors.Is(err, ErrInvalidCountryCode):
++		return "INVALID_COUNTRY_CODE"
++	case errors.Is(err, ErrNotANumber):
++		return "NOT_A_NUMBER"
++	case errors.Is(err, ErrTooShortAfterIDD):
++		return "TOO_SHORT_AFTER_IDD"
++	case errors.Is(err, ErrTooShortNSN):
++		return "TOO_SHORT_NSN"
++	case errors.Is(err, ErrNumTooLong):
++		return "TOO_LONG"
++	}
++	return "other: " + err.Error()
++}
++
++func numOut(p *PhoneNumber) *pyNumber {
++	if p == nil {
++		return nil
++	}
++	return &pyNumber{
++		CC: int(p.GetCountryCode()), NN: p.GetNationalNumber(), Ext: p.GetExtension(), ILZ: p.GetItalianLeadingZero(),
++		NLZ: int(p.GetNumberOfLeadingZeros()), NLZSet: p.NumberOfLeadingZeros != nil, Raw: p.GetRawInput(),
++		CCS: int(p.GetCountryCodeSource()), PDCC: p.GetPreferredDomesticCarrierCode(),
++	}
++}
++
++func numIn(q pyNumber) *PhoneNumber {
++	p := &PhoneNumber{}
++	cc := int32(q.CC)
++	p.CountryCode = &cc
++	nn := q.NN
++	p.NationalNumber = &nn
++	if q.Ext != "" {
++		e := q.Ext
++		p.Extension = &e
++	}
++	if q.ILZ {
++		b := true
++		p.ItalianLeadingZero = &b
++	}
++	if q.NLZSet {
++		z := int32(q.NLZ)
++		p.NumberOfLeadingZeros = &z
++	}
++	if q.Raw != "" {
++		r := q.Raw
++		p.RawInput = &r
++	}
++	if q.CCS != 0 {
++		s := PhoneNumber_CountryCodeSource(q.CCS)
++		p.CountryCodeSource = &s
++	}
++	if q.PDCC != "" {
++		c := q.PDCC
++		p.PreferredDomesticCarrierCode = &c
++	}
++	return p
++}
++
++func sameNum(a, b *pyNumber) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	return *a == *b
++}
++
++// ---- generators ----------------------------------------------------------------------------
++
++var regions = []string{"US", "US", "GB", "DE", "FR", "IT", "ES", "NL", "BE", "CH", "AT", "SE", "NO", "FI", "DK", "PL", "RU", "UA", "TR", "IL",
++	"IN", "CN", "JP", "KR", "AU", "NZ", "SG", "HK", "TW", "ID", "TH", "VN", "PH", "MY", "BR", "AR", "MX", "CO", "CL", "PE",
++	"CA", "ZA", "NG", "KE", "EG", "MA", "SA", "AE", "IR", "PK", "BD", "LK", "IE", "PT", "GR", "CZ", "HU", "RO", "BG", "RS",
++	"GG", "JE", "IM", "PR", "VI", "AS", "BS", "KZ", "VA", "SM", "CI", "AC", "TA", "SH", "HR", "SI", "LU", "MC", "LI", "MT", "CY", "IS"}
++
++// No lower-case codes: Java (and this port) treat them as unknown regions, python upper-cases them.
++var oddRegions = []string{"ZZ", "001", "", "XX", "AQ", "BV", "UM", "EH"}
++
++var callingCodes = []int{1, 7, 20, 27, 30, 31, 33, 34, 39, 41, 43, 44, 45, 46, 47, 48, 49, 52, 54, 55, 56, 57, 61, 62, 63, 64, 65, 66, 81, 82, 84, 86, 90, 91, 92, 98, 212, 234, 254, 262, 290, 358, 372, 380, 500, 590, 800, 808, 870, 878, 881, 882, 883, 888, 979, 0, 2, 999, 1234}
++
++func region(tc hegel.TestCase) string {
++	if chance(tc, 8) {
++		return pick(tc, oddRegions)
++	}
++	return pick(tc, regions)
++}
++
++func lang(tc hegel.TestCase) string {
++	return pick(tc, []string{"en", "en", "de", "fr", "zh", "ja", "ko", "ru", "es", "it", "pt", "ar", "he", "xx", ""})
++}
++
++var vanity = []string{"FLOWERS", "CALL", "HELP", "NOW", "GO", "TAXI", "abc", "MyBiz"}
++
++// digits returns lo..hi random digits, mostly ASCII, sometimes fullwidth or Arabic-Indic.
++func digits(tc hegel.TestCase, lo, hi int) string {
++	k := n(tc, lo, hi)
++	var sb strings.Builder
++	script := 0
++	if chance(tc, 6) {
++		script = n(tc, 1, 3)
++	}
++	for i := 0; i < k; i++ {
++		d := n(tc, 0, 9)
++		switch script {
++		case 1:
++			sb.WriteRune(rune(0xFF10 + d)) // fullwidth
++		case 2:
++			sb.WriteRune(rune(0x0660 + d)) // Arabic-Indic
++		case 3:
++			sb.WriteRune(rune(0x06F0 + d)) // Extended Arabic-Indic
++		default:
++			sb.WriteByte(byte('0' + d))
++		}
++	}
++	return sb.String()
++}
++
++// group splits a digit string with random separators.
++func group(tc hegel.TestCase, s string) string {
++	if chance(tc, 40) {
++		return s
++	}
++	seps := []string{" ", "-", ".", " ", "/", "  ", " ", "‑", "–", "－"}
++	var sb strings.Builder
++	rs := []rune(s)
++	for i, r := range rs {
++		sb.WriteRune(r)
++		if i < len(rs)-1 && chance(tc, 25) {
++			sb.WriteString(pick(tc, seps))
++		}
++	}
++	return sb.String()
++}
++
++// seedNumber is a valid number of a random region formatted by the library itself, the base for mutations.
++func seedNumber(tc hegel.TestCase) (*PhoneNumber, string) {
++	r := pick(tc, regions)
++	var p *PhoneNumber
++	if chance(tc, 50) {
++		p = GetExampleNumberForTypeInRegion(r, pick(tc, allTypes))
++	}
++	if p == nil {
++		p = GetExampleNumber(r)
++	}
++	if p == nil {
++		return nil, r
++	}
++	return p, r
++}
++
++// candidate is a string that may or may not be a phone number, with a default region.
++func candidate(tc hegel.TestCase) (string, string) {
++	seed, r := seedNumber(tc)
++	var s string
++	switch {
++	case seed == nil || chance(tc, 15):
++		s = digits(tc, 0, 19)
++		r = region(tc)
++	case chance(tc, 30):
++		s = Format(seed, pick(tc, []PhoneNumberFormat{E164, INTERNATIONAL, NATIONAL, RFC3966}))
++	default:
++		nsn := GetNationalSignificantNumber(seed)
++		// mutate the national number a little
++		rs := []rune(nsn)
++		for k := n(tc, 0, 2); k > 0 && len(rs) > 0; k-- {
++			i := n(tc, 0, len(rs)-1)
++			switch n(tc, 0, 2) {
++			case 0:
++				rs[i] = rune('0' + n(tc, 0, 9))
++			case 1:
++				rs = append(rs[:i], rs[i+1:]...)
++			default:
++				rs = append(rs[:i+1], append([]rune{rune('0' + n(tc, 0, 9))}, rs[i+1:]...)...)
++			}
++		}
++		nsn = string(rs)
++		cc := strconv.Itoa(int(seed.GetCountryCode()))
++		switch n(tc, 0, 6) {
++		case 0:
++			s = "+" + cc + " " + group(tc, nsn)
++		case 1:
++			s = pick(tc, []string{"00", "011", "0011", "810", "+", "++", "00 "}) + cc + group(tc, nsn)
++		case 2:
++			s = GetNddPrefixForRegion(r, true) + group(tc, nsn)
++		case 3:
++			s = "(" + cc + ") " + group(tc, nsn)
++		case 4:
++			s = "tel:+" + cc + "-" + strings.ReplaceAll(group(tc, nsn), " ", "-")
++		default:
++			s = group(tc, nsn)
++		}
++		if chance(tc, 20) {
++			r = region(tc)
++		}
++	}
++	// RFC 3966 contexts, fullwidth plus, long junk
++	switch n(tc, 0, 30) {
++	case 0:
++		s = "tel:" + strings.TrimPrefix(s, "tel:") + ";phone-context=+" + strconv.Itoa(pick(tc, callingCodes))
++	case 1:
++		s = "tel:" + s + ";phone-context=" + pick(tc, []string{"example.com", "+1-800", "abc.def", "", "+"})
++	case 2:
++		s = "\uFF0B" + strings.TrimLeft(s, "+")
++	case 3:
++		s = s + ";isub=" + digits(tc, 1, 4)
++	case 4:
++		s = strings.Repeat(pick(tc, []string{"1", "9", "+", "-", " "}), n(tc, 200, 300))
++	case 5:
++		s = s + strings.Repeat("0", n(tc, 10, 30))
++	}
++	// noise
++	if chance(tc, 15) {
++		s = s + pick(tc, []string{" x123", " ext. 45", ";ext=7", " extension 9", "#12", " X 2", "~3", " ext", " int. 42", "ｘ12"})
++	}
++	if chance(tc, 10) {
++		s = pick(tc, []string{"", " ", "Tel: ", "‪", "‎", "Call ", ".", "+", "-", "*", "#"}) + s + pick(tc, []string{"", " ", ".", "‬", " please", "ab", "!", "-"})
++	}
++	if chance(tc, 8) {
++		rs := []rune(s)
++		i := n(tc, 0, len(rs))
++		s = string(rs[:i]) + pick(tc, vanity) + string(rs[i:])
++	}
++	if chance(tc, 4) {
++		s = strings.ToLower(s)
++	}
++	return s, r
++}
++
++// ---- properties ----------------------------------------------------------------------------
++
++// Parsing agrees with libphonenumber: the same error class, or the same number.
++func TestHegelParsingAgreesWithLibphonenumber(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		s, r := candidate(tc)
++		keep := chance(tc, 50)
++		var got *PhoneNumber
++		var err error
++		if keep {
++			got, err = ParseAndKeepRawInput(s, r)
++		} else {
++			got, err = Parse(s, r)
++		}
++		var want struct {
++			OK  bool      `json:"ok"`
++			Err string    `json:"err"`
++			Num *pyNumber `json:"num"`
++		}
++		py.call(t, map[string]any{"op": "parse", "number": s, "region": r, "keepRaw": keep}, &want)
++		note(ht, "input %q region %q keepRaw %v", s, r, keep)
++		if want.OK != (err == nil) {
++			if err != nil {
++				fail(ht, "Parse(%q, %q) fails with %v but libphonenumber parses it to %v", s, r, err, want.Num)
++			}
++			fail(ht, "Parse(%q, %q) gives %v but libphonenumber fails with %s", s, r, numOut(got), want.Err)
++		}
++		if err != nil {
++			if errName(err) != want.Err {
++				fail(ht, "Parse(%q, %q) fails with %s but libphonenumber with %s", s, r, errName(err), want.Err)
++			}
++			return
++		}
++		if !sameNum(numOut(got), want.Num) {
++			fail(ht, "Parse(%q, %q, keepRaw %v) gives %v but libphonenumber %v", s, r, keep, numOut(got), want.Num)
++		}
++	})
++}
++
++type infoResult struct {
++	Valid                    bool      `json:"valid"`
++	ValidForRegion           bool      `json:"validForRegion"`
++	Possible                 bool      `json:"possible"`
++	PossibleReason           string    `json:"possibleReason"`
++	PossibleForType          bool      `json:"possibleForType"`
++	PossibleForTypeReason    string    `json:"possibleForTypeReason"`
++	Type                     string    `json:"type"`
++	RegionCode               string    `json:"regionCode"`
++	Formats                  []string  `json:"formats"`
++	OutOfCountry             string    `json:"outOfCountry"`
++	OutOfCountryAlpha        string    `json:"outOfCountryAlpha"`
++	Original                 string    `json:"original"`
++	CarrierCode              string    `json:"carrierCode"`
++	PreferredCarrier         string    `json:"preferredCarrier"`
++	MobileDialing            string    `json:"mobileDialing"`
++	MobileDialingPlain       string    `json:"mobileDialingPlain"`
++	AreaCodeLength           int       `json:"areaCodeLength"`
++	NdcLength                int       `json:"ndcLength"`
++	Geographical             bool      `json:"geographical"`
++	IntlDiallable            bool      `json:"intlDiallable"`
++	Truncated                bool      `json:"truncated"`
++	TruncatedNum             *pyNumber `json:"truncatedNum"`
++	NSN                      string    `json:"nsn"`
++	MatchOther               string    `json:"matchOther"`
++	MatchNum                 string    `json:"matchNum"`
++	Timezones                []string  `json:"timezones"`
++	Carrier                  string    `json:"carrier"`
++	CarrierValid             string    `json:"carrierValid"`
++	CountryName              string    `json:"countryName"`
++	Description              string    `json:"description"`
++	DescriptionValid         string    `json:"descriptionValid"`
++	DescriptionUser          string    `json:"descriptionUser"`
++	PossibleShort            bool      `json:"possibleShort"`
++	PossibleShortForRegion   bool      `json:"possibleShortForRegion"`
++	ValidShort               bool      `json:"validShort"`
++	ValidShortForRegion      bool      `json:"validShortForRegion"`
++	Cost                     string    `json:"cost"`
++	CostForRegion            string    `json:"costForRegion"`
++	CarrierSpecific          bool      `json:"carrierSpecific"`
++	CarrierSpecificForRegion bool      `json:"carrierSpecificForRegion"`
++	SmsService               bool      `json:"smsService"`
++}
++
++// parsedNumber is a number both ports agree on (parsed the same), or nil.
++func parsedNumber(t *testing.T, py *python, tc hegel.TestCase) (*PhoneNumber, string, string) {
++	s, r := candidate(tc)
++	keep := chance(tc, 40)
++	var got *PhoneNumber
++	var err error
++	if keep {
++		got, err = ParseAndKeepRawInput(s, r)
++	} else {
++		got, err = Parse(s, r)
++	}
++	if err != nil {
++		return nil, s, r
++	}
++	var want struct {
++		OK  bool      `json:"ok"`
++		Num *pyNumber `json:"num"`
++	}
++	py.call(t, map[string]any{"op": "parse", "number": s, "region": r, "keepRaw": keep}, &want)
++	if !want.OK || !sameNum(numOut(got), want.Num) {
++		return nil, s, r // the parsing property's business
++	}
++	return got, s, r
++}
++
++func strs(err error, xs []string) []string {
++	if err != nil {
++		return []string{"error: " + err.Error()}
++	}
++	if xs == nil {
++		return []string{}
++	}
++	return xs
++}
++
++func str(s string, err error) string {
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	return s
++}
++
++// Every query on a parsed number agrees with libphonenumber.
++func TestHegelNumberQueriesAgreeWithLibphonenumber(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		num, s, r := parsedNumber(t, py, tc)
++		if num == nil {
++			return
++		}
++		if chance(tc, 30) {
++			r = region(tc)
++		}
++		typ := pick(tc, allTypes)
++		lg := lang(tc)
++		carrierCode := pick(tc, []string{"", "15", "1", "0", "1090", "ab"})
++		// a second number to match against: the same, a variant, or unrelated
++		other, _ := candidate(tc)
++		if chance(tc, 40) {
++			other = Format(num, pick(tc, []PhoneNumberFormat{E164, INTERNATIONAL, NATIONAL, RFC3966}))
++			if chance(tc, 40) {
++				other = other[n(tc, 0, len(other)/2):]
++			}
++		}
++		otherNum := numIn(*numOut(num))
++		if chance(tc, 50) {
++			if p, err := Parse(other, r); err == nil {
++				otherNum = p
++			}
++		} else if chance(tc, 50) {
++			otherNum.CountryCode = nil
++		}
++		var want infoResult
++		py.call(t, map[string]any{"op": "info", "num": numOut(num), "region": r, "lang": lg, "type": typeNames[typ], "carrier": carrierCode, "other": other, "otherNum": numOut(otherNum)}, &want)
++		note(ht, "input %q region %q number %v", s, r, numOut(num))
++		check := func(what string, got, exp any) {
++			if !reflect.DeepEqual(got, exp) {
++				fail(ht, "%s of %v (from %q, region %q, lang %q, type %s) is %#v but libphonenumber gives %#v", what, numOut(num), s, r, lg, typeNames[typ], got, exp)
++			}
++		}
++		check("IsValidNumber", IsValidNumber(num), want.Valid)
++		check("IsValidNumberForRegion", IsValidNumberForRegion(num, r), want.ValidForRegion)
++		check("IsPossibleNumber", IsPossibleNumber(num), want.Possible)
++		check("IsPossibleNumberWithReason", resultNames[IsPossibleNumberWithReason(num)], want.PossibleReason)
++		check("IsPossibleNumberForType", IsPossibleNumberForType(num, typ), want.PossibleForType)
++		check("IsPossibleNumberForTypeWithReason", resultNames[IsPossibleNumberForTypeWithReason(num, typ)], want.PossibleForTypeReason)
++		check("GetNumberType", typeNames[GetNumberType(num)], want.Type)
++		check("GetRegionCodeForNumber", GetRegionCodeForNumber(num), want.RegionCode)
++		check("Format", []string{Format(num, E164), Format(num, INTERNATIONAL), Format(num, NATIONAL), Format(num, RFC3966)}, want.Formats)
++		check("FormatOutOfCountryCallingNumber", FormatOutOfCountryCallingNumber(num, r), want.OutOfCountry)
++		if !known.keepsPlusAndStar(num.GetRawInput()) {
++			check("FormatOutOfCountryKeepingAlphaChars", FormatOutOfCountryKeepingAlphaChars(num, r), want.OutOfCountryAlpha)
++		}
++		check("FormatInOriginalFormat", FormatInOriginalFormat(num, r), want.Original)
++		check("FormatNationalNumberWithCarrierCode", FormatNationalNumberWithCarrierCode(num, carrierCode), want.CarrierCode)
++		check("FormatNationalNumberWithPreferredCarrierCode", FormatNationalNumberWithPreferredCarrierCode(num, carrierCode), want.PreferredCarrier)
++		check("FormatNumberForMobileDialing(formatted)", FormatNumberForMobileDialing(num, r, true), want.MobileDialing)
++		check("FormatNumberForMobileDialing(plain)", FormatNumberForMobileDialing(num, r, false), want.MobileDialingPlain)
++		check("GetLengthOfGeographicalAreaCode", GetLengthOfGeographicalAreaCode(num), want.AreaCodeLength)
++		check("GetLengthOfNationalDestinationCode", GetLengthOfNationalDestinationCode(num), want.NdcLength)
++		check("IsNumberGeographical", IsNumberGeographical(num), want.Geographical)
++		check("CanBeInternationallyDialled", CanBeInternationallyDialled(num), want.IntlDiallable)
++		check("GetNationalSignificantNumber", GetNationalSignificantNumber(num), want.NSN)
++		check("IsNumberMatchWithOneNumber", matchNames[IsNumberMatchWithOneNumber(num, other)], want.MatchOther)
++		check("IsNumberMatchWithNumbers", matchNames[IsNumberMatchWithNumbers(num, otherNum)], want.MatchNum)
++		tzs, err := timezone.GetTimeZonesForNumber(num)
++		check("timezone.GetTimeZonesForNumber", strs(err, tzs), want.Timezones)
++		// Carrier and area names are compared in English only: python has no English fallback for
++		// languages without data (a Java behaviour this port lacks too, bug 1) and its country names
++		// come from its own table, not CLDR ("Antigua and Barbuda" against Java's and this port's
++		// "Antigua & Barbuda"), so a description equal to python's country name is not compared.
++		cc := int(num.GetCountryCode())
++		if lg == "en" && !oracleGap.carrierData(cc) {
++			check("carrier.GetNameForNumber", str(carrier.GetNameForNumber(num, lg)), want.Carrier)
++			check("carrier.GetNameForValidNumber", str(carrier.GetNameForValidNumber(num, lg)), want.CarrierValid)
++		}
++		if lg == "en" && !oracleGap.geocodingData(cc) {
++			if want.Description != want.CountryName {
++				check("geocoding.GetDescriptionForNumber", str(geocoding.GetDescriptionForNumber(num, lg)), want.Description)
++			}
++			if want.DescriptionValid != want.CountryName {
++				check("geocoding.GetDescriptionForValidNumber", str(geocoding.GetDescriptionForValidNumber(num, lg)), want.DescriptionValid)
++			}
++			if want.DescriptionUser != want.CountryName {
++				check("geocoding.GetDescriptionForNumberForUserRegion", str(geocoding.GetDescriptionForNumberForUserRegion(num, lg, r)), want.DescriptionUser)
++			}
++		}
++		check("IsPossibleShortNumber", IsPossibleShortNumber(num), want.PossibleShort)
++		check("IsPossibleShortNumberForRegion", IsPossibleShortNumberForRegion(num, r), want.PossibleShortForRegion)
++		check("IsValidShortNumber", IsValidShortNumber(num), want.ValidShort)
++		check("IsValidShortNumberForRegion", IsValidShortNumberForRegion(num, r), want.ValidShortForRegion)
++		check("GetExpectedCost", costNames[GetExpectedCost(num)], want.Cost)
++		check("GetExpectedCostForRegion", costNames[GetExpectedCostForRegion(num, r)], want.CostForRegion)
++		check("IsCarrierSpecific", IsCarrierSpecific(num), want.CarrierSpecific)
++		check("IsCarrierSpecificForRegion", IsCarrierSpecificForRegion(num, r), want.CarrierSpecificForRegion)
++		check("IsSmsServiceForRegion", IsSmsServiceForRegion(num, r), want.SmsService)
++		// truncation works on a copy
++		copyNum := numIn(*numOut(num))
++		truncated := TruncateTooLongNumber(copyNum)
++		check("TruncateTooLongNumber", truncated, want.Truncated)
++		check("TruncateTooLongNumber result", numOut(copyNum), want.TruncatedNum)
++	})
++}
++
++type regionResult struct {
++	CountryCode    int       `json:"countryCode"`
++	Ndd            string    `json:"ndd"`
++	NddDigits      string    `json:"nddDigits"`
++	Nanpa          bool      `json:"nanpa"`
++	Portable       bool      `json:"portable"`
++	Example        *pyNumber `json:"example"`
++	ExampleForType *pyNumber `json:"exampleForType"`
++	Types          []string  `json:"types"`
++	RegionForCC    string    `json:"regionForCC"`
++	RegionsForCC   []string  `json:"regionsForCC"`
++	MobileToken    string    `json:"mobileToken"`
++	ExampleNonGeo  *pyNumber `json:"exampleNonGeo"`
++	TypesNonGeo    []string  `json:"typesNonGeo"`
++	InvalidExample *pyNumber `json:"invalidExample"`
++}
++
++type textResult struct {
++	Alpha             bool   `json:"alpha"`
++	Converted         string `json:"converted"`
++	Digits            string `json:"digits"`
++	Diallable         string `json:"diallable"`
++	Emergency         bool   `json:"emergency"`
++	ConnectsEmergency bool   `json:"connectsEmergency"`
++	PossibleString    bool   `json:"possibleString"`
++	Match             string `json:"match"`
++}
++
++func typeSet(m map[PhoneNumberType]bool) []string {
++	out := []string{}
++	for k, v := range m {
++		if v {
++			out = append(out, typeNames[k])
++		}
++	}
++	sort.Strings(out)
++	return out
++}
++
++// Region metadata queries and the plain-string helpers agree with libphonenumber.
++func TestHegelRegionAndTextHelpersAgree(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		r := region(tc)
++		cc := pick(tc, callingCodes)
++		typ := pick(tc, allTypes)
++		var want regionResult
++		py.call(t, map[string]any{"op": "region", "region": r, "cc": cc, "type": typeNames[typ]}, &want)
++		check := func(what string, got, exp any) {
++			if !reflect.DeepEqual(got, exp) {
++				fail(ht, "%s (region %q, calling code %d, type %s) is %#v but libphonenumber gives %#v", what, r, cc, typeNames[typ], got, exp)
++			}
++		}
++		check("GetCountryCodeForRegion", GetCountryCodeForRegion(r), want.CountryCode)
++		check("GetNddPrefixForRegion(false)", GetNddPrefixForRegion(r, false), want.Ndd)
++		check("GetNddPrefixForRegion(true)", GetNddPrefixForRegion(r, true), want.NddDigits)
++		check("IsNANPACountry", IsNANPACountry(r), want.Nanpa)
++		check("IsMobileNumberPortableRegion", IsMobileNumberPortableRegion(r), want.Portable)
++		check("GetExampleNumber", numOut(GetExampleNumber(r)), want.Example)
++		check("GetExampleNumberForTypeInRegion", numOut(GetExampleNumberForTypeInRegion(r, typ)), want.ExampleForType)
++		check("GetInvalidExampleNumber", numOut(GetInvalidExampleNumber(r)), want.InvalidExample)
++		check("GetSupportedTypesForRegion", typeSet(GetSupportedTypesForRegion(r)), want.Types)
++		check("GetRegionCodeForCountryCode", GetRegionCodeForCountryCode(cc), want.RegionForCC)
++		got := GetRegionCodesForCountryCode(cc)
++		if got == nil {
++			got = []string{}
++		}
++		check("GetRegionCodesForCountryCode", got, want.RegionsForCC)
++		check("GetCountryMobileToken", GetCountryMobileToken(cc), want.MobileToken)
++		check("GetExampleNumberForNonGeoEntity", numOut(GetExampleNumberForNonGeoEntity(cc)), want.ExampleNonGeo)
++		check("GetSupportedTypesForNonGeoEntity", typeSet(GetSupportedTypesForNonGeoEntity(cc)), want.TypesNonGeo)
++
++		// plain strings
++		s, r2 := candidate(tc)
++		if chance(tc, 20) {
++			s = digits(tc, 1, 4) // short strings for the emergency helpers
++		}
++		other, _ := candidate(tc)
++		if chance(tc, 30) {
++			other = s
++		}
++		var wt textResult
++		py.call(t, map[string]any{"op": "text", "text": s, "region": r2, "other": other}, &wt)
++		check2 := func(what string, got, exp any) {
++			if !reflect.DeepEqual(got, exp) {
++				fail(ht, "%s(%q, region %q, other %q) is %#v but libphonenumber gives %#v", what, s, r2, other, got, exp)
++			}
++		}
++		check2("IsAlphaNumber", IsAlphaNumber(s), wt.Alpha)
++		check2("ConvertAlphaCharactersInNumber", ConvertAlphaCharactersInNumber(s), wt.Converted)
++		check2("NormalizeDigitsOnly", NormalizeDigitsOnly(s), wt.Digits)
++		check2("NormalizeDiallableCharsOnly", NormalizeDiallableCharsOnly(s), wt.Diallable)
++		check2("IsEmergencyNumber", IsEmergencyNumber(s, r2), wt.Emergency)
++		check2("ConnectsToEmergencyNumber", ConnectsToEmergencyNumber(s, r2), wt.ConnectsEmergency)
++		check2("IsPossibleNumberFromRegion", IsPossibleNumberFromRegion(s, r2), wt.PossibleString)
++		check2("IsNumberMatch", matchNames[IsNumberMatch(s, other)], wt.Match)
++	})
++}
++
++// The as-you-type formatter produces the same text after every character.
++func TestHegelAsYouTypeFormatterAgrees(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		s, r := candidate(tc)
++		if chance(tc, 30) {
++			s = strings.Map(func(c rune) rune {
++				if c >= '0' && c <= '9' || c == '+' || c == ' ' || c == '-' || c == '(' || c == ')' || c == '*' || c == '#' {
++					return c
++				}
++				return -1
++			}, s)
++		}
++		chars := []rune(s)
++		if len(chars) > 25 {
++			chars = chars[:25]
++		}
++		remember := -1
++		if len(chars) > 0 && chance(tc, 50) {
++			remember = n(tc, 0, len(chars)-1)
++		}
++		f := GetAsYouTypeFormatter(r)
++		got := make([]string, 0, len(chars))
++		for i, c := range chars {
++			if i == remember {
++				got = append(got, f.InputDigitAndRememberPosition(c))
++			} else {
++				got = append(got, f.InputDigit(c))
++			}
++		}
++		pos := f.GetRememberedPosition()
++		f.Clear()
++		after := ""
++		if len(chars) > 0 {
++			after = f.InputDigit(chars[0])
++		}
++		strChars := make([]string, len(chars))
++		for i, c := range chars {
++			strChars[i] = string(c)
++		}
++		var want struct {
++			Out        []string `json:"out"`
++			Pos        int      `json:"pos"`
++			AfterClear string   `json:"afterClear"`
++		}
++		py.call(t, map[string]any{"op": "aytf", "region": r, "chars": strChars, "remember": remember}, &want)
++		if want.Out == nil {
++			want.Out = []string{}
++		}
++		note(ht, "input %q region %q remember %d", string(chars), r, remember)
++		for i := range chars {
++			if got[i] != want.Out[i] {
++				fail(ht, "AsYouTypeFormatter(%q) after %q (char %d of %q) shows %q but libphonenumber %q", r, string(chars[:i+1]), i, string(chars), got[i], want.Out[i])
++			}
++		}
++		if pos != want.Pos {
++			fail(ht, "AsYouTypeFormatter(%q).GetRememberedPosition after %q (remembered at %d) is %d but libphonenumber %d", r, string(chars), remember, pos, want.Pos)
++		}
++		if after != want.AfterClear {
++			fail(ht, "AsYouTypeFormatter(%q) after Clear and %q shows %q but libphonenumber %q", r, string(chars[:1]), after, want.AfterClear)
++		}
++	})
++}
++
++var words = []string{"call", "me", "at", "or", "fax", "tel", "phone", "the", "office", "number", "is", "and", "please", "ring", "mobile", "Tel.", "Fax:", "Contact:", "on", "before", "after", "9am", "5pm", "Monday", "room", "2024", "1999", "12", "3", "a", "ext", "x"}
++
++// The number matcher finds the same numbers in text.
++func TestHegelNumberMatcherAgrees(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		r := region(tc)
++		var parts []string
++		k := n(tc, 0, 6)
++		for i := 0; i < k; i++ {
++			if chance(tc, 50) {
++				s, _ := candidate(tc)
++				parts = append(parts, s)
++			} else {
++				parts = append(parts, pick(tc, words))
++			}
++		}
++		text := strings.Join(parts, pick(tc, []string{" ", " ", ", ", ". ", "\n", " - ", ":", "/", "", "  "}))
++		leniency := Leniency(n(tc, 0, 3))
++		maxTries := pick(tc, []int{65535, 65535, 3, 1, 0})
++		type match struct {
++			Start int       `json:"start"`
++			End   int       `json:"end"`
++			Raw   string    `json:"raw"`
++			Num   *pyNumber `json:"num"`
++		}
++		got := []match{}
++		for m := range FindNumbersWithLeniency(text, r, leniency, maxTries) {
++			// Go offsets are bytes; python's are code points
++			got = append(got, match{len([]rune(text[:m.Start()])), len([]rune(text[:m.End()])), m.RawString(), numOut(m.Number())})
++		}
++		var want struct {
++			Matches []match `json:"matches"`
++		}
++		py.call(t, map[string]any{"op": "matcher", "text": text, "region": r, "leniency": int(leniency), "maxTries": maxTries}, &want)
++		if want.Matches == nil {
++			want.Matches = []match{}
++		}
++		note(ht, "text %q region %q leniency %d maxTries %d", text, r, leniency, maxTries)
++		if !reflect.DeepEqual(got, want.Matches) {
++			fail(ht, "FindNumbersWithLeniency(%q, %q, %d, %d) finds %v but libphonenumber %v", text, r, leniency, maxTries, got, want.Matches)
++		}
++	})
++}
++
++// ---- pins: one plain test per recorded bug -----------------------------------------------------
++
++// Bug 1: area and carrier lookups do not fall back to English for languages without data.
++func TestHegelPinPrefixLookupsFallBackToEnglish(t *testing.T) {
++	us, _ := Parse("+12015550123", "ZZ")
++	for _, lg := range []string{"de", "", "xx"} {
++		d, err := geocoding.GetDescriptionForNumber(us, lg)
++		if err != nil || d != "New Jersey" {
++			t.Errorf("geocoding.GetDescriptionForNumber(+1 201 555 0123, %q) = %q, %v; libphonenumber falls back to the English area name New Jersey", lg, d, err)
++		}
++	}
++	ph, _ := Parse("+639051234567", "ZZ")
++	for _, lg := range []string{"ru", "", "de"} {
++		c, err := carrier.GetNameForNumber(ph, lg)
++		if err != nil || c != "Globe" {
++			t.Errorf("carrier.GetNameForNumber(+63 905 123 4567, %q) = %q, %v; libphonenumber falls back to the English carrier name Globe", lg, c, err)
++		}
++	}
++	// languages with their own data are unaffected, and zh/ja/ko do not fall back
++	de, _ := Parse("+4930123456", "ZZ")
++	if d, _ := geocoding.GetDescriptionForNumber(de, "de"); d != "Berlin" {
++		t.Errorf("geocoding.GetDescriptionForNumber(+49 30 123456, de) = %q, want Berlin", d)
++	}
++}
++
++// Bug 2: FormatOutOfCountryKeepingAlphaChars keeps a "+" or "*" of the raw input.
++func TestHegelPinAlphaFormattingDropsPlusAndStar(t *testing.T) {
++	cases := [][4]string{
++		{"+1 20-1-55500-2-3", "US", "HU", "00 1 1 20-1-55500-2-3"},
++		{"*02 1234 5678-", "IT", "IT", "02 1234 5678-"},
++		{"*MyBiz02 1234 5678-", "IT", "EH", "00 39 MYBIZ02 1234 5678-"},
++		{"telFLOWERS:+86-10-1234-5678", "CN", "CN", "TELFLOWERS086-10-1234-5678"},
++	}
++	for _, c := range cases {
++		num, err := ParseAndKeepRawInput(c[0], c[1])
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := FormatOutOfCountryKeepingAlphaChars(num, c[2]); got != c[3] {
++			t.Errorf("FormatOutOfCountryKeepingAlphaChars(%q parsed in %s, from %s) = %q, libphonenumber gives %q", c[0], c[1], c[2], got, c[3])
++		}
++	}
++}
