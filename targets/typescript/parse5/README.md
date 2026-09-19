@@ -24,8 +24,9 @@ fail); html5ever 0.39 follows the 2025 `<select>` parser change that parse5 does
 1764). So the properties **vote**: parse5 agreeing with html5ever is the norm, parse5 agreeing with
 html5lib alone means the oracles read different spec versions (counted), parse5 alone against two
 agreeing oracles is a mismatch; three different trees and foreign fragment contexts (html5lib has
-none) are counted and, in collect mode, printed. In 4000 documents and 4000 fragments parse5's tree
-never lost a vote: the parser is conformant; the bugs are around it.
+none) are counted and, in collect mode, printed. In the first 4000 documents and 4000 fragments
+parse5's tree never lost a vote; a later run found the one case where it does (15, a CDATA section
+inside an integration point): the parser is conformant but for that, and the other bugs are around it.
 
 ## What is tested
 
@@ -64,19 +65,23 @@ never lost a vote: the parser is conformant; the bugs are around it.
 - `TestHegelPlainTextBecomesAPreElement`: `PlainTextConversionStream` builds
   `html/head/body/pre` with the text as the spec's "load a text document" describes.
 
-## Known bugs (13, see bugs.toml)
+## Known bugs (15, see bugs.toml)
 
 The serializer leaves `<` and `>` unescaped in attribute values (the 2025 spec change, 1). Source
-locations: a newline right after `&` is counted twice (2), an unterminated comment ends one past the
-input (3), an error at an astral character has the offset of its low surrogate (4), text from a
-character reference after an ignored NUL is located at its last character (5).
+locations: a newline right after `&` is counted twice (2), an unterminated comment or doctype ends
+one past the input (3), an error or a bogus comment at an astral character has an offset one past its column
+(4), a text node
+opened by a character reference or an astral character after ignored input (whitespace before the
+body, a NUL, the newline after `<pre>`) is located at its last code unit (5).
 `PlainTextConversionStream` puts a newline before the text (6). `RewritingStream` drops `</>`
 between tokens (7) and an unfinished tag at the end of the input (8); `emitStartTag` drops the
 prefixes of foreign attributes, `xlink:href` becoming `href` (9); `emitDoctype` writes
 `<!DOCTYPE null>` for a nameless doctype (10). The SAX parser's feedback simulator stays in foreign
 content after a self-closing `<svg/>` or `<math/>` (11) and switches to raw text for a `<style>` or
 `<title>` the tree builder ignores inside `<select>` or `<frameset>` (12). The htmlparser2 adapter
-serializes integer-named attributes first (13).
+serializes integer-named attributes first (13). `parseFragment` in a `noscript` context reads the
+input as raw text even with `scriptingEnabled: false` (14). A CDATA section inside an SVG `title`,
+`desc` or `foreignObject` or a MathML text element is read as a bogus comment (15).
 
 ## Conventions followed, not recorded
 
