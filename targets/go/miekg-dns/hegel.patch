@@ -1,0 +1,2622 @@
+diff --git a/go.mod b/go.mod
+index 0c347ef..0f0a924 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,17 +1,19 @@
+ module github.com/miekg/dns
+ 
+-go 1.25.0
++go 1.26.0
+ 
+ require (
+ 	golang.org/x/net v0.58.0
+ 	golang.org/x/sync v0.22.0
+ 	golang.org/x/sys v0.47.0
++	hegel.dev/go/hegel v0.6.33
+ )
+ 
+ // used for go:generate
+ tool golang.org/x/tools/go/packages
+ 
+ require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
+ 	golang.org/x/mod v0.38.0 // indirect
+ 	golang.org/x/tools v0.48.0 // indirect
+ )
+diff --git a/hegel_dnssec_test.go b/hegel_dnssec_test.go
+new file mode 100644
+index 0000000..9e86797
+--- /dev/null
++++ b/hegel_dnssec_test.go
+@@ -0,0 +1,408 @@
++package dns_test
++
++import (
++	"encoding/hex"
++	"fmt"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/miekg/dns"
++	"hegel.dev/go/hegel"
++)
++
++// TestHegelDnssecPrimitivesAgreeWithDnspython: NSEC3 hashing, DNSKEY key tags
++// and DS digests agree with dnspython.
++func TestHegelDnssecPrimitivesAgreeWithDnspython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		name := genName(tc)
++		if Known.canonicalKeepsEscapedCase && strings.Contains(name, "\\") {
++			name = genHostName(tc)
++		}
++		// NSEC3
++		salt := pick(tc, "", "-", hexOf(genBytes(tc, 1, 32)))
++		iter := pick(tc, 0, 1, 10, 150, n(tc, 0, 500))
++		pySalt := salt
++		if pySalt == "-" {
++			pySalt = "" // HashName takes the salt as hex, "-" is the presentation form of no salt
++		}
++		got := dns.HashName(name, dns.SHA1, uint16(iter), pySalt)
++		var ph struct {
++			Hash string `json:"hash"`
++		}
++		if err := py.call(t, map[string]any{"op": "nsec3", "name": name, "salt": pySalt, "iter": iter, "alg": 1}, &ph); err != nil {
++			fail(ht, "dnspython nsec3_hash(%q, %q, %d): %v", name, salt, iter, err)
++		}
++		if !strings.EqualFold(got, ph.Hash) {
++			fail(ht, "HashName(%q, SHA1, %d, %q) = %q, dnspython %q", name, iter, salt, got, ph.Hash)
++		}
++		if got == "" {
++			fail(ht, "HashName(%q, SHA1, %d, %q) is empty", name, iter, salt)
++		}
++		// DNSKEY key tag and DS
++		key := genBytes(tc, 1, 80)
++		flags := pick(tc, 256, 257, 0, u16(tc))
++		alg := pick(tc, 8, 13, 15, 5, 7, 10, 14, 16, u8(tc))
++		if alg == 1 && Known.keyTagRSAMD5 {
++			alg = 8
++		}
++		text := fmt.Sprintf("%s 3600 IN DNSKEY %d 3 %d %s", name, flags, alg, b64Of(key))
++		rr, err := dns.NewRR(text)
++		if err != nil {
++			fail(ht, "NewRR(%q): %v", text, err)
++		}
++		dk := rr.(*dns.DNSKEY)
++		_, rdata, err := packRR(dk)
++		if err != nil {
++			fail(ht, "PackRR(%q): %v", text, err)
++		}
++		var pk struct {
++			Tag int `json:"tag"`
++		}
++		if err := py.call(t, map[string]any{"op": "keytag", "wire": hex.EncodeToString(rdata)}, &pk); err != nil {
++			fail(ht, "dnspython key_id: %v\n%s", err, text)
++		}
++		if int(dk.KeyTag()) != pk.Tag {
++			fail(ht, "KeyTag %d, dnspython %d\n%s", dk.KeyTag(), pk.Tag, text)
++		}
++		for _, h := range []uint8{dns.SHA1, dns.SHA256, dns.SHA384} {
++			ds := dk.ToDS(h)
++			if ds == nil {
++				fail(ht, "ToDS(%d) is nil\n%s", h, text)
++			}
++			var pd struct {
++				Text string `json:"text"`
++				Wire string `json:"wire"`
++			}
++			if err := py.call(t, map[string]any{"op": "ds", "name": name, "wire": hex.EncodeToString(rdata), "alg": int(h)}, &pd); err != nil {
++				fail(ht, "dnspython make_ds(%d): %v\n%s", h, err, text)
++			}
++			_, dsWire, err := packRR(ds)
++			if err != nil {
++				fail(ht, "PackRR of the DS: %v", err)
++			}
++			if hex.EncodeToString(dsWire) != pd.Wire {
++				fail(ht, "ToDS(%d) = %s, dnspython %s\n%s", h, hex.EncodeToString(dsWire), pd.Wire, text)
++			}
++			if ds.KeyTag != dk.KeyTag() || ds.Algorithm != dk.Algorithm || ds.DigestType != h {
++				fail(ht, "ToDS(%d) fields %d %d %d differ from the key\n%s", h, ds.KeyTag, ds.Algorithm, ds.DigestType, text)
++			}
++		}
++	})
++}
++
++var tsigAlgs = []string{dns.HmacSHA1, dns.HmacSHA224, dns.HmacSHA256, dns.HmacSHA384, dns.HmacSHA512}
++
++// TestHegelTsigInteroperates: a message signed with TsigGenerate verifies in
++// dnspython, a message signed by dnspython verifies with TsigVerify, and a
++// damaged message verifies in neither.
++func TestHegelTsigInteroperates(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		m := genMsg(tc)
++		m.Compress = false
++		if Known.tsigVerifyRefusesNotAuth && m.Rcode&0xF == dns.RcodeNotAuth {
++			m.Rcode = dns.RcodeSuccess
++		}
++		keyName := strings.ToLower(genHostName(tc))
++		secret := b64Of(genBytes(tc, 1, 64))
++		alg := pick(tc, tsigAlgs...)
++		fudge := uint16(pick(tc, 300, 60, 3600))
++		note(ht, "key %s alg %s fudge %d\n%s", keyName, alg, fudge, m.String())
++
++		// signed here, verified there
++		m.SetTsig(keyName, alg, fudge, time.Now().Unix())
++		signed, mac, err := dns.TsigGenerate(m, secret, "", false)
++		if err != nil {
++			fail(ht, "TsigGenerate: %v\n%s", err, m.String())
++		}
++		var pv struct {
++			OK  bool   `json:"ok"`
++			Mac string `json:"mac"`
++			Err string `json:"err"`
++		}
++		if err := py.call(t, map[string]any{"op": "tsig_verify", "wire": hex.EncodeToString(signed), "keyname": keyName, "secret": secret, "alg": alg}, &pv); err != nil {
++			fail(ht, "dnspython tsig verify call: %v", err)
++		}
++		if !pv.OK {
++			fail(ht, "dnspython rejects a message signed by TsigGenerate: %s\nkey %s alg %s\nwire %s\n%s", pv.Err, keyName, alg, hex.EncodeToString(signed), m.String())
++		}
++		if !strings.EqualFold(pv.Mac, mac) {
++			fail(ht, "MAC %s but dnspython read %s", mac, pv.Mac)
++		}
++		// and here again (on a copy: TsigVerify writes into its argument)
++		verified := signed
++		if Known.tsigVerifyMutates {
++			verified = append([]byte(nil), signed...)
++		}
++		if err := dns.TsigVerify(verified, secret, "", false); err != nil {
++			fail(ht, "TsigVerify rejects TsigGenerate's own output: %v\nkey %s alg %s\n%s", err, keyName, alg, m.String())
++		}
++		var back dns.Msg
++		if err := back.Unpack(signed); err != nil {
++			fail(ht, "Unpack of the signed message: %v", err)
++		}
++		ts := back.IsTsig()
++		if ts == nil {
++			fail(ht, "the signed message has no TSIG record after Unpack\nwire %s\n%s", hex.EncodeToString(signed), back.String())
++		}
++		if !strings.EqualFold(ts.Algorithm, alg) || !strings.EqualFold(ts.Hdr.Name, keyName) || int(ts.MACSize)*2 != len(ts.MAC) || !strings.EqualFold(ts.MAC, mac) || ts.Fudge != fudge {
++			fail(ht, "TSIG record read back differs: %s (mac %s)", ts.String(), mac)
++		}
++		// a damaged message (the QR bit; the ID is not covered, RFC 8945 5.3.1 restores the original)
++		damaged := append([]byte(nil), signed...)
++		damaged[2] ^= 0x80
++		if err := dns.TsigVerify(damaged, secret, "", false); err == nil {
++			fail(ht, "TsigVerify accepts a message with a changed QR bit\nkey %s alg %s", keyName, alg)
++		}
++		if err := py.call(t, map[string]any{"op": "tsig_verify", "wire": hex.EncodeToString(damaged), "keyname": keyName, "secret": secret, "alg": alg}, &pv); err == nil && pv.OK {
++			fail(ht, "dnspython accepts a message with a changed QR bit that this library signed")
++		}
++		// wrong secret
++		if err := dns.TsigVerify(signed, b64Of([]byte("other")), "", false); err == nil {
++			fail(ht, "TsigVerify accepts the wrong secret")
++		}
++
++		// signed there, verified here (TsigGenerate removed the TSIG stub from m)
++		plain, err := m.Pack()
++		if err != nil {
++			fail(ht, "Pack: %v", err)
++		}
++		var ps struct {
++			Wire string `json:"wire"`
++		}
++		if err := py.call(t, map[string]any{"op": "tsig_sign", "wire": hex.EncodeToString(plain), "keyname": keyName, "secret": secret, "alg": alg, "fudge": int(fudge)}, &ps); err != nil {
++			fail(ht, "dnspython signing: %v\n%s", err, m.String())
++		}
++		pySigned, _ := hex.DecodeString(ps.Wire)
++		if err := dns.TsigVerify(append([]byte(nil), pySigned...), secret, "", false); err != nil {
++			fail(ht, "TsigVerify rejects a message signed by dnspython: %v\nkey %s alg %s\nwire %s\n%s", err, keyName, alg, ps.Wire, m.String())
++		}
++		var back2 dns.Msg
++		if err := back2.Unpack(pySigned); err != nil {
++			fail(ht, "Unpack of dnspython's signed message: %v\nwire %s", err, ps.Wire)
++		}
++		if back2.IsTsig() == nil {
++			fail(ht, "dnspython's signed message has no TSIG after Unpack")
++		}
++		back2.Extra = back2.Extra[:len(back2.Extra)-1]
++		if pyLosesBackslash(m) {
++			return // dnspython loses backslashes in URI targets and CAA values
++		}
++		want, _ := summarize(m)
++		// (dnspython compresses names case-insensitively, so letter case may change)
++		if got, err := summarize(&back2); err != nil || !reflect.DeepEqual(foldSummary(got), foldSummary(want)) {
++			fail(ht, "dnspython's signed message carries a different message (%v)\n%s", err, diffSummary(want, got))
++		}
++	})
++}
++
++// Zone files -------------------------------------------------------------------
++
++// genZone writes a zone in master file syntax: $TTL and $ORIGIN directives,
++// relative and absolute owners, @, blank owners, parentheses, comments, TTL
++// and class in either order or omitted.
++func genZone(tc hegel.TestCase, origin string) string {
++	var sb strings.Builder
++	fmt.Fprintf(&sb, "$TTL %s\n", pick(tc, "3600", "1h", "86400", "0"))
++	current := origin
++	havePrev := false
++	for i := n(tc, 0, 8); i > 0; i-- {
++		if chance(tc, 10) {
++			current = pick(tc, "sub", "Sub.a") + "." + origin
++			fmt.Fprintf(&sb, "$ORIGIN %s\n", current)
++			continue
++		}
++		if chance(tc, 10) {
++			sb.WriteString(pick(tc, "\n", "; a comment\n", "   ; indented comment\n"))
++		}
++		var owner string
++		switch n(tc, 0, 4) {
++		case 0:
++			owner = "@"
++		case 1:
++			owner = strings.ToLower(genHostName(tc)) + current
++			owner = strings.TrimSuffix(owner, ".") + "."
++		case 2:
++			owner = strings.TrimSuffix(genHostName(tc), ".") // relative
++		case 3:
++			owner = "" // the previous owner
++			if !havePrev {
++				owner = "@"
++			}
++		default:
++			owner = pick(tc, "www", "MAIL", "_tcp", "a.b")
++		}
++		typ := pick(tc, rrTypes...)
++		for typ == "SOA" || typ == "CNAME" || (typ == "IPSECKEY" && Known.ipseckeyEatsNewline) {
++			// dnspython's zone: SOA at the origin only, CNAME alone at its node
++			typ = pick(tc, rrTypes...)
++		}
++		rdata := genRdata(tc, typ)
++		// relative names in rdata for the name-bearing types
++		if chance(tc, 30) {
++			switch typ {
++			case "NS", "PTR", "DNAME":
++				rdata = pick(tc, "ns1", "@", "a.b", "Mail")
++			case "MX":
++				rdata = fmt.Sprintf("%d %s", u16(tc), pick(tc, "mail", "@", "mx.example"))
++			}
++		}
++		ttl := pick(tc, "", "", "3600", "1h", "0", "2147483647")
++		class := pick(tc, "", "", "IN")
++		var fields []string
++		if chance(tc, 50) {
++			fields = append(fields, ttl, class)
++		} else {
++			fields = append(fields, class, ttl)
++		}
++		line := owner
++		for _, f := range fields {
++			if f != "" {
++				line += " " + f
++			}
++		}
++		if owner == "" {
++			line = " " + line
++		}
++		line += " " + typ + " "
++		if chance(tc, 20) && strings.Count(rdata, " ") >= 2 && !strings.Contains(rdata, "\"") {
++			// parentheses around the rdata, split over lines with comments
++			parts := strings.SplitN(rdata, " ", 3)
++			comment := " ; first"
++			switch typ {
++			case "NSEC", "NSEC3", "CSYNC", "RRSIG":
++				if Known.parenCommentBreaksBitmap {
++					comment = ""
++				}
++			}
++			line += "( " + parts[0] + comment + "\n\t" + parts[1] + "\n\t" + parts[2] + " )"
++		} else {
++			line += rdata
++		}
++		if chance(tc, 15) {
++			line += " ; trailing comment"
++		}
++		sb.WriteString(line + "\n")
++		havePrev = true
++	}
++	return sb.String()
++}
++
++type rrsetKey struct {
++	Name  string
++	Type  uint16
++	Class uint16
++}
++
++type rrset struct {
++	TTL    uint32
++	Rdatas []string
++}
++
++// rrsets groups records the way dnspython's zone does: one TTL (the minimum)
++// per owner/type/class and no duplicate rdata.
++func rrsets(keys []rrKey) map[rrsetKey]rrset {
++	out := map[rrsetKey]rrset{}
++	for _, k := range keys {
++		sk := rrsetKey{foldHex(k.Name), k.Type, k.Class}
++		set, ok := out[sk]
++		if !ok || k.TTL < set.TTL {
++			set.TTL = k.TTL
++		}
++		dup := false
++		for _, r := range set.Rdatas {
++			if r == k.Rdata {
++				dup = true
++			}
++		}
++		if !dup {
++			set.Rdatas = append(set.Rdatas, k.Rdata)
++		}
++		sort.Strings(set.Rdatas)
++		out[sk] = set
++	}
++	return out
++}
++
++// foldHex lowercases the ASCII letters of hex-encoded bytes (dnspython's zone
++// keeps the first spelling of a name for all records at a node).
++func foldHex(h string) string {
++	b, err := hex.DecodeString(h)
++	if err != nil {
++		return h
++	}
++	for i, c := range b {
++		if c >= 'A' && c <= 'Z' {
++			b[i] = c + 'a' - 'A'
++		}
++	}
++	return hex.EncodeToString(b)
++}
++
++func fmtRRsets(m map[rrsetKey]rrset) string {
++	var lines []string
++	for k, v := range m {
++		lines = append(lines, fmt.Sprintf("  %s %d %d ttl %d %v", k.Name, k.Type, k.Class, v.TTL, v.Rdatas))
++	}
++	sort.Strings(lines)
++	return strings.Join(lines, "\n")
++}
++
++// TestHegelZoneParserAgreesWithDnspython: a generated zone file yields the
++// same records (per owner/type/class, with dnspython's rrset TTL and
++// duplicate rules) from NewZoneParser and from dnspython's zone reader, and
++// each record's owner is under the origin.
++func TestHegelZoneParserAgreesWithDnspython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		origin := pick(tc, "example.com.", "Example.ORG.", "a.b.c.", "x.")
++		zone := genZone(tc, origin)
++		note(ht, "origin %s zone:\n%s", origin, zone)
++
++		var got []rrKey
++		zp := dns.NewZoneParser(strings.NewReader(zone), origin, "zone")
++		for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
++			got = append(got, rrKeyOf(rr))
++			if !dns.IsSubDomain(origin, rr.Header().Name) {
++				fail(ht, "record %s outside the origin %s\nzone:\n%s", rr.String(), origin, zone)
++			}
++		}
++		gerr := zp.Err()
++		var pz struct {
++			RRs []struct {
++				Name  string `json:"name"`
++				Type  int    `json:"type"`
++				Class int    `json:"class"`
++				TTL   uint32 `json:"ttl"`
++				Rdata string `json:"rdata"`
++				Text  string `json:"text"`
++			} `json:"rrs"`
++		}
++		perr := py.call(t, map[string]any{"op": "zone", "text": zone, "origin": origin}, &pz)
++		if gerr != nil && perr != nil {
++			note(ht, "both reject: go %v python %v", gerr, perr)
++			return
++		}
++		if gerr != nil {
++			fail(ht, "ZoneParser rejects a zone dnspython reads: %v\nzone:\n%s", gerr, zone)
++		}
++		if perr != nil {
++			fail(ht, "dnspython rejects a zone ZoneParser reads: %v\nzone:\n%s", perr, zone)
++		}
++		var want []rrKey
++		for _, r := range pz.RRs {
++			want = append(want, rrKey{Name: r.Name, Type: uint16(r.Type), Class: uint16(r.Class), TTL: r.TTL, Rdata: r.Rdata})
++		}
++		g, w := rrsets(got), rrsets(want)
++		if fmtRRsets(g) != fmtRRsets(w) {
++			fail(ht, "records differ\n go:\n%s\n python:\n%s\nzone:\n%s", fmtRRsets(g), fmtRRsets(w), zone)
++		}
++	})
++}
+diff --git a/hegel_gen_test.go b/hegel_gen_test.go
+new file mode 100644
+index 0000000..e0d16e9
+--- /dev/null
++++ b/hegel_gen_test.go
+@@ -0,0 +1,490 @@
++package dns_test
++
++// Generators: domain names in presentation form, and resource records as
++// "owner TTL class TYPE rdata" text in the syntax both libraries read.
++
++import (
++	"encoding/base32"
++	"encoding/base64"
++	"encoding/hex"
++	"fmt"
++	"net"
++	"sort"
++	"strconv"
++	"strings"
++
++	"github.com/miekg/dns"
++	"hegel.dev/go/hegel"
++)
++
++// Names -----------------------------------------------------------------------
++
++var labelPool = []string{
++	"a", "b", "www", "mail", "example", "com", "net", "org", "arpa", "in-addr", "_sip", "_tcp",
++	"xn--4gbwdl", "A", "Example", "COM", "x-y", "a1", "9", "_", "-a", "a-", "aa", "ab", "abc",
++	"foo", "bar", "baz", "z", "Z",
++}
++
++// genLabel returns one label in presentation form (escapes included).
++func genLabel(tc hegel.TestCase) string {
++	switch n(tc, 0, 9) {
++	case 0:
++		// an escaped byte: \DDD
++		return pick(tc, labelPool...) + fmt.Sprintf("\\%03d", pick(tc, 0, 32, 46, 64, 92, 127, 128, 200, 255, n(tc, 0, 255)))
++	case 1:
++		// an escaped dot, backslash or other character
++		return pick(tc, labelPool...) + pick(tc, "\\.", "\\\\", "\\a", "\\ ", "\\;", "\\(", "\\@", "\\$") + pick(tc, "", "x")
++	case 2:
++		return strings.Repeat(pick(tc, "a", "b", "Q"), n(tc, 1, 63))
++	case 3:
++		return strings.ToUpper(pick(tc, labelPool...))
++	default:
++		return pick(tc, labelPool...)
++	}
++}
++
++// genName returns an absolute name in presentation form.
++func genName(tc hegel.TestCase) string {
++	if chance(tc, 5) {
++		return "."
++	}
++	var labels []string
++	for i := n(tc, 1, 4); i > 0; i-- {
++		labels = append(labels, genLabel(tc))
++	}
++	return strings.Join(labels, ".") + "."
++}
++
++// genHostName returns a plain LDH absolute name (no escapes).
++func genHostName(tc hegel.TestCase) string {
++	var labels []string
++	for i := n(tc, 1, 3); i > 0; i-- {
++		labels = append(labels, pick(tc, labelPool[:16]...))
++	}
++	return strings.Join(labels, ".") + "."
++}
++
++// Bytes and encodings -------------------------------------------------------
++
++func genBytes(tc hegel.TestCase, lo, hi int) []byte {
++	b := make([]byte, n(tc, lo, hi))
++	for i := range b {
++		b[i] = byte(n(tc, 0, 255))
++	}
++	return b
++}
++
++func hexOf(b []byte) string { return hex.EncodeToString(b) }
++
++func b64Of(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
++
++var b32hex = base32.HexEncoding.WithPadding(base32.NoPadding)
++
++func genIP4(tc hegel.TestCase) string {
++	return fmt.Sprintf("%d.%d.%d.%d", n(tc, 0, 255), n(tc, 0, 255), n(tc, 0, 255), n(tc, 0, 255))
++}
++
++func genIP6(tc hegel.TestCase) string {
++	switch n(tc, 0, 5) {
++	case 0:
++		return "::"
++	case 1:
++		return "::1"
++	case 2:
++		return "::ffff:" + genIP4(tc)
++	case 3:
++		return fmt.Sprintf("2001:db8::%x", n(tc, 1, 65535))
++	default:
++		ip := make(net.IP, 16)
++		for i := range ip {
++			if chance(tc, 40) {
++				ip[i] = 0
++			} else {
++				ip[i] = byte(n(tc, 0, 255))
++			}
++		}
++		return ip.String()
++	}
++}
++
++// genGatewayIP6 is genIP6 without IPv4-mapped addresses while the library
++// rejects them as IPSECKEY/AMTRELAY gateways and SVCB ipv6hints.
++func genGatewayIP6(tc hegel.TestCase) string {
++	for {
++		ip := genIP6(tc)
++		if !Known.mappedGatewayRejected || net.ParseIP(ip).To4() == nil {
++			return ip
++		}
++	}
++}
++
++// Character strings -----------------------------------------------------------
++
++// genCharString returns a quoted <character-string> of at most 255 octets
++// with escapes both libraries read: \" \\ \DDD.
++func genCharString(tc hegel.TestCase, maxLen int) string {
++	return genCharStringOpt(tc, maxLen, false)
++}
++
++// genCharStringOpt is genCharString; asciiOnly keeps the \DDD escapes below
++// 128 (dnspython reads the NAPTR and ISDN strings as text and writes them in
++// UTF-8, so a high byte does not survive it).
++func genCharStringOpt(tc hegel.TestCase, maxLen int, asciiOnly bool) string {
++	var sb strings.Builder
++	sb.WriteByte('"')
++	size := 0
++	for i := n(tc, 0, 6); i > 0 && size < maxLen; i-- {
++		switch n(tc, 0, 7) {
++		case 0:
++			sb.WriteString("\\\"")
++		case 1:
++			sb.WriteString("\\\\")
++		case 2:
++			b := pick(tc, 0, 10, 32, 34, 92, 127, 128, 255, n(tc, 0, 255))
++			if asciiOnly {
++				b &= 127
++			}
++			sb.WriteString(fmt.Sprintf("\\%03d", b))
++		case 3:
++			sb.WriteString(" ")
++		case 4:
++			w := strings.Repeat(pick(tc, "x", "ab"), n(tc, 1, 40))
++			if size+len(w) > maxLen {
++				w = w[:maxLen-size]
++			}
++			sb.WriteString(w)
++			size += len(w) - 1
++		default:
++			sb.WriteString(pick(tc, "a", "hello", "v=spf1 -all", "app-name:X", "0123456789", "~", "=", "/", ";", "(", ")", "@"))
++		}
++		size++
++	}
++	sb.WriteByte('"')
++	return sb.String()
++}
++
++// Type names both libraries know (for NSEC/CSYNC bitmaps and RRSIG covers).
++var typeNamePool = []string{"A", "NS", "CNAME", "SOA", "PTR", "MX", "TXT", "AAAA", "SRV", "NAPTR", "DS", "RRSIG", "NSEC", "DNSKEY", "NSEC3", "NSEC3PARAM", "TLSA", "CAA", "HTTPS", "SVCB", "TYPE1234", "TYPE65280", "URI", "OPENPGPKEY", "ZONEMD", "SPF", "HINFO", "CERT", "LOC", "APL"}
++
++func genTypeList(tc hegel.TestCase, lo, hi int) string {
++	seen := map[string]bool{}
++	var out []string
++	for i := n(tc, lo, hi); i > 0; i-- {
++		t := pick(tc, typeNamePool...)
++		if !seen[t] {
++			seen[t] = true
++			out = append(out, t)
++		}
++	}
++	if Known.unsortedTypeBitmap {
++		sort.Slice(out, func(i, j int) bool { return typeCode(out[i]) < typeCode(out[j]) })
++	}
++	return strings.Join(out, " ")
++}
++
++// typeCode returns the numeric type of a mnemonic (TYPEnnn or a known name).
++func typeCode(s string) int {
++	if strings.HasPrefix(s, "TYPE") {
++		v, _ := strconv.Atoi(s[4:])
++		return v
++	}
++	return int(dns.StringToType[s])
++}
++
++func u16(tc hegel.TestCase) int { return pick(tc, 0, 1, 10, 255, 256, 65535, n(tc, 0, 65535)) }
++
++func u32(tc hegel.TestCase) uint32 {
++	return uint32(pick(tc, 0, 1, 3600, 86400, 2147483647, 2147483648, 4294967295, n(tc, 0, 1<<31-1)))
++}
++
++func u8(tc hegel.TestCase) int { return pick(tc, 0, 1, 2, 3, 8, 13, 15, 255, n(tc, 0, 255)) }
++
++// genTime returns an RRSIG time as YYYYMMDDHHmmSS.
++func genTime(tc hegel.TestCase) string {
++	y := pick(tc, 1971, 2000, 2026, 2038, 2100, 2105, n(tc, 1971, 2105))
++	mo := n(tc, 1, 12)
++	d := n(tc, 1, 28)
++	return fmt.Sprintf("%04d%02d%02d%02d%02d%02d", y, mo, d, n(tc, 0, 23), n(tc, 0, 59), n(tc, 0, 59))
++}
++
++// LOC sizes with an exact cm mantissa/exponent representation.
++var locSizes = []string{"0.01m", "0.05m", "0.3m", "1m", "7m", "40m", "500m", "6000m", "90000m", "800000m", "9000000m", "10000000m", "90000000m", "900000000m", "1m", "1m"}
++
++// locMillis returns the fractional part of LOC seconds; exact binary fractions
++// while the float truncation bug is open.
++func locMillis(tc hegel.TestCase) int {
++	if Known.locFloatTruncation {
++		return pick(tc, 0, 125, 250, 375, 500, 625, 750, 875)
++	}
++	return n(tc, 0, 999)
++}
++
++func genLOC(tc hegel.TestCase) string {
++	lat := fmt.Sprintf("%d %d %d.%03d %s", n(tc, 0, 89), n(tc, 0, 59), n(tc, 0, 59), locMillis(tc), pick(tc, "N", "S"))
++	switch {
++	case chance(tc, 20):
++		lat = fmt.Sprintf("%d %s", n(tc, 0, 90), pick(tc, "N", "S"))
++	case !Known.locMinutesNeedSeconds && chance(tc, 30):
++		lat = fmt.Sprintf("%d %d %s", n(tc, 0, 89), n(tc, 0, 59), pick(tc, "N", "S"))
++	}
++	lon := fmt.Sprintf("%d %d %d.%03d %s", n(tc, 0, 179), n(tc, 0, 59), n(tc, 0, 59), locMillis(tc), pick(tc, "E", "W"))
++	switch {
++	case chance(tc, 20):
++		lon = fmt.Sprintf("%d %s", n(tc, 0, 180), pick(tc, "E", "W"))
++	case !Known.locMinutesNeedSeconds && chance(tc, 30):
++		lon = fmt.Sprintf("%d %d %s", n(tc, 0, 179), n(tc, 0, 59), pick(tc, "E", "W"))
++	}
++	// altitude within RFC 1876's range; while the float truncation bug is open the
++	// fractions are exact binary fractions (dnspython truncates 0.58*100 to 57 too)
++	cents := n(tc, 0, 99)
++	if Known.locFloatTruncation {
++		cents = pick(tc, 0, 25, 50, 75)
++	}
++	alt := fmt.Sprintf("%d.%02dm", pick(tc, 0, 10, -24, -99999, 42849672, n(tc, -99999, 42849671)), cents)
++	if chance(tc, 30) {
++		alt = fmt.Sprintf("%dm", n(tc, -100000, 42849672))
++	}
++	out := lat + " " + lon + " " + alt
++	for i := n(tc, 0, 3); i > 0; i-- {
++		out += " " + pick(tc, locSizes...)
++	}
++	return out
++}
++
++func genSVCBParams(tc hegel.TestCase) string {
++	var params []string
++	keys := map[string]bool{}
++	add := func(k, v string) {
++		if !keys[k] {
++			keys[k] = true
++			params = append(params, v)
++		}
++	}
++	for i := n(tc, 0, 4); i > 0; i-- {
++		switch n(tc, 0, 7) {
++		case 0:
++			add("alpn", "alpn="+pick(tc, "h2", "h3", "\"h2,h3\"", "\"h3,h2,http/1.1\"", "dot"))
++		case 1:
++			add("port", fmt.Sprintf("port=%d", u16(tc)))
++		case 2:
++			add("ipv4hint", "ipv4hint="+genIP4(tc)+pick(tc, "", ","+genIP4(tc)))
++		case 3:
++			add("ipv6hint", "ipv6hint="+genGatewayIP6(tc)+pick(tc, "", ","+genGatewayIP6(tc)))
++		case 4:
++			// RFC 9460 7.1.1: only self-consistent with alpn (dnspython checks)
++			if keys["alpn"] {
++				add("no-default-alpn", "no-default-alpn")
++			}
++		case 5:
++			add("ech", "ech="+b64Of(genBytes(tc, 1, 20)))
++		case 6:
++			add("dohpath", "dohpath="+pick(tc, "/dns-query{?dns}", "\"/q{?dns}\""))
++		default:
++			k := pick(tc, 65280, 65500, 65534)
++			add(fmt.Sprintf("key%d", k), fmt.Sprintf("key%d=%s", k, pick(tc, "\"a b\"", "abc", "\"\"", "\"x\\\\y\"")))
++		}
++	}
++	if keys["alpn"] && chance(tc, 40) {
++		params = append(params, "mandatory="+pick(tc, "alpn", "alpn,port", "port"))
++		if !keys["port"] {
++			params = append(params, fmt.Sprintf("port=%d", u16(tc)))
++		}
++	}
++	return strings.Join(params, " ")
++}
++
++// Records ---------------------------------------------------------------------
++
++// rrTypes are the record types both libraries read from text.
++var rrTypes = []string{
++	"A", "AAAA", "NS", "CNAME", "PTR", "DNAME", "NSAP-PTR", "MX", "KX", "RT", "AFSDB", "LP", "SOA", "TXT", "SPF",
++	"AVC", "NINFO", "RESINFO", "HINFO", "ISDN", "X25", "RP", "PX", "GPOS", "SRV", "NAPTR", "CERT", "LOC", "RRSIG",
++	"NSEC", "NSEC3", "NSEC3PARAM", "DS", "CDS", "DLV", "DNSKEY", "CDNSKEY", "SSHFP", "TLSA", "SMIMEA", "HIP",
++	"OPENPGPKEY", "DHCID", "CAA", "URI", "EUI48", "EUI64", "ZONEMD", "CSYNC", "L32", "L64", "NID", "AMTRELAY",
++	"IPSECKEY", "APL", "SVCB", "HTTPS", "TYPE65280", "TYPE1234",
++}
++
++// genRdata returns the presentation rdata of a record of the type.
++func genRdata(tc hegel.TestCase, typ string) string {
++	switch typ {
++	case "A":
++		return genIP4(tc)
++	case "AAAA":
++		return genIP6(tc)
++	case "NS", "CNAME", "PTR", "DNAME", "NSAP-PTR":
++		return genName(tc)
++	case "MX", "KX", "RT", "AFSDB", "LP":
++		return fmt.Sprintf("%d %s", u16(tc), genName(tc))
++	case "SOA":
++		return fmt.Sprintf("%s %s %d %d %d %d %d", genName(tc), genName(tc), u32(tc), u32(tc), u32(tc), u32(tc), u32(tc))
++	case "TXT", "SPF", "AVC", "NINFO", "RESINFO":
++		var parts []string
++		for i := n(tc, 1, 4); i > 0; i-- {
++			if chance(tc, 20) {
++				parts = append(parts, pick(tc, "abc", "v=spf1", "x", "0"))
++			} else {
++				parts = append(parts, genCharString(tc, 255))
++			}
++		}
++		return strings.Join(parts, " ")
++	case "HINFO":
++		return genCharStringOpt(tc, 255, true) + " " + genCharStringOpt(tc, 255, true)
++	case "ISDN":
++		// dnspython omits an empty subaddress from the wire form (RFC 1183 makes it optional)
++		return genCharStringOpt(tc, 255, true) + " " + pick(tc, "1", "004", "\"sub\"", "\"a b\"")
++	case "X25":
++		if Known.x25TakesOneToken {
++			return pick(tc, "311061700956", "1", "0", "abc")
++		}
++		return genCharString(tc, 255)
++	case "RP":
++		return genName(tc) + " " + genName(tc)
++	case "PX":
++		return fmt.Sprintf("%d %s %s", u16(tc), genName(tc), genName(tc))
++	case "GPOS":
++		// RFC 1712 orders longitude, latitude, altitude; dnspython reads latitude first and
++		// range-checks it, so both angles stay within 90 degrees
++		return fmt.Sprintf("%d.%d %d.%d %d.%d", n(tc, -89, 89), n(tc, 0, 9999), n(tc, -89, 89), n(tc, 0, 9999), n(tc, -1000, 100000), n(tc, 0, 99))
++	case "SRV":
++		return fmt.Sprintf("%d %d %d %s", u16(tc), u16(tc), u16(tc), genName(tc))
++	case "NAPTR":
++		return fmt.Sprintf("%d %d %s %s %s %s", u16(tc), u16(tc), genCharStringOpt(tc, 20, true), genCharStringOpt(tc, 30, true), genCharStringOpt(tc, 60, true), genName(tc))
++	case "CERT":
++		ctype := pick(tc, "PKIX", "SPKI", "PGP", "IPKIX", "ISPKI", "IPGP", "ACPKIX", "IACPKIX", "URI", "OID", "1", "8", "253", "65535")
++		if ctype == "IPKIX" && Known.certIPKIXMisspelt {
++			ctype = "4"
++		}
++		return fmt.Sprintf("%s %d %d %s", ctype, u16(tc), u8(tc), b64Of(genBytes(tc, 1, 40)))
++	case "LOC":
++		return genLOC(tc)
++	case "RRSIG":
++		return fmt.Sprintf("%s %d %d %d %s %s %d %s %s", pick(tc, typeNamePool...), u8(tc), n(tc, 0, 127), u32(tc), genTime(tc), genTime(tc), u16(tc), genName(tc), b64Of(genBytes(tc, 1, 80)))
++	case "NSEC":
++		return genName(tc) + pick(tc, "", " "+genTypeList(tc, 1, 6))
++	case "NSEC3":
++		salt := pick(tc, "-", hexOf(genBytes(tc, 1, 16)))
++		// the library packs a hash length of 20 whatever the hash: SHA-1 lengths only while open
++		next := b32hex.EncodeToString(genBytes(tc, 20, 20))
++		if !Known.nsec3HashLengthFixed && chance(tc, 30) {
++			next = b32hex.EncodeToString(genBytes(tc, pick(tc, 5, 10, 15, 25, 32), 32))
++		}
++		return fmt.Sprintf("%d %d %d %s %s%s", u8(tc), pick(tc, 0, 1), u16(tc), salt, next, pick(tc, "", " "+genTypeList(tc, 1, 6)))
++	case "NSEC3PARAM":
++		return fmt.Sprintf("%d %d %d %s", u8(tc), pick(tc, 0, 1), u16(tc), pick(tc, "-", hexOf(genBytes(tc, 1, 16))))
++	case "DS", "CDS", "DLV":
++		// dnspython checks the digest length of the known digest types
++		dt := pick(tc, 1, 2, 4, n(tc, 1, 255))
++		size := map[int]int{1: 20, 2: 32, 3: 32, 4: 48}[dt]
++		if size == 0 {
++			size = n(tc, 1, 48)
++		}
++		return fmt.Sprintf("%d %d %d %s", u16(tc), u8(tc), dt, hexOf(genBytes(tc, size, size)))
++	case "DNSKEY", "CDNSKEY":
++		return fmt.Sprintf("%d %d %d %s", pick(tc, 256, 257, 0, u16(tc)), pick(tc, 3, u8(tc)), pick(tc, 8, 13, 15, u8(tc)), b64Of(genBytes(tc, 1, 70)))
++	case "SSHFP":
++		return fmt.Sprintf("%d %d %s", u8(tc), u8(tc), hexOf(genBytes(tc, 1, 32)))
++	case "TLSA", "SMIMEA":
++		return fmt.Sprintf("%d %d %d %s", u8(tc), u8(tc), u8(tc), hexOf(genBytes(tc, 1, 40)))
++	case "HIP":
++		out := fmt.Sprintf("%d %s %s", u8(tc), hexOf(genBytes(tc, 1, 20)), b64Of(genBytes(tc, 1, 40)))
++		for i := n(tc, 0, 3); i > 0; i-- {
++			out += " " + genName(tc)
++		}
++		return out
++	case "OPENPGPKEY", "DHCID":
++		return b64Of(genBytes(tc, 1, 60))
++	case "CAA":
++		return fmt.Sprintf("%d %s %s", pick(tc, 0, 128, u8(tc)), pick(tc, "issue", "issuewild", "iodef", "contactemail", "x1"), genCharStringOpt(tc, 200, true))
++	case "URI":
++		// RFC 7553: the target must not be empty (dnspython checks)
++		target := genCharStringOpt(tc, 200, true)
++		if target == "\"\"" {
++			target = "\"https://example.com/\""
++		}
++		return fmt.Sprintf("%d %d %s", u16(tc), u16(tc), target)
++	case "EUI48":
++		b := genBytes(tc, 6, 6)
++		return fmt.Sprintf("%02x-%02x-%02x-%02x-%02x-%02x", b[0], b[1], b[2], b[3], b[4], b[5])
++	case "EUI64":
++		b := genBytes(tc, 8, 8)
++		return fmt.Sprintf("%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7])
++	case "ZONEMD":
++		switch n(tc, 0, 2) {
++		case 0:
++			return fmt.Sprintf("%d 1 1 %s", u32(tc), hexOf(genBytes(tc, 48, 48)))
++		case 1:
++			return fmt.Sprintf("%d 1 2 %s", u32(tc), hexOf(genBytes(tc, 64, 64)))
++		default:
++			return fmt.Sprintf("%d %d %d %s", u32(tc), pick(tc, 1, 240), pick(tc, 240, 241), hexOf(genBytes(tc, 12, 40)))
++		}
++	case "CSYNC":
++		return fmt.Sprintf("%d %d%s", u32(tc), pick(tc, 0, 1, 2, 3, u16(tc)), pick(tc, "", " "+genTypeList(tc, 1, 5)))
++	case "L32":
++		return fmt.Sprintf("%d %s", u16(tc), genIP4(tc))
++	case "L64", "NID":
++		return fmt.Sprintf("%d %04x:%04x:%04x:%04x", u16(tc), n(tc, 0, 65535), n(tc, 0, 65535), n(tc, 0, 65535), n(tc, 0, 65535))
++	case "AMTRELAY":
++		// the D bit is left clear while the library drops the gateway when it is set
++		d := pick(tc, 0, 1)
++		if Known.amtrelayDBitDropsGateway {
++			d = 0
++		}
++		switch n(tc, 0, 2) {
++		case 0:
++			return fmt.Sprintf("%d %d 1 %s", u8(tc), d, genIP4(tc))
++		case 1:
++			return fmt.Sprintf("%d %d 2 %s", u8(tc), d, genGatewayIP6(tc))
++		default:
++			return fmt.Sprintf("%d %d 3 %s", u8(tc), d, genName(tc))
++		}
++	case "IPSECKEY":
++		key := b64Of(genBytes(tc, 1, 40))
++		switch n(tc, 0, 3) {
++		case 0:
++			return fmt.Sprintf("%d 0 %d . %s", u8(tc), u8(tc), key)
++		case 1:
++			return fmt.Sprintf("%d 1 %d %s %s", u8(tc), u8(tc), genIP4(tc), key)
++		case 2:
++			return fmt.Sprintf("%d 2 %d %s %s", u8(tc), u8(tc), genGatewayIP6(tc), key)
++		default:
++			return fmt.Sprintf("%d 3 %d %s %s", u8(tc), u8(tc), genName(tc), key)
++		}
++	case "APL":
++		var parts []string
++		for i := n(tc, 0, 4); i > 0; i-- {
++			// the library requires the bits beyond the prefix to be zero (dnspython does not)
++			neg := pick(tc, "", "!")
++			if chance(tc, 50) {
++				bits := n(tc, 0, 32)
++				ip := net.ParseIP(genIP4(tc)).To4().Mask(net.CIDRMask(bits, 32))
++				parts = append(parts, fmt.Sprintf("%s1:%s/%d", neg, ip, bits))
++			} else {
++				bits := n(tc, 0, 128)
++				ip := net.ParseIP(genIP6(tc)).Mask(net.CIDRMask(bits, 128))
++				parts = append(parts, fmt.Sprintf("%s2:%s/%d", neg, ip, bits))
++			}
++		}
++		return strings.Join(parts, " ")
++	case "SVCB", "HTTPS":
++		if chance(tc, 20) {
++			return "0 " + genName(tc)
++		}
++		return fmt.Sprintf("%d %s %s", n(tc, 1, 65535), pick(tc, ".", genName(tc)), genSVCBParams(tc))
++	default: // TYPE65280, TYPE1234: unknown rdata
++		b := genBytes(tc, 0, 30)
++		if len(b) == 0 {
++			return "\\# 0"
++		}
++		return fmt.Sprintf("\\# %d %s", len(b), hexOf(b))
++	}
++}
++
++// genTTL returns a TTL in presentation form (plain or with units).
++func genTTL(tc hegel.TestCase) (string, uint32) {
++	if chance(tc, 20) {
++		h, m := n(tc, 0, 100), n(tc, 0, 59)
++		return fmt.Sprintf("%dh%dm", h, m), uint32(h*3600 + m*60)
++	}
++	v := u32(tc)
++	return fmt.Sprint(v), v
++}
+diff --git a/hegel_messages_test.go b/hegel_messages_test.go
+new file mode 100644
+index 0000000..c0d5dfd
+--- /dev/null
++++ b/hegel_messages_test.go
+@@ -0,0 +1,562 @@
++package dns_test
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/hex"
++	"fmt"
++	"net"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	"github.com/miekg/dns"
++	"hegel.dev/go/hegel"
++)
++
++// Message generation ---------------------------------------------------------
++
++// genMsgRR returns a random record of a type both libraries read, in class IN.
++func genMsgRR(tc hegel.TestCase) dns.RR {
++	for {
++		typ := pick(tc, rrTypes...)
++		// TTLs below 2^31: dnspython reads larger ones as 0 (RFC 2181 section 8)
++		text := fmt.Sprintf("%s %d IN %s %s", genName(tc), u32(tc)&0x7fffffff, typ, genRdata(tc, typ))
++		rr, err := dns.NewRR(text)
++		if err == nil {
++			return rr
++		}
++	}
++}
++
++func genOption(tc hegel.TestCase) dns.EDNS0 {
++	switch n(tc, 0, 12) {
++	case 0:
++		return &dns.EDNS0_NSID{Code: dns.EDNS0NSID, Nsid: hexOf(genBytes(tc, 0, 16))}
++	case 1:
++		o := &dns.EDNS0_SUBNET{Code: dns.EDNS0SUBNET}
++		if chance(tc, 50) {
++			o.Family = 1
++			o.SourceNetmask = uint8(n(tc, 0, 32))
++			o.Address = net.ParseIP(genIP4(tc)).To4().Mask(net.CIDRMask(int(o.SourceNetmask), 32))
++		} else {
++			o.Family = 2
++			o.SourceNetmask = uint8(n(tc, 0, 128))
++			o.Address = net.ParseIP(genIP6(tc)).Mask(net.CIDRMask(int(o.SourceNetmask), 128))
++		}
++		if chance(tc, 30) {
++			o.SourceScope = uint8(n(tc, 0, int(o.SourceNetmask)))
++		}
++		return o
++	case 2:
++		// dnspython reads 8-byte client cookies with 8 to 32 bytes of server cookie
++		size := pick(tc, 8, 16, 24, 40, n(tc, 16, 40))
++		return &dns.EDNS0_COOKIE{Code: dns.EDNS0COOKIE, Cookie: hexOf(genBytes(tc, size, size))}
++	case 3:
++		return &dns.EDNS0_EXPIRE{Code: dns.EDNS0EXPIRE, Expire: u32(tc), Empty: chance(tc, 30)}
++	case 4:
++		return &dns.EDNS0_TCP_KEEPALIVE{Code: dns.EDNS0TCPKEEPALIVE, Timeout: uint16(u16(tc)), Length: uint16(pick(tc, 0, 2))}
++	case 5:
++		return &dns.EDNS0_PADDING{Padding: genBytes(tc, 0, 40)}
++	case 6:
++		return &dns.EDNS0_EDE{InfoCode: uint16(pick(tc, 0, 6, 18, 24, u16(tc))), ExtraText: pick(tc, "", "a", "stale answer", strings.Repeat("x", n(tc, 1, 60)))}
++	case 7:
++		return &dns.EDNS0_DAU{Code: dns.EDNS0DAU, AlgCode: genBytes(tc, 0, 6)}
++	case 8:
++		return &dns.EDNS0_LOCAL{Code: uint16(pick(tc, 65001, 65100, 65534)), Data: genBytes(tc, 0, 20)}
++	case 9:
++		return &dns.EDNS0_LLQ{Code: dns.EDNS0LLQ, Version: uint16(u16(tc)), Opcode: uint16(u16(tc)), Error: uint16(u16(tc)), Id: uint64(u32(tc))<<32 | uint64(u32(tc)), LeaseLife: u32(tc)}
++	case 10:
++		return &dns.EDNS0_UL{Code: dns.EDNS0UL, Lease: u32(tc), KeyLease: uint32(pick(tc, 0, 0, int(u32(tc))))}
++	case 11:
++		return &dns.EDNS0_N3U{Code: dns.EDNS0N3U, AlgCode: genBytes(tc, 0, 3)}
++	default:
++		return &dns.EDNS0_ESU{Code: dns.EDNS0ESU, Uri: pick(tc, "sip:example.com", "tel:+123", "")}
++	}
++}
++
++// genMsg builds a random message: header bits, questions, records in the
++// three sections, an OPT with random options half of the time.
++func genMsg(tc hegel.TestCase) *dns.Msg {
++	m := new(dns.Msg)
++	m.Id = uint16(u16(tc))
++	m.Response = chance(tc, 50)
++	// (no UPDATE: dnspython reads update messages with the semantics of RFC 2136)
++	m.Opcode = pick(tc, dns.OpcodeQuery, dns.OpcodeQuery, dns.OpcodeNotify, dns.OpcodeIQuery, dns.OpcodeStatus, pick(tc, 3, 7, 8, 15))
++	m.Authoritative = chance(tc, 30)
++	m.Truncated = chance(tc, 10)
++	m.RecursionDesired = chance(tc, 60)
++	m.RecursionAvailable = chance(tc, 40)
++	m.Zero = chance(tc, 5)
++	m.AuthenticatedData = chance(tc, 20)
++	m.CheckingDisabled = chance(tc, 20)
++	m.Rcode = pick(tc, dns.RcodeSuccess, dns.RcodeSuccess, dns.RcodeNameError, dns.RcodeServerFailure, dns.RcodeRefused, n(tc, 0, 15))
++	for i := n(tc, 0, 2); i > 0; i-- {
++		q := dns.Question{Name: genName(tc), Qtype: uint16(pick(tc, 1, 28, 15, 255, 252, 6, 16, 65280, u16(tc))), Qclass: uint16(pick(tc, 1, 1, 255, 3, 254))}
++		m.Question = append(m.Question, q)
++	}
++	for i := n(tc, 0, 4); i > 0; i-- {
++		m.Answer = append(m.Answer, genMsgRR(tc))
++	}
++	for i := n(tc, 0, 3); i > 0; i-- {
++		m.Ns = append(m.Ns, genMsgRR(tc))
++	}
++	for i := n(tc, 0, 3); i > 0; i-- {
++		m.Extra = append(m.Extra, genMsgRR(tc))
++	}
++	if chance(tc, 50) {
++		opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
++		opt.SetUDPSize(uint16(pick(tc, 512, 1232, 4096, 65535, u16(tc))))
++		opt.SetDo(chance(tc, 50))
++		if chance(tc, 20) {
++			opt.SetCo(true)
++		}
++		if chance(tc, 10) {
++			opt.SetVersion(uint8(n(tc, 1, 255)))
++		}
++		if chance(tc, 10) {
++			opt.SetZ(uint16(n(tc, 0, 0x3fff)))
++		}
++		for i := n(tc, 0, 4); i > 0; i-- {
++			opt.Option = append(opt.Option, genOption(tc))
++		}
++		m.Extra = append(m.Extra, opt)
++		if chance(tc, 20) {
++			m.Rcode = n(tc, 16, 4095)
++		}
++	}
++	m.Compress = chance(tc, 50)
++	return m
++}
++
++// Summaries ------------------------------------------------------------------
++
++type rrKey struct {
++	Name  string // owner in wire form, hex
++	Type  uint16
++	Class uint16
++	TTL   uint32
++	Rdata string // uncompressed rdata, hex
++}
++
++type optKey struct {
++	Code uint16
++	Data string
++}
++
++type ednsSummary struct {
++	Version uint8
++	Payload uint16
++	Flags   uint32 // the OPT TTL field: extended rcode, version, DO/CO/Z
++	Options []optKey
++}
++
++type msgSummary struct {
++	ID       uint16
++	Flags    uint16
++	Rcode    int
++	Question []rrKey // TTL and Rdata unused
++	Sections [3][]rrKey
++	Edns     *ednsSummary
++}
++
++func nameHex(name string) string {
++	w, err := packName(name)
++	if err != nil {
++		return "bad:" + name
++	}
++	return hex.EncodeToString(w)
++}
++
++func rrKeyOf(rr dns.RR) rrKey {
++	_, rdata, err := packRR(rr)
++	if err != nil {
++		return rrKey{Name: nameHex(rr.Header().Name), Type: rr.Header().Rrtype, Class: rr.Header().Class, TTL: rr.Header().Ttl, Rdata: "err:" + err.Error()}
++	}
++	return rrKey{Name: nameHex(rr.Header().Name), Type: rr.Header().Rrtype, Class: rr.Header().Class, TTL: rr.Header().Ttl, Rdata: hex.EncodeToString(rdata)}
++}
++
++func sortKeys(ks []rrKey) []rrKey {
++	sort.Slice(ks, func(i, j int) bool { return fmt.Sprint(ks[i]) < fmt.Sprint(ks[j]) })
++	if len(ks) == 0 {
++		return nil
++	}
++	return ks
++}
++
++// optionsOf reads the options out of the packed OPT rdata.
++func optionsOf(opt *dns.OPT) ([]optKey, error) {
++	_, rdata, err := packRR(opt)
++	if err != nil {
++		return nil, err
++	}
++	var out []optKey
++	for off := 0; off < len(rdata); {
++		if off+4 > len(rdata) {
++			return nil, fmt.Errorf("truncated option at %d", off)
++		}
++		code := binary.BigEndian.Uint16(rdata[off:])
++		size := int(binary.BigEndian.Uint16(rdata[off+2:]))
++		off += 4
++		if off+size > len(rdata) {
++			return nil, fmt.Errorf("option %d overruns the rdata", code)
++		}
++		out = append(out, optKey{Code: code, Data: hex.EncodeToString(rdata[off : off+size])})
++		off += size
++	}
++	return out, nil
++}
++
++func headerFlags(m *dns.Msg) uint16 {
++	var f uint16
++	if m.Response {
++		f |= 1 << 15
++	}
++	f |= uint16(m.Opcode&0xF) << 11
++	if m.Authoritative {
++		f |= 1 << 10
++	}
++	if m.Truncated {
++		f |= 1 << 9
++	}
++	if m.RecursionDesired {
++		f |= 1 << 8
++	}
++	if m.RecursionAvailable {
++		f |= 1 << 7
++	}
++	if m.Zero {
++		f |= 1 << 6
++	}
++	if m.AuthenticatedData {
++		f |= 1 << 5
++	}
++	if m.CheckingDisabled {
++		f |= 1 << 4
++	}
++	f |= uint16(m.Rcode & 0xF)
++	return f
++}
++
++func summarize(m *dns.Msg) (msgSummary, error) {
++	s := msgSummary{ID: m.Id, Flags: headerFlags(m), Rcode: m.Rcode}
++	for _, q := range m.Question {
++		s.Question = append(s.Question, rrKey{Name: nameHex(q.Name), Type: q.Qtype, Class: q.Qclass})
++	}
++	for i, sec := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
++		var ks []rrKey
++		for _, rr := range sec {
++			if opt, ok := rr.(*dns.OPT); ok {
++				if s.Edns != nil {
++					return s, fmt.Errorf("two OPT records")
++				}
++				opts, err := optionsOf(opt)
++				if err != nil {
++					return s, err
++				}
++				// Pack writes the extended rcode into the OPT TTL of the wire form
++				s.Edns = &ednsSummary{Version: opt.Version(), Payload: opt.UDPSize(), Flags: opt.Hdr.Ttl&0x00ffffff | uint32(m.Rcode>>4)<<24, Options: opts}
++				continue
++			}
++			ks = append(ks, rrKeyOf(rr))
++		}
++		s.Sections[i] = sortKeys(ks)
++	}
++	if s.Edns == nil {
++		s.Rcode &= 0xF
++	}
++	return s, nil
++}
++
++type pyMsg struct {
++	ID       int `json:"id"`
++	Flags    int `json:"flags"`
++	Rcode    int `json:"rcode"`
++	Question []struct {
++		Name  string `json:"name"`
++		Type  int    `json:"type"`
++		Class int    `json:"class"`
++	} `json:"question"`
++	Sections [][]struct {
++		Name  string `json:"name"`
++		Type  int    `json:"type"`
++		Class int    `json:"class"`
++		TTL   uint32 `json:"ttl"`
++		Rdata string `json:"rdata"`
++		Text  string `json:"text"`
++	} `json:"sections"`
++	Rewire string `json:"rewire"`
++	Edns   *struct {
++		Version   int    `json:"version"`
++		Payload   int    `json:"payload"`
++		EdnsFlags uint32 `json:"ednsflags"`
++		Options   []struct {
++			Otype int    `json:"otype"`
++			Data  string `json:"data"`
++			Text  string `json:"text"`
++		} `json:"options"`
++	} `json:"edns"`
++}
++
++func (p *pyMsg) summary() msgSummary {
++	s := msgSummary{ID: uint16(p.ID), Flags: uint16(p.Flags), Rcode: p.Rcode}
++	for _, q := range p.Question {
++		s.Question = append(s.Question, rrKey{Name: q.Name, Type: uint16(q.Type), Class: uint16(q.Class)})
++	}
++	for i, sec := range p.Sections {
++		var ks []rrKey
++		for _, r := range sec {
++			ks = append(ks, rrKey{Name: r.Name, Type: uint16(r.Type), Class: uint16(r.Class), TTL: r.TTL, Rdata: r.Rdata})
++		}
++		if i < 3 {
++			s.Sections[i] = sortKeys(ks)
++		}
++	}
++	if p.Edns != nil {
++		e := &ednsSummary{Version: uint8(p.Edns.Version), Payload: uint16(p.Edns.Payload), Flags: p.Edns.EdnsFlags}
++		for _, o := range p.Edns.Options {
++			e.Options = append(e.Options, optKey{Code: uint16(o.Otype), Data: o.Data})
++		}
++		s.Edns = e
++	}
++	return s
++}
++
++func diffSummary(a, b msgSummary) string {
++	var sb strings.Builder
++	if a.ID != b.ID || a.Flags != b.Flags || a.Rcode != b.Rcode {
++		fmt.Fprintf(&sb, " header: id %d/%d flags %#x/%#x rcode %d/%d\n", a.ID, b.ID, a.Flags, b.Flags, a.Rcode, b.Rcode)
++	}
++	if !reflect.DeepEqual(a.Question, b.Question) {
++		fmt.Fprintf(&sb, " question:\n  %v\n  %v\n", a.Question, b.Question)
++	}
++	for i := range a.Sections {
++		if !reflect.DeepEqual(a.Sections[i], b.Sections[i]) {
++			fmt.Fprintf(&sb, " section %d:\n  %v\n  %v\n", i, a.Sections[i], b.Sections[i])
++		}
++	}
++	if !reflect.DeepEqual(a.Edns, b.Edns) {
++		fmt.Fprintf(&sb, " edns:\n  %+v\n  %+v\n", a.Edns, b.Edns)
++	}
++	return sb.String()
++}
++
++// foldSummary lowercases the ASCII letters in names and rdata.
++func foldSummary(s msgSummary) msgSummary {
++	s.Question = append([]rrKey(nil), s.Question...)
++	for i := range s.Question {
++		s.Question[i].Name = foldHex(s.Question[i].Name)
++	}
++	for i := range s.Sections {
++		ks := append([]rrKey(nil), s.Sections[i]...)
++		for j := range ks {
++			ks[j].Name = foldHex(ks[j].Name)
++			ks[j].Rdata = foldHex(ks[j].Rdata)
++		}
++		s.Sections[i] = sortKeys(ks)
++	}
++	return s
++}
++
++func pyLosesBackslash(m *dns.Msg) bool {
++	for _, sec := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
++		for _, rr := range sec {
++			switch rr.Header().Rrtype {
++			case dns.TypeURI, dns.TypeCAA:
++				if _, rdata, err := packRR(rr); err == nil && bytes.Contains(rdata, []byte{'\\'}) {
++					return true
++				}
++			}
++		}
++	}
++	return false
++}
++
++func msgLenIsApproximate(m *dns.Msg) bool {
++	for _, sec := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
++		for _, rr := range sec {
++			if lenIsApproximate(rr.String(), dns.TypeToString[rr.Header().Rrtype]) {
++				return true
++			}
++		}
++	}
++	for _, q := range m.Question {
++		if strings.Contains(q.Name, "\\") {
++			return true
++		}
++	}
++	return false
++}
++
++// Properties ------------------------------------------------------------------
++
++// TestHegelMessagesAgreeWithDnspython: a packed message (compressed or not)
++// is read by dnspython to the same header, questions, records and EDNS data;
++// dnspython's re-serialisation unpacks to the same message; the library's own
++// unpack and repack are byte-stable; Len equals the packed size; Copy is equal.
++func TestHegelMessagesAgreeWithDnspython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		m := genMsg(tc)
++		want, err := summarize(m)
++		if err != nil {
++			fail(ht, "summarising the generated message: %v\n%s", err, m.String())
++		}
++		note(ht, "message (compress %v):\n%s", m.Compress, m.String())
++		wire, err := m.Pack()
++		if err != nil {
++			fail(ht, "Pack: %v\n%s", err, m.String())
++		}
++		if l := m.Len(); l < len(wire) || (l != len(wire) && !(Known.lenOverestimates && msgLenIsApproximate(m))) {
++			fail(ht, "Len %d but Pack wrote %d bytes (compress %v)\n%s", l, len(wire), m.Compress, m.String())
++		}
++		// dnspython reads it
++		var pm pyMsg
++		if err := py.call(t, map[string]any{"op": "message", "wire": hex.EncodeToString(wire)}, &pm); err != nil {
++			fail(ht, "dnspython rejects the packed message: %v\nwire %s\n%s", err, hex.EncodeToString(wire), m.String())
++		}
++		if got := pm.summary(); !reflect.DeepEqual(got, want) {
++			fail(ht, "dnspython reads the message differently (go / python)\n%s\nwire %s\n%s", diffSummary(want, got), hex.EncodeToString(wire), m.String())
++		}
++		// dnspython's own serialisation unpacks to the same message (dnspython
++		// loses backslashes in URI targets and CAA values on the way: not judged)
++		if pyLosesBackslash(m) {
++			return
++		}
++		rewire, err := hex.DecodeString(pm.Rewire)
++		if err != nil {
++			fail(ht, "bad rewire hex: %v", err)
++		}
++		var fromPy dns.Msg
++		if err := fromPy.Unpack(rewire); err != nil {
++			fail(ht, "Unpack of dnspython's serialisation: %v\nwire %s\n%s", err, pm.Rewire, m.String())
++		}
++		// (dnspython compresses names case-insensitively, so letter case may change)
++		if got, err := summarize(&fromPy); err != nil || !reflect.DeepEqual(foldSummary(got), foldSummary(want)) {
++			fail(ht, "dnspython's serialisation unpacks differently (%v) (go / from python)\n%s\nwire %s\n%s", err, diffSummary(want, got), pm.Rewire, m.String())
++		}
++		// the library's own round trip
++		var back dns.Msg
++		if err := back.Unpack(wire); err != nil {
++			fail(ht, "Unpack of Pack: %v\nwire %s\n%s", err, hex.EncodeToString(wire), m.String())
++		}
++		if got, err := summarize(&back); err != nil || !reflect.DeepEqual(got, want) {
++			fail(ht, "Unpack(Pack) differs (%v) (original / unpacked)\n%s\nwire %s\n%s", err, diffSummary(want, got), hex.EncodeToString(wire), m.String())
++		}
++		back.Compress = m.Compress
++		wire2, err := back.Pack()
++		if err != nil {
++			fail(ht, "Pack of the unpacked message: %v\n%s", err, m.String())
++		}
++		if !bytes.Equal(wire, wire2) {
++			fail(ht, "Pack(Unpack(Pack)) differs (compress %v)\n first  %s\n second %s\n%s", m.Compress, hex.EncodeToString(wire), hex.EncodeToString(wire2), m.String())
++		}
++		// the other compression setting gives the same message
++		other := m.Copy()
++		other.Compress = !m.Compress
++		wire3, err := other.Pack()
++		if err != nil {
++			fail(ht, "Pack (compress %v): %v\n%s", other.Compress, err, m.String())
++		}
++		var back3 dns.Msg
++		if err := back3.Unpack(wire3); err != nil {
++			fail(ht, "Unpack (compress %v): %v\nwire %s\n%s", other.Compress, err, hex.EncodeToString(wire3), m.String())
++		}
++		if got, err := summarize(&back3); err != nil || !reflect.DeepEqual(got, want) {
++			fail(ht, "Unpack(Pack) with compress %v differs (%v)\n%s\n%s", other.Compress, err, diffSummary(want, got), m.String())
++		}
++		if m.Compress && len(wire) > len(wire3) {
++			fail(ht, "compressed form (%d bytes) longer than uncompressed (%d)\n%s", len(wire), len(wire3), m.String())
++		}
++		if got, err := summarize(m.Copy()); err != nil || !reflect.DeepEqual(got, want) {
++			fail(ht, "Copy differs (%v)\n%s\n%s", err, diffSummary(want, got), m.String())
++		}
++		if strings.TrimSpace(m.String()) == "" {
++			fail(ht, "String() is empty")
++		}
++	})
++}
++
++// TestHegelTruncateFits: Truncate(size) leaves a message whose Len is at most
++// the size (or 512), keeps the question and the OPT, drops records only from
++// the end of the sections, sets TC exactly when it dropped something, and
++// changes nothing when the message already fits.
++func TestHegelTruncateFits(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		m := genMsg(tc)
++		m.Truncated = chance(tc, 10)
++		full := m.Len()
++		size := pick(tc, 512, 1232, 4096, 65535, n(tc, 0, 600), full, full-1, full+1, n(tc, 12, full+50))
++		note(ht, "size %d full %d compress %v\n%s", size, full, m.Compress, m.String())
++		before, err := summarize(m)
++		if err != nil {
++			fail(ht, "summarising: %v", err)
++		}
++		c := m.Copy()
++		c.Truncate(size)
++		limit := size
++		if limit < dns.MinMsgSize {
++			limit = dns.MinMsgSize
++		}
++		after, err := summarize(c)
++		if err != nil {
++			fail(ht, "summarising the truncated message: %v", err)
++		}
++		if after.ID != before.ID || after.Rcode != before.Rcode || !reflect.DeepEqual(after.Question, before.Question) || !reflect.DeepEqual(after.Edns, before.Edns) {
++			fail(ht, "Truncate changed the header, question or OPT\n%s\nsize %d\n%s", diffSummary(before, after), size, m.String())
++		}
++		dropped := 0
++		for i, sec := range [][]dns.RR{m.Answer, m.Ns, withoutOPT(m.Extra)} {
++			csec := [][]dns.RR{c.Answer, c.Ns, withoutOPT(c.Extra)}[i]
++			if len(csec) > len(sec) {
++				fail(ht, "Truncate added records to section %d", i)
++			}
++			for j := range csec {
++				if csec[j].String() != sec[j].String() {
++					fail(ht, "Truncate changed record %d of section %d: %s -> %s\nsize %d\n%s", j, i, sec[j], csec[j], size, m.String())
++				}
++			}
++			dropped += len(sec) - len(csec)
++		}
++		if c.Truncated != (m.Truncated || dropped > 0) {
++			fail(ht, "TC %v after dropping %d records (TC before %v)\nsize %d\n%s", c.Truncated, dropped, m.Truncated, size, m.String())
++		}
++		wire, err := c.Pack()
++		if err != nil {
++			fail(ht, "Pack of the truncated message: %v\nsize %d\n%s", err, size, c.String())
++		}
++		if len(wire) > limit && dropped < len(m.Answer)+len(m.Ns)+len(m.Extra)-optCount(m) {
++			fail(ht, "truncated message is %d bytes for size %d (Len %d, compress %v) with %d records left to drop\n%s", len(wire), size, c.Len(), c.Compress, len(c.Answer)+len(c.Ns)+len(c.Extra)-optCount(c)-1, c.String())
++		}
++		if dropped > 0 && len(m.Extra) > optCount(m) && len(c.Extra) > optCount(c) && len(c.Answer) < len(m.Answer) {
++			// answers are dropped before the other sections are emptied
++			fail(ht, "Truncate dropped answers while keeping %d additional records\nsize %d\n%s", len(c.Extra)-optCount(c), size, m.String())
++		}
++		if full <= limit && (dropped > 0 || c.Truncated != m.Truncated) {
++			fail(ht, "Truncate dropped %d records from a message of %d bytes for size %d\n%s", dropped, full, size, m.String())
++		}
++	})
++}
++
++func withoutOPT(rrs []dns.RR) []dns.RR {
++	var out []dns.RR
++	for _, rr := range rrs {
++		if _, ok := rr.(*dns.OPT); !ok {
++			out = append(out, rr)
++		}
++	}
++	return out
++}
++
++func optCount(m *dns.Msg) int {
++	k := 0
++	for _, rr := range m.Extra {
++		if _, ok := rr.(*dns.OPT); ok {
++			k++
++		}
++	}
++	return k
++}
+diff --git a/hegel_names_test.go b/hegel_names_test.go
+new file mode 100644
+index 0000000..7659e42
+--- /dev/null
++++ b/hegel_names_test.go
+@@ -0,0 +1,225 @@
++package dns_test
++
++import (
++	"encoding/hex"
++	"fmt"
++	"net"
++	"strings"
++	"testing"
++
++	"github.com/miekg/dns"
++	"hegel.dev/go/hegel"
++)
++
++type pyName struct {
++	Wire      string `json:"wire"`
++	Text      string `json:"text"`
++	Canonical string `json:"canonical"`
++	Labels    int    `json:"labels"`
++	Relation  int    `json:"relation"`
++	Order     int    `json:"order"`
++	Common    int    `json:"common"`
++	Subdomain bool   `json:"subdomain"`
++}
++
++// packName packs a name without compression.
++func packName(name string) ([]byte, error) {
++	buf := make([]byte, 1024)
++	off, err := dns.PackDomainName(name, buf, 0, nil, false)
++	if err != nil {
++		return nil, err
++	}
++	return buf[:off], nil
++}
++
++// genRelated returns a name related to name: itself, a parent, a child, a
++// case variant, or an unrelated name.
++func genRelated(tc hegel.TestCase, name string) string {
++	switch n(tc, 0, 5) {
++	case 0:
++		return name
++	case 1: // a parent
++		labels := dns.SplitDomainName(name)
++		if len(labels) == 0 {
++			return name
++		}
++		k := n(tc, 1, len(labels))
++		if k == len(labels) {
++			return "."
++		}
++		return strings.Join(labels[k:], ".") + "."
++	case 2: // a child
++		if name == "." {
++			return genLabel(tc) + "."
++		}
++		return genLabel(tc) + "." + name
++	case 3: // a case variant
++		var sb strings.Builder
++		for i := 0; i < len(name); i++ {
++			c := name[i]
++			if c >= 'a' && c <= 'z' && chance(tc, 50) {
++				c -= 'a' - 'A'
++			} else if c >= 'A' && c <= 'Z' && chance(tc, 50) {
++				c += 'a' - 'A'
++			}
++			sb.WriteByte(c)
++		}
++		return sb.String()
++	default:
++		return genName(tc)
++	}
++}
++
++// TestHegelNamesAgreeWithDnspython: a name in presentation form packs to the
++// same wire form in this library and in dnspython; unpacking gives text that
++// packs back identically; canonical form, label count and split points,
++// common-suffix count and subdomain relation agree with dnspython (python's
++// dns.name treats names as label sequences, so it is the arbiter of what an
++// escaped name means).
++func TestHegelNamesAgreeWithDnspython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		name := genName(tc)
++		other := genRelated(tc, name)
++		note(ht, "name %q other %q", name, other)
++
++		var pn pyName
++		perr := py.call(t, map[string]any{"op": "name", "text": name, "other": other}, &pn)
++		labels, ok := dns.IsDomainName(name)
++		wire, gerr := packName(name)
++		if perr != nil {
++			if ok && gerr == nil {
++				fail(ht, "dnspython rejects a name the library packs (%s): %v\nname %q", hex.EncodeToString(wire), perr, name)
++			}
++			note(ht, "both reject %q: go %v/%v python %v", name, ok, gerr, perr)
++			return
++		}
++		if !ok || gerr != nil {
++			fail(ht, "the library rejects a name dnspython accepts (IsDomainName %v, pack %v)\nname %q", ok, gerr, name)
++		}
++		if hex.EncodeToString(wire) != pn.Wire {
++			fail(ht, "wire form differs\n go     %s\n python %s\nname %q", hex.EncodeToString(wire), pn.Wire, name)
++		}
++		// dnspython counts the root label; IsDomainName counts one label for the root name
++		if labels != pn.Labels-1 && name != "." {
++			fail(ht, "IsDomainName counts %d labels, dnspython %d\nname %q", labels, pn.Labels-1, name)
++		}
++		if name == "." {
++			labels = 0
++		}
++		if c := dns.CountLabel(name); c != labels {
++			fail(ht, "CountLabel %d but IsDomainName counted %d\nname %q", c, labels, name)
++		}
++		if sp := dns.Split(name); len(sp) != labels {
++			fail(ht, "Split gives %d offsets for %d labels: %v\nname %q", len(sp), labels, sp, name)
++		} else {
++			for i, off := range sp {
++				if off < 0 || off >= len(name) {
++					fail(ht, "Split offset %d out of range: %v\nname %q", off, sp, name)
++				}
++				if got, _ := dns.NextLabel(name, off); i+1 < len(sp) && got != sp[i+1] {
++					fail(ht, "NextLabel(%d) = %d, Split says %d\nname %q", off, got, sp[i+1], name)
++				}
++				if got, _ := dns.PrevLabel(name, len(sp)-i); got != off {
++					fail(ht, "PrevLabel(%d) = %d, Split says %d\nname %q", len(sp)-i, got, off, name)
++				}
++				suffix := name[off:]
++				sw, err := packName(suffix)
++				if err != nil {
++					fail(ht, "the suffix %q at Split offset %d does not pack: %v\nname %q", suffix, off, err, name)
++				}
++				// the suffix is the tail of the wire form
++				if !strings.HasSuffix(hex.EncodeToString(wire), hex.EncodeToString(sw)) {
++					fail(ht, "the suffix %q at Split offset %d is not a wire suffix\n name   %s\n suffix %s\nname %q", suffix, off, hex.EncodeToString(wire), hex.EncodeToString(sw), name)
++				}
++			}
++		}
++		if parts := dns.SplitDomainName(name); len(parts) != labels {
++			fail(ht, "SplitDomainName gives %d labels for %d: %q\nname %q", len(parts), labels, parts, name)
++		} else if labels > 0 {
++			joined := strings.Join(parts, ".") + "."
++			if jw, err := packName(joined); err != nil || hex.EncodeToString(jw) != pn.Wire {
++				fail(ht, "SplitDomainName labels joined back pack differently (%v)\n labels %q\n joined %s\n name   %s\nname %q", err, parts, hex.EncodeToString(jw), pn.Wire, name)
++			}
++		}
++		// unpack gives text that packs back to the same wire, and that dnspython reads alike
++		s, off, err := dns.UnpackDomainName(wire, 0)
++		if err != nil || off != len(wire) {
++			fail(ht, "UnpackDomainName: %v (off %d of %d)\nname %q", err, off, len(wire), name)
++		}
++		if w2, err := packName(s); err != nil || hex.EncodeToString(w2) != pn.Wire {
++			fail(ht, "unpacked text %q packs differently: %v %s\nname %q", s, err, hex.EncodeToString(w2), name)
++		}
++		var pn2 pyName
++		if err := py.call(t, map[string]any{"op": "name", "text": s}, &pn2); err != nil {
++			fail(ht, "dnspython rejects the unpacked text %q: %v\nname %q", s, err, name)
++		} else if pn2.Wire != pn.Wire {
++			fail(ht, "dnspython reads the unpacked text %q as %s, not %s\nname %q", s, pn2.Wire, pn.Wire, name)
++		}
++		// dnspython's own text reads back the same here
++		if w3, err := packName(pn.Text); err != nil || hex.EncodeToString(w3) != pn.Wire {
++			fail(ht, "dnspython's text %q packs differently: %v %s\nname %q", pn.Text, err, hex.EncodeToString(w3), name)
++		}
++		// canonical form
++		cw, err := packName(dns.CanonicalName(name))
++		if (err != nil || hex.EncodeToString(cw) != pn.Canonical) && !(Known.canonicalKeepsEscapedCase && strings.Contains(name, "\\")) {
++			fail(ht, "CanonicalName %q packs to %s, dnspython's canonical form is %s (%v)\nname %q", dns.CanonicalName(name), hex.EncodeToString(cw), pn.Canonical, err, name)
++		}
++		// relations with the other name
++		if _, ok := dns.IsDomainName(other); !ok {
++			return
++		}
++		if Known.textualDuplicates && (strings.Contains(name, "\\") || strings.Contains(other, "\\")) {
++			return // the comparisons are textual: escape variants of a label differ
++		}
++		if c := dns.CompareDomainName(name, other); c != pn.Common-1 {
++			fail(ht, "CompareDomainName(%q, %q) = %d, dnspython says %d labels in common", name, other, c, pn.Common-1)
++		}
++		if sub := dns.IsSubDomain(other, name); sub != pn.Subdomain {
++			fail(ht, "IsSubDomain(%q, %q) = %v, dnspython says %v", other, name, sub, pn.Subdomain)
++		}
++		// relation 3 = NAMEREL_EQUAL in dnspython
++		if eq := pn.Relation == 3; eq != (hex.EncodeToString(cw) == pn.Canonical && dns.CanonicalName(name) == dns.CanonicalName(other)) {
++			if eq != strings.EqualFold(dns.CanonicalName(name), dns.CanonicalName(other)) {
++				note(ht, "equal names in different escapes: %q %q", name, other)
++			}
++		}
++	})
++}
++
++// TestHegelReverseNamesAgreeWithDnspython: ReverseAddr matches dnspython's
++// reversename for random IPv4 and IPv6 addresses.
++func TestHegelReverseNamesAgreeWithDnspython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		ip := genIP4(tc)
++		if chance(tc, 50) {
++			ip = genIP6(tc)
++		}
++		got, err := dns.ReverseAddr(ip)
++		var pr struct {
++			Text string `json:"text"`
++		}
++		perr := py.call(t, map[string]any{"op": "reverse", "ip": ip}, &pr)
++		if perr != nil || err != nil {
++			if (perr == nil) != (err == nil) {
++				fail(ht, "ReverseAddr(%q): go %v, python %v", ip, err, perr)
++			}
++			return
++		}
++		if !strings.EqualFold(got, pr.Text) {
++			fail(ht, "ReverseAddr(%q) = %q, dnspython %q", ip, got, pr.Text)
++		}
++		// and the name is fully qualified and parses
++		if !dns.IsFqdn(got) {
++			fail(ht, "ReverseAddr(%q) = %q is not fully qualified", ip, got)
++		}
++		if net.ParseIP(ip) == nil {
++			fail(ht, "generated address %q does not parse", ip)
++		}
++	})
++}
++
++var _ = fmt.Sprintf
+diff --git a/hegel_oracle_test.go b/hegel_oracle_test.go
+new file mode 100644
+index 0000000..d805a3f
+--- /dev/null
++++ b/hegel_oracle_test.go
+@@ -0,0 +1,225 @@
++package dns_test
++
++// The dnspython oracle: one python3 child per test binary, fed JSON requests
++// one per line and answering one JSON line each.
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"sync"
++	"testing"
++)
++
++const pyScript = `
++import sys, json, base64, binascii
++import dns, dns.name, dns.rdata, dns.rdataclass, dns.rdatatype, dns.message, dns.rrset, dns.edns, dns.dnssec, dns.tsig, dns.zone, dns.reversename, dns.flags, dns.opcode, dns.rcode, dns.rdtypes.ANY.DNSKEY, dns.exception
++
++ROOT = dns.name.root
++
++def rr_out(name, rd, ttl):
++    try:
++        text = rd.to_text()
++    except Exception as e:  # HIP servers are printed through IDNA decoding, which may fail
++        text = None
++    return {"name": name.to_wire().hex(), "type": rd.rdtype, "class": rd.rdclass, "ttl": ttl, "rdata": rd.to_wire(origin=None).hex(), "text": text}
++
++def sections(m):
++    out = []
++    for sec in (m.answer, m.authority, m.additional):
++        rrs = []
++        for rrset in sec:
++            for rd in rrset:
++                rrs.append(rr_out(rrset.name, rd, rrset.ttl))
++        out.append(rrs)
++    return out
++
++def message_out(m):
++    res = {"id": m.id, "flags": m.flags, "opcode": dns.opcode.from_flags(m.flags), "rcode": m.rcode(),
++           "question": [{"name": q.name.to_wire().hex(), "type": q.rdtype, "class": q.rdclass} for q in m.question],
++           "sections": sections(m), "rewire": m.to_wire().hex()}
++    if m.opt is not None:
++        res["edns"] = {"version": m.edns, "payload": m.payload, "ednsflags": m.ednsflags,
++                       "options": [{"otype": o.otype, "data": o.to_wire().hex(), "text": o.to_text()} for o in m.options]}
++    return res
++
++def handle(req):
++    op = req["op"]
++    if op == "version":
++        return {"version": dns.version.version}
++    if op == "rdata":
++        rd = dns.rdata.from_text(req["class"], req["type"], req["text"], origin=ROOT, relativize=False)
++        w = rd.to_wire(origin=None)
++        rd2 = dns.rdata.from_wire(rd.rdclass, rd.rdtype, w, 0, len(w))
++        return {"wire": w.hex(), "text": rd.to_text(), "rewire": rd2.to_wire(origin=None).hex(), "retext": rd2.to_text()}
++    if op == "rdata_wire":
++        w = bytes.fromhex(req["wire"])
++        rd = dns.rdata.from_wire(req["class"], req["type"], w, 0, len(w))
++        try:
++            rd2 = dns.rdata.from_text(rd.rdclass, rd.rdtype, rd.to_text(), origin=ROOT, relativize=False)
++            textwire = rd2.to_wire(origin=None).hex()
++        except Exception as e:  # dnspython's own text round trip is not under test
++            textwire = None
++        return {"text": rd.to_text(), "rewire": rd.to_wire(origin=None).hex(), "textwire": textwire}
++    if op == "name":
++        n = dns.name.from_text(req["text"], origin=ROOT)
++        res = {"wire": n.to_wire().hex(), "text": n.to_text(), "canonical": n.canonicalize().to_wire().hex(), "labels": len(n.labels)}
++        if "other" in req:
++            o = dns.name.from_text(req["other"], origin=ROOT)
++            rel, order, nlabels = n.fullcompare(o)
++            res["relation"] = int(rel)
++            res["order"] = order
++            res["common"] = nlabels
++            res["subdomain"] = n.is_subdomain(o)
++        return res
++    if op == "name_wire":
++        n, used = dns.name.from_wire(bytes.fromhex(req["wire"]), 0)
++        return {"text": n.to_text(), "used": used}
++    if op == "reverse":
++        return {"text": dns.reversename.from_address(req["ip"]).to_text()}
++    if op == "message":
++        m = dns.message.from_wire(bytes.fromhex(req["wire"]), one_rr_per_rrset=True, ignore_trailing=False)
++        return message_out(m)
++    if op == "nsec3":
++        return {"hash": dns.dnssec.nsec3_hash(req["name"], req["salt"], req["iter"], req["alg"])}
++    if op == "keytag":
++        rd = dns.rdata.from_wire("IN", "DNSKEY", bytes.fromhex(req["wire"]), 0, len(bytes.fromhex(req["wire"])))
++        return {"tag": dns.dnssec.key_id(rd)}
++    if op == "ds":
++        w = bytes.fromhex(req["wire"])
++        rd = dns.rdata.from_wire("IN", "DNSKEY", w, 0, len(w))
++        ds = dns.dnssec.make_ds(dns.name.from_text(req["name"]), rd, req["alg"], policy=dns.dnssec.allow_all_policy)
++        return {"text": ds.to_text(), "wire": ds.to_wire(origin=None).hex()}
++    if op == "tsig_verify":
++        keyring = {dns.name.from_text(req["keyname"]): dns.tsig.Key(req["keyname"], req["secret"], req["alg"])}
++        try:
++            m = dns.message.from_wire(bytes.fromhex(req["wire"]), keyring=keyring, request_mac=bytes.fromhex(req.get("requestMac", "")))
++            return {"ok": True, "mac": m.mac.hex()}
++        except dns.exception.DNSException as e:
++            return {"ok": False, "err": type(e).__name__ + ": " + str(e)[:200]}
++    if op == "tsig_sign":
++        m = dns.message.from_wire(bytes.fromhex(req["wire"]), one_rr_per_rrset=True)  # keep duplicate records
++        key = dns.tsig.Key(req["keyname"], req["secret"], req["alg"])
++        m.use_tsig(key, fudge=req.get("fudge", 300))
++        return {"wire": m.to_wire().hex()}
++    if op == "zone":
++        z = dns.zone.from_text(req["text"], origin=req["origin"], relativize=False, check_origin=False, allow_include=False)
++        rrs = []
++        for name, node in z.nodes.items():
++            for rdataset in node.rdatasets:
++                for rd in rdataset:
++                    rrs.append(rr_out(name, rd, rdataset.ttl))
++        return {"rrs": rrs}
++    return {"error": "unknown op " + op}
++
++for line in sys.stdin:
++    req = json.loads(line)
++    try:
++        res = handle(req)
++    except Exception as e:
++        res = {"error": type(e).__name__ + ": " + str(e)[:300]}
++    sys.stdout.write(json.dumps(res) + "\n")
++    sys.stdout.flush()
++`
++
++type python struct {
++	mu  sync.Mutex
++	cmd *exec.Cmd
++	in  *bufio.Writer
++	out *bufio.Scanner
++}
++
++var (
++	pyOnce sync.Once
++	pyInst *python
++	pyErr  error
++)
++
++// oracle starts (once) the dnspython child and returns it.
++func oracle(t *testing.T) *python {
++	t.Helper()
++	pyOnce.Do(func() {
++		cmd := exec.Command("python3", "-c", pyScript)
++		cmd.Stderr = os.Stderr
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			pyErr = err
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			pyErr = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			pyErr = fmt.Errorf("starting python3: %v", err)
++			return
++		}
++		sc := bufio.NewScanner(stdout)
++		sc.Buffer(make([]byte, 1<<20), 64<<20)
++		pyInst = &python{cmd: cmd, in: bufio.NewWriter(stdin), out: sc}
++		var v struct {
++			Version string `json:"version"`
++			Error   string `json:"error"`
++		}
++		if err := pyInst.rawCall(map[string]any{"op": "version"}, &v); err != nil || v.Version == "" {
++			pyErr = fmt.Errorf("python3 with the dnspython package is needed as the oracle (%v %s)", err, v.Error)
++			return
++		}
++		fmt.Printf("oracle: dnspython %s\n", v.Version)
++	})
++	if pyErr != nil {
++		t.Fatalf("%v", pyErr)
++	}
++	return pyInst
++}
++
++type oracleError struct{ msg string }
++
++func (e *oracleError) Error() string { return e.msg }
++
++func (g *python) rawCall(req map[string]any, res any) error {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	b, err := json.Marshal(req)
++	if err != nil {
++		return err
++	}
++	if _, err := g.in.Write(append(b, '\n')); err != nil {
++		return err
++	}
++	if err := g.in.Flush(); err != nil {
++		return err
++	}
++	if !g.out.Scan() {
++		return fmt.Errorf("the python oracle exited: %v", g.out.Err())
++	}
++	var probe struct {
++		Error string `json:"error"`
++	}
++	line := g.out.Bytes()
++	if err := json.Unmarshal(line, &probe); err != nil {
++		return fmt.Errorf("bad oracle reply %q: %v", line, err)
++	}
++	if probe.Error != "" {
++		return &oracleError{probe.Error}
++	}
++	return json.Unmarshal(line, res)
++}
++
++// call asks the oracle; a python-side exception is returned as *oracleError
++// (the caller decides whether that is a legitimate rejection), any other
++// failure is fatal.
++func (g *python) call(t *testing.T, req map[string]any, res any) error {
++	t.Helper()
++	err := g.rawCall(req, res)
++	if err != nil {
++		if _, ok := err.(*oracleError); ok {
++			return err
++		}
++		t.Fatalf("oracle: %v", err)
++	}
++	return nil
++}
+diff --git a/hegel_pins_test.go b/hegel_pins_test.go
+new file mode 100644
+index 0000000..e5f5c12
+--- /dev/null
++++ b/hegel_pins_test.go
+@@ -0,0 +1,304 @@
++package dns_test
++
++// One plain test per bug in bugs.toml. Each fails while the bug is open and
++// is listed under [expected_failures] in target.toml.
++
++import (
++	"bytes"
++	"encoding/hex"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/miekg/dns"
++)
++
++func mustRR(t *testing.T, text string) dns.RR {
++	t.Helper()
++	rr, err := dns.NewRR(text)
++	if err != nil {
++		t.Fatalf("NewRR(%q): %v", text, err)
++	}
++	return rr
++}
++
++func mustPack(t *testing.T, rr dns.RR) []byte {
++	t.Helper()
++	wire, _, err := packRR(rr)
++	if err != nil {
++		t.Fatalf("PackRR(%s): %v", rr, err)
++	}
++	return wire
++}
++
++func zoneRecords(t *testing.T, zone, origin string) ([]dns.RR, error) {
++	t.Helper()
++	var out []dns.RR
++	zp := dns.NewZoneParser(strings.NewReader(zone), origin, "")
++	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
++		out = append(out, rr)
++	}
++	return out, zp.Err()
++}
++
++// 1: Len returns the length of the uncompressed wire form.
++func TestHegelPinLenIsTheWireLength(t *testing.T) {
++	for _, text := range []string{
++		`a. 1 IN TXT "\\"`,
++		`a. 1 IN TXT "\065"`,
++		`a. 1 IN DNSKEY 256 3 8 ZAKoSg==`,
++		`a. 1 IN CERT PGP 1 1 SwA=`,
++		`a. 1 IN NSEC b.`,
++		`a. 1 IN CSYNC 1 3`,
++		`a. 1 IN HIP 8 0657 pUo= .`,
++		`a. 1 IN AMTRELAY 1 0 3 a\064.`,
++		`a. 1 IN APL 2:::/3`,
++		`a\032. 1 IN A 1.2.3.4`,
++	} {
++		rr := mustRR(t, text)
++		if got, want := dns.Len(rr), len(mustPack(t, rr)); got != want {
++			t.Errorf("Len(%s) = %d, PackRR writes %d bytes", text, got, want)
++		}
++	}
++}
++
++// 2: type bitmaps written in any order pack.
++func TestHegelPinTypeBitmapOrderIsFree(t *testing.T) {
++	for _, text := range []string{
++		"a. 1 IN NSEC b. MX A",
++		"a. 1 IN NSEC3 1 0 0 - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA MX A",
++		"a. 1 IN CSYNC 1 3 MX A",
++	} {
++		rr := mustRR(t, text)
++		buf := make([]byte, 512)
++		if _, err := dns.PackRR(rr, buf, 0, nil, false); err != nil {
++			t.Errorf("PackRR(%s): %v", text, err)
++		}
++	}
++}
++
++// 3: names and records equal on the wire are duplicates and compare equal.
++func TestHegelPinDuplicatesAreJudgedOnTheWire(t *testing.T) {
++	a := mustRR(t, `a\032. 1 IN A 1.2.3.4`)
++	b := mustRR(t, `a\ . 1 IN A 1.2.3.4`)
++	if !dns.IsDuplicate(a, b) {
++		t.Errorf("IsDuplicate(%s, %s) = false", a, b)
++	}
++	if !dns.IsDuplicate(mustRR(t, `a. 1 IN TXT "\065"`), mustRR(t, `a. 1 IN TXT "A"`)) {
++		t.Errorf(`IsDuplicate of TXT "\065" and "A" = false`)
++	}
++	if !dns.IsDuplicate(mustRR(t, `a. 1 IN SSHFP 1 1 abcd`), mustRR(t, `a. 1 IN SSHFP 1 1 ABCD`)) {
++		t.Errorf("IsDuplicate of SSHFP abcd and ABCD = false")
++	}
++	if n := dns.CompareDomainName(`a\032.`, `a\ .`); n != 1 {
++		t.Errorf(`CompareDomainName("a\032.", "a\ .") = %d, want 1`, n)
++	}
++	if !dns.IsSubDomain(`a\032.`, `b.a\ .`) {
++		t.Errorf(`IsSubDomain("a\032.", "b.a\ .") = false`)
++	}
++}
++
++// 4: LOC minutes may be given without seconds (RFC 1876 section 3).
++func TestHegelPinLOCMinutesWithoutSeconds(t *testing.T) {
++	for _, text := range []string{
++		"a. 1 IN LOC 42 30 N 56 40 W 10m",
++		"a. 1 IN LOC 42 30 N 56 W 10m",
++		"a. 1 IN LOC 42 N 56 40 W 10m",
++	} {
++		if _, err := dns.NewRR(text); err != nil {
++			t.Errorf("NewRR(%q): %v", text, err)
++		}
++	}
++}
++
++// 5: the X25 address is a <character-string> and may be quoted (RFC 1183 3.1).
++func TestHegelPinX25AcceptsQuotedAddress(t *testing.T) {
++	rr, err := dns.NewRR(`a. 1 IN X25 "311061700956"`)
++	if err != nil {
++		t.Fatalf("NewRR: %v", err)
++	}
++	if got := rr.(*dns.X25).PSDNAddress; got != "311061700956" {
++		t.Errorf("PSDNAddress = %q", got)
++	}
++}
++
++// 6: an unpacked CAA or URI prints so that it reads back to the same data.
++func TestHegelPinUnpackedOctetStringsPrintEscaped(t *testing.T) {
++	for _, text := range []string{`a. 1 IN CAA 0 issue "a\\b"`, `a. 1 IN URI 1 1 "a\\b"`} {
++		rr := mustRR(t, text)
++		wire := mustPack(t, rr)
++		back, _, err := dns.UnpackRR(wire, 0)
++		if err != nil {
++			t.Fatalf("UnpackRR: %v", err)
++		}
++		again, err := dns.NewRR(back.String())
++		if err != nil {
++			t.Fatalf("NewRR(%q): %v", back.String(), err)
++		}
++		if got := mustPack(t, again); !bytes.Equal(got, wire) {
++			t.Errorf("%s unpacked prints %q, which packs to %s, not %s", text, back.String(), hex.EncodeToString(got), hex.EncodeToString(wire))
++		}
++	}
++}
++
++// 7: an IPv4-mapped IPv6 address is an IPv6 gateway (AAAA accepts it).
++func TestHegelPinMappedIPv6Gateways(t *testing.T) {
++	for _, text := range []string{
++		"a. 1 IN IPSECKEY 1 2 1 ::ffff:1.2.3.4 pUo=",
++		"a. 1 IN AMTRELAY 1 0 2 ::ffff:1.2.3.4",
++		"a. 1 IN SVCB 1 . ipv6hint=::ffff:1.2.3.4",
++	} {
++		if _, err := dns.NewRR(text); err != nil {
++			t.Errorf("NewRR(%q): %v", text, err)
++		}
++	}
++	// and the wire form's String() reads back
++	wire, _ := hex.DecodeString("016100002d000100000001001501020100000000000000000000ffff01020304a54a")
++	rr, _, err := dns.UnpackRR(wire, 0)
++	if err != nil {
++		t.Fatalf("UnpackRR: %v", err)
++	}
++	if _, err := dns.NewRR(rr.String()); err != nil {
++		t.Errorf("NewRR(%q) of an unpacked IPSECKEY: %v", rr.String(), err)
++	}
++}
++
++// 8: the canonical form lowercases letters written as escapes (RFC 4034 6.2).
++func TestHegelPinCanonicalNameLowercasesEscapes(t *testing.T) {
++	c := dns.CanonicalName(`x\070.`)
++	w, err := packName(c)
++	if err != nil || hex.EncodeToString(w) != "02786600" {
++		t.Errorf(`CanonicalName("x\070.") = %q packs to %s (%v), want 02786600 ("xf.")`, c, hex.EncodeToString(w), err)
++	}
++}
++
++// 9: LOC seconds keep their milliseconds.
++func TestHegelPinLOCSecondsAreExact(t *testing.T) {
++	rr := mustRR(t, "a. 1 IN LOC 0 0 4.031 N 0 E 0m")
++	if got := rr.(*dns.LOC).Latitude; got != 1<<31+4031 {
++		t.Errorf("Latitude = %d (%d ms), want %d", got, int64(got)-1<<31, 1<<31+4031)
++	}
++}
++
++// 10: an altitude outside RFC 1876's range is rejected, not wrapped.
++func TestHegelPinLOCAltitudeRange(t *testing.T) {
++	for _, text := range []string{"a. 1 IN LOC 0 N 0 E -100001m", "a. 1 IN LOC 0 N 0 E 42849673m"} {
++		rr, err := dns.NewRR(text)
++		if err == nil {
++			t.Errorf("NewRR(%q) accepted, altitude field %d (%s)", text, rr.(*dns.LOC).Altitude, rr)
++		}
++	}
++}
++
++// 11: the NSEC3 hash length is the length of the hash.
++func TestHegelPinNSEC3HashLength(t *testing.T) {
++	rr := mustRR(t, "a. 1 IN NSEC3 1 0 0 - VE08UH3B")
++	wire := mustPack(t, rr)
++	back, off, err := dns.UnpackRR(wire, 0)
++	if err != nil || off != len(wire) {
++		t.Fatalf("UnpackRR(PackRR) of a 5-byte hash: %v (wire %s)", err, hex.EncodeToString(wire))
++	}
++	if back.(*dns.NSEC3).HashLength != 5 {
++		t.Errorf("hash length %d, want 5", back.(*dns.NSEC3).HashLength)
++	}
++}
++
++// 12: the AMTRELAY gateway is packed whatever the D bit.
++func TestHegelPinAMTRELAYKeepsGatewayWithDBit(t *testing.T) {
++	rr := mustRR(t, "a. 1 IN AMTRELAY 1 1 1 1.2.3.4")
++	_, rdata, err := packRR(rr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := hex.EncodeToString(rdata); got != "018101020304" {
++		t.Errorf("rdata %s, want 018101020304", got)
++	}
++}
++
++// 13: a comment inside parentheses is allowed in every record.
++func TestHegelPinCommentsInsideParentheses(t *testing.T) {
++	for _, zone := range []string{
++		"$TTL 1\n@ NSEC ( a. ; c\n SRV APL )\n",
++		"$TTL 1\n@ NSEC3 ( 1 0 0 - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ; c\n SRV APL )\n",
++		"$TTL 1\n@ CSYNC ( 1 3 ; c\n SRV APL )\n",
++		"$TTL 1\n@ RRSIG ( A 8 2 3600 20260101000000 ; c\n 20250101000000 1 a. AAAA )\n",
++	} {
++		if rrs, err := zoneRecords(t, zone, "example.com."); err != nil || len(rrs) != 1 {
++			t.Errorf("%q: %d records, %v", zone, len(rrs), err)
++		}
++	}
++}
++
++// 14: a blank owner before any record is not an empty name.
++func TestHegelPinBlankFirstOwner(t *testing.T) {
++	rrs, err := zoneRecords(t, "$TTL 1\n  A 1.2.3.4\n", "example.com.")
++	if err != nil {
++		return // rejecting the zone is fine
++	}
++	for _, rr := range rrs {
++		if rr.Header().Name == "" {
++			t.Errorf("record with an empty owner name: %q", rr.String())
++		}
++	}
++}
++
++// 15: TsigVerify leaves the message buffer as it was.
++func TestHegelPinTsigVerifyKeepsTheBuffer(t *testing.T) {
++	m := new(dns.Msg)
++	m.SetQuestion("example.com.", dns.TypeA)
++	m.SetTsig("key.", dns.HmacSHA256, 300, time.Now().Unix())
++	signed, _, err := dns.TsigGenerate(m, "c2VjcmV0", "", false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	before := append([]byte(nil), signed...)
++	if err := dns.TsigVerify(signed, "c2VjcmV0", "", false); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(before, signed) {
++		t.Errorf("TsigVerify changed the buffer: arcount %v -> %v", before[10:12], signed[10:12])
++	}
++}
++
++// 16: the key tag of an RSA/MD5 key follows RFC 4034 appendix B.1.
++func TestHegelPinKeyTagRSAMD5(t *testing.T) {
++	rr := mustRR(t, "a. 1 IN DNSKEY 257 3 1 MWwoyw8q95pCE4xPuwfJBoYj7lnjNMY8XDIilQ==")
++	if got := rr.(*dns.DNSKEY).KeyTag(); got != 12834 {
++		t.Errorf("KeyTag = %d, want 12834 (0x3222, the 3rd and 2nd to last octets of the key)", got)
++	}
++}
++
++// 17: an IPSECKEY record may be followed by another record.
++func TestHegelPinIPSECKEYThenAnotherRecord(t *testing.T) {
++	rrs, err := zoneRecords(t, "$TTL 1\n@ IPSECKEY 1 1 1 1.2.3.4 pUo=\n@ A 1.2.3.4\n", "example.com.")
++	if err != nil || len(rrs) != 2 {
++		t.Errorf("%d records, %v", len(rrs), err)
++	}
++}
++
++// 18: a signed NOTAUTH message (RFC 2136 responses, RFC 8945 BADTIME answers)
++// verifies like any other.
++func TestHegelPinTsigVerifiesNotAuthMessages(t *testing.T) {
++	m := new(dns.Msg)
++	m.SetQuestion("example.com.", dns.TypeSOA)
++	m.Response = true
++	m.Rcode = dns.RcodeNotAuth
++	m.SetTsig("key.", dns.HmacSHA256, 300, time.Now().Unix())
++	signed, _, err := dns.TsigGenerate(m, "c2VjcmV0", "", false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := dns.TsigVerify(signed, "c2VjcmV0", "", false); err != nil {
++		t.Errorf("TsigVerify of a correctly signed NOTAUTH response: %v", err)
++	}
++}
++
++// 19: CERT type 4 is IPKIX (RFC 4398 section 2.1).
++func TestHegelPinCERTTypeIPKIX(t *testing.T) {
++	if got := dns.CertTypeToString[4]; got != "IPKIX" {
++		t.Errorf("CertTypeToString[4] = %q, want IPKIX", got)
++	}
++	if _, err := dns.NewRR("a. 1 IN CERT IPKIX 1 8 ElQ="); err != nil {
++		t.Errorf("NewRR of a CERT IPKIX: %v", err)
++	}
++}
+diff --git a/hegel_records_test.go b/hegel_records_test.go
+new file mode 100644
+index 0000000..a8f1eea
+--- /dev/null
++++ b/hegel_records_test.go
+@@ -0,0 +1,185 @@
++package dns_test
++
++import (
++	"bytes"
++	"encoding/hex"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/miekg/dns"
++	"hegel.dev/go/hegel"
++)
++
++// packRR packs a record without compression and returns the whole wire form
++// and the rdata part.
++func packRR(rr dns.RR) (wire, rdata []byte, err error) {
++	buf := make([]byte, 65535)
++	off, err := dns.PackRR(rr, buf, 0, nil, false)
++	if err != nil {
++		return nil, nil, err
++	}
++	wire = buf[:off]
++	nameLen, err := dns.PackDomainName(rr.Header().Name, buf[off:], 0, nil, false)
++	if err != nil {
++		return nil, nil, err
++	}
++	return wire, wire[nameLen+10:], nil
++}
++
++// lenIsApproximate reports the shapes for which Len is known to overestimate:
++// escaped names and strings, base64 fields (their padding), empty type bitmaps.
++func lenIsApproximate(text, typ string) bool {
++	if strings.Contains(text, "\\") {
++		return true
++	}
++	switch typ {
++	case "CERT", "DNSKEY", "CDNSKEY", "RRSIG", "HIP", "IPSECKEY", "OPENPGPKEY", "DHCID", "AMTRELAY":
++		return true
++	case "NSEC", "NSEC3", "CSYNC", "APL":
++		return true
++	}
++	return false
++}
++
++// hasHexField reports the types with a hex string field, which the library
++// compares case-sensitively (unpacking gives lower case, String() upper case).
++func hasHexField(typ string) bool {
++	switch typ {
++	case "SSHFP", "NSEC3PARAM", "NSEC3", "DS", "CDS", "DLV", "TLSA", "SMIMEA", "HIP", "ZONEMD", "TYPE65280", "TYPE1234":
++		return true
++	}
++	return false
++}
++
++func isASCII(s string) bool {
++	for i := 0; i < len(s); i++ {
++		if s[i] >= 128 {
++			return false
++		}
++	}
++	return true
++}
++
++type pyRdata struct {
++	Wire   string `json:"wire"`
++	Text   string `json:"text"`
++	Rewire string `json:"rewire"`
++	Retext string `json:"retext"`
++}
++
++type pyRdataWire struct {
++	Text     string `json:"text"`
++	Rewire   string `json:"rewire"`
++	TextWire string `json:"textwire"`
++}
++
++// TestHegelRecordsAgreeWithDnspython: a record written in presentation form
++// packs to the same rdata in this library and in dnspython; the wire form
++// read back by either library prints and re-packs stably; Len matches the
++// packed size and the text round trip is exact.
++func TestHegelRecordsAgreeWithDnspython(t *testing.T) {
++	py := oracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		typ := pick(tc, rrTypes...)
++		rdata := genRdata(tc, typ)
++		owner := genName(tc)
++		ttlText, ttl := genTTL(tc)
++		class := pick(tc, "IN", "IN", "IN", "CH", "HS", "CLASS250")
++		text := fmt.Sprintf("%s %s %s %s %s", owner, ttlText, class, typ, rdata)
++		note(ht, "record %s", text)
++
++		rr, gerr := dns.NewRR(text)
++		var pr pyRdata
++		// dnspython's class-specific types live under IN only (CH A is Chaosnet's A); the
++		// library reads every class alike, so the oracle always parses in class IN
++		perr := py.call(t, map[string]any{"op": "rdata", "type": typ, "class": "IN", "text": rdata}, &pr)
++		if perr != nil && gerr != nil {
++			note(ht, "both reject: go %v; python %v", gerr, perr)
++			return
++		}
++		if gerr != nil {
++			fail(ht, "NewRR rejects text dnspython accepts (wire %s): %v\nrecord %s", pr.Wire, gerr, text)
++		}
++		if perr != nil {
++			fail(ht, "dnspython rejects text NewRR accepts (%s): %v\nrecord %s", rr.String(), perr, text)
++		}
++		wire, got, err := packRR(rr)
++		if err != nil {
++			fail(ht, "PackRR failed: %v\nrecord %s", err, text)
++		}
++		if hex.EncodeToString(got) != pr.Wire {
++			fail(ht, "rdata wire differs\n go     %s\n python %s\nrecord %s\ngo text %s\npython text %s", hex.EncodeToString(got), pr.Wire, text, rr.String(), pr.Text)
++		}
++		// header
++		h := rr.Header()
++		if h.Ttl != ttl {
++			fail(ht, "TTL %d parsed as %d\nrecord %s", ttl, h.Ttl, text)
++		}
++		if dns.Len(rr) < len(wire) {
++			fail(ht, "Len %d but PackRR wrote %d bytes\nrecord %s", dns.Len(rr), len(wire), text)
++		}
++		if dns.Len(rr) != len(wire) && !(Known.lenOverestimates && lenIsApproximate(text, typ)) {
++			fail(ht, "Len %d but PackRR wrote %d bytes\nrecord %s", dns.Len(rr), len(wire), text)
++		}
++		// the library reads its own wire form back to the same record
++		back, off, err := dns.UnpackRR(wire, 0)
++		if err != nil || off != len(wire) {
++			fail(ht, "UnpackRR of PackRR: %v (off %d of %d)\nrecord %s", err, off, len(wire), text)
++		}
++		// the unpacked record prints to text that reads back to the same wire form
++		reback, err := dns.NewRR(back.String())
++		if err != nil {
++			fail(ht, "NewRR rejects the String() of an unpacked record: %v\n%s\nrecord %s", err, back.String(), text)
++		}
++		octetBackslash := Known.octetPrintUnescaped && (typ == "CAA" || typ == "URI") && bytes.Contains(got, []byte{'\\'})
++		if w2, _, err := packRR(reback); (err != nil || !bytes.Equal(w2, wire)) && !octetBackslash {
++			fail(ht, "String() of an unpacked record reads back differently (%v)\n parsed   %s\n unpacked %s\nrecord %s", err, rr.String(), back.String(), text)
++		}
++		if !dns.IsDuplicate(rr, back) && !(Known.textualDuplicates && strings.Contains(text, "\\")) {
++			fail(ht, "IsDuplicate false for a record and its wire copy\nrecord %s", text)
++		}
++		octetField := typ == "CAA" || typ == "URI" // stored raw after unpacking, escaped after parsing
++		if !dns.IsDuplicate(back, reback) && !(Known.textualDuplicates && (hasHexField(typ) || octetField)) && !octetBackslash {
++			fail(ht, "IsDuplicate false for an unpacked record and its reparsed String()\nrecord %s", text)
++		}
++		// the library's text round trip
++		again, err := dns.NewRR(rr.String())
++		if err != nil {
++			fail(ht, "NewRR rejects the library's own String(): %v\n%s\nrecord %s", err, rr.String(), text)
++		}
++		wire2, got2, err := packRR(again)
++		if err != nil {
++			fail(ht, "PackRR of the reparsed record: %v\nrecord %s", err, text)
++		}
++		if !bytes.Equal(got, got2) {
++			fail(ht, "text round trip changes the rdata\n first  %s\n second %s\nString() %s\nrecord %s", hex.EncodeToString(got), hex.EncodeToString(got2), rr.String(), text)
++		}
++		if !bytes.Equal(wire, wire2) {
++			fail(ht, "text round trip changes the header: %s -> %s\nrecord %s", h.String(), again.Header().String(), text)
++		}
++		// dnspython reads the library's wire form to its own text
++		var pw pyRdataWire
++		if err := py.call(t, map[string]any{"op": "rdata_wire", "type": typ, "class": "IN", "wire": hex.EncodeToString(got)}, &pw); err != nil {
++			fail(ht, "dnspython cannot read the rdata wire %s: %v\nrecord %s", hex.EncodeToString(got), err, text)
++		}
++		if pw.Text != pr.Text {
++			fail(ht, "dnspython prints the wire form differently from its own parse\n from text %s\n from wire %s\nrecord %s", pr.Text, pw.Text, text)
++		}
++		// and the library reads dnspython's re-serialised text, when it parses at all
++		// (dnspython does not escape backslashes in URI targets: not judged)
++		if typ == "URI" || !isASCII(pr.Text) {
++			return
++		}
++		back2, err := dns.NewRR(fmt.Sprintf("%s %d %s %s %s", owner, ttl, class, typ, pr.Text))
++		if err != nil {
++			note(ht, "NewRR rejects dnspython's text %q: %v", pr.Text, err)
++		} else {
++			_, got3, err := packRR(back2)
++			if err == nil && !bytes.Equal(got, got3) {
++				fail(ht, "dnspython's text %q parses to different rdata\n go from it %s\n go from original %s\nrecord %s", pr.Text, hex.EncodeToString(got3), hex.EncodeToString(got), text)
++			}
++		}
++	})
++}
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..0976eee
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,150 @@
++package dns_test
++
++// Hegel properties for github.com/miekg/dns: records, names, messages,
++// zone files and DNSSEC/TSIG primitives against dnspython (the other
++// complete DNS library, as a child process), plus library-internal
++// identities (text and wire round trips, lengths, compression, truncation,
++// duplicates).
++//
++// Needs python3 with the `dnspython` package (2.x) on PATH.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Plumbing.
++
++var (
++	collecting    = os.Getenv("HEGEL_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++)
++
++type collected struct{}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++		defer func() {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 400 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}()
++	}
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if err, ok := r.(error); ok && strings.Contains(err.Error(), "hegel_") {
++				panic(r) // libhegel control flow
++			}
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			fail(ht, "panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func hegelOpts() []hegel.Option {
++	var opts []hegel.Option
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			opts = append(opts, hegel.WithTestCases(n))
++		}
++	}
++	if os.Getenv("HEGEL_VERBOSE") != "" {
++		opts = append(opts, hegel.WithVerbosity(hegel.VerbosityVerbose))
++	}
++	return opts
++}
++
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf(format, args...)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// Known gates the input shapes of recorded bugs (see bugs.toml); every switch
++// is on while the bug is open so the properties run clean, and the pin tests
++// in hegel_pins_test.go assert the correct behaviour and fail meanwhile.
++var Known = struct {
++	lenOverestimates          bool // 1: Len counts escapes, base64 padding, empty bitmaps
++	unsortedTypeBitmap        bool // 2: NSEC/NSEC3/CSYNC text with unsorted types cannot be packed
++	textualDuplicates         bool // 3: IsDuplicate, CompareDomainName compare the presentation text
++	locMinutesNeedSeconds     bool // 4: LOC text with minutes but no seconds is rejected
++	x25TakesOneToken          bool // 5: X25 rejects a quoted character-string
++	octetPrintUnescaped       bool // 6: unpacked CAA/URI values print backslashes as escapes
++	mappedGatewayRejected     bool // 7: IPSECKEY/AMTRELAY/SVCB reject an IPv4-mapped IPv6 address
++	canonicalKeepsEscapedCase bool // 8: CanonicalName leaves an escaped upper-case letter
++	locFloatTruncation        bool // 9: LOC seconds lose a millisecond to float truncation
++	locAltitudeWraps          bool // 10: LOC altitude outside the range wraps around
++	nsec3HashLengthFixed      bool // 11: NSEC3 packs a hash length of 20 whatever the hash
++	amtrelayDBitDropsGateway  bool // 12: AMTRELAY with the D bit set packs without its gateway
++	parenCommentBreaksBitmap  bool // 13: a comment inside parentheses breaks NSEC/NSEC3/CSYNC/RRSIG parsing
++	blankFirstOwnerEmpty      bool // 14: a blank owner before any record gives an empty owner name
++	tsigVerifyMutates         bool // 15: TsigVerify decrements the ARCOUNT in the caller's buffer
++	keyTagRSAMD5              bool // 16: KeyTag ignores the RSAMD5 rule of RFC 4034 appendix B.1
++	ipseckeyEatsNewline       bool // 17: an IPSECKEY record cannot be followed by another record
++	tsigVerifyRefusesNotAuth  bool // 18: TsigVerify rejects every NOTAUTH message unverified
++	certIPKIXMisspelt         bool // 19: CERT type 4 is spelt IPIX instead of IPKIX
++}{
++	lenOverestimates:          true,
++	unsortedTypeBitmap:        true,
++	textualDuplicates:         true,
++	locMinutesNeedSeconds:     true,
++	x25TakesOneToken:          true,
++	octetPrintUnescaped:       true,
++	mappedGatewayRejected:     true,
++	canonicalKeepsEscapedCase: true,
++	locFloatTruncation:        true,
++	locAltitudeWraps:          true,
++	nsec3HashLengthFixed:      true,
++	amtrelayDBitDropsGateway:  true,
++	parenCommentBreaksBitmap:  true,
++	blankFirstOwnerEmpty:      true,
++	tsigVerifyMutates:         true,
++	keyTagRSAMD5:              true,
++	ipseckeyEatsNewline:       true,
++	tsigVerifyRefusesNotAuth:  true,
++	certIPKIXMisspelt:         true,
++}
