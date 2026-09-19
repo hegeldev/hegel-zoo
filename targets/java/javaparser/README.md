@@ -27,7 +27,9 @@ operators — `"a" + "b" <= x` keeps both, `x + "a" + "b"` becomes `x + "ab"`; `
 `this(…)`/`super(…)` invocations become constructor calls, `new int[] {…}` ranks are reconciled,
 enum constants and record components are recognised by javac's flags, and empty enum constant bodies are
 ignored on javac's side (bug 18). Literal values are compared as values (`asInt`/`asDouble`/`asString`…
-against javac's constants), which is how the escape and text-block bugs surfaced.
+against javac's constants), which is how the escape and text-block bugs surfaced. Two javac leniencies are
+excluded from the acceptance check: its parser accepts any expression as an assignment target (`a == b = c;`,
+rejected only in attribution; JavaParser follows the JLS grammar), and it accepts `(int[]) -x`.
 
 **The library against itself**: pretty print → parse (shape, `equals`, `hashCode`), the
 `LexicalPreservingPrinter` (identity on the text), the fragment parsers against the compilation-unit parse,
@@ -88,18 +90,17 @@ reference-type cast, and JavaParser rightly rejects it).
 
 ## Bugs found
 
-19, in bugs.toml: JavaParser rejects valid programs (a cast lambda as an operand, `var` lambda parameters in
+21, in bugs.toml: JavaParser rejects valid programs (a cast lambda as an operand, `var` lambda parameters in
 initializers, local enums, `'\''`, and — grammatical but never well-typed — a method reference as an
 operand), gives wrong literal values (`\s`, Unicode-escaped backslashes, text blocks with white space after the
 opening delimiter or containing a form feed), prints wrongly (`- -x` as `--x`, `int m()[]` as `int ()[]m`, the
 form feed as a line break, `A { }` as `A`), has five range bugs (type parameters' annotations, patterns'
 modifiers, `int x[]` names, catch parameters with qualified types, type annotations), does not make a
-pattern's type its child in `instanceof`, and accepts `import static x;` and `permits Foo<T>`.
+pattern's type its child in `instanceof`, accepts `import static x;` and `permits Foo<T>`, and keeps Unicode
+escapes in identifiers (`\u0041b` is not `Ab`, bug 20), and crashes on a qualified type starting with `var` (bug 21).
 
 Observed, not recorded: JavaParser accepts `import y;` (a single identifier), which the JLS grammar allows and
-javac rejects; the generator's programs occasionally made JavaParser report a `ClassCastException`
-(`VarType cannot be cast to ClassOrInterfaceType`) as a problem on a valid program with a variable named
-`var` — not reduced to a small case yet; javac's parser refuses lambdas inside `case … when` guards and
+javac rejects; javac's parser refuses lambdas inside `case … when` guards and
 `;` right after the imports, both of which JavaParser accepts and the JLS allows, so the generator does
 not produce them.
 
@@ -107,3 +108,5 @@ not produce them.
 
 - 2026-09-16: created (turn 174); 19 bugs.
 - 2026-09-18: base bumped a99f4dc25b72 → 554c6f70674f (2026-09-18, "fix: resolve qualified nested types against members only (fixes #5140)"; 3.29.0-SNAPSHOT); 19 bug(s) still reproduce. 7 tests pass.
+- 2026-09-19: base bumped 554c6f70674f -> 98c8b8c43e7a (2026-09-18, "refactor: look up values among members, and drop the thread-local guard"); bug 20 (Unicode escapes in identifiers) found by `mutationsNeverCrash` during the bump, bug 21 (`var.X`) by `agreesWithJavac`, and the javac assignment-target leniency gated. 21 bugs.
+- 2026-09-19: base bumped 554c6f70674f → 98c8b8c43e7a (2026-09-19, "refactor: look up values among members, and drop the thread-local guard"; 3.29.0-SNAPSHOT); 21 bug(s) still reproduce. 7 tests pass.
