@@ -48,18 +48,18 @@ counter), block scalar tokens at indent 0, `fill()` over more than one slot, str
 whitespace-only line, a null value in a flow mapping under the JSON schema, a tagged scalar
 overwritten by `set()`, block scalar tokens for values with leading spaces, `-0.0e+0` in the writer's
 documents, `toJS()` of an erroneous document, aliases to undefined anchors, root strings starting with
-whitespace, leading-space lines under an `indent` other than 2, timestamps before the year 100, output
+whitespace, strings starting with U+FEFF as values or keys, leading-space lines under an `indent` other than 2, timestamps before the year 100, output
 containing the word undefined, empty `!!binary` at unlimited width, `---`/`...` scalars on the marker line, empty sequence values under
 `collectionStyle: block` with `indentSeq: false`. Not judged: NUL characters (v3 rejects them
 in comments where yaml@2 read on; YAML forbids them anywhere), `nullStr: ""` in flow collections (it cannot be represented
-there), the JSON schema writing non-finite numbers as `null` (as `JSON.stringify` does), and
-yaml@2's own output when v3 rightly rejects it (`!!set` with `simpleKeys`). Pins (`TestHegelPin*`)
+there), the JSON schema writing non-finite numbers as `null` and `-0` as `0` (as `JSON.stringify` does), and
+yaml@2's own output when v3 rightly rejects it (`!!set` with `simpleKeys`) or when yaml@2 itself does not read it back (a plain `<<` key under yaml-1.1, which v3 quotes). Pins (`TestHegelPin*`)
 reproduce the bugs in `bugs.toml` and are listed as expected failures; the hang pin runs the lexer
 in a worker with a five-second limit.
 
 Two source reviews (parser/composer; nodes/stringify/schemas) named yaml/1-8, 10-19 and 21 before or
 alongside the properties; every claim was confirmed with a pin, and the properties found yaml/1
-(as a hang), 4, 5, 6, 7, 8, 9, 15, 20, 22, 23, 24, 25, 26, 27, 28, 29 and 30 on their own (the writer's mutated documents
+(as a hang), 4, 5, 6, 7, 8, 9, 15, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30 and 31 on their own (the writer's mutated documents
 hit the CST shapes).
 
 ## Not tested
@@ -73,3 +73,4 @@ hit the CST shapes).
 ## History
 
 - 2026-09-20: created (turn 323); 30 bugs recorded.
+- 2026-09-20 (turn 324): `-0` under the JSON schema is not judged either (first CI run failed on it); yaml/31 (a leading U+FEFF lost at the stream start) recorded; 31 bugs.
