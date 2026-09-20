@@ -2,14 +2,14 @@
 
 [nyaruka/phonenumbers](https://github.com/nyaruka/phonenumbers) v2 (MIT), pinned at `0a7e43b1`
 (v2.0.9, 2026-08-31): the Go port of Google's libphonenumber (tracking the Java reference), with
-the metadata of libphonenumber 9.0.38 - parsing, validation, formatting, number types, short
+the metadata of libphonenumber 9.0.39 - parsing, validation, formatting, number types, short
 numbers, the as-you-type formatter, the text matcher, geocoding, carrier and time-zone lookups.
 
 The patch adds `hegel_test.go` and `hegel_oracle_test.go` (package `phonenumbers_test`) and the
 `hegel.dev/go/hegel` requirement to `go.mod`. The oracle is Python's `phonenumbers` package at
-the same metadata version (9.0.38), driven as a child process speaking one JSON request per line;
+the same metadata version (9.0.39), driven as a child process speaking one JSON request per line;
 enumerations travel by their libphonenumber names. The tests need `python3` with that package on
-PATH (CI installs `phonenumbers==9.0.38` into the Go job's venv). Where the two ports disagreed,
+PATH (CI installs `phonenumbers==9.0.39` into the Go job's venv). Where the two ports disagreed,
 the Java reference (libphonenumber 9.0.38 with geocoder 3.39 and carrier 2.39 from Maven Central)
 decided.
 
@@ -56,3 +56,4 @@ returning the country name or nothing where libphonenumber returns "New Jersey" 
   South Korea in other languages, carrier names under 549), gated by calling code.
 - Carrier and area comparisons are made in English only because of bug 1; the pin covers the
   fallback with German, empty and unknown language codes.
+- 2026-09-20: base bumped 0a7e43b1fc85 → 7e3ecf02576b (2026-09-14, "Updated metadata to v9.0.39"; v2.0.12+); 2 bug(s) still reproduce. 262 tests pass.
