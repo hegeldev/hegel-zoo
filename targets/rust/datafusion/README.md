@@ -93,3 +93,4 @@
 - 2026-09-18: base bumped 3b16a3d0eef7 → 6e4d9bae3c63 (2026-09-18, "fix: Spark `map_from_arrays`, `map_from_entries` for sliced lists (#25431)"; 55.1.0); 1 bug(s) still reproduce. 627 tests pass.
 - 2026-09-20: base bumped 6e4d9bae3c63 → a9579bdfd544 (2026-09-20, "fix: duplicate ordering state field names in partial aggregates (#25196)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.
 - 2026-09-20: base bumped a9579bdfd544 → 9bffbea2a4cc (2026-09-20, "minor: move `create_group_accumulator` out of the legacy aggregate stream (#25539)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.
+- 2026-09-20: base bumped 9bffbea2a4cc → 6700d02160b1 (2026-09-20, "test: bound merge fan-in in the final hash aggregate spill test (#25424)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.

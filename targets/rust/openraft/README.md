@@ -56,3 +56,4 @@
 - 2026-09-18: base bumped c717fe98a286 → f1a2ec636416 (2026-09-18, "docs: openraft: document v0.10 feature flag migration"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 615 tests pass.
 - 2026-09-18: base bumped f1a2ec636416 → 542b9046ee92 (2026-09-18, "change: openraft: gate heartbeats after quorum loss"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 618 tests pass.
 - 2026-09-20: base bumped 542b9046ee92 → d356e98d3256 (2026-09-20, "test: jepsen: use alternate Maven Central endpoint"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 625 tests pass.
+- 2026-09-20: base bumped d356e98d3256 → a80b7f1cabfc (2026-09-20, "test: jepsen: add partial-network liveness test"; 0.10.0-alpha.34); 0 bug(s) still reproduce. 625 tests pass.

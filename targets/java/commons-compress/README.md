@@ -46,3 +46,4 @@ NTFS extra inventing 1601-01-01 access times, 7z directory flags); `finish()`/`c
 member, xz throws, zstd writes nothing, an empty LZ4 block throws); and small input-validation gaps in the compressors
 and utilities.
 - 2026-09-20: base bumped 62f794ce81f8 → 0fd3df607265 (2026-09-19, "Bump com.github.luben:zstd-jni from 1.5.7-16 to 1.5.7-17"; 1.29.0-SNAPSHOT); 38 bug(s) still reproduce. 16 tests pass.
+- 2026-09-20: base bumped 0fd3df607265 → c15e1edf95b8 (2026-09-20, "Bump org.slf4j:slf4j-* from 2.0.16 to 2.0.19, use the BOM POM org.slf4j:slf4j-bom"; 1.29.0-SNAPSHOT); 38 bug(s) still reproduce. 16 tests pass.
