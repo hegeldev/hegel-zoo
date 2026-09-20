@@ -41,3 +41,4 @@
 - 2026-09-17: base bumped 8abd89514424 → 09c030eab56e (2026-09-17, "Merge commit from fork"; 9.0.0-pre3); 0 bug(s) still reproduce. 291 tests pass.
 - 2026-09-17: base bumped 09c030eab56e → 57fad8231ed4 (2026-09-17, "Fix: some permissions tests can only run on Unix (#1000)"; 9.0.0-pre3); 0 bug(s) still reproduce. 291 tests pass.
 - 2026-09-18: base bumped 57fad8231ed4 → b56344970080 (2026-09-18, "fix: parse the central header of the extended timestamp (#1002)"; 9.0.0-pre3); 0 bug(s) still reproduce. 297 tests pass.
+- 2026-09-20: base bumped b56344970080 → 0e0e74b5c8e0 (2026-09-19, "ci(deps): bump the codeql group with 2 updates (#1005)"; 9.0.0-pre3); 0 bug(s) still reproduce. 297 tests pass.

@@ -141,3 +141,4 @@ for negative bounds (/6). All still reproduce.
 ## History
 
 - 2026-09-16: created at 92f407eb (2.0.0-SNAPSHOT); bugs /1–/6.
+- 2026-09-20: base bumped 92f407eb8a91 → d8c77137bf2a (2026-09-19, "Fix sequence rotations by Integer.MIN_VALUE (#3352)"; 2.0.0-SNAPSHOT); 6 bug(s) still reproduce. 5 tests pass.
