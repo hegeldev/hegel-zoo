@@ -116,3 +116,4 @@ does for pip.
 - 2026-09-20: base bumped b28593f9a5c6 → 7b090fba99bc (2026-09-19, "Honor dependency metadata when checking installed requirements (#21843)"; 0.0.84); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-20: base bumped 7b090fba99bc → 7f9bce21fbcb (2026-09-20, "Fix BSD and Haiku platform tag casing (#21853)"; 0.0.84); 2 bug(s) still reproduce. 12 tests pass.
 - 2026-09-20: base bumped 7f9bce21fbcb → 25ea3bcfbe6e (2026-09-20, "Materialize fake-uv without checkout symlinks (#21855)"; 0.0.84); 2 bug(s) still reproduce. 12 tests pass.
+- 2026-09-20: base bumped 25ea3bcfbe6e → 09f725dfd2d7 (2026-09-20, "Restore project files when remove and version fail (#21856)"; 0.0.84); 2 bug(s) still reproduce. 12 tests pass.

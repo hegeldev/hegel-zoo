@@ -55,3 +55,4 @@ x (18); `x[2.5]` is `x[2]` (19); `last()` in a second predicate is empty and non
 miscount their second predicate (20); `substring()` rounds halves away from zero (21); a filter
 over a reverse axis keeps nearest-first order, so `(ancestor::*)[1]` is the nearest ancestor (22);
 `position()` and `last()` after a path in the same predicate lose their context (23).
+- 2026-09-20: base bumped 551dd37711fe → 487996fbb427 (2026-09-21, "Merge PR #140: Skip Filter flag for non-positional predicates"; v1.3.8+); 23 bug(s) still reproduce. 89 tests pass.
