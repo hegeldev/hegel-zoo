@@ -32,7 +32,7 @@ the case count):
 - `TestHegelDamagedFilesNeverPanic`: a file with flipped, deleted, inserted or truncated bytes
   never makes `OpenFile` or reading its rows panic (`HEGEL_DUMP=dir` keeps the files that do).
 
-Seven bugs, found 2026-09-20 at v0.32.0+: `Schema.Deconstruct` (and so the deprecated `Writer`)
+Eight bugs, found 2026-09-20 at v0.32.0+: `Schema.Deconstruct` (and so the deprecated `Writer`)
 panics on `[]*T` list elements and writes `[]string` elements tagged optional as nulls (1,
 medium); a `[N]byte` decimal whose precision needs more than N bytes passes `SchemaOf` and
 panics on write (2, low); a decimal tag on `[]int32` yields a bogus fixed-length column whose
@@ -41,13 +41,15 @@ the min and +0.0 for the max, and write NaN bounds for all-NaN columns, against 
 (4, low); reading into a struct with a `[N]byte` column the file lacks panics where other
 missing columns read as zero (5, medium); a damaged v2 data page makes `ReadRows` panic in
 `decodeLevelsV2` (6, medium); the statistics of a dictionary-encoded float column holding a NaN
-skip values and write NaN bounds ({-1, NaN, 1}: min 1) (7, medium). Everything else pyarrow read
-to the bit: values of every type and nesting, null counts, minima and maxima, compression and
-encodings.
+skip values and write NaN bounds ({-1, NaN, 1}: min 1) (7, medium); negative column or offset
+index lengths in the footer make `OpenFile` panic in `ReadPageIndex` (8, medium). Everything else
+pyarrow read to the bit: values of every type and nesting, null counts, minima and maxima,
+compression and encodings.
 
-Gates (`hegel/known.go` and the statistics check) cover the shapes of bugs 1, 4, 5, 6 and 7;
+Gates (`hegel/known.go` and the statistics check) cover the shapes of bugs 1, 4, 5, 6, 7 and 8;
 dictionary-encoded booleans, which the format allows for every physical type but parquet-cpp
 refuses to read ("Dictionary encoding not implemented for boolean type"), are counted, not
 compared. The generator keeps to the tag placements parquet-go accepts (logical types on LIST
 elements go in `parquet-element`, bare slices take no logical type, pointers take no enum,
-time, uuid, json or delta).
+time, uuid, json or delta). The patch also un-ignores `hegel/oracle.py` (upstream's
+`.gitignore` has `*.py`).
