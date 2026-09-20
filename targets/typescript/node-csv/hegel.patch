@@ -1,0 +1,1187 @@
+diff --git a/hegel/csv.mjs b/hegel/csv.mjs
+new file mode 100644
+index 00000000..7104ee96
+--- /dev/null
++++ b/hegel/csv.mjs
+@@ -0,0 +1,375 @@
++// Hegel zoo: the Python `csv` oracle bridge, the library under test, and the generators used by
++// the properties (records and option sets for the round trips, raw CSV documents with their
++// expected model for the parser, mutations for the hostile-input checks).
++
++import { execFileSync, spawn } from "node:child_process";
++import { mkdtempSync, openSync, readSync, rmSync, writeSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { chance, count, n, pick, word } from "./hegel-zoo.mjs";
++
++const here = dirname(fileURLToPath(import.meta.url));
++
++// The libraries under test: the ESM sources of the two packages.
++export const { parse, CsvError } = await import("../packages/csv-parse/lib/sync.js");
++export const { Parser } = await import("../packages/csv-parse/lib/index.js");
++export const { delimiter_discover } = await import("../packages/csv-parse/lib/utils/delimiter_discover.js");
++export const { stringify } = await import("../packages/csv-stringify/lib/sync.js");
++
++// ---------------------------------------------------------------- the oracle, held open
++
++let oracle = null;
++
++function startOracle() {
++  execFileSync("python3", ["-c", "import csv"], { stdio: "ignore" });
++  const dir = mkdtempSync(join(tmpdir(), "hegel-csv-"));
++  const req = join(dir, "req");
++  const resp = join(dir, "resp");
++  execFileSync("mkfifo", [req, resp]);
++  const child = spawn("python3", ["-u", join(here, "oracle.py"), req, resp], {
++    stdio: ["ignore", "inherit", "inherit"],
++  });
++  child.unref();
++  const wfd = openSync(req, "w");
++  const rfd = openSync(resp, "r");
++  process.on("exit", () => {
++    try { child.kill(); } catch {}
++    try { rmSync(dir, { recursive: true, force: true }); } catch {}
++  });
++  const buf = Buffer.alloc(1 << 16);
++  let pending = "";
++  return {
++    call(obj) {
++      // Lone surrogates cannot cross as UTF-8; escape every surrogate code unit.
++      const line = JSON.stringify(obj).replace(/[\ud800-\udfff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
++      writeSync(wfd, line + "\n");
++      for (;;) {
++        const nl = pending.indexOf("\n");
++        if (nl !== -1) {
++          const answer = pending.slice(0, nl);
++          pending = pending.slice(nl + 1);
++          return JSON.parse(answer);
++        }
++        const got = readSync(rfd, buf, 0, buf.length, null);
++        if (got === 0) throw new Error("the csv oracle went away");
++        pending += buf.toString("utf8", 0, got);
++      }
++    },
++  };
++}
++
++/** Python's csv.reader on `text` with `dialect` (see oracle.py): {ok, records} or {ok: false, error}. */
++export function pyRead(text, dialect) {
++  oracle ??= startOracle();
++  return oracle.call({ op: "read", text, dialect });
++}
++
++/** Python's csv.writer on `records` with `dialect`: {ok, text} or {ok: false, error}. */
++export function pyWrite(records, dialect) {
++  oracle ??= startOracle();
++  return oracle.call({ op: "write", records, dialect });
++}
++
++// ---------------------------------------------------------------- fields and records
++
++const WORDS = ["a", "b", "x", "abc", "hello", "world", "42", "-1", "3.5", "1e3", "0x10", "true", "null", "NaN", "e", "ee", "Z"];
++const ODD = ["\u00e9", "\u65e5\u672c", "\ud83d\ude00", "\u00ff", "\u0100", "\u00a0", "\u2028", "\u2029", "\u3000", "\u001e", "\u0000", "\u0085", "\ufeff", "\u007f", "\u200b"];
++const PUNCT = [",", ";", "\t", "|", ":", " ", "  ", ".", "/", "#", "=", "+", "-", "@", "'", "\"", "\\", "^", "~", "«", "＝", "＋"];
++const BREAKS = ["\n", "\r", "\r\n", "\n\r", "\n\n"];
++
++/** A field: a short concatenation of words, punctuation (delimiters, quotes, escapes, comment
++ *  and formula characters), line breaks and odd characters, often empty; `avoid` is a set of
++ *  strings none of which may appear as a substring, `newlines` allows line breaks. */
++export function genField(tc, { avoid = [], newlines = true } = {}) {
++  for (let attempt = 0; attempt < 20; attempt++) {
++    let s = "";
++    const parts = chance(tc, 15) ? 0 : n(tc, 1, 4);
++    for (let i = 0; i < parts; i++) {
++      const r = n(tc, 0, 99);
++      if (r < 45) s += pick(tc, WORDS);
++      else if (r < 75) s += pick(tc, PUNCT);
++      else if (r < 85) s += pick(tc, ODD);
++      else if (r < 95 && newlines) s += pick(tc, BREAKS);
++      else s += word(tc, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 1, 6);
++    }
++    if (avoid.every((a) => a === "" || !s.includes(a))) return s;
++  }
++  return "";
++}
++
++/** Rectangular records: `rows` x `width` fields. */
++export function genRecords(tc, { rows = n(tc, 0, 6), width = n(tc, 1, 5), field = (tc) => genField(tc) } = {}) {
++  const out = [];
++  for (let r = 0; r < rows; r++) {
++    const rec = [];
++    for (let c = 0; c < width; c++) rec.push(field(tc));
++    out.push(rec);
++  }
++  return out;
++}
++
++const DELIMITERS = [",", ",", ",", ";", "\t", "|", ":", " ", "::", ", ", "é", "│"];
++const QUOTES = ["\"", "\"", "\"", "'", "|", "«", "~"];
++const RECORD_DELIMITERS = ["\n", "\n", "\r\n", "\r", "unix", "windows", "mac", "ascii", "unicode", "\u001e", "\u2028", "||", ";\n", "\n\n"];
++
++function resolveRd(rd) {
++  return { unix: "\n", windows: "\r\n", mac: "\r", ascii: "\u001e", unicode: "\u2028" }[rd] ?? rd;
++}
++
++/** Distinct separator characters for a document: delimiter, quote, escape and record delimiter
++ *  that do not contain one another (the escape may equal the quote: RFC 4180 doubling). */
++export function genSeparators(tc, { python = false } = {}) {
++  for (;;) {
++    const delimiter = python ? pick(tc, DELIMITERS.filter((d) => d.length === 1 && d.charCodeAt(0) < 128)) : pick(tc, DELIMITERS);
++    const quote = pick(tc, python ? QUOTES.filter((q) => q.charCodeAt(0) < 128) : QUOTES);
++    const escape = chance(tc, 60) ? quote : pick(tc, ["\\", "^", "\\", "§"].filter((e) => !python || e.charCodeAt(0) < 128));
++    const rdName = python ? pick(tc, ["\n", "\n", "\r\n", "\r"]) : pick(tc, RECORD_DELIMITERS);
++    const rd = resolveRd(rdName);
++    const chars = new Set([...delimiter, ...quote, ...escape, ...rd]);
++    if (chars.size !== delimiter.length + quote.length + (escape === quote ? 0 : escape.length) + rd.length) continue;
++    if (/[\r\n]/.test(delimiter) || /[\r\n]/.test(quote) || /[\r\n]/.test(escape)) continue;
++    // a record delimiter that shares characters with the delimiter would fuse at boundaries
++    if ([...rd].some((c) => delimiter.includes(c)) || [...delimiter].some((c) => rd.includes(c))) continue;
++    return { delimiter, quote, escape, rdName, rd };
++  }
++}
++
++// ---------------------------------------------------------------- raw documents with a model
++
++const TRIM_WS = [" ", "\t", " \t", "  "];
++// csv-parse's trimable characters (init_state.js): the JS whitespace set, line breaks included
++const TRIM_CLASS = "[ \\t\\n\\r\\f\\v\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]";
++const TRIM_START = new RegExp("^" + TRIM_CLASS + "+");
++const TRIM_END = new RegExp(TRIM_CLASS + "+$");
++const TRIM_ALL = new RegExp("^" + TRIM_CLASS + "+$");
++
++/** A raw CSV document written in the RFC 4180 style with the given separators and a model of
++ *  how csv-parse (and Python's strict reader, on the plain subset) should read it. Lines:
++ *  {kind: "record", fields, quoted}, {kind: "empty"}, {kind: "comment"}; each record line's
++ *  `span` is the number of physical lines it covers (quoted fields may hold line breaks). The
++ *  option set decides what the generator may write: comment lines only with `comment`,
++ *  whitespace around fields only with ltrim/rtrim, empty lines only when they parse. */
++export function genDocument(tc, opts = {}) {
++  const sep = opts.sep ?? genSeparators(tc);
++  const { delimiter, quote, escape, rd } = sep;
++  const comment = opts.comment ?? (chance(tc, 25) ? pick(tc, ["#", "//", "%", "--"]) : null);
++  const ltrim = opts.ltrim ?? chance(tc, 25);
++  const rtrim = opts.rtrim ?? chance(tc, 25);
++  const width = opts.width ?? n(tc, 1, 5);
++  const ragged = opts.ragged ?? chance(tc, 15);
++  const emptyLines = opts.emptyLines ?? chance(tc, 30);
++  const trailing = chance(tc, 70);
++  const bom = opts.bom ?? chance(tc, 10);
++  const nlines = n(tc, 0, 7);
++  const bareAvoid = [delimiter, quote, "\r", "\n", rd, ...(escape === quote ? [] : [escape]), ...(comment ? [comment] : [])];
++  // padding whitespace must not be the delimiter (a space or tab delimiter is a delimiter first)
++  const padding = TRIM_WS.filter((ws) => ![...ws].some((c) => delimiter.includes(c) || rd.includes(c)));
++  const quotedAvoid = [rd.length > 1 && !/^[\r\n]+$/.test(rd) ? rd : ""];
++  const lines = [];
++  let text = bom ? "\ufeff" : "";
++  let physical = 1;
++  for (let i = 0; i < nlines; i++) {
++    const r = n(tc, 0, 99);
++    let raw;
++    let line;
++    if (comment && r < 15) {
++      raw = comment + genField(tc, { avoid: ["\r", "\n", rd] });
++      line = { kind: "comment", raw, start: physical, span: 1 };
++    } else if (emptyLines && r < 30) {
++      raw = "";
++      line = { kind: "empty", raw, start: physical, span: 1 };
++    } else {
++      const w = ragged && chance(tc, 30) ? n(tc, 1, width + 2) : width;
++      const fields = [];
++      const rawFields = [];
++      let span = 1;
++      for (let c = 0; c < w; c++) {
++        const quoted = chance(tc, 45);
++        let value;
++        let rawField;
++        if (quoted) {
++          value = genField(tc, { avoid: quotedAvoid });
++          let inner = "";
++          for (const ch of value) {
++            if (ch === quote || ch === escape) inner += escape + ch;
++            else inner += ch;
++          }
++          rawField = quote + inner + quote;
++          span += (value.match(/\r\n|\r|\n/g) || []).length;
++        } else {
++          value = genField(tc, { avoid: bareAvoid, newlines: false });
++          rawField = value;
++        }
++        // whitespace around the field, allowed only when it is trimmed away
++        if (ltrim && chance(tc, 40)) {
++          const ws = pick(tc, padding);
++          rawField = ws + rawField;
++        }
++        if (rtrim && chance(tc, 40)) rawField = rawField + pick(tc, padding);
++        if (!quoted) {
++          if (ltrim) value = value.replace(TRIM_START, "");
++          if (rtrim) value = value.replace(TRIM_END, "");
++        }
++        fields.push(value);
++        rawFields.push(rawField);
++      }
++      raw = rawFields.join(delimiter);
++      line = { kind: "record", fields, raw, start: physical, span };
++    }
++    lines.push(line);
++    text += raw;
++    if (i < nlines - 1 || trailing) text += rd;
++    // a record delimiter counts as one line break when it starts with a CR or LF (csv-parse counts
++    // lines by the CR/LF bytes it meets, and skips the rest of a matched delimiter); with any other
++    // record delimiter the line count never advances
++    physical += line.span - 1 + (/^[\r\n]/.test(rd) ? 1 : 0);
++  }
++  // a last line that reads as empty with no record delimiter after it is nothing at all
++  if (!trailing && lines.length && emptyish(lines[lines.length - 1], ltrim)) lines.pop();
++  return { text, lines, sep, comment, ltrim, rtrim, width, bom, trailing, rdKind: rd };
++}
++
++/** A line csv-parse reads as empty: an empty line, a record line that is one bare empty field,
++ *  or, with ltrim, one of whitespace only. */
++function emptyish(line, ltrim) {
++  return line.kind === "empty" || line.raw === "" || (ltrim && TRIM_ALL.test(line.raw));
++}
++
++/** The records csv-parse should produce for a generated document under `options` (a subset of
++ *  its options: from, to, from_line, to_line, skip_empty_lines, relax_column_count[_less|_more],
++ *  columns), as {records, error} where `error` is the CsvError code expected instead. */
++export function model(doc, options = {}) {
++  const from = options.from ?? 1;
++  const to = options.to ?? -1;
++  const fromLine = options.from_line ?? 1;
++  const toLine = options.to_line ?? -1;
++  const skipEmpty = !!options.skip_empty_lines;
++  const relax = !!options.relax_column_count;
++  const relaxLess = !!options.relax_column_count_less;
++  const relaxMore = !!options.relax_column_count_more;
++  const columns = options.columns === true;
++  const recs = [];
++  let header = null;
++  let expected = null;
++  let records = 0;
++  let commentLines = 0;
++  let emptyLines = 0;
++  for (const line of doc.lines) {
++    const last = line.start + line.span - 1;
++    if (toLine !== -1 && last > toLine) break;
++    if (line.kind === "comment") {
++      commentLines++;
++      continue;
++    }
++    if (line.start < fromLine) continue;
++    let fields = line.fields;
++    if (emptyish(line, doc.ltrim) && skipEmpty) {
++      emptyLines++;
++      continue;
++    }
++    if (line.kind === "empty") fields = [""];
++    if (columns && header === null) {
++      header = fields;
++      expected = fields.length;
++      continue;
++    }
++    if (expected === null) expected = fields.length;
++    if (fields.length !== expected) {
++      const ok = relax || (relaxLess && fields.length < expected) || (relaxMore && fields.length > expected);
++      if (!ok) return { records: recs, header, error: columns ? "CSV_RECORD_INCONSISTENT_COLUMNS" : "CSV_RECORD_INCONSISTENT_FIELDS_LENGTH" };
++    }
++    records++;
++    if (records < from) {
++      // `to` counts the records handled, the skipped ones included
++      if (to !== -1 && records >= to) break;
++      continue;
++    }
++    let rec = fields;
++    if (columns) {
++      rec = {};
++      for (let i = 0; i < Math.min(header.length, fields.length); i++) rec[header[i]] = fields[i];
++    }
++    recs.push({ record: rec, info: { lines: last, records, comment_lines: commentLines, empty_lines: emptyLines } });
++    if (to !== -1 && records >= to) break;
++  }
++  return { records: recs, header, error: null };
++}
++
++/** The csv-parse options for a generated document (separators and the trim/comment choices). */
++export function parseOptions(doc, extra = {}) {
++  const { delimiter, quote, escape, rd } = doc.sep;
++  const o = { delimiter, quote, escape, ...extra };
++  if (doc.comment) o.comment = doc.comment;
++  if (doc.ltrim) o.ltrim = true;
++  if (doc.rtrim) o.rtrim = true;
++  if (doc.bom) o.bom = true;
++  // the three usual line endings are discovered; anything else must be named
++  if (!["\n", "\r\n", "\r"].includes(rd) || extra.explicitRd) o.record_delimiter = rd;
++  delete o.explicitRd;
++  return o;
++}
++
++// ---------------------------------------------------------------- mutations
++
++/** `text` with 1..k random edits: a character inserted, deleted, replaced or a slice
++ *  duplicated; the inserted characters favour the separators of `sep`. */
++export function mutate(tc, text, sep, k = n(tc, 1, 3)) {
++  const special = [sep.delimiter, sep.quote, sep.escape, sep.rd, "\n", "\r", "\r\n", " ", "\"", "'", "\\", "#", "\ufeff", "\u00e9", "\ud800", "\u2028"];
++  for (let i = 0; i < k; i++) {
++    const pos = n(tc, 0, text.length);
++    const r = n(tc, 0, 3);
++    if (r === 0 || text.length === 0) text = text.slice(0, pos) + pick(tc, special) + text.slice(pos);
++    else if (r === 1) text = text.slice(0, pos) + text.slice(pos + 1);
++    else if (r === 2) text = text.slice(0, pos) + pick(tc, special) + text.slice(pos + 1);
++    else {
++      const end = Math.min(text.length, pos + n(tc, 1, 5));
++      text = text.slice(0, end) + text.slice(pos, end) + text.slice(end);
++    }
++  }
++  return text;
++}
++
++/** Random chunk boundaries for a buffer: byte offsets, often cutting inside multi-byte
++ *  sequences and multi-character separators. */
++export function chunk(tc, buf) {
++  const out = [];
++  let pos = 0;
++  while (pos < buf.length) {
++    const len = chance(tc, 30) ? 1 : n(tc, 1, Math.max(1, Math.min(buf.length - pos, 12)));
++    out.push(buf.subarray(pos, pos + len));
++    pos += len;
++  }
++  if (chance(tc, 20)) out.push(Buffer.alloc(0));
++  return out;
++}
++
++/** Feed `chunks` to a csv-parse stream with `options`; resolves {records} or {error}. */
++export function parseStream(chunks, options) {
++  return new Promise((resolve) => {
++    const records = [];
++    let done = false;
++    const finish = (v) => {
++      if (!done) {
++        done = true;
++        resolve(v);
++      }
++    };
++    const parser = new Parser(options);
++    parser.on("readable", function () {
++      let rec;
++      while ((rec = this.read()) !== null) records.push(rec);
++    });
++    parser.on("error", (error) => finish({ error }));
++    parser.on("end", () => finish({ records }));
++    parser.on("close", () => finish({ records }));
++    // a source stops writing once the parser has ended itself (`to`, `to_line`), as pipe() does
++    for (const c of chunks) {
++      if (parser.writableEnded || parser.destroyed) break;
++      parser.write(c);
++    }
++    if (!parser.writableEnded && !parser.destroyed) parser.end();
++  });
++}
++
++export { count };
+diff --git a/hegel/hegel-zoo.mjs b/hegel/hegel-zoo.mjs
+new file mode 100644
+index 00000000..1ca6f10b
+--- /dev/null
++++ b/hegel/hegel-zoo.mjs
+@@ -0,0 +1,163 @@
++// Hegel zoo: the small harness shared by the zoo's TypeScript/JavaScript targets.
++//
++// `property(name, body)` registers a node:test test that runs `body(tc)` under Hegel with
++// HEGEL_TEST_CASES cases (default 100) and the database at HEGEL_DATABASE. With ZOO_COLLECT=1
++// a `fail()` records the mismatch instead of failing, the case ends there, and the counts of
++// mismatches and of the shapes seen (`count(key)`) are printed at the end of the test, so a
++// property can be run over many cases to see every shape at once. `pin(name, body)` is a
++// plain test for one pinned bug: it must fail while the bug is present and pass once it is
++// fixed (the zoo's judge reads an unexpected pass as "fixed upstream?").
++
++import { readFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath, pathToFileURL } from "node:url";
++import { test as nodeTest } from "node:test";
++
++// The Hegel version these tests were written against (the zoo pins it in zoo.toml; upstream
++// would add it to devDependencies). Hegel and esbuild are installed with `npm install --prefix
++// .hegel` so the target's own package.json and lock file stay untouched. Checked at load time so
++// a stray install cannot silently change the engine.
++export const HEGEL_PIN = { "@hegeldev/hegel": "0.4.5" };
++
++const hegelDir = join(dirname(fileURLToPath(import.meta.url)), "..", ".hegel", "node_modules", "@hegeldev", "hegel");
++{
++  const installed = JSON.parse(readFileSync(join(hegelDir, "package.json"), "utf8")).version;
++  if (installed !== HEGEL_PIN["@hegeldev/hegel"]) {
++    throw new Error(`@hegeldev/hegel ${installed} is installed; these tests pin ${HEGEL_PIN["@hegeldev/hegel"]}`);
++  }
++}
++const hegel = await import(pathToFileURL(join(hegelDir, "dist", "index.js")));
++const gs = await import(pathToFileURL(join(hegelDir, "dist", "generators", "index.js")));
++
++export const collecting = !!process.env.ZOO_COLLECT;
++
++class Collected extends Error {}
++
++let msgs = [];
++let stats = new Map();
++
++/** Report a mismatch: an error normally, a recorded line in collect mode. */
++export function fail(message) {
++  if (collecting) {
++    msgs.push(message);
++    throw new Collected(message);
++  }
++  throw new Error(message);
++}
++
++/** Bump a statistic (the shape of a pinned bug, a generator branch). */
++export function count(key) {
++  stats.set(key, (stats.get(key) || 0) + 1);
++}
++
++function settings() {
++  const s = { testCases: Number(process.env.HEGEL_TEST_CASES) || 100 };
++  if (process.env.HEGEL_DATABASE) {
++    s.database = hegel.Database.fromPath(process.env.HEGEL_DATABASE);
++  }
++  return s;
++}
++
++/** A property: `body(tc)` runs under Hegel; a thrown error (or `fail`) is a failure. */
++export function property(name, body) {
++  nodeTest(name, () => {
++    msgs = [];
++    stats = new Map();
++    hegel.test((tc) => {
++      try {
++        body(tc);
++      } catch (e) {
++        if (collecting && e instanceof Collected) {
++          return;
++        }
++        throw e;
++      }
++    }, settings());
++    if (collecting) {
++      const shapes = [...stats].map(([k, v]) => `${k}=${v}`).join(" ");
++      console.log(`# COLLECT ${name}: ${msgs.length} mismatches; stats ${shapes}`);
++      for (const m of msgs.slice(0, 25)) {
++        console.log(`#   ${m.split("\n").join("\n#   ")}`);
++      }
++    }
++  });
++}
++
++/** An async property: `body(tc)` may await; runs under Hegel's testAsync with the same settings. */
++export function propertyAsync(name, body) {
++  nodeTest(name, async () => {
++    msgs = [];
++    stats = new Map();
++    await hegel.testAsync(async (tc) => {
++      try {
++        await body(tc);
++      } catch (e) {
++        if (collecting && e instanceof Collected) {
++          return;
++        }
++        throw e;
++      }
++    }, settings());
++    if (collecting) {
++      const shapes = [...stats].map(([k, v]) => `${k}=${v}`).join(" ");
++      console.log(`# COLLECT ${name}: ${msgs.length} mismatches; stats ${shapes}`);
++      for (const m of msgs.slice(0, 25)) {
++        console.log(`#   ${m.split("\n").join("\n#   ")}`);
++      }
++    }
++  });
++}
++
++/** A pin: a plain test for one recorded bug. */
++export function pin(name, body) {
++  nodeTest(name, body);
++}
++
++/** An integer in [lo, hi]. */
++export function n(tc, lo, hi) {
++  return tc.draw(gs.integers({ minValue: lo, maxValue: hi }));
++}
++
++/** One of xs. */
++export function pick(tc, xs) {
++  return xs[n(tc, 0, xs.length - 1)];
++}
++
++/** True pct percent of the time. */
++export function chance(tc, pct) {
++  return n(tc, 0, 99) < pct;
++}
++
++/** A string of `len` characters drawn from `alphabet` (an array of strings). */
++export function word(tc, alphabet, lo, hi) {
++  const len = n(tc, lo, hi);
++  let s = "";
++  for (let i = 0; i < len; i++) {
++    s += pick(tc, alphabet);
++  }
++  return s;
++}
++
++/** Structural equality: arrays by position, objects by key set (prototype ignored), else ===. */
++export function same(a, b) {
++  if (Array.isArray(a) || Array.isArray(b)) {
++    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
++      return false;
++    }
++    return a.every((x, i) => same(x, b[i]));
++  }
++  if (a !== null && b !== null && typeof a === "object" && typeof b === "object") {
++    const ka = Object.keys(a).sort();
++    const kb = Object.keys(b).sort();
++    if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) {
++      return false;
++    }
++    return ka.every((k) => same(a[k], b[k]));
++  }
++  return a === b;
++}
++
++/** A compact, unambiguous rendering for messages. */
++export function show(x) {
++  return JSON.stringify(x, (k, v) => (v === undefined ? "<undefined>" : v));
++}
+diff --git a/hegel/hegel.test.mjs b/hegel/hegel.test.mjs
+new file mode 100644
+index 00000000..77a39ae3
+--- /dev/null
++++ b/hegel/hegel.test.mjs
+@@ -0,0 +1,480 @@
++// Hegel zoo: node-csv (csv-parse and csv-stringify) against Python's csv module and a model of
++// the parser's options: the stringify/parse round trip, both interop directions with Python,
++// the parser against the model on generated documents, streaming against one-shot parsing,
++// delimiter discovery, and hostile input.
++
++import assert from "node:assert/strict";
++import { chance, count, fail, n, pick, pin, property, propertyAsync, same, show, word } from "./hegel-zoo.mjs";
++import {
++  CsvError, chunk, delimiter_discover, genDocument, genField, genRecords, genSeparators, model, mutate,
++  parse, parseOptions, parseStream, pyRead, pyWrite, stringify,
++} from "./csv.mjs";
++import { known } from "./known.mjs";
++
++/** The path of the first difference between two values, for messages. */
++function firstDiff(a, b, path = "$") {
++  if (Array.isArray(a) && Array.isArray(b)) {
++    for (let i = 0; i < Math.min(a.length, b.length); i++) {
++      const d = firstDiff(a[i], b[i], `${path}[${i}]`);
++      if (d) return d;
++    }
++    return a.length === b.length ? null : `${path}: ${a.length} vs ${b.length} items`;
++  }
++  if (a && b && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b)) {
++    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
++      const d = firstDiff(a[k], b[k], `${path}.${k}`);
++      if (d) return d;
++    }
++    return null;
++  }
++  return same(a, b) ? null : `${path}: ${show(a)} vs ${show(b)}`;
++}
++
++/** A thrown value as "code" (a CsvError), or "<Name>: message" for anything else. */
++function errorOf(e) {
++  return e instanceof CsvError ? e.code : `${e?.constructor?.name}: ${e?.message}`;
++}
++
++const FORMULA = new Set(["=", "+", "-", "@", "\t", "\r", "＝", "＋", "－", "＠"]);
++
++/** Stringify options for a round trip and the parse options that read them back. */
++function genStringifyCase(tc, { python = false } = {}) {
++  const sep = genSeparators(tc, { python });
++  const s = { delimiter: sep.delimiter, quote: sep.quote, escape: sep.escape, record_delimiter: sep.rdName };
++  if (chance(tc, 20)) s.quoted = true;
++  if (chance(tc, 20)) s.quoted_empty = chance(tc, 70);
++  if (chance(tc, 20)) s.quoted_string = true;
++  if (chance(tc, 15)) s.quoted_match = pick(tc, ["a", " ", /^\d/, /e/, "#"]);
++  if (chance(tc, 20)) s.eof = false;
++  if (!python && chance(tc, 15)) s.bom = true;
++  if (!python && chance(tc, 15)) s.escape_formulas = true;
++  const width = n(tc, 1, 5);
++  let columns = null;
++  if (chance(tc, 25)) {
++    columns = [];
++    for (let i = 0; i < width; i++) columns.push(pick(tc, ["a", "b", "id", "name", "x y", "é", "a,b", "q\"r"]) + i);
++    s.header = true;
++    s.columns = columns;
++  }
++  const p = { delimiter: sep.delimiter, quote: sep.quote, escape: sep.escape };
++  if (!["\n", "\r\n", "\r"].includes(sep.rd) || chance(tc, 30)) p.record_delimiter = sep.rd;
++  if (s.bom) p.bom = true;
++  if (columns) p.columns = true;
++  return { sep, s, p, width, columns };
++}
++
++/** What csv-parse should read back from csv-stringify's output of `records`. */
++function expectedBack(records, s, columns) {
++  const f = (v) => (s.escape_formulas && v && FORMULA.has(v[0]) ? "'" + v : v);
++  return records.map((r) => {
++    const vals = r.map(f);
++    if (!columns) return vals;
++    const o = {};
++    columns.forEach((c, i) => { o[c] = vals[i]; });
++    return o;
++  });
++}
++
++property("TestHegelStringifyParseRoundTrip", (tc) => {
++  const { s, p, width, columns } = genStringifyCase(tc);
++  const records = genRecords(tc, { width });
++  let text;
++  try {
++    text = stringify(records, s);
++  } catch (e) {
++    fail(`stringify throws ${errorOf(e)}\n records: ${show(records)}\n options: ${show(s)}`);
++  }
++  let back;
++  try {
++    back = parse(text, p);
++  } catch (e) {
++    const id = known("roundtrip", { records, s, p, text, error: errorOf(e) });
++    if (id) return count("known " + id);
++    fail(`parse throws ${errorOf(e)} on csv-stringify's output\n records: ${show(records)}\n stringify: ${show(s)}\n parse: ${show(p)}\n text: ${show(text)}`);
++  }
++  const want = expectedBack(records, s, columns);
++  const d = firstDiff(back, want);
++  if (d) {
++    const id = known("roundtrip", { records, s, p, text, back, want });
++    if (id) return count("known " + id);
++    fail(`round trip differs at ${d}\n records: ${show(records)}\n stringify: ${show(s)}\n parse: ${show(p)}\n text: ${show(text)}\n back: ${show(back)}`);
++  }
++  count(columns ? "objects" : "arrays");
++});
++
++property("TestHegelStringifyOutputReadByPython", (tc) => {
++  const { sep, s, width, columns } = genStringifyCase(tc, { python: true });
++  // Python's escapechar acts outside quotes too, csv-parse's only inside: quote everything then
++  if (sep.escape !== sep.quote) s.quoted = true;
++  const records = genRecords(tc, { width });
++  const text = stringify(records, s);
++  const dialect = {
++    delimiter: sep.delimiter, quotechar: sep.quote, strict: true,
++    doublequote: sep.escape === sep.quote, escapechar: sep.escape === sep.quote ? null : sep.escape,
++  };
++  const py = pyRead(text, dialect);
++  if (!py.ok) {
++    const id = known("python-reads", { records, s, text, error: py.error });
++    if (id) return count("known " + id);
++    fail(`Python's csv.reader rejects csv-stringify's output: ${py.error}\n records: ${show(records)}\n options: ${show(s)}\n text: ${show(text)}`);
++  }
++  const want = columns ? [columns, ...records] : records;
++  // Python reads an empty line as no fields; csv-stringify writes a lone empty field that way
++  const got = py.records.map((r) => (r.length === 0 && width === 1 ? [""] : r));
++  if (got.length !== py.records.filter((r) => r.length !== 0).length) count("lone empty field written as an empty line");
++  const d = firstDiff(got, want);
++  if (d) {
++    const id = known("python-reads", { records, s, text, got, want });
++    if (id) return count("known " + id);
++    fail(`Python reads csv-stringify's output differently at ${d}\n records: ${show(records)}\n options: ${show(s)}\n text: ${show(text)}\n python: ${show(got)}`);
++  }
++  count("agree");
++});
++
++property("TestHegelPythonOutputParsed", (tc) => {
++  const sep = genSeparators(tc, { python: true });
++  const width = n(tc, 1, 5);
++  const records = genRecords(tc, { width });
++  const dialect = { delimiter: sep.delimiter, quotechar: sep.quote, lineterminator: sep.rd };
++  if (sep.escape === sep.quote) {
++    dialect.doublequote = true;
++    dialect.quoting = pick(tc, ["minimal", "minimal", "all", "nonnumeric"]);
++  } else {
++    dialect.doublequote = false;
++    dialect.escapechar = sep.escape;
++    dialect.quoting = "all";
++  }
++  const py = pyWrite(records, dialect);
++  if (!py.ok) throw new Error(`Python's csv.writer failed: ${py.error} for ${show(records)} with ${show(dialect)}`);
++  const p = { delimiter: sep.delimiter, quote: sep.quote, escape: sep.escape };
++  if (chance(tc, 30)) p.record_delimiter = sep.rd;
++  let got;
++  try {
++    got = parse(py.text, p);
++  } catch (e) {
++    const id = known("python-writes", { records, dialect, p, text: py.text, error: errorOf(e) });
++    if (id) return count("known " + id);
++    fail(`parse throws ${errorOf(e)} on Python's csv.writer output\n records: ${show(records)}\n dialect: ${show(dialect)}\n parse: ${show(p)}\n text: ${show(py.text)}`);
++  }
++  const d = firstDiff(got, records);
++  if (d) {
++    const id = known("python-writes", { records, dialect, p, text: py.text, got });
++    if (id) return count("known " + id);
++    fail(`parse reads Python's output differently at ${d}\n records: ${show(records)}\n dialect: ${show(dialect)}\n parse: ${show(p)}\n text: ${show(py.text)}\n got: ${show(got)}`);
++  }
++  count("agree " + dialect.quoting);
++});
++
++/** Random slicing/shape options for the model property. */
++function genExtras(tc) {
++  const x = {};
++  if (chance(tc, 30)) x.skip_empty_lines = true;
++  if (chance(tc, 20)) x.relax_column_count = true;
++  else {
++    if (chance(tc, 10)) x.relax_column_count_less = true;
++    if (chance(tc, 10)) x.relax_column_count_more = true;
++  }
++  if (chance(tc, 15)) x.from = n(tc, 1, 4);
++  if (chance(tc, 15)) x.to = n(tc, 1, 5);
++  if (chance(tc, 15)) x.from_line = n(tc, 1, 5);
++  if (chance(tc, 15)) x.to_line = n(tc, 1, 6);
++  if (chance(tc, 20)) x.columns = true;
++  if (chance(tc, 30)) x.info = true;
++  if (chance(tc, 20)) x.explicitRd = true;
++  return x;
++}
++
++function validHeader(h) {
++  return h && h.length > 0 && new Set(h).size === h.length && h.every((x) => x !== "" && x !== "__proto__");
++}
++
++/** The plain subset Python's strict reader can also judge: RFC 4180 separators, no trimming,
++ *  no comments, no BOM, no slicing. */
++function pythonCanRead(doc, extra) {
++  const { delimiter, quote, escape, rd } = doc.sep;
++  return !doc.comment && !doc.ltrim && !doc.rtrim && !doc.bom && Object.keys(extra).length === 0 &&
++    delimiter.length === 1 && delimiter.charCodeAt(0) < 128 && quote.charCodeAt(0) < 128 &&
++    escape.length === 1 && escape.charCodeAt(0) < 128 && ["\n", "\r\n", "\r"].includes(rd);
++}
++
++property("TestHegelParseMatchesTheModel", (tc) => {
++  const extra = genExtras(tc);
++  const doc = genDocument(tc);
++  const opts = parseOptions(doc, extra);
++  const m = model(doc, extra);
++  if (extra.columns && !validHeader(m.header)) return count("header unusable: skipped");
++  if (pythonCanRead(doc, extra)) {
++    // the generator's expectation checked against Python's strict reader (a disagreement is a
++    // harness error: reported loudly)
++    const py = pyRead(doc.text, {
++      delimiter: doc.sep.delimiter, quotechar: doc.sep.quote, strict: true,
++      doublequote: doc.sep.escape === doc.sep.quote, escapechar: doc.sep.escape === doc.sep.quote ? null : doc.sep.escape,
++    });
++    if (!py.ok) throw new Error(`the generator wrote CSV Python rejects: ${py.error}\n${show(doc.text)}`);
++    const rows = py.records.map((r) => (r.length === 0 ? [""] : r));
++    const want = doc.lines.filter((l) => l.kind !== "comment").map((l) => (l.kind === "empty" ? [""] : l.fields));
++    const d = firstDiff(rows, want);
++    if (d) throw new Error(`the generator's expectation disagrees with Python at ${d}\n${show(doc.text)}\n python: ${show(rows)}`);
++    count("checked by python");
++  }
++  let got;
++  try {
++    got = parse(doc.text, opts);
++  } catch (e) {
++    const code = errorOf(e);
++    if (m.error && code === m.error) return count("expected " + code);
++    const id = known("model", { doc, opts, error: code, want: m });
++    if (id) return count("known " + id);
++    fail(`parse throws ${code}, the model ${m.error ? "expects " + m.error : "expects records"}\n text: ${show(doc.text)}\n options: ${show(opts)}\n model: ${show(m.records.map((r) => r.record))}`);
++  }
++  if (m.error) {
++    const id = known("model", { doc, opts, got, want: m });
++    if (id) return count("known " + id);
++    fail(`parse returns records, the model expects ${m.error}\n text: ${show(doc.text)}\n options: ${show(opts)}\n got: ${show(got)}`);
++  }
++  const want = m.records.map((r) => (extra.info ? { record: r.record, lines: r.info.lines, records: r.info.records } : r.record));
++  const have = got.map((r) => (extra.info ? { record: r.record, lines: r.info.lines, records: r.info.records } : r));
++  const d = firstDiff(have, want);
++  if (d) {
++    const id = known("model", { doc, opts, got, want: m });
++    if (id) return count("known " + id);
++    fail(`parse differs from the model at ${d}\n text: ${show(doc.text)}\n options: ${show(opts)}\n got: ${show(have)}\n want: ${show(want)}`);
++  }
++  count("agree" + (Object.keys(extra).length ? " with options" : ""));
++});
++
++propertyAsync("TestHegelStreamMatchesOneShot", async (tc) => {
++  const extra = chance(tc, 50) ? genExtras(tc) : {};
++  delete extra.columns;
++  const doc = genDocument(tc);
++  const text = chance(tc, 30) ? mutate(tc, doc.text, doc.sep) : doc.text;
++  const opts = parseOptions(doc, extra);
++  if (chance(tc, 15)) opts.relax_quotes = true;
++  if (chance(tc, 10)) opts.skip_records_with_error = true;
++  if (chance(tc, 15)) opts.raw = true;
++  const buf = Buffer.from(text);
++  let sync;
++  try {
++    sync = { records: parse(buf, opts) };
++  } catch (e) {
++    sync = { error: errorOf(e) };
++  }
++  const chunks = chunk(tc, buf);
++  const streamed = await parseStream(chunks, opts);
++  const have = streamed.error ? { error: errorOf(streamed.error) } : streamed;
++  const d = firstDiff(have, sync);
++  if (d) {
++    const id = known("stream", { doc, text, opts, chunks: chunks.map((c) => c.toString("latin1")), sync, streamed: have });
++    if (id) return count("known " + id);
++    fail(`streaming differs from one-shot parsing at ${d}\n text: ${show(text)}\n options: ${show(opts)}\n chunks: ${show(chunks.map((c) => [...c]))}\n one-shot: ${show(sync)}\n streamed: ${show(have)}`);
++  }
++  count(sync.error ? "both reject" : "agree");
++});
++
++const PREFERRED = [",", "\t", ";", " ", ":", ".", "/"];
++
++property("TestHegelDelimiterDiscovery", (tc) => {
++  const delimiter = pick(tc, PREFERRED);
++  const width = n(tc, 2, 5);
++  const rows = n(tc, 2, 6);
++  const alphabet = chance(tc, 30) ? "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789éü日Ā" : "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
++  const records = genRecords(tc, { rows, width, field: (tc) => word(tc, alphabet, 1, 4) });
++  const text = stringify(records, { delimiter, record_delimiter: pick(tc, ["unix", "windows", "mac"]) });
++  // the delimiter must dominate every other character for the heuristic to have one answer
++  const counts = new Map();
++  for (const r of records) for (const f of r) for (const c of f) counts.set(c, (counts.get(c) || 0) + 1);
++  const dcount = rows * (width - 1);
++  if ([...counts.values()].some((v) => v >= dcount)) return count("no dominant delimiter: skipped");
++  let found;
++  try {
++    found = delimiter_discover(text);
++  } catch (e) {
++    const id = known("discover", { text, error: errorOf(e) });
++    if (id) return count("known " + id);
++    fail(`delimiter_discover throws ${errorOf(e)}\n text: ${show(text)}`);
++  }
++  if (found !== delimiter) {
++    const id = known("discover", { text, found });
++    if (id) return count("known " + id);
++    fail(`delimiter_discover finds ${show(found)}, the delimiter is ${show(delimiter)}\n text: ${show(text)}`);
++  }
++  let auto;
++  try {
++    auto = parse(text, { delimiter_auto: true });
++  } catch (e) {
++    const id = known("discover", { text, error: errorOf(e) });
++    if (id) return count("known " + id);
++    fail(`parse with delimiter_auto throws ${errorOf(e)}\n text: ${show(text)}`);
++  }
++  const d = firstDiff(auto, records);
++  if (d) {
++    const id = known("discover", { text, auto });
++    if (id) return count("known " + id);
++    fail(`parse with delimiter_auto differs at ${d}\n text: ${show(text)}\n got: ${show(auto)}`);
++  }
++  count("agree");
++});
++
++/** Random parse options for hostile input (all valid combinations). */
++function genAnyOptions(tc) {
++  const sep = genSeparators(tc);
++  const o = {};
++  if (chance(tc, 70)) o.delimiter = chance(tc, 20) ? [sep.delimiter, ","] : sep.delimiter;
++  if (chance(tc, 60)) o.quote = chance(tc, 10) ? null : sep.quote;
++  if (chance(tc, 60)) o.escape = chance(tc, 10) ? null : sep.escape;
++  if (chance(tc, 40)) o.record_delimiter = chance(tc, 30) ? ["\r\n", "\n", "\r"] : sep.rd;
++  if (chance(tc, 20)) o.comment = pick(tc, ["#", "//"]);
++  if (chance(tc, 10)) o.comment_no_infix = true;
++  if (chance(tc, 20)) o.trim = true;
++  if (chance(tc, 10)) o.ltrim = true;
++  if (chance(tc, 10)) o.rtrim = true;
++  if (chance(tc, 20)) o.relax_quotes = true;
++  if (chance(tc, 30)) o.relax_column_count = true;
++  if (chance(tc, 20)) o.skip_empty_lines = true;
++  if (chance(tc, 15)) o.skip_records_with_error = true;
++  if (chance(tc, 15)) o.skip_records_with_empty_values = true;
++  if (chance(tc, 15)) o.bom = true;
++  if (chance(tc, 15)) o.cast = true;
++  if (chance(tc, 10)) o.cast_date = true;
++  if (chance(tc, 15)) o.columns = true;
++  if (chance(tc, 10)) o.info = true;
++  if (chance(tc, 10)) o.raw = true;
++  if (chance(tc, 10)) o.from_line = n(tc, 1, 3);
++  if (chance(tc, 10)) o.to_line = n(tc, 1, 4);
++  if (chance(tc, 10)) o.from = n(tc, 1, 3);
++  if (chance(tc, 10)) o.to = n(tc, 1, 4);
++  if (chance(tc, 10)) o.max_record_size = n(tc, 1, 20);
++  if (chance(tc, 10)) {
++    o.delimiter_auto = true;
++    delete o.delimiter;
++  }
++  if (o.columns && chance(tc, 30)) o.group_columns_by_name = true;
++  return o;
++}
++
++propertyAsync("TestHegelHostileInputNeverCrashes", async (tc) => {
++  const doc = genDocument(tc);
++  const r = n(tc, 0, 2);
++  const text = r === 0 ? mutate(tc, doc.text, doc.sep, n(tc, 1, 6)) : r === 1 ? word(tc, "ab,;\"'\\\n\r\t #|:é ﻿", 0, 30) : doc.text;
++  const opts = chance(tc, 60) ? genAnyOptions(tc) : parseOptions(doc, {});
++  const outcome = (f) => {
++    try {
++      return { ok: f() };
++    } catch (e) {
++      if (e instanceof CsvError) return { code: e.code };
++      return { crash: errorOf(e) };
++    }
++  };
++  const sync = outcome(() => parse(text, opts));
++  if (sync.crash) {
++    const id = known("hostile", { text, opts, crash: sync.crash });
++    if (id) return count("known " + id);
++    fail(`parse crashes with ${sync.crash}\n text: ${show(text)}\n options: ${show(opts)}`);
++  }
++  if (r === 2) {
++    // a well-formed document with random options: the outcome must be records or a CsvError
++    count(sync.code ? "well-formed rejected: " + sync.code : "well-formed parsed");
++  }
++  const buf = Buffer.from(text);
++  const streamed = await Promise.race([
++    parseStream(chunk(tc, buf), opts),
++    new Promise((res) => setTimeout(() => res({ hang: true }), 5000)),
++  ]);
++  if (streamed.hang) fail(`the stream neither ends nor errors\n text: ${show(text)}\n options: ${show(opts)}`);
++  if (streamed.error && !(streamed.error instanceof CsvError)) {
++    const id = known("hostile", { text, opts, crash: errorOf(streamed.error) });
++    if (id) return count("known " + id);
++    fail(`the stream crashes with ${errorOf(streamed.error)}\n text: ${show(text)}\n options: ${show(opts)}`);
++  }
++  // stringify on arrays of strings with any separators never throws
++  const { s } = genStringifyCase(tc);
++  const records = genRecords(tc, { width: n(tc, 1, 4) });
++  const out = outcome(() => stringify(records, s));
++  if (out.crash || out.code) fail(`stringify throws ${out.crash || out.code}\n records: ${show(records)}\n options: ${show(s)}`);
++  if (typeof out.ok !== "string") fail(`stringify returns ${show(out.ok)}`);
++  count(sync.code ? "rejected " + sync.code : "parsed");
++});
++
++// ---------------------------------------------------------------- pins (one per recorded bug)
++
++pin("TestHegelPinLineBreaksInFieldsAreQuoted", () => {
++  // node-csv/1: a CR in a field is written bare when the record delimiter is LF, so the parser's
++  // record-delimiter discovery (and any RFC 4180 reader) splits the record there
++  const records = [["a\rb", "c"], ["d", "e"]];
++  const text = stringify(records);
++  assert.equal(text, "\"a\rb\",c\nd,e\n");
++  assert.deepEqual(parse(text), records);
++  const py = pyRead(stringify([["x\ny"]], { record_delimiter: "\r\n" }), { strict: true });
++  assert.deepEqual(py.records, [["x\ny"]]);
++});
++
++pin("TestHegelPinLoneEmptyFieldIsQuoted", () => {
++  // node-csv/2: a record of one empty field is written as an empty line, which is no record at
++  // all at the end of the output (and no fields for Python's reader)
++  assert.deepEqual(parse(stringify([["a"], [""]], { eof: false })), [["a"], [""]]);
++  assert.equal(stringify([[""]]), "\"\"\n");
++});
++
++pin("TestHegelPinEscapedFormulaPrefixIsEscaped", () => {
++  // node-csv/3: escape_formulas prefixes the field with an apostrophe after the quoting decision,
++  // so with quote "'" the prefix opens a quoted field that never closes
++  const text = stringify([["=1", "b"]], { escape_formulas: true, quote: "'" });
++  assert.deepEqual(parse(text, { quote: "'" }), [["'=1", "b"]]);
++});
++
++pin("TestHegelPinFromLineAfterACommentLine", () => {
++  // node-csv/4: a comment line just before from_line: the record at from_line is dropped
++  assert.deepEqual(parse("a\n#c\nb\nc\n", { from_line: 3, comment: "#" }), [["b"], ["c"]]);
++  assert.deepEqual(parse("a\nx\nb\nc\n", { from_line: 3 }), [["b"], ["c"]]);
++});
++
++pin("TestHegelPinCRLFInAQuotedFieldIsOneLine", () => {
++  // node-csv/5: a CRLF inside a quoted field advances the line count by two
++  const text = "\"a\r\nb\",1\r\nc,2\r\n";
++  assert.deepEqual(parse(text, { info: true }).map((r) => r.info.lines), [2, 3]);
++  assert.deepEqual(parse(text, { to_line: 2 }), [["a\r\nb", "1"]]);
++});
++
++pin("TestHegelPinDelimiterDiscoveryBeyondASCII", () => {
++  // node-csv/6: delimiter_discover indexes a 127-entry table by character code and throws on
++  // any character beyond U+007E
++  const text = "a,é\n1,2\n";
++  assert.equal(delimiter_discover(text), ",");
++  assert.deepEqual(parse(text, { delimiter_auto: true }), [["a", "é"], ["1", "2"]]);
++});
++
++pin("TestHegelPinRawHoldsTheWholeRecordDelimiter", () => {
++  // node-csv/7: `raw` keeps one byte of a multi-byte record delimiter (and of a multi-character
++  // delimiter): "a,b\r" for the record "a,b\r\n"
++  assert.deepEqual(parse("a,b\nc,d\n", { raw: true }).map((r) => r.raw), ["a,b\n", "c,d\n"]);
++  assert.deepEqual(parse("a,b\r\nc,d\r\n", { raw: true }).map((r) => r.raw), ["a,b\r\n", "c,d\r\n"]);
++  assert.deepEqual(parse("a::b\n", { raw: true, delimiter: "::" }).map((r) => r.raw), ["a::b\n"]);
++});
++
++pin("TestHegelPinCastLeavesPrefixedNumeralsAlone", () => {
++  // node-csv/8: cast reads "0x10" as the number 0 (parseFloat stops at the x; the numeric test
++  // does not): a hexadecimal, binary or octal literal is either its value or a string, never 0
++  const [row] = parse("0x10,0b11,0o7,1", { cast: true });
++  assert.equal(row[3], 1);
++  for (const v of row.slice(0, 3)) assert.notEqual(v, 0);
++});
++
++pin("TestHegelPinDelimiterDiscoveryOnAnEmptyStream", async () => {
++  // node-csv/9: a stream with delimiter_auto that ends without data throws a TypeError from
++  // delimiter_discover(undefined) instead of ending with no records
++  const out = await parseStream([], { delimiter_auto: true });
++  assert.equal(out.error, undefined);
++  assert.deepEqual(out.records, []);
++});
++
++pin("TestHegelPinStreamWaitsForTheDelimiterAfterAQuote", async () => {
++  // node-csv/10: with a quote of several bytes, a chunk boundary inside a delimiter of several
++  // bytes right after a closing quote throws CSV_INVALID_CLOSING_QUOTE (the look-ahead after a
++  // closing quote covers the record delimiter, not the delimiter)
++  const opts = { quote: "||", delimiter: ":::" };
++  const want = parse("||a||:::b\n", opts);
++  assert.deepEqual(want, [["a", "b"]]);
++  const out = await parseStream([Buffer.from("||a||::"), Buffer.from(":b\n")], opts);
++  assert.equal(out.error, undefined);
++  assert.deepEqual(out.records, want);
++});
+diff --git a/hegel/known.mjs b/hegel/known.mjs
+new file mode 100644
+index 00000000..ece9da17
+--- /dev/null
++++ b/hegel/known.mjs
+@@ -0,0 +1,64 @@
++// Hegel zoo: the recorded bugs of node-csv (bugs.toml), as gates. `known(where, ctx)` returns
++// the bug id when a case has the shape of a recorded bug, so it is counted rather than judged;
++// ZOO_NO_KNOWN=1 lifts the gates. `where` names the property, `ctx` carries what it has.
++
++const lifted = !!process.env.ZOO_NO_KNOWN;
++
++const FORMULA = new Set(["=", "+", "-", "@", "\t", "\r", "＝", "＋", "－", "＠"]);
++
++function resolveRd(rd) {
++  return { unix: "\n", windows: "\r\n", mac: "\r", ascii: "", unicode: " " }[rd] ?? rd ?? "\n";
++}
++
++/** Would csv-stringify leave `f` unquoted under options `s`? (the quoting rules of api/index.js) */
++function unquoted(f, s) {
++  if (s.quoted || s.quoted_string) return false;
++  const rd = resolveRd(s.record_delimiter);
++  const delimiter = s.delimiter ?? ",";
++  const quote = s.quote ?? "\"";
++  if (f.includes(delimiter) || f.includes(rd) || f.includes(quote)) return false;
++  if (s.quoted_match) {
++    const m = Array.isArray(s.quoted_match) ? s.quoted_match : [s.quoted_match];
++    if (m.some((p) => (typeof p === "string" ? f.includes(p) : p.test(f)))) return false;
++  }
++  return true;
++}
++
++export function known(where, ctx) {
++  if (lifted) return "";
++  if (where === "roundtrip" || where === "python-reads") {
++    const { records, s } = ctx;
++    const fields = records.flat();
++    // node-csv/1: a field holding a CR or LF that is not the record delimiter is written bare
++    if (fields.some((f) => /[\r\n]/.test(f) && unquoted(f, s))) return "node-csv/1";
++    // node-csv/2: a lone empty field is written as an empty line
++    if (records.some((r) => r.length === 1 && r[0] === "") && s.quoted_empty !== true && !s.quoted_string) return "node-csv/2";
++    // node-csv/3: escape_formulas prefixes a quote character without escaping it
++    if (s.escape_formulas && (s.quote ?? "\"") === "'" && fields.some((f) => f && FORMULA.has(f[0]))) return "node-csv/3";
++  }
++  if (where === "model") {
++    const { doc, opts } = ctx;
++    // node-csv/4: a comment line before from_line swallows the record at from_line
++    if (opts.from_line > 1 && doc.lines.some((l) => l.kind === "comment" && l.start < opts.from_line)) return "node-csv/4";
++    // node-csv/5: a CRLF inside a quoted field counts as two lines
++    if ((opts.info || opts.from_line || opts.to_line) && doc.lines.some((l) => l.kind === "record" && l.raw.includes("\r\n"))) return "node-csv/5";
++  }
++  if (where === "stream") {
++    const { opts, streamed } = ctx;
++    // node-csv/10: after a closing quote of several bytes the stream does not wait for a whole
++    // delimiter of several bytes
++    if (Buffer.byteLength(opts.quote ?? "\"") > 1 && Buffer.byteLength(opts.delimiter ?? ",") > 2 &&
++      (streamed.error === "CSV_INVALID_CLOSING_QUOTE" || opts.skip_records_with_error)) return "node-csv/10";
++  }
++  if (where === "hostile") {
++    // node-csv/9: delimiter_auto on an empty stream throws
++    if (ctx.opts.delimiter_auto && ctx.text === "" && (ctx.crash ?? "").includes("reading 'map'")) return "node-csv/9";
++    // node-csv/6, reached through the parser
++    if (ctx.opts.delimiter_auto && /[^\x00-\x7e]/.test(ctx.text) && (ctx.crash ?? "").startsWith("TypeError")) return "node-csv/6";
++  }
++  if (where === "discover") {
++    // node-csv/6: delimiter discovery throws on a character beyond U+007E
++    if (/[^\x00-\x7e]/.test(ctx.text) && (ctx.error ?? "").startsWith("TypeError")) return "node-csv/6";
++  }
++  return "";
++}
+diff --git a/hegel/oracle.py b/hegel/oracle.py
+new file mode 100644
+index 00000000..e942b407
+--- /dev/null
++++ b/hegel/oracle.py
+@@ -0,0 +1,75 @@
++# Hegel zoo: the Python `csv` oracle for node-csv. Reads one JSON request per line from the
++# request FIFO and writes one JSON answer per line to the response FIFO (see hegel/csv.mjs).
++#
++#   {"op": "read", "text": "...", "dialect": {...}}
++#       -> {"ok": true, "records": [[field, ...], ...]} or {"ok": false, "error": "..."}
++#   {"op": "write", "records": [[...], ...], "dialect": {...}}
++#       -> {"ok": true, "text": "..."} or {"ok": false, "error": "..."}
++#
++# dialect keys (all optional): delimiter, quotechar, escapechar (null for none), doublequote,
++# skipinitialspace, strict, lineterminator, quoting ("minimal", "all", "nonnumeric", "none").
++#
++# The reader is fed the text through io.StringIO(newline=""), so "\r", "\n" and "\r\n" all end
++# a record and a newline inside a quoted field is kept as written.
++
++import csv
++import io
++import json
++import sys
++
++QUOTING = {
++    "minimal": csv.QUOTE_MINIMAL,
++    "all": csv.QUOTE_ALL,
++    "nonnumeric": csv.QUOTE_NONNUMERIC,
++    "none": csv.QUOTE_NONE,
++}
++
++
++def dialect_kwargs(d):
++    kw = {}
++    for k in ("delimiter", "quotechar", "escapechar", "doublequote", "skipinitialspace", "strict", "lineterminator"):
++        if k in d:
++            kw[k] = d[k]
++    if "quoting" in d:
++        kw["quoting"] = QUOTING[d["quoting"]]
++    return kw
++
++
++def read(text, dialect):
++    try:
++        rows = list(csv.reader(io.StringIO(text, newline=""), **dialect_kwargs(dialect)))
++    except Exception as e:  # csv.Error, TypeError for a bad dialect
++        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
++    return {"ok": True, "records": rows}
++
++
++def write(records, dialect):
++    out = io.StringIO()
++    try:
++        w = csv.writer(out, **dialect_kwargs(dialect))
++        w.writerows(records)
++    except Exception as e:
++        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
++    return {"ok": True, "text": out.getvalue()}
++
++
++def main(req_path, resp_path):
++    req = open(req_path, "r", encoding="utf-8", errors="surrogatepass")
++    resp = open(resp_path, "w", encoding="utf-8", errors="surrogatepass")
++    for line in req:
++        try:
++            q = json.loads(line)
++            if q["op"] == "read":
++                a = read(q["text"], q.get("dialect", {}))
++            elif q["op"] == "write":
++                a = write(q["records"], q.get("dialect", {}))
++            else:
++                a = {"ok": False, "error": "unknown op %r" % q["op"]}
++        except Exception as e:  # never let the oracle die on one request
++            a = {"ok": False, "error": "oracle: %s: %s" % (type(e).__name__, e)}
++        resp.write(json.dumps(a, ensure_ascii=True) + "\n")
++        resp.flush()
++
++
++if __name__ == "__main__":
++    main(sys.argv[1], sys.argv[2])
