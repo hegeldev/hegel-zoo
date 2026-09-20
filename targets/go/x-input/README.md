@@ -80,3 +80,4 @@ entries (ncurses-base); it fails either way, so it is a stable expected failure.
   shape.
 - A stream ending in ESC, or `ESC ESC` followed by a key, is ambiguous (Escape then alt+key,
   or alt+esc then key) in the protocol itself; the stream generator keeps them last.
+- 2026-09-20: base bumped c615ff2f7805 → 53e2afe73ae5 (2026-09-20, "chore(powernap): update lsp configs from nvim-lspconfig"; v0.3.7+); 10 bug(s) still reproduce. 7 tests pass.

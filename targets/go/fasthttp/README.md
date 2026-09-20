@@ -108,3 +108,4 @@ forms, `Args` numeric getters, `URI.Update`, header parameter parsing (`VisitHea
 
 - 2026-09-20: written against 0e13c85e8ed5b41b489c502eeccdf90a45eb8dfe (2026-09-19, after
   v1.69.0) with hegel.dev/go/hegel v0.6.33; 7 bugs.
+- 2026-09-20: base bumped 0e13c85e8ed5 → 5687435d22d1 (2026-09-20, "fix: request time left at zero, and an opt in Server.LazyRequestTime (#2404)"; v1.74.0+); 7 bug(s) still reproduce. 14 tests pass.

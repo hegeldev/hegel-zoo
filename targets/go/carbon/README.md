@@ -83,3 +83,4 @@ of calendar defects (lunar dates shifted by zone and by the 2033 leap month,
 the Persian 2820-year cycle and epoch, Julian-calendar reading before 1582,
 zone-blind Julian days, the `NewJulian` digit heuristic) plus a few naming
 slips — and fail while they stand.
+- 2026-09-20: base bumped e83625c5fe4a → 9c24fbd5e35d (2026-09-19, "perf(lunar): Derive the day tables once instead of recounting them per call (#357)"; v2.6.17+); 30 bug(s) still reproduce. 21 tests pass.

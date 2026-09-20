@@ -94,3 +94,4 @@ read differently by every implementation; `path.Match` refuses it).
 - Zone of `Match` vs `Glob` for files under `a/**`: `Match("f/**", "f")` is true ("might be a
   directory") while `Glob("f/**")` is empty for a regular file — the documented rule concerns
   names, and `Glob` knows the file type.
+- 2026-09-20: base bumped a9ad9e0ef4d6 → 314a6092ed05 (2026-09-19, "Merge branch 'sidsri14-master'"; v4.10.1); 12 bug(s) still reproduce. 5 tests pass.

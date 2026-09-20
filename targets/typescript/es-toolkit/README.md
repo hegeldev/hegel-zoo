@@ -179,3 +179,4 @@ modified built-in prototypes.
 
 - 2026-09-17: target added at 60fe20d3 (1.52.0), 8 properties, 42 bugs.
 - 2026-09-17: base bumped 60fe20d333e6 → 82ce4af4f35e (2026-09-17, "docs(contributing): limit compat fixes to inputs Lodash's types allow or real code passes (#2108)"; 1.52.0); 42 bug(s) still reproduce. 8 tests pass.
+- 2026-09-20: base bumped 82ce4af4f35e → ee72fc74b763 (2026-09-19, "fix(compat/words): match emoji sequences, non-ASCII numerals and symbols (#2110)"; 1.52.0); 42 bug(s) still reproduce. 8 tests pass.

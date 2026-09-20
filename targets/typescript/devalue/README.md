@@ -84,3 +84,4 @@ surrogates are written raw (8); `error.path` for a Map keyed by `undefined` or a
 - The Temporal generator skips the `chinese` calendar: the polyfill's `toPlainMonthDay` throws
   "Unexpected leap month suffix" there, which is the polyfill's problem, not devalue's.
 - 2026-09-18: base bumped 8ade61d0e70d → 58ad7452142f (2026-09-18, "chore: enforce formatting with Prettier (#195)"; 5.9.4); 7 bug(s) still reproduce; fixed upstream: devalue/10, devalue/5, devalue/8. 11 tests pass.
+- 2026-09-20: base bumped 58ad7452142f → 80e75e7c08f6 (2026-09-19, "Version Packages (#203)"; 6.0.0); 7 bug(s) still reproduce. 17 tests pass.

@@ -121,3 +121,4 @@ compressed-size bytes of a single-block stream showed both directions.
 Filters other than LZMA2 (the package supports none), multi-threading (none), the `gxz` and
 `xb` commands, `internal/*`, Writer2 output concatenated after a Flush without Close, dictionary
 sizes above 8 MiB, streams above 256 KiB.
+- 2026-09-20: base bumped 024f9092972a → 6ead826b4d3c (2026-09-19, "Prepare release v0.5.17"; v0.5.17); 8 bug(s) still reproduce. 9 tests pass.

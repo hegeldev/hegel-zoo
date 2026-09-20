@@ -107,3 +107,4 @@ in the repository; not archived, active. Checked 2026-09-15. The harness lives i
   the documentation lists the formats and says "similar" to XParseColor.
 - `ESC \` after an ESC-terminated string is dispatched by the `Parser` as an escape sequence;
   that is how a VT parser sees the 7-bit String Terminator.
+- 2026-09-20: base bumped c615ff2f7805 → 53e2afe73ae5 (2026-09-20, "chore(powernap): update lsp configs from nvim-lspconfig"; v0.11.8+); 22 bug(s) still reproduce. 13 tests pass.

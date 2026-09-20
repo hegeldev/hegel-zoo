@@ -89,3 +89,4 @@ the real `Render`, since the hang cannot be recovered from once it starts.
   by design; for equal non-empty styles it is cellbuf/16.
 - `Ascii.Convert`-style profile downsampling (`ConvertStyle`) is not exercised: the screen
   runs with profile 0.
+- 2026-09-20: base bumped c615ff2f7805 → 53e2afe73ae5 (2026-09-20, "chore(powernap): update lsp configs from nvim-lspconfig"; v0.0.15+); 18 bug(s) still reproduce. 9 tests pass.
