@@ -1,0 +1,804 @@
+diff --git a/go.mod b/go.mod
+index 7a04105..c08f618 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,9 @@
+ module github.com/joho/godotenv
+ 
+-go 1.13
++go 1.26.0
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++	hegel.dev/go/hegel v0.6.33 // indirect
++)
+diff --git a/hegel/doc.go b/hegel/doc.go
+new file mode 100644
+index 0000000..0ab64be
+--- /dev/null
++++ b/hegel/doc.go
+@@ -0,0 +1,3 @@
++// Package hegel holds the zoo's Hegel property tests for godotenv. See the
++// target's README.
++package hegel
+diff --git a/hegel/hegel_dotenv_test.go b/hegel/hegel_dotenv_test.go
+new file mode 100644
+index 0000000..16ad1c9
+--- /dev/null
++++ b/hegel/hegel_dotenv_test.go
+@@ -0,0 +1,428 @@
++package hegel
++
++import (
++	"bufio"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++	"unicode/utf8"
++
++	"github.com/joho/godotenv"
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Generators.
++
++// keys is the alphabet of variable names: [A-Za-z0-9_.], never a name of the
++// process environment.
++var keys = []string{"A", "B", "C", "FOO", "BAR_1", "a", "bar", "K.1", "_X", "1A", "Mixed_Case", "Z9"}
++
++// refs are the names variable references use: the keys, a name set in the
++// environment of both parsers (ZOO_PRE=pre), and names set nowhere.
++var refs = append(append([]string(nil), keys...), "ZOO_PRE", "NOPE", "nope", "Zoo_Pre")
++
++// words is the alphabet of value pieces that mean the same in every quoting.
++var words = []string{"x", "y", "hello", "123", "a b", "=", ":", ";", "é", "日本", "😀", "'", "\"", "\\", "#", "{}", "$", "http://h:80/p?q=1"}
++
++// genRef draws a variable reference: $NAME, ${NAME}, or an escaped \$NAME.
++func genRef(tc hegel.TestCase) string {
++	name := pick(tc, refs...)
++	switch pick(tc, 0, 1, 2) {
++	case 0:
++		return "$" + name
++	case 1:
++		return "${" + name + "}"
++	default:
++		return "\\$" + name
++	}
++}
++
++// genUnquoted draws an unquoted value: words, references, spaces; no
++// backslash (unquoted escapes differ between Ruby and Node dotenv, and
++// godotenv follows Node), no # (a # starts a comment in Ruby and Node, in
++// godotenv only after a space: a tested divergence), no quote first.
++func genUnquoted(tc hegel.TestCase) string {
++	var b strings.Builder
++	for k := n(tc, 1, 4); k > 0; k-- {
++		if chance(tc, 30) {
++			b.WriteString(genRef(tc))
++		} else {
++			w := pick(tc, words...)
++			for strings.ContainsAny(w, "\\#") {
++				w = pick(tc, words...)
++			}
++			b.WriteString(w)
++		}
++		if k > 1 && chance(tc, 30) {
++			b.WriteString(pick(tc, " ", "\t", "  "))
++		}
++	}
++	s := b.String()
++	if s == "" || s[0] == '\'' || s[0] == '"' {
++		s = "v" + s
++	}
++	return s
++}
++
++// genSingle draws a single-quoted value's inside: anything but an unescaped
++// quote; \' is an escaped quote (kept literally by both); newlines allowed.
++func genSingle(tc hegel.TestCase) string {
++	var b strings.Builder
++	for k := n(tc, 0, 4); k > 0; k-- {
++		switch pick(tc, 0, 0, 0, 1, 2, 3, 4) {
++		case 0:
++			b.WriteString(pick(tc, words...))
++		case 1:
++			b.WriteString(genRef(tc))
++		case 2:
++			b.WriteString("\\'")
++		case 3:
++			b.WriteString(pick(tc, "\\n", "\\\\", "\\t", "\\$"))
++		case 4:
++			b.WriteString(pick(tc, "\n", " # c\n", "\r\n"))
++		}
++	}
++	s := strings.ReplaceAll(b.String(), "'", "\\'")
++	// Ruby's regex reads any backslash before a quote as an escape (no
++	// parity), godotenv counts backslashes: keep single backslashes before
++	// quotes and none before the closing quote.
++	s = manyBackslashesBeforeQuote.ReplaceAllString(s, "\\'")
++	s = strings.TrimRight(s, "\\")
++	return s
++}
++
++// genDouble draws a double-quoted value's inside: words, references,
++// escapes (\n \r \t \\ \" \$ \q), newlines.
++func genDouble(tc hegel.TestCase) string {
++	var b strings.Builder
++	for k := n(tc, 0, 4); k > 0; k-- {
++		switch pick(tc, 0, 0, 0, 1, 2, 3) {
++		case 0:
++			w := pick(tc, words...)
++			w = strings.ReplaceAll(strings.ReplaceAll(w, "\\", "\\\\"), "\"", "\\\"")
++			b.WriteString(w)
++		case 1:
++			b.WriteString(genRef(tc))
++		case 2:
++			b.WriteString(pick(tc, "\\n", "\\r", "\\t", "\\\\", "\\\"", "\\$", "\\q", "\\'"))
++		case 3:
++			b.WriteString(pick(tc, "\n", " # c\n", "\r\n"))
++		}
++	}
++	return strings.TrimRight(b.String(), "\\")
++}
++
++var manyBackslashesBeforeQuote = regexp.MustCompile(`\\{2,}'`)
++
++type entry struct {
++	key, raw string // raw is the value as written, quotes included
++	quote    byte   // 0, '\'' or '"'
++}
++
++// genLine draws one line of a .env text and returns it (with its line end)
++// and the entry it declares, if any.
++func genLine(tc hegel.TestCase, eol string) (string, *entry) {
++	switch pick(tc, 0, 0, 0, 0, 0, 0, 1, 2, 3) {
++	case 1:
++		return pick(tc, "", " ", "\t") + eol, nil
++	case 2:
++		return pick(tc, "", "  ", "\t") + "#" + pick(tc, "", " comment", "A=1", " export B=2") + eol, nil
++	case 3:
++		// a comment line with leading spaces
++		return "   # c" + eol, nil
++	}
++	e := &entry{key: pick(tc, keys...)}
++	var b strings.Builder
++	b.WriteString(pick(tc, "", "", "", " ", "\t"))
++	export := chance(tc, 20)
++	if export {
++		b.WriteString("export" + pick(tc, " ", "\t", "  "))
++	}
++	b.WriteString(e.key)
++	if chance(tc, 15) {
++		b.WriteString(": ") // yaml-ish, Ruby needs the space
++	} else {
++		b.WriteString(pick(tc, "=", "=", "=", " = ", "= ", " ="))
++	}
++	kind := pick(tc, 0, 0, 1, 2, 3)
++	if kind == 3 && export {
++		// Ruby reads "export KEY=" as "export KEY" (an error, or no change
++		// when KEY is defined); godotenv and Node dotenv set "".
++		kind = 0
++	}
++	switch kind {
++	case 0:
++		e.raw = genUnquoted(tc)
++	case 1:
++		e.quote = '\''
++		e.raw = "'" + genSingle(tc) + "'"
++	case 2:
++		e.quote = '"'
++		e.raw = "\"" + genDouble(tc) + "\""
++	case 3:
++		e.raw = ""
++	}
++	b.WriteString(e.raw)
++	if chance(tc, 25) {
++		b.WriteString(pick(tc, " ", "\t", "  "))
++	}
++	if chance(tc, 20) {
++		b.WriteString(pick(tc, " #", " # c", "\t# c", " #A=1"))
++	}
++	b.WriteString(eol)
++	return b.String(), e
++}
++
++type env struct {
++	text    string
++	entries []*entry
++}
++
++func genEnv(tc hegel.TestCase) env {
++	eol := pick(tc, "\n", "\n", "\n", "\r\n")
++	var b strings.Builder
++	var es []*entry
++	for k := n(tc, 0, 6); k > 0; k-- {
++		l, e := genLine(tc, eol)
++		b.WriteString(l)
++		if e != nil {
++			es = append(es, e)
++		}
++	}
++	text := b.String()
++	if chance(tc, 20) {
++		text = strings.TrimSuffix(text, eol) // no final line end
++	}
++	return env{text, es}
++}
++
++// ---------------------------------------------------------------------------
++// Oracle: Ruby dotenv in a child process.
++
++type oracle struct {
++	cmd *exec.Cmd
++	in  io.WriteCloser
++	out *bufio.Reader
++}
++
++var ruby *oracle
++
++func TestMain(m *testing.M) {
++	os.Setenv("ZOO_PRE", "pre")
++	os.Unsetenv("NOPE")
++	code := m.Run()
++	if ruby != nil {
++		ruby.in.Close()
++		ruby.cmd.Wait()
++	}
++	os.Exit(code)
++}
++
++func startOracle(t testing.TB) {
++	if ruby != nil {
++		return
++	}
++	wd, _ := os.Getwd()
++	cmd := exec.Command("ruby", filepath.Join(wd, "oracle.rb"))
++	cmd.Env = []string{
++		"PATH=" + os.Getenv("PATH"),
++		"HOME=" + os.Getenv("HOME"), // user gems
++		"LANG=C.UTF-8",
++		"ZOO_PRE=pre",
++		"DOTENV_LINEBREAK_MODE=legacy",
++	}
++	for _, k := range []string{"GEM_HOME", "GEM_PATH"} {
++		if v, ok := os.LookupEnv(k); ok {
++			cmd.Env = append(cmd.Env, k+"="+v)
++		}
++	}
++	in, err := cmd.StdinPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	out, err := cmd.StdoutPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	cmd.Stderr = os.Stderr
++	if err := cmd.Start(); err != nil {
++		t.Fatalf("starting ruby: %v", err)
++	}
++	ruby = &oracle{cmd, in, bufio.NewReader(out)}
++	// a first request checks the gem is there
++	if _, err := ruby.parse("A=1\n"); err != nil {
++		t.Fatalf("ruby dotenv not usable: %v", err)
++	}
++}
++
++// parse asks Ruby dotenv for the map of text; an error is Ruby's rejection.
++func (o *oracle) parse(text string) (map[string]string, error) {
++	if _, err := fmt.Fprintf(o.in, "%s\n", hex.EncodeToString([]byte(text))); err != nil {
++		panic(fmt.Sprintf("oracle write: %v", err))
++	}
++	line, err := o.out.ReadString('\n')
++	if err != nil {
++		panic(fmt.Sprintf("oracle read: %v", err))
++	}
++	line = strings.TrimSuffix(line, "\n")
++	if strings.HasPrefix(line, "error ") {
++		msg, _ := hex.DecodeString(line[6:])
++		return nil, fmt.Errorf("%s", msg)
++	}
++	if !strings.HasPrefix(line, "ok") {
++		panic("oracle said " + line)
++	}
++	m := map[string]string{}
++	for _, f := range strings.Fields(line[2:]) {
++		k, v, _ := strings.Cut(f, "=")
++		kb, _ := hex.DecodeString(k)
++		vb, _ := hex.DecodeString(v)
++		m[string(kb)] = string(vb)
++	}
++	return m, nil
++}
++
++func showMap(m map[string]string) string {
++	ks := make([]string, 0, len(m))
++	for k := range m {
++		ks = append(ks, k)
++	}
++	sort.Strings(ks)
++	var b strings.Builder
++	for _, k := range ks {
++		fmt.Fprintf(&b, "  %q=%q\n", k, m[k])
++	}
++	return b.String()
++}
++
++// ---------------------------------------------------------------------------
++// Properties.
++
++// TestHegelParseMatchesRuby: Parse of a generated .env text gives the map
++// Ruby dotenv gives.
++func TestHegelParseMatchesRuby(t *testing.T) {
++	startOracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		e := genEnv(tc)
++		if !utf8.ValidString(e.text) {
++			panic("generator made invalid UTF-8")
++		}
++		want, rerr := ruby.parse(e.text)
++		got, gerr := unmarshal(e.text)
++		if gerr != nil {
++			if rerr != nil {
++				count("both reject")
++				return
++			}
++			if id := knownReject(e, gerr); id != "" {
++				count("known " + id)
++				return
++			}
++			fail(ht, "godotenv rejects (%v), Ruby dotenv gives\n%stext %q", gerr, showMap(want), e.text)
++		}
++		if rerr != nil {
++			count("ruby rejects: " + firstWords(rerr.Error()))
++			return
++		}
++		if id := known(e, got, want); id != "" {
++			count("known " + id)
++			return
++		}
++		if len(e.entries) > 0 {
++			count("entries")
++		}
++		for _, k := range sortedKeys(want, got) {
++			gv, gok := got[k]
++			wv, wok := want[k]
++			if gok != wok || gv != wv {
++				fail(ht, "key %q: godotenv %q (present %v), Ruby dotenv %q (present %v)\ngot:\n%swant:\n%stext %q",
++					k, gv, gok, wv, wok, showMap(got), showMap(want), e.text)
++			}
++		}
++	})
++}
++
++// unmarshal is godotenv.Unmarshal with panics turned into errors.
++func unmarshal(text string) (m map[string]string, err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("panic: %v", r)
++		}
++	}()
++	return godotenv.Unmarshal(text)
++}
++
++func sortedKeys(ms ...map[string]string) []string {
++	seen := map[string]bool{}
++	var ks []string
++	for _, m := range ms {
++		for k := range m {
++			if !seen[k] {
++				seen[k] = true
++				ks = append(ks, k)
++			}
++		}
++	}
++	sort.Strings(ks)
++	return ks
++}
++
++func firstWords(s string) string {
++	f := strings.Fields(s)
++	if len(f) > 3 {
++		f = f[:3]
++	}
++	return strings.Join(f, " ")
++}
++
++// TestHegelMarshalRoundTrip: Marshal of a map parses back to the same map
++// with godotenv and with Ruby dotenv.
++func TestHegelMarshalRoundTrip(t *testing.T) {
++	startOracle(t)
++	property(t, func(ht *hegel.T) {
++		var tc hegel.TestCase = ht
++		m := map[string]string{}
++		for k := n(tc, 0, 5); k > 0; k-- {
++			var v strings.Builder
++			for j := n(tc, 0, 3); j > 0; j-- {
++				v.WriteString(pick(tc, append(words, "\n", "\r", "\t", " ", "\\n", "$A", "${A}", "\\$A", " # c", "\"q\"", "'q'", "$(x)")...))
++			}
++			m[pick(tc, keys...)] = v.String()
++		}
++		text, err := godotenv.Marshal(m)
++		if err != nil {
++			fail(ht, "Marshal(%s): %v", showMap(m), err)
++		}
++		if id := knownMarshal(m, text); id != "" {
++			count("known " + id)
++			return
++		}
++		got, err := godotenv.Unmarshal(text)
++		if err != nil {
++			fail(ht, "Unmarshal(Marshal(m)): %v\nm:\n%stext %q", err, showMap(m), text)
++		}
++		if showMap(got) != showMap(m) {
++			fail(ht, "Unmarshal(Marshal(m)) differs\nm:\n%sgot:\n%stext %q", showMap(m), showMap(got), text)
++		}
++		if rubyCannotRead(m) {
++			count("backslash-n or trailing backslash: the references read Marshal's output differently")
++			return
++		}
++		want, rerr := ruby.parse(text)
++		if rerr != nil {
++			fail(ht, "Ruby dotenv rejects Marshal's output: %v\nm:\n%stext %q", rerr, showMap(m), text)
++		}
++		if showMap(want) != showMap(m) {
++			fail(ht, "Ruby dotenv reads Marshal's output differently\nm:\n%sruby:\n%stext %q", showMap(m), showMap(want), text)
++		}
++	})
++}
+diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
+new file mode 100644
+index 0000000..8b2be97
+--- /dev/null
++++ b/hegel/hegel_pins_test.go
+@@ -0,0 +1,73 @@
++package hegel
++
++import (
++	"testing"
++
++	"github.com/joho/godotenv"
++)
++
++// Pins: one deterministic reproducer per bug in bugs.toml. Each fails while
++// its bug is open. The expectations are what Ruby dotenv 3.2.0 (with
++// DOTENV_LINEBREAK_MODE=legacy) and Node dotenv 18 give for the same text.
++
++func parse(t *testing.T, text string) map[string]string {
++	t.Helper()
++	m, err := godotenv.Unmarshal(text)
++	if err != nil {
++		t.Fatalf("Unmarshal(%q): %v", text, err)
++	}
++	return m
++}
++
++// godotenv/1: a variable reference names any variable, in any case (Ruby
++// dotenv's pattern is case-insensitive, dotenv-expand's is \w+); godotenv's
++// pattern is [A-Z0-9_]+, so $low stays literal and ${Mixed_Case} substitutes
++// M and leaves ixed_Case}.
++func TestHegelPinLowerCaseReference(t *testing.T) {
++	m := parse(t, "low=2\nC=$low ${low}\nMixed_Case=5\nD=${Mixed_Case}\n")
++	if m["C"] != "2 2" {
++		t.Errorf("C=$low ${low} with low=2: %q; Ruby dotenv gives %q", m["C"], "2 2")
++	}
++	if m["D"] != "5" {
++		t.Errorf("D=${Mixed_Case} with Mixed_Case=5: %q; Ruby dotenv gives %q", m["D"], "5")
++	}
++}
++
++// godotenv/2: a value that is only a comment (KEY= # comment, KEY=#comment)
++// is the empty string; godotenv panics with an index out of range.
++func TestHegelPinCommentAsValuePanics(t *testing.T) {
++	for _, text := range []string{"A= # to be filled in\n", "A=#c\n", "A: # c\n"} {
++		func() {
++			defer func() {
++				if r := recover(); r != nil {
++					t.Errorf("Unmarshal(%q) panics: %v; Ruby and Node dotenv give A=\"\"", text, r)
++				}
++			}()
++			m := parse(t, text)
++			if m["A"] != "" {
++				t.Errorf("Unmarshal(%q): A=%q, want \"\"", text, m["A"])
++			}
++		}()
++	}
++}
++
++// godotenv/3: a quoted value ending with an escaped quote loses the quote:
++// the value between the quotes is trimmed of every quote character at both
++// ends instead of one.
++func TestHegelPinEscapedQuoteBeforeClosingQuote(t *testing.T) {
++	if m := parse(t, "B='it\\''\n"); m["B"] != "it\\'" {
++		t.Errorf("B='it\\'': %q; Ruby and Node dotenv give %q", m["B"], "it\\'")
++	}
++	if m := parse(t, "B=\"a\\\"\"\n"); m["B"] != "a\"" {
++		t.Errorf("B=\"a\\\"\": %q; Ruby dotenv gives %q", m["B"], "a\"")
++	}
++	// The package's own round trip.
++	in := map[string]string{"Q": "say \"hi\""}
++	text, err := godotenv.Marshal(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if out := parse(t, text); out["Q"] != in["Q"] {
++		t.Errorf("Unmarshal(Marshal(%q)) = %q (text %q)", in["Q"], out["Q"], text)
++	}
++}
+diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
+new file mode 100644
+index 0000000..3834107
+--- /dev/null
++++ b/hegel/hegel_test.go
+@@ -0,0 +1,134 @@
++package hegel
++
++// Hegel property tests for godotenv: generated .env texts, parsed by this
++// package and by Ruby dotenv (the library it is a port of), must give the
++// same map.
++//
++// Needs ruby with the dotenv gem.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"runtime/debug"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// ---------------------------------------------------------------------------
++// Plumbing.
++
++var (
++	collecting    = os.Getenv("HEGEL_COLLECT") != ""
++	collectedMu   sync.Mutex
++	collectedMsgs []string
++	countsMu      sync.Mutex
++	counts        = map[string]int{}
++	curT          testing.TB
++	firstFailure  sync.Once
++)
++
++type collected struct{}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	curT, firstFailure = t, sync.Once{}
++	countsMu.Lock()
++	counts = map[string]int{}
++	countsMu.Unlock()
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = nil
++		collectedMu.Unlock()
++	}
++	defer func() {
++		countsMu.Lock()
++		keys := make([]string, 0, len(counts))
++		for k := range counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		for _, k := range keys {
++			t.Logf("COUNT %s: %d", k, counts[k])
++		}
++		countsMu.Unlock()
++		if collecting {
++			collectedMu.Lock()
++			defer collectedMu.Unlock()
++			sort.Slice(collectedMsgs, func(i, j int) bool { return len(collectedMsgs[i]) < len(collectedMsgs[j]) })
++			t.Logf("COLLECT %s: %d mismatches", t.Name(), len(collectedMsgs))
++			for i, m := range collectedMsgs {
++				if i == 200 {
++					break
++				}
++				t.Logf("MISMATCH %d\n%s", i, m)
++			}
++		}
++	}()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if err, ok := r.(error); ok && strings.Contains(err.Error(), "hegel_") {
++				panic(r) // libhegel control flow
++			}
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			fail(ht, "panic in the harness: %v\n%s", r, debug.Stack())
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func hegelOpts() []hegel.Option {
++	opts := []hegel.Option{hegel.SuppressHealthCheck(hegel.TooSlow, hegel.TestCasesTooLarge, hegel.LargeInitialTestCase)}
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			opts = append(opts, hegel.WithTestCases(n))
++		}
++	}
++	return opts
++}
++
++// count tallies a kind of case that is noted, not failed.
++func count(kind string) {
++	countsMu.Lock()
++	counts[kind]++
++	countsMu.Unlock()
++}
++
++// fail reports a property failure; in collect mode it records the message
++// and moves on to the next case.
++func fail(ht *hegel.T, format string, args ...any) {
++	if collecting {
++		collectedMu.Lock()
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...))
++		collectedMu.Unlock()
++		panic(collected{})
++	}
++	msg := fmt.Sprintf(format, args...)
++	firstFailure.Do(func() {
++		if curT != nil {
++			curT.Logf("first failing case (before shrinking):\n%s", msg)
++		}
++	})
++	ht.Fatalf("%s", msg)
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
+diff --git a/hegel/known.go b/hegel/known.go
+new file mode 100644
+index 0000000..d44f309
+--- /dev/null
++++ b/hegel/known.go
+@@ -0,0 +1,95 @@
++package hegel
++
++import (
++	"os"
++	"regexp"
++	"strings"
++)
++
++// Gates for the recorded bugs (bugs.toml). A case that has a known bug's
++// shape is counted, not judged. HEGEL_NO_KNOWN=1 disables the gates.
++
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") != ""
++
++// known returns the id of a recorded bug whose shape the text has, given
++// both parsers' maps, or "".
++func known(e env, got, want map[string]string) string {
++	if noKnown {
++		return ""
++	}
++	for _, en := range e.entries {
++		if en.quote != '\'' && lowerRef.MatchString(unescape(en.raw)) {
++			return "godotenv/1"
++		}
++		if en.quote != 0 && endsWithEscapedQuote(en.raw, en.quote) {
++			return "godotenv/3"
++		}
++	}
++	return ""
++}
++
++// endsWithEscapedQuote: the quoted raw value's content ends with an escaped
++// quote (an odd run of backslashes and the quote) before the closing quote.
++func endsWithEscapedQuote(raw string, q byte) bool {
++	if len(raw) < 4 || raw[len(raw)-1] != q || raw[len(raw)-2] != q {
++		return false
++	}
++	bs := 0
++	for i := len(raw) - 3; i >= 1 && raw[i] == '\\'; i-- {
++		bs++
++	}
++	return bs%2 == 1
++}
++
++// unescape removes the backslashes of escapes other than \$, as both parsers
++// do before expanding references (so "$\t" and "$B\t" name t and Bt).
++func unescape(raw string) string {
++	return escapes.ReplaceAllString(raw, "$1")
++}
++
++var escapes = regexp.MustCompile(`\\([^$])`)
++
++// lowerRef: an unescaped reference to a name with a lower-case letter.
++var lowerRef = regexp.MustCompile(`(^|[^\\])\$\{?[A-Za-z0-9_]*[a-z]`)
++
++// valueIsComment: a separator followed by spaces and a #.
++var valueIsComment = regexp.MustCompile(`[=:][ \t]*#`)
++
++// knownReject gates godotenv's rejections of texts Ruby dotenv accepts.
++func knownReject(e env, err error) string {
++	if noKnown {
++		return ""
++	}
++	if strings.Contains(err.Error(), "index out of range [-1]") && valueIsComment.MatchString(e.text) {
++		return "godotenv/2"
++	}
++	return ""
++}
++
++// knownMarshal gates Marshal outputs Ruby dotenv reads differently.
++func knownMarshal(m map[string]string, text string) string {
++	if noKnown {
++		return ""
++	}
++	for _, v := range m {
++		if strings.HasSuffix(v, "\"") {
++			return "godotenv/3"
++		}
++	}
++	return ""
++}
++
++// rubyCannotRead reports whether a value of m has a backslash followed by n
++// or r, or ends with a backslash: Marshal writes them as \\n and \\" and
++// Ruby dotenv (legacy line-break mode, expanding \n before unescaping \\;
++// a regex that reads any backslash before a quote as an escape) and Node
++// dotenv (the same regex) read them as a backslash and a newline, and as an
++// escaped quote. Limitations of the references, not of the package.
++func rubyCannotRead(m map[string]string) bool {
++	for _, v := range m {
++		if strings.Contains(v, "\\n") || strings.Contains(v, "\\r") || strings.HasSuffix(v, "\\") {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/hegel/oracle.rb b/hegel/oracle.rb
+new file mode 100644
+index 0000000..3633269
+--- /dev/null
++++ b/hegel/oracle.rb
+@@ -0,0 +1,20 @@
++# Oracle for the zoo's godotenv tests: Ruby dotenv's parser, one request per
++# line on stdin. Request: the .env text as hex (UTF-8). Reply: "ok" followed by
++# " <hexkey>=<hexvalue>" per pair, or "error <hexmessage>".
++#
++# Run with a controlled environment (DOTENV_LINEBREAK_MODE=legacy so that \n in
++# double quotes is a newline, as in godotenv and dotenv 2.x).
++require "dotenv"
++
++STDOUT.sync = true
++while (line = STDIN.gets)
++  text = [line.chomp].pack("H*").force_encoding("UTF-8")
++  begin
++    h = Dotenv::Parser.call(text)
++    out = "ok"
++    h.each { |k, v| out << " " << k.unpack1("H*") << "=" << v.to_s.unpack1("H*") }
++    puts out
++  rescue Exception => e # FormatError is a SyntaxError, not a StandardError
++    puts "error " + "#{e.class}: #{e.message}".unpack1("H*")
++  end
++end
