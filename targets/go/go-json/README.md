@@ -129,3 +129,4 @@ as a 17-field struct in the probe behaving differently from an 8-field one.
 - The nesting limit of 10 000 is the same in both.
 - `MarshalNoEscape`, `UnmarshalNoEscape`, the `*Context` variants, `path.go`/`query.go` (JSON
   path and field queries) and the colour/debug output are not covered.
+- 2026-09-20: base bumped f1e755401429 → 15fe6a58bfc7 (2026-09-21, "Add bench-check task to fail CI on performance degradation (#623)"; v0.10.6+); 25 bug(s) still reproduce. 177 tests pass.

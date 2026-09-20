@@ -115,3 +115,4 @@ crate's `RequirementsTxt`.
 - 2026-09-18: base bumped a5a0b62c4912 → b28593f9a5c6 (2026-09-18, "fix docs publication to astral-sh/docs (#21832)"; 0.0.84); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-20: base bumped b28593f9a5c6 → 7b090fba99bc (2026-09-19, "Honor dependency metadata when checking installed requirements (#21843)"; 0.0.84); 4 bug(s) still reproduce. 55 tests pass.
 - 2026-09-20: base bumped 7b090fba99bc → 7f9bce21fbcb (2026-09-20, "Fix BSD and Haiku platform tag casing (#21853)"; 0.0.84); 4 bug(s) still reproduce. 55 tests pass.
+- 2026-09-20: base bumped 7f9bce21fbcb → 25ea3bcfbe6e (2026-09-20, "Materialize fake-uv without checkout symlinks (#21855)"; 0.0.84); 4 bug(s) still reproduce. 55 tests pass.
