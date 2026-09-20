@@ -21,3 +21,4 @@
 - 2026-09-13: base bumped 3a418c9ea586 → 1bc0cc4b752b (2026-09-04, "don't crash on division with i32::MIN (#695)"; 0.8.3); 3 bug(s) still reproduce; fixed upstream: steel/2; 1 ignored reproducer(s) not run. 37 tests pass. steel/2 is fixed by that very commit (PR #695): the division properties no longer exclude an i32::MIN divisor. steel/4 (process-aborting reproducer) was not run.
 - 2026-09-15: base bumped 1bc0cc4b752b → 21ea5eaa7880 (2026-09-14, "fix internal define ordering bug (#696)"; 0.8.3); 3 bug(s) still reproduce; 1 ignored reproducer(s) not run. 38 tests pass.
 - 2026-09-16: base bumped 21ea5eaa7880 → 24cd21598c09 (2026-09-15, "Mwp bytevector variants (#697)"; 0.8.3); 3 bug(s) still reproduce; 1 ignored reproducer(s) not run. 38 tests pass.
+- 2026-09-20: base bumped 24cd21598c09 → 2ef0a028f1f1 (2026-09-18, "fix macro expansion bug (#700)"; 0.8.3); 3 bug(s) still reproduce; 1 ignored reproducer(s) not run. 38 tests pass.
