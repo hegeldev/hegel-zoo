@@ -58,3 +58,4 @@
 - 2026-09-17: base bumped b6ba8c9cd596 → 9447f2ad9fcb (2026-09-17, "refactor(rust): Rename arrow(-format) to polars-arrow(-format) (#29356)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass. Harness: `use arrow::offset::OffsetsBuffer` became `polars_arrow::…` with upstream's crate rename (#29356).
 - 2026-09-17: base bumped 9447f2ad9fcb → 2ddc4d580e5b (2026-09-17, "feat: Add `APPROX_QUANTILE` to the SQL frontend (#29288)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-18: base bumped 2ddc4d580e5b → fe841f959ef4 (2026-09-18, "perf: Prepare Parquet scans for row-group splitting in Polars Cloud (#29295)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-20: base bumped fe841f959ef4 → 3f06658dfeca (2026-09-20, "release(python): Polars 2.0.0rc2 (#29355)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
