@@ -112,3 +112,4 @@ moving [4]; `IntLists.unmodifiable(list).size(n)` resizes the backing list [5];
 ## History
 
 - 2026-09-19: created at 46316b12 (8.5.19, 2026-07-22) with 13 properties and 6 bugs.
+- 2026-09-20: base bumped 46316b125eeb → cbf3c2ec706d (2026-09-13, "Merge pull request #384 from arimu1/fix/367-write-advance-position"; 8.5.19); 6 bug(s) still reproduce; 6 ignored reproducer(s) not run. 13 tests pass.
