@@ -67,3 +67,4 @@ a root when two successive iterates happen to fall within the accuracy (3).
 - Where a polynomial evaluates to rounding noise around a root, the solvers cannot tell the sides
   of the root apart; the sided-solution check accepts an answer whose function value is within a
   Horner rounding bound.
+- 2026-09-20: base bumped 7bc81e97e91d → 3c7e96cb47e2 (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 4.0-SNAPSHOT); 3 bug(s) still reproduce. 14 tests pass. The integrator property now counts, rather than fails, an O(h^2) rule (Trapezoid, MidPoint, one-point Legendre-Gauss) that exhausts its 100,000 evaluations on an integral cancelling to nearly zero (5x^4 - 3x^5 over [0, 2]): only the absolute tolerance is left to meet there.
