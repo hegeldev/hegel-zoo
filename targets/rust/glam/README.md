@@ -52,3 +52,4 @@
 - 2026-09-17: base bumped 296329c1dd4b → 3ccb58c04d04 (2026-09-17, "chore(bench): fold throughput into bench macros and document benchmarking (#852)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
 - 2026-09-17: base bumped 3ccb58c04d04 → d75cec20529b (2026-09-17, "perf(simd): broadcast dot product without an extra shuffle (#833)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
 - 2026-09-18: base bumped d75cec20529b → ca88a767ab3e (2026-09-18, "perf: use fma whenever the target supports it (#853)"; 0.33.7); 1 bug(s) still reproduce. 3466 tests pass.
+- 2026-09-20: base bumped ca88a767ab3e → 465b60040b40 (2026-09-20, "Prepare 0.33.8 release (#839)"; 0.33.8); 1 bug(s) still reproduce. 3466 tests pass.
