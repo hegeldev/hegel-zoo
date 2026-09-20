@@ -27,3 +27,4 @@
 - 2026-09-15: base bumped e96027477756 → 2fb9b8a66a62 (2026-09-15, "Merge pull request #2996 from GitoxideLabs/credential-helper-non-interactive"; 0.58.0); 2 bug(s) still reproduce. 656 tests pass.
 - 2026-09-16: base bumped 2fb9b8a66a62 → 2abc090968e5 (2026-09-16, "Merge pull request #3002 from GitoxideLabs/fix-8bit-date"; 0.58.0); 2 bug(s) still reproduce. 658 tests pass.
 - 2026-09-16: base bumped 2abc090968e5 → 77c8cd956c08 (2026-09-16, "Merge pull request #2999 from GitoxideLabs/sbom"; 0.58.0); 2 bug(s) still reproduce. 658 tests pass.
+- 2026-09-20: base bumped 77c8cd956c08 → a0e284cc8727 (2026-09-20, "Merge pull request #3007 from GitoxideLabs/add-ref-validation"; 0.58.0); 2 bug(s) still reproduce. 658 tests pass.
