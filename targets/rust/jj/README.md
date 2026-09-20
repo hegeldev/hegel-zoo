@@ -49,3 +49,4 @@
 - 2026-09-17: base bumped e6dd2c0d60f2 → f9588f37ec00 (2026-09-17, "revset: drop 'index lifetime from evaluate_revset()"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
 - 2026-09-17: base bumped f9588f37ec00 → a497458e49e8 (2026-09-17, "workspace remove: remove workspace directory"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
 - 2026-09-18: base bumped a497458e49e8 → bb9b8fac71fe (2026-09-18, "bisect: --trust-endpoints"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
+- 2026-09-20: base bumped bb9b8fac71fe → aa8c087f7d2f (2026-09-20, "config: Support `aliases.<name>.enabled = false`"; 0.45.1); 0 bug(s) still reproduce. 1958 tests pass.
