@@ -33,3 +33,4 @@
 - 2026-09-16: base bumped ed4b23aa0191 → 9ffad8d54139 (2026-09-16, "Refactor the benchmark suite (#619)"; 2.0.0-alpha.13); 0 bug(s) still reproduce. 90 tests pass.
 - 2026-09-16: base bumped 9ffad8d54139 → 1a1db06bc483 (2026-09-16, "chore: bump version (#615)"; 2.0.0-beta.1); 0 bug(s) still reproduce. 90 tests pass.
 - 2026-09-20: base bumped 1a1db06bc483 → 484d49c2fed9 (2026-09-20, "fix: correct bounds of unsafe send and sync implementation (#630)"; 2.0.0-beta.1); 0 bug(s) still reproduce. 90 tests pass.
+- 2026-09-20: base bumped 484d49c2fed9 → 402122cdf904 (2026-09-20, "ci: remove the SmallBot workflow (#641)"; 2.0.0-beta.1); 0 bug(s) still reproduce. 90 tests pass.

@@ -59,3 +59,4 @@
 - 2026-09-17: base bumped 9447f2ad9fcb → 2ddc4d580e5b (2026-09-17, "feat: Add `APPROX_QUANTILE` to the SQL frontend (#29288)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-18: base bumped 2ddc4d580e5b → fe841f959ef4 (2026-09-18, "perf: Prepare Parquet scans for row-group splitting in Polars Cloud (#29295)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
 - 2026-09-20: base bumped fe841f959ef4 → 3f06658dfeca (2026-09-20, "release(python): Polars 2.0.0rc2 (#29355)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
+- 2026-09-20: base bumped 3f06658dfeca → da47b7405f0e (2026-09-20, "perf: Order pushed parquet predicate columns by measured selectivity (#29397)"; 0.55.1); 0 bug(s) still reproduce. 10 tests pass.
