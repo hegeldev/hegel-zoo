@@ -27,3 +27,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/xml-rs.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 6def29fd97a1 → e2b391aba4ed (2026-08-11, "Support for ATTLIST CDATA default attribute value definitions."; 1.4.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run; add/add conflicts in tests/event_reader.rs, tests/event_writer.rs resolved by keeping both sides. 168 tests pass.
+- 2026-09-20: base bumped e2b391aba4ed → 45504757c87d (2026-09-19, "Expose element's own declared namespaces via an accessor"; 1.4.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run; add/add conflicts in tests/event_reader.rs resolved by keeping both sides. 172 tests pass.
