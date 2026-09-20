@@ -136,3 +136,4 @@ whitespace", but the Javadoc's own example `toCamelCase(" to @ Camel case", true
 space as a delimiter too; the model follows the examples); `AlphabetConverter.toString()` prints `char -> <code
 point>` instead of the encoding (no contract); `FuzzyScore` consumes the whole term on a missed
 query character, so later query characters cannot score (the Javadoc gives only the scoring rule).
+- 2026-09-20: base bumped ae3d36b8cea5 → 00be782c2bb4 (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 1.15.1-SNAPSHOT); 14 bug(s) still reproduce. 12 tests pass.

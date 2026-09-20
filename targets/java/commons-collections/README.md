@@ -113,3 +113,4 @@ elsewhere (documented); `LRUMap.get` during iteration throws `ConcurrentModifica
 ## History
 
 - 2026-09-16: created (turn 182) at 21d6821190e0 (4.6.1-SNAPSHOT of 2026-09-07, after 4.5.0); 14 bugs.
+- 2026-09-20: base bumped 21d6821190e0 → e68a90bcbe55 (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 4.6.1-SNAPSHOT); 14 bug(s) still reproduce. 14 tests pass.

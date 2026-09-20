@@ -60,3 +60,4 @@
   `engineering_notation_then_parse_roundtrips` is a new bug, **bigdecimal/4** — at scale i64::MAX
   `to_engineering_notation()` prints `100e-9223372036854775809`, which the crate's `FromStr`
   rejects with "Exponent overflow". Both pinned as intermittent expected failures.
+- 2026-09-20: base bumped 7f0243e73702 → 120166b6faaa (2026-09-20, "use the dep: syntax, in order to remove a duplicate feature name"; 0.5.0+dev); 2 bug(s) still reproduce; intermittent, not seen this run: bigdecimal/4; 1 ignored reproducer(s) not run. 1346 tests pass.

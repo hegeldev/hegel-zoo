@@ -45,3 +45,4 @@ metadata lost between writer and reader (a GNU long name next to a pax header, l
 NTFS extra inventing 1601-01-01 access times, 7z directory flags); `finish()`/`close()` contracts (gzip appends a bogus
 member, xz throws, zstd writes nothing, an empty LZ4 block throws); and small input-validation gaps in the compressors
 and utilities.
+- 2026-09-20: base bumped 62f794ce81f8 → 0fd3df607265 (2026-09-19, "Bump com.github.luben:zstd-jni from 1.5.7-16 to 1.5.7-17"; 1.29.0-SNAPSHOT); 38 bug(s) still reproduce. 16 tests pass.

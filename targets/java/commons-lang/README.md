@@ -155,3 +155,4 @@ tries `_` before `-`, so `"en-GB-a_b"` is invalid while `"en_GB_a_b"` has the va
 
 - 2026-09-16: created at 01a66dd2 (3.21.0-SNAPSHOT), 12 properties, 11 bugs.
 - 2026-09-18: base bumped 01a66dd238cb → d235f1e99752 (2026-09-18, "LANG-1834 Fix Fraction reduction for Integer.MIN_VALUE (#1794)."; 3.21.0-SNAPSHOT); 11 bug(s) still reproduce. 12 tests pass.
+- 2026-09-20: base bumped d235f1e99752 → 9c94f38ff471 (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 3.21.0-SNAPSHOT); 11 bug(s) still reproduce. 12 tests pass.

@@ -102,3 +102,4 @@ FastCSV 4.0.0 loses quoted fields that contain a lone CR (its own defect; the Fa
 ## History
 
 - 2026-09-16: created (turn 181) at bb0f0fbb0f84 (1.15.0-SNAPSHOT of 2026-09-07, after v1.14.1); 6 bugs.
+- 2026-09-20: base bumped bb0f0fbb0f84 → 417d6a4502a2 (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 1.15.0-SNAPSHOT); 6 bug(s) still reproduce. 5 tests pass.
