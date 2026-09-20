@@ -69,3 +69,4 @@ a midnight that may not exist; `Duration.parse` reads the `PTn.nS` form only; `P
 millis (compare `seconds*1000 + millis`); `forOffsetHoursMinutes(-1, 30)` and `(-1, -30)` both mean −01:30;
 `adjustOffset` is documented as best-effort ("non-pathological cases") — it fails inside a few long or adjacent
 historical overlaps, not recorded; the conversions overflow with `ArithmeticException` at the `long` extremes.
+- 2026-09-20: base bumped b80254120c5b → 13691681d373 (2026-09-19, "Release v2.14.4"; 2.14.4); 18 bug(s) still reproduce. 14 tests pass.
