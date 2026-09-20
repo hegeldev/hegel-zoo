@@ -95,3 +95,4 @@
 - 2026-09-20: base bumped a9579bdfd544 → 9bffbea2a4cc (2026-09-20, "minor: move `create_group_accumulator` out of the legacy aggregate stream (#25539)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.
 - 2026-09-20: base bumped 9bffbea2a4cc → 6700d02160b1 (2026-09-20, "test: bound merge fan-in in the final hash aggregate spill test (#25424)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.
 - 2026-09-20: base bumped 6700d02160b1 → 99af44a5e620 (2026-09-20, "dev: include generated config and function docs in the local lint suite (#25525)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.
+- 2026-09-20: base bumped 99af44a5e620 → 923d64fd5448 (2026-09-20, "fix: reject mixed-sign intervals in range functions (#25520)"; 55.1.0); 1 bug(s) still reproduce. 628 tests pass.
