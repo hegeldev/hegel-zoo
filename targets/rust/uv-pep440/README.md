@@ -109,3 +109,4 @@ candidates). Four `pep440_rs` pins hold here as regular properties, since the fo
 - 2026-09-18: base bumped d88bb84e7bd4 → a5a0b62c4912 (2026-09-18, "Remove guidance to add changelog introductions (#21818)"; 0.0.83); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-18: base bumped a5a0b62c4912 → b28593f9a5c6 (2026-09-18, "fix docs publication to astral-sh/docs (#21832)"; 0.0.84); 5 bug(s) still reproduce. 83 tests pass.
 - 2026-09-20: base bumped b28593f9a5c6 → 7b090fba99bc (2026-09-19, "Honor dependency metadata when checking installed requirements (#21843)"; 0.0.84); 5 bug(s) still reproduce. 83 tests pass.
+- 2026-09-20: base bumped 7b090fba99bc → 7f9bce21fbcb (2026-09-20, "Fix BSD and Haiku platform tag casing (#21853)"; 0.0.84); 5 bug(s) still reproduce. 83 tests pass.
