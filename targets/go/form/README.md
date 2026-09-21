@@ -49,18 +49,33 @@ one plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in go.mod (the
   mixed ("array/slice then array[idx]/slice[idx]"), `[key]` for string and integer keys,
   structs in slices and maps, nested slices with plain and indexed inner values, bare element
   keys, unrelated keys; the decoded struct and the error namespaces.
+- **A model of Decode over the whole universe into a pre-filled destination**: the values are
+  the encoding of another value of the same type under the same settings, some tokens
+  replaced by arbitrary ones, plus unrelated keys of every shape; fields present are set,
+  nested structs (also behind non-nil pointers) field by field, a slice's plain values
+  appended after its existing elements and its indexed values set in place, arrays in place,
+  map entries added or replaced, an unparsable value leaving its field alone with an error
+  under its namespace. Both anonymous modes, tag names, `RegisterTagNameFunc` variants.
+- **Custom type functions** on both sides (a string type, a struct type written as one or two
+  values, `time.Time` as a date; failing on a chosen text) for fields in every position:
+  direct, behind pointers, in slices and arrays (indexed), as map keys (the first value) and
+  values, in nested structs and slices and maps of structs; `Encode` against the encoder model
+  with the functions as hooks (values and error namespaces), the round trip, and the decoder
+  model on a pre-filled destination.
 
 ## Properties
 
-`TestHegelRoundTrip`, `TestHegelEncodeModel`, `TestHegelScalars`, `TestHegelIndexed`; the
-pins `TestHegelPin*`.
+`TestHegelRoundTrip`, `TestHegelEncodeModel`, `TestHegelScalars`, `TestHegelIndexed`,
+`TestHegelDecodeModel`, `TestHegelCustomTypes`; the pins `TestHegelPin*`.
 
 ## Bugs
 
-Five, in `bugs.toml`: two panics on input (a key with a stray `]` or an unclosed `[`; an
+Seven, in `bugs.toml`: two panics on input (a key with a stray `]` or an unclosed `[`; an
 `interface{}` field that already holds a value), nil elements of a slice of interfaces losing
-the positions of the others, an unparsable time zeroing its field, and map keys with brackets
-written unescaped so that they cannot be read back.
+the positions of the others, an unparsable time zeroing its field, map keys with brackets
+written unescaped so that they cannot be read back, and two panics on custom type functions
+used for map keys (an encoder function returning no values, a decoder function returning
+nil).
 
 ## Modelled as recorded
 
@@ -69,15 +84,24 @@ written unescaped so that they cannot be read back.
   slices as the encoder does (bug 3).
 - The scalar model zeroes a time field on a parse error (bug 4) and does not pre-fill the
   `interface{}` field (bug 2).
-- The key model skips cases with a key the decoder panics on (bug 1).
+- The key model skips cases with a key the decoder panics on (bug 1); the decoder model
+  clears the pre-filled interface fields (bug 2) and skips map keys with brackets (bug 5).
+- Bugs 6 and 7 have pins only: the custom functions of the property always return a value.
 
 ## Not tested
 
-Custom type functions (`RegisterCustomTypeFunc`, `RegisterTagNameFunc`), `json.Unmarshaler`
-or `TextUnmarshaler` destinations (unsupported by design), decoding into pre-filled containers
-(existing slices, maps and pointers), the exact error messages, concurrency of the shared
-struct cache, the warning printed for values beyond an array's length.
+`json.Unmarshaler` or `TextUnmarshaler` destinations (unsupported by design), custom
+functions returning a value of the wrong type or given no values (a user error: `vals[0]`
+in the documented example panics on a key present with no values), `SetMaxArraySize` against
+a pre-filled slice with spare capacity (deliberately unchecked), the exact error messages,
+concurrency of the shared struct cache, the warning printed for values beyond an array's
+length. Two quirks are recorded here rather than as bugs: with lower-case field names and an
+empty namespace prefix, `In.S` and `Ins` both become `ins` (an inherent collision, so the
+generator avoids it); a decoder custom function for the element type of a slice given plain
+repeated values receives the values from its element to the end, not just its own.
 
 ## History
 
 - 2026-09-21: new target at v4.5.0; four properties, five bugs.
+- 2026-09-21: the decoder model on pre-filled destinations, custom type functions and
+  `RegisterTagNameFunc`; two more bugs (6, 7).
