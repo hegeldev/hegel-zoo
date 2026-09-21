@@ -4,7 +4,9 @@ Hegel property tests for [olekukonko/tablewriter](https://github.com/olekukonko/
 the ASCII/Unicode table renderer: its helper packages `pkg/twwidth` (display widths of strings
 holding ANSI escape sequences, truncation, the tab width), `pkg/twwarp` (word splitting and
 minimum-raggedness wrapping) and `tw` (padding, header title formatting, camel-case splitting,
-break points).
+break points); and the table's Markdown and HTML renderings (`renderer.NewMarkdown`,
+`renderer.NewHTML`) with header, rows and footer, trimming, auto-formatting, alignments and
+AutoHide.
 
 ## Build
 
@@ -32,6 +34,15 @@ comments (`Title`'s dot rule, `SplitCamelCase`'s classes and the upper-run lendi
 rune, `IsNumeric` as `Atoi`/`ParseFloat`, `BreakPoint` over the visible width, the `Pad`
 family by gap).
 
+For the table, a model of the documented pipeline: cells trimmed by `TrimSpace`/`TrimTab`,
+tabs expanded, header (and optionally row/footer) cells auto-formatted through
+`SplitCamelCase` and `Title`, split at newlines into visual lines, a blank later line of a
+record dropped (`TrimLine`), column widths the widest cell plus the padding; the Markdown
+cells padded to the column width by the alignment rules (an explicit body alignment, else the
+header's, else centre; at least three characters), the separator row `:--`/`--:`/`:-:` per
+column; the HTML sections (`thead`/`tbody`/`tfoot`, classes, `text-align` styles for the
+explicit alignments, `html.EscapeString` unless disabled), exact to the byte.
+
 ## Properties
 
 - `TestHegelWidth`: `Width`, `WidthNoCache`, `WidthWithOptions`, `Filter`, `SetOptions`,
@@ -40,10 +51,15 @@ family by gap).
 - `TestHegelWrap`: `SplitWords`, `WrapWords`, `WrapString`, `WrapStringWithSpaces`.
 - `TestHegelFn`: `tw.Title`, `tw.SplitCamelCase`, `tw.IsNumeric`, `tw.BreakPoint`, `tw.Pad`,
   `tw.PadLeft`, `tw.PadRight`, `tw.PadCenter`.
+- `TestHegelMarkdown`: `NewTable` + `Header`/`Append`/`Footer`/`Render` with
+  `renderer.NewMarkdown`, under `WithTrimSpace`, `WithTrimTab`, `With{Header,Row,Footer}AutoFormat`,
+  `With{Header,Row,Footer}AlignmentConfig`, `WithAutoHide`, `WithHeaderControl`, `WithFooterControl`.
+- `TestHegelHTML`: the same with `renderer.NewHTML` and its `HTMLConfig` (escaping, classes,
+  `AddLinesTag`).
 
 ## Bugs
 
-Eight, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
+Twelve, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
 detection (1, medium); `Width`'s cache is not purged when the tab width changes (2, medium).
 Widths: emoji sequences (VS16, ZWJ, flags, modifiers) are measured rune by rune (3).
 `Truncate`: an ESC inside a sequence restarts the scan, so an `ESC \`-terminated OSC (a
@@ -51,7 +67,12 @@ hyperlink) swallows the rest of the string (4, medium); at width 0 the documente
 returned (5). Wrapping: `WrapStringWithSpaces` splits a multi-byte last rune, mis-measuring the
 last word and returning a limit its lines exceed (6, medium). `tw`: `BreakPoint` counts the
 characters of escape sequences, so `WrapBreak` cuts coloured text inside its sequence (7,
-medium); `SplitCamelCase` keeps groups of several underscores (8).
+medium); `SplitCamelCase` keeps groups of several underscores (8). Table: the Markdown
+renderer does not escape `|` in cells (9, medium); a cell with newlines becomes extra
+Markdown/HTML rows and one `<thead>`/`<tfoot>` per header/footer line, the renderers' `<br>`
+code being unreachable (10, medium); the Markdown and HTML renderers render the columns
+`AutoHide` hides (11, medium); `WithColumnMax` is shared by the columns though documented as a
+column width, emptying cells under `WrapTruncate` (12).
 
 ## Modelled as recorded, not counted
 
@@ -68,4 +89,8 @@ medium); `SplitCamelCase` keeps groups of several underscores (8).
 - `IsNumeric` accepts whatever `ParseFloat` accepts: `inf`, `NaN`, `1_000`, hexadecimal floats.
 - The `Pad` family repeats the padding string by characters, not columns (a wide padding
   character over-pads), and `Pad` with an unknown alignment pads right.
-- The table itself (`tablewriter.Table`, the renderers) is not yet exercised.
+- Table: a record without cells is dropped; a header or footer of zero cells is not rendered;
+  the Markdown footer cells take the body's alignment (one alignment per column); Markdown
+  always pads with at least a space even under `PaddingNone`; escape sequences in cells are
+  written raw. Merges, width constraints, captions, streaming, `Bulk`/struct input and the
+  boxed renderers (Blueprint, Colorized, Ocean, SVG) are not yet exercised.
