@@ -9,7 +9,9 @@ break points); and the table's Markdown, HTML and boxed renderings (`renderer.Ne
 with header, rows and footer, trimming, auto-formatting, alignments, padding, AutoHide, the
 width constraints (`WithColumnWidths`, `With{Header,Row,Footer}MaxWidth`, `WithMaxWidth`) with
 the wrap modes, and captions; and the input conversion of `Append`/`Bulk` (`[]string`, `[]any`,
-typed slices, single values, structs with `tw`/`json`/`db` tags and AutoHeader).
+typed slices, single values, structs with `tw`/`json`/`db` tags and AutoHeader); and cell
+merging (`With{Header,Row,Footer}MergeMode`: horizontal, vertical, hierarchical and their
+combinations, `Merging.ByColumnIndex`).
 
 ## Build
 
@@ -76,6 +78,23 @@ The generated values include nil pointers, typed nils in interfaces, `sql.Null*`
 validities, readers of 0-600 bytes, embedded structs by value and by (nil or set) pointer, and
 dynamic struct types built with `reflect.StructOf`.
 
+Cell merging, from `prepareWithMerges` and the merge passes: in a header, record or footer
+with the horizontal bit, a run of equal non-empty logical cells (the visual lines joined and
+trimmed; `-` never merges) merges into its first column and the others are blanked; a footer's
+leading empty cells merge with its first content cell, which moves to column 0 (the `TOTAL`
+pattern); with the vertical bit a run of equal non-empty cells down a column merges, and with
+the hierarchical bit a cell merges with the one above only when it is the first column or the
+cell to its left merged too (the passes run horizontal, vertical, hierarchical, each on the
+content the previous one left); `ByColumnIndex` restricts the vertical and hierarchical
+passes. The rendering follows `renderLine` and `Junction`: a merge's first cell spans the
+widths of its columns and their separators (a row's from the normalized widths at render
+time, a header's or footer's as pre-computed), the continuing cells print nothing, a cell
+continuing a vertical or hierarchical merge is blank, an `AlignNone` cell starting a footer
+merge or following a `total` cell is right-aligned, and a separator line's segments are
+spaces where a vertical merge passes through, its junction glyphs chosen by the merge states
+above and below (the column glyph inside a pass-through, the mid-left/mid-right glyphs at its
+edges, the top-mid/bottom-mid glyphs where a horizontal span ends above or below).
+
 ## Properties
 
 - `TestHegelWidth`: `Width`, `WidthNoCache`, `WidthWithOptions`, `Filter`, `SetOptions`,
@@ -99,10 +118,15 @@ dynamic struct types built with `reflect.StructOf`.
   (`StyleASCII` to `StyleGraphical`, `StyleMarkdown` and `StyleNone` included), every state of
   `Borders`, `Separators` and `Lines`, and `WithPadding` (default, none, `*`/`**`, `""`/`>`);
   exact output, and every line of a bordered table as wide as the others.
+- `TestHegelMerge`: the boxed rendering with `With{Header,Row,Footer}MergeMode`
+  (`MergeVertical`, `MergeHorizontal`, `MergeBoth`, `MergeHierarchical` and, through
+  `Configure`, the combinations 5-7), `Row.Merging.ByColumnIndex`, over cells from a small pool
+  so that equal neighbours are common, with `AutoHide`, padding and every rendition setting;
+  exact output.
 
 ## Bugs
 
-Thirty-two, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
+Thirty-five, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
 detection (1, medium); `Width`'s cache is not purged when the tab width changes (2, medium).
 Widths: emoji sequences (VS16, ZWJ, flags, modifiers) are measured rune by rune (3).
 `Truncate`: an ESC inside a sequence restarts the scan, so an `ESC \`-terminated OSC (a
@@ -135,7 +159,11 @@ dereferences) panics (26, high); `sql.NullInt32`/`NullInt16`/`NullByte` render a
 (27); a `[]byte` row is a numeric cell per byte, against the code's own comment (28); an
 `io.Reader` of exactly 512 bytes gets the ellipsis (29); a nil embedded struct pointer drops
 its columns and misaligns AutoHeader (30, medium); an error or reader appended alone is an
-empty row (31); AutoHeader's extraction consumes the first row's readers (32).
+empty row (31); AutoHeader's extraction consumes the first row's readers (32). Merges: the
+top border has no junction after a merged header cell, the row glyph standing where the header
+line has its separator (33); a merged header keeps the widths of the columns `AutoHide` hides,
+so the header line is wider than the rows (34, medium); the footer's lead merge drops the
+later lines of a multi-line cell (35).
 
 ## Modelled as recorded, not counted
 
@@ -178,5 +206,14 @@ empty row (31); AutoHeader's extraction consumes the first row's readers (32).
   from its first element even after rows were appended; `IsZero` for `omitempty` looks at the
   interface for interface-typed fields, so a typed nil inside one is not zero; the `tw` tag's
   `align`, `max_width`, `pad_*`, `trim_*`, `auto_format` and `wrap` keys (table-wide side
-  effects applied on the first row only) are not generated. Merges, streaming, `NewCSV` and
-  the Colorized, Ocean and SVG renderers are not yet exercised.
+  effects applied on the first row only) are not generated.
+- Merges: `-` never merges (a placeholder); a horizontal merge compares the logical cell (all
+  visual lines joined), so `x\ny` merges with `x\ny` only; the vertical pass runs over the
+  horizontally merged content, so a cell blanked by a horizontal merge cannot start a vertical
+  run; a vertical run continues across a record without cells; the hierarchical pass compares
+  a snapshot taken after the vertical pass; the `total` rule looks at the previous cell of the
+  same visual line; the header's and footer's `MergeMode` use only the horizontal bit;
+  `TrimLine` drops a visual line blanked by a merge; `Behavior.Compact.Merge` and the
+  merged-header expansion (never reached: each column is at least as wide as the shared header
+  cell) are not generated. Streaming, `NewCSV` and the Colorized, Ocean and SVG renderers are
+  not yet exercised.
