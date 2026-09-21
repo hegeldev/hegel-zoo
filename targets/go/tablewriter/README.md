@@ -8,7 +8,8 @@ break points); and the table's Markdown, HTML and boxed renderings (`renderer.Ne
 `renderer.NewHTML`, `renderer.NewBlueprint` under every border style and rendition setting)
 with header, rows and footer, trimming, auto-formatting, alignments, padding, AutoHide, the
 width constraints (`WithColumnWidths`, `With{Header,Row,Footer}MaxWidth`, `WithMaxWidth`) with
-the wrap modes, and captions.
+the wrap modes, and captions; and the input conversion of `Append`/`Bulk` (`[]string`, `[]any`,
+typed slices, single values, structs with `tw`/`json`/`db` tags and AutoHeader).
 
 ## Build
 
@@ -63,6 +64,18 @@ column width outright (0 hides the column). A caption is wrapped to its width, e
 (else its own for a table under five cells), padded to that target by its alignment or the
 spot's default, and printed above or below; side spots print nothing.
 
+Input conversion, from the code's documented cases: a cell value is its `Format()`, else its
+`io.Reader` content up to 512 bytes, else the `sql.Null*` value or empty, else `string([]byte)`,
+`Error()`, `String()`, the `strconv` form of a basic type, and `fmt.Sprintf("%v")` for the
+rest; a row is a `[]string`, a `[]any` or typed slice of cells, a Formatter/Stringer alone, a
+struct or pointer to one reflected into its exported fields (embedded structs recursively; the
+`tw` tag's `-` and `name=`, the first non-empty `json`/`db` tag naming the column, `-` skipping
+it and `,omitempty` blanking a zero value; the header names titled), else one cell. AutoHeader
+takes the header from the first struct appended (Bulk: its first element) when none is set.
+The generated values include nil pointers, typed nils in interfaces, `sql.Null*` with both
+validities, readers of 0-600 bytes, embedded structs by value and by (nil or set) pointer, and
+dynamic struct types built with `reflect.StructOf`.
+
 ## Properties
 
 - `TestHegelWidth`: `Width`, `WidthNoCache`, `WidthWithOptions`, `Filter`, `SetOptions`,
@@ -80,6 +93,8 @@ spot's default, and printed above or below; side spots print nothing.
   negative widths), `With{Header,Row,Footer}MaxWidth`, `WithMaxWidth`,
   `With{Header,Row,Footer}AutoWrap` (all four modes) and `Caption` (every spot, alignment and
   width), exact output.
+- `TestHegelInput`: `Append` (single, variadic, slices), `Bulk`, `Configure` with
+  `Behavior.Structs.AutoHeader`, an explicit `Header`, checked through the Markdown rendering.
 - `TestHegelBlueprint`: the same with `renderer.NewBlueprint` over the eleven border styles
   (`StyleASCII` to `StyleGraphical`, `StyleMarkdown` and `StyleNone` included), every state of
   `Borders`, `Separators` and `Lines`, and `WithPadding` (default, none, `*`/`**`, `""`/`>`);
@@ -87,7 +102,7 @@ spot's default, and printed above or below; side spots print nothing.
 
 ## Bugs
 
-Twenty-four, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
+Thirty-two, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
 detection (1, medium); `Width`'s cache is not purged when the tab width changes (2, medium).
 Widths: emoji sequences (VS16, ZWJ, flags, modifiers) are measured rune by rune (3).
 `Truncate`: an ESC inside a sequence restarts the scan, so an `ESC \`-terminated OSC (a
@@ -114,7 +129,13 @@ one-cell column wider than its cell lines (21). Captions and widths: a caption a
 on a centre or right spot is realigned to the spot's default, `AlignDefault` being `AlignLeft`
 (22); with a caption an empty table becomes hard-coded `+--+` lines in any style (23);
 `WithMaxWidth` does not bound the table width - padding, separators and borders are uncounted
-and long words widen the columns (24, medium).
+and long words widen the columns (24, medium). Input: pointers to basic types render as
+addresses (25, medium); a nil `*time.Time` (any nil pointer whose `String()`/`Error()`
+dereferences) panics (26, high); `sql.NullInt32`/`NullInt16`/`NullByte` render as `{5 true}`
+(27); a `[]byte` row is a numeric cell per byte, against the code's own comment (28); an
+`io.Reader` of exactly 512 bytes gets the ellipsis (29); a nil embedded struct pointer drops
+its columns and misaligns AutoHeader (30, medium); an error or reader appended alone is an
+empty row (31); AutoHeader's extraction consumes the first row's readers (32).
 
 ## Modelled as recorded, not counted
 
@@ -150,5 +171,12 @@ and long words widen the columns (24, medium).
   space before the break character and drops a blank visual line; `WithColumnMax`
   (`Widths.Global`, bug 12) and its shrinking pass are not generated; the side caption spots
   (`SpotLeftTop` ...) are defined but print nothing; a caption's `Width` pads the caption to
-  that width even when the table is wider or narrower. Merges, streaming, `Bulk`/struct input
-  and the Colorized, Ocean and SVG renderers are not yet exercised.
+  that width even when the table is wider or narrower.
+- Input: a struct appended alone is a row of its fields even when `convertToString` has a case
+  for the type (`sql.NullString` alone is two cells, `String` and `Valid`); a nil pointer to a
+  struct is the cell `<nil>`; a `[]int32` is numbers, not runes; `Bulk` takes the AutoHeader
+  from its first element even after rows were appended; `IsZero` for `omitempty` looks at the
+  interface for interface-typed fields, so a typed nil inside one is not zero; the `tw` tag's
+  `align`, `max_width`, `pad_*`, `trim_*`, `auto_format` and `wrap` keys (table-wide side
+  effects applied on the first row only) are not generated. Merges, streaming, `NewCSV` and
+  the Colorized, Ocean and SVG renderers are not yet exercised.
