@@ -48,15 +48,30 @@ plain test per bug), requires `hegel.dev/go/hegel v0.6.33` in go.mod and raises 
   lookup methods (`Insert`, `Set`/`SetKey`, `Append`, `SetIndex`, `DeleteIndex`, `DeleteKey`,
   `AtIndex`, `AtKey`, `NI`, `NK`, `NKC`, `Len`) with their documented return values and errors,
   on object and array nodes.
+- **encoding/json on typed destinations**: a generated Hjson object (quoteless, quoted and
+  multiline values, arrays, objects, keys in several spellings, unknown and duplicate keys)
+  decodes into a possibly pre-filled struct with fields of every kind (`string`, `*string`,
+  numbers, `bool`, `json.Number`, `interface{}`, slices, arrays, maps, a `TextUnmarshaler`
+  type, nested and embedded structs, `ElemTyper` types, a `json` tag) exactly as encoding/json
+  decodes the JSON text in which each quoteless token is a string when its destination is
+  string-typed (README: "A string destination will receive a string even if the quoteless
+  string also was a valid number, boolean or null") and the raw token otherwise; with
+  `UseJSONNumber` and `DisallowUnknownFields` too.
+- **encoding/json on Marshaler values**: a value with `json.Marshaler` and
+  `encoding.TextMarshaler` parts (value and pointer receivers, direct, behind pointers, in
+  struct fields, lists and maps, as map keys) marshals to Hjson that decodes to what
+  encoding/json writes for it; a failing `MarshalJSON` fails `Marshal`; maps with
+  `TextMarshaler` keys are written in key order.
 
 ## Properties
 
 `TestHegelJSON`, `TestHegelParse`, `TestHegelRoundTrip`, `TestHegelTypedRoundTrip`,
-`TestHegelNodeFixedPoint`, `TestHegelOrderedMap`, `TestHegelNodeAPI`.
+`TestHegelNodeFixedPoint`, `TestHegelOrderedMap`, `TestHegelNodeAPI`, `TestHegelTypedHints`,
+`TestHegelMarshalers`.
 
 ## Bugs
 
-Twelve, in `bugs.toml`. The parser combines no `\u` surrogate pairs (1); `Node.Insert` shadows
+Sixteen, in `bugs.toml`. The parser combines no `\u` surrogate pairs (1); `Node.Insert` shadows
 its return values (2); the encoder's single-line `'''` form loses leading whitespace (4) and
 breaks the document for strings ending in a quote (5); quoteless strings are trimmed of Unicode
 spaces the encoder does not quote (6); multi-line `comment` tags are split on `Eol`, so CRLF
@@ -64,7 +79,11 @@ output does not parse (7); a root string with a colon reads back as an object (9
 round trip doubles the base indentation (3), doubles the CR of CRLF line ends (8) and adds a
 blank line before a multiline string in an array (10); `1.` fails with "Internal error" into
 `interface{}` but is 1 in a `Node` (11), and `1e400` is a string in a `Node` but an error into
-`interface{}` (12).
+`interface{}` (12). The encoder never calls a pointer-receiver `MarshalJSON` or `MarshalText`
+(13) and sorts `TextMarshaler` map keys by their Go value rather than their text (15); the
+type hint that keeps a quoteless number a string is missing for `TextUnmarshaler` slice
+elements, map values and fields behind a nil pointer (14) and for keys encoding/json folds onto
+a field but `strings.ToLower` does not (16).
 
 ## Modelled as recorded
 
@@ -76,17 +95,22 @@ blank line before a multiline string in an array (10); `1.` fails with "Internal
   string in an array (10; skipped when `IndentBy` is empty or a string ends in a line feed,
   where the layout is ambiguous).
 - The typed round trip skips a multi-line `comment` tag under CRLF (7).
+- The typed-hints model gives no string hint to pointer-receiver `TextUnmarshaler` elements,
+  map values and fields behind a nil pointer (14) and looks fields up by `strings.ToLower` (16);
+  the Marshaler model replaces pointer-receiver marshalers by their fields (13) and sorts
+  `TextMarshaler` map keys by `fmt %v` of the key (15).
 - The grammar model generates no `1.`-style numbers, no exponents beyond float64 and no root
   quoteless strings with a colon; surrogate pairs decode as two U+FFFD (1) in both decoding
   properties.
 
 ## Not tested
 
-`ElemTyper`, `json.Marshaler`/`TextMarshaler` values in the encoder, `json.Unmarshaler`
-destinations, `DisallowUnknownFields`, the struct field type hints for quoteless values in
-nested and pre-filled destinations, the `hjson-cli` tool, the comment-carrying `Node` round
-trip of hand-written documents (comments in every position), the nesting-depth limits.
+`json.Unmarshaler` destinations, the `hjson-cli` tool, the comment-carrying `Node` round trip
+of hand-written documents (comments in every position), the nesting-depth limits, the
+`Marshal`/`Unmarshal` of `Node` trees inside other values.
 
 ## History
 
 - 2026-09-21: created at v4.7.1 (`033fae8`); 12 bugs.
+- 2026-09-21: typed destinations (`TestHegelTypedHints`) and Marshaler values
+  (`TestHegelMarshalers`); bugs 13-16.

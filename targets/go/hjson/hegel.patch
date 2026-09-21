@@ -698,6 +698,634 @@ index 0000000..b9a2804
 +	}
 +	return s
 +}
+diff --git a/hegel/hegel_hints_test.go b/hegel/hegel_hints_test.go
+new file mode 100644
+index 0000000..625a307
+--- /dev/null
++++ b/hegel/hegel_hints_test.go
+@@ -0,0 +1,622 @@
++package hegel
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++
++	hjson "github.com/hjson/hjson-go/v4"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- typed destinations
++//
++// Hjson's quoteless values are typed by their destination: "A string destination will receive
++// a string even if the quoteless string also was a valid number, boolean or null" (README);
++// otherwise a quoteless number, true, false or null is that value. Destinations that implement
++// encoding.TextUnmarshaler count as strings; a type implementing ElemTyper types all of its
++// elements; the rest is encoding/json ("the same rules apply"). The model here reads a
++// generated document into the JSON text encoding/json would need to give the same result: each
++// quoteless token becomes a JSON string when its destination is string-typed, and the raw
++// token otherwise.
++
++// textVal is a TextUnmarshaler with a pointer receiver (like time.Time, net.IP, big.Int).
++type textVal struct{ S string }
++
++func (t *textVal) UnmarshalText(b []byte) error { t.S = "T:" + string(b); return nil }
++
++type hintedInner struct {
++	S   string
++	I   int
++	T   textVal
++	Any interface{}
++}
++
++type hintedEmb struct {
++	Emb  string
++	EmbN float64
++}
++
++// elemStrs types its elements as strings (value receiver).
++type elemStrs []interface{}
++
++func (elemStrs) ElemType() reflect.Type { return reflect.TypeOf("") }
++
++// elemMap types its values as strings (pointer receiver, callable on nil).
++type elemMap map[string]interface{}
++
++func (*elemMap) ElemType() reflect.Type { return reflect.TypeOf("") }
++
++// elemStruct types all of its fields' values as strings.
++type elemStruct struct {
++	A interface{}
++	B interface{}
++}
++
++func (elemStruct) ElemType() reflect.Type { return reflect.TypeOf("") }
++
++type hinted struct {
++	S   string
++	PS  *string
++	I   int
++	F   float64
++	B   bool
++	N   json.Number
++	Any interface{}
++	SS  []string
++	SA  []interface{}
++	AS  [2]string
++	MS  map[string]string
++	MA  map[string]interface{}
++	T   textVal
++	PT  *textVal
++	TS  []textVal
++	TM  map[string]textVal
++	Sub *hintedInner
++	In  hintedInner
++	hintedEmb
++	Rn   string `json:"renamed"`
++	Skip string `json:"-"`
++	ES   elemStrs
++	EM   elemMap
++	EST  elemStruct
++	AB   int
++	Ab   string
++}
++
++// prefill holds the drawn initial state of a destination, so that both decoders start from
++// equal values (json.Decoder merges into pre-filled destinations).
++type prefill struct {
++	s, ps, rn string
++	hasPS     bool
++	i         int
++	any       int // 0 nil, 1 string, 2 number, 3 map, 4 array
++	sub       bool
++	subAny    int
++	ss        []string
++	ms        map[string]string
++	ma        int
++}
++
++func genPrefill(tc hegel.TestCase) prefill {
++	p := prefill{
++		s:      pick(tc, []string{"", "old", "1"}),
++		i:      drawInt(tc, -3, 3),
++		any:    drawInt(tc, 0, 4),
++		sub:    chance(tc, 50),
++		subAny: drawInt(tc, 0, 2),
++		rn:     pick(tc, []string{"", "r"}),
++		ma:     drawInt(tc, 0, 2),
++	}
++	if chance(tc, 40) {
++		p.hasPS, p.ps = true, pick(tc, []string{"", "p", "7"})
++	}
++	if chance(tc, 30) {
++		p.ss = []string{"x", "y"}
++	}
++	if chance(tc, 30) {
++		p.ms = map[string]string{"k": "v"}
++	}
++	return p
++}
++
++func anyValue(kind int) interface{} {
++	switch kind {
++	case 1:
++		return "old"
++	case 2:
++		return 1.5
++	case 3:
++		return map[string]interface{}{"T": "s", "k": 2.0}
++	case 4:
++		return []interface{}{"a", 1.0}
++	}
++	return nil
++}
++
++func (p prefill) build() *hinted {
++	h := &hinted{S: p.s, I: p.i, Any: anyValue(p.any), Rn: p.rn, Skip: "kept"}
++	if p.hasPS {
++		s := p.ps
++		h.PS = &s
++	}
++	if p.sub {
++		h.Sub = &hintedInner{S: "s", Any: anyValue(p.subAny)}
++	}
++	if p.ss != nil {
++		h.SS = append([]string{}, p.ss...)
++	}
++	if p.ms != nil {
++		h.MS = map[string]string{}
++		for k, v := range p.ms {
++			h.MS[k] = v
++		}
++	}
++	switch p.ma {
++	case 1:
++		h.MA = map[string]interface{}{}
++	case 2:
++		h.MA = map[string]interface{}{"a": "b"}
++	}
++	return h
++}
++
++// ---- the model of the destination type at a position
++
++var textUnmarshalerT = reflect.TypeOf((*interface{ UnmarshalText([]byte) error })(nil)).Elem()
++var elemTyperT = reflect.TypeOf((*hjson.ElemTyper)(nil)).Elem()
++
++// hint is a destination: the value being decoded into (invalid when the parser tracks none)
++// and its static type (nil when unknown).
++type hint struct {
++	dest reflect.Value
++	t    reflect.Type
++	fold bool // match keys as encoding/json does whatever Known.foldKeys says (the shape a value must have)
++}
++
++// unravel follows the destination through non-nil pointers and interfaces, then the type
++// through pointers.
++func (h hint) unravel() (reflect.Value, reflect.Type) {
++	d, t := h.dest, h.t
++	if d.IsValid() {
++		for (d.Kind() == reflect.Ptr || d.Kind() == reflect.Interface) && !d.IsNil() {
++			d = d.Elem()
++		}
++		if d.IsValid() {
++			t = d.Type()
++		}
++	}
++	for t != nil && t.Kind() == reflect.Ptr {
++		t = t.Elem()
++	}
++	return d, t
++}
++
++// isString: a quoteless value here is a string whatever it spells.
++func (h hint) isString() bool {
++	_, t := h.unravel()
++	if t == nil {
++		return false
++	}
++	if t.Kind() == reflect.String || (h.t != nil && h.t.Implements(textUnmarshalerT)) {
++		return true
++	}
++	if Known.textElemHint {
++		// The parser only asks the destination's address, which exists for struct fields it
++		// tracks, not for slice elements, map values or fields behind a nil pointer.
++		return h.dest.IsValid() && h.dest.CanAddr() && reflect.PtrTo(h.dest.Type()).Implements(textUnmarshalerT)
++	}
++	return reflect.PtrTo(t).Implements(textUnmarshalerT)
++}
++
++// nullIsNil: a quoteless null is nil (not the string "null") for a pointer destination.
++func (h hint) nullIsNil() bool { return h.t != nil && h.t.Kind() == reflect.Ptr }
++
++// elemType is the ElemTyper's element type, if the destination type (or a pointer to it)
++// implements it.
++func (h hint) elemType() reflect.Type {
++	t := h.t
++	if t == nil {
++		return nil
++	}
++	if t.Implements(elemTyperT) {
++		v := reflect.Zero(t)
++		if t.Kind() == reflect.Ptr {
++			v = reflect.New(t.Elem())
++		}
++		return v.Interface().(hjson.ElemTyper).ElemType()
++	}
++	if pt := reflect.PtrTo(t); pt.Implements(elemTyperT) {
++		return reflect.Zero(pt).Interface().(hjson.ElemTyper).ElemType()
++	}
++	return nil
++}
++
++// elem is the destination of an array element.
++func (h hint) elem() hint {
++	if et := h.elemType(); et != nil {
++		return hint{t: et, fold: h.fold}
++	}
++	_, t := h.unravel()
++	if t != nil && (t.Kind() == reflect.Slice || t.Kind() == reflect.Array) {
++		return hint{t: t.Elem(), fold: h.fold}
++	}
++	return hint{fold: h.fold}
++}
++
++type fieldInfo struct {
++	name  string
++	index []int
++	typ   reflect.Type
++}
++
++// structFields lists a struct type's encoded fields as encoding/json sees them (exported,
++// json tag names, "-" skipped, embedded structs flattened; unique names here), sorted by name.
++func structFields(t reflect.Type) []fieldInfo {
++	var out []fieldInfo
++	var walk func(t reflect.Type, prefix []int)
++	walk = func(t reflect.Type, prefix []int) {
++		for i := 0; i < t.NumField(); i++ {
++			sf := t.Field(i)
++			idx := append(append([]int{}, prefix...), i)
++			if sf.Anonymous && sf.Type.Kind() == reflect.Struct && sf.Tag.Get("json") == "" {
++				walk(sf.Type, idx)
++				continue
++			}
++			if sf.PkgPath != "" {
++				continue
++			}
++			tag := sf.Tag.Get("json")
++			if tag == "-" {
++				continue
++			}
++			name := sf.Name
++			if n := strings.Split(tag, ",")[0]; n != "" {
++				name = n
++			}
++			out = append(out, fieldInfo{name: name, index: idx, typ: sf.Type})
++		}
++	}
++	walk(t, nil)
++	sort.SliceStable(out, func(i, j int) bool { return out[i].name < out[j].name })
++	return out
++}
++
++// fieldFor finds the field a key selects: an exact name, else the first field whose name
++// matches case-insensitively (encoding/json folds with unicode.SimpleFold; the parser's hint
++// lookup lowercases with strings.ToLower, which misses the long s).
++func fieldFor(t reflect.Type, key string, fold bool) (fieldInfo, bool) {
++	fields := structFields(t)
++	for _, f := range fields {
++		if f.name == key {
++			return f, true
++		}
++	}
++	for _, f := range fields {
++		if Known.foldKeys && !fold {
++			if strings.ToLower(f.name) == strings.ToLower(key) {
++				return f, true
++			}
++		} else if strings.EqualFold(f.name, key) {
++			return f, true
++		}
++	}
++	return fieldInfo{}, false
++}
++
++// child is the destination of an object member.
++func (h hint) child(key string) hint {
++	if et := h.elemType(); et != nil {
++		return hint{t: et, fold: h.fold}
++	}
++	d, t := h.unravel()
++	if t == nil {
++		return hint{fold: h.fold}
++	}
++	switch t.Kind() {
++	case reflect.Map:
++		return hint{t: t.Elem(), fold: h.fold}
++	case reflect.Struct:
++		f, ok := fieldFor(t, key, h.fold)
++		if !ok {
++			return hint{fold: h.fold}
++		}
++		var fd reflect.Value
++		if d.IsValid() && d.Kind() == reflect.Struct {
++			fd = d.FieldByIndex(f.index)
++		}
++		return hint{dest: fd, t: f.typ, fold: h.fold}
++	}
++	return hint{fold: h.fold}
++}
++
++// ---- the document writer
++
++// Quoteless tokens: numbers, keywords, near misses and plain words; none contains a
++// terminator (comma, bracket, comment start) so each runs to its line end.
++var hintTokens = []string{
++	"123", "-5", "0", "-0", "1.5", "1e3", "1E+2", "0.25", "100000000000000000000",
++	"true", "false", "null", "True", "NULL", "tru", "nul",
++	".5", "01", "+1", "0x10", "1 2", "12abc", "-", "abc", "a b", "x", "e5", "true 1", "null ",
++	"123 ", "\t7", "1.5.2", "1e", "-e3",
++}
++
++var hintKeys = []string{"a", "b", "k", "key", "1", "x-y", "Zed", "unknown", "T", "S", "s", "Any", "ANY"}
++
++type hintWriter struct {
++	hj    *hjWriter
++	tc    hegel.TestCase
++	depth int
++}
++
++func (w *hintWriter) line(indent int) {
++	w.hj.write("\n" + strings.Repeat(" ", indent))
++}
++
++// jsonString is the JSON text of s.
++func jsonString(s string) string { return string(mustJSON(s)) }
++
++// token writes the quoteless token tok and returns the JSON text of what the parser makes of
++// it for the destination h (leading whitespace belongs to the separator, trailing whitespace
++// is trimmed).
++func (w *hintWriter) token(h hint, tok string) string {
++	w.hj.write(tok)
++	tok = strings.TrimLeft(tok, " \t")
++	trimmed := strings.TrimSpace(tok)
++	if trimmed == "null" && h.nullIsNil() {
++		return "null"
++	}
++	if h.isString() {
++		return jsonString(trimmed)
++	}
++	if trimmed == "true" || trimmed == "false" || trimmed == "null" {
++		return trimmed
++	}
++	if c := tok[0]; (c == '-' || c >= '0' && c <= '9') && numberSyntax(tok) {
++		return trimmed
++	}
++	return jsonString(trimmed)
++}
++
++var intTokens = []string{"123", "-5", "0", "-0", "7 ", "null"}
++var numTokens = []string{"123", "-5", "0", "-0", "1.5", "1e3", "1E+2", "0.25", "null"}
++var jsonNumberTokens = []string{"123", "-5", "0", "-0", "1.5", "1e3", "1E+2", "0.25", "7 "}
++var boolTokens = []string{"true", "false", "null", "true "}
++var jsonNumberT = reflect.TypeOf(json.Number(""))
++
++// fitting writes a value of the kind the destination shape expects (most of the time), so
++// that most documents decode without error; it reports whether it did. h is the parser's view
++// of the destination (its hint), shape encoding/json's.
++func (w *hintWriter) fitting(h, shape hint, indent int) (string, bool) {
++	if !chance(w.tc, 96) {
++		return "", false
++	}
++	_, t := shape.unravel()
++	if t == nil {
++		return "", false
++	}
++	switch t.Kind() {
++	case reflect.String:
++		if t == jsonNumberT {
++			return w.token(h, pick(w.tc, jsonNumberTokens)), true
++		}
++		switch drawInt(w.tc, 0, 9) {
++		case 0, 1:
++			return jsonString(w.hj.quoted(genString(w.tc), chance(w.tc, 30))), true
++		case 2:
++			return jsonString(w.hj.multiline()), true
++		}
++		return w.token(h, pick(w.tc, hintTokens)), true
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		return w.token(h, pick(w.tc, intTokens)), true
++	case reflect.Float32, reflect.Float64:
++		return w.token(h, pick(w.tc, numTokens)), true
++	case reflect.Bool:
++		return w.token(h, pick(w.tc, boolTokens)), true
++	case reflect.Slice, reflect.Array:
++		return w.array(h, shape, indent), true
++	case reflect.Map, reflect.Struct:
++		if reflect.PtrTo(t).Implements(textUnmarshalerT) {
++			return w.token(h, pick(w.tc, hintTokens)), true
++		}
++		return w.object(h, shape, indent), true
++	}
++	return "", false
++}
++
++func (w *hintWriter) array(h, shape hint, indent int) string {
++	if w.depth <= 0 {
++		w.hj.write("[]")
++		return "[]"
++	}
++	w.depth--
++	defer func() { w.depth++ }()
++	w.hj.write("[")
++	n := drawInt(w.tc, 0, 3)
++	var parts []string
++	for i := 0; i < n; i++ {
++		w.line(indent + 2)
++		parts = append(parts, w.value(h.elem(), shape.elem(), indent+2))
++	}
++	w.line(indent)
++	w.hj.write("]")
++	return "[" + strings.Join(parts, ",") + "]"
++}
++
++func (w *hintWriter) object(h, shape hint, indent int) string {
++	if w.depth <= 0 {
++		w.hj.write("{}")
++		return "{}"
++	}
++	w.depth--
++	defer func() { w.depth++ }()
++	w.hj.write("{")
++	s := w.members(h, shape, indent+2, drawInt(w.tc, 0, 4))
++	w.line(indent)
++	w.hj.write("}")
++	return s
++}
++
++// keyFor draws a member key for the destination h: field names of a struct destination in
++// several spellings, unknown keys, or plain keys.
++func (w *hintWriter) keyFor(h hint) string {
++	_, t := w.hintStructType(h)
++	if t != nil && chance(w.tc, 88) {
++		fields := structFields(t)
++		f := fields[drawInt(w.tc, 0, len(fields)-1)]
++		switch drawInt(w.tc, 0, 7) {
++		case 0:
++			return strings.ToLower(f.name)
++		case 1:
++			return strings.ToUpper(f.name)
++		case 2:
++			// The long s folds to S in encoding/json.
++			return strings.Replace(strings.Replace(f.name, "S", "\u017f", 1), "s", "\u017f", 1)
++		default:
++			return f.name
++		}
++	}
++	return pick(w.tc, hintKeys)
++}
++
++func (w *hintWriter) hintStructType(h hint) (reflect.Value, reflect.Type) {
++	if h.elemType() != nil {
++		return reflect.Value{}, nil
++	}
++	d, t := h.unravel()
++	if t != nil && t.Kind() == reflect.Struct {
++		return d, t
++	}
++	return reflect.Value{}, nil
++}
++
++// writeKey writes a key, quoteless when it can be, and returns it.
++func (w *hintWriter) writeKey(k string) string {
++	if k != "" && !strings.ContainsAny(k, " \t\n\r{}[],:\"'#/") && chance(w.tc, 80) {
++		w.hj.write(k)
++		return k
++	}
++	return w.hj.quoted(k, chance(w.tc, 30))
++}
++
++// value writes a value for the destination h and returns the JSON text the parser gives it.
++func (w *hintWriter) value(h, shape hint, indent int) string {
++	if s, ok := w.fitting(h, shape, indent); ok {
++		return s
++	}
++	top := 9
++	if w.depth <= 0 {
++		top = 6
++	}
++	switch drawInt(w.tc, 0, top) {
++	case 0, 1, 2, 3, 4:
++		return w.token(h, pick(w.tc, hintTokens))
++	case 5:
++		return jsonString(w.hj.quoted(genString(w.tc), chance(w.tc, 30)))
++	case 6:
++		return jsonString(w.hj.multiline())
++	case 7:
++		return w.array(h, shape, indent)
++	default:
++		return w.object(h, shape, indent)
++	}
++}
++
++// members writes n object members, one per line, and returns the JSON object: keys in
++// first-occurrence order with the last value of a duplicated key (the parser's OrderedMap).
++func (w *hintWriter) members(h, shape hint, indent int, n int) string {
++	var keys []string
++	vals := map[string]string{}
++	for i := 0; i < n; i++ {
++		w.line(indent)
++		k := w.writeKey(w.keyFor(h))
++		w.hj.write(pick(w.tc, []string{":", ": ", " : "}))
++		v := w.value(h.child(k), shape.child(k), indent)
++		if _, dup := vals[k]; !dup {
++			keys = append(keys, k)
++		}
++		vals[k] = v
++	}
++	var sb strings.Builder
++	sb.WriteString("{")
++	for i, k := range keys {
++		if i > 0 {
++			sb.WriteString(",")
++		}
++		sb.WriteString(jsonString(k) + ":" + vals[k])
++	}
++	sb.WriteString("}")
++	return sb.String()
++}
++
++// TestHegelTypedHints: an Hjson object of quoteless, quoted and multiline values, arrays and
++// objects decodes into a (possibly pre-filled) struct with fields of every kind exactly as
++// encoding/json decodes the JSON text in which each quoteless token is a string when its
++// destination is string-typed and the raw token otherwise; with UseJSONNumber and
++// DisallowUnknownFields too.
++func TestHegelTypedHints(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		pre := genPrefill(ht)
++		want, got := pre.build(), pre.build()
++		opts := hjson.DefaultDecoderOptions()
++		opts.UseJSONNumber = chance(ht, 30)
++		opts.DisallowUnknownFields = chance(ht, 30)
++
++		w := &hintWriter{hj: &hjWriter{tc: ht}, tc: ht, depth: 2}
++		root := hint{dest: reflect.ValueOf(got).Elem(), t: reflect.TypeOf(got)}
++		shape := root
++		shape.fold = true
++		n := drawInt(ht, 0, 6)
++		var modelJSON string
++		if chance(ht, 50) {
++			w.hj.write("{")
++			modelJSON = w.members(root, shape, 2, n)
++			w.line(0)
++			w.hj.write("}")
++		} else {
++			if n == 0 {
++				n = 1
++			}
++			modelJSON = w.members(root, shape, 0, n)
++			w.hj.write("\n")
++		}
++		text := w.hj.sb.String()
++		if w.hj.surrog {
++			c.count("surrogate pairs")
++		}
++
++		dec := json.NewDecoder(bytes.NewReader([]byte(modelJSON)))
++		if opts.UseJSONNumber {
++			dec.UseNumber()
++		}
++		if opts.DisallowUnknownFields {
++			dec.DisallowUnknownFields()
++		}
++		wantErr := dec.Decode(want)
++		gotErr := hjson.UnmarshalWithOptions([]byte(text), got, opts)
++		if (wantErr == nil) != (gotErr == nil) {
++			c.failClass(ht, "error", "opts %+v\n%q\nmodel %s\n  hjson err %v\n  json err  %v", opts, show(text), modelJSON, gotErr, wantErr)
++			return
++		}
++		if wantErr != nil {
++			c.count("both error")
++			return
++		}
++		if !reflect.DeepEqual(want, got) {
++			c.failClass(ht, "value", "opts %+v\n%q\nmodel %s\n  got  %s\n  want %s", opts, show(text), modelJSON, showHinted(got), showHinted(want))
++		}
++	})
++}
++
++func showHinted(h *hinted) string {
++	b, err := json.Marshal(h)
++	if err != nil {
++		return fmt.Sprintf("%#v", h)
++	}
++	return string(b) + fmt.Sprintf(" (Skip=%q, PS nil=%v, Sub nil=%v)", h.Skip, h.PS == nil, h.Sub == nil)
++}
 diff --git a/hegel/hegel_json_test.go b/hegel/hegel_json_test.go
 new file mode 100644
 index 0000000..d6e6a7a
@@ -978,6 +1606,370 @@ index 0000000..d6e6a7a
 +		err := hjson.UnmarshalWithOptions([]byte(text), &dv, opts)
 +		if (err != nil) != w.dupes {
 +			c.failClass(ht, "duplicates", "DisallowDuplicateKeys: err=%v, duplicated key written=%v\n%s", err, w.dupes, show(text))
++		}
++	})
++}
+diff --git a/hegel/hegel_marshalers_test.go b/hegel/hegel_marshalers_test.go
+new file mode 100644
+index 0000000..27a256b
+--- /dev/null
++++ b/hegel/hegel_marshalers_test.go
+@@ -0,0 +1,358 @@
++package hegel
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"sort"
++	"strings"
++	"testing"
++
++	hjson "github.com/hjson/hjson-go/v4"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- Marshaler values
++//
++// MarshalWithOptions: "If an encountered value implements the json.Marshaler interface then
++// the function MarshalJSON() is called on it. The JSON is then converted to Hjson ... If an
++// encountered value implements the encoding.TextMarshaler interface but not the json.Marshaler
++// interface, then the function MarshalText() is called on it to get a text." Map keys "must be
++// possible to print to a string using fmt.Sprintf("%v", key), or implement
++// encoding.TextMarshaler. The map keys are sorted alphabetically". The oracle is encoding/json:
++// the Hjson text of a value, decoded, is the value encoding/json gives it.
++
++type mjVal struct{ N int }
++
++func (m mjVal) MarshalJSON() ([]byte, error) { return []byte(fmt.Sprintf(`{"v":%d}`, m.N)), nil }
++
++type mjPtr struct{ N int }
++
++func (m *mjPtr) MarshalJSON() ([]byte, error) { return []byte(fmt.Sprintf(`{"p":%d}`, m.N)), nil }
++
++// The texts carry no colon: a root string with a colon reads back as an object (bug 9).
++type mtVal struct{ S string }
++
++func (m mtVal) MarshalText() ([]byte, error) { return []byte("t_" + m.S), nil }
++
++type mtPtr struct{ S string }
++
++func (m *mtPtr) MarshalText() ([]byte, error) { return []byte("pt_" + m.S), nil }
++
++// mjAny marshals to arbitrary JSON.
++type mjAny struct{ V interface{} }
++
++func (m mjAny) MarshalJSON() ([]byte, error) { return json.Marshal(m.V) }
++
++// mjBoth implements both interfaces; MarshalJSON must win.
++type mjBoth struct{ N int }
++
++func (m mjBoth) MarshalJSON() ([]byte, error) { return []byte(fmt.Sprintf(`[%d]`, m.N)), nil }
++func (m mjBoth) MarshalText() ([]byte, error) { return []byte("text"), nil }
++
++type mjErr struct{}
++
++func (mjErr) MarshalJSON() ([]byte, error) { return nil, errors.New("no") }
++
++// plainN and plainS are what the encoder writes for mjPtr and mtPtr (their fields).
++type plainN struct{ N int }
++type plainS struct{ S string }
++
++// intKey is a map key type with a TextMarshaler whose text order differs from its value order.
++type intKey int
++
++var intKeyNames = map[intKey]string{1: "z", 2: "a", 3: "m", 4: "b", 5: "y", 10: "c"}
++
++func (k intKey) MarshalText() ([]byte, error) { return []byte(intKeyNames[k]), nil }
++
++// holder has Marshaler fields of every receiver kind; encoding/json calls a pointer-receiver
++// method on an addressable field (when the holder is marshalled through a pointer).
++type holder struct {
++	V  mjVal
++	P  mjPtr
++	PP *mjPtr
++	T  mtVal
++	TP mtPtr
++	B  mjBoth
++	A  mjAny
++}
++
++// oracleHolder is holder as the encoder writes it: pointer-receiver marshalers ignored.
++type oracleHolder struct {
++	V  mjVal
++	P  plainN
++	PP *plainN
++	T  mtVal
++	TP plainS
++	B  mjBoth
++	A  mjAny
++}
++
++var safeWords = []string{"a", "b", "hello", "x y", "1", "true", "", "z"}
++
++// safeValue is genValue with plain words for strings (the quoting rules are covered elsewhere).
++func safeValue(tc hegel.TestCase, depth int) interface{} {
++	return reword(tc, genValue(tc, depth))
++}
++
++func reword(tc hegel.TestCase, v interface{}) interface{} {
++	switch x := v.(type) {
++	case string:
++		return pick(tc, safeWords)
++	case []interface{}:
++		for i := range x {
++			x[i] = reword(tc, x[i])
++		}
++	case map[string]interface{}:
++		m := map[string]interface{}{}
++		for _, val := range x {
++			m[pick(tc, safeWords)] = reword(tc, val)
++		}
++		return m
++	}
++	return v
++}
++
++// mkind is a generated value's shape; build makes the value (real) and its oracle twin.
++type mkind int
++
++const (
++	kPlain mkind = iota
++	kMjVal
++	kMjPtr    // mjPtr by value (not addressable inside an interface: json writes its fields too)
++	kMjPtrPtr // *mjPtr
++	kMtVal
++	kMtPtr
++	kMtPtrPtr // *mtPtr
++	kMjAny
++	kMjBoth
++	kMjErr
++	kHolderPtr
++	kHolderVal
++	kList
++	kIntMap
++	kTextMap
++	kStrMap
++)
++
++type mspec struct {
++	kind  mkind
++	n     int
++	s     string
++	any   interface{}
++	items []mspec
++	keys  []intKey
++	ks    []string
++}
++
++func genSpec(tc hegel.TestCase, depth int) mspec {
++	top := int(kStrMap)
++	if depth <= 0 {
++		top = int(kHolderVal)
++	}
++	sp := mspec{kind: mkind(drawInt(tc, 0, top)), n: drawInt(tc, -5, 100), s: pick(tc, safeWords)}
++	if sp.kind == kMjErr && !chance(tc, 20) {
++		sp.kind = kMjAny
++	}
++	switch sp.kind {
++	case kPlain, kMjAny, kHolderPtr, kHolderVal:
++		sp.any = safeValue(tc, 1)
++	case kList, kStrMap:
++		seen := map[string]bool{}
++		for i := drawInt(tc, 0, 3); i > 0; i-- {
++			k := pick(tc, safeWords)
++			if sp.kind == kStrMap && seen[k] {
++				continue
++			}
++			seen[k] = true
++			sp.items = append(sp.items, genSpec(tc, depth-1))
++			sp.ks = append(sp.ks, k)
++		}
++	case kIntMap:
++		for i := drawInt(tc, 0, 4); i > 0; i-- {
++			sp.keys = append(sp.keys, pick(tc, []intKey{1, 2, 3, 4, 5, 10}))
++		}
++	case kTextMap:
++		for i := drawInt(tc, 0, 3); i > 0; i-- {
++			sp.ks = append(sp.ks, pick(tc, safeWords))
++		}
++	}
++	return sp
++}
++
++// hasErr reports whether the value's MarshalJSON fails somewhere.
++func (sp mspec) hasErr() bool {
++	if sp.kind == kMjErr {
++		return true
++	}
++	for _, it := range sp.items {
++		if it.hasErr() {
++			return true
++		}
++	}
++	return false
++}
++
++// build makes the value; oracle asks for the twin encoding/json must see to write what the
++// encoder writes (pointer-receiver marshalers replaced by plain structs when the encoder
++// ignores them).
++func (sp mspec) build(oracle bool) interface{} {
++	plain := oracle && Known.ptrMarshalers
++	switch sp.kind {
++	case kPlain:
++		return sp.any
++	case kMjVal:
++		return mjVal{N: sp.n}
++	case kMjPtr:
++		if plain {
++			return plainN{N: sp.n}
++		}
++		return mjPtr{N: sp.n}
++	case kMjPtrPtr:
++		if plain {
++			return &plainN{N: sp.n}
++		}
++		return &mjPtr{N: sp.n}
++	case kMtVal:
++		return mtVal{S: sp.s}
++	case kMtPtr:
++		if plain {
++			return plainS{S: sp.s}
++		}
++		return mtPtr{S: sp.s}
++	case kMtPtrPtr:
++		if plain {
++			return &plainS{S: sp.s}
++		}
++		return &mtPtr{S: sp.s}
++	case kMjAny:
++		return mjAny{V: sp.any}
++	case kMjBoth:
++		return mjBoth{N: sp.n}
++	case kMjErr:
++		return mjErr{}
++	case kHolderPtr, kHolderVal:
++		if plain {
++			h := oracleHolder{V: mjVal{sp.n}, P: plainN{sp.n + 1}, PP: &plainN{sp.n + 2}, T: mtVal{sp.s}, TP: plainS{sp.s + "!"}, B: mjBoth{sp.n}, A: mjAny{sp.any}}
++			if sp.kind == kHolderPtr {
++				return &h
++			}
++			return h
++		}
++		h := holder{V: mjVal{sp.n}, P: mjPtr{sp.n + 1}, PP: &mjPtr{sp.n + 2}, T: mtVal{sp.s}, TP: mtPtr{sp.s + "!"}, B: mjBoth{sp.n}, A: mjAny{sp.any}}
++		if sp.kind == kHolderPtr {
++			return &h
++		}
++		return h
++	case kList:
++		out := make([]interface{}, 0, len(sp.items))
++		for _, it := range sp.items {
++			out = append(out, it.build(oracle))
++		}
++		return out
++	case kStrMap:
++		out := map[string]interface{}{}
++		for i, it := range sp.items {
++			out[sp.ks[i]] = it.build(oracle)
++		}
++		return out
++	case kIntMap:
++		out := map[intKey]int{}
++		for i, k := range sp.keys {
++			out[k] = i
++		}
++		return out
++	default:
++		out := map[mtVal]int{}
++		for i, k := range sp.ks {
++			out[mtVal{S: k}] = i
++		}
++		return out
++	}
++}
++
++// wantKeyOrder is the order the encoder writes the keys of a map with TextMarshaler keys:
++// alphabetically by text, or (as recorded) by the fmt %v of the key values.
++func (sp mspec) wantKeyOrder() []string {
++	type kv struct{ sortBy, text string }
++	var kvs []kv
++	seen := map[string]bool{}
++	switch sp.kind {
++	case kIntMap:
++		for _, k := range sp.keys {
++			text := intKeyNames[k]
++			if !seen[text] {
++				seen[text] = true
++				kvs = append(kvs, kv{fmt.Sprintf("%v", int(k)), text})
++			}
++		}
++	case kTextMap:
++		for _, k := range sp.ks {
++			text := "t_" + k
++			if !seen[text] {
++				seen[text] = true
++				kvs = append(kvs, kv{fmt.Sprintf("%v", mtVal{S: k}), text})
++			}
++		}
++	}
++	sort.Slice(kvs, func(i, j int) bool {
++		if Known.mapKeyOrder {
++			return kvs[i].sortBy < kvs[j].sortBy
++		}
++		return kvs[i].text < kvs[j].text
++	})
++	var out []string
++	for _, x := range kvs {
++		out = append(out, x.text)
++	}
++	return out
++}
++
++// TestHegelMarshalers: a value with json.Marshaler and encoding.TextMarshaler parts (value and
++// pointer receivers, direct, behind pointers, in struct fields, lists and maps, as map keys)
++// marshals to Hjson that decodes to what encoding/json writes for it; a failing MarshalJSON
++// fails Marshal; maps with TextMarshaler keys are written in key order.
++func TestHegelMarshalers(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		sp := genSpec(ht, 2)
++		opts := genEncoderOptions(ht)
++		opts.QuoteAmbiguousStrings = true // the words include 1 and true; the quoting rules are covered elsewhere
++		real := sp.build(false)
++		text, err := hjson.MarshalWithOptions(real, opts)
++		if sp.hasErr() {
++			c.count("marshal error")
++			if err == nil {
++				c.failClass(ht, "no error", "Marshal of a failing MarshalJSON succeeded: %q", show(string(text)))
++			}
++			return
++		}
++		if err != nil {
++			c.failClass(ht, "error", "Marshal %T: %v", real, err)
++			return
++		}
++		var got interface{}
++		if err := hjson.Unmarshal(text, &got); err != nil {
++			c.failClass(ht, "decode error", "Unmarshal of the encoder's output: %v\n%q", err, show(string(text)))
++			return
++		}
++		var want interface{}
++		if err := json.Unmarshal(mustJSON(sp.build(true)), &want); err != nil {
++			panic(err)
++		}
++		if g, w := canon(got), canon(want); g != w {
++			c.failClass(ht, "value", "%T under %+v\n%q\n  got  %s\n  want %s", real, opts, show(string(text)), show(g), show(w))
++			return
++		}
++		if sp.kind == kIntMap || sp.kind == kTextMap {
++			var om hjson.OrderedMap
++			if err := hjson.Unmarshal(text, &om); err != nil {
++				c.failClass(ht, "om error", "into OrderedMap: %v\n%q", err, show(string(text)))
++				return
++			}
++			if g, w := strings.Join(om.Keys, ","), strings.Join(sp.wantKeyOrder(), ","); g != w {
++				c.failClass(ht, "key order", "%T\n%q\n  keys %s\n  want %s", real, show(string(text)), g, w)
++			}
 +		}
 +	})
 +}
@@ -1719,10 +2711,10 @@ index 0000000..3e87a6d
 +}
 diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
 new file mode 100644
-index 0000000..bbe6c33
+index 0000000..354beb5
 --- /dev/null
 +++ b/hegel/hegel_pins_test.go
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,273 @@
 +package hegel
 +
 +// One plain test per recorded bug (bugs.toml). Each asserts the documented behaviour and fails
@@ -1934,6 +2926,66 @@ index 0000000..bbe6c33
 +	}
 +	if err == nil && canon(v) != canon(&n) {
 +		t.Fatalf("interface{} gets %s, Node gets %s", canon(v), canon(&n))
++	}
++}
++
++// hjson/13: a pointer-receiver MarshalJSON is called for a pointer value, as in encoding/json.
++func TestHegelPinPointerMarshaler(t *testing.T) {
++	text, err := hjson.Marshal(&mjPtr{N: 4})
++	if err != nil {
++		t.Fatal(err)
++	}
++	v, err := decodeAny(t, string(text))
++	if err != nil {
++		t.Fatalf("Unmarshal: %v", err)
++	}
++	m, ok := v.(map[string]interface{})
++	if !ok || m["p"] != 4.0 {
++		t.Fatalf("Marshal(&mjPtr{4}) wrote %q, want the MarshalJSON output {p: 4}", text)
++	}
++}
++
++// hjson/14: a quoteless number for a TextUnmarshaler slice element is a string, as for a
++// TextUnmarshaler struct field.
++func TestHegelPinTextUnmarshalerElement(t *testing.T) {
++	var field struct{ T textVal }
++	if err := hjson.Unmarshal([]byte("T: 123"), &field); err != nil || field.T.S != "T:123" {
++		t.Fatalf("field: %v %+v", err, field)
++	}
++	var elems []textVal
++	if err := hjson.Unmarshal([]byte("[\n  123\n]"), &elems); err != nil {
++		t.Fatalf("Unmarshal into []textVal: %v", err)
++	}
++	if len(elems) != 1 || elems[0].S != "T:123" {
++		t.Fatalf("got %+v, want [{T:123}]", elems)
++	}
++}
++
++// hjson/15: the keys of a map with TextMarshaler keys are written in the order of their texts.
++func TestHegelPinTextMarshalerKeyOrder(t *testing.T) {
++	text, err := hjson.Marshal(map[intKey]int{1: 1, 2: 2}) // 1 marshals to z, 2 to a
++	if err != nil {
++		t.Fatal(err)
++	}
++	var om hjson.OrderedMap
++	if err := hjson.Unmarshal(text, &om); err != nil {
++		t.Fatal(err)
++	}
++	if strings.Join(om.Keys, ",") != "a,z" {
++		t.Fatalf("keys written as %v, want a,z", om.Keys)
++	}
++}
++
++// hjson/16: a key encoding/json matches to a field case-insensitively (the long s folds to S)
++// gets the field's type hint.
++func TestHegelPinFoldedKeyHint(t *testing.T) {
++	var v struct{ Str string }
++	key := string(rune(0x17f)) + "tr" // long s, t, r
++	if err := hjson.Unmarshal([]byte(key+": 123"), &v); err != nil {
++		t.Fatalf("Unmarshal: %v", err)
++	}
++	if v.Str != "123" {
++		t.Fatalf("Str = %q, want 123", v.Str)
 +	}
 +}
 diff --git a/hegel/hegel_quote_test.go b/hegel/hegel_quote_test.go
@@ -2376,10 +3428,10 @@ index 0000000..022e039
 +}
 diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
 new file mode 100644
-index 0000000..fcb6350
+index 0000000..9ab0930
 --- /dev/null
 +++ b/hegel/hegel_test.go
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,166 @@
 +package hegel
 +
 +// Hegel property tests for hjson/hjson-go, written for the Hegel zoo. See
@@ -2524,7 +3576,11 @@ index 0000000..fcb6350
 +	mlArrayBlankLine    bool // 10: a multiline string in an array gains an indented blank line at each Node round trip
 +	trailingDotInternal bool // 11: (pin only) Unmarshal fails with Internal error on a number with a trailing decimal point
 +	hugeNumberString    bool // 12: (pin only) a number beyond float64 is a string in a Node but an error into interface{}
-+}{true, true, true, true, true, true, true, true, true, true, true, true}
++	ptrMarshalers       bool // 13: a pointer-receiver MarshalJSON or MarshalText is never called (the encoder dereferences first)
++	textElemHint        bool // 14: pointer-receiver TextUnmarshaler slice elements, map values and fields behind a nil pointer get no string hint
++	mapKeyOrder         bool // 15: TextMarshaler map keys are sorted by their Go value, not by their text
++	foldKeys            bool // 16: the hint lookup lowercases keys, so a key encoding/json folds onto a field (long s) gets no hint
++}{true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true}
 +
 +// ZOO_KNOWN_OFF=name,name turns switches off, to check that the model then disagrees with the
 +// package on them (never set in the zoo's runs).
