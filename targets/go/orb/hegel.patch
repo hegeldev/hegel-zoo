@@ -1,0 +1,3653 @@
+diff --git a/go.mod b/go.mod
+index 0a86856..dc4708f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,9 +1,15 @@
+ module github.com/paulmach/orb
+ 
+-go 1.18
++go 1.26.0
+ 
+ require (
+ 	github.com/gogo/protobuf v1.3.2
+ 	github.com/paulmach/protoscan v0.2.1
+ 	go.mongodb.org/mongo-driver/v2 v2.5.0
+ )
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++	hegel.dev/go/hegel v0.6.33 // indirect
++)
+diff --git a/hegel/hegel_codec_test.go b/hegel/hegel_codec_test.go
+new file mode 100644
+index 0000000..a1c2611
+--- /dev/null
++++ b/hegel/hegel_codec_test.go
+@@ -0,0 +1,550 @@
++package hegel
++
++// The codecs: WKT, WKB/EWKB and GeoJSON, as round trips and against shapely.
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"regexp"
++	"strings"
++	"testing"
++
++	"github.com/paulmach/orb"
++	"github.com/paulmach/orb/encoding/ewkb"
++	"github.com/paulmach/orb/encoding/wkb"
++	"github.com/paulmach/orb/encoding/wkt"
++	"github.com/paulmach/orb/geojson"
++	"hegel.dev/go/hegel"
++)
++
++// wktType is the WKT keyword of a geometry.
++func wktType(g orb.Geometry) string {
++	switch g.(type) {
++	case orb.Point:
++		return "POINT"
++	case orb.MultiPoint:
++		return "MULTIPOINT"
++	case orb.LineString:
++		return "LINESTRING"
++	case orb.MultiLineString:
++		return "MULTILINESTRING"
++	case orb.Polygon, orb.Ring, orb.Bound:
++		return "POLYGON"
++	case orb.MultiPolygon:
++		return "MULTIPOLYGON"
++	case orb.Collection:
++		return "GEOMETRYCOLLECTION"
++	}
++	panic(fmt.Sprintf("wktType %T", g))
++}
++
++// asGeoJSONType is the geometry as its GeoJSON type: a Ring becomes a Polygon and a Bound its
++// polygon (what the codecs write).
++func asGeoJSONType(g orb.Geometry) orb.Geometry {
++	switch g := g.(type) {
++	case orb.Ring:
++		return orb.Polygon{g}
++	case orb.Bound:
++		return g.ToPolygon()
++	}
++	return g
++}
++
++// hasEmptyMemberIn reports whether a collection has an empty member (of any type) directly or
++// in a nested collection.
++func hasEmptyMember(g orb.Geometry) bool {
++	c, ok := g.(orb.Collection)
++	if !ok {
++		return false
++	}
++	for _, m := range c {
++		if len(coords(m)) == 0 {
++			return true
++		}
++		if hasEmptyMember(m) {
++			return true
++		}
++	}
++	return false
++}
++
++// hasEmptyInnerPart reports whether the geometry has an empty part that WKT would write as an
++// EMPTY member: an empty Ring (alone or in a polygon) or an empty line string in a
++// MultiLineString, at any depth.
++func hasEmptyInnerPart(g orb.Geometry) bool {
++	switch g := g.(type) {
++	case orb.Ring:
++		return len(g) == 0
++	case orb.MultiLineString:
++		for _, ls := range g {
++			if len(ls) == 0 {
++				return true
++			}
++		}
++	case orb.Polygon:
++		for _, r := range g {
++			if len(r) == 0 {
++				return true
++			}
++		}
++	case orb.MultiPolygon:
++		for _, p := range g {
++			if hasEmptyInnerPart(p) {
++				return true
++			}
++		}
++	case orb.Collection:
++		for _, m := range g {
++			if hasEmptyInnerPart(m) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// hasEmptyCollection reports whether the geometry is, or holds at any depth, an empty
++// Collection.
++func hasEmptyCollection(g orb.Geometry) bool {
++	c, ok := g.(orb.Collection)
++	if !ok {
++		return false
++	}
++	if len(c) == 0 {
++		return true
++	}
++	for _, m := range c {
++		if hasEmptyCollection(m) {
++			return true
++		}
++	}
++	return false
++}
++
++func hasNestedCollection(g orb.Geometry) bool {
++	c, ok := g.(orb.Collection)
++	if !ok {
++		return false
++	}
++	for _, m := range c {
++		if _, ok := m.(orb.Collection); ok {
++			return true
++		}
++	}
++	return false
++}
++
++// spaceAfterCommas rewrites the WKT with ", " between members (the GEOS/PostGIS text form).
++func spaceAfterCommas(s string) string { return strings.ReplaceAll(s, ",", ", ") }
++
++var parenRe = regexp.MustCompile(`([A-Z])\(`)
++
++// spaceBeforeParens writes "POINT (1 2)" instead of "POINT(1 2)" (the GEOS form).
++func spaceBeforeParens(s string) string { return parenRe.ReplaceAllString(s, "$1 (") }
++
++// TestHegelWKT: Marshal writes the WKT shapely reads as the same geometry; Unmarshal reads
++// orb's text, shapely's text and the whitespace variants the WKT grammar allows back to the
++// geometry; the typed Unmarshal functions accept their type and reject the others with
++// ErrIncorrectGeometry; a proper prefix of a text is rejected.
++func TestHegelWKT(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		g := genAnyGeometry(ht)
++		if Known.emptyPartWKT && hasEmptyInnerPart(g) {
++			return
++		}
++		want := asGeoJSONType(g)
++		_, isCol := g.(orb.Collection)
++		s := wkt.MarshalString(g)
++		if !bytes.Equal(wkt.Marshal(g), []byte(s)) {
++			col.fail(ht, "Marshal and MarshalString differ for %v", g)
++		}
++		if !strings.HasPrefix(s, wktType(g)) {
++			col.fail(ht, "WKT %q of a %T does not start with %s", s, g, wktType(g))
++		}
++		emptyIn := hasEmptyMember(g)
++		nested := hasNestedCollection(g)
++
++		// shapely reads orb's text as the same geometry
++		r := shapelyWKT(s)
++		if !r.Ok {
++			col.failClass(ht, "shapely-rejects", "shapely rejects orb's WKT %q: %s %s", s, r.Error, r.Message)
++		} else {
++			back := fromHexWKB(r.WKB)
++			if !same(back, want) {
++				col.failClass(ht, "shapely-differs", "shapely reads orb's WKT %q as %v, orb has %v", s, back, want)
++			}
++		}
++
++		// orb reads its own text back (a collection with a nested or an empty member: gate)
++		colGate := Known.wktCollectionMembers && (nested || emptyIn)
++		back, err := wkt.Unmarshal(s)
++		if err != nil {
++			if !colGate {
++				col.failClass(ht, "own-unmarshal-error", "Unmarshal(%q) = %v", s, err)
++			}
++		} else if !same(back, want) && !colGate {
++			col.failClass(ht, "own-unmarshal-differs", "Unmarshal(Marshal(%v)) = %v", g, back)
++		}
++
++		// orb reads shapely's text (spaces before parentheses and after commas)
++		if r.Ok {
++			back, err := wkt.Unmarshal(r.WKT)
++			gate := Known.wktCollectionMembers && isCol
++			if err != nil {
++				if !gate {
++					col.failClass(ht, "geos-text-error", "Unmarshal(%q) (shapely's text) = %v", r.WKT, err)
++				}
++			} else if !same(back, want) && !gate {
++				col.failClass(ht, "geos-text-differs", "Unmarshal(%q) (shapely's text) = %v, want %v", r.WKT, back, want)
++			}
++		}
++
++		// whitespace variants of orb's own text
++		variants := map[string]string{
++			"leading/trailing": "  " + s + " \n",
++			"space-parens":     spaceBeforeParens(s),
++			"space-commas":     spaceAfterCommas(s),
++			"tab-commas":       strings.ReplaceAll(s, ",", ",\t"),
++			"lower":            strings.ToLower(s),
++			"double-space":     strings.ReplaceAll(s, " ", "  "),
++		}
++		for name, v := range variants {
++			back, err := wkt.Unmarshal(v)
++			gate := colGate
++			if Known.wktCollectionMembers && isCol && name != "leading/trailing" && name != "lower" {
++				gate = true
++			}
++			if Known.wktWhitespace && name == "double-space" {
++				gate = true
++			}
++			if err != nil {
++				if !gate {
++					col.failClass(ht, "variant-error", "Unmarshal(%q) [%s] = %v", v, name, err)
++				}
++			} else if !same(back, want) && !gate {
++				col.failClass(ht, "variant-differs", "Unmarshal(%q) [%s] = %v, want %v", v, name, back, want)
++			}
++		}
++
++		// the typed functions
++		checkTyped := func(name string, ok bool, err error, got orb.Geometry) {
++			if wktType(g) == name {
++				if colGate {
++					return
++				}
++				if err != nil {
++					col.failClass(ht, "typed-error", "Unmarshal%s(%q) = %v", name, s, err)
++				} else if !same(got, want) {
++					col.failClass(ht, "typed-differs", "Unmarshal%s(%q) = %v, want %v", name, s, got, want)
++				}
++			} else if !errors.Is(err, wkt.ErrIncorrectGeometry) {
++				col.failClass(ht, "typed-wrong-type", "Unmarshal%s(%q) = %v, %v; want ErrIncorrectGeometry", name, s, got, err)
++			}
++			_ = ok
++		}
++		p, err := wkt.UnmarshalPoint(s)
++		checkTyped("POINT", true, err, p)
++		mp, err := wkt.UnmarshalMultiPoint(s)
++		checkTyped("MULTIPOINT", true, err, mp)
++		ls, err := wkt.UnmarshalLineString(s)
++		checkTyped("LINESTRING", true, err, ls)
++		mls, err := wkt.UnmarshalMultiLineString(s)
++		checkTyped("MULTILINESTRING", true, err, mls)
++		poly, err := wkt.UnmarshalPolygon(s)
++		checkTyped("POLYGON", true, err, poly)
++		mpoly, err := wkt.UnmarshalMultiPolygon(s)
++		checkTyped("MULTIPOLYGON", true, err, mpoly)
++		c, err := wkt.UnmarshalCollection(s)
++		checkTyped("GEOMETRYCOLLECTION", true, err, c)
++
++		// a proper prefix is not WKT (except that "XXX EMPTY" has a prefix... no: no proper
++		// prefix of a WKT text is itself complete)
++		if len(s) > 1 && !(Known.wktCollectionMembers && isCol) {
++			cut := drawInt(ht, 1, len(s)-1)
++			if _, err := wkt.Unmarshal(s[:cut]); err == nil {
++				col.failClass(ht, "prefix-accepted", "Unmarshal(%q) (a prefix of %q) succeeded", s[:cut], s)
++			}
++		}
++		col.count("wkt")
++	})
++}
++
++// TestHegelWKB: Marshal in either byte order decodes back (Unmarshal, the stream Decoder, the
++// hex form); shapely reads the bytes as the same geometry and writes the same little-endian
++// bytes; EWKB carries the SRID; a proper prefix is rejected without a panic.
++func TestHegelWKB(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		g := genAnyGeometry(ht)
++		if r, ok := g.(orb.Ring); ok && len(r) == 0 {
++			return // Polygon{Ring{}}: a ring of zero points, which shapely reads as POLYGON EMPTY
++		}
++		want := asGeoJSONType(g)
++		order := binary.ByteOrder(binary.LittleEndian)
++		if chance(ht, 50) {
++			order = binary.BigEndian
++		}
++		data, err := wkb.Marshal(g, order)
++		if err != nil {
++			col.fail(ht, "Marshal(%v) = %v", g, err)
++			return
++		}
++		if !bytes.Equal(wkb.MustMarshal(g, order), data) {
++			col.fail(ht, "MustMarshal differs from Marshal for %v", g)
++		}
++		h, _ := wkb.MarshalToHex(g, order)
++		if h != hex.EncodeToString(data) || wkb.MustMarshalToHex(g, order) != h {
++			col.fail(ht, "MarshalToHex(%v) = %q, bytes %x", g, h, data)
++		}
++		back, err := wkb.Unmarshal(data)
++		if err != nil {
++			col.failClass(ht, "own-unmarshal-error", "Unmarshal(Marshal(%v)) = %v", g, err)
++		} else if !same(back, want) {
++			col.failClass(ht, "own-unmarshal-differs", "Unmarshal(Marshal(%v)) = %v", g, back)
++		}
++
++		r := shapelyWKB(hex.EncodeToString(data))
++		if !r.Ok {
++			col.failClass(ht, "shapely-rejects", "shapely rejects orb's WKB of %v: %s %s", g, r.Error, r.Message)
++		} else {
++			if !same(fromHexWKB(r.WKB), want) {
++				col.failClass(ht, "shapely-differs", "shapely reads orb's WKB of %v as %s", g, r.WKT)
++			}
++			le := wkb.MustMarshal(g, binary.LittleEndian)
++			if r.WKB != hex.EncodeToString(le) {
++				col.failClass(ht, "bytes-differ", "orb's little-endian WKB of %v is %x, shapely writes %s", g, le, r.WKB)
++			}
++		}
++
++		// the stream: two geometries with a chosen byte order
++		g2 := genGeometry(ht, 1)
++		var buf bytes.Buffer
++		enc := wkb.NewEncoder(&buf).SetByteOrder(order)
++		if err := enc.Encode(g); err != nil {
++			col.fail(ht, "Encode(%v) = %v", g, err)
++		}
++		if err := enc.Encode(g2); err != nil {
++			col.fail(ht, "Encode(%v) = %v", g2, err)
++		}
++		dec := wkb.NewDecoder(bytes.NewReader(buf.Bytes()))
++		d1, err1 := dec.Decode()
++		d2, err2 := dec.Decode()
++		if err1 != nil || err2 != nil || !same(d1, want) || !same(d2, g2) {
++			col.failClass(ht, "stream", "stream of %v, %v decodes to %v (%v), %v (%v)", g, g2, d1, err1, d2, err2)
++		}
++		if _, err := dec.Decode(); err == nil {
++			col.failClass(ht, "stream-eof", "a third Decode on a two-geometry stream succeeded")
++		}
++
++		// EWKB with an SRID
++		srid := pick(ht, []int{0, 4326, 3857, 1})
++		edata, err := ewkb.Marshal(g, srid, order)
++		if err != nil {
++			col.fail(ht, "ewkb.Marshal(%v, %d) = %v", g, srid, err)
++			return
++		}
++		eg, gotSRID, err := ewkb.Unmarshal(edata)
++		if err != nil || gotSRID != srid || !same(eg, want) {
++			col.failClass(ht, "ewkb", "ewkb.Unmarshal(Marshal(%v, %d)) = %v, %d, %v", g, srid, eg, gotSRID, err)
++		}
++		if srid == 0 && !bytes.Equal(edata, data) {
++			col.failClass(ht, "ewkb-srid0", "ewkb.Marshal with SRID 0 is not the WKB: %x vs %x", edata, data)
++		}
++		if srid != 0 {
++			// the plain WKB decoder must not read an EWKB with an SRID as if it were plain
++			if pg, err := wkb.Unmarshal(edata); err == nil && !same(pg, want) {
++				col.failClass(ht, "wkb-reads-ewkb-wrong", "wkb.Unmarshal of EWKB (srid %d) of %v = %v", srid, g, pg)
++			}
++		}
++
++		// prefixes: never a panic, never a success
++		if len(data) > 1 {
++			cut := drawInt(ht, 1, len(data)-1)
++			if pg, err := wkb.Unmarshal(data[:cut]); err == nil {
++				col.failClass(ht, "prefix-accepted", "Unmarshal of the first %d of %d bytes of %v succeeded: %v", cut, len(data), g, pg)
++			}
++		}
++		col.count("wkb")
++	})
++}
++
++// TestHegelGeoJSON: geojson.NewGeometry marshals to a document shapely reads as the same
++// geometry and that unmarshals back; the typed helper types agree; features and feature
++// collections keep their geometry, properties, id and bbox; BBox and Bound convert both ways.
++func TestHegelGeoJSON(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		g := genAnyGeometry(ht)
++		if Known.emptyCollectionGeoJSON && hasEmptyCollection(g) {
++			return
++		}
++		want := asGeoJSONType(g)
++		jg := geojson.NewGeometry(g)
++		if jg.Type != want.GeoJSONType() {
++			col.fail(ht, "NewGeometry(%v).Type = %q", g, jg.Type)
++		}
++		data, err := json.Marshal(jg)
++		if err != nil {
++			col.fail(ht, "Marshal(%v) = %v", g, err)
++			return
++		}
++		data2, err := jg.MarshalJSON()
++		if err != nil || !bytes.Equal(data, data2) {
++			col.fail(ht, "MarshalJSON differs from json.Marshal for %v: %s vs %s (%v)", g, data, data2, err)
++		}
++
++		back, err := geojson.UnmarshalGeometry(data)
++		if err != nil {
++			col.failClass(ht, "own-unmarshal-error", "UnmarshalGeometry(%s) = %v", data, err)
++		} else if !same(back.Geometry(), want) {
++			col.failClass(ht, "own-unmarshal-differs", "UnmarshalGeometry(%s).Geometry() = %v, want %v", data, back.Geometry(), want)
++		}
++		var jg2 geojson.Geometry
++		if err := json.Unmarshal(data, &jg2); err != nil || !same(jg2.Geometry(), want) {
++			col.failClass(ht, "json-unmarshal", "json.Unmarshal(%s) = %v, %v", data, jg2.Geometry(), err)
++		}
++
++		// shapely reads the document as the same geometry, and orb reads shapely's document
++		if !hasEmptyPart(want) { // GEOS's GeoJSON reader turns empty parts into empty collections
++			r := shapelyGeoJSON(string(data))
++			if !r.Ok {
++				col.failClass(ht, "shapely-rejects", "shapely rejects %s: %s %s", data, r.Error, r.Message)
++			} else if !same(fromHexWKB(r.WKB), want) {
++				col.failClass(ht, "shapely-differs", "shapely reads %s as %s", data, r.WKT)
++			}
++			gj := shapelyToGeoJSON(want)
++			if gj.Ok {
++				back, err := geojson.UnmarshalGeometry([]byte(gj.GeoJSON))
++				if err != nil {
++					col.failClass(ht, "geos-doc-error", "UnmarshalGeometry(%s) (shapely's document) = %v", gj.GeoJSON, err)
++				} else if !same(back.Geometry(), want) {
++					col.failClass(ht, "geos-doc-differs", "UnmarshalGeometry(%s) = %v, want %v", gj.GeoJSON, back.Geometry(), want)
++				}
++			}
++		}
++
++		// the helper types write the same document as the Geometry wrapper
++		var helperDoc []byte
++		switch w := want.(type) {
++		case orb.Point:
++			helperDoc, err = json.Marshal(geojson.Point(w))
++		case orb.MultiPoint:
++			helperDoc, err = json.Marshal(geojson.MultiPoint(w))
++		case orb.LineString:
++			helperDoc, err = json.Marshal(geojson.LineString(w))
++		case orb.MultiLineString:
++			helperDoc, err = json.Marshal(geojson.MultiLineString(w))
++		case orb.Polygon:
++			helperDoc, err = json.Marshal(geojson.Polygon(w))
++		case orb.MultiPolygon:
++			helperDoc, err = json.Marshal(geojson.MultiPolygon(w))
++		}
++		if helperDoc != nil {
++			if err != nil || !bytes.Equal(helperDoc, data) {
++				col.failClass(ht, "helper-doc", "helper type of %v writes %s, Geometry writes %s (%v)", g, helperDoc, data, err)
++			}
++			// and read it back
++			switch want.(type) {
++			case orb.Point:
++				var p geojson.Point
++				if err := json.Unmarshal(data, &p); err != nil || !same(p.Geometry(), want) {
++					col.failClass(ht, "helper-read", "geojson.Point reads %s as %v, %v", data, p, err)
++				}
++			case orb.Polygon:
++				var p geojson.Polygon
++				if err := json.Unmarshal(data, &p); err != nil || !same(p.Geometry(), want) {
++					col.failClass(ht, "helper-read", "geojson.Polygon reads %s as %v, %v", data, p, err)
++				}
++			case orb.MultiLineString:
++				var p geojson.MultiLineString
++				if err := json.Unmarshal(data, &p); err != nil || !same(p.Geometry(), want) {
++					col.failClass(ht, "helper-read", "geojson.MultiLineString reads %s as %v, %v", data, p, err)
++				}
++			}
++			// the wrong helper type rejects it
++			if _, isPoint := want.(orb.Point); !isPoint {
++				var p geojson.Point
++				if err := json.Unmarshal(data, &p); err == nil {
++					col.failClass(ht, "helper-wrong-type", "geojson.Point accepts %s", data)
++				}
++			}
++		}
++
++		// a feature: geometry, properties, id and bbox survive
++		f := geojson.NewFeature(g)
++		f.Properties["name"] = pick(ht, []string{"a", "b c", "", "\"q\""})
++		f.Properties["n"] = float64(drawInt(ht, -5, 5))
++		if chance(ht, 50) {
++			f.ID = pick(ht, []interface{}{"id-1", float64(7), "x"})
++		}
++		if chance(ht, 50) {
++			f.BBox = geojson.NewBBox(g.Bound())
++		}
++		fdata, err := json.Marshal(f)
++		if err != nil {
++			col.fail(ht, "Marshal(feature of %v) = %v", g, err)
++			return
++		}
++		fb, err := geojson.UnmarshalFeature(fdata)
++		if err != nil {
++			col.failClass(ht, "feature-error", "UnmarshalFeature(%s) = %v", fdata, err)
++		} else {
++			if !same(fb.Geometry, want) {
++				col.failClass(ht, "feature-geometry", "feature of %v reads back with geometry %v", g, fb.Geometry)
++			}
++			if fb.Properties["name"] != f.Properties["name"] || fb.Properties["n"] != f.Properties["n"] {
++				col.failClass(ht, "feature-properties", "feature properties %v read back as %v", f.Properties, fb.Properties)
++			}
++			if fmt.Sprint(fb.ID) != fmt.Sprint(f.ID) {
++				col.failClass(ht, "feature-id", "feature id %v read back as %v", f.ID, fb.ID)
++			}
++			if (f.BBox == nil) != (fb.BBox == nil) || (f.BBox != nil && !fb.BBox.Bound().Equal(f.BBox.Bound())) {
++				col.failClass(ht, "feature-bbox", "feature bbox %v read back as %v", f.BBox, fb.BBox)
++			}
++			if fb.Type != "Feature" {
++				col.failClass(ht, "feature-type", "feature type %q", fb.Type)
++			}
++		}
++		fc := geojson.NewFeatureCollection()
++		fc.Append(f)
++		g2 := genGeometry(ht, 1)
++		for Known.emptyCollectionGeoJSON && hasEmptyCollection(g2) {
++			g2 = genGeometry(ht, 0)
++		}
++		fc.Append(geojson.NewFeature(g2))
++		fcdata, err := json.Marshal(fc)
++		if err != nil {
++			col.fail(ht, "Marshal(feature collection) = %v", err)
++			return
++		}
++		fcb, err := geojson.UnmarshalFeatureCollection(fcdata)
++		if err != nil || len(fcb.Features) != 2 || !same(fcb.Features[0].Geometry, want) || !same(fcb.Features[1].Geometry, fc.Features[1].Geometry) {
++			col.failClass(ht, "feature-collection", "UnmarshalFeatureCollection(%s) = %v, %v", fcdata, fcb, err)
++		}
++
++		// BBox <-> Bound
++		b := genBound(ht)
++		bb := geojson.NewBBox(b)
++		if !bb.Valid() || !bb.Bound().Equal(b) {
++			col.failClass(ht, "bbox", "NewBBox(%v) = %v, Bound() = %v", b, bb, bb.Bound())
++		}
++
++		// a position needs two numbers (RFC 7946, 3.1.1)
++		if !Known.shortPositionAccepted {
++			short := pick(ht, []string{`[]`, `[1]`, `[[1,2],[3]]`})
++			doc := `{"type":"Point","coordinates":` + short + `}`
++			if strings.HasPrefix(short, "[[") {
++				doc = `{"type":"LineString","coordinates":` + short + `}`
++			}
++			if _, err := geojson.UnmarshalGeometry([]byte(doc)); err == nil {
++				col.failClass(ht, "short-position", "UnmarshalGeometry(%s) succeeded", doc)
++			}
++		}
++		col.count(want.GeoJSONType())
++	})
++}
+diff --git a/hegel/hegel_gen_test.go b/hegel/hegel_gen_test.go
+new file mode 100644
+index 0000000..6820bb0
+--- /dev/null
++++ b/hegel/hegel_gen_test.go
+@@ -0,0 +1,422 @@
++package hegel
++
++// Generators of orb geometries and helpers shared by the properties.
++
++import (
++	"fmt"
++	"math"
++	"sort"
++
++	"github.com/paulmach/orb"
++	"hegel.dev/go/hegel"
++)
++
++// coord draws a coordinate with two decimals in [-20, 20] (exact in %g and in JSON).
++func coord(tc hegel.TestCase) float64 { return float64(drawInt(tc, -2000, 2000)) / 100 }
++
++func genPoint(tc hegel.TestCase) orb.Point { return orb.Point{coord(tc), coord(tc)} }
++
++// genMultiPoint draws 0..5 points (duplicates allowed).
++func genMultiPoint(tc hegel.TestCase) orb.MultiPoint {
++	n := drawInt(tc, 0, 5)
++	mp := make(orb.MultiPoint, 0, n)
++	for i := 0; i < n; i++ {
++		mp = append(mp, genPoint(tc))
++	}
++	return mp
++}
++
++// genLineString draws an empty line string or one with 2..6 points; consecutive points differ.
++func genLineString(tc hegel.TestCase) orb.LineString {
++	if chance(tc, 10) {
++		return orb.LineString{}
++	}
++	return genLongLineString(tc, 6)
++}
++
++// genLongLineString draws a line of 2..max points, consecutive points distinct (a repeat is
++// nudged by 0.01 rather than redrawn: hegel's minimal test case repeats every draw).
++func genLongLineString(tc hegel.TestCase, max int) orb.LineString {
++	n := drawInt(tc, 2, max)
++	ls := make(orb.LineString, 0, n)
++	for len(ls) < n {
++		p := genPoint(tc)
++		if len(ls) > 0 && ls[len(ls)-1] == p {
++			p[0] = round2(p[0] + 0.01)
++		}
++		ls = append(ls, p)
++	}
++	return ls
++}
++
++func genMultiLineString(tc hegel.TestCase) orb.MultiLineString {
++	n := drawInt(tc, 0, 3)
++	mls := make(orb.MultiLineString, 0, n)
++	for i := 0; i < n; i++ {
++		mls = append(mls, genLineString(tc))
++	}
++	return mls
++}
++
++// genStarRing draws a closed, simple ring around a centre: vertices at increasing angles with
++// gaps of 30..90 degrees (so 4..12 of them) and radii in [rmin, rmax], rounded to two
++// decimals; the orientation is either. With gaps of at most 90 degrees and radii of at least
++// rmin, every edge stays at least rmin*cos(45deg) from the centre: with rmin = 3 the disc of
++// radius 1.2 around the centre is inside the ring.
++func genStarRing(tc hegel.TestCase, cx, cy, rmin, rmax float64) orb.Ring {
++	start := drawInt(tc, 0, 35) * 10
++	var angles []int
++	cur := 0
++	for cur < 270 {
++		g := drawInt(tc, 3, 9) * 10
++		if cur+g > 330 {
++			g = 330 - cur
++		}
++		angles = append(angles, (start+cur)%360)
++		cur += g
++	}
++	angles = append(angles, (start+cur)%360)
++	sort.Ints(angles)
++	n := len(angles)
++	r := make(orb.Ring, 0, n+1)
++	for _, a := range angles {
++		rad := rmin + float64(drawInt(tc, 0, 100))/100*(rmax-rmin)
++		th := float64(a) * math.Pi / 180
++		r = append(r, orb.Point{round2(cx + rad*math.Cos(th)), round2(cy + rad*math.Sin(th))})
++	}
++	r = append(r, r[0])
++	if chance(tc, 50) {
++		r.Reverse()
++	}
++	return r
++}
++
++func round2(f float64) float64 { return math.Round(f*100) / 100 }
++
++// genRing draws a star ring around a random centre (or, rarely, an empty ring).
++func genRing(tc hegel.TestCase) orb.Ring {
++	if chance(tc, 5) {
++		return orb.Ring{}
++	}
++	return genStarRing(tc, float64(drawInt(tc, -15, 15)), float64(drawInt(tc, -15, 15)), 3, 5)
++}
++
++// holeSquares are hole rings that fit inside the disc of radius 1.2 around the centre and
++// are disjoint from each other.
++var holeSquares = [][4]float64{{0.1, 0.1, 0.7, 0.7}, {-0.7, -0.7, -0.1, -0.1}, {0.1, -0.7, 0.7, -0.1}, {-0.7, 0.1, -0.1, 0.7}}
++
++func squareRing(cx, cy float64, sq [4]float64, cw bool) orb.Ring {
++	x0, y0, x1, y1 := round2(cx+sq[0]), round2(cy+sq[1]), round2(cx+sq[2]), round2(cy+sq[3])
++	r := orb.Ring{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}, {x0, y0}}
++	if cw {
++		r.Reverse()
++	}
++	return r
++}
++
++// genPolygonAt draws a valid polygon around (cx, cy): a star outer ring and 0..2 square holes.
++func genPolygonAt(tc hegel.TestCase, cx, cy float64) orb.Polygon {
++	p := orb.Polygon{genStarRing(tc, cx, cy, 3, 5)}
++	nh := drawInt(tc, 0, 2)
++	for i := 0; i < nh; i++ {
++		p = append(p, squareRing(cx, cy, holeSquares[i], chance(tc, 50)))
++	}
++	return p
++}
++
++// genPolygon draws an empty polygon (rarely) or a valid one around a random centre.
++func genPolygon(tc hegel.TestCase) orb.Polygon {
++	if chance(tc, 5) {
++		return orb.Polygon{}
++	}
++	return genPolygonAt(tc, float64(drawInt(tc, -15, 15)), float64(drawInt(tc, -15, 15)))
++}
++
++// genMultiPolygon draws 0..3 disjoint polygons (centres 12 apart, radii at most 5).
++func genMultiPolygon(tc hegel.TestCase) orb.MultiPolygon {
++	n := drawInt(tc, 0, 3)
++	mp := make(orb.MultiPolygon, 0, n)
++	for i := 0; i < n; i++ {
++		mp = append(mp, genPolygonAt(tc, float64(-12+12*i), float64(drawInt(tc, -1, 1)*12)))
++	}
++	return mp
++}
++
++// genCollection draws 0..4 members; nested collections down to depth 2.
++func genCollection(tc hegel.TestCase, depth int) orb.Collection {
++	n := drawInt(tc, 0, 4)
++	c := make(orb.Collection, 0, n)
++	for i := 0; i < n; i++ {
++		c = append(c, genGeometry(tc, depth))
++	}
++	return c
++}
++
++// geoKinds are the GeoJSON geometry types (what the codecs round-trip as themselves).
++var geoKinds = []string{"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon", "GeometryCollection"}
++
++// genGeometry draws one of the seven GeoJSON geometry types (collections only while depth > 0).
++func genGeometry(tc hegel.TestCase, depth int) orb.Geometry {
++	kinds := geoKinds
++	if depth <= 0 {
++		kinds = geoKinds[:6]
++	}
++	switch pick(tc, kinds) {
++	case "Point":
++		return genPoint(tc)
++	case "MultiPoint":
++		return genMultiPoint(tc)
++	case "LineString":
++		return genLineString(tc)
++	case "MultiLineString":
++		return genMultiLineString(tc)
++	case "Polygon":
++		return genPolygon(tc)
++	case "MultiPolygon":
++		return genMultiPolygon(tc)
++	default:
++		return genCollection(tc, depth-1)
++	}
++}
++
++// genAnyGeometry adds Ring and Bound, the two orb types without a GeoJSON type of their own.
++func genAnyGeometry(tc hegel.TestCase) orb.Geometry {
++	switch drawInt(tc, 0, 9) {
++	case 0:
++		return genRing(tc)
++	case 1:
++		return genBound(tc)
++	default:
++		return genGeometry(tc, 2)
++	}
++}
++
++// genBound draws a non-empty bound (Min <= Max), sometimes degenerate.
++func genBound(tc hegel.TestCase) orb.Bound {
++	a, b := genPoint(tc), genPoint(tc)
++	if chance(tc, 10) {
++		b[0] = a[0]
++	}
++	if chance(tc, 10) {
++		b[1] = a[1]
++	}
++	return orb.Bound{Min: orb.Point{math.Min(a[0], b[0]), math.Min(a[1], b[1])}, Max: orb.Point{math.Max(a[0], b[0]), math.Max(a[1], b[1])}}
++}
++
++// --------------------------------------------------------------------------- helpers
++
++// coords lists every coordinate of a geometry, in order.
++func coords(g orb.Geometry) []orb.Point {
++	switch g := g.(type) {
++	case nil:
++		return nil
++	case orb.Point:
++		return []orb.Point{g}
++	case orb.MultiPoint:
++		return []orb.Point(g)
++	case orb.LineString:
++		return []orb.Point(g)
++	case orb.Ring:
++		return []orb.Point(g)
++	case orb.MultiLineString:
++		var out []orb.Point
++		for _, ls := range g {
++			out = append(out, ls...)
++		}
++		return out
++	case orb.Polygon:
++		var out []orb.Point
++		for _, r := range g {
++			out = append(out, r...)
++		}
++		return out
++	case orb.MultiPolygon:
++		var out []orb.Point
++		for _, p := range g {
++			out = append(out, coords(p)...)
++		}
++		return out
++	case orb.Collection:
++		var out []orb.Point
++		for _, m := range g {
++			out = append(out, coords(m)...)
++		}
++		return out
++	case orb.Bound:
++		return []orb.Point{g.Min, g.Max}
++	}
++	panic(fmt.Sprintf("coords: %T", g))
++}
++
++// modelBound is the bounding box of the coordinates, or the empty bound (Min > Max) when there
++// are none; a Bound's own bound is itself.
++func modelBound(g orb.Point) orb.Bound { return orb.Bound{Min: g, Max: g} }
++
++func boundOf(ps []orb.Point) (orb.Bound, bool) {
++	if len(ps) == 0 {
++		return orb.Bound{}, false
++	}
++	b := orb.Bound{Min: ps[0], Max: ps[0]}
++	for _, p := range ps[1:] {
++		b.Min[0] = math.Min(b.Min[0], p[0])
++		b.Min[1] = math.Min(b.Min[1], p[1])
++		b.Max[0] = math.Max(b.Max[0], p[0])
++		b.Max[1] = math.Max(b.Max[1], p[1])
++	}
++	return b, true
++}
++
++// hasEmptyPart reports whether the geometry or a part of it has no coordinates (empty
++// multi-geometries, collections, line strings, polygons).
++func hasEmptyPart(g orb.Geometry) bool {
++	switch g := g.(type) {
++	case orb.Point:
++		return false
++	case orb.MultiPoint:
++		return len(g) == 0
++	case orb.LineString:
++		return len(g) == 0
++	case orb.Ring:
++		return len(g) == 0
++	case orb.MultiLineString:
++		if len(g) == 0 {
++			return true
++		}
++		for _, ls := range g {
++			if len(ls) == 0 {
++				return true
++			}
++		}
++	case orb.Polygon:
++		if len(g) == 0 {
++			return true
++		}
++		for _, r := range g {
++			if len(r) == 0 {
++				return true
++			}
++		}
++	case orb.MultiPolygon:
++		if len(g) == 0 {
++			return true
++		}
++		for _, p := range g {
++			if hasEmptyPart(p) {
++				return true
++			}
++		}
++	case orb.Collection:
++		if len(g) == 0 {
++			return true
++		}
++		for _, m := range g {
++			if hasEmptyPart(m) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// closePoints compares two points within tol.
++func closePoints(a, b orb.Point, tol float64) bool {
++	return math.Abs(a[0]-b[0]) <= tol && math.Abs(a[1]-b[1]) <= tol
++}
++
++// closeNum compares two numbers within an absolute and a relative tolerance.
++func closeNum(a, b, abs, rel float64) bool {
++	if math.IsNaN(a) || math.IsNaN(b) {
++		return math.IsNaN(a) && math.IsNaN(b)
++	}
++	d := math.Abs(a - b)
++	return d <= abs || d <= rel*math.Max(math.Abs(a), math.Abs(b))
++}
++
++// closeGeom compares two geometries structurally (same type, same shape, coordinates within
++// tol).
++func closeGeom(a, b orb.Geometry, tol float64) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	switch a := a.(type) {
++	case orb.Point:
++		b, ok := b.(orb.Point)
++		return ok && closePoints(a, b, tol)
++	case orb.MultiPoint:
++		b, ok := b.(orb.MultiPoint)
++		return ok && closeLine(orb.LineString(a), orb.LineString(b), tol)
++	case orb.LineString:
++		b, ok := b.(orb.LineString)
++		return ok && closeLine(a, b, tol)
++	case orb.Ring:
++		b, ok := b.(orb.Ring)
++		return ok && closeLine(orb.LineString(a), orb.LineString(b), tol)
++	case orb.MultiLineString:
++		b, ok := b.(orb.MultiLineString)
++		if !ok || len(a) != len(b) {
++			return false
++		}
++		for i := range a {
++			if !closeLine(a[i], b[i], tol) {
++				return false
++			}
++		}
++		return true
++	case orb.Polygon:
++		b, ok := b.(orb.Polygon)
++		if !ok || len(a) != len(b) {
++			return false
++		}
++		for i := range a {
++			if !closeLine(orb.LineString(a[i]), orb.LineString(b[i]), tol) {
++				return false
++			}
++		}
++		return true
++	case orb.MultiPolygon:
++		b, ok := b.(orb.MultiPolygon)
++		if !ok || len(a) != len(b) {
++			return false
++		}
++		for i := range a {
++			if !closeGeom(a[i], b[i], tol) {
++				return false
++			}
++		}
++		return true
++	case orb.Collection:
++		b, ok := b.(orb.Collection)
++		if !ok || len(a) != len(b) {
++			return false
++		}
++		for i := range a {
++			if !closeGeom(a[i], b[i], tol) {
++				return false
++			}
++		}
++		return true
++	case orb.Bound:
++		b, ok := b.(orb.Bound)
++		return ok && closePoints(a.Min, b.Min, tol) && closePoints(a.Max, b.Max, tol)
++	}
++	panic(fmt.Sprintf("closeGeom: %T", a))
++}
++
++func closeLine(a, b orb.LineString, tol float64) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if !closePoints(a[i], b[i], tol) {
++			return false
++		}
++	}
++	return true
++}
++
++// same is structural equality with empty and nil slices alike (orb.Equal distinguishes a nil
++// Collection member from an empty one only through its slices' lengths, so it serves).
++func same(a, b orb.Geometry) bool { return closeGeom(a, b, 0) }
++
++// pointDistance is the planar distance.
++func pointDistance(a, b orb.Point) float64 { return math.Hypot(a[0]-b[0], a[1]-b[1]) }
+diff --git a/hegel/hegel_geo_test.go b/hegel/hegel_geo_test.go
+new file mode 100644
+index 0000000..aaf3e16
+--- /dev/null
++++ b/hegel/hegel_geo_test.go
+@@ -0,0 +1,724 @@
++package hegel
++
++// Map tiles, the quadtree, the geo formulas and the projections, against models written from
++// the doc comments.
++
++import (
++	"math"
++	"sort"
++	"testing"
++
++	"github.com/paulmach/orb"
++	"github.com/paulmach/orb/geo"
++	"github.com/paulmach/orb/maptile"
++	"github.com/paulmach/orb/maptile/tilecover"
++	"github.com/paulmach/orb/planar"
++	"github.com/paulmach/orb/project"
++	"github.com/paulmach/orb/quadtree"
++	"hegel.dev/go/hegel"
++)
++
++// genLonLat draws a longitude/latitude with four decimals; sometimes an edge value.
++func genLonLat(tc hegel.TestCase) orb.Point {
++	if chance(tc, 10) {
++		return orb.Point{pick(tc, []float64{-180, 180, 0, 179.9999, -179.9999}), pick(tc, []float64{-90, 90, -85.0511, 85.0511, 0, -85.05, 85.06})}
++	}
++	return orb.Point{float64(drawInt(tc, -1800000, 1800000)) / 10000, float64(drawInt(tc, -850000, 850000)) / 10000}
++}
++
++// modelFraction is the web-mercator tile fraction of the doc comment: x from the longitude,
++// y from the Mercator latitude, clamped at the 85.0511 degree limits.
++func modelFraction(ll orb.Point, z maptile.Zoom) orb.Point {
++	n := math.Exp2(float64(z))
++	x := (ll[0]/360 + 0.5) * n
++	var y float64
++	switch {
++	case ll[1] < -85.0511:
++		y = n - 1
++	case ll[1] > 85.0511:
++		y = 0
++	default:
++		lat := ll[1] * math.Pi / 180
++		y = (0.5 - math.Log(math.Tan(math.Pi/4+lat/2))/(2*math.Pi)) * n
++	}
++	return orb.Point{x, y}
++}
++
++// modelQuadkey interleaves the x and y bits.
++func modelQuadkey(t maptile.Tile) uint64 {
++	var k uint64
++	for i := uint(0); i < uint(t.Z); i++ {
++		k |= uint64((t.X>>i)&1) << (2 * i)
++		k |= uint64((t.Y>>i)&1) << (2*i + 1)
++	}
++	return k
++}
++
++func toZoom(t maptile.Tile, z maptile.Zoom) maptile.Tile {
++	if z > t.Z {
++		return maptile.Tile{X: t.X << (z - t.Z), Y: t.Y << (z - t.Z), Z: z}
++	}
++	return maptile.Tile{X: t.X >> (t.Z - z), Y: t.Y >> (t.Z - z), Z: z}
++}
++
++// TestHegelMaptile: Fraction and At against the Mercator model, the tile's Bound and Center,
++// quadkeys, parents, children, siblings, containment, shared parents, ranges, and tilecover of
++// points and bounds.
++func TestHegelMaptile(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		z := maptile.Zoom(drawInt(ht, 0, 20))
++		ll := genLonLat(ht)
++		n := math.Exp2(float64(z))
++
++		f := maptile.Fraction(ll, z)
++		want := modelFraction(ll, z)
++		if !closeNum(f[0], want[0], 1e-9*n, 1e-12) || !closeNum(f[1], want[1], 1e-9*n, 1e-12) {
++			col.failClass(ht, "fraction", "Fraction(%v, %d) = %v, model %v", ll, z, f, want)
++		}
++		tile := maptile.At(ll, z)
++		if tile.Z != z || tile.X != uint32(f[0]) || tile.Y != uint32(f[1]) {
++			col.failClass(ht, "at", "At(%v, %d) = %v, fraction %v", ll, z, tile, f)
++		}
++		wantValid := true
++		if Known.tileAtLongitude180 && ll[0] >= 180 {
++			wantValid = false
++		}
++		if tile.Valid() != wantValid {
++			col.failClass(ht, "at-valid", "At(%v, %d) = %v, Valid() = %v", ll, z, tile, tile.Valid())
++		}
++		if !tile.Valid() {
++			col.count("invalid-tile")
++			return
++		}
++
++		// bound and center
++		b := tile.Bound()
++		c := tile.Center()
++		if !closePoints(c, b.Center(), 0) {
++			col.failClass(ht, "center", "%v.Center() = %v, Bound().Center() = %v", tile, c, b.Center())
++		}
++		if maptile.At(c, z) != tile {
++			col.failClass(ht, "center-tile", "At(%v.Center() = %v) = %v", tile, c, maptile.At(c, z))
++		}
++		wantMinLon := float64(tile.X)/n*360 - 180
++		wantMaxLon := float64(tile.X+1)/n*360 - 180
++		if !closeNum(b.Min[0], wantMinLon, 1e-9, 0) || !closeNum(b.Max[0], wantMaxLon, 1e-9, 0) {
++			col.failClass(ht, "bound-lon", "%v.Bound() = %v, longitudes %v..%v", tile, b, wantMinLon, wantMaxLon)
++		}
++		// the latitudes: the fraction of the bound's corners is the tile's edges
++		if fy := maptile.Fraction(orb.Point{c[0], b.Max[1]}, z); !closeNum(fy[1], float64(tile.Y), 1e-6, 0) {
++			col.failClass(ht, "bound-lat", "%v.Bound() top latitude %v has fraction %v", tile, b.Max[1], fy[1])
++		}
++		if fy := maptile.Fraction(orb.Point{c[0], b.Min[1]}, z); b.Min[1] >= -85.0511 && !closeNum(fy[1], float64(tile.Y+1), 1e-6, 0) {
++			col.failClass(ht, "bound-lat", "%v.Bound() bottom latitude %v has fraction %v", tile, b.Min[1], fy[1])
++		}
++		if !b.Contains(ll) && ll[1] >= -85.0511 && ll[1] <= 85.0511 {
++			// a point maps to a tile whose bound holds it (up to the float error at the edge)
++			if !b.Pad(1e-9).Contains(ll) {
++				col.failClass(ht, "bound-contains", "At(%v) = %v whose Bound %v does not contain the point", ll, tile, b)
++			}
++		}
++		bb := tile.Bound(1)
++		if !closeNum(bb.Max[0]-bb.Min[0], 3*(b.Max[0]-b.Min[0]), 1e-9, 1e-9) || !(bb.Min[1] <= b.Min[1] && bb.Max[1] >= b.Max[1]) {
++			col.failClass(ht, "bound-buffer", "%v.Bound(1) = %v, Bound() = %v", tile, bb, b)
++		}
++
++		// quadkey
++		k := tile.Quadkey()
++		if k != modelQuadkey(tile) {
++			col.failClass(ht, "quadkey", "%v.Quadkey() = %d, model %d", tile, k, modelQuadkey(tile))
++		}
++		if back := maptile.FromQuadkey(k, z); back != tile {
++			col.failClass(ht, "fromquadkey", "FromQuadkey(%d, %d) = %v, want %v", k, z, back, tile)
++		}
++
++		// family
++		parent := tile.Parent()
++		if z == 0 {
++			if parent != tile {
++				col.failClass(ht, "parent-root", "%v.Parent() = %v", tile, parent)
++			}
++		} else if parent != (maptile.Tile{X: tile.X >> 1, Y: tile.Y >> 1, Z: z - 1}) || !parent.Contains(tile) {
++			col.failClass(ht, "parent", "%v.Parent() = %v", tile, parent)
++		}
++		children := tile.Children()
++		if len(children) != 4 {
++			col.failClass(ht, "children", "%v.Children() = %v", tile, children)
++		}
++		seen := map[maptile.Tile]bool{}
++		for _, ch := range children {
++			seen[ch] = true
++			if ch.Parent() != tile || !tile.Contains(ch) || ch.Z != z+1 || ch.Contains(tile) {
++				col.failClass(ht, "child", "%v.Children() has %v (parent %v)", tile, ch, ch.Parent())
++			}
++		}
++		if len(seen) != 4 {
++			col.failClass(ht, "children-distinct", "%v.Children() = %v", tile, children)
++		}
++		sib := tile.Siblings()
++		found := false
++		for _, s := range sib {
++			if s == tile {
++				found = true
++			}
++			if s.Parent() != parent {
++				col.failClass(ht, "siblings", "%v.Siblings() = %v", tile, sib)
++			}
++		}
++		if !found && z > 0 {
++			col.failClass(ht, "siblings-self", "%v.Siblings() = %v does not include the tile", tile, sib)
++		}
++		if !tile.Contains(tile) {
++			col.failClass(ht, "contains-self", "%v.Contains(itself) = false", tile)
++		}
++		if z > 0 && tile.Contains(parent) {
++			col.failClass(ht, "contains-parent", "%v.Contains(parent %v) = true", tile, parent)
++		}
++		// a descendant a few levels down
++		dz := maptile.Zoom(drawInt(ht, 0, 5))
++		if z+dz <= 30 {
++			desc := maptile.Tile{X: tile.X<<dz + uint32(drawInt(ht, 0, int(math.Exp2(float64(dz)))-1)), Y: tile.Y<<dz + uint32(drawInt(ht, 0, int(math.Exp2(float64(dz)))-1)), Z: z + dz}
++			if !tile.Contains(desc) {
++				col.failClass(ht, "contains-desc", "%v.Contains(%v) = false", tile, desc)
++			}
++			if sp := tile.SharedParent(desc); sp != tile {
++				col.failClass(ht, "shared-parent-desc", "%v.SharedParent(%v) = %v", tile, desc, sp)
++			}
++			minT, maxT := tile.Range(z + dz)
++			if minT != (maptile.Tile{X: tile.X << dz, Y: tile.Y << dz, Z: z + dz}) || maxT != (maptile.Tile{X: ((tile.X + 1) << dz) - 1, Y: ((tile.Y + 1) << dz) - 1, Z: z + dz}) {
++				col.failClass(ht, "range", "%v.Range(%d) = %v, %v", tile, z+dz, minT, maxT)
++			}
++			if dz <= 3 {
++				all := maptile.ChildrenInZoomRange(tile, z, z+dz)
++				wantN := 0
++				for d := 0; d <= int(dz); d++ {
++					wantN += 1 << (2 * d)
++				}
++				if len(all) != wantN {
++					col.failClass(ht, "children-range", "ChildrenInZoomRange(%v, %d, %d) has %d tiles, want %d", tile, z, z+dz, len(all), wantN)
++				}
++				for _, ch := range all {
++					if !tile.Contains(ch) {
++						col.failClass(ht, "children-range-contains", "ChildrenInZoomRange(%v, %d, %d) has %v", tile, z, z+dz, ch)
++						break
++					}
++				}
++			}
++		}
++		// shared parent with another tile at the same zoom: the deepest common ancestor
++		other := maptile.At(genLonLat(ht), z)
++		if other.Valid() {
++			sp := tile.SharedParent(other)
++			a, b2 := tile, other
++			for a != b2 {
++				a, b2 = a.Parent(), b2.Parent()
++			}
++			if sp != a {
++				col.failClass(ht, "shared-parent", "%v.SharedParent(%v) = %v, want %v", tile, other, sp, a)
++			}
++			lower := maptile.Zoom(drawInt(ht, 0, int(z)))
++			if minT, maxT := tile.Range(lower); minT != toZoom(tile, lower) || maxT != minT {
++				col.failClass(ht, "range-lower", "%v.Range(%d) = %v, %v", tile, lower, minT, maxT)
++			}
++		}
++
++		// tilecover
++		if s := tilecover.Point(ll, z); len(s) != 1 || !s[tile] {
++			col.failClass(ht, "cover-point", "tilecover.Point(%v, %d) = %v", ll, z, s)
++		}
++		mp := orb.MultiPoint{ll, genLonLat(ht), genLonLat(ht)}
++		wantSet := maptile.Set{}
++		for _, p := range mp {
++			wantSet[maptile.At(p, z)] = true
++		}
++		got := tilecover.MultiPoint(mp, z)
++		if len(got) != len(wantSet) {
++			col.failClass(ht, "cover-multipoint", "tilecover.MultiPoint(%v, %d) = %v, want %v", mp, z, got, wantSet)
++		} else {
++			for k := range wantSet {
++				if !got[k] {
++					col.failClass(ht, "cover-multipoint", "tilecover.MultiPoint(%v, %d) = %v, want %v", mp, z, got, wantSet)
++					break
++				}
++			}
++		}
++		// a bound within one tile covers that tile alone; a bound is covered by the tiles
++		// between its corners' tiles
++		inner := orb.Bound{Min: orb.Point{b.Min[0] + (b.Max[0]-b.Min[0])/4, b.Min[1] + (b.Max[1]-b.Min[1])/4}, Max: orb.Point{b.Max[0] - (b.Max[0]-b.Min[0])/4, b.Max[1] - (b.Max[1]-b.Min[1])/4}}
++		if s := tilecover.Bound(inner, z); len(s) != 1 || !s[tile] {
++			col.failClass(ht, "cover-inner", "tilecover.Bound(%v within %v, %d) = %v", inner, tile, z, s)
++		}
++		if z <= 12 {
++			p2 := genLonLat(ht)
++			bnd := orb.MultiPoint{ll, p2}.Bound()
++			lo, hi := maptile.At(bnd.Min, z), maptile.At(bnd.Max, z)
++			wantCount := (int(hi.X) - int(lo.X) + 1) * (int(lo.Y) - int(hi.Y) + 1)
++			if wantCount > 0 && wantCount <= 4096 {
++				s := tilecover.Bound(bnd, z)
++				if len(s) != wantCount {
++					col.failClass(ht, "cover-bound", "tilecover.Bound(%v, %d) has %d tiles, want %d", bnd, z, len(s), wantCount)
++				}
++				for tt := range s {
++					if !tt.Valid() {
++						if !(Known.tileAtLongitude180 && bnd.Max[0] >= 180) {
++							col.failClass(ht, "cover-invalid", "tilecover.Bound(%v, %d) has the invalid tile %v", bnd, z, tt)
++						}
++						break
++					}
++					if !tt.Bound().Pad(1e-9).Intersects(bnd) && bnd.Min[1] >= -85.0511 && bnd.Max[1] <= 85.0511 {
++						col.failClass(ht, "cover-disjoint", "tilecover.Bound(%v, %d) has %v, whose bound %v is disjoint", bnd, z, tt, tt.Bound())
++						break
++					}
++				}
++				tiles := maptile.Tiles{tile, other}
++				if fc := tiles.ToFeatureCollection(); len(fc.Features) != 2 || !same(fc.Features[0].Geometry, tile.Bound().ToPolygon()) {
++					col.failClass(ht, "feature-collection", "Tiles.ToFeatureCollection: %v", fc.Features)
++				}
++			}
++		}
++		col.count("ok")
++	})
++}
++
++// ptr wraps a point with an id so duplicates at one point stay distinct.
++type ptr struct {
++	p  orb.Point
++	id int
++}
++
++func (p *ptr) Point() orb.Point { return p.p }
++
++// TestHegelQuadtree: Find, KNearest (with a filter and a maximum distance), InBound and Remove
++// against brute force over the same points.
++func TestHegelQuadtree(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		size := float64(pick(ht, []int{10, 100}))
++		bound := orb.Bound{Min: orb.Point{0, 0}, Max: orb.Point{size, size}}
++		qt := quadtree.New(bound)
++		if !qt.Bound().Equal(bound) {
++			col.fail(ht, "Bound() = %v", qt.Bound())
++		}
++		n := drawInt(ht, 0, 30)
++		var pts []*ptr
++		for i := 0; i < n; i++ {
++			p := &ptr{p: orb.Point{float64(drawInt(ht, 0, int(size))), float64(drawInt(ht, 0, int(size)))}, id: i}
++			if chance(ht, 30) { // fractional
++				p.p[0] += float64(drawInt(ht, 0, 99)) / 100
++				p.p[1] += float64(drawInt(ht, 0, 99)) / 100
++				if p.p[0] > size {
++					p.p[0] = size
++				}
++				if p.p[1] > size {
++					p.p[1] = size
++				}
++			}
++			if err := qt.Add(p); err != nil {
++				col.fail(ht, "Add(%v) = %v", p.p, err)
++				return
++			}
++			pts = append(pts, p)
++		}
++		outside := &ptr{p: orb.Point{size + 1, size / 2}, id: -1}
++		if err := qt.Add(outside); err != quadtree.ErrPointOutsideOfBounds {
++			col.failClass(ht, "outside", "Add of %v outside %v = %v", outside.p, bound, err)
++		}
++		if err := qt.Add(nil); err != nil {
++			col.failClass(ht, "nil", "Add(nil) = %v", err)
++		}
++
++		q := orb.Point{float64(drawInt(ht, -5, int(size)+5)), float64(drawInt(ht, -5, int(size)+5))}
++		if chance(ht, 30) && n > 0 {
++			q = pts[drawInt(ht, 0, n-1)].p
++		}
++		dists := make([]float64, len(pts))
++		for i, p := range pts {
++			dists[i] = pointDistance(p.p, q)
++		}
++		sorted := append([]float64(nil), dists...)
++		sort.Float64s(sorted)
++
++		// Find
++		f := qt.Find(q)
++		if n == 0 {
++			if f != nil {
++				col.failClass(ht, "find-empty", "Find on an empty tree = %v", f)
++			}
++		} else if f == nil {
++			col.failClass(ht, "find-nil", "Find(%v) = nil with %d points", q, n)
++		} else if d := pointDistance(f.Point(), q); !closeNum(d, sorted[0], 0, 1e-12) {
++			col.failClass(ht, "find", "Find(%v) = %v at %v, nearest is at %v", q, f.Point(), d, sorted[0])
++		}
++
++		// KNearest
++		k := drawInt(ht, 0, 8)
++		if Known.kNearestZeroPanics && k == 0 && n > 0 {
++			k = 1
++		}
++		var res []orb.Pointer
++		if chance(ht, 50) {
++			res = qt.KNearest(nil, q, k)
++		} else {
++			res = qt.KNearest(make([]orb.Pointer, 0, 2), q, k)
++		}
++		wantK := k
++		if wantK > n {
++			wantK = n
++		}
++		if len(res) != wantK {
++			col.failClass(ht, "knearest-count", "KNearest(%v, %d) has %d results of %d points", q, k, len(res), n)
++		} else {
++			for i, r := range res {
++				d := pointDistance(r.Point(), q)
++				if !closeNum(d, sorted[i], 0, 1e-12) {
++					col.failClass(ht, "knearest-order", "KNearest(%v, %d) result %d at %v, want %v (all %v)", q, k, i, d, sorted[i], sorted[:wantK])
++					break
++				}
++			}
++		}
++		// with a maximum distance
++		maxD := float64(drawInt(ht, 0, int(size)))
++		resM := qt.KNearest(nil, q, k, maxD)
++		within := 0
++		for _, d := range sorted {
++			if d <= maxD {
++				within++
++			}
++		}
++		strictly := 0
++		for _, d := range sorted {
++			if d < maxD {
++				strictly++
++			}
++		}
++		wantM := within
++		if wantM > k {
++			wantM = k
++		}
++		wantMs := strictly
++		if wantMs > k {
++			wantMs = k
++		}
++		if len(resM) != wantM && len(resM) != wantMs {
++			col.failClass(ht, "knearest-max", "KNearest(%v, %d, max %v) has %d results, want %d (or %d strictly)", q, k, maxD, len(resM), wantM, wantMs)
++		}
++		for _, r := range resM {
++			if pointDistance(r.Point(), q) > maxD+1e-12 {
++				col.failClass(ht, "knearest-max-far", "KNearest(%v, %d, max %v) has %v at %v", q, k, maxD, r.Point(), pointDistance(r.Point(), q))
++				break
++			}
++		}
++		// with a filter: even ids only
++		even := func(p orb.Pointer) bool { return p.(*ptr).id%2 == 0 }
++		var evenD []float64
++		for _, p := range pts {
++			if even(p) {
++				evenD = append(evenD, pointDistance(p.p, q))
++			}
++		}
++		sort.Float64s(evenD)
++		resF := qt.KNearestMatching(nil, q, k, even)
++		wantF := k
++		if wantF > len(evenD) {
++			wantF = len(evenD)
++		}
++		if len(resF) != wantF {
++			col.failClass(ht, "knearest-filter-count", "KNearestMatching(%v, %d, even) has %d results, want %d", q, k, len(resF), wantF)
++		} else {
++			for i, r := range resF {
++				if !even(r) || !closeNum(pointDistance(r.Point(), q), evenD[i], 0, 1e-12) {
++					col.failClass(ht, "knearest-filter", "KNearestMatching(%v, %d, even) result %d is %v (id %d)", q, k, i, r.Point(), r.(*ptr).id)
++					break
++				}
++			}
++		}
++		if m := qt.Matching(q, even); (m == nil) != (len(evenD) == 0) || (m != nil && !closeNum(pointDistance(m.Point(), q), evenD[0], 0, 1e-12)) {
++			col.failClass(ht, "matching", "Matching(%v, even) = %v", q, m)
++		}
++
++		// InBound
++		qb := orb.MultiPoint{{float64(drawInt(ht, 0, int(size))), float64(drawInt(ht, 0, int(size)))}, {float64(drawInt(ht, 0, int(size))), float64(drawInt(ht, 0, int(size)))}}.Bound()
++		inb := qt.InBound(nil, qb)
++		wantIn := 0
++		for _, p := range pts {
++			if qb.Contains(p.p) {
++				wantIn++
++			}
++		}
++		if len(inb) != wantIn {
++			col.failClass(ht, "inbound-count", "InBound(%v) has %d results, want %d", qb, len(inb), wantIn)
++		}
++		for _, r := range inb {
++			if !qb.Contains(r.Point()) {
++				col.failClass(ht, "inbound-outside", "InBound(%v) has %v", qb, r.Point())
++				break
++			}
++		}
++		inbF := qt.InBoundMatching(nil, qb, even)
++		wantInF := 0
++		for _, p := range pts {
++			if qb.Contains(p.p) && even(p) {
++				wantInF++
++			}
++		}
++		if len(inbF) != wantInF {
++			col.failClass(ht, "inbound-filter", "InBoundMatching(%v, even) has %d results, want %d", qb, len(inbF), wantInF)
++		}
++
++		// Remove: one element at the point (by id through the filter, or the first by point)
++		if n > 0 {
++			victim := pts[drawInt(ht, 0, n-1)]
++			byID := func(p orb.Pointer) bool { return p.(*ptr).id == victim.id }
++			if !qt.Remove(victim, byID) {
++				col.failClass(ht, "remove", "Remove(%v id %d) = false", victim.p, victim.id)
++			}
++			if qt.Remove(victim, byID) {
++				col.failClass(ht, "remove-twice", "Remove(%v id %d) succeeded twice", victim.p, victim.id)
++			}
++			all := qt.InBound(nil, bound)
++			if len(all) != n-1 {
++				col.failClass(ht, "remove-count", "after Remove, InBound(all) has %d, want %d", len(all), n-1)
++			}
++			for _, r := range all {
++				if r.(*ptr).id == victim.id {
++					col.failClass(ht, "remove-still", "after Remove, %v id %d is still in the tree", victim.p, victim.id)
++				}
++			}
++			// the nearest to the victim's point among the rest
++			rest := make([]float64, 0, n-1)
++			for _, p := range pts {
++				if p.id != victim.id {
++					rest = append(rest, pointDistance(p.p, victim.p))
++				}
++			}
++			sort.Float64s(rest)
++			f := qt.Find(victim.p)
++			if len(rest) == 0 {
++				if f != nil {
++					col.failClass(ht, "find-after-remove", "Find after removing the only point = %v", f)
++				}
++			} else if f == nil || !closeNum(pointDistance(f.Point(), victim.p), rest[0], 0, 1e-12) {
++				col.failClass(ht, "find-after-remove", "Find(%v) after Remove = %v, nearest at %v", victim.p, f, rest[0])
++			}
++			// remove by point (nil filter) an absent point
++			absent := &ptr{p: orb.Point{size / 3, size / 7}, id: -2}
++			present := false
++			for _, p := range pts {
++				if p.id != victim.id && p.p == absent.p {
++					present = true
++				}
++			}
++			if qt.Remove(absent, nil) != present {
++				col.failClass(ht, "remove-absent", "Remove(%v, nil) = %v, present %v", absent.p, !present, present)
++			}
++		}
++		col.count("ok")
++	})
++}
++
++const earthR = 6378137.0
++
++func haversine(a, b orb.Point) float64 {
++	la1, la2 := a[1]*math.Pi/180, b[1]*math.Pi/180
++	dlat := la2 - la1
++	dlon := (b[0] - a[0]) * math.Pi / 180
++	h := math.Sin(dlat/2)*math.Sin(dlat/2) + math.Cos(la1)*math.Cos(la2)*math.Sin(dlon/2)*math.Sin(dlon/2)
++	return 2 * earthR * math.Atan2(math.Sqrt(h), math.Sqrt(1-h))
++}
++
++// genNearby draws a point within about 0.5 degrees of p.
++func genNearby(tc hegel.TestCase, p orb.Point) orb.Point {
++	return orb.Point{p[0] + float64(drawInt(tc, -5000, 5000))/10000, p[1] + float64(drawInt(tc, -5000, 5000))/10000}
++}
++
++// TestHegelGeo: the geo package against the haversine model and geometric contracts (bearing
++// and distance round trip, midpoints, bounds around points, padding, heights and widths, the
++// area of small polygons, points along lines).
++func TestHegelGeo(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		p := orb.Point{float64(drawInt(ht, -1600000, 1600000)) / 10000, float64(drawInt(ht, -700000, 700000)) / 10000}
++		q := genNearby(ht, p)
++		hd := geo.DistanceHaversine(p, q)
++		if !closeNum(hd, haversine(p, q), 1e-6, 1e-9) {
++			col.failClass(ht, "haversine", "DistanceHaversine(%v, %v) = %v, model %v", p, q, hd, haversine(p, q))
++		}
++		d := geo.Distance(p, q)
++		if !closeNum(d, hd, 0.5, 1e-4) { // the equirectangular approximation, nearby points
++			col.failClass(ht, "distance", "Distance(%v, %v) = %v, haversine %v", p, q, d, hd)
++		}
++		if geo.Distance(p, p) != 0 || geo.DistanceHaversine(p, p) != 0 {
++			col.failClass(ht, "distance-self", "Distance(%v, itself) = %v / %v", p, geo.Distance(p, p), geo.DistanceHaversine(p, p))
++		}
++		// bearing and distance round trip
++		br := geo.Bearing(p, q)
++		if br < -180 || br > 180 {
++			col.failClass(ht, "bearing-range", "Bearing(%v, %v) = %v", p, q, br)
++		}
++		if p != q {
++			r := geo.PointAtBearingAndDistance(p, br, hd)
++			if !closePoints(r, q, 1e-6) {
++				col.failClass(ht, "bearing-roundtrip", "PointAtBearingAndDistance(%v, Bearing %v, %v) = %v, want %v", p, br, hd, r, q)
++			}
++		}
++		// midpoint
++		m := geo.Midpoint(p, q)
++		d1, d2 := geo.DistanceHaversine(p, m), geo.DistanceHaversine(m, q)
++		if !closeNum(d1, d2, 1e-6, 1e-9) || !closeNum(d1+d2, hd, 1e-6, 1e-9) {
++			col.failClass(ht, "midpoint", "Midpoint(%v, %v) = %v: %v + %v vs %v", p, q, m, d1, d2, hd)
++		}
++		// length
++		ls := orb.LineString{p, q, genNearby(ht, q)}
++		wantL := geo.Distance(ls[0], ls[1]) + geo.Distance(ls[1], ls[2])
++		wantH := haversine(ls[0], ls[1]) + haversine(ls[1], ls[2])
++		if !closeNum(geo.Length(ls), wantL, 1e-6, 1e-12) || !closeNum(geo.LengthHaversine(ls), wantH, 1e-6, 1e-9) {
++			col.failClass(ht, "length", "Length(%v) = %v / %v, want %v / %v", ls, geo.Length(ls), geo.LengthHaversine(ls), wantL, wantH)
++		}
++		// bound around a point: the cardinal points just inside the distance are inside,
++		// just outside are outside
++		dist := float64(drawInt(ht, 1, 100000))
++		if math.Abs(p[1]) <= 60 && math.Abs(p[0]) <= 150 {
++			nb := geo.NewBoundAroundPoint(p, dist)
++			for _, bearing := range []float64{0, 90, 180, 270, float64(drawInt(ht, 0, 359))} {
++				in := geo.PointAtBearingAndDistance(p, bearing, dist*0.99)
++				if !nb.Contains(in) {
++					col.failClass(ht, "bound-around-in", "NewBoundAroundPoint(%v, %v) = %v misses %v (bearing %v at 0.99 d)", p, dist, nb, in, bearing)
++					break
++				}
++				if bearing == float64(int(bearing)) && int(bearing)%90 == 0 {
++					out := geo.PointAtBearingAndDistance(p, bearing, dist*1.01)
++					if nb.Contains(out) {
++						col.failClass(ht, "bound-around-out", "NewBoundAroundPoint(%v, %v) = %v contains %v (bearing %v at 1.01 d)", p, dist, nb, out, bearing)
++						break
++					}
++				}
++			}
++			if !closeNum(geo.BoundHeight(nb), 2*dist, 1, 5e-3) { // BoundHeight's 111131.75 m/deg vs the sphere's 111319.49
++				col.failClass(ht, "bound-around-height", "NewBoundAroundPoint(%v, %v) = %v has height %v", p, dist, nb, geo.BoundHeight(nb))
++			}
++		}
++		// pad, height, width
++		b := orb.MultiPoint{p, q}.Bound()
++		if h := geo.BoundHeight(b); h != 111131.75*(b.Max[1]-b.Min[1]) {
++			col.failClass(ht, "height", "BoundHeight(%v) = %v", b, h)
++		}
++		cy := (b.Min[1] + b.Max[1]) / 2
++		if w := geo.BoundWidth(b); w != geo.Distance(orb.Point{b.Min[0], cy}, orb.Point{b.Max[0], cy}) {
++			col.failClass(ht, "width", "BoundWidth(%v) = %v", b, w)
++		}
++		if math.Abs(p[1]) <= 60 && math.Abs(p[0]) <= 150 {
++			pb := geo.BoundPad(b, dist)
++			if !pb.Contains(b.Min) || !pb.Contains(b.Max) || !closeNum(geo.BoundHeight(pb), geo.BoundHeight(b)+2*dist, 1e-3, 1e-9) {
++				col.failClass(ht, "pad", "BoundPad(%v, %v) = %v (heights %v, %v)", b, dist, pb, geo.BoundHeight(b), geo.BoundHeight(pb))
++			}
++			if geo.BoundWidth(pb) < geo.BoundWidth(b)+2*dist*0.99 {
++				col.failClass(ht, "pad-width", "BoundPad(%v, %v) = %v widened by %v", b, dist, pb, geo.BoundWidth(pb)-geo.BoundWidth(b))
++			}
++		}
++		// area of a small polygon: the planar area scaled to metres at the centre latitude
++		if math.Abs(p[1]) <= 60 {
++			ring := genStarRing(ht, 0, 0, 3, 5)
++			scale := 0.01 // degrees per unit: rings of at most 0.1 degrees across
++			for i := range ring {
++				ring[i] = orb.Point{p[0] + ring[i][0]*scale, p[1] + ring[i][1]*scale}
++			}
++			planarDeg := planar.Area(ring) // signed
++			k := earthR * math.Pi / 180
++			wantArea := planarDeg * k * k * math.Cos(p[1]*math.Pi/180)
++			got := geo.SignedArea(ring)
++			if !closeNum(got, wantArea, 0, 2e-3) {
++				col.failClass(ht, "signed-area", "SignedArea(%v) = %v, scaled planar %v", ring, got, wantArea)
++			}
++			if geo.Area(ring) != math.Abs(got) || !closeNum(geo.Area(orb.Polygon{ring}), math.Abs(got), 1e-6, 1e-12) {
++				col.failClass(ht, "area", "Area(%v) = %v, SignedArea %v", ring, geo.Area(ring), got)
++			}
++			if (ring.Orientation() == orb.CCW) != (got > 0) {
++				col.failClass(ht, "area-sign", "SignedArea(%v) = %v, orientation %v", ring, got, ring.Orientation())
++			}
++		}
++		// point at a distance along a line
++		total := geo.LengthHaversine(ls)
++		frac := float64(drawInt(ht, -10, 110)) / 100
++		along := frac * total
++		pt, bearing := geo.PointAtDistanceAlongLine(ls, along)
++		switch {
++		case along < 0:
++			if pt != ls[0] {
++				col.failClass(ht, "along-negative", "PointAtDistanceAlongLine(%v, %v) = %v", ls, along, pt)
++			}
++		case along >= total-1e-6:
++			// at the end within the rounding of the summed segment distances
++			if !closePoints(pt, ls[2], 1e-9) {
++				col.failClass(ht, "along-past", "PointAtDistanceAlongLine(%v, %v) = %v, want the end", ls, along, pt)
++			}
++		default:
++			// on the path: within a metre of a segment, and the travelled distance matches
++			travelled := math.Inf(1)
++			for i := 0; i+1 < len(ls); i++ {
++				a, b := ls[i], ls[i+1]
++				// geodesic-ish check: the point is where the bearing walk lands, so measure
++				// with the same tools
++				if closeNum(geo.DistanceHaversine(a, pt)+geo.DistanceHaversine(pt, b), geo.DistanceHaversine(a, b), 1, 1e-6) {
++					tv := geo.DistanceHaversine(a, pt)
++					for j := 0; j < i; j++ {
++						tv += geo.DistanceHaversine(ls[j], ls[j+1])
++					}
++					if math.Abs(tv-along) < math.Abs(travelled-along) {
++						travelled = tv
++					}
++				}
++			}
++			if !closeNum(travelled, along, 1, 1e-6) {
++				col.failClass(ht, "along", "PointAtDistanceAlongLine(%v, %v) = %v (bearing %v): travelled %v", ls, along, pt, bearing, travelled)
++			}
++		}
++		col.count("ok")
++	})
++}
++
++// TestHegelProject: Mercator forward and back, WGS84 the inverse pair, the scale factor, and
++// the geometry helpers applied point-wise.
++func TestHegelProject(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		p := orb.Point{float64(drawInt(ht, -1800000, 1800000)) / 10000, float64(drawInt(ht, -850000, 850000)) / 10000}
++		m := project.WGS84.ToMercator(p)
++		back := project.Mercator.ToWGS84(m)
++		if !closePoints(back, p, 1e-9) {
++			col.failClass(ht, "mercator-roundtrip", "Mercator.ToWGS84(WGS84.ToMercator(%v) = %v) = %v", p, m, back)
++		}
++		// the model: x = R * lon (rad), y = R * ln(tan(pi/4 + lat/2))
++		wantX := earthR * p[0] * math.Pi / 180
++		wantY := earthR * math.Log(math.Tan(math.Pi/4+p[1]*math.Pi/360))
++		if !closeNum(m[0], wantX, 1e-6, 1e-12) || !closeNum(m[1], wantY, 1e-6, 1e-12) {
++			col.failClass(ht, "mercator", "Mercator.ToPlanar(%v) = %v, model %v %v", p, m, wantX, wantY)
++		}
++		if s := project.MercatorScaleFactor(p); !closeNum(s, 1/math.Cos(p[1]*math.Pi/180), 1e-9, 1e-12) {
++			col.failClass(ht, "scale", "MercatorScaleFactor(%v) = %v, want %v", p, s, 1/math.Cos(p[1]*math.Pi/180))
++		}
++		// the helpers apply the projection to every coordinate, in order
++		g := genAnyGeometry(ht)
++		shift := func(q orb.Point) orb.Point { return orb.Point{q[0] + 1, q[1] - 2} }
++		before := coords(g)
++		res := project.Geometry(orb.Clone(g), shift)
++		after := coords(res)
++		if res.GeoJSONType() != g.GeoJSONType() || len(after) != len(before) {
++			col.failClass(ht, "helper-shape", "project.Geometry(%v) = %v", g, res)
++		} else {
++			for i := range before {
++				if after[i] != shift(before[i]) {
++					col.failClass(ht, "helper", "project.Geometry(%v) coordinate %d = %v, want %v", g, i, after[i], shift(before[i]))
++					break
++				}
++			}
++		}
++		if bd, ok := g.(orb.Bound); ok {
++			pb := project.Bound(bd, shift)
++			if pb.Min != shift(bd.Min) || pb.Max != shift(bd.Max) {
++				col.failClass(ht, "helper-bound", "project.Bound(%v) = %v", bd, pb)
++			}
++		}
++		col.count("ok")
++	})
++}
+diff --git a/hegel/hegel_ops_test.go b/hegel/hegel_ops_test.go
+new file mode 100644
+index 0000000..431c368
+--- /dev/null
++++ b/hegel/hegel_ops_test.go
+@@ -0,0 +1,463 @@
++package hegel
++
++// Clipping, simplification and resampling.
++
++import (
++	"math"
++	"testing"
++
++	"github.com/paulmach/orb"
++	"github.com/paulmach/orb/clip"
++	"github.com/paulmach/orb/planar"
++	"github.com/paulmach/orb/resample"
++	"github.com/paulmach/orb/simplify"
++	"hegel.dev/go/hegel"
++)
++
++// withinBound reports whether every coordinate lies in the (closed) bound, within tol.
++func withinBound(g orb.Geometry, b orb.Bound, tol float64) bool {
++	for _, p := range coords(g) {
++		if p[0] < b.Min[0]-tol || p[0] > b.Max[0]+tol || p[1] < b.Min[1]-tol || p[1] > b.Max[1]+tol {
++			return false
++		}
++	}
++	return true
++}
++
++// TestHegelClip: clip.MultiPoint keeps the points the bound contains; clipped lines and rings
++// lie in the bound, on the original, and measure (length, area) what shapely's intersection
++// with the box measures; clip.Geometry dispatches and unwraps single results.
++func TestHegelClip(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		b := genBound(ht)
++		if b.Min[0] == b.Max[0] {
++			b.Max[0] = round2(b.Max[0] + 1)
++		}
++		if b.Min[1] == b.Max[1] {
++			b.Max[1] = round2(b.Max[1] + 1)
++		}
++		if chance(ht, 30) { // a bound around the origin where the polygons are
++			b = orb.Bound{Min: orb.Point{-3, -3}, Max: orb.Point{float64(drawInt(ht, 0, 8)), float64(drawInt(ht, 0, 8))}}
++		}
++		g := genGeometry(ht, 2)
++		if chance(ht, 25) {
++			g = genLongLineString(ht, 8)
++		}
++		if p, ok := g.(orb.Polygon); ok && len(p) > 0 && chance(ht, 50) {
++			g = genPolygonAt(ht, 0, 0) // where the near-origin bounds cut it
++		}
++		orig := orb.Clone(g)
++		tol := 1e-9
++
++		switch gg := g.(type) {
++		case orb.MultiPoint:
++			res := clip.MultiPoint(b, gg)
++			var want orb.MultiPoint
++			for _, p := range gg {
++				if b.Contains(p) {
++					want = append(want, p)
++				}
++			}
++			if !same(res, want) && !(len(res) == 0 && len(want) == 0) {
++				col.failClass(ht, "multipoint", "clip.MultiPoint(%v, %v) = %v, want %v", b, gg, res, want)
++			}
++		case orb.LineString:
++			res := clip.LineString(b, gg.Clone())
++			if !withinBound(res, b, tol) {
++				col.failClass(ht, "line-outside", "clip.LineString(%v, %v) = %v has points outside", b, gg, res)
++			}
++			for _, p := range coords(res) {
++				if planar.DistanceFrom(gg, p) > 1e-7 {
++					col.failClass(ht, "line-off", "clip.LineString(%v, %v) = %v has a point off the line", b, gg, res)
++					break
++				}
++			}
++			for _, ls := range res {
++				if len(ls) < 2 {
++					col.failClass(ht, "line-short", "clip.LineString(%v, %v) = %v has a line of %d points", b, gg, res, len(ls))
++				}
++			}
++			if len(gg) > 0 {
++				r := shapelyClip(gg, b)
++				if r.Ok {
++					if !closeNum(planar.Length(res), num(r.Length), 1e-7, 1e-9) {
++						col.failClass(ht, "line-length", "clip.LineString(%v, %v) = %v, length %v, shapely %v", b, gg, res, planar.Length(res), num(r.Length))
++					}
++				}
++			}
++			// the Geometry dispatcher unwraps a single line
++			gres := clip.Geometry(b, gg.Clone())
++			switch len(res) {
++			case 0:
++				if gres != nil {
++					col.failClass(ht, "geometry-nil", "clip.Geometry(%v, %v) = %v, LineString gave nothing", b, gg, gres)
++				}
++			case 1:
++				if !same(gres, res[0]) {
++					col.failClass(ht, "geometry-unwrap", "clip.Geometry(%v, %v) = %v, want %v", b, gg, gres, res[0])
++				}
++			default:
++				if !same(gres, res) {
++					col.failClass(ht, "geometry-mls", "clip.Geometry(%v, %v) = %v, want %v", b, gg, gres, res)
++				}
++			}
++		case orb.MultiLineString:
++			res := clip.MultiLineString(b, gg.Clone())
++			if !withinBound(res, b, tol) {
++				col.failClass(ht, "mls-outside", "clip.MultiLineString(%v, %v) = %v has points outside", b, gg, res)
++			}
++			total := 0.0
++			for _, ls := range gg {
++				if len(ls) > 0 {
++					r := shapelyClip(ls, b)
++					if r.Ok {
++						total += num(r.Length)
++					}
++				}
++			}
++			if !closeNum(planar.Length(res), total, 1e-7, 1e-9) {
++				col.failClass(ht, "mls-length", "clip.MultiLineString(%v, %v) = %v, length %v, shapely %v", b, gg, res, planar.Length(res), total)
++			}
++		case orb.Polygon:
++			if len(gg) == 0 {
++				if res := clip.Polygon(b, gg); res != nil {
++					col.failClass(ht, "empty-polygon", "clip.Polygon(%v, empty) = %v", b, res)
++				}
++				break
++			}
++			res := clip.Polygon(b, gg.Clone())
++			if !withinBound(res, b, tol) {
++				col.failClass(ht, "polygon-outside", "clip.Polygon(%v, %v) = %v has points outside", b, gg, res)
++			}
++			r := shapelyClip(gg, b)
++			if r.Ok {
++				area := 0.0
++				if res != nil {
++					area = planar.Area(res)
++				}
++				if !closeNum(area, num(r.Area), 1e-7, 1e-9) {
++					col.failClass(ht, "polygon-area", "clip.Polygon(%v, %v) = %v, area %v, shapely %v", b, gg, res, area, num(r.Area))
++				}
++				if res != nil && len(res[0]) > 0 && res[0][0] != res[0][len(res[0])-1] {
++					col.failClass(ht, "polygon-open", "clip.Polygon(%v, %v) = %v: outer ring not closed", b, gg, res)
++				}
++			}
++			// the ring alone
++			rr := clip.Ring(b, gg[0].Clone())
++			r0 := shapelyClip(orb.Polygon{gg[0]}, b)
++			if r0.Ok {
++				area := 0.0
++				if rr != nil {
++					area = math.Abs(planar.Area(rr))
++				}
++				if !closeNum(area, num(r0.Area), 1e-7, 1e-9) {
++					col.failClass(ht, "ring-area", "clip.Ring(%v, %v) = %v, area %v, shapely %v", b, gg[0], rr, area, num(r0.Area))
++				}
++				if rr != nil && area > 1e-9 && rr.Orientation() != gg[0].Orientation() {
++					col.failClass(ht, "ring-orientation", "clip.Ring(%v, %v) = %v changed the orientation", b, gg[0], rr)
++				}
++			}
++		case orb.MultiPolygon:
++			res := clip.MultiPolygon(b, gg.Clone())
++			if !withinBound(res, b, tol) {
++				col.failClass(ht, "mp-outside", "clip.MultiPolygon(%v, %v) = %v has points outside", b, gg, res)
++			}
++			total := 0.0
++			for _, p := range gg {
++				r := shapelyClip(p, b)
++				if r.Ok {
++					total += num(r.Area)
++				}
++			}
++			area := 0.0
++			if res != nil {
++				area = planar.Area(res)
++			}
++			if !closeNum(area, total, 1e-7, 1e-9) {
++				col.failClass(ht, "mp-area", "clip.MultiPolygon(%v, %v) = %v, area %v, shapely %v", b, gg, res, area, total)
++			}
++		case orb.Collection:
++			res := clip.Collection(b, orb.Clone(gg).(orb.Collection))
++			if !withinBound(res, b, tol) {
++				col.failClass(ht, "collection-outside", "clip.Collection(%v, %v) = %v has points outside", b, gg, res)
++			}
++			if len(res) > len(gg) {
++				col.failClass(ht, "collection-count", "clip.Collection(%v, %v) = %v has more members", b, gg, res)
++			}
++		case orb.Point:
++			gres := clip.Geometry(b, gg)
++			if b.Contains(gg) != (gres != nil) || (gres != nil && !same(gres, gg)) {
++				col.failClass(ht, "point", "clip.Geometry(%v, %v) = %v", b, gg, gres)
++			}
++		}
++		// clip.Geometry: nil when the bounds do not meet, within the bound otherwise
++		gres := clip.Geometry(b, orb.Clone(g))
++		if !b.Intersects(g.Bound()) && gres != nil {
++			col.failClass(ht, "geometry-disjoint", "clip.Geometry(%v, %v) = %v though the bounds are disjoint", b, g, gres)
++		}
++		if gres != nil && !withinBound(gres, b, tol) {
++			col.failClass(ht, "geometry-outside", "clip.Geometry(%v, %v) = %v has points outside", b, g, gres)
++		}
++		_ = orig
++		col.count(g.GeoJSONType())
++	})
++}
++
++// subsequence reports whether sub is an in-order subsequence of ls.
++func subsequence(sub, ls orb.LineString) bool {
++	j := 0
++	for _, p := range sub {
++		for j < len(ls) && ls[j] != p {
++			j++
++		}
++		if j == len(ls) {
++			return false
++		}
++		j++
++	}
++	return true
++}
++
++// modelRadial is the radial simplification: keep a point when it is further than the
++// threshold from the last kept point; the last point is always kept.
++func modelRadial(ls orb.LineString, threshold float64) orb.LineString {
++	if len(ls) <= 2 {
++		return ls
++	}
++	out := orb.LineString{ls[0]}
++	current := 0
++	for i := 1; i < len(ls); i++ {
++		if pointDistance(ls[current], ls[i]) > threshold {
++			current = i
++			out = append(out, ls[i])
++		}
++	}
++	if current != len(ls)-1 {
++		out = append(out, ls[len(ls)-1])
++	}
++	return out
++}
++
++// TestHegelSimplify: Douglas-Peucker against shapely's; Radial against its model; Visvalingam's
++// point-count contracts; every simplifier keeps an in-order subsequence with the end points,
++// removed points within the threshold of the result (Douglas-Peucker), and the type rules of
++// Simplify.
++func TestHegelSimplify(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		ls := genLongLineString(ht, 12)
++		threshold := float64(drawInt(ht, 0, 600)) / 100
++
++		// Douglas-Peucker
++		dp := simplify.DouglasPeucker(threshold).LineString(ls.Clone())
++		if !subsequence(dp, ls) || len(dp) < 2 || dp[0] != ls[0] || dp[len(dp)-1] != ls[len(ls)-1] {
++			col.failClass(ht, "dp-shape", "DouglasPeucker(%v) of %v = %v", threshold, ls, dp)
++		} else {
++			for _, p := range ls {
++				if planar.DistanceFrom(dp, p) > threshold+1e-9 {
++					col.failClass(ht, "dp-distance", "DouglasPeucker(%v) of %v = %v leaves %v at %v", threshold, ls, dp, p, planar.DistanceFrom(dp, p))
++					break
++				}
++			}
++			// a point within 1e-6 of the threshold from a chord decides differently in
++			// squared (orb) and plain (GEOS) distance: not compared
++			tie := false
++			for a := 0; a < len(ls); a++ {
++				for b := a + 2; b < len(ls); b++ {
++					for i := a + 1; i < b; i++ {
++						if math.Abs(planar.DistanceFromSegment(ls[a], ls[b], ls[i])-threshold) < 1e-6 {
++							tie = true
++						}
++					}
++				}
++			}
++			r := shapelySimplify(ls, threshold)
++			if r.Ok && !tie {
++				want := fromHexWKB(r.WKB)
++				if !same(dp, want) {
++					col.failClass(ht, "dp-shapely", "DouglasPeucker(%v) of %v = %v, shapely %v", threshold, ls, dp, want)
++				}
++			}
++		}
++
++		// Radial
++		rad := simplify.Radial(planar.Distance, threshold).LineString(ls.Clone())
++		if !same(rad, modelRadial(ls, threshold)) {
++			col.failClass(ht, "radial", "Radial(%v) of %v = %v, model %v", threshold, ls, rad, modelRadial(ls, threshold))
++		}
++
++		// Visvalingam
++		vt := simplify.VisvalingamThreshold(threshold).LineString(ls.Clone())
++		if !subsequence(vt, ls) || len(vt) < 2 || vt[0] != ls[0] || vt[len(vt)-1] != ls[len(ls)-1] {
++			col.failClass(ht, "vis-threshold", "VisvalingamThreshold(%v) of %v = %v", threshold, ls, vt)
++		}
++		keep := drawInt(ht, 0, 12)
++		if !(Known.visvalingamKeepOnePanics && keep == 1 && len(ls) > 2) {
++			vk := simplify.VisvalingamKeep(keep).LineString(ls.Clone())
++			wantN := keep
++			if keep < 2 {
++				wantN = 2 // the ends always stay
++			}
++			if wantN > len(ls) {
++				wantN = len(ls)
++			}
++			if len(vk) != wantN || !subsequence(vk, ls) {
++				col.failClass(ht, "vis-keep", "VisvalingamKeep(%d) of %v (%d points) = %v (%d points), want %d", keep, ls, len(ls), vk, len(vk), wantN)
++			}
++		}
++
++		// rings and polygons: the ring stays closed and a subsequence; holes reduced to nothing
++		// disappear; the type rules of Simplify
++		g := genAnyGeometry(ht)
++		s := pick(ht, []orb.Simplifier{simplify.DouglasPeucker(threshold), simplify.Radial(planar.Distance, threshold), simplify.VisvalingamThreshold(threshold)})
++		res := s.Simplify(orb.Clone(g))
++		switch gg := g.(type) {
++		case orb.Point, orb.Bound:
++			if !same(res, gg) {
++				col.failClass(ht, "simplify-point", "Simplify(%v) = %v", g, res)
++			}
++		case orb.MultiPoint:
++			if !same(res, gg) && !(len(gg) == 0 && res == nil) {
++				col.failClass(ht, "simplify-multipoint", "Simplify(%v) = %v", g, res)
++			}
++		case orb.LineString:
++			if len(gg) == 0 {
++				if res != nil {
++					col.failClass(ht, "simplify-empty", "Simplify(%v) = %v", g, res)
++				}
++			} else if r, ok := res.(orb.LineString); !ok || !subsequence(r, gg) || r[0] != gg[0] || r[len(r)-1] != gg[len(gg)-1] {
++				col.failClass(ht, "simplify-line", "Simplify(%v) = %v", g, res)
++			}
++		case orb.Ring:
++			if len(gg) == 0 {
++				if res != nil {
++					col.failClass(ht, "simplify-empty", "Simplify(%v) = %v", g, res)
++				}
++			} else if r, ok := res.(orb.Ring); !ok || !subsequence(orb.LineString(r), orb.LineString(gg)) || r[0] != gg[0] || r[len(r)-1] != gg[len(gg)-1] {
++				col.failClass(ht, "simplify-ring", "Simplify(%v) = %v", g, res)
++			}
++		case orb.Polygon:
++			if len(gg) == 0 {
++				if res != nil {
++					col.failClass(ht, "simplify-empty", "Simplify(%v) = %v", g, res)
++				}
++			} else if r, ok := res.(orb.Polygon); !ok || len(r) == 0 || len(r) > len(gg) || !subsequence(orb.LineString(r[0]), orb.LineString(gg[0])) {
++				col.failClass(ht, "simplify-polygon", "Simplify(%v) = %v", g, res)
++			} else {
++				for _, h := range r[1:] {
++					if len(h) <= 2 {
++						col.failClass(ht, "simplify-hole", "Simplify(%v) = %v keeps a hole of %d points", g, res, len(h))
++					}
++				}
++			}
++		}
++		col.count("ok")
++	})
++}
++
++// arcPos is the distance along ls of a point on it (the first segment within tol), or -1.
++func arcPos(ls orb.LineString, p orb.Point, tol float64) float64 {
++	pos := 0.0
++	for i := 0; i+1 < len(ls); i++ {
++		if planar.DistanceFromSegment(ls[i], ls[i+1], p) <= tol {
++			return pos + pointDistance(ls[i], p)
++		}
++		pos += pointDistance(ls[i], ls[i+1])
++	}
++	return -1
++}
++
++// TestHegelResample: Resample gives the asked number of points, the ends unchanged, evenly
++// spaced along the path; ToInterval spaces about the interval; edge cases per the doc comments.
++func TestHegelResample(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		ls := genLongLineString(ht, 6)
++		if chance(ht, 10) {
++			ls = orb.LineString{}
++		} else if chance(ht, 10) {
++			p := genPoint(ht)
++			ls = orb.LineString{p}
++			for i := drawInt(ht, 0, 3); i > 0; i-- {
++				ls = append(ls, p)
++			}
++		}
++		n := drawInt(ht, -1, 12)
++		res := resample.Resample(ls.Clone(), planar.Distance, n)
++		total := planar.Length(ls)
++		switch {
++		case n <= 0:
++			if res != nil {
++				col.failClass(ht, "nonpositive", "Resample(%v, %d) = %v", ls, n, res)
++			}
++		case len(ls) <= 1:
++			if !same(res, ls) && !(len(ls) == 0 && len(res) == 0) {
++				col.failClass(ht, "short", "Resample(%v, %d) = %v", ls, n, res)
++			}
++		case total == 0: // all points equal: padded or truncated to n copies
++			if len(res) != n {
++				col.failClass(ht, "equal-points", "Resample(%v, %d) = %v", ls, n, res)
++			}
++			for _, p := range res {
++				if p != ls[0] {
++					col.failClass(ht, "equal-points", "Resample(%v, %d) = %v", ls, n, res)
++					break
++				}
++			}
++		default:
++			if len(res) != n {
++				col.failClass(ht, "count", "Resample(%v, %d) = %v (%d points)", ls, n, res, len(res))
++			} else if res[0] != ls[0] || (n > 1 && res[n-1] != ls[len(ls)-1]) {
++				col.failClass(ht, "ends", "Resample(%v, %d) = %v", ls, n, res)
++			} else if n > 1 {
++				step := total / float64(n-1)
++				for i, p := range res {
++					pos := arcPos(ls, p, 1e-7)
++					if pos < 0 || !closeNum(pos, float64(i)*step, 1e-6, 1e-9) {
++						// a point on a self-crossing gets the first crossing's position: accept
++						// when the distance from the path is fine and the neighbours are spaced
++						if planar.DistanceFrom(ls, p) > 1e-7 {
++							col.failClass(ht, "spacing", "Resample(%v, %d) = %v: point %d at %v off the path", ls, n, res, i, p)
++							break
++						}
++					}
++				}
++				for i := 1; i < n; i++ {
++					if d := pointDistance(res[i-1], res[i]); d > step+1e-7 {
++						col.failClass(ht, "chord", "Resample(%v, %d) = %v: chord %d is %v > step %v", ls, n, res, i, d, step)
++						break
++					}
++				}
++			}
++		}
++
++		// ToInterval
++		dist := float64(drawInt(ht, -1, 50)) / 10
++		if len(ls) == 0 && Known.toIntervalEmptyPanics && dist > 0 {
++			return
++		}
++		ti := resample.ToInterval(ls.Clone(), planar.Distance, dist)
++		switch {
++		case dist <= 0:
++			if ti != nil {
++				col.failClass(ht, "interval-nonpositive", "ToInterval(%v, %v) = %v", ls, dist, ti)
++			}
++		case len(ls) <= 1:
++			if !same(ti, ls) && !(len(ls) == 0 && len(ti) == 0) {
++				col.failClass(ht, "interval-short", "ToInterval(%v, %v) = %v", ls, dist, ti)
++			}
++		default:
++			wantN := int(total/dist) + 1
++			if len(ti) != wantN {
++				col.failClass(ht, "interval-count", "ToInterval(%v, %v) = %v (%d points), want %d (length %v)", ls, dist, ti, len(ti), wantN, total)
++			} else if wantN > 1 && total > 0 {
++				// the spacing is total/(wantN-1), "about the given distance" (up to 2x it)
++				if ti[0] != ls[0] || ti[wantN-1] != ls[len(ls)-1] {
++					col.failClass(ht, "interval-ends", "ToInterval(%v, %v) = %v", ls, dist, ti)
++				}
++			}
++		}
++		col.count("ok")
++	})
++}
+diff --git a/hegel/hegel_oracle_test.go b/hegel/hegel_oracle_test.go
+new file mode 100644
+index 0000000..87fb1de
+--- /dev/null
++++ b/hegel/hegel_oracle_test.go
+@@ -0,0 +1,336 @@
++package hegel
++
++// The shapely oracle: a Python child process answering one JSON line per request. Requests are
++// "CMD hexarg hexarg ..." (arguments hex-encoded so that spaces and newlines are safe).
++// Geometries travel as ISO WKB, 2D, little-endian.
++
++import (
++	"bufio"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"math"
++	"os"
++	"os/exec"
++	"strconv"
++	"sync"
++
++	"github.com/paulmach/orb"
++	"github.com/paulmach/orb/encoding/wkb"
++)
++
++const pythonScript = `
++import sys, json, math, faulthandler
++faulthandler.enable()
++import shapely
++from shapely.geometry import box as _box
++
++def hx(s):
++    return bytes.fromhex(s).decode()
++
++def wkb(g):
++    return shapely.to_wkb(g, byte_order=1, output_dimension=2, flavor="iso").hex()
++
++def wkt(g):
++    return shapely.to_wkt(g, rounding_precision=-1, trim=True)
++
++def fromwkb(h):
++    return shapely.from_wkb(bytes.fromhex(h))
++
++def num(x):
++    x = float(x)
++    if math.isnan(x):
++        return "NaN"
++    if math.isinf(x):
++        return "Inf" if x > 0 else "-Inf"
++    return x
++
++def bounds(g):
++    b = shapely.bounds(g).tolist()
++    return None if any(math.isnan(x) for x in b) else b
++
++def handle(cmd, a):
++    if cmd == "WKT":  # parse WKT
++        g = shapely.from_wkt(a[0])
++        return {"wkb": wkb(g), "wkt": wkt(g), "type": shapely.get_type_id(g).item()}
++    if cmd == "WKB":  # parse WKB
++        g = fromwkb(a[0])
++        return {"wkb": wkb(g), "wkt": wkt(g), "type": shapely.get_type_id(g).item()}
++    if cmd == "GJ":  # parse GeoJSON
++        g = shapely.from_geojson(a[0])
++        return {"wkb": wkb(g), "wkt": wkt(g), "type": shapely.get_type_id(g).item()}
++    if cmd == "TOGJ":  # GeoJSON text of a geometry
++        return {"geojson": shapely.to_geojson(fromwkb(a[0]))}
++    if cmd == "U":  # unary measures
++        g = fromwkb(a[0])
++        c = shapely.centroid(g)
++        return {"area": num(shapely.area(g)), "length": num(shapely.length(g)), "bounds": bounds(g),
++                "empty": bool(shapely.is_empty(g)), "valid": bool(shapely.is_valid(g)),
++                "centroid": None if shapely.is_empty(c) else [c.x, c.y]}
++    if cmd == "PT":  # a geometry against a point
++        g, p = fromwkb(a[0]), fromwkb(a[1])
++        b = shapely.boundary(g) if shapely.get_type_id(g) in (3, 6) else g
++        return {"covers": bool(shapely.covers(g, p)), "contains": bool(shapely.contains(g, p)),
++                "distance": num(shapely.distance(g, p)), "touches": bool(shapely.touches(g, p)),
++                "bdist": num(shapely.distance(b, p))}
++    if cmd == "S":  # Douglas-Peucker without topology preservation
++        return {"wkb": wkb(shapely.simplify(fromwkb(a[0]), float(a[1]), preserve_topology=False))}
++    if cmd == "CLIP":  # intersection with a box
++        g = fromwkb(a[0])
++        b = _box(float(a[1]), float(a[2]), float(a[3]), float(a[4]))
++        r = shapely.intersection(g, b)
++        return {"wkb": wkb(r), "area": num(shapely.area(r)), "length": num(shapely.length(r)),
++                "intersects": bool(shapely.intersects(g, b))}
++    if cmd == "EQ":  # do two geometries agree
++        g, h = fromwkb(a[0]), fromwkb(a[1])
++        tol = float(a[2])
++        r = {"exact": bool(shapely.equals_exact(shapely.normalize(g), shapely.normalize(h), tol)),
++             "both_empty": bool(shapely.is_empty(g) and shapely.is_empty(h))}
++        try:
++            r["topo"] = bool(shapely.equals(g, h))
++        except Exception as e:
++            r["topo_error"] = str(e)[:200]
++        try:
++            d = shapely.symmetric_difference(g, h)
++            r["symdiff_area"] = num(shapely.area(d))
++            r["symdiff_length"] = num(shapely.length(d))
++        except Exception as e:
++            r["symdiff_error"] = str(e)[:200]
++        return r
++    return {"ok": False, "error": "unknown command " + cmd}
++
++for line in sys.stdin:
++    parts = line.rstrip("\n").split(" ")
++    cmd, args = parts[0], [hx(p) for p in parts[1:]]
++    try:
++        reply = handle(cmd, args)
++        reply.setdefault("ok", True)
++    except Exception as e:
++        reply = {"ok": False, "error": type(e).__name__, "message": str(e)[:300]}
++    print(json.dumps(reply), flush=True)
++`
++
++type pyChild struct {
++	mu    sync.Mutex
++	cmd   *exec.Cmd
++	stdin *bufio.Writer
++	out   *bufio.Reader
++}
++
++var (
++	pyOnce sync.Once
++	py     *pyChild
++)
++
++func oracle() *pyChild {
++	pyOnce.Do(func() {
++		python := "python3"
++		if p := os.Getenv("HEGEL_PYTHON"); p != "" {
++			python = p
++		}
++		cmd := exec.Command(python, "-u", "-c", pythonScript)
++		cmd.Stderr = os.Stderr
++		in, err := cmd.StdinPipe()
++		if err != nil {
++			panic(err)
++		}
++		out, err := cmd.StdoutPipe()
++		if err != nil {
++			panic(err)
++		}
++		if err := cmd.Start(); err != nil {
++			panic(fmt.Sprintf("python3 with shapely is needed as the oracle: %v", err))
++		}
++		py = &pyChild{cmd: cmd, stdin: bufio.NewWriter(in), out: bufio.NewReader(out)}
++	})
++	return py
++}
++
++// reply is the common part of every oracle answer.
++type reply struct {
++	Ok      bool   `json:"ok"`
++	Error   string `json:"error"`
++	Message string `json:"message"`
++}
++
++// geomReply carries one geometry (or the error computing it).
++type geomReply struct {
++	reply
++	WKB  string `json:"wkb"`
++	WKT  string `json:"wkt"`
++	Type int    `json:"type"`
++}
++
++type geojsonReply struct {
++	reply
++	GeoJSON string `json:"geojson"`
++}
++
++type unaryReply struct {
++	reply
++	Area     json.RawMessage `json:"area"`
++	Length   json.RawMessage `json:"length"`
++	Bounds   []float64       `json:"bounds"`
++	Empty    bool            `json:"empty"`
++	Valid    bool            `json:"valid"`
++	Centroid []float64       `json:"centroid"`
++}
++
++type pointReply struct {
++	reply
++	Covers   bool            `json:"covers"`
++	Contains bool            `json:"contains"`
++	Touches  bool            `json:"touches"`
++	Distance json.RawMessage `json:"distance"`
++	BDist    json.RawMessage `json:"bdist"` // distance to the boundary for polygons, to the geometry otherwise
++}
++
++type clipReply struct {
++	reply
++	WKB        string          `json:"wkb"`
++	Area       json.RawMessage `json:"area"`
++	Length     json.RawMessage `json:"length"`
++	Intersects bool            `json:"intersects"`
++}
++
++type eqReply struct {
++	reply
++	Exact         bool            `json:"exact"`
++	BothEmpty     bool            `json:"both_empty"`
++	Topo          *bool           `json:"topo"`
++	TopoError     string          `json:"topo_error"`
++	SymdiffArea   json.RawMessage `json:"symdiff_area"`
++	SymdiffLength json.RawMessage `json:"symdiff_length"`
++	SymdiffError  string          `json:"symdiff_error"`
++}
++
++func ask(v interface{}, cmd string, args ...string) {
++	p := oracle()
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	line := cmd
++	for _, a := range args {
++		line += " " + hex.EncodeToString([]byte(a))
++	}
++	p.stdin.WriteString(line + "\n")
++	if err := p.stdin.Flush(); err != nil {
++		py, pyOnce = nil, sync.Once{}
++		panic(fmt.Sprintf("shapely oracle gone (%v) at %s %s", err, cmd, summarize(args)))
++	}
++	raw, err := p.out.ReadBytes('\n')
++	if err != nil {
++		py, pyOnce = nil, sync.Once{}
++		panic(fmt.Sprintf("shapely oracle died on %s %s", cmd, summarize(args)))
++	}
++	if err := json.Unmarshal(raw, v); err != nil {
++		panic(fmt.Sprintf("shapely oracle reply %q: %v", raw, err))
++	}
++}
++
++func summarize(args []string) string {
++	s := ""
++	for _, a := range args {
++		if len(a) > 400 {
++			a = a[:400] + "..."
++		}
++		s += " " + a
++	}
++	return s
++}
++
++// num decodes a JSON number the oracle sent, "NaN"/"Inf"/"-Inf" included.
++func num(raw json.RawMessage) float64 {
++	var f float64
++	if json.Unmarshal(raw, &f) == nil {
++		return f
++	}
++	var s string
++	if json.Unmarshal(raw, &s) == nil {
++		switch s {
++		case "NaN":
++			return math.NaN()
++		case "Inf":
++			return math.Inf(1)
++		case "-Inf":
++			return math.Inf(-1)
++		}
++	}
++	panic(fmt.Sprintf("oracle number %q", raw))
++}
++
++// hexWKB is the geometry as hex ISO WKB, little-endian, the form the oracle takes.
++func hexWKB(g orb.Geometry) string {
++	return hex.EncodeToString(wkb.MustMarshal(g, binary.LittleEndian))
++}
++
++// fromHexWKB decodes the oracle's geometry with orb's decoder (checked on its own by the WKB
++// property).
++func fromHexWKB(h string) orb.Geometry {
++	b, err := hex.DecodeString(h)
++	if err != nil {
++		panic(err)
++	}
++	g, err := wkb.Unmarshal(b)
++	if err != nil {
++		panic(fmt.Sprintf("oracle WKB %s: %v", h, err))
++	}
++	return g
++}
++
++func ftoa(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
++
++// shapelyGeom asks the oracle to parse a WKT text.
++func shapelyWKT(s string) geomReply {
++	var r geomReply
++	ask(&r, "WKT", s)
++	return r
++}
++
++func shapelyWKB(h string) geomReply {
++	var r geomReply
++	ask(&r, "WKB", h)
++	return r
++}
++
++func shapelyGeoJSON(s string) geomReply {
++	var r geomReply
++	ask(&r, "GJ", s)
++	return r
++}
++
++func shapelyToGeoJSON(g orb.Geometry) geojsonReply {
++	var r geojsonReply
++	ask(&r, "TOGJ", hexWKB(g))
++	return r
++}
++
++func shapelyUnary(g orb.Geometry) unaryReply {
++	var r unaryReply
++	ask(&r, "U", hexWKB(g))
++	return r
++}
++
++func shapelyPoint(g orb.Geometry, p orb.Point) pointReply {
++	var r pointReply
++	ask(&r, "PT", hexWKB(g), hexWKB(p))
++	return r
++}
++
++func shapelySimplify(g orb.Geometry, tol float64) geomReply {
++	var r geomReply
++	ask(&r, "S", hexWKB(g), ftoa(tol))
++	return r
++}
++
++func shapelyClip(g orb.Geometry, b orb.Bound) clipReply {
++	var r clipReply
++	ask(&r, "CLIP", hexWKB(g), ftoa(b.Min[0]), ftoa(b.Min[1]), ftoa(b.Max[0]), ftoa(b.Max[1]))
++	return r
++}
++
++func shapelyEqual(g, h orb.Geometry, tol float64) eqReply {
++	var r eqReply
++	ask(&r, "EQ", hexWKB(g), hexWKB(h), ftoa(tol))
++	return r
++}
+diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
+new file mode 100644
+index 0000000..3dcea58
+--- /dev/null
++++ b/hegel/hegel_pins_test.go
+@@ -0,0 +1,304 @@
++package hegel
++
++// Pins: one directed test per recorded bug, asserting the documented behaviour. They fail
++// while the bug exists (target.toml lists them as expected failures).
++
++import (
++	"encoding/json"
++	"math"
++	"strings"
++	"testing"
++
++	"github.com/paulmach/orb"
++	"github.com/paulmach/orb/encoding/wkt"
++	"github.com/paulmach/orb/geojson"
++	"github.com/paulmach/orb/maptile"
++	"github.com/paulmach/orb/maptile/tilecover"
++	"github.com/paulmach/orb/planar"
++	"github.com/paulmach/orb/quadtree"
++	"github.com/paulmach/orb/resample"
++	"github.com/paulmach/orb/simplify"
++)
++
++// orb/1: collection members separated by ", ", nested collections, EMPTY members, a space
++// before the collection's parenthesis.
++func TestHegelPinWKTCollectionMembers(t *testing.T) {
++	cases := map[string]orb.Geometry{
++		"GEOMETRYCOLLECTION(POINT(1 2), LINESTRING(3 4,5 6))":           orb.Collection{orb.Point{1, 2}, orb.LineString{{3, 4}, {5, 6}}},
++		"GEOMETRYCOLLECTION (POINT (1 2), LINESTRING (3 4, 5 6))":       orb.Collection{orb.Point{1, 2}, orb.LineString{{3, 4}, {5, 6}}},
++		"GEOMETRYCOLLECTION (POINT (1 2))":                              orb.Collection{orb.Point{1, 2}},
++		"GEOMETRYCOLLECTION(POINT(1 2),GEOMETRYCOLLECTION(POINT(3 4)))": orb.Collection{orb.Point{1, 2}, orb.Collection{orb.Point{3, 4}}},
++		"GEOMETRYCOLLECTION(MULTIPOINT EMPTY,POINT(1 2))":               orb.Collection{orb.MultiPoint{}, orb.Point{1, 2}},
++		"GEOMETRYCOLLECTION(POINT(1 2),MULTIPOINT EMPTY)":               orb.Collection{orb.Point{1, 2}, orb.MultiPoint{}},
++		"GEOMETRYCOLLECTION(LINESTRING EMPTY)":                          orb.Collection{orb.LineString{}},
++	}
++	for s, want := range cases {
++		got, err := wkt.Unmarshal(s)
++		if err != nil {
++			t.Errorf("Unmarshal(%q) = %v", s, err)
++		} else if !same(got, want) {
++			t.Errorf("Unmarshal(%q) = %v, want %v", s, got, want)
++		}
++	}
++	// and a prefix must not parse
++	if g, err := wkt.Unmarshal("GEOMETRYCOLLECTION(GEOMETRYCOLLECTION EMPTY,"); err == nil {
++		t.Errorf("Unmarshal of a truncated collection = %v", g)
++	}
++}
++
++// orb/2: whitespace between tokens is free in WKT.
++func TestHegelPinWKTWhitespace(t *testing.T) {
++	cases := map[string]orb.Geometry{
++		"POINT(1  2)":                 orb.Point{1, 2},
++		"POINT( 1 2 )":                orb.Point{1, 2},
++		"LINESTRING(1 2,3  4)":        orb.LineString{{1, 2}, {3, 4}},
++		"MULTIPOINT  EMPTY":           orb.MultiPoint{},
++		"MULTIPOINT((1 2),(3\t4))":    orb.MultiPoint{{1, 2}, {3, 4}},
++		"POLYGON((0 0,1 0,1  1,0 0))": orb.Polygon{{{0, 0}, {1, 0}, {1, 1}, {0, 0}}},
++	}
++	for s, want := range cases {
++		got, err := wkt.Unmarshal(s)
++		if err != nil {
++			t.Errorf("Unmarshal(%q) = %v", s, err)
++		} else if !same(got, want) {
++			t.Errorf("Unmarshal(%q) = %v, want %v", s, got, want)
++		}
++	}
++}
++
++// orb/3: Union/Extend on an empty bound, and the Bound() of geometries whose first part is
++// empty.
++func TestHegelPinUnionOfEmptyBound(t *testing.T) {
++	empty := orb.MultiPoint{}.Bound()
++	if !empty.IsEmpty() {
++		t.Fatalf("MultiPoint{}.Bound() = %v, not empty", empty)
++	}
++	a := orb.Bound{Min: orb.Point{5, 5}, Max: orb.Point{6, 6}}
++	if got := empty.Union(a); !got.Equal(a) {
++		t.Errorf("empty.Union(%v) = %v", a, got)
++	}
++	if got := empty.Extend(orb.Point{5, 5}); !got.Equal(orb.Bound{Min: orb.Point{5, 5}, Max: orb.Point{5, 5}}) {
++		t.Errorf("empty.Extend(5 5) = %v", got)
++	}
++	want := orb.Bound{Min: orb.Point{5, 5}, Max: orb.Point{5, 5}}
++	if got := (orb.Collection{orb.MultiPoint{}, orb.Point{5, 5}}).Bound(); !got.Equal(want) {
++		t.Errorf("Collection{MultiPoint{}, Point{5 5}}.Bound() = %v, want %v", got, want)
++	}
++	if got := (orb.Collection{orb.LineString{}, orb.Point{-3, -3}}).Bound(); !got.Equal(orb.Bound{Min: orb.Point{-3, -3}, Max: orb.Point{-3, -3}}) {
++		t.Errorf("Collection{LineString{}, Point{-3 -3}}.Bound() = %v", got)
++	}
++	mls := orb.MultiLineString{{}, {{-10, -1}, {1, -2}}}
++	if got := mls.Bound(); !got.Equal(orb.Bound{Min: orb.Point{-10, -2}, Max: orb.Point{1, -1}}) {
++		t.Errorf("%v.Bound() = %v", mls, got)
++	}
++	mp := orb.MultiPolygon{{}, {{{5, 5}, {6, 5}, {6, 6}, {5, 5}}}}
++	if got := mp.Bound(); !got.Equal(orb.Bound{Min: orb.Point{5, 5}, Max: orb.Point{6, 6}}) {
++		t.Errorf("%v.Bound() = %v", mp, got)
++	}
++}
++
++// orb/4: IsEmpty is documented true for a zero-area bound.
++func TestHegelPinIsEmptyZeroArea(t *testing.T) {
++	for _, b := range []orb.Bound{
++		{Min: orb.Point{1, 1}, Max: orb.Point{1, 1}},
++		{Min: orb.Point{1, 1}, Max: orb.Point{1, 5}},
++		{Min: orb.Point{1, 1}, Max: orb.Point{5, 1}},
++	} {
++		if !b.IsEmpty() {
++			t.Errorf("%v.IsEmpty() = false though its area is zero", b)
++		}
++	}
++	if b := (orb.Bound{Min: orb.Point{1, 1}, Max: orb.Point{0, 0}}); !b.IsEmpty() {
++		t.Errorf("%v.IsEmpty() = false", b)
++	}
++}
++
++// orb/5: At creates a valid tile for every longitude in [-180, 180].
++func TestHegelPinTileAtLongitude180(t *testing.T) {
++	for _, z := range []maptile.Zoom{0, 1, 5, 20} {
++		tile := maptile.At(orb.Point{180, 0}, z)
++		if !tile.Valid() {
++			t.Errorf("At(180 0, %d) = %v is not valid", z, tile)
++		}
++		if z > 8 {
++			continue // tilecover.Bound allocates a set of every tile in the box
++		}
++		set := tilecover.Bound(orb.Bound{Min: orb.Point{170, -10}, Max: orb.Point{180, 10}}, z)
++		for tt := range set {
++			if !tt.Valid() {
++				t.Errorf("tilecover.Bound up to longitude 180 at zoom %d has the invalid tile %v", z, tt)
++				break
++			}
++		}
++	}
++}
++
++// orb/6: a point on a hole's boundary is on the polygon's boundary, so "in".
++func TestHegelPinHoleBoundaryContained(t *testing.T) {
++	poly := orb.Polygon{
++		{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}},
++		{{2, 2}, {4, 2}, {4, 4}, {2, 4}, {2, 2}},
++	}
++	for _, p := range []orb.Point{{2, 3}, {3, 2}, {4, 4}, {2, 2}} {
++		if !planar.PolygonContains(poly, p) {
++			t.Errorf("PolygonContains(polygon with hole, %v on the hole boundary) = false", p)
++		}
++		if !planar.MultiPolygonContains(orb.MultiPolygon{poly}, p) {
++			t.Errorf("MultiPolygonContains(polygon with hole, %v on the hole boundary) = false", p)
++		}
++	}
++	if !planar.PolygonContains(poly, orb.Point{0, 3}) || planar.PolygonContains(poly, orb.Point{3, 3}) {
++		t.Errorf("the outer boundary or the hole interior misbehave")
++	}
++}
++
++// orb/7: ToInterval of an empty line string returns it, as Resample does.
++func TestHegelPinToIntervalEmpty(t *testing.T) {
++	defer func() {
++		if r := recover(); r != nil {
++			t.Errorf("ToInterval(empty, 1) panicked: %v", r)
++		}
++	}()
++	got := resample.ToInterval(orb.LineString{}, planar.Distance, 1)
++	if len(got) != 0 {
++		t.Errorf("ToInterval(empty, 1) = %v", got)
++	}
++}
++
++// orb/8: empty parts are written EMPTY, and read back.
++func TestHegelPinEmptyPartWKT(t *testing.T) {
++	for _, g := range []orb.Geometry{orb.Ring{}, orb.Polygon{orb.Ring{}}, orb.MultiLineString{{}, {{0, 0}, {1, 1}}}} {
++		s := wkt.MarshalString(g)
++		if strings.Contains(s, "()") {
++			t.Errorf("Marshal(%#v) = %q contains ()", g, s)
++		}
++		back, err := wkt.Unmarshal(s)
++		if err != nil {
++			t.Errorf("Unmarshal(Marshal(%#v) = %q) = %v", g, s, err)
++		} else if len(coords(back)) != len(coords(g)) {
++			t.Errorf("Unmarshal(Marshal(%#v) = %q) = %v", g, s, back)
++		}
++	}
++}
++
++// orb/9: an empty collection is a GeoJSON GeometryCollection with no geometries, and a null
++// member is rejected rather than crashing.
++func TestHegelPinEmptyCollectionGeoJSON(t *testing.T) {
++	data, err := json.Marshal(geojson.NewGeometry(orb.Collection{}))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(data) == "null" {
++		t.Errorf("NewGeometry(Collection{}) marshals to null")
++	}
++	if g, err := geojson.UnmarshalGeometry(data); err != nil || !same(g.Geometry(), orb.Collection{}) {
++		t.Errorf("UnmarshalGeometry(%s) = %v, %v", data, g, err)
++	}
++	data, err = json.Marshal(geojson.NewGeometry(orb.Collection{orb.Point{1, 2}, orb.Collection{}}))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(data), "null") {
++		t.Errorf("a nested empty collection marshals as null: %s", data)
++	}
++	func() {
++		defer func() {
++			if r := recover(); r != nil {
++				t.Errorf("UnmarshalGeometry of a collection with a null member panicked: %v", r)
++			}
++		}()
++		if g, err := geojson.UnmarshalGeometry([]byte(`{"type":"GeometryCollection","geometries":[null]}`)); err == nil {
++			t.Errorf("UnmarshalGeometry of a collection with a null member = %v", g.Geometry())
++		}
++	}()
++}
++
++// orb/10: a position has at least two numbers.
++func TestHegelPinShortPosition(t *testing.T) {
++	for _, doc := range []string{
++		`{"type":"Point","coordinates":[]}`,
++		`{"type":"Point","coordinates":[1]}`,
++		`{"type":"LineString","coordinates":[[1,2],[3]]}`,
++		`{"type":"MultiPoint","coordinates":[[]]}`,
++	} {
++		if g, err := geojson.UnmarshalGeometry([]byte(doc)); err == nil {
++			t.Errorf("UnmarshalGeometry(%s) = %v", doc, g.Geometry())
++		}
++	}
++}
++
++// orb/11: the centroid of a zero-area ring is the centroid of its line, as for the polygon.
++func TestHegelPinDegenerateRingCentroid(t *testing.T) {
++	r := orb.Ring{{0, 0}, {0, 10}, {0, 0}}
++	c, _ := planar.CentroidArea(r)
++	pc, _ := planar.CentroidArea(orb.Polygon{r})
++	if !closePoints(c, pc, 1e-9) {
++		t.Errorf("CentroidArea(ring %v) = %v, as a polygon %v", r, c, pc)
++	}
++	if !closePoints(c, orb.Point{0, 5}, 1e-9) {
++		t.Errorf("CentroidArea(ring %v) = %v, want (0 5)", r, c)
++	}
++	b := orb.Bound{Min: orb.Point{0, 0}, Max: orb.Point{0, 10}}
++	if bc, _ := planar.CentroidArea(b); !closePoints(bc, orb.Point{0, 5}, 1e-9) {
++		t.Errorf("CentroidArea(%v) = %v, want (0 5)", b, bc)
++	}
++}
++
++// orb/12: the centroid of a collection of points or lines is not the origin.
++func TestHegelPinCollectionCentroid(t *testing.T) {
++	cases := map[string]struct {
++		g    orb.Geometry
++		want orb.Point
++	}{
++		"one point":     {orb.Collection{orb.Point{3, 4}}, orb.Point{3, 4}},
++		"two points":    {orb.Collection{orb.Point{2, 2}, orb.Point{4, 4}}, orb.Point{3, 3}},
++		"a line":        {orb.Collection{orb.LineString{{0, 0}, {10, 0}}}, orb.Point{5, 0}},
++		"empty polygon": {orb.Collection{orb.Polygon{}, orb.Point{3, 4}}, orb.Point{3, 4}},
++	}
++	for name, tc := range cases {
++		c, _ := planar.CentroidArea(tc.g)
++		if !closePoints(c, tc.want, 1e-9) {
++			t.Errorf("%s: CentroidArea(%v) = %v, want %v", name, tc.g, c, tc.want)
++		}
++	}
++}
++
++// orb/13: VisvalingamKeep(1) keeps the two ends of a line (it cannot keep fewer).
++func TestHegelPinVisvalingamKeepOne(t *testing.T) {
++	defer func() {
++		if r := recover(); r != nil {
++			t.Errorf("VisvalingamKeep(1) panicked: %v", r)
++		}
++	}()
++	ls := orb.LineString{{0, 0}, {1, 1}, {2, 0}}
++	got := simplify.VisvalingamKeep(1).LineString(ls.Clone())
++	if len(got) != 2 || got[0] != ls[0] || got[1] != ls[2] {
++		t.Errorf("VisvalingamKeep(1) of %v = %v", ls, got)
++	}
++	r := orb.Ring{{0, 0}, {1, 1}, {2, 0}, {1, -1}, {0, 0}}
++	if got := simplify.VisvalingamKeep(1).Ring(r.Clone()); len(got) < 2 {
++		t.Errorf("VisvalingamKeep(1) of ring %v = %v", r, got)
++	}
++}
++
++// orb/14: KNearest with k = 0 returns nothing.
++func TestHegelPinKNearestZero(t *testing.T) {
++	defer func() {
++		if r := recover(); r != nil {
++			t.Errorf("KNearest(k = 0) panicked: %v", r)
++		}
++	}()
++	qt := quadtree.New(orb.Bound{Min: orb.Point{0, 0}, Max: orb.Point{10, 10}})
++	if err := qt.Add(orb.Point{1, 1}); err != nil {
++		t.Fatal(err)
++	}
++	if err := qt.Add(orb.Point{2, 2}); err != nil {
++		t.Fatal(err)
++	}
++	if got := qt.KNearest(nil, orb.Point{1, 1}, 0); len(got) != 0 {
++		t.Errorf("KNearest(k = 0) = %v", got)
++	}
++	if got := qt.KNearest(nil, orb.Point{1, 1}, 0, math.Inf(1)); len(got) != 0 {
++		t.Errorf("KNearest(k = 0, max distance) = %v", got)
++	}
++}
+diff --git a/hegel/hegel_planar_test.go b/hegel/hegel_planar_test.go
+new file mode 100644
+index 0000000..10fa311
+--- /dev/null
++++ b/hegel/hegel_planar_test.go
+@@ -0,0 +1,599 @@
++package hegel
++
++// Bounds, the planar package, orientation, rounding, cloning and equality.
++
++import (
++	"fmt"
++	"math"
++	"testing"
++
++	"github.com/paulmach/orb"
++	"github.com/paulmach/orb/clip"
++	"github.com/paulmach/orb/planar"
++	"hegel.dev/go/hegel"
++)
++
++// collectionStartsEmpty reports whether some multi-geometry or collection in the geometry has
++// a coordinate-less part before a part with coordinates (the case where Bound() unions onto
++// an empty bound).
++func collectionStartsEmpty(g orb.Geometry) bool {
++	var parts []orb.Geometry
++	switch g := g.(type) {
++	case orb.Collection:
++		parts = g
++	case orb.MultiLineString:
++		for _, ls := range g {
++			parts = append(parts, ls)
++		}
++	case orb.Polygon:
++		for _, r := range g {
++			parts = append(parts, r)
++		}
++	case orb.MultiPolygon:
++		for _, p := range g {
++			parts = append(parts, p)
++		}
++	default:
++		return false
++	}
++	seenEmpty := false
++	for _, m := range parts {
++		if collectionStartsEmpty(m) {
++			return true
++		}
++		if len(coords(m)) == 0 {
++			seenEmpty = true
++		} else if seenEmpty {
++			return true
++		}
++	}
++	return false
++}
++
++// TestHegelBounds: Bound() is the box of the coordinates (shapely agrees), the empty bound for
++// a geometry without coordinates; the Bound methods against their doc comments; clip.Bound.
++func TestHegelBounds(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		g := genAnyGeometry(ht)
++		b := g.Bound()
++		if bb, ok := g.(orb.Bound); ok {
++			if !b.Equal(bb) {
++				col.fail(ht, "Bound.Bound() = %v", b)
++			}
++		} else if want, ok := boundOf(coords(g)); ok {
++			if !b.Equal(want) {
++				if !(Known.unionOfEmptyBound && collectionStartsEmpty(g)) {
++					col.failClass(ht, "bound", "%v.Bound() = %v, want %v", g, b, want)
++				}
++			}
++			u := shapelyUnary(g)
++			if u.Ok && u.Bounds != nil {
++				sb := orb.Bound{Min: orb.Point{u.Bounds[0], u.Bounds[1]}, Max: orb.Point{u.Bounds[2], u.Bounds[3]}}
++				if !sb.Equal(want) {
++					col.failClass(ht, "shapely-bounds", "shapely bounds of %v = %v, model %v", g, sb, want)
++				}
++			}
++		} else if !b.IsEmpty() {
++			col.failClass(ht, "empty-bound", "%v (no coordinates).Bound() = %v, not empty", g, b)
++		}
++
++		// the methods
++		a := genBound(ht)
++		c := genBound(ht)
++		p := genPoint(ht)
++		if chance(ht, 30) { // on the boundary
++			p = pick(ht, []orb.Point{a.Min, a.Max, a.LeftTop(), a.RightBottom(), {a.Min[0], (a.Min[1] + a.Max[1]) / 2}})
++		}
++		inA := a.Min[0] <= p[0] && p[0] <= a.Max[0] && a.Min[1] <= p[1] && p[1] <= a.Max[1]
++		if a.Contains(p) != inA {
++			col.failClass(ht, "contains", "%v.Contains(%v) = %v", a, p, !inA)
++		}
++		e := a.Extend(p)
++		wantE := orb.Bound{Min: orb.Point{math.Min(a.Min[0], p[0]), math.Min(a.Min[1], p[1])}, Max: orb.Point{math.Max(a.Max[0], p[0]), math.Max(a.Max[1], p[1])}}
++		if !e.Equal(wantE) {
++			col.failClass(ht, "extend", "%v.Extend(%v) = %v, want %v", a, p, e, wantE)
++		}
++		u := a.Union(c)
++		wantU := orb.Bound{Min: orb.Point{math.Min(a.Min[0], c.Min[0]), math.Min(a.Min[1], c.Min[1])}, Max: orb.Point{math.Max(a.Max[0], c.Max[0]), math.Max(a.Max[1], c.Max[1])}}
++		if !u.Equal(wantU) || !c.Union(a).Equal(wantU) {
++			col.failClass(ht, "union", "%v.Union(%v) = %v, want %v", a, c, u, wantU)
++		}
++		empty := orb.Bound{Min: orb.Point{1, 1}, Max: orb.Point{-1, -1}}
++		if !a.Union(empty).Equal(a) {
++			col.failClass(ht, "union-empty-arg", "%v.Union(empty) = %v", a, a.Union(empty))
++		}
++		if !Known.unionOfEmptyBound && !empty.Union(a).Equal(a) {
++			col.failClass(ht, "union-empty-receiver", "empty.Union(%v) = %v", a, empty.Union(a))
++		}
++		inter := !(a.Max[0] < c.Min[0] || a.Min[0] > c.Max[0] || a.Max[1] < c.Min[1] || a.Min[1] > c.Max[1])
++		if a.Intersects(c) != inter || c.Intersects(a) != inter {
++			col.failClass(ht, "intersects", "%v.Intersects(%v) = %v, want %v", a, c, a.Intersects(c), inter)
++		}
++		d := float64(drawInt(ht, -300, 300)) / 100
++		pad := a.Pad(d)
++		if pad.Min[0] != a.Min[0]-d || pad.Min[1] != a.Min[1]-d || pad.Max[0] != a.Max[0]+d || pad.Max[1] != a.Max[1]+d {
++			col.failClass(ht, "pad", "%v.Pad(%v) = %v", a, d, pad)
++		}
++		center := a.Center()
++		if center[0] != (a.Min[0]+a.Max[0])/2 || center[1] != (a.Min[1]+a.Max[1])/2 {
++			col.failClass(ht, "center", "%v.Center() = %v", a, center)
++		}
++		if a.Top() != a.Max[1] || a.Bottom() != a.Min[1] || a.Left() != a.Min[0] || a.Right() != a.Max[0] ||
++			a.LeftTop() != (orb.Point{a.Min[0], a.Max[1]}) || a.RightBottom() != (orb.Point{a.Max[0], a.Min[1]}) {
++			col.failClass(ht, "sides", "sides of %v: %v %v %v %v", a, a.Top(), a.Bottom(), a.Left(), a.Right())
++		}
++		zeroArea := a.Min[0] == a.Max[0] || a.Min[1] == a.Max[1]
++		wantEmpty := false
++		if !Known.isEmptyZeroArea {
++			wantEmpty = zeroArea
++		}
++		if a.IsEmpty() != wantEmpty {
++			col.failClass(ht, "isempty", "%v.IsEmpty() = %v (zero area %v)", a, a.IsEmpty(), zeroArea)
++		}
++		if !pad.IsEmpty() && (pad.Min[0] > pad.Max[0] || pad.Min[1] > pad.Max[1]) {
++			col.failClass(ht, "isempty-negative", "%v.IsEmpty() = false with Min > Max", pad)
++		}
++		if a.IsZero() != (a == orb.Bound{}) {
++			col.failClass(ht, "iszero", "%v.IsZero() = %v", a, a.IsZero())
++		}
++		ring := a.ToRing()
++		wantRing := orb.Ring{a.Min, {a.Max[0], a.Min[1]}, a.Max, {a.Min[0], a.Max[1]}, a.Min}
++		if !same(ring, wantRing) || !same(a.ToPolygon(), orb.Polygon{wantRing}) {
++			col.failClass(ht, "toring", "%v.ToRing() = %v", a, ring)
++		}
++		if a.GeoJSONType() != "Polygon" || a.Dimensions() != 2 {
++			col.failClass(ht, "type", "%v: %s %d", a, a.GeoJSONType(), a.Dimensions())
++		}
++		if !a.Equal(a) || a.Equal(c) != (a == c) {
++			col.failClass(ht, "equal", "%v.Equal(%v) = %v", a, c, a.Equal(c))
++		}
++
++		// clip.Bound: the intersection when both are non-empty (an empty argument is ignored,
++		// as upstream's tests want)
++		ib := clip.Bound(a, c)
++		if inter {
++			wantI := orb.Bound{Min: orb.Point{math.Max(a.Min[0], c.Min[0]), math.Max(a.Min[1], c.Min[1])}, Max: orb.Point{math.Min(a.Max[0], c.Max[0]), math.Min(a.Max[1], c.Max[1])}}
++			if !ib.Equal(wantI) {
++				col.failClass(ht, "clip-bound", "clip.Bound(%v, %v) = %v, want %v", a, c, ib, wantI)
++			}
++		} else if !ib.IsEmpty() {
++			col.failClass(ht, "clip-bound-disjoint", "clip.Bound(%v, %v) = %v, not empty", a, c, ib)
++		}
++		if !clip.Bound(a, empty).Equal(a) || !clip.Bound(empty, a).Equal(a) {
++			col.failClass(ht, "clip-bound-empty", "clip.Bound with an empty bound: %v %v", clip.Bound(a, empty), clip.Bound(empty, a))
++		}
++		col.count("bounds")
++	})
++}
++
++// shoelace is twice the signed area of a ring (positive counter-clockwise), exact for small
++// two-decimal coordinates up to floating error.
++func shoelace(r orb.Ring) float64 {
++	s := 0.0
++	n := len(r)
++	if n == 0 {
++		return 0
++	}
++	for i := 0; i < n; i++ {
++		a, b := r[i], r[(i+1)%n]
++		s += a[0]*b[1] - b[0]*a[1]
++	}
++	return s
++}
++
++// modelLength is the sum of the segment lengths of every line in the geometry.
++func modelLength(g orb.Geometry) float64 {
++	switch g := g.(type) {
++	case orb.Point, orb.MultiPoint:
++		return 0
++	case orb.LineString:
++		s := 0.0
++		for i := 1; i < len(g); i++ {
++			s += pointDistance(g[i-1], g[i])
++		}
++		return s
++	case orb.Ring:
++		return modelLength(orb.LineString(g))
++	case orb.MultiLineString:
++		s := 0.0
++		for _, ls := range g {
++			s += modelLength(ls)
++		}
++		return s
++	case orb.Polygon:
++		s := 0.0
++		for _, r := range g {
++			s += modelLength(r)
++		}
++		return s
++	case orb.MultiPolygon:
++		s := 0.0
++		for _, p := range g {
++			s += modelLength(p)
++		}
++		return s
++	case orb.Collection:
++		s := 0.0
++		for _, m := range g {
++			s += modelLength(m)
++		}
++		return s
++	case orb.Bound:
++		return modelLength(g.ToRing())
++	}
++	panic("modelLength")
++}
++
++// modelDistanceFrom is planar.DistanceFrom's contract: the distance to the boundary of a
++// polygon, to the geometry otherwise, the minimum over a collection's members (recursively);
++// shapely computes the leaves.
++func modelDistanceFrom(g orb.Geometry, p orb.Point) float64 {
++	switch gg := g.(type) {
++	case orb.Collection:
++		d := math.Inf(1)
++		for _, m := range gg {
++			d = math.Min(d, modelDistanceFrom(m, p))
++		}
++		return d
++	case orb.Bound:
++		return modelDistanceFrom(gg.ToPolygon(), p)
++	case orb.Ring:
++		return modelDistanceFrom(orb.LineString(gg), p)
++	}
++	if len(coords(g)) == 0 {
++		return math.Inf(1)
++	}
++	r := shapelyPoint(g, p)
++	if !r.Ok {
++		panic(fmt.Sprintf("shapely PT on %v: %s %s", g, r.Error, r.Message))
++	}
++	return num(r.BDist)
++}
++
++// pointOnRing draws a vertex of a ring, or (midpoints, for axis-parallel rings whose midpoints
++// are exactly on the edge) an edge midpoint.
++func pointOnRing(tc hegel.TestCase, r orb.Ring, midpoints bool) orb.Point {
++	i := drawInt(tc, 0, len(r)-2)
++	if !midpoints || chance(tc, 50) {
++		return r[i]
++	}
++	return orb.Point{(r[i][0] + r[i+1][0]) / 2, (r[i][1] + r[i+1][1]) / 2}
++}
++
++// onRing reports whether p is a vertex or an edge midpoint of the ring (what pointOnRing draws).
++func onRing(p orb.Point, r orb.Ring) bool {
++	for i := 0; i < len(r)-1; i++ {
++		if p == r[i] || p == (orb.Point{(r[i][0] + r[i+1][0]) / 2, (r[i][1] + r[i+1][1]) / 2}) {
++			return true
++		}
++	}
++	return false
++}
++
++// TestHegelPlanar: area, length, centroid and distance against shapely (and exact models),
++// point-in-ring/polygon against shapely's covers, orientation against the shoelace sign.
++func TestHegelPlanar(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		g := genAnyGeometry(ht)
++		u := shapelyUnary(asGeoJSONType(g))
++		if !u.Ok {
++			col.fail(ht, "shapely on %v: %s %s", g, u.Error, u.Message)
++			return
++		}
++
++		// area and length
++		area := planar.Area(g)
++		wantArea := num(u.Area)
++		if r, ok := g.(orb.Ring); ok {
++			// a ring's area is signed
++			if (shoelace(r) < 0) != (area < 0) && area != 0 {
++				col.failClass(ht, "ring-area-sign", "Area(%v) = %v, shoelace %v", r, area, shoelace(r))
++			}
++			area = math.Abs(area)
++		}
++		if !closeNum(area, wantArea, 1e-9, 1e-9) {
++			col.failClass(ht, "area", "Area(%v) = %v, shapely %v", g, area, wantArea)
++		}
++		length := planar.Length(g)
++		if !closeNum(length, num(u.Length), 1e-9, 1e-9) || !closeNum(length, modelLength(g), 1e-9, 1e-9) {
++			col.failClass(ht, "length", "Length(%v) = %v, shapely %v, model %v", g, length, num(u.Length), modelLength(g))
++		}
++
++		// centroid (of the highest-dimension members, as GEOS)
++		cen, area2 := planar.CentroidArea(g)
++		if _, ok := g.(orb.Ring); !ok && area2 != planar.Area(g) {
++			col.failClass(ht, "centroid-area", "CentroidArea(%v) area %v, Area %v", g, area2, planar.Area(g))
++		}
++		if u.Centroid != nil {
++			want := orb.Point{u.Centroid[0], u.Centroid[1]}
++			degenerateRing := false
++			switch gg := g.(type) {
++			case orb.Ring:
++				degenerateRing = shoelace(gg) == 0
++			case orb.Bound:
++				degenerateRing = gg.Min[0] == gg.Max[0] || gg.Min[1] == gg.Max[1]
++			}
++			if Known.degenerateRingCentroid && degenerateRing {
++				want = coords(g)[0] // the first point (a Bound: its Min)
++			}
++			if _, isCol := g.(orb.Collection); isCol && Known.collectionCentroidByArea && planar.Area(g) == 0 {
++				want = orb.Point{} // the origin: weights are areas
++			}
++			if !closePoints(cen, want, 1e-7) {
++				col.failClass(ht, "centroid", "CentroidArea(%#v) centroid %v, shapely %v", g, cen, want)
++			}
++		}
++
++		// distances
++		p := genPoint(ht)
++		q := genPoint(ht)
++		if d := planar.Distance(p, q); !closeNum(d, math.Hypot(p[0]-q[0], p[1]-q[1]), 0, 1e-14) || planar.DistanceSquared(p, q) != (p[0]-q[0])*(p[0]-q[0])+(p[1]-q[1])*(p[1]-q[1]) {
++			col.failClass(ht, "distance", "Distance(%v, %v) = %v", p, q, d)
++		}
++		if len(coords(g)) > 0 {
++			if chance(ht, 30) {
++				cs := coords(g)
++				p = cs[drawInt(ht, 0, len(cs)-1)]
++			}
++			r := shapelyPoint(asGeoJSONType(g), p)
++			if r.Ok {
++				d := planar.DistanceFrom(g, p)
++				want := modelDistanceFrom(g, p)
++				if !closeNum(d, want, 1e-9, 1e-9) {
++					col.failClass(ht, "distance-from", "DistanceFrom(%v, %v) = %v, shapely %v", g, p, d, want)
++				}
++				d2, idx := planar.DistanceFromWithIndex(g, p)
++				if d2 != d {
++					col.failClass(ht, "distance-from-index", "DistanceFromWithIndex(%v, %v) = %v, DistanceFrom %v", g, p, d2, d)
++				}
++				switch gg := g.(type) {
++				case orb.MultiPoint:
++					if idx < 0 || idx >= len(gg) || !closeNum(pointDistance(gg[idx], p), d, 0, 1e-14) {
++						col.failClass(ht, "index", "DistanceFromWithIndex(%v, %v) index %d", g, p, idx)
++					}
++				case orb.MultiLineString, orb.MultiPolygon, orb.Collection:
++					n := 0
++					switch gg := gg.(type) {
++					case orb.MultiLineString:
++						n = len(gg)
++					case orb.MultiPolygon:
++						n = len(gg)
++					case orb.Collection:
++						n = len(gg)
++					}
++					if idx < 0 || idx >= n {
++						col.failClass(ht, "index", "DistanceFromWithIndex(%v, %v) index %d of %d", g, p, idx, n)
++					}
++				}
++			}
++		}
++		// segment distance against the projection model
++		a, b := genPoint(ht), genPoint(ht)
++		if a != b {
++			vx, vy := b[0]-a[0], b[1]-a[1]
++			tt := ((p[0]-a[0])*vx + (p[1]-a[1])*vy) / (vx*vx + vy*vy)
++			tt = math.Max(0, math.Min(1, tt))
++			cp := orb.Point{a[0] + tt*vx, a[1] + tt*vy}
++			want := pointDistance(cp, p)
++			if d := planar.DistanceFromSegment(a, b, p); !closeNum(d, want, 1e-9, 1e-9) {
++				col.failClass(ht, "segment", "DistanceFromSegment(%v, %v, %v) = %v, want %v", a, b, p, d, want)
++			}
++		}
++
++		// point in ring / polygon
++		var poly orb.Polygon
++		switch gg := g.(type) {
++		case orb.Polygon:
++			poly = gg
++		case orb.Ring:
++			if len(gg) > 0 {
++				poly = orb.Polygon{gg}
++			}
++		case orb.Bound:
++			poly = gg.ToPolygon()
++		}
++		if len(poly) > 0 {
++			pt := genPoint(ht)
++			switch drawInt(ht, 0, 3) {
++			case 0:
++				pt = pointOnRing(ht, poly[0], false)
++			case 1:
++				if len(poly) > 1 {
++					pt = pointOnRing(ht, poly[drawInt(ht, 1, len(poly)-1)], true)
++				}
++			case 2:
++				pt = poly[0].Bound().Center()
++			}
++			r := shapelyPoint(poly, pt)
++			if r.Ok {
++				want := r.Covers
++				onHole := false
++				for _, h := range poly[1:] {
++					if onRing(pt, h) {
++						onHole = true
++					}
++				}
++				if Known.holeBoundaryNotContained && onHole && !onRing(pt, poly[0]) {
++					want = false
++				}
++				if got := planar.PolygonContains(poly, pt); got != want {
++					col.failClass(ht, "polygon-contains", "PolygonContains(%v, %v) = %v, shapely covers %v", poly, pt, got, r.Covers)
++				}
++				if got := planar.MultiPolygonContains(orb.MultiPolygon{poly}, pt); got != want {
++					col.failClass(ht, "multipolygon-contains", "MultiPolygonContains({%v}, %v) = %v, want %v", poly, pt, got, want)
++				}
++			}
++			ri := drawInt(ht, 0, len(poly)-1)
++			rr := shapelyPoint(orb.Polygon{poly[ri]}, pt)
++			if rr.Ok {
++				if got := planar.RingContains(poly[ri], pt); got != rr.Covers {
++					col.failClass(ht, "ring-contains", "RingContains(%v, %v) = %v, shapely covers %v", poly[ri], pt, got, rr.Covers)
++				}
++			}
++			// orientation
++			for _, r := range poly {
++				s := shoelace(r)
++				want := orb.CCW
++				if s < 0 {
++					want = orb.CW
++				}
++				if s != 0 && r.Orientation() != want {
++					col.failClass(ht, "orientation", "%v.Orientation() = %v, shoelace %v", r, r.Orientation(), s)
++				}
++				rc := r.Clone()
++				rc.Reverse()
++				if s != 0 && rc.Orientation() != -want {
++					col.failClass(ht, "orientation-reverse", "reversed %v.Orientation() = %v", r, rc.Orientation())
++				}
++				if !r.Closed() {
++					col.failClass(ht, "closed", "%v.Closed() = false", r)
++				}
++			}
++		}
++		col.count(g.GeoJSONType())
++	})
++}
++
++// TestHegelRoundCloneEqual: Round rounds every coordinate to the factor (default 1e6) and is
++// idempotent; Clone shares nothing with the original; Equal is structural.
++func TestHegelRoundCloneEqual(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		g := genAnyGeometry(ht)
++		// perturb a copy to get non-rounded coordinates
++		h := orb.Clone(g)
++		if !orb.Equal(g, h) || !same(g, h) {
++			col.failClass(ht, "clone-equal", "Clone(%v) = %v", g, h)
++		}
++		cs := coords(h)
++		if len(cs) > 0 && h.GeoJSONType() != "Point" {
++			if _, isB := h.(orb.Bound); !isB {
++				// mutate the clone's first coordinate in place
++				mutateFirst(h, 1e-3)
++				if same(g, h) || orb.Equal(g, h) {
++					col.failClass(ht, "clone-shared", "mutating the clone of %v changed the original", g)
++				}
++				if same(g, orb.Clone(g)) == false {
++					col.failClass(ht, "clone-after", "Clone(%v) differs after the first clone was mutated", g)
++				}
++			}
++		}
++		factor := pick(ht, []int{1, 10, 100, 1000, 1000000})
++		var rounded orb.Geometry
++		if factor == 1000000 && chance(ht, 50) {
++			rounded = orb.Round(orb.Clone(g))
++		} else {
++			rounded = orb.Round(orb.Clone(g), factor)
++		}
++		rc := coords(rounded)
++		oc := coords(g)
++		if len(rc) != len(oc) || rounded.GeoJSONType() != g.GeoJSONType() {
++			col.failClass(ht, "round-shape", "Round(%v, %d) = %v", g, factor, rounded)
++		} else {
++			f := float64(factor)
++			for i := range rc {
++				want := orb.Point{math.Round(oc[i][0]*f) / f, math.Round(oc[i][1]*f) / f}
++				if rc[i] != want {
++					col.failClass(ht, "round", "Round(%v, %d) coordinate %d = %v, want %v", g, factor, i, rc[i], want)
++					break
++				}
++			}
++		}
++		if again := orb.Round(orb.Clone(rounded), factor); !same(again, rounded) {
++			col.failClass(ht, "round-idempotent", "Round twice of %v with %d: %v then %v", g, factor, rounded, again)
++		}
++		// types and dimensions
++		wantDim := map[string]int{"Point": 0, "MultiPoint": 0, "LineString": 1, "MultiLineString": 1, "Polygon": 2, "MultiPolygon": 2}
++		if d, ok := wantDim[g.GeoJSONType()]; ok && g.Dimensions() != d {
++			col.failClass(ht, "dimensions", "%v.Dimensions() = %d", g, g.Dimensions())
++		}
++		if c, ok := g.(orb.Collection); ok {
++			max := -1 // the empty collection: no dimension
++			for _, m := range c {
++				if m.Dimensions() > max {
++					max = m.Dimensions()
++				}
++			}
++			if c.Dimensions() != max {
++				col.failClass(ht, "dimensions", "%v.Dimensions() = %d, want %d", g, c.Dimensions(), max)
++			}
++		}
++		if _, ok := g.(orb.Ring); ok && (g.GeoJSONType() != "Polygon" || g.Dimensions() != 2) {
++			col.failClass(ht, "ring-type", "Ring type %s dim %d", g.GeoJSONType(), g.Dimensions())
++		}
++		// Equal against a different geometry of the same type
++		h2 := genAnyGeometry(ht)
++		if orb.Equal(g, h2) != same(g, h2) {
++			col.failClass(ht, "equal", "Equal(%v, %v) = %v, structural %v", g, h2, orb.Equal(g, h2), same(g, h2))
++		}
++		// LineString.Reverse twice is the identity, once reverses
++		if ls, ok := g.(orb.LineString); ok && len(ls) > 0 {
++			r := ls.Clone()
++			r.Reverse()
++			for i := range ls {
++				if r[i] != ls[len(ls)-1-i] {
++					col.failClass(ht, "reverse", "%v reversed is %v", ls, r)
++					break
++				}
++			}
++			r.Reverse()
++			if !same(r, ls) {
++				col.failClass(ht, "reverse-twice", "%v reversed twice is %v", ls, r)
++			}
++		}
++		col.count("ok")
++	})
++}
++
++// mutateFirst adds d to the first coordinate found in the geometry (in place).
++func mutateFirst(g orb.Geometry, d float64) {
++	switch g := g.(type) {
++	case orb.MultiPoint:
++		if len(g) > 0 {
++			g[0][0] += d
++		}
++	case orb.LineString:
++		if len(g) > 0 {
++			g[0][0] += d
++		}
++	case orb.Ring:
++		if len(g) > 0 {
++			g[0][0] += d
++		}
++	case orb.MultiLineString:
++		for _, ls := range g {
++			if len(ls) > 0 {
++				ls[0][0] += d
++				return
++			}
++		}
++	case orb.Polygon:
++		for _, r := range g {
++			if len(r) > 0 {
++				r[0][0] += d
++				return
++			}
++		}
++	case orb.MultiPolygon:
++		for _, p := range g {
++			if len(coords(p)) > 0 {
++				mutateFirst(p, d)
++				return
++			}
++		}
++	case orb.Collection:
++		for i, m := range g {
++			if len(coords(m)) > 0 {
++				if p, ok := m.(orb.Point); ok {
++					p[0] += d
++					g[i] = p
++					return
++				}
++				mutateFirst(m, d)
++				return
++			}
++		}
++	}
++}
+diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
+new file mode 100644
+index 0000000..095c41a
+--- /dev/null
++++ b/hegel/hegel_test.go
+@@ -0,0 +1,186 @@
++package hegel
++
++// Hegel property tests for paulmach/orb, written for the Hegel zoo. See targets/go/orb/README.md.
++//
++// Oracles: shapely 2.1.2 (GEOS 3.13.1) through a Python child process for the codecs (WKT,
++// WKB, GeoJSON), the planar measures (area, length, centroid, distance, point in polygon),
++// Douglas-Peucker simplification and clipping; models written from the doc comments for the
++// rest (bounds, map tiles, the quadtree, resampling, radial simplification, the geo formulas,
++// rounding, cloning and equality).
++//
++// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
++// through hegelOpts; a panic in the code under test is turned into a failure of the current
++// test case by property(). ZOO_COLLECT=1 makes the properties record their mismatches instead
++// of failing.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			return []hegel.Option{hegel.WithTestCases(v)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func drawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return drawInt(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++var collecting = os.Getenv("ZOO_COLLECT") != ""
++
++type collector struct {
++	name   string
++	mu     sync.Mutex
++	counts map[string]int
++	msgs   []string
++	bad    int
++}
++
++func newCollector(t *testing.T) *collector {
++	c := &collector{name: t.Name(), counts: map[string]int{}}
++	t.Cleanup(func() {
++		if !collecting {
++			return
++		}
++		keys := make([]string, 0, len(c.counts))
++		for k := range c.counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		var parts []string
++		for _, k := range keys {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, c.counts[k]))
++		}
++		fmt.Printf("COLLECT %s: %d mismatches; %s\n", c.name, c.bad, strings.Join(parts, " "))
++		for _, m := range c.msgs {
++			fmt.Printf("MISMATCH %s\n", m)
++		}
++	})
++	return c
++}
++
++func (c *collector) count(class string) {
++	c.mu.Lock()
++	c.counts[class]++
++	c.mu.Unlock()
++}
++
++func (c *collector) fail(ht *hegel.T, format string, args ...any) {
++	c.failClass(ht, "", format, args...)
++}
++
++// failClass is fail with a class: in collect mode the class is counted and only its first two
++// messages are kept.
++func (c *collector) failClass(ht *hegel.T, class string, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collecting {
++		c.mu.Lock()
++		c.bad++
++		if class != "" {
++			c.counts["mismatch "+class]++
++		}
++		if (class == "" && len(c.msgs) < 25) || (class != "" && c.counts["mismatch "+class] <= 2) {
++			c.msgs = append(c.msgs, c.name+": "+msg)
++		}
++		c.mu.Unlock()
++		return
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// --------------------------------------------------------------------------- known bugs
++
++// Known: the recorded bugs (bugs.toml). The model reproduces a behaviour while its switch is
++// on; the pins assert the documented behaviour and fail while the bug exists.
++var Known = struct {
++	// wkt.Unmarshal fails on a GEOMETRYCOLLECTION whose members are separated by ", " (a space
++	// after the comma), on a nested collection, and on an EMPTY member before another member;
++	// an EMPTY member after another member is dropped silently. The splitter for collection
++	// members looks for the first letter after a ")" and takes what came before it, minus one
++	// character, as the previous member.
++	wktCollectionMembers bool
++	// wkt.Unmarshal rejects two consecutive spaces between the coordinates of a point
++	// ("POINT(1  2)") or before EMPTY ("MULTIPOINT  EMPTY"), though WKT separates tokens by
++	// any whitespace.
++	wktWhitespace bool
++	// Bound.Extend and Bound.Union on an empty bound (Min > Max, as an empty geometry's Bound()
++	// returns) mix the empty bound's coordinates into the result, so the Bound() of a
++	// Collection, MultiLineString, Polygon or MultiPolygon whose first part is empty is wrong:
++	// Collection{MultiPoint{}, Point{5, 5}}.Bound() is [1 1]-[5 5].
++	unionOfEmptyBound bool
++	// Bound.IsEmpty is documented to be true for a bound of zero area; it is true only when
++	// Min > Max, so a point's bound is not empty.
++	isEmptyZeroArea bool
++	// maptile.At and Fraction do not clamp the longitude: At(Point{180, 0}, z) is X = 2^z, an
++	// invalid tile, though At is documented to create a valid tile for the zoom (and
++	// tilecover.Bound of a bound reaching longitude 180 lists those tiles).
++	tileAtLongitude180 bool
++	// planar.PolygonContains (and MultiPolygonContains) returns false for a point on the
++	// boundary of a hole, though "points on the boundary are considered in".
++	holeBoundaryNotContained bool
++	// resample.ToInterval panics (makeslice: len out of range) on an empty line string, where
++	// Resample returns it.
++	toIntervalEmptyPanics bool
++	// wkt.Marshal writes "()" for an empty part (an empty Ring: "POLYGON(())"; an empty
++	// LineString in a MultiLineString: "MULTILINESTRING((),(0 0,1 1))"), which is not WKT (the
++	// grammar has EMPTY there) and which no parser, orb's own included, reads.
++	emptyPartWKT bool
++	// geojson.NewGeometry of an empty Collection marshals to the JSON null (not a GeoJSON
++	// geometry object; UnmarshalGeometry rejects it), inside a collection's "geometries" too;
++	// and UnmarshalGeometry of a collection with a null member panics (nil pointer).
++	emptyCollectionGeoJSON bool
++	// a GeoJSON position with fewer than two numbers ([], [1]) is accepted as a point with
++	// zero coordinates instead of being rejected.
++	shortPositionAccepted bool
++	// planar.CentroidArea of a zero-area Ring (or of a degenerate Bound) returns the ring's
++	// first point, while the same ring inside a Polygon gets the centroid of its boundary line
++	// (as GEOS computes it).
++	degenerateRingCentroid bool
++	// planar.CentroidArea of a Collection weights its members by area only, so a collection
++	// of points or lines, or one whose only polygons are empty, has the origin as its
++	// centroid.
++	collectionCentroidByArea bool
++	// simplify.VisvalingamKeep(1) panics (nil pointer) on any line string or ring of three or
++	// more points: the loop pops an end point (area +Inf, not above the +Inf threshold) once
++	// only the two ends are left, and the end has no neighbour to relink.
++	visvalingamKeepOnePanics bool
++	// quadtree.KNearest (KNearestMatching) with k = 0 panics (index out of range) on a tree
++	// holding a point: the visitor pops the one heap element and reads the top of the empty
++	// heap.
++	kNearestZeroPanics bool
++}{true, true, true, true, true, true, true, true, true, true, true, true, true, true}
