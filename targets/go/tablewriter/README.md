@@ -6,7 +6,9 @@ holding ANSI escape sequences, truncation, the tab width), `pkg/twwarp` (word sp
 minimum-raggedness wrapping) and `tw` (padding, header title formatting, camel-case splitting,
 break points); and the table's Markdown, HTML and boxed renderings (`renderer.NewMarkdown`,
 `renderer.NewHTML`, `renderer.NewBlueprint` under every border style and rendition setting)
-with header, rows and footer, trimming, auto-formatting, alignments, padding and AutoHide.
+with header, rows and footer, trimming, auto-formatting, alignments, padding, AutoHide, the
+width constraints (`WithColumnWidths`, `With{Header,Row,Footer}MaxWidth`, `WithMaxWidth`) with
+the wrap modes, and captions.
 
 ## Build
 
@@ -50,6 +52,16 @@ visible column between the style's corner, junction and edge glyphs (the first a
 segments shortened by the corners' excess over the column glyph, as `Line` does); a cell line
 is every visible cell padded to its column width by its alignment (an explicit one, else the
 section's default) between column glyphs, the padding strings repeated as `formatCell` does.
+Width constraints follow `calculateContentMaxWidth`: the cell width is the per-column width
+if set, else the section's maximum (which a table `MaxWidth` replaces by `MaxWidth` over the
+record's cell count when no per-column width is set), else `MaxWidth` for a wrapping section;
+less the padding, at least 1; each visual line is then wrapped by the section's mode
+(`WrapNormal`: `WrapString`, or `WrapStringWithSpaces` unless both trims are on;
+`WrapTruncate`: `Truncate` to one less with the ellipsis; `WrapBreak`: `BreakPoint` pieces
+with the break character, a blank line vanishing), and a per-column width replaces the natural
+column width outright (0 hides the column). A caption is wrapped to its width, else the table's
+(else its own for a table under five cells), padded to that target by its alignment or the
+spot's default, and printed above or below; side spots print nothing.
 
 ## Properties
 
@@ -64,6 +76,10 @@ section's default) between column glyphs, the padding strings repeated as `forma
   `With{Header,Row,Footer}AlignmentConfig`, `WithAutoHide`, `WithHeaderControl`, `WithFooterControl`.
 - `TestHegelHTML`: the same with `renderer.NewHTML` and its `HTMLConfig` (escaping, classes,
   `AddLinesTag`).
+- `TestHegelConstraints`: the boxed rendering under `WithColumnWidths` (0, small, large and
+  negative widths), `With{Header,Row,Footer}MaxWidth`, `WithMaxWidth`,
+  `With{Header,Row,Footer}AutoWrap` (all four modes) and `Caption` (every spot, alignment and
+  width), exact output.
 - `TestHegelBlueprint`: the same with `renderer.NewBlueprint` over the eleven border styles
   (`StyleASCII` to `StyleGraphical`, `StyleMarkdown` and `StyleNone` included), every state of
   `Borders`, `Separators` and `Lines`, and `WithPadding` (default, none, `*`/`**`, `""`/`>`);
@@ -71,7 +87,7 @@ section's default) between column glyphs, the padding strings repeated as `forma
 
 ## Bugs
 
-Twenty-one, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
+Twenty-four, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
 detection (1, medium); `Width`'s cache is not purged when the tab width changes (2, medium).
 Widths: emoji sequences (VS16, ZWJ, flags, modifiers) are measured rune by rune (3).
 `Truncate`: an ESC inside a sequence restarts the scan, so an `ESC \`-terminated OSC (a
@@ -94,7 +110,11 @@ a header and a footer without rows (17); a table whose only record is empty rend
 coloured header, which then print as text (19, medium); `Truncate` and `Width` parse a CSI
 sequence with a leading intermediate byte differently, so a truncated string can be wider
 than the limit (20); `StyleGraphical`'s two-cell corners make the border lines of a lone
-one-cell column wider than its cell lines (21).
+one-cell column wider than its cell lines (21). Captions and widths: a caption aligned left
+on a centre or right spot is realigned to the spot's default, `AlignDefault` being `AlignLeft`
+(22); with a caption an empty table becomes hard-coded `+--+` lines in any style (23);
+`WithMaxWidth` does not bound the table width - padding, separators and borders are uncounted
+and long words widen the columns (24, medium).
 
 ## Modelled as recorded, not counted
 
@@ -122,5 +142,13 @@ one-cell column wider than its cell lines (21).
   none (bug 14); a record of fewer cells is padded with empty ones; `AutoHide` looks at the
   rows only (a column with a header but no row content is hidden); a multi-character padding is
   repeated whole and cut back by `Truncate` (visible with bug 20); the ragged-width check skips
-  the cases of bugs 15, 19/20 and 21. Merges, width constraints, captions, streaming,
-  `Bulk`/struct input and the Colorized, Ocean and SVG renderers are not yet exercised.
+  the cases of bugs 15, 19/20 and 21.
+- Widths and captions: `WithColumnWidths` with 0 hides the column (and drops the separator
+  after it, bug 15 again); a width narrower than the padding gives a content width of 1, and
+  `WrapTruncate` at 1 empties the cell (bugs 5 and 12); the `MaxWidth` share is computed per
+  record from its own cell count, so a short record wraps wider; `WrapBreak` keeps a trailing
+  space before the break character and drops a blank visual line; `WithColumnMax`
+  (`Widths.Global`, bug 12) and its shrinking pass are not generated; the side caption spots
+  (`SpotLeftTop` ...) are defined but print nothing; a caption's `Width` pads the caption to
+  that width even when the table is wider or narrower. Merges, streaming, `Bulk`/struct input
+  and the Colorized, Ocean and SVG renderers are not yet exercised.
