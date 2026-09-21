@@ -10,7 +10,7 @@ spreads, `@skip`/`@include`, a second operation selected by name) against genera
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of five
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of seven
 `hegel_zoo_*_test.go` files that drive the public API. `go test -count=1 -run TestHegel -v ./hegel`
 needs `python3` with the `graphql-core` package (3.2+) on the PATH.
 
@@ -32,11 +32,23 @@ are compared as well.
   kind, nulls in non-null positions, non-lists for lists, wrong `__typename`s); an operation of
   up to 25 field selections with the features above. Classes counted: ok, errors agree, both
   reject (request errors), both reject with agreeing paths.
+- `TestHegelIntrospection`: graphql-core's introspection query (without the newer fields) on the
+  same type system; the results must agree after normalisation (introspection types and
+  directives left out, lists sorted by name, built-in scalar descriptions and an interface's own
+  interfaces not judged, a `= null` default - which the Go API cannot express - counted as none,
+  an integer-like ID default the same quoted or bare).
+- `TestHegelValidate`: the generated operation with one or two text mutations aimed at the
+  validation rules (unknown field/argument/directive/type, undefined or unused fragments and
+  variables, duplicate names, variables of non-input types or in the wrong position, leaf and
+  object selection errors, fragments on scalars and inputs, impossible spreads, cycles, anonymous
+  and duplicate operations, missing root operation types, SDL in the document, conflicting
+  aliases and arguments, unknown and duplicate input fields); `ValidateDocument`'s verdict must
+  equal graphql-core's `validate`.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
 
 ## Bugs
 
-Fourteen, recorded in `bugs.toml`. The language and validation: the `null` literal is a syntax
+Eighteen, recorded in `bugs.toml`. The language and validation: the `null` literal is a syntax
 error (graphql-go/1); a non-null argument or input field with a default must still be provided
 (2); a non-null variable with a default is rejected (3); an inline fragment without a type
 condition under a list or non-null field is rejected (8); an Int literal outside 32 bits is
@@ -47,7 +59,10 @@ leaf value that cannot be serialized becomes null without a field error (10); In
 truncates fractional floats (11); Boolean serialization turns strings into true (12); String and
 ID serialization print slices, maps, booleans and floats with fmt (13); `Enum.Serialize` of a
 slice or map panics (9); when a non-null root field is null the other root fields' errors are
-dropped (14).
+dropped (14). Introspection: enum, list and input object defaults printed as quoted fmt strings
+(15); an empty string instead of null for a missing description (16). Validation: the same
+directive twice on one selection accepted (17); a type definition in an executable document
+accepted (18).
 
 ## Modelled as recorded
 
@@ -56,8 +71,11 @@ behaviour (no null literals, non-null arguments with defaults always provided, n
 non-null variables, no null variable values, only wrong-kind variable values both sides reject,
 no out-of-range Int literals, variable-driven directive conditions only on freshly aliased
 fields, no condition-less inline fragments under wrapped fields, no wrong-kind leaf values of the
-recorded kinds) or the comparison allows for it (with `rootPropagationDropsErrors`, graphql-go's
-error paths need only be among graphql-core's when both data are null); the collector counts
+recorded kinds, no duplicate-directive or SDL mutations) or the comparison allows for it (with
+`rootPropagationDropsErrors`, graphql-go's error paths need only be among graphql-core's when
+both data are null; with `introDefaultValueUntyped`, enum, list and input object defaults are
+not compared; with `introEmptyDescription`, graphql-go's empty descriptions read as null); the
+collector counts
 the avoidances. `ZOO_KNOWN_OFF=name` turns a switch off and the property then fails on it.
 
 Design notes:
@@ -73,11 +91,13 @@ Design notes:
 
 ## Not tested
 
-Mutations and subscriptions, custom scalars (`DateTime`), introspection (`__schema`, `__type`),
-`ResolveType` functions, resolver errors and thunks, `Plan`/`PlanQuery`/`ExecutePlan` and the
+Mutations and subscriptions, custom scalars (`DateTime`), the introspection of directives
+(graphql-go has neither `@specifiedBy` nor `@oneOf` and its `@deprecated` lacks the 2021
+locations), `ResolveType` functions, resolver errors and thunks, `Plan`/`PlanQuery`/`ExecutePlan` and the
 plan cache directly, extensions, `Schema.AppendType`/`AddImplementation`, error messages and
 locations, the printer.
 
 ## History
 
 - 2026-09-21: new target, one property, 14 bugs.
+- 2026-09-21: introspection and validation properties, 4 more bugs.
