@@ -3,7 +3,8 @@
 Hegel property tests for [jedib0t/go-pretty](https://github.com/jedib0t/go-pretty), the
 table/list/progress renderer: its `text` package, the ANSI-aware string utilities the renderers
 are built on (widths, trimming, wrapping, alignment, case conversion, colours, the escape
-sequence parser, the transformers).
+sequence parser, the transformers); its `table` package (the boxed, CSV, TSV, Markdown and HTML
+renderings, filtering, sorting, hidden columns, the pager); and its `list` package.
 
 ## Build
 
@@ -27,6 +28,17 @@ order, a wrapped output leaves no state open, WrapSoft keeps words that fit, a s
 is returned as it is. The transformers are checked against `fmt.Sprintf` with the documented
 sign colours and against `time.Format` with the documented unit detection.
 
+For the `table` package, a model of the rows as documented: cells stringified as
+`convertValueToString` does (transformers applied), rows filtered by the documented operators,
+columns hidden or suppressed, numeric columns detected; on it the exact CSV/TSV records (read
+back with `encoding/csv`), the exact Markdown and HTML outputs (plus the cells a GFM table
+parser reads back), and for the boxed rendering the line layout (title, header, rows, footer,
+separators), one width for every line (or `Size.WidthMax`), the cells' text, the auto-index
+numbers and a row's `AutoMerge`. Sorting is checked as a permutation in an order the keys allow.
+The pager's pages must re-join to `Render()`, hold the page size, and navigate as documented.
+For the `list` package, the exact `Render`/`RenderMarkdown` output and the `<ul>`/`<li>` nesting
+of `RenderHTML` against the items and their levels.
+
 ## Properties
 
 - `TestHegelWidth`: `StripEscape`, `StringWidthWithoutEscSequences`, `RuneCount`,
@@ -38,10 +50,21 @@ sign colours and against `time.Format` with the documented unit detection.
 - `TestHegelWrap`: `WrapHard`, `WrapSoft`, `WrapText`.
 - `TestHegelTransform`: `NewNumberTransformer`, `NewTimeTransformer`,
   `NewUnixTimeTransformer`.
+- `TestHegelTableCSV`: `RenderCSV`, `RenderTSV`, `FilterBy`, `SortBy`, `SetColumnConfigs`
+  (Hidden, transformers), `SuppressEmptyColumns`, `SetAutoIndex`, `CSV.FieldProtection`,
+  `Length`, `ImportGrid`.
+- `TestHegelTableMarkdown`: `RenderMarkdown` (with and without `PadContent`).
+- `TestHegelTableHTML`: `RenderHTML`.
+- `TestHegelTableRender`: `Render` with title, caption, `SeparateRows`, auto-index, colours, a
+  column `WidthMax`, `Size.WidthMin`, `Size.WidthMax`, `RowConfig{AutoMerge}`.
+- `TestHegelTablePager`: `Pager`, `SetPageSize`, `PageSize`, `GoTo`, `Next`, `Prev`,
+  `Location`.
+- `TestHegelList`: `list.Writer` `Render`, `RenderMarkdown`, `RenderHTML`, `Indent`,
+  `UnIndent`, `UnIndentAll`, `Length`.
 
 ## Bugs
 
-Twenty-four, in `bugs.toml`. Sequences: a CSI sequence is terminated only by `m`, so the
+Forty-five, in `bugs.toml`. In `text`, twenty-four. Sequences: a CSI sequence is terminated only by `m`, so the
 package's own cursor and erase sequences swallow the text after them (1, medium); an OSC
 sequence terminated by BEL is recognised only for OSC 8 (2); the parser reads a 24-bit colour
 as five attributes (9, medium), restores colours in numeric order rather than the last set
@@ -63,6 +86,21 @@ are formatted as `-` plus the format of the negated value, breaking widths and M
 times at or before the epoch render as "" (13, medium); unix times are accepted as int64 and
 string only (14).
 
+In `table`, twenty-one. Crashes: `Pager()` keeps the previous pager's page and panics past the
+new page count (39, medium); `Render` divides by zero re-balancing a merged cell wider than its
+columns (42, medium). Rows: an empty row gets one field too many in CSV/TSV (25) and is dropped
+by `Render` and `RenderHTML` (26); a row of one empty cell is an empty CSV line that readers
+skip (45); `ImportGrid` turns an empty inner row into a `[]` cell (38); `RowConfig` stays with
+a position when rows are sorted or filtered (35, medium). Sorting and filtering: a numeric sort
+with a non-numeric cell leaves the numbers unordered (29, medium); duplicate keys are applied,
+not discarded (30); `SortBy.Name` is matched after the header transformer (31); `Equal` compares
+strings (32); a row lacking the column fails every operator (33); `Length()` reports the
+previous render's filter (34); `SuppressEmptyColumns` decides on the first non-empty cell (40,
+medium). Layout: Markdown `PadContent` pads by the raw width (27) and backslashes are not
+escaped (28); `Size.WidthMin` sizes the title beyond capped columns (36) and beyond
+`Size.WidthMax` (41); `Size.WidthMax` of 1 or 2 renders nothing (37); the auto-index header row
+is not counted in the widths (43); a footer-only table gets a `++` top border (44).
+
 ## Modelled as recorded, not counted
 
 - Widths are `text.RuneWidth` per rune (runewidth with the box-drawing rule): a combining mark
@@ -77,5 +115,13 @@ string only (14).
   not columns; Trim drops the visible runes after the first that does not fit.
 - NewUnixTimeTransformer reads a value >= 10^10 as milliseconds, >= 10^13 as microseconds,
   >= 10^16 as nanoseconds; float32 values are formatted after conversion to float64.
-- BeEquivalent-like conversions and the `table`, `list` and `progress` packages are not
-  exercised.
+- Table: `Format.Header`/`Format.Footer` (upper case) apply to the boxed rendering only; the
+  CSV title and caption are written as raw lines; TSV quotes a field holding four spaces; a
+  regex filter that does not compile falls back to an equality; a non-numeric cell under a
+  numeric sort, and NaN, are unordered; Markdown `PadContent` keeps the separator at least
+  three dashes wide (narrower columns misalign, as the option's own example shows); the GFM
+  read-back trims cells and maps `<br/>` to a newline.
+- List: `Indent` shifts only once past the previous item's level and never before the first
+  item; the connector styles (`StyleConnected*`) are not exercised, `StyleDefault` and
+  `StyleMarkdown` are.
+- The `progress` package is not exercised.
