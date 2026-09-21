@@ -1,0 +1,835 @@
+diff --git a/go.mod b/go.mod
+index 3b36da4..d231f97 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,25 +1,27 @@
+ module github.com/compose-spec/compose-go/v2
+ 
+-go 1.24
++go 1.26.0
+ 
+ require (
+ 	github.com/distribution/reference v0.5.0
+ 	github.com/docker/go-connections v0.4.0
+ 	github.com/docker/go-units v0.5.0
+ 	github.com/go-viper/mapstructure/v2 v2.4.0
+-	github.com/google/go-cmp v0.5.9
++	github.com/google/go-cmp v0.7.0
+ 	github.com/mattn/go-shellwords v1.0.12
+ 	github.com/opencontainers/go-digest v1.0.0
+ 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.1
+ 	github.com/sirupsen/logrus v1.10.1
+ 	github.com/xhit/go-str2duration/v2 v2.1.0
+ 	go.yaml.in/yaml/v4 v4.0.0-rc.4
+-	golang.org/x/sync v0.3.0
++	golang.org/x/sync v0.20.0
+ 	golang.org/x/text v0.14.0
+ 	gotest.tools/v3 v3.5.2
+ )
+ 
+ require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
+ 	github.com/stretchr/testify v1.12.1 // indirect
+-	golang.org/x/sys v0.13.0 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++	hegel.dev/go/hegel v0.6.33 // indirect
+ )
+diff --git a/hegel/hegel_model_test.go b/hegel/hegel_model_test.go
+new file mode 100644
+index 0000000..794f8a2
+--- /dev/null
++++ b/hegel/hegel_model_test.go
+@@ -0,0 +1,388 @@
++package hegel
++
++// A model of the Compose specification's interpolation syntax (12-interpolation.md, plus the
++// ${VAR:+alt}/${VAR+alt} forms documented by Docker), a generator of templates and the bash
++// oracle.
++
++import (
++	"errors"
++	"fmt"
++	"os/exec"
++	"sort"
++	"strings"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- environment
++
++// env is the mapping: set variables with plain, empty and dollar-containing values; U, V and W
++// are unset.
++var env = map[string]string{
++	"A":   "alpha",
++	"B":   "b b",
++	"E":   "",
++	"D":   "$X",
++	"H":   "${A}",
++	"F":   "a}b",
++	"n1":  "1",
++	"MiX": "m",
++	"_u":  "under",
++}
++
++var names = []string{"A", "B", "E", "D", "H", "F", "n1", "MiX", "_u", "U", "V", "W"}
++
++func mapping(k string) (string, bool) { v, ok := env[k]; return v, ok }
++
++// --------------------------------------------------------------------------- model
++
++type missingErr struct{ name, reason string }
++type invalidErr struct{}
++
++func (e *missingErr) Error() string { return "required " + e.name + ": " + e.reason }
++func (e *invalidErr) Error() string { return "invalid template" }
++
++func isNameStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
++func isNameChar(c byte) bool  { return isNameStart(c) || (c >= '0' && c <= '9') }
++
++// variable is what ExtractVariables reports for one occurrence.
++type variable struct {
++	name, def, presence string
++	required            bool
++	inMessage           bool // occurs only inside a ?-message
++}
++
++// model parses and evaluates a template lazily: words are evaluated only when the operator
++// selects them, and the first error in evaluation order is returned.
++type model struct {
++	s             string
++	newlineInWord bool
++	invalid       bool // an invalid form occurs somewhere, whichever error is reported first
++	vars          []variable
++}
++
++// run evaluates the whole template.
++func (m *model) run() (string, error) { return m.runFrom(false) }
++
++// dollar handles the text at a '$' at position i, returning its value and the next position.
++// Values of substitutions are never re-expanded.
++func (m *model) dollar(i int, inMessage bool) (string, int, error) {
++	if i+1 >= len(m.s) {
++		return "$", i + 1, nil // a lone $ is preserved
++	}
++	c := m.s[i+1]
++	switch {
++	case c == '$':
++		return "$", i + 2, nil
++	case isNameStart(c):
++		j := i + 1
++		for j < len(m.s) && isNameChar(m.s[j]) {
++			j++
++		}
++		name := m.s[i+1 : j]
++		m.vars = append(m.vars, variable{name: name, inMessage: inMessage})
++		v, _ := mapping(name)
++		return v, j, nil
++	case c == '{':
++		return m.braced(i+2, inMessage)
++	}
++	return "$", i + 1, nil // "$ ", "$1": preserved
++}
++
++// braced parses from just after "${".
++func (m *model) braced(i int, inMessage bool) (string, int, error) {
++	j := i
++	for j < len(m.s) && isNameChar(m.s[j]) {
++		j++
++	}
++	name := m.s[i:j]
++	if name == "" || !isNameStart(name[0]) || j >= len(m.s) {
++		return "", 0, &invalidErr{}
++	}
++	if m.s[j] == '}' {
++		m.vars = append(m.vars, variable{name: name, inMessage: inMessage})
++		v, _ := mapping(name)
++		return v, j + 1, nil
++	}
++	op := ""
++	if m.s[j] == ':' {
++		op = ":"
++		j++
++		if j >= len(m.s) {
++			return "", 0, &invalidErr{}
++		}
++	}
++	switch m.s[j] {
++	case '-', '+', '?':
++		op += string(m.s[j])
++		j++
++	default:
++		return "", 0, &invalidErr{}
++	}
++	// the word extends to the matching '}', nested ${...} included
++	start := j
++	depth := 0
++	for j < len(m.s) {
++		if m.s[j] == '$' && j+1 < len(m.s) && m.s[j+1] == '{' {
++			depth++
++			j += 2
++			continue
++		}
++		if m.s[j] == '$' && j+1 < len(m.s) && m.s[j+1] == '$' {
++			j += 2
++			continue
++		}
++		if m.s[j] == '}' {
++			if depth == 0 {
++				break
++			}
++			depth--
++		}
++		if m.s[j] == '\n' {
++			m.newlineInWord = true
++		}
++		j++
++	}
++	if j >= len(m.s) {
++		return "", 0, &invalidErr{}
++	}
++	word := m.s[start:j]
++	end := j + 1
++	value, set := mapping(name)
++	v := variable{name: name, inMessage: inMessage}
++	switch op {
++	case ":-", "-":
++		v.def = word
++	case ":+", "+":
++		v.presence = word
++	default:
++		v.required = true
++	}
++	m.vars = append(m.vars, v)
++	// the word's own variables count for ExtractVariables whether or not it is evaluated
++	sub := &model{s: word}
++	subVal, subErr := sub.runFrom(inMessage || op == "?" || op == ":?")
++	m.newlineInWord = m.newlineInWord || sub.newlineInWord
++	m.invalid = m.invalid || sub.invalid
++	m.vars = append(m.vars, sub.vars...)
++	useWord := false
++	switch op {
++	case ":-":
++		useWord = !set || value == ""
++	case "-":
++		useWord = !set
++	case ":+":
++		useWord = set && value != ""
++		if !useWord {
++			value = ""
++		}
++	case "+":
++		useWord = set
++		if !useWord {
++			value = ""
++		}
++	case ":?":
++		if !set || value == "" {
++			if subErr != nil {
++				return "", end, subErr
++			}
++			return "", end, &missingErr{name, subVal}
++		}
++	case "?":
++		if !set {
++			if subErr != nil {
++				return "", end, subErr
++			}
++			return "", end, &missingErr{name, subVal}
++		}
++	}
++	if useWord {
++		if subErr != nil {
++			return "", end, subErr
++		}
++		return subVal, end, nil
++	}
++	return value, end, nil
++}
++
++// runFrom evaluates the template; the first error is returned, but parsing goes on after a
++// required-variable error (as compose-go's substitution does, and as its extraction, which is
++// purely syntactic, needs), and stops at an invalid template.
++func (m *model) runFrom(inMessage bool) (string, error) {
++	var b strings.Builder
++	var first error
++	i := 0
++	for i < len(m.s) {
++		c := m.s[i]
++		if c != '$' {
++			b.WriteByte(c)
++			i++
++			continue
++		}
++		v, n, err := m.dollar(i, inMessage)
++		if err != nil {
++			if first == nil {
++				first = err
++			}
++			if errors.As(err, new(*invalidErr)) {
++				m.invalid = true
++				return "", first
++			}
++		}
++		b.WriteString(v)
++		i = n
++	}
++	if first != nil {
++		return "", first
++	}
++	return b.String(), nil
++}
++
++// extracted combines the occurrences the way ExtractVariables documents: required as soon as
++// one occurrence is, the default and presence value of the first occurrence defining one.
++type extracted struct {
++	def, presence string
++	required      bool
++	defs, press   int // number of distinct non-empty candidates
++}
++
++func (m *model) extracted(skipMessages bool) map[string]*extracted {
++	out := map[string]*extracted{}
++	for _, v := range m.vars {
++		if skipMessages && v.inMessage {
++			continue
++		}
++		e := out[v.name]
++		if e == nil {
++			e = &extracted{}
++			out[v.name] = e
++		}
++		e.required = e.required || v.required
++		if v.def != "" {
++			if e.def == "" {
++				e.def = v.def
++			}
++			if e.def != v.def || e.defs == 0 {
++				e.defs++
++			}
++		}
++		if v.presence != "" {
++			if e.presence == "" {
++				e.presence = v.presence
++			}
++			if e.presence != v.presence || e.press == 0 {
++				e.press++
++			}
++		}
++	}
++	return out
++}
++
++func sortedKeys[T any](m map[string]T) []string {
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++// --------------------------------------------------------------------------- generator
++
++// literal alphabets: outside words braces are literal; inside words they are left out (the
++// specification says nothing about bare braces in a default; bash and compose-go differ).
++var outerChars = []string{"a", "b", "x", "1", " ", "-", ":", ".", "/", "}", "{", "?", "+", "=", ",", "\n", "'", "\\", "!", "#", "%", "@", "~", "\t"}
++var wordChars = []string{"a", "b", "x", "1", " ", "-", ":", ".", "/", "?", "+", "=", ",", "!", "#", "%", "@", "~"}
++
++var ops = []string{":-", "-", ":+", "+", ":?", "?"}
++
++var invalidForms = []string{"${", "${}", "${1x}", "${A B}", "${A:x}", "${A!}", "${A:}", "${A::-x}", "${-x}", "${:-x}", "${A.b}", "${ A}"}
++
++// genTemplate draws a template as text; bashSafe reports whether the bash oracle can run it
++// (no invalid forms, no newlines in words, no characters bash treats specially inside double
++// quotes: backslash, backquote, quotes are fine).
++func genTemplate(tc hegel.TestCase, depth int) (text string, bashSafe bool) {
++	var b strings.Builder
++	safe := true
++	afterName := false
++	n := drawInt(tc, 0, 5)
++	if depth == 0 {
++		n = drawInt(tc, 1, 6)
++	}
++	for k := 0; k < n; k++ {
++		r := drawInt(tc, 1, 100)
++		switch {
++		case r <= 30: // literal run
++			var chars []string
++			if depth == 0 {
++				chars = outerChars
++			} else {
++				chars = wordChars
++			}
++			for j := drawInt(tc, 1, 4); j > 0; j-- {
++				c := pick(tc, chars)
++				if afterName && isNameChar(c[0]) {
++					b.WriteString(" ")
++				}
++				if c == "\\" || c == "\n" && depth > 0 {
++					safe = false
++				}
++				b.WriteString(c)
++				afterName = false
++			}
++		case r <= 38: // escaped dollar
++			b.WriteString("$$")
++			if depth > 0 && chance(tc, 30) {
++				b.WriteString("x") // never "$${" inside a word
++			}
++			afterName = false
++		case r <= 55: // $NAME
++			b.WriteString("$" + pick(tc, names))
++			afterName = true
++		case r <= 68: // ${NAME}
++			b.WriteString("${" + pick(tc, names) + "}")
++			afterName = false
++		case r <= 94 || depth >= 2: // ${NAME op word}
++			op := pick(tc, ops)
++			word := ""
++			wsafe := true
++			if depth < 2 {
++				word, wsafe = genTemplate(tc, depth+1)
++			} else if chance(tc, 50) {
++				word = pick(tc, wordChars)
++			}
++			safe = safe && wsafe
++			b.WriteString("${" + pick(tc, names) + op + word + "}")
++			afterName = false
++		default: // an invalid form (only at the top level, at most once)
++			if depth == 0 {
++				b.WriteString(pick(tc, invalidForms))
++				safe = false
++				afterName = false
++			}
++		}
++	}
++	if depth > 0 && strings.HasPrefix(b.String(), "}") {
++		return "x" + b.String(), safe
++	}
++	return b.String(), safe
++}
++
++// --------------------------------------------------------------------------- bash
++
++// bashExpand expands the template as bash does inside double quotes ($$ becomes \$); the
++// environment is env. exit code 1 with "parameter null or not set" is the required-variable
++// error.
++func bashExpand(t string) (string, error) {
++	var e []string
++	for k, v := range env {
++		e = append(e, k+"="+v)
++	}
++	cmd := exec.Command("bash", "-c", `printf '%s' "`+strings.ReplaceAll(t, "$$", `\$`)+`"`)
++	cmd.Env = append([]string{"PATH=/usr/bin:/bin"}, e...)
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
++	}
++	return string(out), nil
++}
+diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
+new file mode 100644
+index 0000000..59d7fd0
+--- /dev/null
++++ b/hegel/hegel_pins_test.go
+@@ -0,0 +1,58 @@
++package hegel
++
++// Pins: one deterministic test per recorded bug, asserting the documented behaviour. Each
++// fails while the bug exists and is listed under [expected_failures] in target.toml.
++
++import (
++	"testing"
++
++	"github.com/compose-spec/compose-go/v2/template"
++)
++
++// compose-go/1: a default value, alternative or error message may contain a newline, as any
++// other character; the template is not invalid.
++func TestHegelPinNewlineInDefault(t *testing.T) {
++	for tmpl, want := range map[string]string{"${U:-a\nb}": "a\nb", "${E:-\n}": "\n", "${A:+x\ny}": "x\ny", "${U:-${V:-1\n2}}": "1\n2"} {
++		got, err := template.SubstituteWithOptions(tmpl, mapping, template.WithoutLogging)
++		if err != nil || got != want {
++			t.Errorf("Substitute(%q) = %q, %v; want %q", tmpl, got, err, want)
++		}
++	}
++	if _, err := template.SubstituteWithOptions("${U:?line1\nline2}", mapping, template.WithoutLogging); err == nil {
++		t.Errorf("Substitute(%q) succeeded, want the required-variable error", "${U:?line1\nline2}")
++	} else if e, ok := err.(*template.MissingRequiredError); !ok || e.Reason != "line1\nline2" {
++		t.Errorf("Substitute(%q): %v, want a MissingRequiredError with the message", "${U:?line1\nline2}", err)
++	}
++}
++
++// compose-go/2: variables used inside a required-variable message are variables of the file.
++func TestHegelPinExtractMessageVariables(t *testing.T) {
++	for _, tmpl := range []string{"${U:?${B}}", "${U?$B}", "${U:?x ${B:-y} z}"} {
++		got := template.ExtractVariables(map[string]interface{}{"k": tmpl}, nil)
++		if _, ok := got["B"]; !ok {
++			t.Errorf("ExtractVariables(%q) = %v, B missing", tmpl, sortedKeys(got))
++		}
++	}
++}
++
++// compose-go/3: a variable used several times keeps the default and presence value of its
++// first occurrence, in one string as across the configuration.
++func TestHegelPinExtractFirstOccurrence(t *testing.T) {
++	got := template.ExtractVariables(map[string]interface{}{"k": "${A:-x} ${A:-y} ${A:+p} ${A:+q}"}, nil)
++	if got["A"].DefaultValue != "x" || got["A"].PresenceValue != "p" {
++		t.Errorf("one string: DefaultValue %q PresenceValue %q, want %q %q", got["A"].DefaultValue, got["A"].PresenceValue, "x", "p")
++	}
++	got = template.ExtractVariables(map[string]interface{}{"k": "${A:-x}${A:-y}"}, nil)
++	if got["A"].DefaultValue != "x" {
++		t.Errorf("adjacent: DefaultValue %q, want %q", got["A"].DefaultValue, "x")
++	}
++	// across keys the result must at least be the same every time
++	seen := map[string]bool{}
++	for i := 0; i < 50; i++ {
++		got = template.ExtractVariables(map[string]interface{}{"k1": "${A:-x}", "k2": "${A:-y}"}, nil)
++		seen[got["A"].DefaultValue] = true
++	}
++	if len(seen) != 1 {
++		t.Errorf("two keys: DefaultValue varies between runs: %v", sortedKeys(seen))
++	}
++}
+diff --git a/hegel/hegel_props_test.go b/hegel/hegel_props_test.go
+new file mode 100644
+index 0000000..338b68f
+--- /dev/null
++++ b/hegel/hegel_props_test.go
+@@ -0,0 +1,197 @@
++package hegel
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++	"testing"
++
++	"github.com/compose-spec/compose-go/v2/template"
++	"github.com/sirupsen/logrus"
++	"hegel.dev/go/hegel"
++)
++
++// Substitute warns through logrus about every unset variable; keep the test output readable.
++func init() { logrus.SetOutput(io.Discard) }
++
++// classify names the outcome of a Substitute call.
++func classify(v string, err error) string {
++	if err == nil {
++		return fmt.Sprintf("value %q", v)
++	}
++	var inv *template.InvalidTemplateError
++	var miss *template.MissingRequiredError
++	switch {
++	case errors.As(err, &inv):
++		return "invalid"
++	case errors.As(err, &miss):
++		return fmt.Sprintf("missing %s: %q", miss.Variable, miss.Reason)
++	}
++	return fmt.Sprintf("other error %T: %v", err, err)
++}
++
++func modelClass(v string, err error) string {
++	if err == nil {
++		return fmt.Sprintf("value %q", v)
++	}
++	var miss *missingErr
++	if errors.As(err, &miss) {
++		return fmt.Sprintf("missing %s: %q", miss.name, miss.reason)
++	}
++	return "invalid"
++}
++
++// TestHegelSubstitute: Substitute agrees with the model of the specification on the value,
++// or on the error (invalid template; required variable with its name and expanded message).
++func TestHegelSubstitute(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		text, _ := genTemplate(ht, 0)
++		m := &model{s: text}
++		want, werr := m.run()
++		got, err := template.SubstituteWithOptions(text, mapping, template.WithoutLogging)
++		if Known.newlineInWordInvalid && m.newlineInWord {
++			if !errors.As(err, new(*template.InvalidTemplateError)) && !(werr != nil && errors.As(werr, new(*invalidErr))) {
++				c.failClass(ht, "NewlineAccepted", "Substitute(%q) = %s (a newline inside a word no longer invalid?)", text, classify(got, err))
++			}
++			c.count("known newline in word")
++			return
++		}
++		if classify(got, err) != modelClass(want, werr) {
++			c.failClass(ht, "Mismatch", "Substitute(%q):\n  got  %s\n  want %s", text, classify(got, err), modelClass(want, werr))
++			return
++		}
++		if err != nil {
++			if !strings.Contains(err.Error(), "required variable") && !strings.Contains(err.Error(), "Invalid template") {
++				c.failClass(ht, "Message", "Substitute(%q) error message %q", text, err)
++				return
++			}
++			c.count("error")
++		} else {
++			c.count("value")
++		}
++		// the logging variant is the same function
++		got2, err2 := template.Substitute(text, mapping)
++		if classify(got2, err2) != classify(got, err) {
++			c.failClass(ht, "Variant", "Substitute(%q) = %s but SubstituteWithOptions = %s", text, classify(got2, err2), classify(got, err))
++		}
++	})
++}
++
++// TestHegelBash: on templates bash accepts (no invalid forms, no backslashes), Substitute gives
++// what bash gives for the same string in double quotes, and fails exactly when bash fails
++// (a required variable).
++func TestHegelBash(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		text, safe := genTemplate(ht, 0)
++		if !safe {
++			c.count("not bash-safe")
++			return
++		}
++		want, berr := bashExpand(text)
++		got, err := template.SubstituteWithOptions(text, mapping, template.WithoutLogging)
++		if berr != nil {
++			if !strings.Contains(berr.Error(), "parameter null or not set") && !strings.Contains(berr.Error(), "parameter not set") {
++				c.count("bash rejects otherwise")
++				return // not a case the oracle covers
++			}
++			var miss *template.MissingRequiredError
++			if !errors.As(err, &miss) {
++				c.failClass(ht, "NoError", "Substitute(%q) = %s; bash: %v", text, classify(got, err), berr)
++				return
++			}
++			c.count("required error")
++			return
++		}
++		if err != nil || got != want {
++			c.failClass(ht, "Mismatch", "Substitute(%q) = %s; bash gives %q", text, classify(got, err), want)
++			return
++		}
++		c.count("ok")
++	})
++}
++
++// TestHegelEscape: doubling every dollar sign makes any string a template that substitutes to
++// itself, whatever the string contains.
++func TestHegelEscape(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		var b strings.Builder
++		for k := drawInt(ht, 0, 12); k > 0; k-- {
++			if chance(ht, 40) {
++				b.WriteString("$")
++			} else {
++				b.WriteString(pick(ht, []string{"a", "{", "}", ":", "-", "?", "+", " ", "\n", "A", "1", "_"}))
++			}
++		}
++		s := b.String()
++		got, err := template.SubstituteWithOptions(strings.ReplaceAll(s, "$", "$$"), mapping, template.WithoutLogging)
++		if err != nil || got != s {
++			c.failClass(ht, "Escape", "Substitute(%q) = %s, want %q", strings.ReplaceAll(s, "$", "$$"), classify(got, err), s)
++			return
++		}
++		c.count("ok")
++	})
++}
++
++// TestHegelExtractVariables: the variables ExtractVariables reports for a configuration holding
++// the template are those the model parsed, required when any occurrence is, with the default
++// and presence value of the occurrence defining one (checked when it is unambiguous).
++func TestHegelExtractVariables(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		text, _ := genTemplate(ht, 0)
++		m := &model{s: text}
++		_, _ = m.run()
++		if m.invalid {
++			// ExtractVariables of an invalid template also reports a variable with an empty
++			// name for the stray "${"; not a case callers reach, since Substitute fails first
++			c.count("invalid template")
++			return
++		}
++		if Known.newlineInWordInvalid && m.newlineInWord {
++			c.count("known newline in word")
++			return
++		}
++		want := m.extracted(Known.messageVarsNotExtracted)
++		var cfg interface{} = map[string]interface{}{"k": text}
++		if chance(ht, 30) {
++			cfg = map[string]interface{}{"list": []interface{}{"x", map[string]interface{}{"deep": text}}}
++		}
++		got := template.ExtractVariables(cfg.(map[string]interface{}), nil)
++		if strings.Join(sortedKeys(got), ",") != strings.Join(sortedKeys(want), ",") {
++			c.failClass(ht, "Names", "ExtractVariables(%q) names %v, want %v", text, sortedKeys(got), sortedKeys(want))
++			return
++		}
++		for name, w := range want {
++			g := got[name]
++			if g.Name != name {
++				c.failClass(ht, "Name", "ExtractVariables(%q)[%s].Name = %q", text, name, g.Name)
++				return
++			}
++			if g.Required != w.required {
++				c.failClass(ht, "Required", "ExtractVariables(%q)[%s].Required = %v, want %v", text, name, g.Required, w.required)
++				return
++			}
++			if w.defs <= 1 || !Known.laterOccurrenceWinsInStr {
++				if g.DefaultValue != w.def {
++					c.failClass(ht, "Default", "ExtractVariables(%q)[%s].DefaultValue = %q, want %q", text, name, g.DefaultValue, w.def)
++					return
++				}
++			} else {
++				c.count("known ambiguous default")
++			}
++			if w.press <= 1 || !Known.laterOccurrenceWinsInStr {
++				if g.PresenceValue != w.presence {
++					c.failClass(ht, "Presence", "ExtractVariables(%q)[%s].PresenceValue = %q, want %q", text, name, g.PresenceValue, w.presence)
++					return
++				}
++			} else {
++				c.count("known ambiguous presence")
++			}
++		}
++		c.count("ok")
++	})
++}
+diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
+new file mode 100644
+index 0000000..d2c643f
+--- /dev/null
++++ b/hegel/hegel_test.go
+@@ -0,0 +1,132 @@
++package hegel
++
++// Hegel property tests for compose-spec/compose-go (package template), written for the Hegel
++// zoo. See targets/go/compose-go/README.md.
++//
++// Oracle: a model of the Compose specification's interpolation syntax (and bash, which the
++// syntax follows, as a second oracle on the shared subset) applied to generated templates.
++//
++// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
++// through hegelOpts; a panic in the code under test is turned into a failure of the current
++// test case by property(). ZOO_COLLECT=1 makes the properties record their mismatches instead
++// of failing.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			return []hegel.Option{hegel.WithTestCases(v)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func drawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return drawInt(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++var collecting = os.Getenv("ZOO_COLLECT") != ""
++
++type collector struct {
++	name   string
++	mu     sync.Mutex
++	counts map[string]int
++	msgs   []string
++	bad    int
++}
++
++func newCollector(t *testing.T) *collector {
++	c := &collector{name: t.Name(), counts: map[string]int{}}
++	t.Cleanup(func() {
++		if !collecting {
++			return
++		}
++		keys := make([]string, 0, len(c.counts))
++		for k := range c.counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		var parts []string
++		for _, k := range keys {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, c.counts[k]))
++		}
++		fmt.Printf("COLLECT %s: %d mismatches; %s\n", c.name, c.bad, strings.Join(parts, " "))
++		for _, m := range c.msgs {
++			fmt.Printf("MISMATCH %s\n", m)
++		}
++	})
++	return c
++}
++
++func (c *collector) count(class string) {
++	c.mu.Lock()
++	c.counts[class]++
++	c.mu.Unlock()
++}
++
++func (c *collector) fail(ht *hegel.T, format string, args ...any) {
++	c.failClass(ht, "", format, args...)
++}
++
++// failClass is fail with a class: in collect mode the class is counted and only its first two
++// messages are kept.
++func (c *collector) failClass(ht *hegel.T, class string, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collecting {
++		c.mu.Lock()
++		c.bad++
++		if class != "" {
++			c.counts["mismatch "+class]++
++		}
++		if (class == "" && len(c.msgs) < 25) || (class != "" && c.counts["mismatch "+class] <= 2) {
++			c.msgs = append(c.msgs, c.name+": "+msg)
++		}
++		c.mu.Unlock()
++		return
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// --------------------------------------------------------------------------- known bugs
++
++// Known: the recorded bugs (bugs.toml). The model reproduces a behaviour while its switch is
++// on; the pins assert the documented behaviour and fail while the bug exists.
++var Known = struct {
++	newlineInWordInvalid     bool // 1: a default, alternative or message containing a newline makes the template invalid
++	messageVarsNotExtracted  bool // 2: ExtractVariables misses the variables used inside a ?-message
++	laterOccurrenceWinsInStr bool // 3: within one string the last occurrence's default/presence value is kept, not the first
++}{true, true, true}
