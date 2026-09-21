@@ -71,7 +71,7 @@ fragment and `BracketString()` of any descent unparsable (7, 8); `Parse` accepti
 on an empty array with a negative-step slice (11); negative-step slices clamping out-of-range
 bounds onto the array (12); surrogate pair escapes not combined (13); union keys with a quote
 or backslash rendered unescaped (14); `Locate` ignoring `max` for slices (15); `oj.Match`
-reporting only top-level children for `$..*` (16) and only one callback for a filter matching
+not searching inside an element a descent matched, so `$..*` yields only top-level children (16) and only one callback for a filter matching
 several elements, with the wrong path (17); a truncated literal before a comma (`[nul,1]`)
 accepted by `Parse` and `Validate` with the value dropped (18).
 

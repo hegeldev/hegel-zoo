@@ -1754,7 +1754,7 @@ line2` | wrong-result | low | 0.6.8 (58fb0747c) | open |  |
 | [ojg/13](targets/go/ojg/bugs.toml) | Parse does not combine UTF-16 surrogate pair escapes | logic | medium | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
 | [ojg/14](targets/go/ojg/bugs.toml) | jp Expr.String() and BracketString() do not escape a quote or backslash in a union key | logic | low | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
 | [ojg/15](targets/go/ojg/bugs.toml) | jp Expr.Locate ignores max for slice fragments | contract | low | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
-| [ojg/16](targets/go/ojg/bugs.toml) | oj.Match with a descent wildcard ($..*) reports only the top-level children | logic | low | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
+| [ojg/16](targets/go/ojg/bugs.toml) | oj.Match with a descent does not search inside an element that itself matched | logic | low | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
 | [ojg/17](targets/go/ojg/bugs.toml) | oj.Match with a filter matching several elements calls back once, with the first value and the last path | logic | medium | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
 | [ojg/18](targets/go/ojg/bugs.toml) | A truncated null, true or false followed by a comma is accepted and the value silently dropped | logic | medium | v1.28.6-6-gcb591c2 (cb591c25a) | open |  |
 | [orb/1](targets/go/orb/bugs.toml) | wkt.Unmarshal fails on a GEOMETRYCOLLECTION with a space after a comma or before its parenthesis, on a nested collection and on an EMPTY member, and drops a trailing EMPTY member | wrong-result | medium | v0.13.0 (a12a48ea0) | open |  |
