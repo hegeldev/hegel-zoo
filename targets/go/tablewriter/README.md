@@ -11,7 +11,9 @@ width constraints (`WithColumnWidths`, `With{Header,Row,Footer}MaxWidth`, `WithM
 the wrap modes, and captions; and the input conversion of `Append`/`Bulk` (`[]string`, `[]any`,
 typed slices, single values, structs with `tw`/`json`/`db` tags and AutoHeader); and cell
 merging (`With{Header,Row,Footer}MergeMode`: horizontal, vertical, hierarchical and their
-combinations, `Merging.ByColumnIndex`).
+combinations, `Merging.ByColumnIndex`); and the streaming API (`WithStreaming`, `Start`,
+`Header`/`Append`/`Footer` in any order, `Close`, `StrictColumns`, `WithColumnWidths` and
+`WithColumnMax` as the fixed stream widths).
 
 ## Build
 
@@ -95,6 +97,20 @@ spaces where a vertical merge passes through, its junction glyphs chosen by the 
 above and below (the column glyph inside a pass-through, the mid-left/mid-right glyphs at its
 edges, the top-mid/bottom-mid glyphs where a horizontal span ends above or below).
 
+Streaming, from `Start`, `streamCalculateWidths` and the `stream*` render functions: the
+column count and the fixed widths come from `Widths.PerColumn` (missing columns 0, negative
+ones dropped by the option), else from the first section that arrives with cells - each
+trimmed cell's width (at least the ellipsis's under `WrapTruncate`) plus a variance of two
+plus the padding, at least `MinimumColumnWidth` (8) - shrunk in proportion to `Widths.Global`
+when the table is wider (separators counted, every column at least 1, the rounding
+remainder spread column by column); every later row is padded or cut to the count, or refused
+with an error under `StrictColumns`; a row without cells prints nothing; the cells wrap to the
+fixed width less the padding (the section maximum widths and `MaxWidth` are ignored); the
+horizontal merges are detected on the raw trimmed cells; the top border comes with the first
+header or row, the header separator with the first row (or with the header when the footer
+was stored first), a separator between rows when asked, and `Close` prints the stored footer
+after its separator and the bottom border with the last line's merge states.
+
 ## Properties
 
 - `TestHegelWidth`: `Width`, `WidthNoCache`, `WidthWithOptions`, `Filter`, `SetOptions`,
@@ -123,10 +139,14 @@ edges, the top-mid/bottom-mid glyphs where a horizontal span ends above or below
   `Configure`, the combinations 5-7), `Row.Merging.ByColumnIndex`, over cells from a small pool
   so that equal neighbours are common, with `AutoHide`, padding and every rendition setting;
   exact output.
+- `TestHegelStream`: `Start`/`Header`/`Append`/`Footer`/`Close` in three call orders with
+  `StreamConfig.StrictColumns`, `WithColumnWidths`, `WithColumnMax`, the wrap modes, padding,
+  the horizontal merge modes and every rendition setting, against the streamed Blueprint
+  output and the count of rows `Append` refuses; exact output.
 
 ## Bugs
 
-Thirty-five, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
+Thirty-nine, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
 detection (1, medium); `Width`'s cache is not purged when the tab width changes (2, medium).
 Widths: emoji sequences (VS16, ZWJ, flags, modifiers) are measured rune by rune (3).
 `Truncate`: an ESC inside a sequence restarts the scan, so an `ESC \`-terminated OSC (a
@@ -163,7 +183,12 @@ empty row (31); AutoHeader's extraction consumes the first row's readers (32). M
 top border has no junction after a merged header cell, the row glyph standing where the header
 line has its separator (33); a merged header keeps the widths of the columns `AutoHide` hides,
 so the header line is wider than the rows (34, medium); the footer's lead merge drops the
-later lines of a multi-line cell (35).
+later lines of a multi-line cell (35). Streaming: a merged header cell is rendered at its
+first column's width, so the header line is narrower than the borders (36, medium); the
+footer's horizontal merges are not applied though `Start` promises them (37); an empty row
+appended first suppresses the header separator (38); the `Widths.Global` shrink spreads its
+rounding remainder in map order, so the same table lays out differently from run to run (39,
+medium).
 
 ## Modelled as recorded, not counted
 
@@ -215,5 +240,15 @@ later lines of a multi-line cell (35).
   same visual line; the header's and footer's `MergeMode` use only the horizontal bit;
   `TrimLine` drops a visual line blanked by a merge; `Behavior.Compact.Merge` and the
   merged-header expansion (never reached: each column is at least as wide as the shared header
-  cell) are not generated. Streaming, `NewCSV` and the Colorized, Ocean and SVG renderers are
-  not yet exercised.
+  cell) are not generated.
+- Streaming: `AutoHide`, the vertical and hierarchical merges, the section maximum widths and
+  `MaxWidth` are ignored (`Start` warns about the first two); a footer-only table has no top
+  border (bug 14's streaming twin, not counted); a hidden header or footer (`Control.Hide`)
+  is as if never given, so it does not fix the widths; the header's `AutoFormat` runs after
+  the width sample, so a formatted header can be wider than its column and is truncated; a
+  merge in a header cell starts at raw-cell equality (`a` and `A` do not merge, `x\ny` and
+  `x\n\ny` do not, unlike batch mode); blank visual lines are kept (`TrimLine` is batch
+  only); the footer separator's junctions see no footer merge states; a row refused under
+  `StrictColumns` leaves the stream as it was; cases where the global shrink leaves a
+  rounding remainder over several columns are skipped (bug 39). `NewCSV` and the Colorized,
+  Ocean and SVG renderers are not yet exercised.
