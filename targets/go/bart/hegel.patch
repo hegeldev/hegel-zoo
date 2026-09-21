@@ -1,0 +1,1596 @@
+diff --git a/go.mod b/go.mod
+index 8a00176..b3822cb 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,11 @@
+ module github.com/gaissmai/bart
+ 
+-go 1.24.0
++go 1.26.0
+ 
+ retract v0.20.5 // introduced a bug in InsertPersist
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++	hegel.dev/go/hegel v0.6.33 // indirect
++)
+diff --git a/hegel/hegel_concurrent_test.go b/hegel/hegel_concurrent_test.go
+new file mode 100644
+index 0000000..f88e0ee
+--- /dev/null
++++ b/hegel/hegel_concurrent_test.go
+@@ -0,0 +1,99 @@
++package hegel
++
++import (
++	"fmt"
++	"net/netip"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// TestHegelConcurrentPersist: the documented lock-free pattern: readers query a version
++// while a writer produces new versions with the Persist operations; every reader's answers
++// must match the version's model throughout (run with -race in development).
++func TestHegelConcurrentPersist(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		kind := pick(ht, kinds)
++		tab, md := build(ht, kind, drawInt(ht, 1, 10))
++		// the queries the readers will ask, and the answers of the initial version
++		type q struct {
++			p    netip.Prefix
++			want []pv
++		}
++		nq := drawInt(ht, 1, 6)
++		qs := make([]q, nq)
++		for i := range qs {
++			p := genQuery(ht, md)
++			qs[i] = q{p, tab.Supernets(p)}
++		}
++		// the writer's operations, drawn up front (no draws inside goroutines)
++		nops := drawInt(ht, 1, 12)
++		type wop struct {
++			p   netip.Prefix
++			v   int
++			del bool
++		}
++		ops := make([]wop, nops)
++		for i := range ops {
++			ops[i] = wop{genQuery(ht, md), genVal(ht), chance(ht, 30)}
++		}
++		var wg sync.WaitGroup
++		var mu sync.Mutex
++		var bad []string
++		readers := drawInt(ht, 1, 3)
++		for r := 0; r < readers; r++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				for round := 0; round < 20; round++ {
++					for _, qq := range qs {
++						got := tab.Supernets(qq.p)
++						if !samePVList(got, qq.want) {
++							mu.Lock()
++							bad = append(bad, fmt.Sprintf("Supernets(%v) = %v, want %v", qq.p, got, qq.want))
++							mu.Unlock()
++							return
++						}
++						if _, ok := tab.LookupPrefix(qq.p); ok != (len(qq.want) > 0) {
++							mu.Lock()
++							bad = append(bad, fmt.Sprintf("LookupPrefix(%v) ok %v, want %v", qq.p, ok, len(qq.want) > 0))
++							mu.Unlock()
++							return
++						}
++					}
++				}
++			}()
++		}
++		cur := tab
++		wmd := md.clone()
++		for _, o := range ops {
++			if o.del {
++				cur = cur.DeletePersist(o.p)
++				wmd.delete(o.p)
++			} else {
++				cur = cur.InsertPersist(o.p, o.v)
++				wmd.insert(o.p, o.v)
++			}
++		}
++		wg.Wait()
++		for _, b := range bad {
++			col.failClass(ht, "Reader", "%s: a reader of the original version saw %s while the writer persisted %d ops", kind, b, nops)
++		}
++		check(ht, col, tab, md, fmt.Sprintf("%s original after %d persist ops", kind, nops))
++		check(ht, col, cur, wmd, fmt.Sprintf("%s newest after %d persist ops", kind, nops))
++	})
++}
++
++func samePVList(a, b []pv) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/hegel/hegel_model_test.go b/hegel/hegel_model_test.go
+new file mode 100644
+index 0000000..f7828fa
+--- /dev/null
++++ b/hegel/hegel_model_test.go
+@@ -0,0 +1,485 @@
++package hegel
++
++// The model: a routing table as a map from canonical (masked) prefix to value, with every
++// query answered by brute force over the map using net/netip.
++
++import (
++	"fmt"
++	"net/netip"
++	"sort"
++
++	"hegel.dev/go/hegel"
++)
++
++type model struct {
++	m map[netip.Prefix]int
++}
++
++func newModel() *model { return &model{m: map[netip.Prefix]int{}} }
++
++func (md *model) clone() *model {
++	c := newModel()
++	for p, v := range md.m {
++		c.m[p] = v
++	}
++	return c
++}
++
++func (md *model) insert(p netip.Prefix, v int) {
++	if !p.IsValid() {
++		return
++	}
++	md.m[p.Masked()] = v
++}
++
++func (md *model) delete(p netip.Prefix) {
++	if !p.IsValid() {
++		return
++	}
++	delete(md.m, p.Masked())
++}
++
++func (md *model) get(p netip.Prefix) (int, bool) {
++	if !p.IsValid() {
++		return 0, false
++	}
++	v, ok := md.m[p.Masked()]
++	return v, ok
++}
++
++// lookup: the longest prefix containing ip (an IPv6 address with a zone is looked up without
++// it, as the package documents).
++func (md *model) lookup(ip netip.Addr) (netip.Prefix, int, bool) {
++	if !ip.IsValid() {
++		return netip.Prefix{}, 0, false
++	}
++	ip = ip.WithZone("")
++	best, bv, ok := netip.Prefix{}, 0, false
++	for p, v := range md.m {
++		if p.Addr().Is4() == ip.Is4() && p.Contains(ip) && (!ok || p.Bits() > best.Bits()) {
++			best, bv, ok = p, v, true
++		}
++	}
++	return best, bv, ok
++}
++
++// covers reports whether p covers q: same family, p no longer than q, q's address inside p.
++func covers(p, q netip.Prefix) bool {
++	return p.Addr().Is4() == q.Addr().Is4() && p.Bits() <= q.Bits() && p.Contains(q.Addr())
++}
++
++// lookupPrefix: the longest prefix covering q (the most specific entry matching every address
++// of q).
++func (md *model) lookupPrefix(q netip.Prefix) (netip.Prefix, int, bool) {
++	if !q.IsValid() {
++		return netip.Prefix{}, 0, false
++	}
++	q = q.Masked()
++	best, bv, ok := netip.Prefix{}, 0, false
++	for p, v := range md.m {
++		if covers(p, q) && (!ok || p.Bits() > best.Bits()) {
++			best, bv, ok = p, v, true
++		}
++	}
++	return best, bv, ok
++}
++
++// supernets: every prefix covering q, longest first.
++func (md *model) supernets(q netip.Prefix) []netip.Prefix {
++	if !q.IsValid() {
++		return nil
++	}
++	q = q.Masked()
++	var out []netip.Prefix
++	for p := range md.m {
++		if covers(p, q) {
++			out = append(out, p)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Bits() > out[j].Bits() })
++	return out
++}
++
++// subnets: every prefix covered by q, in CIDR sort order.
++func (md *model) subnets(q netip.Prefix) []netip.Prefix {
++	if !q.IsValid() {
++		return nil
++	}
++	q = q.Masked()
++	var out []netip.Prefix
++	for p := range md.m {
++		if covers(q, p) {
++			out = append(out, p)
++		}
++	}
++	sortPrefixes(out)
++	return out
++}
++
++func (md *model) overlapsPrefix(q netip.Prefix) bool {
++	if !q.IsValid() {
++		return false
++	}
++	for p := range md.m {
++		if p.Addr().Is4() == q.Addr().Is4() && p.Overlaps(q) {
++			return true
++		}
++	}
++	return false
++}
++
++func (md *model) overlaps(o *model, is4 *bool) bool {
++	for p := range md.m {
++		if is4 != nil && p.Addr().Is4() != *is4 {
++			continue
++		}
++		for q := range o.m {
++			if p.Addr().Is4() == q.Addr().Is4() && p.Overlaps(q) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func (md *model) union(o *model) {
++	for p, v := range o.m {
++		md.m[p] = v
++	}
++}
++
++func (md *model) equal(o *model) bool {
++	if len(md.m) != len(o.m) {
++		return false
++	}
++	for p, v := range md.m {
++		if w, ok := o.m[p]; !ok || w != v {
++			return false
++		}
++	}
++	return true
++}
++
++func (md *model) size(is4 *bool) int {
++	n := 0
++	for p := range md.m {
++		if is4 == nil || p.Addr().Is4() == *is4 {
++			n++
++		}
++	}
++	return n
++}
++
++// sorted: every prefix of the family (nil: both, IPv4 first) in CIDR sort order.
++func (md *model) sorted(is4 *bool) []netip.Prefix {
++	var v4, v6 []netip.Prefix
++	for p := range md.m {
++		if p.Addr().Is4() {
++			v4 = append(v4, p)
++		} else {
++			v6 = append(v6, p)
++		}
++	}
++	sortPrefixes(v4)
++	sortPrefixes(v6)
++	if is4 == nil {
++		return append(v4, v6...)
++	}
++	if *is4 {
++		return v4
++	}
++	return v6
++}
++
++// dumpTree: the hierarchy of one family: roots are prefixes with no covering prefix; the
++// children of a node are the prefixes whose closest covering prefix is that node; sorted.
++type treeNode struct {
++	pfx  netip.Prefix
++	val  int
++	subs []treeNode
++}
++
++func (md *model) dumpTree(is4 bool) []treeNode {
++	all := md.sorted(&is4)
++	parent := map[netip.Prefix]netip.Prefix{}
++	hasParent := map[netip.Prefix]bool{}
++	for _, p := range all {
++		for _, q := range all {
++			if q != p && covers(q, p) && (!hasParent[p] || q.Bits() > parent[p].Bits()) {
++				parent[p], hasParent[p] = q, true
++			}
++		}
++	}
++	var build func(par netip.Prefix, root bool) []treeNode
++	build = func(par netip.Prefix, root bool) []treeNode {
++		var out []treeNode
++		for _, p := range all {
++			if root && !hasParent[p] || !root && hasParent[p] && parent[p] == par {
++				out = append(out, treeNode{pfx: p, val: md.m[p], subs: build(p, false)})
++			}
++		}
++		return out
++	}
++	return build(netip.Prefix{}, true)
++}
++
++// aggregate: the minimal set of CIDR blocks covering the same addresses: covered prefixes
++// removed, sibling pairs merged, to a fixpoint.
++func (md *model) aggregate() {
++	for {
++		changed := false
++		// remove covered
++		for p := range md.m {
++			for q := range md.m {
++				if q != p && covers(q, p) {
++					delete(md.m, p)
++					changed = true
++					break
++				}
++			}
++		}
++		// merge siblings
++		for p := range md.m {
++			if p.Bits() == 0 {
++				continue
++			}
++			s := sibling(p)
++			if _, ok := md.m[s]; ok {
++				parentPfx := netip.PrefixFrom(p.Addr(), p.Bits()-1).Masked()
++				delete(md.m, p)
++				delete(md.m, s)
++				md.m[parentPfx] = 0
++				changed = true
++				break
++			}
++		}
++		if !changed {
++			return
++		}
++	}
++}
++
++// sibling flips the last bit of p's network.
++func sibling(p netip.Prefix) netip.Prefix {
++	b := p.Bits()
++	if p.Addr().Is4() {
++		a := p.Addr().As4()
++		i := (b - 1) / 8
++		a[i] ^= 1 << (7 - uint(b-1)%8)
++		return netip.PrefixFrom(netip.AddrFrom4(a), b)
++	}
++	a := p.Addr().As16()
++	i := (b - 1) / 8
++	a[i] ^= 1 << (7 - uint(b-1)%8)
++	return netip.PrefixFrom(netip.AddrFrom16(a), b)
++}
++
++// cmpPrefix: CIDR sort order, by address then by length (IPv4 before IPv6).
++func cmpPrefix(a, b netip.Prefix) int {
++	if a.Addr().Is4() != b.Addr().Is4() {
++		if a.Addr().Is4() {
++			return -1
++		}
++		return 1
++	}
++	if c := a.Addr().Compare(b.Addr()); c != 0 {
++		return c
++	}
++	return a.Bits() - b.Bits()
++}
++
++func sortPrefixes(ps []netip.Prefix) {
++	sort.Slice(ps, func(i, j int) bool { return cmpPrefix(ps[i], ps[j]) < 0 })
++}
++
++// --------------------------------------------------------------------------- generators
++
++var v4Bases = []uint32{0x0a000000, 0x0a010000, 0xc0a80000, 0xc0a80100, 0xac100000, 0x00000000, 0xffffffff, 0x7f000000}
++
++// genPrefix4: an IPv4 prefix (not necessarily masked) with clustered addresses so that
++// prefixes overlap, cover and neighbour each other.
++func genPrefix4(tc hegel.TestCase) netip.Prefix {
++	var a uint32
++	switch drawInt(tc, 0, 3) {
++	case 0:
++		a = uint32(drawInt(tc, 0, 1<<32-1))
++	default:
++		base := pick(tc, v4Bases)
++		low := uint32(drawInt(tc, 0, 0xffff))
++		if chance(tc, 50) {
++			low = uint32(drawInt(tc, 0, 3)) << uint(drawInt(tc, 0, 15))
++		}
++		a = base ^ low
++	}
++	b := drawInt(tc, 0, 32)
++	if chance(tc, 40) {
++		b = pick(tc, []int{0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32})
++	}
++	var ab [4]byte
++	ab[0], ab[1], ab[2], ab[3] = byte(a>>24), byte(a>>16), byte(a>>8), byte(a)
++	return netip.PrefixFrom(netip.AddrFrom4(ab), b)
++}
++
++// genPrefix6: an IPv6 prefix within a few documentation and special ranges.
++func genPrefix6(tc hegel.TestCase) netip.Prefix {
++	var a [16]byte
++	switch drawInt(tc, 0, 3) {
++	case 0:
++		for i := range a {
++			a[i] = byte(drawInt(tc, 0, 255))
++		}
++	case 1:
++		a[0], a[1], a[2], a[3] = 0x20, 0x01, 0x0d, 0xb8
++		for i := 4; i < 16; i++ {
++			if chance(tc, 30) {
++				a[i] = byte(drawInt(tc, 0, 255))
++			}
++		}
++	case 2:
++		a[0], a[1] = 0xfe, 0x80
++		a[15] = byte(drawInt(tc, 0, 3))
++	default:
++		a[0], a[1], a[2], a[3] = 0x20, 0x01, 0x0d, 0xb8
++		a[7] = byte(drawInt(tc, 0, 3))
++		a[15] = byte(drawInt(tc, 0, 3))
++	}
++	b := drawInt(tc, 0, 128)
++	if chance(tc, 40) {
++		b = pick(tc, []int{0, 1, 3, 8, 16, 31, 32, 33, 47, 48, 56, 63, 64, 65, 96, 112, 127, 128})
++	}
++	return netip.PrefixFrom(netip.AddrFrom16(a), b)
++}
++
++func genPrefix(tc hegel.TestCase) netip.Prefix {
++	if chance(tc, 55) {
++		return genPrefix4(tc)
++	}
++	return genPrefix6(tc)
++}
++
++// genAddrIn: an address inside p (its network, its last address, or a random one).
++func genAddrIn(tc hegel.TestCase, p netip.Prefix) netip.Addr {
++	p = p.Masked()
++	switch drawInt(tc, 0, 2) {
++	case 0:
++		return p.Addr()
++	case 1:
++		return lastAddr(p)
++	}
++	if p.Addr().Is4() {
++		a := p.Addr().As4()
++		host := 32 - p.Bits()
++		var r uint32
++		if host > 0 {
++			r = uint32(drawInt(tc, 0, 1<<uint(host)-1))
++		}
++		v := uint32(a[0])<<24 | uint32(a[1])<<16 | uint32(a[2])<<8 | uint32(a[3]) | r
++		return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
++	}
++	a := p.Addr().As16()
++	for i := p.Bits(); i < 128; i++ {
++		if chance(tc, 50) {
++			a[i/8] |= 1 << (7 - uint(i)%8)
++		}
++	}
++	return netip.AddrFrom16(a)
++}
++
++func lastAddr(p netip.Prefix) netip.Addr {
++	if p.Addr().Is4() {
++		a := p.Addr().As4()
++		for i := p.Bits(); i < 32; i++ {
++			a[i/8] |= 1 << (7 - uint(i)%8)
++		}
++		return netip.AddrFrom4(a)
++	}
++	a := p.Addr().As16()
++	for i := p.Bits(); i < 128; i++ {
++		a[i/8] |= 1 << (7 - uint(i)%8)
++	}
++	return netip.AddrFrom16(a)
++}
++
++// genAddr: an address near the table's prefixes (inside one, or just outside), or random.
++func genAddr(tc hegel.TestCase, md *model) netip.Addr {
++	ps := md.sorted(nil)
++	if len(ps) > 0 && chance(tc, 75) {
++		p := pick(tc, ps)
++		if chance(tc, 25) {
++			// the neighbour just past the prefix
++			a := lastAddr(p).Next()
++			if a.IsValid() {
++				return a
++			}
++		}
++		if chance(tc, 20) {
++			a := p.Masked().Addr().Prev()
++			if a.IsValid() {
++				return a
++			}
++		}
++		return genAddrIn(tc, p)
++	}
++	return genPrefix(tc).Addr()
++}
++
++// genQuery: a prefix for a lookup, related to the table's prefixes.
++func genQuery(tc hegel.TestCase, md *model) netip.Prefix {
++	ps := md.sorted(nil)
++	if len(ps) > 0 && chance(tc, 70) {
++		p := pick(tc, ps)
++		switch drawInt(tc, 0, 3) {
++		case 0:
++			return p
++		case 1: // a subnet
++			b := p.Bits()
++			if b < p.Addr().BitLen() {
++				b = drawInt(tc, b+1, p.Addr().BitLen())
++			}
++			return netip.PrefixFrom(genAddrIn(tc, p), b)
++		case 2: // a supernet
++			return netip.PrefixFrom(p.Addr(), drawInt(tc, 0, p.Bits()))
++		default: // unmasked
++			return netip.PrefixFrom(genAddrIn(tc, p), p.Bits())
++		}
++	}
++	return genPrefix(tc)
++}
++
++func genVal(tc hegel.TestCase) int { return drawInt(tc, 1, 1000) }
++
++// --------------------------------------------------------------------------- helpers
++
++func samePrefixes(a, b []netip.Prefix) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func setOf(ps []netip.Prefix) map[netip.Prefix]bool {
++	s := map[netip.Prefix]bool{}
++	for _, p := range ps {
++		s[p] = true
++	}
++	return s
++}
++
++func fmtTree(ns []treeNode) string {
++	s := "["
++	for i, n := range ns {
++		if i > 0 {
++			s += " "
++		}
++		s += fmt.Sprintf("%v=%d", n.pfx, n.val)
++		if len(n.subs) > 0 {
++			s += fmtTree(n.subs)
++		}
++	}
++	return s + "]"
++}
+diff --git a/hegel/hegel_props_test.go b/hegel/hegel_props_test.go
+new file mode 100644
+index 0000000..bfc2650
+--- /dev/null
++++ b/hegel/hegel_props_test.go
+@@ -0,0 +1,839 @@
++package hegel
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"iter"
++	"net/netip"
++	"strings"
++	"testing"
++
++	"hegel.dev/go/hegel"
++
++	"github.com/gaissmai/bart"
++)
++
++// --------------------------------------------------------------------------- adapters
++
++// pv is a prefix with its value.
++type pv struct {
++	p netip.Prefix
++	v int
++}
++
++// rtab is the common face of Table[int], Fast[int] and Lite for the properties. Lite has no
++// values: its adapter reports 0 and hasValues() false.
++type rtab interface {
++	name() string
++	hasValues() bool
++	Insert(p netip.Prefix, v int)
++	Delete(p netip.Prefix)
++	Get(p netip.Prefix) (int, bool)
++	Lookup(ip netip.Addr) (int, bool)
++	Contains(ip netip.Addr) bool
++	LookupPrefix(p netip.Prefix) (int, bool)
++	LookupPrefixLPM(p netip.Prefix) (netip.Prefix, int, bool)
++	// Modify: the callback receives (value, exists) and returns (new value, delete)
++	Modify(p netip.Prefix, cb func(int, bool) (int, bool))
++	Supernets(p netip.Prefix) []pv
++	Subnets(p netip.Prefix) []pv
++	OverlapsPrefix(p netip.Prefix) bool
++	Overlaps(o rtab) bool
++	Overlaps4(o rtab) bool
++	Overlaps6(o rtab) bool
++	Union(o rtab)
++	Equal(o rtab) bool
++	Clone() rtab
++	InsertPersist(p netip.Prefix, v int) rtab
++	DeletePersist(p netip.Prefix) rtab
++	ModifyPersist(p netip.Prefix, cb func(int, bool) (int, bool)) rtab
++	UnionPersist(o rtab) rtab
++	Size() int
++	Size4() int
++	Size6() int
++	All() []pv
++	All4() []pv
++	All6() []pv
++	AllSorted() []pv
++	AllSorted4() []pv
++	AllSorted6() []pv
++	Dump4() []treeNode
++	Dump6() []treeNode
++	MarshalJSON() ([]byte, error)
++	MarshalText() ([]byte, error)
++	Fprint(w *bytes.Buffer) error
++	fresh() rtab
++}
++
++// tableAPI is what Table[int] and Fast[int] share, with the self type T.
++type tableAPI[T any] interface {
++	Insert(netip.Prefix, int)
++	Delete(netip.Prefix)
++	Get(netip.Prefix) (int, bool)
++	Lookup(netip.Addr) (int, bool)
++	Contains(netip.Addr) bool
++	LookupPrefix(netip.Prefix) (int, bool)
++	LookupPrefixLPM(netip.Prefix) (netip.Prefix, int, bool)
++	Modify(netip.Prefix, func(int, bool) (int, bool))
++	Supernets(netip.Prefix) iter.Seq2[netip.Prefix, int]
++	Subnets(netip.Prefix) iter.Seq2[netip.Prefix, int]
++	OverlapsPrefix(netip.Prefix) bool
++	Overlaps(T) bool
++	Overlaps4(T) bool
++	Overlaps6(T) bool
++	Union(T)
++	Equal(T) bool
++	Clone() T
++	InsertPersist(netip.Prefix, int) T
++	DeletePersist(netip.Prefix) T
++	ModifyPersist(netip.Prefix, func(int, bool) (int, bool)) T
++	UnionPersist(T) T
++	Size() int
++	Size4() int
++	Size6() int
++	All() iter.Seq2[netip.Prefix, int]
++	All4() iter.Seq2[netip.Prefix, int]
++	All6() iter.Seq2[netip.Prefix, int]
++	AllSorted() iter.Seq2[netip.Prefix, int]
++	AllSorted4() iter.Seq2[netip.Prefix, int]
++	AllSorted6() iter.Seq2[netip.Prefix, int]
++	DumpList4() []bart.DumpListNode[int]
++	DumpList6() []bart.DumpListNode[int]
++	MarshalJSON() ([]byte, error)
++	MarshalText() ([]byte, error)
++	Fprint(w io.Writer) error
++}
++
++type wrap[T tableAPI[T]] struct {
++	t    T
++	kind string
++	mk   func() T
++}
++
++func collect(seq iter.Seq2[netip.Prefix, int]) []pv {
++	var out []pv
++	for p, v := range seq {
++		out = append(out, pv{p, v})
++	}
++	return out
++}
++
++func (w *wrap[T]) name() string                            { return w.kind }
++func (w *wrap[T]) hasValues() bool                         { return true }
++func (w *wrap[T]) Insert(p netip.Prefix, v int)            { w.t.Insert(p, v) }
++func (w *wrap[T]) Delete(p netip.Prefix)                   { w.t.Delete(p) }
++func (w *wrap[T]) Get(p netip.Prefix) (int, bool)          { return w.t.Get(p) }
++func (w *wrap[T]) Lookup(ip netip.Addr) (int, bool)        { return w.t.Lookup(ip) }
++func (w *wrap[T]) Contains(ip netip.Addr) bool             { return w.t.Contains(ip) }
++func (w *wrap[T]) LookupPrefix(p netip.Prefix) (int, bool) { return w.t.LookupPrefix(p) }
++func (w *wrap[T]) LookupPrefixLPM(p netip.Prefix) (netip.Prefix, int, bool) {
++	return w.t.LookupPrefixLPM(p)
++}
++func (w *wrap[T]) Modify(p netip.Prefix, cb func(int, bool) (int, bool)) { w.t.Modify(p, cb) }
++func (w *wrap[T]) Supernets(p netip.Prefix) []pv                         { return collect(w.t.Supernets(p)) }
++func (w *wrap[T]) Subnets(p netip.Prefix) []pv                           { return collect(w.t.Subnets(p)) }
++func (w *wrap[T]) OverlapsPrefix(p netip.Prefix) bool                    { return w.t.OverlapsPrefix(p) }
++func (w *wrap[T]) Overlaps(o rtab) bool                                  { return w.t.Overlaps(o.(*wrap[T]).t) }
++func (w *wrap[T]) Overlaps4(o rtab) bool                                 { return w.t.Overlaps4(o.(*wrap[T]).t) }
++func (w *wrap[T]) Overlaps6(o rtab) bool                                 { return w.t.Overlaps6(o.(*wrap[T]).t) }
++func (w *wrap[T]) Union(o rtab)                                          { w.t.Union(o.(*wrap[T]).t) }
++func (w *wrap[T]) Equal(o rtab) bool                                     { return w.t.Equal(o.(*wrap[T]).t) }
++func (w *wrap[T]) Clone() rtab                                           { return &wrap[T]{w.t.Clone(), w.kind, w.mk} }
++func (w *wrap[T]) InsertPersist(p netip.Prefix, v int) rtab {
++	return &wrap[T]{w.t.InsertPersist(p, v), w.kind, w.mk}
++}
++func (w *wrap[T]) DeletePersist(p netip.Prefix) rtab {
++	return &wrap[T]{w.t.DeletePersist(p), w.kind, w.mk}
++}
++func (w *wrap[T]) ModifyPersist(p netip.Prefix, cb func(int, bool) (int, bool)) rtab {
++	return &wrap[T]{w.t.ModifyPersist(p, cb), w.kind, w.mk}
++}
++func (w *wrap[T]) UnionPersist(o rtab) rtab {
++	return &wrap[T]{w.t.UnionPersist(o.(*wrap[T]).t), w.kind, w.mk}
++}
++func (w *wrap[T]) Size() int                    { return w.t.Size() }
++func (w *wrap[T]) Size4() int                   { return w.t.Size4() }
++func (w *wrap[T]) Size6() int                   { return w.t.Size6() }
++func (w *wrap[T]) All() []pv                    { return collect(w.t.All()) }
++func (w *wrap[T]) All4() []pv                   { return collect(w.t.All4()) }
++func (w *wrap[T]) All6() []pv                   { return collect(w.t.All6()) }
++func (w *wrap[T]) AllSorted() []pv              { return collect(w.t.AllSorted()) }
++func (w *wrap[T]) AllSorted4() []pv             { return collect(w.t.AllSorted4()) }
++func (w *wrap[T]) AllSorted6() []pv             { return collect(w.t.AllSorted6()) }
++func (w *wrap[T]) Dump4() []treeNode            { return toTree(w.t.DumpList4()) }
++func (w *wrap[T]) Dump6() []treeNode            { return toTree(w.t.DumpList6()) }
++func (w *wrap[T]) MarshalJSON() ([]byte, error) { return w.t.MarshalJSON() }
++func (w *wrap[T]) MarshalText() ([]byte, error) { return w.t.MarshalText() }
++func (w *wrap[T]) Fprint(b *bytes.Buffer) error { return w.t.Fprint(b) }
++func (w *wrap[T]) fresh() rtab                  { return &wrap[T]{w.mk(), w.kind, w.mk} }
++
++func toTree[V any](ns []bart.DumpListNode[V]) []treeNode {
++	var out []treeNode
++	for _, n := range ns {
++		v := 0
++		if x, ok := any(n.Value).(int); ok {
++			v = x
++		}
++		out = append(out, treeNode{pfx: n.CIDR, val: v, subs: toTree(n.Subnets)})
++	}
++	return out
++}
++
++// liteW adapts Lite (no values).
++type liteW struct{ t *bart.Lite }
++
++func liteSeq(seq iter.Seq[netip.Prefix]) []pv {
++	var out []pv
++	for p := range seq {
++		out = append(out, pv{p, 0})
++	}
++	return out
++}
++
++func (w *liteW) name() string                            { return "Lite" }
++func (w *liteW) hasValues() bool                         { return false }
++func (w *liteW) Insert(p netip.Prefix, v int)            { w.t.Insert(p) }
++func (w *liteW) Delete(p netip.Prefix)                   { w.t.Delete(p) }
++func (w *liteW) Get(p netip.Prefix) (int, bool)          { return 0, w.t.Get(p) }
++func (w *liteW) Lookup(ip netip.Addr) (int, bool)        { return 0, w.t.Lookup(ip) }
++func (w *liteW) Contains(ip netip.Addr) bool             { return w.t.Contains(ip) }
++func (w *liteW) LookupPrefix(p netip.Prefix) (int, bool) { return 0, w.t.LookupPrefix(p) }
++func (w *liteW) LookupPrefixLPM(p netip.Prefix) (netip.Prefix, int, bool) {
++	lpm, ok := w.t.LookupPrefixLPM(p)
++	return lpm, 0, ok
++}
++func (w *liteW) Modify(p netip.Prefix, cb func(int, bool) (int, bool)) {
++	w.t.Modify(p, func(exists bool) bool { _, del := cb(0, exists); return del })
++}
++func (w *liteW) Supernets(p netip.Prefix) []pv            { return liteSeq(w.t.Supernets(p)) }
++func (w *liteW) Subnets(p netip.Prefix) []pv              { return liteSeq(w.t.Subnets(p)) }
++func (w *liteW) OverlapsPrefix(p netip.Prefix) bool       { return w.t.OverlapsPrefix(p) }
++func (w *liteW) Overlaps(o rtab) bool                     { return w.t.Overlaps(o.(*liteW).t) }
++func (w *liteW) Overlaps4(o rtab) bool                    { return w.t.Overlaps4(o.(*liteW).t) }
++func (w *liteW) Overlaps6(o rtab) bool                    { return w.t.Overlaps6(o.(*liteW).t) }
++func (w *liteW) Union(o rtab)                             { w.t.Union(o.(*liteW).t) }
++func (w *liteW) Equal(o rtab) bool                        { return w.t.Equal(o.(*liteW).t) }
++func (w *liteW) Clone() rtab                              { return &liteW{w.t.Clone()} }
++func (w *liteW) InsertPersist(p netip.Prefix, v int) rtab { return &liteW{w.t.InsertPersist(p)} }
++func (w *liteW) DeletePersist(p netip.Prefix) rtab        { return &liteW{w.t.DeletePersist(p)} }
++func (w *liteW) ModifyPersist(p netip.Prefix, cb func(int, bool) (int, bool)) rtab {
++	return &liteW{w.t.ModifyPersist(p, func(exists bool) bool { _, del := cb(0, exists); return del })}
++}
++func (w *liteW) UnionPersist(o rtab) rtab     { return &liteW{w.t.UnionPersist(o.(*liteW).t)} }
++func (w *liteW) Size() int                    { return w.t.Size() }
++func (w *liteW) Size4() int                   { return w.t.Size4() }
++func (w *liteW) Size6() int                   { return w.t.Size6() }
++func (w *liteW) All() []pv                    { return liteSeq(w.t.All()) }
++func (w *liteW) All4() []pv                   { return liteSeq(w.t.All4()) }
++func (w *liteW) All6() []pv                   { return liteSeq(w.t.All6()) }
++func (w *liteW) AllSorted() []pv              { return liteSeq(w.t.AllSorted()) }
++func (w *liteW) AllSorted4() []pv             { return liteSeq(w.t.AllSorted4()) }
++func (w *liteW) AllSorted6() []pv             { return liteSeq(w.t.AllSorted6()) }
++func (w *liteW) Dump4() []treeNode            { return toTree(w.t.DumpList4()) }
++func (w *liteW) Dump6() []treeNode            { return toTree(w.t.DumpList6()) }
++func (w *liteW) MarshalJSON() ([]byte, error) { return w.t.MarshalJSON() }
++func (w *liteW) MarshalText() ([]byte, error) { return w.t.MarshalText() }
++func (w *liteW) Fprint(b *bytes.Buffer) error { return w.t.Fprint(b) }
++func (w *liteW) fresh() rtab                  { return &liteW{new(bart.Lite)} }
++
++var kinds = []string{"Table", "Fast", "Lite"}
++
++func newTab(kind string) rtab {
++	switch kind {
++	case "Table":
++		mk := func() *bart.Table[int] { return new(bart.Table[int]) }
++		return &wrap[*bart.Table[int]]{mk(), kind, mk}
++	case "Fast":
++		mk := func() *bart.Fast[int] { return new(bart.Fast[int]) }
++		return &wrap[*bart.Fast[int]]{mk(), kind, mk}
++	}
++	return &liteW{new(bart.Lite)}
++}
++
++// --------------------------------------------------------------------------- checks
++
++// check compares a table with its model: sizes, sorted and unsorted enumerations, the dump
++// trees, and a few queries related to the table's prefixes.
++func check(ht *hegel.T, col *collector, t rtab, md *model, what string) {
++	vals := t.hasValues()
++	if t.Size() != md.size(nil) || t.Size4() != md.size(ptr(true)) || t.Size6() != md.size(ptr(false)) {
++		col.failClass(ht, "Size", "%s: Size %d/%d/%d, want %d/%d/%d", what, t.Size(), t.Size4(), t.Size6(), md.size(nil), md.size(ptr(true)), md.size(ptr(false)))
++	}
++	for _, f := range []struct {
++		name string
++		got  []pv
++		want []netip.Prefix
++	}{
++		{"AllSorted", t.AllSorted(), md.sorted(nil)},
++		{"AllSorted4", t.AllSorted4(), md.sorted(ptr(true))},
++		{"AllSorted6", t.AllSorted6(), md.sorted(ptr(false))},
++	} {
++		if !samePV(f.got, f.want, md, vals) {
++			col.failClass(ht, f.name, "%s: %s %v, want %v", what, f.name, f.got, withVals(f.want, md))
++		}
++	}
++	for _, f := range []struct {
++		name string
++		got  []pv
++		want []netip.Prefix
++	}{
++		{"All", t.All(), md.sorted(nil)},
++		{"All4", t.All4(), md.sorted(ptr(true))},
++		{"All6", t.All6(), md.sorted(ptr(false))},
++	} {
++		got := append([]pv(nil), f.got...)
++		sortPV(got)
++		if !samePV(got, f.want, md, vals) {
++			col.failClass(ht, f.name, "%s: %s (sorted) %v, want %v", what, f.name, got, withVals(f.want, md))
++		}
++	}
++	if got, want := t.Dump4(), md.dumpTree(true); !sameTree(got, want, vals) {
++		col.failClass(ht, "DumpList4", "%s: DumpList4 %s, want %s", what, fmtTree(got), fmtTree(want))
++	}
++	if got, want := t.Dump6(), md.dumpTree(false); !sameTree(got, want, vals) {
++		col.failClass(ht, "DumpList6", "%s: DumpList6 %s, want %s", what, fmtTree(got), fmtTree(want))
++	}
++	// queries
++	for i := 0; i < 4; i++ {
++		q := genQuery(ht, md)
++		gv, gok := t.Get(q)
++		wv, wok := md.get(q)
++		if gok != wok || (vals && gok && gv != wv) {
++			col.failClass(ht, "Get", "%s: Get(%v) = %d, %v; want %d, %v", what, q, gv, gok, wv, wok)
++		}
++		gv, gok = t.LookupPrefix(q)
++		wp, wv, wok := md.lookupPrefix(q)
++		if gok != wok || (vals && gok && gv != wv) {
++			col.failClass(ht, "LookupPrefix", "%s: LookupPrefix(%v) = %d, %v; want %d, %v (%v)", what, q, gv, gok, wv, wok, wp)
++		}
++		gp, gv, gok := t.LookupPrefixLPM(q)
++		if gok != wok || (gok && gp != wp) || (vals && gok && gv != wv) {
++			col.failClass(ht, "LookupPrefixLPM", "%s: LookupPrefixLPM(%v) = %v, %d, %v; want %v, %d, %v", what, q, gp, gv, gok, wp, wv, wok)
++		}
++		if got, want := t.Supernets(q), md.supernets(q); !samePV(got, want, md, vals) {
++			col.failClass(ht, "Supernets", "%s: Supernets(%v) %v, want %v", what, q, got, withVals(want, md))
++		}
++		if got, want := t.Subnets(q), md.subnets(q); !samePV(got, want, md, vals) {
++			col.failClass(ht, "Subnets", "%s: Subnets(%v) %v, want %v", what, q, got, withVals(want, md))
++		}
++		if got, want := t.OverlapsPrefix(q), md.overlapsPrefix(q); got != want {
++			col.failClass(ht, "OverlapsPrefix", "%s: OverlapsPrefix(%v) = %v, want %v", what, q, got, want)
++		}
++		ip := genAddr(ht, md)
++		gv, gok = t.Lookup(ip)
++		wp, wv, wok = md.lookup(ip)
++		if gok != wok || (vals && gok && gv != wv) {
++			col.failClass(ht, "Lookup", "%s: Lookup(%v) = %d, %v; want %d, %v (%v)", what, ip, gv, gok, wv, wok, wp)
++		}
++		if got := t.Contains(ip); got != wok {
++			col.failClass(ht, "Contains", "%s: Contains(%v) = %v, want %v", what, ip, got, wok)
++		}
++		if ip.Is6() && chance(ht, 50) {
++			z := ip.WithZone("eth0")
++			zv, zok := t.Lookup(z)
++			if zok != wok || (vals && zok && zv != wv) || t.Contains(z) != wok {
++				col.failClass(ht, "Zone", "%s: Lookup(%v) = %d, %v, Contains %v; want %d, %v", what, z, zv, zok, t.Contains(z), wv, wok)
++			}
++		}
++	}
++}
++
++func ptr(b bool) *bool { return &b }
++
++func withVals(ps []netip.Prefix, md *model) []pv {
++	out := make([]pv, len(ps))
++	for i, p := range ps {
++		out[i] = pv{p, md.m[p]}
++	}
++	return out
++}
++
++func samePV(got []pv, want []netip.Prefix, md *model, vals bool) bool {
++	if len(got) != len(want) {
++		return false
++	}
++	for i := range got {
++		if got[i].p != want[i] || (vals && got[i].v != md.m[want[i]]) {
++			return false
++		}
++	}
++	return true
++}
++
++func sortPV(xs []pv) {
++	for i := 1; i < len(xs); i++ {
++		for j := i; j > 0 && cmpPrefix(xs[j].p, xs[j-1].p) < 0; j-- {
++			xs[j], xs[j-1] = xs[j-1], xs[j]
++		}
++	}
++}
++
++func sameTree(a, b []treeNode, vals bool) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i].pfx != b[i].pfx || (vals && a[i].val != b[i].val) || !sameTree(a[i].subs, b[i].subs, vals) {
++			return false
++		}
++	}
++	return true
++}
++
++// build fills a fresh table and model with n random prefixes.
++func build(ht *hegel.T, kind string, n int) (rtab, *model) {
++	t, md := newTab(kind), newModel()
++	for i := 0; i < n; i++ {
++		p, v := genPrefix(ht), genVal(ht)
++		t.Insert(p, v)
++		md.insert(p, v)
++	}
++	return t, md
++}
++
++var invalidPrefixes = []netip.Prefix{{}, netip.PrefixFrom(netip.MustParseAddr("10.0.0.0"), 33), netip.PrefixFrom(netip.MustParseAddr("::1"), 129), netip.PrefixFrom(netip.Addr{}, 8), netip.PrefixFrom(netip.MustParseAddr("1.2.3.4"), -1)}
++
++// --------------------------------------------------------------------------- properties
++
++// TestHegelTable: Table, Fast and Lite under random sequences of Insert, Delete, Modify
++// (with the documented callback contract), the Persist variants (receiver unchanged, result
++// as modelled), Union, Clone independence and invalid inputs, compared with the model after
++// every step: sizes, All/AllSorted per family, DumpList trees, and queries (Get, Lookup,
++// Contains, LookupPrefix, LookupPrefixLPM, Supernets, Subnets, OverlapsPrefix, zones).
++func TestHegelTable(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		kind := pick(ht, kinds)
++		tab, md := build(ht, kind, drawInt(ht, 0, 12))
++		var trace []string
++		where := func() string { return fmt.Sprintf("%s after %v", kind, trace) }
++		check(ht, col, tab, md, where())
++		nops := drawInt(ht, 0, 25)
++		for i := 0; i < nops; i++ {
++			switch drawInt(ht, 0, 9) {
++			case 0, 1, 2:
++				p, v := genQuery(ht, md), genVal(ht)
++				trace = append(trace, fmt.Sprintf("Insert(%v, %d)", p, v))
++				tab.Insert(p, v)
++				md.insert(p, v)
++			case 3:
++				p := genQuery(ht, md)
++				trace = append(trace, fmt.Sprintf("Delete(%v)", p))
++				tab.Delete(p)
++				md.delete(p)
++			case 4:
++				// Modify: the callback sees the current state and decides
++				p := genQuery(ht, md)
++				del := chance(ht, 40)
++				nv := genVal(ht)
++				calls := 0
++				wv, wok := md.get(p)
++				trace = append(trace, fmt.Sprintf("Modify(%v, del %v, val %d)", p, del, nv))
++				tab.Modify(p, func(cur int, ok bool) (int, bool) {
++					calls++
++					if ok != wok || (tab.hasValues() && ok && cur != wv) {
++						col.failClass(ht, "ModifyCallback", "%s: Modify callback got (%d, %v), want (%d, %v)", where(), cur, ok, wv, wok)
++					}
++					return nv, del
++				})
++				if calls != 1 && p.IsValid() {
++					col.failClass(ht, "ModifyCalls", "%s: Modify callback called %d times", where(), calls)
++				}
++				if del {
++					md.delete(p)
++				} else {
++					md.insert(p, nv)
++				}
++			case 5:
++				// Persist variants: the receiver keeps its state, the result is the modelled one
++				p, v := genQuery(ht, md), genVal(ht)
++				before := tab.Clone()
++				md2 := md.clone()
++				var res rtab
++				switch drawInt(ht, 0, 2) {
++				case 0:
++					trace = append(trace, fmt.Sprintf("InsertPersist(%v, %d)", p, v))
++					res = tab.InsertPersist(p, v)
++					md2.insert(p, v)
++				case 1:
++					trace = append(trace, fmt.Sprintf("DeletePersist(%v)", p))
++					res = tab.DeletePersist(p)
++					md2.delete(p)
++				default:
++					del := chance(ht, 40)
++					trace = append(trace, fmt.Sprintf("ModifyPersist(%v, del %v, val %d)", p, del, v))
++					res = tab.ModifyPersist(p, func(int, bool) (int, bool) { return v, del })
++					if del {
++						md2.delete(p)
++					} else {
++						md2.insert(p, v)
++					}
++				}
++				if !tab.Equal(before) {
++					col.failClass(ht, "PersistReceiver", "%s: the receiver changed", where())
++				}
++				check(ht, col, tab, md, where()+" (receiver)")
++				check(ht, col, res, md2, where()+" (result)")
++				// continue with the result half of the time
++				if chance(ht, 50) {
++					tab, md = res, md2
++					trace = append(trace, "-> result")
++				}
++			case 6:
++				// Union with a fresh random table
++				o, mo := build(ht, kind, drawInt(ht, 0, 6))
++				oBefore := o.Clone()
++				if chance(ht, 50) {
++					trace = append(trace, fmt.Sprintf("Union(%v)", o.AllSorted()))
++					tab.Union(o)
++					md.union(mo)
++				} else {
++					trace = append(trace, fmt.Sprintf("UnionPersist(%v)", o.AllSorted()))
++					before := tab.Clone()
++					res := tab.UnionPersist(o)
++					if !tab.Equal(before) {
++						col.failClass(ht, "UnionPersistReceiver", "%s: the receiver changed", where())
++					}
++					md2 := md.clone()
++					md2.union(mo)
++					check(ht, col, res, md2, where()+" (result)")
++					tab, md = res, md2
++				}
++				if !o.Equal(oBefore) {
++					col.failClass(ht, "UnionArgument", "%s: the argument changed", where())
++				}
++			case 7:
++				// Clone independence
++				c := tab.Clone()
++				if !c.Equal(tab) || !tab.Equal(c) {
++					col.failClass(ht, "CloneEqual", "%s: Clone not Equal", where())
++				}
++				p, v := genQuery(ht, md), genVal(ht)
++				trace = append(trace, fmt.Sprintf("Clone().Insert(%v, %d)", p, v))
++				c.Insert(p, v)
++				c.Delete(genQuery(ht, md))
++				check(ht, col, tab, md, where()+" (original after mutating the clone)")
++			case 8:
++				// invalid inputs are no-ops or negative answers
++				p := pick(ht, invalidPrefixes)
++				trace = append(trace, fmt.Sprintf("invalid %v", p))
++				tab.Insert(p, 1)
++				tab.Delete(p)
++				tab.Modify(p, func(int, bool) (int, bool) { return 1, false })
++				if _, ok := tab.Get(p); ok {
++					col.failClass(ht, "InvalidGet", "%s: Get(%v) ok", where(), p)
++				}
++				if _, ok := tab.LookupPrefix(p); ok {
++					col.failClass(ht, "InvalidLookupPrefix", "%s: LookupPrefix(%v) ok", where(), p)
++				}
++				if _, _, ok := tab.LookupPrefixLPM(p); ok {
++					col.failClass(ht, "InvalidLookupPrefixLPM", "%s: LookupPrefixLPM(%v) ok", where(), p)
++				}
++				if s := tab.Supernets(p); len(s) != 0 {
++					col.failClass(ht, "InvalidSupernets", "%s: Supernets(%v) = %v", where(), p, s)
++				}
++				if s := tab.Subnets(p); len(s) != 0 {
++					col.failClass(ht, "InvalidSubnets", "%s: Subnets(%v) = %v", where(), p, s)
++				}
++				if tab.OverlapsPrefix(p) {
++					col.failClass(ht, "InvalidOverlaps", "%s: OverlapsPrefix(%v) true", where(), p)
++				}
++				if _, ok := tab.Lookup(netip.Addr{}); ok || tab.Contains(netip.Addr{}) {
++					col.failClass(ht, "InvalidLookup", "%s: Lookup of the zero address ok", where())
++				}
++				r := tab.InsertPersist(p, 1)
++				r2 := tab.DeletePersist(p)
++				if !r.Equal(tab) || !r2.Equal(tab) {
++					col.failClass(ht, "InvalidPersist", "%s: InsertPersist/DeletePersist(%v) changed the table", where(), p)
++				}
++			default:
++				// a fresh insert of a random (possibly unmasked) prefix and its Get by an unmasked form
++				p, v := genPrefix(ht), genVal(ht)
++				trace = append(trace, fmt.Sprintf("Insert(%v, %d)", p, v))
++				tab.Insert(p, v)
++				md.insert(p, v)
++				u := netip.PrefixFrom(genAddrIn(ht, p), p.Bits())
++				if gv, ok := tab.Get(u); !ok || (tab.hasValues() && gv != v) {
++					col.failClass(ht, "GetUnmasked", "%s: Get(%v) = %d, %v after Insert(%v)", where(), u, gv, ok, p)
++				}
++			}
++			check(ht, col, tab, md, where())
++		}
++		col.count(kind)
++	})
++}
++
++// TestHegelSetOps: Overlaps/Overlaps4/Overlaps6 between two random tables (symmetric, as
++// modelled), Equal (reflexive, with clones, false after a change of value or set), Union as
++// the modelled merge with the argument's values winning.
++func TestHegelSetOps(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		kind := pick(ht, kinds)
++		a, ma := build(ht, kind, drawInt(ht, 0, 8))
++		b, mb := build(ht, kind, drawInt(ht, 0, 8))
++		if chance(ht, 30) {
++			// make b share some prefixes with a
++			for _, e := range a.AllSorted() {
++				if chance(ht, 50) {
++					v := genVal(ht)
++					b.Insert(e.p, v)
++					mb.insert(e.p, v)
++				}
++			}
++		}
++		what := fmt.Sprintf("%s A=%v B=%v", kind, a.AllSorted(), b.AllSorted())
++		for _, f := range []struct {
++			name string
++			got  func(x, y rtab) bool
++			is4  *bool
++		}{
++			{"Overlaps", func(x, y rtab) bool { return x.Overlaps(y) }, nil},
++			{"Overlaps4", func(x, y rtab) bool { return x.Overlaps4(y) }, ptr(true)},
++			{"Overlaps6", func(x, y rtab) bool { return x.Overlaps6(y) }, ptr(false)},
++		} {
++			want := ma.overlaps(mb, f.is4)
++			if got := f.got(a, b); got != want {
++				col.failClass(ht, f.name, "%s: %s = %v, want %v", what, f.name, got, want)
++			}
++			if got := f.got(b, a); got != want {
++				col.failClass(ht, f.name+"Sym", "%s: %s (reversed) = %v, want %v", what, f.name, got, want)
++			}
++		}
++		if !a.Equal(a) || !a.Equal(a.Clone()) {
++			col.failClass(ht, "EqualSelf", "%s: A not Equal to itself or its clone", what)
++		}
++		if got, want := a.Equal(b), ma.equal(mb) || (!a.hasValues() && sameKeys(ma, mb)); got != want {
++			col.failClass(ht, "Equal", "%s: A.Equal(B) = %v, want %v", what, got, want)
++		}
++		if a.hasValues() && a.Size() > 0 {
++			c := a.Clone()
++			e := pick(ht, a.AllSorted())
++			c.Insert(e.p, e.v+1)
++			if a.Equal(c) {
++				col.failClass(ht, "EqualValue", "%s: Equal after changing the value of %v", what, e.p)
++			}
++		}
++		// Union
++		u := a.Clone()
++		u.Union(b)
++		mu := ma.clone()
++		mu.union(mb)
++		check(ht, col, u, mu, what+" Union")
++		if !u.Equal(a.UnionPersist(b)) {
++			col.failClass(ht, "UnionPersist", "%s: UnionPersist differs from Union", what)
++		}
++		if b.Size() == 0 && !u.Equal(a) {
++			col.failClass(ht, "UnionEmpty", "%s: Union with an empty table changed A", what)
++		}
++		// union with itself is identity
++		s := a.Clone()
++		s.Union(a)
++		if !s.Equal(a) {
++			col.failClass(ht, "UnionSelf", "%s: A.Union(A) != A", what)
++		}
++	})
++}
++
++func sameKeys(a, b *model) bool {
++	if len(a.m) != len(b.m) {
++		return false
++	}
++	for p := range a.m {
++		if _, ok := b.m[p]; !ok {
++			return false
++		}
++	}
++	return true
++}
++
++// TestHegelDump: MarshalJSON is the two DumpLists; Fprint/MarshalText lists every prefix
++// exactly once under one header per non-empty family, in sorted order.
++func TestHegelDump(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		kind := pick(ht, kinds)
++		tab, md := build(ht, kind, drawInt(ht, 0, 12))
++		what := fmt.Sprintf("%s %v", kind, tab.AllSorted())
++		js, err := tab.MarshalJSON()
++		if err != nil {
++			col.failClass(ht, "JSONErr", "%s: MarshalJSON: %v", what, err)
++			return
++		}
++		var back struct {
++			V4 []bart.DumpListNode[json.RawMessage] `json:"ipv4"`
++			V6 []bart.DumpListNode[json.RawMessage] `json:"ipv6"`
++		}
++		if err := json.Unmarshal(js, &back); err != nil {
++			col.failClass(ht, "JSONParse", "%s: MarshalJSON output does not parse: %v: %s", what, err, js)
++			return
++		}
++		if got, want := toTree(back.V4), md.dumpTree(true); !sameTree(got, want, false) {
++			col.failClass(ht, "JSON4", "%s: JSON ipv4 %s, want %s", what, fmtTree(got), fmtTree(want))
++		}
++		if got, want := toTree(back.V6), md.dumpTree(false); !sameTree(got, want, false) {
++			col.failClass(ht, "JSON6", "%s: JSON ipv6 %s, want %s", what, fmtTree(got), fmtTree(want))
++		}
++		if tab.hasValues() {
++			// the values survive
++			var walk func(ns []bart.DumpListNode[json.RawMessage])
++			walk = func(ns []bart.DumpListNode[json.RawMessage]) {
++				for _, n := range ns {
++					if string(n.Value) != fmt.Sprint(md.m[n.CIDR]) {
++						col.failClass(ht, "JSONValue", "%s: JSON value of %v is %s, want %d", what, n.CIDR, n.Value, md.m[n.CIDR])
++					}
++					walk(n.Subnets)
++				}
++			}
++			walk(back.V4)
++			walk(back.V6)
++		}
++		var buf bytes.Buffer
++		if err := tab.Fprint(&buf); err != nil {
++			col.failClass(ht, "FprintErr", "%s: Fprint: %v", what, err)
++			return
++		}
++		txt, err := tab.MarshalText()
++		if err != nil || string(txt) != buf.String() {
++			col.failClass(ht, "MarshalText", "%s: MarshalText %q, %v; Fprint %q", what, txt, err, buf.String())
++		}
++		lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
++		if buf.Len() == 0 {
++			lines = nil
++		}
++		headers, entries := 0, 0
++		var order []netip.Prefix
++		for _, l := range lines {
++			if l == "\u25bc" {
++				headers++
++				continue
++			}
++			i := strings.Index(l, "\u2500 ")
++			if i < 0 {
++				col.failClass(ht, "FprintLine", "%s: unexpected line %q", what, l)
++				continue
++			}
++			rest := l[i+len("\u2500 "):]
++			j := strings.Index(rest, " (")
++			if j < 0 && tab.hasValues() {
++				col.failClass(ht, "FprintLine", "%s: unexpected line %q", what, l)
++				continue
++			}
++			if j < 0 {
++				j = len(rest) // Lite prints no value
++			}
++			p, err := netip.ParsePrefix(rest[:j])
++			if err != nil {
++				col.failClass(ht, "FprintPrefix", "%s: line %q: %v", what, l, err)
++				continue
++			}
++			order = append(order, p)
++			entries++
++		}
++		wantHeaders := 0
++		if md.size(ptr(true)) > 0 {
++			wantHeaders++
++		}
++		if md.size(ptr(false)) > 0 {
++			wantHeaders++
++		}
++		if headers != wantHeaders || entries != md.size(nil) {
++			col.failClass(ht, "FprintShape", "%s: Fprint has %d headers and %d entries, want %d and %d:\n%s", what, headers, entries, wantHeaders, md.size(nil), buf.String())
++		}
++		if !samePrefixes(order, md.sorted(nil)) {
++			col.failClass(ht, "FprintOrder", "%s: Fprint order %v, want %v", what, order, md.sorted(nil))
++		}
++	})
++}
++
++// TestHegelAggregate: Lite.Aggregate yields the minimal covering set: covered prefixes gone,
++// full sibling pairs merged, every address's membership unchanged.
++func TestHegelAggregate(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		tab, md := build(ht, "Lite", drawInt(ht, 0, 10))
++		// add siblings and subnets deliberately
++		for _, e := range tab.AllSorted() {
++			if e.p.Bits() > 0 && chance(ht, 40) {
++				s := sibling(e.p)
++				tab.Insert(s, 0)
++				md.insert(s, 0)
++			}
++			if chance(ht, 30) {
++				q := genQuery(ht, md)
++				tab.Insert(q, 0)
++				md.insert(q, 0)
++			}
++		}
++		before := tab.Clone()
++		what := fmt.Sprintf("Lite %v", tab.AllSorted())
++		addrs := make([]netip.Addr, 0, 12)
++		for i := 0; i < 12; i++ {
++			addrs = append(addrs, genAddr(ht, md))
++		}
++		tab.(*liteW).t.Aggregate()
++		md.aggregate()
++		check(ht, col, tab, md, what+" aggregated")
++		for _, ip := range addrs {
++			if tab.Contains(ip) != before.Contains(ip) {
++				col.failClass(ht, "AggregateContains", "%s: Contains(%v) changed from %v by Aggregate", what, ip, before.Contains(ip))
++			}
++		}
++		if tab.Size() > before.Size() {
++			col.failClass(ht, "AggregateSize", "%s: Aggregate grew the table from %d to %d", what, before.Size(), tab.Size())
++		}
++		// idempotent
++		again := tab.Clone()
++		again.(*liteW).t.Aggregate()
++		if !again.Equal(tab) {
++			col.failClass(ht, "AggregateIdempotent", "%s: a second Aggregate changed the table: %v -> %v", what, tab.AllSorted(), again.AllSorted())
++		}
++	})
++}
++
++// TestHegelPersistVersions: a chain of Persist operations leaves every earlier version
++// intact (structural sharing must not leak writes), each still matching its own model.
++func TestHegelPersistVersions(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		kind := pick(ht, kinds)
++		tab, md := build(ht, kind, drawInt(ht, 0, 8))
++		type version struct {
++			t  rtab
++			md *model
++			op string
++		}
++		versions := []version{{tab, md, "start"}}
++		n := drawInt(ht, 1, 10)
++		for i := 0; i < n; i++ {
++			cur := versions[len(versions)-1]
++			p, v := genQuery(ht, cur.md), genVal(ht)
++			nm := cur.md.clone()
++			var nt rtab
++			var op string
++			switch drawInt(ht, 0, 3) {
++			case 0, 1:
++				nt = cur.t.InsertPersist(p, v)
++				nm.insert(p, v)
++				op = fmt.Sprintf("InsertPersist(%v, %d)", p, v)
++			case 2:
++				nt = cur.t.DeletePersist(p)
++				nm.delete(p)
++				op = fmt.Sprintf("DeletePersist(%v)", p)
++			default:
++				o, mo := build(ht, kind, drawInt(ht, 0, 4))
++				nt = cur.t.UnionPersist(o)
++				nm.union(mo)
++				op = fmt.Sprintf("UnionPersist(%v)", o.AllSorted())
++			}
++			versions = append(versions, version{nt, nm, op})
++		}
++		// (no in-place mutation here: the versions share untouched nodes by design, so only the
++		// Persist operations are valid on them from now on)
++		for i, ver := range versions {
++			check(ht, col, ver.t, ver.md, fmt.Sprintf("%s version %d (%s) of %d", kind, i, ver.op, len(versions)))
++		}
++	})
++}
+diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
+new file mode 100644
+index 0000000..cf4024f
+--- /dev/null
++++ b/hegel/hegel_test.go
+@@ -0,0 +1,132 @@
++package hegel
++
++// Hegel property tests for gaissmai/bart, written for the Hegel zoo. See
++// targets/go/bart/README.md.
++//
++// Oracle: a routing table as a plain map from canonical prefix to value; longest-prefix match,
++// supernets, subnets and overlap are computed by brute force over the map with net/netip.
++// Table, Fast and Lite are driven by the same random operation sequences and compared with the
++// model after every step.
++//
++// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
++// through hegelOpts; a panic in the code under test is turned into a failure of the current
++// test case by property(). ZOO_COLLECT=1 makes the properties record their mismatches instead
++// of failing.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			return []hegel.Option{hegel.WithTestCases(v)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func drawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return drawInt(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++var collecting = os.Getenv("ZOO_COLLECT") != ""
++
++type collector struct {
++	name   string
++	mu     sync.Mutex
++	counts map[string]int
++	msgs   []string
++	bad    int
++}
++
++func newCollector(t *testing.T) *collector {
++	c := &collector{name: t.Name(), counts: map[string]int{}}
++	t.Cleanup(func() {
++		if !collecting {
++			return
++		}
++		keys := make([]string, 0, len(c.counts))
++		for k := range c.counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		var parts []string
++		for _, k := range keys {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, c.counts[k]))
++		}
++		fmt.Printf("COLLECT %s: %d mismatches; %s\n", c.name, c.bad, strings.Join(parts, " "))
++		for _, m := range c.msgs {
++			fmt.Printf("MISMATCH %s\n", m)
++		}
++	})
++	return c
++}
++
++func (c *collector) count(class string) {
++	c.mu.Lock()
++	c.counts[class]++
++	c.mu.Unlock()
++}
++
++func (c *collector) fail(ht *hegel.T, format string, args ...any) {
++	c.failClass(ht, "", format, args...)
++}
++
++// failClass is fail with a class: in collect mode the class is counted and only its first two
++// messages are kept.
++func (c *collector) failClass(ht *hegel.T, class string, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collecting {
++		c.mu.Lock()
++		c.bad++
++		if class != "" {
++			c.counts["mismatch "+class]++
++		}
++		if (class == "" && len(c.msgs) < 25) || (class != "" && c.counts["mismatch "+class] <= 2) {
++			c.msgs = append(c.msgs, c.name+": "+msg)
++		}
++		c.mu.Unlock()
++		return
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// --------------------------------------------------------------------------- known bugs
++
++// Known: the recorded bugs (bugs.toml). The model reproduces a behaviour while its switch is
++// on; the pins assert the documented behaviour and fail while the bug exists.
++var Known = struct {
++	none bool
++}{false}
