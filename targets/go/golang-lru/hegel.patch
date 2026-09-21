@@ -1,0 +1,1190 @@
+diff --git a/go.mod b/go.mod
+index 3db9529..b5f3336 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,10 @@
+ module github.com/hashicorp/golang-lru/v2
+ 
+-go 1.19
++go 1.26.0
++
++require hegel.dev/go/hegel v0.6.33
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel/hegel_model_test.go b/hegel/hegel_model_test.go
+new file mode 100644
+index 0000000..b30417a
+--- /dev/null
++++ b/hegel/hegel_model_test.go
+@@ -0,0 +1,356 @@
++package hegel
++
++// The model: an LRU cache as an ordered list of (key, value) pairs, oldest first, a size (0
++// means unlimited, as expirable.NewLRU documents) and a log of the evictions in order; the 2Q
++// cache as the published algorithm over three such lists.
++
++import (
++	"fmt"
++	"sort"
++
++	"hegel.dev/go/hegel"
++)
++
++type kv struct{ k, v int }
++
++func (p kv) String() string { return fmt.Sprintf("%d:%d", p.k, p.v) }
++
++// lruModel is the reference LRU.
++type lruModel struct {
++	size    int  // 0 = unlimited
++	ents    []kv // oldest first
++	evicted []kv // every entry removed by eviction, Remove, RemoveOldest, Resize or Purge
++}
++
++func newModel(size int) *lruModel { return &lruModel{size: size} }
++
++func (m *lruModel) find(k int) int {
++	for i, e := range m.ents {
++		if e.k == k {
++			return i
++		}
++	}
++	return -1
++}
++
++func (m *lruModel) drop(i int) kv {
++	e := m.ents[i]
++	m.ents = append(m.ents[:i:i], m.ents[i+1:]...)
++	m.evicted = append(m.evicted, e)
++	return e
++}
++
++// add: an existing key is refreshed (moved to newest) and its value replaced, no eviction; a
++// new key is appended and, if the size is exceeded, the oldest entry is evicted.
++func (m *lruModel) add(k, v int) bool {
++	if i := m.find(k); i >= 0 {
++		m.ents = append(m.ents[:i:i], m.ents[i+1:]...)
++		m.ents = append(m.ents, kv{k, v})
++		return false
++	}
++	m.ents = append(m.ents, kv{k, v})
++	if m.size > 0 && len(m.ents) > m.size {
++		m.drop(0)
++		return true
++	}
++	return false
++}
++
++func (m *lruModel) get(k int) (int, bool) {
++	i := m.find(k)
++	if i < 0 {
++		return 0, false
++	}
++	e := m.ents[i]
++	m.ents = append(m.ents[:i:i], m.ents[i+1:]...)
++	m.ents = append(m.ents, e)
++	return e.v, true
++}
++
++func (m *lruModel) peek(k int) (int, bool) {
++	if i := m.find(k); i >= 0 {
++		return m.ents[i].v, true
++	}
++	return 0, false
++}
++
++func (m *lruModel) contains(k int) bool { return m.find(k) >= 0 }
++
++func (m *lruModel) remove(k int) bool {
++	if i := m.find(k); i >= 0 {
++		m.drop(i)
++		return true
++	}
++	return false
++}
++
++func (m *lruModel) removeOldest() (int, int, bool) {
++	if len(m.ents) == 0 {
++		return 0, 0, false
++	}
++	e := m.drop(0)
++	return e.k, e.v, true
++}
++
++func (m *lruModel) getOldest() (int, int, bool) {
++	if len(m.ents) == 0 {
++		return 0, 0, false
++	}
++	return m.ents[0].k, m.ents[0].v, true
++}
++
++// purge evicts everything; the order of the callbacks is the map's, so the log is compared as
++// a multiset for this operation.
++func (m *lruModel) purge() {
++	for len(m.ents) > 0 {
++		m.drop(0)
++	}
++}
++
++// resize evicts the oldest entries beyond the new size and returns how many; a size of 0
++// makes the model unlimited (the documented meaning for expirable.LRU; the other caches are
++// never resized to 0 or below by the properties, see golang-lru/1).
++func (m *lruModel) resize(size int) int {
++	n := 0
++	if size > 0 {
++		for len(m.ents) > size {
++			m.drop(0)
++			n++
++		}
++	}
++	m.size = size
++	return n
++}
++
++func (m *lruModel) keys() []int {
++	ks := make([]int, len(m.ents))
++	for i, e := range m.ents {
++		ks[i] = e.k
++	}
++	return ks
++}
++
++func (m *lruModel) values() []int {
++	vs := make([]int, len(m.ents))
++	for i, e := range m.ents {
++		vs[i] = e.v
++	}
++	return vs
++}
++
++func (m *lruModel) length() int { return len(m.ents) }
++
++// --------------------------------------------------------------------------- 2Q
++
++// twoQModel mirrors TwoQueueCache: a recent list (entries seen once), a frequent list
++// (entries seen twice), a ghost list of keys recently evicted from recent; the total of
++// recent and frequent is bounded by size, recent is kept at or below size*recentRatio when
++// space is needed, the ghost list holds size*ghostRatio keys.
++type twoQModel struct {
++	size, recentSize        int
++	recentRatio, ghostRatio float64
++	recent, frequent, ghost *lruModel
++}
++
++func newTwoQModel(size int, recentRatio, ghostRatio float64) *twoQModel {
++	return &twoQModel{
++		size: size, recentSize: int(float64(size) * recentRatio),
++		recentRatio: recentRatio, ghostRatio: ghostRatio,
++		recent: newModel(size), frequent: newModel(size),
++		ghost: newModel(int(float64(size) * ghostRatio)),
++	}
++}
++
++// ghostAdd: a ghost list resized to 0 keeps nothing (see the model's resize; the real store
++// evicts the key it has just added).
++func (q *twoQModel) ghostAdd(k int) {
++	if q.ghost.size <= 0 {
++		return
++	}
++	q.ghost.add(k, 0)
++}
++
++func (q *twoQModel) get(k int) (int, bool) {
++	if v, ok := q.frequent.get(k); ok {
++		return v, true
++	}
++	if v, ok := q.recent.peek(k); ok {
++		q.recent.remove(k)
++		q.frequent.add(k, v)
++		return v, true
++	}
++	return 0, false
++}
++
++func (q *twoQModel) add(k, v int) {
++	if q.frequent.contains(k) {
++		q.frequent.add(k, v)
++		return
++	}
++	if q.recent.contains(k) {
++		q.recent.remove(k)
++		q.frequent.add(k, v)
++		return
++	}
++	if q.ghost.contains(k) {
++		q.ensureSpace(true)
++		q.ghost.remove(k)
++		q.frequent.add(k, v)
++		return
++	}
++	q.ensureSpace(false)
++	q.recent.add(k, v)
++}
++
++func (q *twoQModel) ensureSpace(recentEvict bool) {
++	rl, fl := q.recent.length(), q.frequent.length()
++	if rl+fl < q.size {
++		return
++	}
++	if rl > 0 && (rl > q.recentSize || (rl == q.recentSize && !recentEvict)) {
++		k, _, _ := q.recent.removeOldest()
++		q.ghostAdd(k)
++		return
++	}
++	q.frequent.removeOldest()
++}
++
++func (q *twoQModel) resize(size int) int {
++	q.size = size
++	q.recentSize = int(float64(size) * q.recentRatio)
++	diff := q.recent.length() + q.frequent.length() - size
++	if diff < 0 {
++		diff = 0
++	}
++	for i := 0; i < diff; i++ {
++		q.ensureSpace(true)
++	}
++	q.recent.resize(size)
++	q.frequent.resize(size)
++	// the ghost list's Resize(0) evicts everything and keeps nothing afterwards
++	es := int(float64(size) * q.ghostRatio)
++	if es <= 0 {
++		q.ghost.purge()
++		q.ghost.size = 0
++	} else {
++		q.ghost.resize(es)
++	}
++	return diff
++}
++
++func (q *twoQModel) remove(k int) {
++	if q.frequent.remove(k) {
++		return
++	}
++	if q.recent.remove(k) {
++		return
++	}
++	q.ghost.remove(k)
++}
++
++func (q *twoQModel) purge() {
++	q.recent.purge()
++	q.frequent.purge()
++	q.ghost.purge()
++}
++
++func (q *twoQModel) contains(k int) bool { return q.frequent.contains(k) || q.recent.contains(k) }
++
++func (q *twoQModel) peek(k int) (int, bool) {
++	if v, ok := q.frequent.peek(k); ok {
++		return v, true
++	}
++	return q.recent.peek(k)
++}
++
++func (q *twoQModel) keys() []int   { return append(q.frequent.keys(), q.recent.keys()...) }
++func (q *twoQModel) values() []int { return append(q.frequent.values(), q.recent.values()...) }
++func (q *twoQModel) length() int   { return q.recent.length() + q.frequent.length() }
++
++// --------------------------------------------------------------------------- generators
++
++const keySpace = 8 // keys are 0..keySpace-1 so that sequences revisit them
++
++func genKey(tc hegel.TestCase) int { return drawInt(tc, 0, keySpace-1) }
++
++func genVal(tc hegel.TestCase) int { return drawInt(tc, 0, 1000) }
++
++func genSize(tc hegel.TestCase) int {
++	if chance(tc, 20) {
++		return drawInt(tc, 1, 2)
++	}
++	return drawInt(tc, 1, 6)
++}
++
++// op is one step of a random sequence.
++type op struct {
++	name string
++	k, v int
++	n    int // Resize target
++}
++
++var opNames = []string{"Add", "Add", "Add", "Get", "Contains", "Peek", "Remove", "RemoveOldest", "GetOldest", "Purge", "Resize", "ContainsOrAdd", "PeekOrAdd"}
++
++func genOp(tc hegel.TestCase, extra bool) op {
++	names := opNames
++	if !extra {
++		names = opNames[:11]
++	}
++	o := op{name: pick(tc, names), k: genKey(tc), v: genVal(tc)}
++	if o.name == "Purge" && !chance(tc, 30) {
++		o.name = "Add"
++	}
++	if o.name == "Resize" {
++		o.n = drawInt(tc, 1, 8)
++	}
++	return o
++}
++
++func (o op) String() string {
++	switch o.name {
++	case "Add", "ContainsOrAdd", "PeekOrAdd":
++		return fmt.Sprintf("%s(%d, %d)", o.name, o.k, o.v)
++	case "Resize":
++		return fmt.Sprintf("Resize(%d)", o.n)
++	case "Purge", "RemoveOldest", "GetOldest":
++		return o.name + "()"
++	}
++	return fmt.Sprintf("%s(%d)", o.name, o.k)
++}
++
++// --------------------------------------------------------------------------- helpers
++
++func sameInts(a, b []int) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func sortedKV(xs []kv) []kv {
++	ys := append([]kv(nil), xs...)
++	sort.Slice(ys, func(i, j int) bool {
++		if ys[i].k != ys[j].k {
++			return ys[i].k < ys[j].k
++		}
++		return ys[i].v < ys[j].v
++	})
++	return ys
++}
++
++func sameKV(a, b []kv) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
+new file mode 100644
+index 0000000..6059ee2
+--- /dev/null
++++ b/hegel/hegel_pins_test.go
+@@ -0,0 +1,97 @@
++package hegel
++
++// Pins: one plain test per recorded bug (bugs.toml), asserting the documented behaviour.
++// Each fails while the bug exists and is listed in target.toml's [expected_failures].
++
++import (
++	"testing"
++	"time"
++
++	lru "github.com/hashicorp/golang-lru/v2"
++	"github.com/hashicorp/golang-lru/v2/expirable"
++	"github.com/hashicorp/golang-lru/v2/simplelru"
++)
++
++// golang-lru/1: the constructors refuse a size at or below zero, Resize does not: a cache
++// resized to 0 evicts every key as it is added (Add returns true and the callback fires for
++// the key just added), and Resize(-3) of an empty cache reports 3 evictions.
++func TestHegelPinResizeNonPositive(t *testing.T) {
++	var evicted []int
++	c, _ := simplelru.NewLRU[int, int](3, func(k, v int) { evicted = append(evicted, k) })
++	c.Add(1, 1)
++	c.Resize(0)
++	evicted = nil
++	if ev := c.Add(2, 2); ev || !c.Contains(2) || len(evicted) != 0 {
++		t.Errorf("after Resize(0): Add(2) evicted %v, Contains(2) %v, callbacks %v; Cap %d", ev, c.Contains(2), evicted, c.Cap())
++	}
++	if n := c.Resize(-3); n != 0 || c.Cap() < 1 {
++		t.Errorf("Resize(-3) of a cache holding %d keys: %d evictions, Cap %d", c.Len(), n, c.Cap())
++	}
++	w, _ := lru.New[int, int](3)
++	w.Resize(0)
++	if ev := w.Add(2, 2); ev || !w.Contains(2) {
++		t.Errorf("lru.Cache after Resize(0): Add(2) evicted %v, Contains(2) %v", ev, w.Contains(2))
++	}
++}
++
++// golang-lru/2: New2QParams documents size > 0 and ratios within [0, 1] as valid, but a
++// ghost ratio that rounds the ghost list's size to zero (ghost ratio 0, or New2Q(1) with the
++// default 0.5) fails with the inner LRU's "must provide a positive size".
++func TestHegelPinTwoQueueSmallGhost(t *testing.T) {
++	if _, err := lru.New2Q[int, int](1); err != nil {
++		t.Errorf("New2Q(1): %v", err)
++	}
++	if _, err := lru.New2QParams[int, int](10, 0.25, 0); err != nil {
++		t.Errorf("New2QParams(10, 0.25, 0): %v", err)
++	}
++}
++
++// golang-lru/3: after Close (documented as destroying the cleanup goroutine), expired entries
++// are returned by Get, Peek, Keys and Values as if they were live.
++func TestHegelPinExpiredAfterClose(t *testing.T) {
++	c := expirable.NewLRU[int, int](0, nil, 50*time.Millisecond)
++	c.Close()
++	c.Add(1, 1)
++	time.Sleep(80 * time.Millisecond)
++	if v, ok := c.Get(1); ok {
++		t.Errorf("Get(1) = %d, true 80ms after adding with a 50ms TTL (cache closed); Keys %v", v, c.Keys())
++	}
++}
++
++// golang-lru/4: simplelru.LRU.Purge calls the eviction callback before removing the entry,
++// unlike Remove, RemoveOldest, Resize and Add: the callback still finds the key in the
++// cache, and removing it from there reports the eviction twice.
++func TestHegelPinPurgeCallbackAfterRemoval(t *testing.T) {
++	var c *simplelru.LRU[int, int]
++	var seen []int
++	var present []int
++	c, _ = simplelru.NewLRU[int, int](3, func(k, v int) {
++		seen = append(seen, k)
++		if c.Contains(k) {
++			present = append(present, k)
++		}
++	})
++	c.Add(1, 1)
++	c.Add(2, 2)
++	c.Purge()
++	if len(present) > 0 || len(seen) != 2 {
++		t.Errorf("Purge: callbacks for %v, the key still present for %v", seen, present)
++	}
++}
++
++// golang-lru/5: TwoQueueCache is "a thread-safe fixed size 2Q cache", but with a recent ratio
++// of 1 (documented valid) it holds size+1 entries: when the recent list is full and the
++// frequent list empty, re-adding a key that is in the ghost list evicts nothing (ensureSpace
++// asks the empty frequent list) and adds to frequent.
++func TestHegelPinTwoQueueFixedSize(t *testing.T) {
++	q, err := lru.New2QParams[int, int](2, 1, 0.5)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, k := range []int{2, 0, 1, 2} {
++		q.Add(k, k)
++	}
++	if q.Len() > q.Cap() {
++		t.Errorf("after Add(2), Add(0), Add(1), Add(2): Len %d above the size %d; Keys %v", q.Len(), q.Cap(), q.Keys())
++	}
++}
+diff --git a/hegel/hegel_props_test.go b/hegel/hegel_props_test.go
+new file mode 100644
+index 0000000..dc29fa2
+--- /dev/null
++++ b/hegel/hegel_props_test.go
+@@ -0,0 +1,548 @@
++package hegel
++
++import (
++	"fmt"
++	"os"
++	"strconv"
++	"sync"
++	"testing"
++	"time"
++
++	"hegel.dev/go/hegel"
++
++	lru "github.com/hashicorp/golang-lru/v2"
++	"github.com/hashicorp/golang-lru/v2/expirable"
++	"github.com/hashicorp/golang-lru/v2/simplelru"
++)
++
++// cache is the interface shared by simplelru.LRU, lru.Cache and expirable.LRU.
++type cache interface {
++	Add(k, v int) bool
++	Get(k int) (int, bool)
++	Contains(k int) bool
++	Peek(k int) (int, bool)
++	Remove(k int) bool
++	RemoveOldest() (int, int, bool)
++	GetOldest() (int, int, bool)
++	Keys() []int
++	Values() []int
++	Len() int
++	Cap() int
++	Purge()
++	Resize(int) int
++}
++
++// evictLog records the eviction callbacks and checks, from inside the callback, that the
++// evicted key is no longer in the cache.
++type evictLog struct {
++	c        cache
++	log      []kv
++	reentry  bool // Contains may be called from the callback (thread-safe caches: outside the lock)
++	stillIn  []kv
++	disabled bool
++}
++
++func (l *evictLog) cb(k, v int) {
++	l.log = append(l.log, kv{k, v})
++	if l.reentry && l.c != nil && l.c.Contains(k) {
++		l.stillIn = append(l.stillIn, kv{k, v})
++	}
++}
++
++type flavour struct {
++	name string
++	// make builds a cache of the size with the callback (nil when withCB is false); size 0 is
++	// allowed only for expirable (unlimited).
++	make func(size int, cb func(k, v int)) cache
++	// resizeZero: Resize(0) means unlimited (expirable) rather than being refused
++	resizeZero bool
++	extra      bool // ContainsOrAdd / PeekOrAdd (lru.Cache)
++	reentry    bool // callbacks run outside the lock
++}
++
++var flavours = []flavour{
++	{name: "simplelru", make: func(size int, cb func(k, v int)) cache {
++		c, err := simplelru.NewLRU[int, int](size, cb)
++		if err != nil {
++			panic(err)
++		}
++		return c
++	}, reentry: true},
++	{name: "lru.Cache", make: func(size int, cb func(k, v int)) cache {
++		c, err := lru.NewWithEvict[int, int](size, cb)
++		if err != nil {
++			panic(err)
++		}
++		return c
++	}, extra: true, reentry: true},
++	{name: "expirable", make: func(size int, cb func(k, v int)) cache {
++		return expirable.NewLRU[int, int](size, cb, 0)
++	}, resizeZero: true, reentry: true},
++}
++
++// TestHegelLRU: the three LRU caches against the model under random operation sequences,
++// compared after every step (Len, Cap, Keys, Values, Contains, Peek, GetOldest, the result
++// of the operation and the eviction callbacks in order).
++func TestHegelLRU(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		f := pick(ht, flavours)
++		size := genSize(ht)
++		if f.resizeZero && chance(ht, 25) {
++			size = 0
++		}
++		withCB := chance(ht, 75)
++		l := &evictLog{reentry: f.reentry}
++		var cb func(k, v int)
++		if withCB {
++			cb = l.cb
++		}
++		c := f.make(size, cb)
++		l.c = c
++		m := newModel(size)
++		nops := drawInt(ht, 0, 40)
++		var trace []string
++		for i := 0; i < nops; i++ {
++			o := genOp(ht, f.extra)
++			if o.name == "Resize" && f.resizeZero && chance(ht, 30) {
++				o.n = 0
++			}
++			trace = append(trace, o.String())
++			where := func() string { return fmt.Sprintf("%s size %d: after %v", f.name, size, trace) }
++			l.log = l.log[:0]
++			m.evicted = m.evicted[:0]
++			switch o.name {
++			case "Add":
++				got, want := c.Add(o.k, o.v), m.add(o.k, o.v)
++				if got != want {
++					col.failClass(ht, "Add", "%s: Add evicted %v, want %v", where(), got, want)
++				}
++			case "Get":
++				gv, gok := c.Get(o.k)
++				wv, wok := m.get(o.k)
++				if gok != wok || (gok && gv != wv) {
++					col.failClass(ht, "Get", "%s: Get = %d, %v; want %d, %v", where(), gv, gok, wv, wok)
++				}
++			case "Contains":
++				if got, want := c.Contains(o.k), m.contains(o.k); got != want {
++					col.failClass(ht, "Contains", "%s: Contains = %v, want %v", where(), got, want)
++				}
++			case "Peek":
++				gv, gok := c.Peek(o.k)
++				wv, wok := m.peek(o.k)
++				if gok != wok || (gok && gv != wv) {
++					col.failClass(ht, "Peek", "%s: Peek = %d, %v; want %d, %v", where(), gv, gok, wv, wok)
++				}
++			case "Remove":
++				if got, want := c.Remove(o.k), m.remove(o.k); got != want {
++					col.failClass(ht, "Remove", "%s: Remove = %v, want %v", where(), got, want)
++				}
++			case "RemoveOldest":
++				gk, gv, gok := c.RemoveOldest()
++				wk, wv, wok := m.removeOldest()
++				if gok != wok || (gok && (gk != wk || gv != wv)) {
++					col.failClass(ht, "RemoveOldest", "%s: RemoveOldest = %d, %d, %v; want %d, %d, %v", where(), gk, gv, gok, wk, wv, wok)
++				}
++			case "GetOldest":
++				gk, gv, gok := c.GetOldest()
++				wk, wv, wok := m.getOldest()
++				if gok != wok || (gok && (gk != wk || gv != wv)) {
++					col.failClass(ht, "GetOldest", "%s: GetOldest = %d, %d, %v; want %d, %d, %v", where(), gk, gv, gok, wk, wv, wok)
++				}
++			case "Purge":
++				c.Purge()
++				m.purge()
++			case "Resize":
++				if got, want := c.Resize(o.n), m.resize(o.n); got != want {
++					col.failClass(ht, "Resize", "%s: Resize evicted %d, want %d", where(), got, want)
++				}
++				size = o.n
++			case "ContainsOrAdd":
++				cc := c.(*lru.Cache[int, int])
++				ok, ev := cc.ContainsOrAdd(o.k, o.v)
++				wok := m.contains(o.k)
++				wev := false
++				if !wok {
++					wev = m.add(o.k, o.v)
++				}
++				if ok != wok || ev != wev {
++					col.failClass(ht, "ContainsOrAdd", "%s: ContainsOrAdd = %v, %v; want %v, %v", where(), ok, ev, wok, wev)
++				}
++			case "PeekOrAdd":
++				cc := c.(*lru.Cache[int, int])
++				prev, ok, ev := cc.PeekOrAdd(o.k, o.v)
++				wprev, wok := m.peek(o.k)
++				wev := false
++				if !wok {
++					wev = m.add(o.k, o.v)
++				}
++				if ok != wok || ev != wev || (ok && prev != wprev) {
++					col.failClass(ht, "PeekOrAdd", "%s: PeekOrAdd = %d, %v, %v; want %d, %v, %v", where(), prev, ok, ev, wprev, wok, wev)
++				}
++			}
++			// callbacks
++			if withCB {
++				got, want := l.log, m.evicted
++				if o.name == "Purge" {
++					got, want = sortedKV(got), sortedKV(want)
++				}
++				if !sameKV(got, want) {
++					col.failClass(ht, "Callbacks", "%s: eviction callbacks %v, want %v", where(), got, want)
++				}
++				if len(l.stillIn) > 0 && !(Known.purgeCallbackBeforeRemoval && f.name == "simplelru" && o.name == "Purge") {
++					col.failClass(ht, "CallbackSeesKey", "%s: the eviction callback still finds %v in the cache", where(), l.stillIn)
++				}
++				l.stillIn = nil
++			}
++			// state
++			if got, want := c.Len(), m.length(); got != want {
++				col.failClass(ht, "Len", "%s: Len %d, want %d", where(), got, want)
++			}
++			if got := c.Cap(); got != size {
++				col.failClass(ht, "Cap", "%s: Cap %d, want %d", where(), got, size)
++			}
++			if got, want := c.Keys(), m.keys(); !sameInts(got, want) {
++				col.failClass(ht, "Keys", "%s: Keys %v, want %v", where(), got, want)
++			}
++			if got, want := c.Values(), m.values(); !sameInts(got, want) {
++				col.failClass(ht, "Values", "%s: Values %v, want %v", where(), got, want)
++			}
++			if size > 0 && c.Len() > size {
++				col.failClass(ht, "Overfull", "%s: Len %d above the size %d", where(), c.Len(), size)
++			}
++			for k := 0; k < keySpace; k++ {
++				wv, wok := m.peek(k)
++				if got := c.Contains(k); got != wok {
++					col.failClass(ht, "ContainsAll", "%s: Contains(%d) = %v, want %v", where(), k, got, wok)
++				}
++				gv, gok := c.Peek(k)
++				if gok != wok || (gok && gv != wv) {
++					col.failClass(ht, "PeekAll", "%s: Peek(%d) = %d, %v; want %d, %v", where(), k, gv, gok, wv, wok)
++				}
++			}
++			gk, gv, gok := c.GetOldest()
++			wk, wv, wok := m.getOldest()
++			if gok != wok || (gok && (gk != wk || gv != wv)) {
++				col.failClass(ht, "Oldest", "%s: GetOldest = %d, %d, %v; want %d, %d, %v", where(), gk, gv, gok, wk, wv, wok)
++			}
++		}
++		col.count(f.name)
++	})
++}
++
++// TestHegelConstructors: sizes at or below zero refused by the fixed-size constructors and
++// mapped to unlimited by expirable; Cap reports the size; a fresh cache is empty.
++func TestHegelConstructors(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		size := drawInt(ht, -3, 6)
++		if _, err := simplelru.NewLRU[int, int](size, nil); (err == nil) != (size > 0) {
++			col.failClass(ht, "simplelru", "simplelru.NewLRU(%d): err %v", size, err)
++		}
++		if _, err := lru.New[int, int](size); (err == nil) != (size > 0) {
++			col.failClass(ht, "lru.New", "lru.New(%d): err %v", size, err)
++		}
++		if c, err := lru.NewWithEvict[int, int](size, func(k, v int) {}); (err == nil) != (size > 0) {
++			col.failClass(ht, "lru.NewWithEvict", "lru.NewWithEvict(%d): err %v", size, err)
++		} else if err == nil && (c.Cap() != size || c.Len() != 0 || len(c.Keys()) != 0) {
++			col.failClass(ht, "fresh", "lru.New(%d): Cap %d Len %d Keys %v", size, c.Cap(), c.Len(), c.Keys())
++		}
++		e := expirable.NewLRU[int, int](size, nil, 0)
++		wantCap := size
++		if size < 0 {
++			wantCap = 0
++		}
++		if e.Cap() != wantCap || e.Len() != 0 {
++			col.failClass(ht, "expirable", "expirable.NewLRU(%d): Cap %d Len %d", size, e.Cap(), e.Len())
++		}
++		// 2Q: size must be positive, ratios within [0, 1]
++		ratios := []float64{-0.5, 0, 0.1, 0.25, 0.5, 0.75, 1, 1.5}
++		rr, gr := pick(ht, ratios), pick(ht, ratios)
++		valid := size > 0 && rr >= 0 && rr <= 1 && gr >= 0 && gr <= 1
++		q, err := lru.New2QParams[int, int](size, rr, gr)
++		if valid && Known.twoQueueSmallGhostFails && int(float64(size)*gr) == 0 {
++			if err == nil {
++				col.failClass(ht, "2Q ghost", "New2QParams(%d, %g, %g) accepted (the recorded failure is gone?)", size, rr, gr)
++			}
++			return
++		}
++		if (err == nil) != valid {
++			col.failClass(ht, "New2QParams", "New2QParams(%d, %g, %g): err %v, valid %v", size, rr, gr, err, valid)
++		} else if err == nil && (q.Cap() != size || q.Len() != 0 || len(q.Keys()) != 0) {
++			col.failClass(ht, "fresh 2Q", "New2QParams(%d, %g, %g): Cap %d Len %d", size, rr, gr, q.Cap(), q.Len())
++		}
++	})
++}
++
++// TestHegelTwoQueue: TwoQueueCache against the 2Q model under random sequences: Len, Cap,
++// Keys (frequent first, each oldest first), Values, Contains, Peek, Get; the cache never
++// exceeds its size; a key seen twice is in the frequent list and survives a burst of new
++// keys while the recent list is above its share.
++func TestHegelTwoQueue(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		size := drawInt(ht, 1, 12)
++		rr, gr := lru.Default2QRecentRatio, lru.Default2QGhostEntries
++		if chance(ht, 40) {
++			rr = pick(ht, []float64{0, 0.25, 0.5, 0.75, 1})
++			gr = pick(ht, []float64{0, 0.25, 0.5, 1})
++		}
++		if Known.twoQueueSmallGhostFails && int(float64(size)*gr) == 0 {
++			// New2QParams fails for these (golang-lru/2): pick a size whose ghost list is not empty
++			size = drawInt(ht, 4, 12)
++			if gr == 0 {
++				gr = 0.5
++			}
++		}
++		q, err := lru.New2QParams[int, int](size, rr, gr)
++		if err != nil {
++			col.failClass(ht, "New2QParams", "New2QParams(%d, %g, %g): %v", size, rr, gr, err)
++			return
++		}
++		m := newTwoQModel(size, rr, gr)
++		nops := drawInt(ht, 0, 50)
++		var trace []string
++		for i := 0; i < nops; i++ {
++			o := genOp(ht, false)
++			if o.name == "RemoveOldest" || o.name == "GetOldest" {
++				o.name = "Get"
++			}
++			if o.name == "Resize" {
++				o.n = drawInt(ht, 1, 12) // a ghost list resized to 0 is modelled (ghostAdd)
++			}
++			trace = append(trace, o.String())
++			where := func() string {
++				return fmt.Sprintf("2Q(size %d, recent %g, ghost %g): after %v", size, rr, gr, trace)
++			}
++			switch o.name {
++			case "Add":
++				q.Add(o.k, o.v)
++				m.add(o.k, o.v)
++			case "Get":
++				gv, gok := q.Get(o.k)
++				wv, wok := m.get(o.k)
++				if gok != wok || (gok && gv != wv) {
++					col.failClass(ht, "Get", "%s: Get(%d) = %d, %v; want %d, %v", where(), o.k, gv, gok, wv, wok)
++				}
++			case "Contains":
++				if got, want := q.Contains(o.k), m.contains(o.k); got != want {
++					col.failClass(ht, "Contains", "%s: Contains(%d) = %v, want %v", where(), o.k, got, want)
++				}
++			case "Peek":
++				gv, gok := q.Peek(o.k)
++				wv, wok := m.peek(o.k)
++				if gok != wok || (gok && gv != wv) {
++					col.failClass(ht, "Peek", "%s: Peek(%d) = %d, %v; want %d, %v", where(), o.k, gv, gok, wv, wok)
++				}
++			case "Remove":
++				q.Remove(o.k)
++				m.remove(o.k)
++			case "Purge":
++				q.Purge()
++				m.purge()
++			case "Resize":
++				if got, want := q.Resize(o.n), m.resize(o.n); got != want {
++					col.failClass(ht, "Resize", "%s: Resize evicted %d, want %d", where(), got, want)
++				}
++				size = o.n
++			}
++			if got, want := q.Len(), m.length(); got != want {
++				col.failClass(ht, "Len", "%s: Len %d, want %d", where(), got, want)
++			}
++			if q.Cap() != size {
++				col.failClass(ht, "Cap", "%s: Cap %d, want %d", where(), q.Cap(), size)
++			}
++			if q.Len() > size && !(Known.twoQueueOverfullAtFullRecent && rr == 1) {
++				col.failClass(ht, "Overfull", "%s: Len %d above size %d", where(), q.Len(), size)
++			}
++			if got, want := q.Keys(), m.keys(); !sameInts(got, want) {
++				col.failClass(ht, "Keys", "%s: Keys %v, want %v", where(), got, want)
++			}
++			if got, want := q.Values(), m.values(); !sameInts(got, want) {
++				col.failClass(ht, "Values", "%s: Values %v, want %v", where(), got, want)
++			}
++			for k := 0; k < keySpace; k++ {
++				wv, wok := m.peek(k)
++				gv, gok := q.Peek(k)
++				if gok != wok || (gok && gv != wv) || q.Contains(k) != wok {
++					col.failClass(ht, "PeekAll", "%s: Peek(%d) = %d, %v, Contains %v; want %d, %v", where(), k, gv, gok, q.Contains(k), wv, wok)
++				}
++			}
++		}
++		// the 2Q promise, independent of the model: with a fresh cache, a key added and then
++		// read is in the frequent list; adding size-1 fresh keys afterwards evicts from the
++		// recent list first while it holds more than its share, so the hot key survives when
++		// the recent share is below 1.
++		if size >= 4 && rr < 1 {
++			where := func() string {
++				return fmt.Sprintf("2Q(size %d, recent %g, ghost %g): after %v", size, rr, gr, trace)
++			}
++			q.Purge()
++			hot := 100
++			q.Add(hot, 1)
++			q.Get(hot)
++			for k := 200; k < 200+size; k++ {
++				q.Add(k, k)
++			}
++			if !q.Contains(hot) {
++				col.failClass(ht, "HotEvicted", "%s: a key read twice was evicted by %d fresh keys (recent ratio %g)", where(), size, rr)
++			}
++			if q.Len() > size {
++				col.failClass(ht, "Overfull", "%s: Len %d above size %d after the burst", where(), q.Len(), size)
++			}
++		}
++	})
++}
++
++// TestHegelConcurrent: the thread-safe caches under concurrent Add/Get/Remove keep Len at
++// or below the size and consistent with Keys, and every callback names a key that has been
++// added.
++func TestHegelConcurrent(t *testing.T) {
++	col := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		size := drawInt(ht, 1, 8)
++		var mu sync.Mutex
++		var evicted []kv
++		kind := pick(ht, []string{"lru.Cache", "expirable", "2Q"})
++		var add func(k, v int)
++		var lenKeys func() (int, []int)
++		switch kind {
++		case "lru.Cache":
++			c, _ := lru.NewWithEvict[int, int](size, func(k, v int) {
++				mu.Lock()
++				evicted = append(evicted, kv{k, v})
++				mu.Unlock()
++			})
++			add = func(k, v int) { c.Add(k, v); c.Get(k - 1); c.Peek(k + 1); c.Contains(k) }
++			lenKeys = func() (int, []int) { return c.Len(), c.Keys() }
++		case "expirable":
++			c := expirable.NewLRU[int, int](size, func(k, v int) {
++				mu.Lock()
++				evicted = append(evicted, kv{k, v})
++				mu.Unlock()
++			}, 0)
++			add = func(k, v int) { c.Add(k, v); c.Get(k - 1); c.Peek(k + 1); c.Contains(k) }
++			lenKeys = func() (int, []int) { return c.Len(), c.Keys() }
++		default:
++			if size < 2 {
++				size = 2
++			}
++			c, _ := lru.New2Q[int, int](size)
++			add = func(k, v int) { c.Add(k, v); c.Get(k - 1); c.Peek(k + 1); c.Contains(k) }
++			lenKeys = func() (int, []int) { return c.Len(), c.Keys() }
++		}
++		workers := drawInt(ht, 2, 4)
++		per := drawInt(ht, 1, 30)
++		var wg sync.WaitGroup
++		for w := 0; w < workers; w++ {
++			wg.Add(1)
++			go func(w int) {
++				defer wg.Done()
++				for i := 0; i < per; i++ {
++					add(w*100+i%(size+2), i)
++				}
++			}(w)
++		}
++		wg.Wait()
++		n, ks := lenKeys()
++		if n != len(ks) || n > size {
++			col.failClass(ht, "Len", "%s size %d: Len %d, Keys %v", kind, size, n, ks)
++		}
++		mu.Lock()
++		for _, e := range evicted {
++			if e.k < 0 || e.k >= workers*100+size+2 {
++				col.failClass(ht, "Callback", "%s: callback for an unknown key %v", kind, e)
++			}
++		}
++		mu.Unlock()
++	})
++}
++
++// TestHegelExpiry: expirable.LRU with a real TTL: entries older than the TTL are hidden by
++// Get, Peek, Keys and Values, entries refreshed by Add within the TTL survive, and after two
++// TTLs the cache is empty and every entry has been reported to the callback exactly once.
++// Few cases, since each sleeps for three TTLs.
++func TestHegelExpiry(t *testing.T) {
++	col := newCollector(t)
++	// 4 cases; HEGEL_TEST_CASES raises that to at most 8 (each case sleeps for three TTLs)
++	cases := 4
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > cases {
++			cases = 8
++		}
++	}
++	opts := []hegel.Option{hegel.WithTestCases(cases)}
++	hegel.Test(t, func(ht *hegel.T) {
++		const ttl = 200 * time.Millisecond
++		size := 0
++		if chance(ht, 50) {
++			size = drawInt(ht, 2, 6)
++		}
++		var mu sync.Mutex
++		evicted := map[int]int{}
++		c := expirable.NewLRU[int, int](size, func(k, v int) {
++			mu.Lock()
++			evicted[k]++
++			mu.Unlock()
++		}, ttl)
++		defer c.Close()
++		n := drawInt(ht, 1, 4)
++		if size > 0 && n > size {
++			n = size
++		}
++		for k := 0; k < n; k++ {
++			c.Add(k, k)
++		}
++		renew := drawInt(ht, 0, n)
++		time.Sleep(ttl / 2)
++		for k := n - renew; k < n; k++ {
++			c.Add(k, k+100)
++		}
++		// t = ttl + 40ms: the first batch (not renewed) has expired, the renewed keys have
++		// half a TTL left
++		time.Sleep(ttl/2 + 40*time.Millisecond)
++		keys := c.Keys()
++		for k := 0; k < n-renew; k++ {
++			if _, ok := c.Get(k); ok {
++				col.failClass(ht, "GetExpired", "size %d, %d keys, %d renewed: Get(%d) still ok after the TTL", size, n, renew, k)
++			}
++			if _, ok := c.Peek(k); ok {
++				col.failClass(ht, "PeekExpired", "size %d, %d keys, %d renewed: Peek(%d) still ok after the TTL", size, n, renew, k)
++			}
++			for _, kk := range keys {
++				if kk == k {
++					col.failClass(ht, "KeysExpired", "size %d, %d keys, %d renewed: Keys %v lists the expired %d", size, n, renew, keys, k)
++				}
++			}
++		}
++		for k := n - renew; k < n; k++ {
++			if v, ok := c.Get(k); !ok || v != k+100 {
++				col.failClass(ht, "GetRenewed", "size %d, %d keys, %d renewed: Get(%d) = %d, %v within the renewed TTL", size, n, renew, k, v, ok)
++			}
++		}
++		if len(c.Values()) != len(c.Keys()) {
++			col.failClass(ht, "ValuesKeys", "Values %v vs Keys %v", c.Values(), c.Keys())
++		}
++		if !Known.expiredVisibleAfterClose {
++			// a closed cache still hides expired entries (golang-lru/3 says otherwise)
++			c.Close()
++			for k := 0; k < n-renew; k++ {
++				if _, ok := c.Get(k); ok {
++					col.failClass(ht, "GetExpiredClosed", "size %d, %d keys, %d renewed: Get(%d) ok after Close", size, n, renew, k)
++				}
++			}
++			return
++		}
++		time.Sleep(2*ttl + 40*time.Millisecond)
++		if c.Len() != 0 || len(c.Keys()) != 0 {
++			col.failClass(ht, "NotEmpty", "size %d, %d keys, %d renewed: Len %d Keys %v three TTLs after the last Add", size, n, renew, c.Len(), c.Keys())
++		}
++		mu.Lock()
++		defer mu.Unlock()
++		for k := 0; k < n; k++ {
++			if evicted[k] != 1 {
++				col.failClass(ht, "CallbackCount", "size %d, %d keys, %d renewed: key %d reported %d times", size, n, renew, k, evicted[k])
++			}
++		}
++	}, opts...)
++}
+diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
+new file mode 100644
+index 0000000..521c132
+--- /dev/null
++++ b/hegel/hegel_test.go
+@@ -0,0 +1,149 @@
++package hegel
++
++// Hegel property tests for hashicorp/golang-lru, written for the Hegel zoo. See
++// targets/go/golang-lru/README.md.
++//
++// Oracle: a plain model of an LRU cache as an ordered list of (key, value) pairs, oldest first,
++// with a log of evictions; the 2Q cache is modelled by the published algorithm over three such
++// lists. Every cache type is driven by the same random operation sequences and compared with
++// the model after every step.
++//
++// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
++// through hegelOpts; a panic in the code under test is turned into a failure of the current
++// test case by property(). ZOO_COLLECT=1 makes the properties record their mismatches instead
++// of failing.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			return []hegel.Option{hegel.WithTestCases(v)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func drawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return drawInt(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++var collecting = os.Getenv("ZOO_COLLECT") != ""
++
++type collector struct {
++	name   string
++	mu     sync.Mutex
++	counts map[string]int
++	msgs   []string
++	bad    int
++}
++
++func newCollector(t *testing.T) *collector {
++	c := &collector{name: t.Name(), counts: map[string]int{}}
++	t.Cleanup(func() {
++		if !collecting {
++			return
++		}
++		keys := make([]string, 0, len(c.counts))
++		for k := range c.counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		var parts []string
++		for _, k := range keys {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, c.counts[k]))
++		}
++		fmt.Printf("COLLECT %s: %d mismatches; %s\n", c.name, c.bad, strings.Join(parts, " "))
++		for _, m := range c.msgs {
++			fmt.Printf("MISMATCH %s\n", m)
++		}
++	})
++	return c
++}
++
++func (c *collector) count(class string) {
++	c.mu.Lock()
++	c.counts[class]++
++	c.mu.Unlock()
++}
++
++func (c *collector) fail(ht *hegel.T, format string, args ...any) {
++	c.failClass(ht, "", format, args...)
++}
++
++// failClass is fail with a class: in collect mode the class is counted and only its first two
++// messages are kept.
++func (c *collector) failClass(ht *hegel.T, class string, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collecting {
++		c.mu.Lock()
++		c.bad++
++		if class != "" {
++			c.counts["mismatch "+class]++
++		}
++		if (class == "" && len(c.msgs) < 25) || (class != "" && c.counts["mismatch "+class] <= 2) {
++			c.msgs = append(c.msgs, c.name+": "+msg)
++		}
++		c.mu.Unlock()
++		return
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// --------------------------------------------------------------------------- known bugs
++
++// Known: the recorded bugs (bugs.toml). The model reproduces a behaviour while its switch is
++// on; the pins assert the documented behaviour and fail while the bug exists.
++var Known = struct {
++	// golang-lru/1: Resize accepts a size of zero or below (the constructors refuse it): the
++	// simple and thread-safe caches then evict every key as it is added (Add returns true and
++	// the eviction callback fires for the key just added), Cap() reports the bad size.
++	resizeAcceptsNonPositive bool
++	// golang-lru/2: New2Q(1), and New2QParams with a ghost ratio (or size * ratio) that rounds
++	// to zero, fail with the internal "must provide a positive size" although the documented
++	// validation passes.
++	twoQueueSmallGhostFails bool
++	// golang-lru/3: after Close, expirable.LRU's Get, Peek, Keys and Values return expired
++	// entries as live ones.
++	expiredVisibleAfterClose bool
++	// golang-lru/4: simplelru.LRU.Purge invokes the eviction callback before removing the
++	// entry (every other path removes first), so the callback finds the key still present
++	// and a Remove from it fires the callback a second time.
++	purgeCallbackBeforeRemoval bool
++	// golang-lru/5: a TwoQueueCache with recentRatio 1 exceeds its size: re-adding a key from
++	// the ghost list when the recent list is full and the frequent list empty evicts nothing.
++	twoQueueOverfullAtFullRecent bool
++}{true, true, true, true, true}
