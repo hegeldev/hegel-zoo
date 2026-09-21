@@ -84,3 +84,8 @@ leave the new mapping's range; FromProto/MergeWithProto do not apply MaxDecodeIn
   an exact rank boundary may answer with the value one rank below; accepted.
 - Reweight(0) of summary statistics whose sum has already overflowed to +-Inf leaves a NaN
   sum; not counted.
+- One development run of `TestHegelEncoding` (500 cases) saw a single proto round trip of a
+  one-point sketch (linear mapping, alpha 0.2, sparse store) decode by `FromProto` to a bin
+  tens of indexes away (-2.5e11 for -0.6). It did not recur in 3300 further cases, with and
+  without the race detector, and the dense store has no shared state; the diagnostic now
+  prints both stores' bins so a recurrence can be read. Unreproduced, not recorded.
