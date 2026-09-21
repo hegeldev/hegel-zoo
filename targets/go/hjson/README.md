@@ -62,16 +62,22 @@ plain test per bug), requires `hegel.dev/go/hegel v0.6.33` in go.mod and raises 
   struct fields, lists and maps, as map keys) marshals to Hjson that decodes to what
   encoding/json writes for it; a failing `MarshalJSON` fails `Marshal`; maps with
   `TextMarshaler` keys are written in key order.
+- **Comment round trips**: a hand-written document of the grammar model (comments of the three
+  kinds wherever the syntax allows them, optional commas, braceless root, multiline strings),
+  read into a `Node` (whitespace kept as comments, or comments only) and written with its
+  comments, denotes the same value (up to the recorded string bugs, `expectedDecode`); the
+  written text, read and written once more, does not change again (checked for documents
+  without CR or multiline strings; trailing blanks on a line do not count).
 
 ## Properties
 
 `TestHegelJSON`, `TestHegelParse`, `TestHegelRoundTrip`, `TestHegelTypedRoundTrip`,
 `TestHegelNodeFixedPoint`, `TestHegelOrderedMap`, `TestHegelNodeAPI`, `TestHegelTypedHints`,
-`TestHegelMarshalers`.
+`TestHegelMarshalers`, `TestHegelCommentRoundTrip`.
 
 ## Bugs
 
-Sixteen, in `bugs.toml`. The parser combines no `\u` surrogate pairs (1); `Node.Insert` shadows
+Nineteen, in `bugs.toml`. The parser combines no `\u` surrogate pairs (1); `Node.Insert` shadows
 its return values (2); the encoder's single-line `'''` form loses leading whitespace (4) and
 breaks the document for strings ending in a quote (5); quoteless strings are trimmed of Unicode
 spaces the encoder does not quote (6); multi-line `comment` tags are split on `Eol`, so CRLF
@@ -83,12 +89,16 @@ blank line before a multiline string in an array (10); `1.` fails with "Internal
 (13) and sorts `TextMarshaler` map keys by their Go value rather than their text (15); the
 type hint that keeps a quoteless number a string is missing for `TextUnmarshaler` slice
 elements, map values and fields behind a nil pointer (14) and for keys encoding/json folds onto
-a field but `strings.ToLower` does not (16).
+a field but `strings.ToLower` does not (16). Reading comments into a `Node` and writing them
+back doubles a comment after a root scalar (17) and turns a multiline string after a key comment
+ending in a line feed into a differently indented one that reads back changed (18). A string
+spelling a number beyond float64 is written quoteless, and the text then fails to read into
+`interface{}` (19).
 
 ## Modelled as recorded
 
-- Strings: the models reproduce bugs 4, 5, 6 and 9 (`stringOutcome`); strings that break the
-  document are skipped and counted.
+- Strings: the models reproduce bugs 4, 5, 6, 9 and 19 (`stringOutcome`); strings that break
+  the document are skipped and counted.
 - Node fixed point: the doubled base indentation (3, not for a braceless root object), the
   doubled CR (8, not on a key line whose bracket follows, not inside multiline strings — the
   latter and strings ending in a colon are skipped) and the blank line before a multiline
@@ -99,18 +109,23 @@ a field but `strings.ToLower` does not (16).
   map values and fields behind a nil pointer (14) and looks fields up by `strings.ToLower` (16);
   the Marshaler model replaces pointer-receiver marshalers by their fields (13) and sorts
   `TextMarshaler` map keys by `fmt %v` of the key (15).
+- The comment round trip skips the fixed-point check for a root scalar with trailing comments
+  or whitespace (17) and skips documents with a multiline string after a comment or a kept
+  line end (18).
 - The grammar model generates no `1.`-style numbers, no exponents beyond float64 and no root
   quoteless strings with a colon; surrogate pairs decode as two U+FFFD (1) in both decoding
   properties.
 
 ## Not tested
 
-`json.Unmarshaler` destinations, the `hjson-cli` tool, the comment-carrying `Node` round trip
-of hand-written documents (comments in every position), the nesting-depth limits, the
-`Marshal`/`Unmarshal` of `Node` trees inside other values.
+`json.Unmarshaler` destinations, the `hjson-cli` tool, the nesting-depth limits, the
+`Marshal`/`Unmarshal` of `Node` trees inside other values, the exact comment placement of the
+`Node` round trip (only the value and the fixed point are checked).
 
 ## History
 
 - 2026-09-21: created at v4.7.1 (`033fae8`); 12 bugs.
 - 2026-09-21: typed destinations (`TestHegelTypedHints`) and Marshaler values
   (`TestHegelMarshalers`); bugs 13-16.
+- 2026-09-21: comment round trips of hand-written documents (`TestHegelCommentRoundTrip`);
+  bugs 17-19.
