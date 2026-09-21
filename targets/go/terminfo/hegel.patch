@@ -1,0 +1,1705 @@
+diff --git a/go.mod b/go.mod
+index 4d73d2b..bafb3b4 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,3 +1,9 @@
+ module github.com/xo/terminfo
+ 
+-go 1.25
++go 1.26.0
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++	hegel.dev/go/hegel v0.6.33 // indirect
++)
+diff --git a/hegel/hegel_model_test.go b/hegel/hegel_model_test.go
+new file mode 100644
+index 0000000..4b3d907
+--- /dev/null
++++ b/hegel/hegel_model_test.go
+@@ -0,0 +1,787 @@
++package hegel
++
++// The oracle side: ncurses' tic compiles generated terminfo sources, infocmp reads the compiled
++// files back and tput evaluates parameterized strings. This file holds the capability tables,
++// the source-escaping of strings, the parser of infocmp's output, the entry and program
++// generators and the runners.
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++
++	"github.com/xo/terminfo"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- cap tables
++
++var (
++	shortBool   = map[string]int{}
++	shortNum    = map[string]int{}
++	shortString = map[string]int{}
++	allShort    = map[string]bool{}
++)
++
++func init() {
++	for i := 0; i < terminfo.CapCountBool; i++ {
++		shortBool[terminfo.BoolCapNameShort(i)] = i
++	}
++	for i := 0; i < terminfo.CapCountNum; i++ {
++		shortNum[terminfo.NumCapNameShort(i)] = i
++	}
++	for i := 0; i < terminfo.CapCountString; i++ {
++		shortString[terminfo.StringCapNameShort(i)] = i
++	}
++	for _, m := range []map[string]int{shortBool, shortNum, shortString} {
++		for k := range m {
++			allShort[k] = true
++		}
++	}
++}
++
++// --------------------------------------------------------------------------- source escaping
++
++// tiQuote renders b in terminfo source syntax, choosing among the equivalent forms terminfo(5)
++// allows. b holds no NUL (a compiled string cannot).
++func tiQuote(tc hegel.TestCase, b []byte) string {
++	var s strings.Builder
++	for i, c := range b {
++		edge := i == 0 || i == len(b)-1
++		octal := fmt.Sprintf(`\%03o`, c)
++		switch {
++		case c == ' ':
++			if edge || chance(tc, 30) {
++				s.WriteString(`\s`)
++			} else {
++				s.WriteByte(' ')
++			}
++		case c == 27:
++			s.WriteString(pick(tc, []string{`\E`, `\e`, octal}))
++		case c == ',':
++			s.WriteString(`\,`)
++		case c == '^':
++			s.WriteString(`\^`)
++		case c == '\\':
++			s.WriteString(`\\`)
++		case c == ':':
++			s.WriteString(`\:`)
++		case c == '\n':
++			s.WriteString(pick(tc, []string{`\n`, octal}))
++		case c == '\r':
++			s.WriteString(pick(tc, []string{`\r`, octal}))
++		case c == '\t':
++			s.WriteString(pick(tc, []string{`\t`, octal}))
++		case c == '\b':
++			s.WriteString(pick(tc, []string{`\b`, octal}))
++		case c == '\f':
++			s.WriteString(pick(tc, []string{`\f`, octal}))
++		case c == 127:
++			if i > 0 && b[i-1] == '%' { // tic keeps %^X literal (the xor operator)
++				s.WriteString(octal)
++			} else {
++				s.WriteString(pick(tc, []string{`^?`, octal}))
++			}
++		case c >= 1 && c <= 26:
++			if chance(tc, 50) && !(i > 0 && b[i-1] == '%') {
++				s.WriteString("^" + string(rune('A'+c-1)))
++			} else {
++				s.WriteString(octal)
++			}
++		case c < 32 || c >= 127:
++			s.WriteString(octal)
++		default:
++			s.WriteByte(c)
++		}
++	}
++	return s.String()
++}
++
++// icUnquote decodes a string as infocmp prints it: \E, \n, \r, \t, \b, \f, \s, \^, \,, \:, \\,
++// \ooo (three octal digits), \0 (the byte 0200, which stands for NUL) and ^X.
++func icUnquote(s string) ([]byte, error) {
++	var out []byte
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		switch c {
++		case '\\':
++			i++
++			if i >= len(s) {
++				return nil, errors.New("trailing backslash")
++			}
++			d := s[i]
++			switch {
++			case d >= '0' && d <= '7':
++				n, k := 0, 0
++				for k < 3 && i+k < len(s) && s[i+k] >= '0' && s[i+k] <= '7' {
++					n = n*8 + int(s[i+k]-'0')
++					k++
++				}
++				i += k - 1
++				if k == 1 && n == 0 {
++					n = 0x80
++				}
++				if n > 255 {
++					return nil, fmt.Errorf("octal escape %d out of range", n)
++				}
++				out = append(out, byte(n))
++			case d == 'E' || d == 'e':
++				out = append(out, 27)
++			case d == 'n' || d == 'l':
++				out = append(out, '\n')
++			case d == 'r':
++				out = append(out, '\r')
++			case d == 't':
++				out = append(out, '\t')
++			case d == 'b':
++				out = append(out, '\b')
++			case d == 'f':
++				out = append(out, '\f')
++			case d == 'a':
++				out = append(out, 7)
++			case d == 's':
++				out = append(out, ' ')
++			case d == '^' || d == ',' || d == ':' || d == '\\':
++				out = append(out, d)
++			default:
++				return nil, fmt.Errorf("unknown escape \\%c", d)
++			}
++		case '^':
++			i++
++			if i >= len(s) {
++				return nil, errors.New("trailing caret")
++			}
++			if s[i] == '?' {
++				out = append(out, 127)
++			} else {
++				out = append(out, s[i]&0x1f)
++			}
++		case '%':
++			// the parameter language: infocmp prints the character after % raw (%^ is the xor
++			// operator, not a control character), and tic reads it the same way
++			out = append(out, c)
++			if i+1 < len(s) && s[i+1] == '^' {
++				i++
++				out = append(out, '^')
++			}
++		default:
++			out = append(out, c)
++		}
++	}
++	return out, nil
++}
++
++// --------------------------------------------------------------------------- entries
++
++// icEntry is an entry as infocmp -1 -x prints it, by short capability name.
++type icEntry struct {
++	names     []string
++	bools     map[string]bool
++	nums      map[string]int
++	strs      map[string][]byte
++	cancelled map[string]bool
++}
++
++func newIC() *icEntry {
++	return &icEntry{bools: map[string]bool{}, nums: map[string]int{}, strs: map[string][]byte{}, cancelled: map[string]bool{}}
++}
++
++// infocmpEntry runs infocmp on the entry name in database dir.
++func infocmpEntry(dir, name string) (*icEntry, error) {
++	out, err := exec.Command("infocmp", "-1", "-x", "-A", dir, name).Output()
++	if err != nil {
++		var ee *exec.ExitError
++		if errors.As(err, &ee) {
++			return nil, fmt.Errorf("infocmp: %v: %s", err, ee.Stderr)
++		}
++		return nil, err
++	}
++	e := newIC()
++	for _, ln := range strings.Split(string(out), "\n") {
++		if ln == "" || ln[0] == '#' {
++			continue
++		}
++		if ln[0] != '\t' {
++			e.names = strings.Split(strings.TrimSuffix(ln, ","), "|")
++			continue
++		}
++		ln = strings.TrimSuffix(ln[1:], ",")
++		i := strings.IndexAny(ln, "=#@")
++		if i < 0 {
++			e.bools[ln] = true
++			continue
++		}
++		cap, rest := ln[:i], ln[i+1:]
++		switch ln[i] {
++		case '@':
++			e.cancelled[cap] = true
++		case '#':
++			n, err := strconv.ParseInt(rest, 0, 64)
++			if err != nil {
++				return nil, fmt.Errorf("infocmp: bad number %q", ln)
++			}
++			e.nums[cap] = int(n)
++		case '=':
++			b, err := icUnquote(rest)
++			if err != nil {
++				return nil, fmt.Errorf("infocmp: %s: %v (value %q)", cap, err, rest)
++			}
++			if b == nil {
++				b = []byte{}
++			}
++			e.strs[cap] = b
++		}
++	}
++	return e, nil
++}
++
++// tiToIC presents a decoded Terminfo the way infocmp prints an entry.
++func tiToIC(ti *terminfo.Terminfo) *icEntry {
++	e := newIC()
++	e.names = ti.Names
++	for i, v := range ti.Bools {
++		if v {
++			e.bools[terminfo.BoolCapNameShort(i)] = true
++		}
++	}
++	for i := range ti.BoolsM {
++		e.cancelled[terminfo.BoolCapNameShort(i)] = true
++	}
++	for i, v := range ti.Nums {
++		if v >= 0 {
++			e.nums[terminfo.NumCapNameShort(i)] = v
++		}
++	}
++	for i := range ti.NumsM {
++		e.cancelled[terminfo.NumCapNameShort(i)] = true
++	}
++	for i, v := range ti.Strings {
++		if v != nil { // absent strings are nil entries; present empty ones are empty slices
++			e.strs[terminfo.StringCapNameShort(i)] = v
++		}
++	}
++	for i := range ti.StringsM {
++		e.cancelled[terminfo.StringCapNameShort(i)] = true
++	}
++	for i, v := range ti.ExtBools {
++		if v {
++			e.bools[string(ti.ExtBoolNames[i])] = true
++		}
++	}
++	for i, v := range ti.ExtNums {
++		e.nums[string(ti.ExtNumNames[i])] = v
++	}
++	for i, v := range ti.ExtStrings {
++		e.strs[string(ti.ExtStringNames[i])] = v
++	}
++	for i := range ti.ExtStringsM {
++		e.cancelled[string(ti.ExtStringNames[i])] = true
++	}
++	return e
++}
++
++// icDiff lists the differences between two entries.
++func icDiff(a, b *icEntry) []string {
++	var d []string
++	if strings.Join(a.names, "|") != strings.Join(b.names, "|") {
++		d = append(d, fmt.Sprintf("names %q vs %q", a.names, b.names))
++	}
++	for _, k := range union(a.bools, b.bools) {
++		if a.bools[k] != b.bools[k] {
++			d = append(d, fmt.Sprintf("bool %s: %v vs %v", k, a.bools[k], b.bools[k]))
++		}
++	}
++	for _, k := range union(a.nums, b.nums) {
++		va, oka := a.nums[k]
++		vb, okb := b.nums[k]
++		if oka != okb || va != vb {
++			d = append(d, fmt.Sprintf("num %s: %d,%v vs %d,%v", k, va, oka, vb, okb))
++		}
++	}
++	for _, k := range union(a.strs, b.strs) {
++		va, oka := a.strs[k]
++		vb, okb := b.strs[k]
++		if oka != okb || !bytes.Equal(va, vb) {
++			i := 0
++			for i < len(va) && i < len(vb) && va[i] == vb[i] {
++				i++
++			}
++			d = append(d, fmt.Sprintf("string %s (lengths %d, %d; first difference at %d): %q,%v vs %q,%v", k, len(va), len(vb), i, va, oka, vb, okb))
++		}
++	}
++	for _, k := range union(a.cancelled, b.cancelled) {
++		if a.cancelled[k] != b.cancelled[k] {
++			d = append(d, fmt.Sprintf("cancelled %s: %v vs %v", k, a.cancelled[k], b.cancelled[k]))
++		}
++	}
++	return d
++}
++
++func union[T any](a, b map[string]T) []string {
++	seen := map[string]bool{}
++	for k := range a {
++		seen[k] = true
++	}
++	for k := range b {
++		seen[k] = true
++	}
++	keys := make([]string, 0, len(seen))
++	for k := range seen {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++// --------------------------------------------------------------------------- entry generator
++
++// entry is a generated terminfo entry: the source-independent values.
++type entry struct {
++	name      string
++	names     []string // name, aliases and description, as they appear in the compiled file
++	bools     map[string]bool
++	bcancel   []string // cancelled bools: tic drops them (absent in the file)
++	nums      map[string]int
++	strs      map[string][]byte
++	cancelled map[string]bool // cancelled nums and strings (standard and extended)
++	order     []string        // caps in source order
++}
++
++func (e *entry) expected() *icEntry {
++	ic := newIC()
++	ic.names = e.names
++	for k, v := range e.bools {
++		ic.bools[k] = v
++	}
++	for k, v := range e.nums {
++		ic.nums[k] = v
++	}
++	for k, v := range e.strs {
++		if k == "acsc" {
++			v = repairAcsc(v)
++		}
++		ic.strs[k] = v
++	}
++	for k, v := range e.cancelled {
++		ic.cancelled[k] = v
++	}
++	return ic
++}
++
++var (
++	aliasChars = []string{"a", "b", "z", "0", "9", "+", "-", "x", "t", "m"}
++	descChars  = []string{"a", "Z", "0", " ", " ", "-", "/", "(", ")", "\"", ";", "#", "=", "@", ":", "'", "!", "&", "~", "."}
++	extChars   = []string{"A", "Z", "a", "z", "0", "9", "_", "b", "y"}
++	extStarts  = []string{"A", "Z", "a", "z", "X", "k"} // tic rejects a leading underscore
++)
++
++func genString(tc hegel.TestCase) []byte {
++	n := drawInt(tc, 0, 12)
++	if chance(tc, 5) {
++		n = drawInt(tc, 40, 300)
++	}
++	b := make([]byte, n)
++	for i := range b {
++		switch {
++		case chance(tc, 55):
++			b[i] = byte(drawInt(tc, 33, 126))
++		case chance(tc, 50):
++			b[i] = byte(pick(tc, []int{' ', ',', '^', '\\', ':', '%', '$', '<', '>', '\'', '"', '#', '=', '@', '|'}))
++		default:
++			b[i] = byte(drawInt(tc, 1, 255))
++		}
++	}
++	// a caret or backslash right after a percent sign is the parameter language's business:
++	// tic keeps %^X literal and infocmp prints %\ raw, so the oracle is ambiguous there
++	for i := 0; i+1 < len(b); i++ {
++		if b[i] == '%' && (b[i+1] == '^' || b[i+1] == '\\' || b[i+1] < 32 || b[i+1] == 127) {
++			b[i+1] = 'x' // infocmp prints a control character after % as ^X, which its own %^ convention makes ambiguous
++		}
++		// infocmp prints a backslash that follows a caret raw (\^\ for the two bytes), which
++		// no reader can undo, and the byte 0200 as \0 even before an octal digit
++		if (b[i] == '^' && b[i+1] == '\\') || (b[i] == 0x80 && b[i+1] >= '0' && b[i+1] <= '7') {
++			b[i+1] = 'x'
++		}
++	}
++	return b
++}
++
++// repairAcsc is ncurses' repair_acsc (progs/dump_entry.c), which infocmp applies to an acsc
++// whose keys are not strictly increasing: mappings sorted by key, the last mapping of a
++// repeated key kept, an odd trailing byte appended.
++func repairAcsc(b []byte) []byte {
++	inOrder := true
++	for i, last := 0, -1; i < len(b); i += 2 {
++		if int(b[i]) <= last {
++			inOrder = false
++			break
++		}
++		last = int(b[i])
++	}
++	if inOrder {
++		return b
++	}
++	var mapped [256]byte
++	var extra byte
++	for i := 0; i < len(b); i++ {
++		if i+1 < len(b) {
++			mapped[b[i]] = b[i+1]
++			i++
++		} else {
++			extra = b[i]
++		}
++	}
++	var out []byte
++	for k, v := range mapped {
++		if v != 0 {
++			out = append(out, byte(k), v)
++		}
++	}
++	if extra != 0 {
++		out = append(out, extra)
++	}
++	return out
++}
++
++// acscRepeatsKey reports whether a key of the acsc mapping occurs twice with different values.
++func acscRepeatsKey(b []byte) bool {
++	seen := map[byte]byte{}
++	for i := 0; i+1 < len(b); i += 2 {
++		if v, ok := seen[b[i]]; ok && v != b[i+1] {
++			return true
++		}
++		seen[b[i]] = b[i+1]
++	}
++	return false
++}
++
++// genAcsc draws an acsc value: pairs with unique keys in order, or an odd-length one.
++func genAcsc(tc hegel.TestCase) []byte {
++	if chance(tc, 15) {
++		b := make([]byte, 2*drawInt(tc, 0, 3)+1)
++		for i := range b {
++			b[i] = byte(drawInt(tc, 'a', 'z'))
++		}
++		return b
++	}
++	keys := []byte("jklmnopqrstuvwxyz`afgh~{}|+,-.0")
++	n := drawInt(tc, 0, 6)
++	var b []byte
++	for i := 0; i < n; i++ {
++		k := keys[drawInt(tc, 0, len(keys)-1)]
++		b = append(b, k, byte(drawInt(tc, 33, 126)))
++	}
++	return b
++}
++
++func genExtName(tc hegel.TestCase, used map[string]bool) string {
++	for {
++		s := pick(tc, extStarts)
++		for n := drawInt(tc, 2, 5); n > 0; n-- { // two-letter names are termcap codes to tic
++			s += pick(tc, extChars)
++		}
++		if !allShort[s] && !used[s] && !strings.HasPrefix(s, "OT") {
++			used[s] = true
++			return s
++		}
++	}
++}
++
++// genEntry draws an entry and renders it as terminfo source.
++func genEntry(tc hegel.TestCase, id string) (*entry, string) {
++	e := &entry{name: "z" + id, bools: map[string]bool{}, nums: map[string]int{}, strs: map[string][]byte{}, cancelled: map[string]bool{}}
++	e.names = []string{e.name}
++	for n := drawInt(tc, 0, 2); n > 0; n-- {
++		a := pick(tc, []string{"a", "z", "0", "9", "t"}) // tic files each alias under its first character
++		for k := drawInt(tc, 0, 5); k > 0; k-- {
++			a += pick(tc, aliasChars)
++		}
++		e.names = append(e.names, a)
++	}
++	if chance(tc, 85) {
++		d := pick(tc, descChars)
++		for k := drawInt(tc, 0, 15); k > 0; k-- {
++			d += pick(tc, descChars)
++		}
++		d = strings.TrimSpace(d)
++		if d != "" {
++			e.names = append(e.names, d)
++		}
++	}
++	used := map[string]bool{}
++	var caps []string
++	add := func(k, src string) {
++		used[k] = true
++		caps = append(caps, src)
++		e.order = append(e.order, k)
++	}
++	// standard bools
++	for n := drawInt(tc, 0, 8); n > 0; n-- {
++		k := terminfo.BoolCapNameShort(drawInt(tc, 0, terminfo.CapCountBool-1))
++		if used[k] {
++			continue
++		}
++		if chance(tc, 10) {
++			e.bcancel = append(e.bcancel, k)
++			add(k, k+"@")
++			continue
++		}
++		e.bools[k] = true
++		add(k, k)
++	}
++	// standard nums
++	for n := drawInt(tc, 0, 6); n > 0; n-- {
++		k := terminfo.NumCapNameShort(drawInt(tc, 0, terminfo.CapCountNum-1))
++		if used[k] {
++			continue
++		}
++		if chance(tc, 10) {
++			e.cancelled[k] = true
++			add(k, k+"@")
++			continue
++		}
++		v := genNum(tc)
++		e.nums[k] = v
++		add(k, fmt.Sprintf("%s#%d", k, v))
++	}
++	// standard strings
++	for n := drawInt(tc, 0, 8); n > 0; n-- {
++		k := terminfo.StringCapNameShort(drawInt(tc, 0, terminfo.CapCountString-1))
++		if used[k] || k == "box1" || k == "box2" {
++			continue // tic derives acsc from box1
++		}
++		if chance(tc, 10) {
++			e.cancelled[k] = true
++			add(k, k+"@")
++			continue
++		}
++		var v []byte
++		if k == "acsc" {
++			v = genAcsc(tc)
++		} else {
++			v = genString(tc)
++		}
++		e.strs[k] = v
++		add(k, k+"="+tiQuote(tc, v))
++	}
++	// extended caps
++	for n := drawInt(tc, 0, 3); n > 0; n-- {
++		k := genExtName(tc, used)
++		e.bools[k] = true
++		add(k, k)
++	}
++	for n := drawInt(tc, 0, 3); n > 0; n-- {
++		k := genExtName(tc, used)
++		v := genNum(tc)
++		if v > 32767 {
++			v = drawInt(tc, 0, 32767) // tic stores a larger extended number as cancelled unless a standard one forces the 32-bit format
++		}
++		e.nums[k] = v
++		add(k, fmt.Sprintf("%s#%d", k, v))
++	}
++	for n := drawInt(tc, 0, 4); n > 0; n-- {
++		k := genExtName(tc, used)
++		if chance(tc, 15) {
++			e.cancelled[k] = true
++			add(k, k+"@")
++			continue
++		}
++		v := genString(tc)
++		e.strs[k] = v
++		add(k, k+"="+tiQuote(tc, v))
++	}
++	var src strings.Builder
++	src.WriteString(strings.Join(e.names, "|"))
++	src.WriteString(",\n")
++	for _, c := range caps {
++		src.WriteString("\t" + c + ",\n")
++	}
++	return e, src.String()
++}
++
++func genNum(tc hegel.TestCase) int {
++	switch {
++	case chance(tc, 55):
++		return drawInt(tc, 0, 255)
++	case chance(tc, 70):
++		return drawInt(tc, 256, 32767)
++	default:
++		return drawInt(tc, 32768, 2147483647)
++	}
++}
++
++// --------------------------------------------------------------------------- runners
++
++// ticCompile compiles the source into dir/db, returning the database directory.
++func ticCompile(dir, src string) (string, error) {
++	f := filepath.Join(dir, "e.ti")
++	if err := os.WriteFile(f, []byte(src), 0o644); err != nil {
++		return "", err
++	}
++	db := filepath.Join(dir, "db")
++	out, err := exec.Command("tic", "-x", "-o", db, f).CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("tic: %v: %s", err, out)
++	}
++	return db, nil
++}
++
++// tput evaluates the string capability cap of the entry name in database db with the params.
++func tput(db, name, cap string, params []int) ([]byte, error) {
++	args := []string{"-T", name, "--", cap}
++	for _, p := range params {
++		args = append(args, strconv.Itoa(p))
++	}
++	cmd := exec.Command("tput", args...)
++	cmd.Env = []string{"TERMINFO=" + db, "PATH=/usr/bin:/bin"}
++	var stderr bytes.Buffer
++	cmd.Stderr = &stderr
++	out, err := cmd.Output()
++	if err != nil {
++		return nil, fmt.Errorf("tput: %v: %s", err, stderr.String())
++	}
++	return out, nil
++}
++
++// --------------------------------------------------------------------------- program generator
++
++// program is a parameterized string with the parameters it is evaluated with.
++type program struct {
++	text   string
++	params [9]int
++}
++
++var (
++	litChars   = []string{"a", "Z", "0", "9", " ", ";", "[", "]", "(", ")", ".", "-", "#", "!", "~", "x", ":", "{", "}", "'", "?", "+", ",", "\\", "^", "\t"}
++	binOps     = []string{"+", "-", "*", "/", "m", "&", "|", "^", "=", "<", ">", "A", "O"}
++	unOps      = []string{"!", "~"}
++	varNames   = []string{"a", "b", "z"} // dynamic only: static variables persist across Printf calls but not across tput processes
++	charLits   = []string{"a", "Z", "0", " ", "!", "#", "-", ";", "[", "x", "~", "@"}
++	convChars  = []string{"d", "o", "x", "X"}
++	flagChars  = []string{"#", " ", "0", "-"}
++	tputCaps   = []string{"cup", "hpa", "vpa", "csr", "u6", "u7", "sgr", "setaf"}
++	pushSmalls = []string{"%p", "%p", "%{"} // tic rewrites %'c' as %{n}, so the generator writes the latter
++)
++
++// genProgram draws a parameterized string of n items; params are in 1..255 so that %c right
++// after a push is a printable or high byte, never NUL.
++func genProgram(tc hegel.TestCase, depth int) string {
++	var b strings.Builder
++	n := drawInt(tc, 0, 6)
++	if depth == 0 {
++		n = drawInt(tc, 1, 8)
++	}
++	for k := 0; k < n; k++ {
++		r := drawInt(tc, 1, 100)
++		switch {
++		case r <= 18: // literal
++			for j := drawInt(tc, 1, 3); j > 0; j-- {
++				b.WriteString(pick(tc, litChars))
++			}
++		case r <= 22:
++			b.WriteString("%%")
++		case r <= 40: // push a parameter, a constant or a char
++			b.WriteString(genPush(tc))
++		case r <= 47: // push and print as a char
++			b.WriteString(genPush(tc) + "%c")
++		case r <= 62: // operators
++			if chance(tc, 80) {
++				b.WriteString("%" + pick(tc, binOps))
++			} else {
++				b.WriteString("%" + pick(tc, unOps))
++			}
++		case r <= 66:
++			b.WriteString("%i")
++		case r <= 72:
++			b.WriteString("%P" + pick(tc, varNames))
++		case r <= 76:
++			b.WriteString("%g" + pick(tc, varNames))
++		case r <= 88: // print
++			if chance(tc, 60) {
++				b.WriteString("%" + pick(tc, convChars))
++			} else {
++				b.WriteString(genFormat(tc))
++			}
++		default: // conditional
++			if depth >= 2 {
++				b.WriteString("%p1%d")
++				continue
++			}
++			b.WriteString("%?" + genProgram(tc, depth+1) + "%t" + genProgram(tc, depth+1))
++			for chance(tc, 30) {
++				b.WriteString("%e" + genProgram(tc, depth+1) + "%t" + genProgram(tc, depth+1))
++			}
++			if chance(tc, 60) {
++				b.WriteString("%e" + genProgram(tc, depth+1))
++			}
++			b.WriteString("%;")
++		}
++	}
++	return b.String()
++}
++
++func genPush(tc hegel.TestCase) string {
++	switch pick(tc, pushSmalls) {
++	case "%p":
++		return "%p" + strconv.Itoa(drawInt(tc, 1, 9))
++	case "%{":
++		if chance(tc, 80) {
++			return "%{" + strconv.Itoa(drawInt(tc, 1, 255)) + "}"
++		}
++		return "%{" + strconv.Itoa(drawInt(tc, 0, 999)) + "}"
++	}
++	return "%'" + pick(tc, charLits) + "'"
++}
++
++// genFormat draws a printf-style conversion: %[:][flags][width][.precision]conv. The + flag is
++// left out (ncurses 6.4 does not implement it after the colon), and - needs the colon.
++func genFormat(tc hegel.TestCase) string {
++	conv := pick(tc, convChars)
++	s := "%"
++	colon := chance(tc, 40)
++	prec := ""
++	if chance(tc, 30) {
++		prec = "." + strconv.Itoa(drawInt(tc, 0, 5))
++	}
++	var flags string
++	for n := drawInt(tc, 0, 2); n > 0; n-- {
++		f := pick(tc, flagChars)
++		switch {
++		case f == "-" && !colon:
++			continue
++		case f == "#" && (conv == "d" || prec != ""): // C ignores it for d and prints a lone 0 for %#.0o of zero, Go does not
++			continue
++		case f == " " && (conv != "d" || prec != ""): // C ignores it for unsigned conversions and prints a space for % .0d of zero, Go does not
++			continue
++		case f == "0" && strings.Contains(flags, "#"), f == "#" && strings.Contains(flags, "0"):
++			continue // C counts the 0x prefix in a zero-padded width, Go does not
++		}
++		flags += f
++	}
++	if colon {
++		s += ":"
++	}
++	s += flags
++	if chance(tc, 60) {
++		s += strconv.Itoa(drawInt(tc, 1, 9))
++	}
++	return s + prec + conv
++}
++
++func genParams(tc hegel.TestCase) [9]int {
++	var p [9]int
++	for i := range p {
++		if chance(tc, 70) {
++			p[i] = drawInt(tc, 1, 20)
++		} else {
++			p[i] = drawInt(tc, 1, 255)
++		}
++	}
++	return p
++}
+diff --git a/hegel/hegel_parm_test.go b/hegel/hegel_parm_test.go
+new file mode 100644
+index 0000000..0adab1d
+--- /dev/null
++++ b/hegel/hegel_parm_test.go
+@@ -0,0 +1,359 @@
++package hegel
++
++// A model of the terminfo parameter language as ncurses' tparm evaluates it (terminfo(5),
++// "Parameterized Strings"): every value is a C int, a condition is true when non-zero, %c
++// writes the low byte (0200 for zero), %o/%x/%X convert as unsigned.
++//
++// With typed set the model follows xo/terminfo's typed stack instead: values keep the Go type
++// they were pushed with (int for parameters and %{n}, byte for %'c', bool for comparisons and
++// logic), and a pop of another type yields the zero value. The two differ only where the
++// recorded typing bugs bite; everything else (skipping, variables, formats, arithmetic) is
++// shared, so a mismatch between the package and the typed model is a new finding.
++
++import (
++	"bytes"
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++type pkind byte
++
++const (
++	kInt pkind = iota
++	kBool
++	kByte
++	kNil
++)
++
++type pval struct {
++	n int
++	k pkind
++}
++
++type parmVM struct {
++	z      string
++	pos    int
++	stack  []pval
++	params [9]int
++	vars   [26]pval
++	// the package's typing: bools (comparisons and logic) and chars (%'c' and %c) are
++	// distinct from ints
++	typedBools, typedChars bool
++	out                    bytes.Buffer
++	// flags for cases the property leaves out
++	negUnsigned bool // %o/%x/%X of a negative value (C prints two's complement)
++	nulChar     bool // %c of a non-zero multiple of 256 (a NUL truncates the C string)
++	overflow    bool // an intermediate result outside int32
++	hashZero    bool // %#x or %#X of zero (C prints 0, Go 0x0)
++	multiI      bool // a second %i executed (ncurses increments once, the package every time)
++	incremented bool
++}
++
++func (vm *parmVM) push(v pval) { vm.stack = append(vm.stack, v) }
++
++func (vm *parmVM) pop() pval {
++	if len(vm.stack) == 0 {
++		return pval{0, kNil}
++	}
++	v := vm.stack[len(vm.stack)-1]
++	vm.stack = vm.stack[:len(vm.stack)-1]
++	return v
++}
++
++// popInt pops a number: in C mode every value is one; in typed mode only ints count.
++func (vm *parmVM) popInt() int {
++	v := vm.pop()
++	if (vm.typedBools && v.k == kBool) || (vm.typedChars && v.k == kByte) {
++		return 0
++	}
++	return v.n
++}
++
++// popBool pops a condition.
++func (vm *parmVM) popBool() bool {
++	v := vm.pop()
++	if vm.typedBools {
++		return v.k == kBool && v.n != 0
++	}
++	if vm.typedChars && v.k == kByte {
++		return false
++	}
++	return v.n != 0
++}
++
++// popByte pops a character.
++func (vm *parmVM) popByte() (byte, bool) {
++	v := vm.pop()
++	if vm.typedChars {
++		if v.k != kByte {
++			return 0, true
++		}
++		return byte(v.n), true
++	}
++	if vm.typedBools && v.k == kBool {
++		v.n = 0
++	}
++	n := v.n
++	if n == 0 {
++		return 0x80, true
++	}
++	if n%256 == 0 {
++		vm.nulChar = true
++		return 0, false
++	}
++	return byte(n), true
++}
++
++func (vm *parmVM) pushInt(n int) {
++	if n > 2147483647 || n < -2147483648 {
++		vm.overflow = true
++	}
++	vm.push(pval{n, kInt})
++}
++
++func (vm *parmVM) pushBool(b bool) {
++	n := 0
++	if b {
++		n = 1
++	}
++	vm.push(pval{n, kBool})
++}
++
++func (vm *parmVM) peek() (byte, bool) {
++	if vm.pos >= len(vm.z) {
++		return 0, false
++	}
++	return vm.z[vm.pos], true
++}
++
++// skip advances past the %e (when stopAtElse) or %; that closes the current conditional.
++func (vm *parmVM) skip(stopAtElse bool) {
++	level := 0
++	for vm.pos < len(vm.z) {
++		c := vm.z[vm.pos]
++		vm.pos++
++		if c != '%' || vm.pos >= len(vm.z) {
++			continue
++		}
++		d := vm.z[vm.pos]
++		vm.pos++
++		switch d {
++		case '?':
++			level++
++		case ';':
++			if level == 0 {
++				return
++			}
++			level--
++		case 'e':
++			if level == 0 && stopAtElse {
++				return
++			}
++		}
++	}
++}
++
++// format applies a printf conversion to n with C semantics on the flag subset the generator
++// uses (-, #, space, 0, width, precision).
++func (vm *parmVM) format(spec string, conv byte, n int) {
++	if conv != 'd' {
++		if n < 0 {
++			vm.negUnsigned = true
++		}
++		if n == 0 && strings.Contains(spec, "#") && (conv == 'x' || conv == 'X') {
++			vm.hashZero = true
++		}
++	}
++	fmt.Fprintf(&vm.out, "%"+spec+string(conv), n)
++}
++
++// run evaluates the string.
++func (vm *parmVM) run() string {
++	for vm.pos < len(vm.z) {
++		c := vm.z[vm.pos]
++		vm.pos++
++		if c != '%' {
++			vm.out.WriteByte(c)
++			continue
++		}
++		c, ok := vm.peek()
++		if !ok {
++			break
++		}
++		vm.pos++
++		switch c {
++		case '%':
++			vm.out.WriteByte('%')
++		case 'd', 'o', 'x', 'X':
++			vm.format("", c, vm.popInt())
++		case ':', '#', ' ', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.':
++			// a format: flags, width, precision, conversion (%- and %+ are operators, so those
++			// flags need the colon)
++			spec := ""
++			if c != ':' {
++				spec = string(c)
++			}
++			for {
++				d, ok := vm.peek()
++				if !ok {
++					return vm.out.String()
++				}
++				vm.pos++
++				if d == 'd' || d == 'o' || d == 'x' || d == 'X' {
++					vm.format(spec, d, vm.popInt())
++					break
++				}
++				spec += string(d)
++			}
++		case 'c':
++			b, ok := vm.popByte()
++			if !ok {
++				return vm.out.String()
++			}
++			vm.out.WriteByte(b)
++		case 'p':
++			d, ok := vm.peek()
++			if !ok {
++				break
++			}
++			vm.pos++
++			if d >= '1' && d <= '9' {
++				vm.pushInt(vm.params[d-'1'])
++			} else {
++				vm.pushInt(0)
++			}
++		case 'P':
++			d, ok := vm.peek()
++			if !ok {
++				break
++			}
++			vm.pos++
++			v := vm.pop()
++			if d >= 'a' && d <= 'z' {
++				vm.vars[d-'a'] = v
++			}
++		case 'g':
++			d, ok := vm.peek()
++			if !ok {
++				break
++			}
++			vm.pos++
++			if d >= 'a' && d <= 'z' {
++				vm.push(vm.vars[d-'a'])
++			} else {
++				vm.push(pval{0, kNil})
++			}
++		case '\'':
++			d, ok := vm.peek()
++			if !ok {
++				break
++			}
++			vm.pos++
++			vm.push(pval{int(d), kByte})
++			vm.pos++ // the closing quote
++		case '{':
++			n := 0
++			for {
++				d, ok := vm.peek()
++				if !ok {
++					return vm.out.String()
++				}
++				vm.pos++
++				if d < '0' || d > '9' {
++					break
++				}
++				n = n*10 + int(d-'0')
++			}
++			vm.pushInt(n)
++		case '+', '-', '*', '/', 'm', '&', '|', '^':
++			b, a := vm.popInt(), vm.popInt()
++			switch c {
++			case '+':
++				vm.pushInt(a + b)
++			case '-':
++				vm.pushInt(a - b)
++			case '*':
++				vm.pushInt(a * b)
++			case '/':
++				if b == 0 {
++					vm.pushInt(0)
++				} else {
++					vm.pushInt(a / b)
++				}
++			case 'm':
++				if b == 0 {
++					vm.pushInt(0)
++				} else {
++					vm.pushInt(a % b)
++				}
++			case '&':
++				vm.pushInt(a & b)
++			case '|':
++				vm.pushInt(a | b)
++			case '^':
++				vm.pushInt(a ^ b)
++			}
++		case '=', '>', '<':
++			b, a := vm.popInt(), vm.popInt()
++			switch c {
++			case '=':
++				vm.pushBool(a == b)
++			case '>':
++				vm.pushBool(a > b)
++			case '<':
++				vm.pushBool(a < b)
++			}
++		case 'A', 'O':
++			b, a := vm.popBool(), vm.popBool()
++			if c == 'A' {
++				vm.pushBool(a && b)
++			} else {
++				vm.pushBool(a || b)
++			}
++		case '!':
++			vm.pushBool(!vm.popBool())
++		case '~':
++			vm.pushInt(^vm.popInt())
++		case 'i':
++			// ncurses increments the first two parameters at most once per evaluation
++			if vm.incremented {
++				vm.multiI = true
++			} else {
++				vm.params[0]++
++				vm.params[1]++
++				vm.incremented = true
++			}
++		case '?', ';':
++		case 't':
++			if !vm.popBool() {
++				vm.skip(true)
++			}
++		case 'e':
++			vm.skip(false)
++		}
++	}
++	return vm.out.String()
++}
++
++// parm evaluates z with the parameters; typedBools and typedChars select the package's typing.
++func parm(z string, params [9]int, typedBools, typedChars bool) (string, *parmVM) {
++	vm := &parmVM{z: z, params: params, typedBools: typedBools, typedChars: typedChars}
++	for i := range vm.vars {
++		vm.vars[i] = pval{0, kNil}
++	}
++	s := vm.run()
++	return s, vm
++}
++
++// usesAny reports whether z contains one of the operators.
++func usesAny(z string, ops ...string) bool {
++	for _, op := range ops {
++		if strings.Contains(z, op) {
++			return true
++		}
++	}
++	return false
++}
++
++var _ = strconv.Itoa
+diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
+new file mode 100644
+index 0000000..0f30bc4
+--- /dev/null
++++ b/hegel/hegel_pins_test.go
+@@ -0,0 +1,126 @@
++package hegel
++
++// Pins: the documented behaviour behind each recorded bug. They fail while the bug exists and
++// are listed as expected failures in target.toml.
++
++import (
++	"os"
++	"testing"
++
++	"github.com/xo/terminfo"
++)
++
++// compileEntry compiles a source with tic into a fresh directory and opens it.
++func compileEntry(t *testing.T, name, src string) (*terminfo.Terminfo, error) {
++	t.Helper()
++	dir, err := os.MkdirTemp("", "hegel-ti-")
++	if err != nil {
++		t.Fatalf("mkdir: %v", err)
++	}
++	t.Cleanup(func() { os.RemoveAll(dir) })
++	db, err := ticCompile(dir, src)
++	if err != nil {
++		t.Fatalf("%v", err)
++	}
++	return decodeSafely(db, name)
++}
++
++// terminfo/1: an acsc of odd length (tic accepts it, infocmp prints it) must not crash Open.
++func TestHegelPinOddAcsc(t *testing.T) {
++	ti, err := compileEntry(t, "zpin1", "zpin1|t,\n\tacsc=abc, cup=x,\n")
++	if err != nil {
++		t.Fatalf("Open: %v", err)
++	}
++	if string(ti.Strings[terminfo.AcsChars]) != "abc" && len(ti.Strings[terminfo.AcsChars]) != 2 {
++		t.Fatalf("acsc = %q", ti.Strings[terminfo.AcsChars])
++	}
++}
++
++// terminfo/2: an integer is true when non-zero, and comparisons yield the integers 1 and 0
++// (terminfo(5): %t "then", %! logical not, %= %< %> push 1 or 0).
++func TestHegelPinIntsAreTrue(t *testing.T) {
++	for _, tc := range []struct {
++		prog   string
++		params []any
++		want   string
++	}{
++		{"%?%p1%tX%eY%;", []any{1}, "X"},
++		{"%?%p1%tX%eY%;", []any{0}, "Y"},
++		{"%p1%p2%=%d", []any{3, 3}, "1"},
++		{"%p1%p2%<%d", []any{3, 3}, "0"},
++		{"%p1%!%d", []any{0}, "1"},
++		{"%p1%!%d", []any{7}, "0"},
++		{"%p1%p2%A%d", []any{1, 2}, "1"},
++		{"%?%p1%p3%|%t;7%;", []any{1, 0, 0}, ";7"},     // xterm's sgr: reverse or standout
++		{"%?%p6%t;1%;", []any{0, 0, 0, 0, 0, 1}, ";1"}, // xterm's sgr: bold
++	} {
++		if got := terminfo.Printf([]byte(tc.prog), tc.params...); got != tc.want {
++			t.Errorf("Printf(%q, %v) = %q, want %q", tc.prog, tc.params, got, tc.want)
++		}
++	}
++}
++
++// terminfo/3: %'c' pushes the character's code as a number and %c prints a number as a
++// character; tic writes every printable %{n} as %'c', so cup=\E=%p1%' '%+%c (adm3a and many
++// others) depends on it.
++func TestHegelPinCharsAreInts(t *testing.T) {
++	for _, tc := range []struct {
++		prog   string
++		params []any
++		want   string
++	}{
++		{"%p1%c", []any{65}, "A"},
++		{"%'A'%d", nil, "65"},
++		{"%p1%'A'%+%c", []any{1}, "B"},
++		{"\x1b=%p1%' '%+%c%p2%' '%+%c", []any{3, 4}, "\x1b=#$"},
++		{"%'a'%p1%-%d", []any{1}, "96"},
++	} {
++		if got := terminfo.Printf([]byte(tc.prog), tc.params...); got != tc.want {
++			t.Errorf("Printf(%q, %v) = %q, want %q", tc.prog, tc.params, got, tc.want)
++		}
++	}
++}
++
++// terminfo/4: an entry without acsc has no acsc after decoding.
++func TestHegelPinNoAcscWhenAbsent(t *testing.T) {
++	ti, err := compileEntry(t, "zpin4", "zpin4|t,\n\tsetaf=\\E[3%p1%dm, cup=x,\n")
++	if err != nil {
++		t.Fatalf("Open: %v", err)
++	}
++	if v, ok := ti.Strings[terminfo.AcsChars]; ok && v != nil {
++		t.Fatalf("Strings[AcsChars] = %q, want absent", v)
++	}
++	if v, ok := ti.StringCapsShort()["acsc"]; ok {
++		t.Fatalf("StringCapsShort()[acsc] = %q, want absent", v)
++	}
++}
++
++// terminfo/6: the canonical acsc keeps the last mapping of a repeated key, as ncurses' repair
++// (which the package's canonicalization cites) does: infocmp prints acsc=g9oUxa~e for
++// acsc=xa~egHg9oU.
++func TestHegelPinAcscRepeatedKey(t *testing.T) {
++	ti, err := compileEntry(t, "zpin6", "zpin6|t,\n\tacsc=xa~egHg9oU, cup=x,\n")
++	if err != nil {
++		t.Fatalf("Open: %v", err)
++	}
++	if got := string(ti.Strings[terminfo.AcsChars]); got != "g9oUxa~e" {
++		t.Fatalf("acsc = %q, want %q", got, "g9oUxa~e")
++	}
++}
++
++// terminfo/5: %: followed directly by the conversion character is a plain conversion
++// (terminfo(5): %[[:]flags][width[.precision]][doxXs], every part but the conversion optional).
++func TestHegelPinColonConversion(t *testing.T) {
++	for _, tc := range []struct {
++		prog string
++		want string
++	}{
++		{"%p1%:d|%p1%d", "5|5"},
++		{"%p1%:x;%p1%:o", "5;5"},
++		{"%p1%:X", "5"},
++	} {
++		if got := terminfo.Printf([]byte(tc.prog), 5); got != tc.want {
++			t.Errorf("Printf(%q, 5) = %q, want %q", tc.prog, got, tc.want)
++		}
++	}
++}
+diff --git a/hegel/hegel_props_test.go b/hegel/hegel_props_test.go
+new file mode 100644
+index 0000000..72916fa
+--- /dev/null
++++ b/hegel/hegel_props_test.go
+@@ -0,0 +1,253 @@
++package hegel
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/xo/terminfo"
++	"hegel.dev/go/hegel"
++)
++
++var caseSeq struct {
++	sync.Mutex
++	n int
++}
++
++// nextID returns a fresh identifier for an entry name.
++func nextID() string {
++	caseSeq.Lock()
++	defer caseSeq.Unlock()
++	caseSeq.n++
++	return fmt.Sprintf("%d", caseSeq.n)
++}
++
++// decodeSafely calls Open, turning a panic into an error.
++func decodeSafely(dir, name string) (ti *terminfo.Terminfo, err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("panic: %v", r)
++		}
++	}()
++	return terminfo.Open(dir, name)
++}
++
++// gateAcsc removes the empty acsc the package reports for an entry without one (bug 4) while
++// the switch is on, reporting whether it did.
++func gateAcsc(x, ic *icEntry) bool {
++	if !Known.emptyAcscIfAbsent {
++		return false
++	}
++	v, ok := x.strs["acsc"]
++	if _, has := ic.strs["acsc"]; ok && !has && len(v) == 0 {
++		delete(x.strs, "acsc")
++		return true
++	}
++	return false
++}
++
++// TestHegelDecode: an entry compiled by tic decodes to what infocmp reads back from the same
++// file (and both agree with the generated source).
++func TestHegelDecode(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		e, src := genEntry(ht, nextID())
++		dir, err := os.MkdirTemp("", "hegel-ti-")
++		if err != nil {
++			ht.Fatalf("mkdir: %v", err)
++		}
++		defer os.RemoveAll(dir)
++		db, err := ticCompile(dir, src)
++		if err != nil {
++			c.failClass(ht, "TicRejected", "tic rejected the source:\n%s\n%v", src, err)
++			return
++		}
++		ic, err := infocmpEntry(db, e.name)
++		if err != nil {
++			c.failClass(ht, "Infocmp", "infocmp failed on\n%s\n%v", src, err)
++			return
++		}
++		if d := icDiff(e.expected(), ic); len(d) > 0 {
++			c.failClass(ht, "Source", "generated source and infocmp differ:\n%s\n%s", src, strings.Join(d, "\n"))
++			return
++		}
++		ti, err := decodeSafely(db, e.name)
++		if err != nil {
++			if Known.oddAcscPanics && len(e.strs["acsc"])%2 == 1 && strings.HasPrefix(err.Error(), "panic: runtime error: index out of range") {
++				c.count("known odd acsc panic")
++				return
++			}
++			c.failClass(ht, "Open", "Open failed on\n%s\n%v", src, err)
++			return
++		}
++		x := tiToIC(ti)
++		gated := gateAcsc(x, ic)
++		if Known.acscFirstWins && acscRepeatsKey(e.strs["acsc"]) {
++			// the package keeps the first mapping of a repeated key, ncurses the last
++			delete(x.strs, "acsc")
++			delete(ic.strs, "acsc")
++			c.count("known acsc repeated key")
++		}
++		if d := icDiff(x, ic); len(d) > 0 {
++			c.failClass(ht, "Decode", "Open and infocmp differ on\n%s\n%s", src, strings.Join(d, "\n"))
++			return
++		}
++		switch {
++		case gated:
++			c.count("ok, known empty acsc removed")
++		case len(e.cancelled) > 0:
++			c.count("ok with cancelled caps")
++		case len(e.nums) > 0 && maxNum(e.nums) > 32767:
++			c.count("ok 32-bit format")
++		default:
++			c.count("ok")
++		}
++	})
++}
++
++func maxNum(m map[string]int) int {
++	mx := 0
++	for _, v := range m {
++		if v > mx {
++			mx = v
++		}
++	}
++	return mx
++}
++
++var dbFiles = func() []string {
++	fs, _ := filepath.Glob("/usr/share/terminfo/*/*")
++	return fs
++}()
++
++// TestHegelDatabase: the installed terminfo database decodes to what infocmp prints.
++func TestHegelDatabase(t *testing.T) {
++	if len(dbFiles) == 0 {
++		t.Skip("no /usr/share/terminfo")
++	}
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		f := pick(ht, dbFiles)
++		name := filepath.Base(f)
++		ic, err := infocmpEntry("/usr/share/terminfo", name)
++		if err != nil {
++			c.count("infocmp failed")
++			return
++		}
++		ti, err := decodeSafely("/usr/share/terminfo", name)
++		if err != nil {
++			c.failClass(ht, "Open", "Open(%s) failed: %v", name, err)
++			return
++		}
++		x := tiToIC(ti)
++		gated := gateAcsc(x, ic)
++		if d := icDiff(x, ic); len(d) > 0 {
++			c.failClass(ht, "Decode", "Open(%s) and infocmp differ:\n%s", name, strings.Join(d, "\n"))
++			return
++		}
++		if gated {
++			c.count("ok, known empty acsc removed")
++		} else {
++			c.count("ok")
++		}
++	})
++}
++
++// TestHegelPrintf: a parameterized string compiled into an entry evaluates, through Printf with
++// int parameters, to what tput prints for the same parameters (and to the model of tparm,
++// which validates the oracle; under the typing switches the package must match the model with
++// its typing instead).
++func TestHegelPrintf(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		prog := genProgram(ht, 0)
++		if !strings.Contains(prog, "%p") {
++			prog += "%p1%Pa" // tput evaluates a string only when it refers to a parameter
++		}
++		params := genParams(ht)
++		cap := pick(ht, tputCaps)
++		name := "z" + nextID()
++		src := name + "|t,\n\t" + cap + "=" + tiQuote(ht, []byte(prog)) + ",\n"
++		dir, err := os.MkdirTemp("", "hegel-ti-")
++		if err != nil {
++			ht.Fatalf("mkdir: %v", err)
++		}
++		defer os.RemoveAll(dir)
++		db, err := ticCompile(dir, src)
++		if err != nil {
++			c.failClass(ht, "TicRejected", "tic rejected\n%s\n%v", src, err)
++			return
++		}
++		ti, err := decodeSafely(db, name)
++		if err != nil {
++			c.failClass(ht, "Open", "Open failed on\n%s\n%v", src, err)
++			return
++		}
++		z := ti.Strings[shortString[cap]]
++		if z == nil {
++			c.failClass(ht, "Missing", "compiled entry has no %s (source %q)", cap, src)
++			return
++		}
++		if string(z) != prog {
++			c.count("tic rewrote the string")
++			prog = string(z)
++		}
++		if Known.colonConversion && usesAny(prog, "%:d", "%:o", "%:x", "%:X") {
++			c.count("known colon conversion")
++			return
++		}
++		want, vm := parm(prog, params, false, false)
++		switch {
++		case vm.negUnsigned:
++			c.count("left out: unsigned conversion of a negative")
++			return
++		case vm.nulChar:
++			c.count("left out: NUL from %c")
++			return
++		case vm.overflow:
++			c.count("left out: int32 overflow")
++			return
++		case vm.hashZero:
++			c.count("left out: %#x of zero")
++			return
++		case vm.multiI:
++			c.count("left out: second %i")
++			return
++		}
++		out, err := tput(db, name, cap, params[:])
++		if err != nil {
++			c.failClass(ht, "Tput", "tput failed on %q %v: %v", prog, params, err)
++			return
++		}
++		if string(out) != want {
++			c.failClass(ht, "Model", "tput(%q, %v) = %q, the model gives %q", prog, params, out, want)
++			return
++		}
++		args := make([]any, 9)
++		for i, p := range params {
++			args[i] = p
++		}
++		got := terminfo.Printf(z, args...)
++		if got == want {
++			c.count("ok")
++			return
++		}
++		if Known.intsNeverTrue || Known.charsAreNotInts {
++			typed, tvm := parm(prog, params, Known.intsNeverTrue, Known.charsAreNotInts)
++			if got == typed {
++				c.count("known typing")
++				return
++			}
++			if tvm.negUnsigned || tvm.nulChar || tvm.overflow || tvm.hashZero || tvm.multiI {
++				c.count("left out: on the typed path")
++				return
++			}
++			c.failClass(ht, "Mismatch", "Printf(%q, %v) = %q; tput and the model give %q, the typed model %q", prog, params, got, want, typed)
++			return
++		}
++		c.failClass(ht, "Mismatch", "Printf(%q, %v) = %q, tput gives %q", prog, params, got, want)
++	})
++}
+diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
+new file mode 100644
+index 0000000..3984926
+--- /dev/null
++++ b/hegel/hegel_test.go
+@@ -0,0 +1,135 @@
++package hegel
++
++// Hegel property tests for xo/terminfo, written for the Hegel zoo. See
++// targets/go/terminfo/README.md.
++//
++// Oracle: ncurses. tic compiles generated terminfo sources, infocmp reads the compiled files
++// back and tput evaluates parameterized strings; the package must agree with them.
++//
++// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
++// through hegelOpts; a panic in the code under test is turned into a failure of the current
++// test case by property(). ZOO_COLLECT=1 makes the properties record their mismatches instead
++// of failing.
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			return []hegel.Option{hegel.WithTestCases(v)}
++		}
++	}
++	return nil
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++}
++
++func drawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return drawInt(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++var collecting = os.Getenv("ZOO_COLLECT") != ""
++
++type collector struct {
++	name   string
++	mu     sync.Mutex
++	counts map[string]int
++	msgs   []string
++	bad    int
++}
++
++func newCollector(t *testing.T) *collector {
++	c := &collector{name: t.Name(), counts: map[string]int{}}
++	t.Cleanup(func() {
++		if !collecting {
++			return
++		}
++		keys := make([]string, 0, len(c.counts))
++		for k := range c.counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		var parts []string
++		for _, k := range keys {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, c.counts[k]))
++		}
++		fmt.Printf("COLLECT %s: %d mismatches; %s\n", c.name, c.bad, strings.Join(parts, " "))
++		for _, m := range c.msgs {
++			fmt.Printf("MISMATCH %s\n", m)
++		}
++	})
++	return c
++}
++
++func (c *collector) count(class string) {
++	c.mu.Lock()
++	c.counts[class]++
++	c.mu.Unlock()
++}
++
++func (c *collector) fail(ht *hegel.T, format string, args ...any) {
++	c.failClass(ht, "", format, args...)
++}
++
++// failClass is fail with a class: in collect mode the class is counted and only its first two
++// messages are kept.
++func (c *collector) failClass(ht *hegel.T, class string, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collecting {
++		c.mu.Lock()
++		c.bad++
++		if class != "" {
++			c.counts["mismatch "+class]++
++		}
++		if (class == "" && len(c.msgs) < 25) || (class != "" && c.counts["mismatch "+class] <= 2) {
++			c.msgs = append(c.msgs, c.name+": "+msg)
++		}
++		c.mu.Unlock()
++		return
++	}
++	ht.Fatalf("%s", msg)
++}
++
++// --------------------------------------------------------------------------- known bugs
++
++// Known: the recorded bugs (bugs.toml). The model reproduces a behaviour while its switch is
++// on; the pins assert the documented behaviour and fail while the bug exists.
++var Known = struct {
++	oddAcscPanics     bool // 1: Decode panics on an acsc string of odd length
++	intsNeverTrue     bool // 2: an int is never true for %t, %!, %A, %O; a comparison result prints as 0
++	charsAreNotInts   bool // 3: a %'c' constant is 0 in arithmetic; %c of an int writes NUL
++	emptyAcscIfAbsent bool // 4: an entry without acsc decodes with an empty acsc present
++	colonConversion   bool // 5: %: directly followed by the conversion swallows the following text as format
++	acscFirstWins     bool // 6: acsc canonicalization keeps the first mapping of a repeated key, ncurses the last
++}{true, true, true, true, true, true}
