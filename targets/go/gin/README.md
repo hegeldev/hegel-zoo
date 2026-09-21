@@ -6,14 +6,15 @@ wildcard segments at one position (since v1.7) and with escaped colons. Tested h
 tree's matching of requests to routes with `:param` and `*catch-all` wildcards, the conflicts
 it refuses at registration, `cleanPath`, and the `Engine` options that decide what happens
 when nothing matches - `RedirectTrailingSlash`, `RedirectFixedPath`, `HandleMethodNotAllowed`,
-`RemoveExtraSlash`, `UseRawPath`, `UnescapePathValues`.
+`RemoveExtraSlash`, `UseRawPath`, `UnescapePathValues`; and (part 2) the `binding` package's
+mapping of form, query and URI values into structs and maps by their `form`/`uri` tags.
 
 ## Build
 
 The patch adds `hegel.dev/go/hegel` to `go.mod` (and lets `go mod tidy` move `golang.org/x/sys`
-from v0.41.0 to v0.44.0) and five `hegel_zoo_*_test.go` files in package `gin` itself: the
-tree and `cleanPath` are unexported. Every identifier carries the `hz` prefix to stay clear of
-the upstream tests. `go test -count=1 -run TestHegel -v .`
+from v0.41.0 to v0.44.0), five `hegel_zoo_*_test.go` files in package `gin` itself (the tree
+and `cleanPath` are unexported) and three in package `binding`. Every identifier carries the
+`hz` prefix to stay clear of the upstream tests. `go test -count=1 -run TestHegel -v . ./binding`
 
 ## Oracles
 
@@ -39,6 +40,20 @@ the upstream tests. `go test -count=1 -run TestHegel -v .`
   (`HandleMethodNotAllowed`); else 404. `RemoveExtraSlash` cleans the path first; `UseRawPath`
   matches `URL.RawPath` when set, unescaping params if `UnescapePathValues`. The Location is
   what `http.Redirect` makes of the new path.
+- A model of the form mapping (`MapFormWithTag`, behind `ShouldBind`, `ShouldBindQuery`,
+  `ShouldBindUri`, `ShouldBindHeader`) from docs/doc.md ("Bind default value if none provided",
+  "Collection format for arrays", "Bind Uri", the `time_format` examples, "Bind form-data request
+  with custom struct") and the `BindUnmarshaler` doc: a field is set from the entry named by its
+  tag (the field name without one; `-` skips it); a missing or empty value gives the `default=`;
+  the value is parsed by its kind (whitespace trimmed except for strings, an empty value the
+  zero), by `UnmarshalText` when `parser=encoding.TextUnmarshaler` says so, by `UnmarshalParam`
+  when the type has it, `time.Time` by `time_format`/`time_utc`/`time_location` (the unix
+  formats case-insensitively), structs and maps from JSON; a slice or array takes every instance,
+  split by the `collection_format` separator (`;` separates the instances of a default for multi
+  and csv), an array wanting exactly its length; pointers are allocated only when something below
+  them is set; the fields of a nested struct, named or embedded, are looked up by their own keys.
+  A `map[string][]string` destination receives every entry, a `map[string]string` the last value
+  of each; other maps with string keys are an error.
 
 ## Properties
 
@@ -52,6 +67,15 @@ the upstream tests. `go test -count=1 -run TestHegel -v .`
 - `TestHegelEngine`: every combination of the six options, requests including escapes, `.`,
   `..`, doubled slashes and case changes, against the engine model (status, body, Location,
   Allow); the engine's panic is a possible answer.
+- `TestHegelFormMapping`: struct types built at runtime with `reflect.StructOf` (1-4 fields,
+  nested to depth 2, embedded structs and pointers to them, slices, arrays, pointers, maps,
+  `time.Time`, `time.Duration`, a `BindUnmarshaler` and a `TextUnmarshaler` type, `any`) with
+  generated tags (keys of their own or shared, `default=`, `parser=`, stray options,
+  `collection_format`, the time tags, a tag of the other name) and a form drawn for the keys
+  the type looks up, with values fit for each field and some bad ones, against the model (the
+  value reached and the error, by message).
+- `TestHegelFormMapDest`: map destinations of six types, by value and by pointer, nil or holding
+  an entry, forms with keys without values, against the model (result, error, or panic).
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
 
@@ -66,13 +90,23 @@ after a `:param` (gin/4); `UseRawPath` turns `+` into a space (gin/5); the skipp
 leaks between the method trees of one request, giving a 405 with a wrong `Allow` and, with four
 or more method trees, a panic (gin/7, fixed upstream by 3b08cd7 two days before this pin).
 
+Five more in the binding package: binding into a nil map panics, as does a key without values
+(gin/8); a struct with a pointer field of its own type - a tree node, a linked list - binds
+until the stack overflows, a fatal error no middleware recovers (gin/9); a destination passed
+by value panics where the JSON binding returns an error (gin/10); an empty value for a struct
+or map field is a JSON error where every other kind takes its zero (gin/11); an empty value for
+a slice or array is not replaced by its `default=` as a scalar's is (gin/12).
+
 ## Modelled as recorded
 
 The tree's stopping rules (where it does not backtrack: gin/1, gin/2), its trailing-slash
 recommendations (gin/3, gin/6), the unreachable catch-all after a param (gin/4),
 `url.QueryUnescape` for values (gin/5) and the shared stack across trees, including its
-overflow (gin/7), are in the model behind `HZKnown` switches, so the properties agree with the
-package while the bugs exist; `ZOO_KNOWN_OFF=name` turns a switch off and each then fails.
+overflow (gin/7), the nil-map and empty-list panics (gin/8), the JSON error on an empty value
+(gin/11) and the default not applied to an empty value (gin/12) are in the models behind
+`HZKnown` switches (one struct per package), so the properties agree with the package while the
+bugs exist; `ZOO_KNOWN_OFF=name` turns a switch off and each then fails. gin/9 and gin/10 have
+pins only: the generated types have no cycles and are always addressed.
 
 Design notes on the tree that the model follows:
 
@@ -85,12 +119,36 @@ Design notes on the tree that the model follows:
   the lower-case then the upper-case child.
 - The other method trees are consulted in the order the methods were first registered.
 
+Design notes on the form mapping that the model follows:
+
+- A scalar takes the first value of its key, a `map[string]string` destination the last.
+- A whitespace-only value is not "empty": it is trimmed to nothing and parsed as the zero, not
+  replaced by the default. The default of a scalar applies to a missing and to an empty value.
+- A default of a collection is split at `;` for multi and csv (the docs' rule), and is one
+  instance split by the separator for ssv, tsv and pipes; an empty default gives one zero
+  element.
+- A collection type that itself implements `BindUnmarshaler` (or `TextUnmarshaler` with the
+  parser tag) takes the first instance whole; otherwise the element type does, per element.
+- A named struct field whose key is present is filled from JSON and its fields are not looked
+  up; without the key (and without a default) its fields are looked up by their own keys, in the
+  flat namespace of the form; an embedded struct is never filled from JSON.
+- Array elements are written in place until the first error; a slice is set only when every
+  element parsed.
+- `any`, `uintptr` and other kinds without a parse are "unknown type" errors when their key is
+  present or they have a default, and are skipped otherwise. An unknown `collection_format` is
+  an error only when the field has values or a default.
+- `time_utc` is read with `strconv.ParseBool`, an unreadable value meaning false; the unix
+  formats ignore `time_utc` and `time_location`.
+
 ## Not tested
 
-The `binding` package (form, query, JSON, URI binding: a candidate for a second part),
-`UseEscapedPath`, `X-Forwarded-Prefix` in redirects, `NoRoute`/`NoMethod` handlers,
-`HandleContext`, middleware, rendering.
+In the `binding` package: multipart file fields, the validator (`binding:"required"` and the
+rest of go-playground/validator), the JSON/XML/YAML/TOML/protobuf/msgpack decoders (thin
+wrappers), header binding beyond the shared mapping. In the engine: `UseEscapedPath`,
+`X-Forwarded-Prefix` in redirects, `NoRoute`/`NoMethod` handlers, `HandleContext`, middleware,
+rendering.
 
 ## History
 
 - 2026-09-21: new target, four properties, 7 bugs.
+- 2026-09-21: part 2, the binding package's form mapping, two properties, 5 more bugs.
