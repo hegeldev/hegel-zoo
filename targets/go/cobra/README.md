@@ -8,11 +8,13 @@ by the first positional argument, skipping the flags and their values (`stripFla
 prefix and case-insensitive matching (`EnablePrefixMatching`, `EnableCaseInsensitive`),
 aliases, the automatic `help` command and `--help`/`--version` flags, the `Args` validators
 (`args.go`), required flags, flag groups (`flag_groups.go`), suggestions and the Run hooks.
-Tested here: `Command.ExecuteC` over generated command trees and argument lists.
+Tested here: `Command.ExecuteC` over generated command trees and argument lists, and the
+shell-completion protocol (`completions.go`: the hidden `__complete`/`__completeNoDesc`
+command that the generated shell scripts call) over the same trees.
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of three
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
 `hegel_zoo_*_test.go` files that drive the public API (a `cobra.Command` tree built from a
 spec, `ExecuteC` with `SilenceErrors`/`SilenceUsage`, the output writers on buffers, the help
 and usage functions replaced by recorders, the default completion command disabled).
@@ -39,6 +41,22 @@ and usage functions replaced by recorders, the default completion command disabl
   where every flag of the group is defined; required-together, then one-required, then
   mutually exclusive), `Run`/`RunE`, `PostRun`, the persistent post-run hooks; the `help`
   command finds its topic from the root. Values are parsed with the same `strconv` calls.
+- A model of the completion protocol as the completions guide (`site/content/completions`)
+  and the doc comments of `completions.go` describe it: `root __complete args… toComplete`
+  prints the completions, one per line with the description after a tab (stripped for
+  `__completeNoDesc`), then `:<directive>`; the command is found as an `Execute` of the
+  same arguments would find it, and its flags are parsed as they would be for `RunE`; the
+  value of a flag is being completed after `--flag`/`-f` taking a value, or with `--flag=`
+  and `-f=` prefixes, with the flag's registered completion function or the file-extension
+  (`MarkFlagFilename`) and directory (`MarkFlagDirname`) directives; after a `-` the flag
+  names (`--name` and `-s` with the description, inherited then local, sorted, the hidden
+  ones left out, required ones first, groups enforced: a required-together group's other
+  flags become required, a set flag hides the rest of a one-required or mutually-exclusive
+  group), directive `NoFileComp`; otherwise the visible subcommands with a matching prefix
+  (case-insensitively with `EnableCaseInsensitive`), the required flags, then `ValidArgs`
+  and `ArgAliases` or `ValidArgsFunction` with its directive, `help` completing the
+  subcommands of its topic, `--help`/`--version` set completing nothing, and a command's
+  `DefaultShellCompDirective` (or the root's, or `Default`) when no function decides.
 - The result compared: the command `ExecuteC` returns, the error text, the ordered log of
   hooks (with the positional arguments, `CalledAs` and `ArgsLenAtDash` at `Run`), the help
   and usage requests, the output (deprecation and version messages, unknown help topics), and
@@ -61,12 +79,20 @@ and usage functions replaced by recorders, the default completion command disabl
   name, `--` before a command name, a valid argument then a typo, an empty argument, a help
   flag before a command name, the `help` command, a case variant of a prefix, a `SuggestFor`
   word); against the model.
+- `TestHegelComplete`: the same trees with `ValidArgsFunction`s (an echo of the arguments,
+  the word to complete and the changed flags, or fixed choices with a fixed directive),
+  `ArgAliases`, `DefaultShellCompDirective`, hidden flags, flag completion functions,
+  file-extension and directory annotations; a request `__complete` or `__completeNoDesc`
+  over a walk towards one command with flags and positionals (or a truncated argument list
+  of the first property) and a word to complete from the corners (empty, `-`, `--`, a flag
+  name or its prefix, `--name=`, `-s=v`, a subcommand or valid-argument prefix, an odd
+  token); the printed lines and the directive against the model.
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
 
 ## Bugs
 
-Ten, recorded in `bugs.toml`: the dispatcher does not see that the last letter of a combined
+Fifteen, recorded in `bugs.toml`. From the dispatcher: the dispatcher does not see that the last letter of a combined
 short token takes the next argument, so `root -af x sub` is an unknown command (cobra/1);
 with `TraverseChildren`, `--` is taken for a flag with a value and `root -- x sub` runs sub
 without x (cobra/2); with `TraverseChildren` a root with subcommands accepts an unknown
@@ -78,15 +104,24 @@ the `help` command is refused when a required persistent flag or a flag group of
 not satisfied (cobra/7); the dispatcher takes the argument after `--help`/`-h`/`--version`/`-v`
 for the flag's value, so `root --help sub child` is an unknown command (cobra/8); prefix
 matching ignores `EnableCaseInsensitive` (cobra/9); a command matched by distance and by
-`SuggestFor` is suggested twice (cobra/10).
+`SuggestFor` is suggested twice (cobra/10). From shell completion: the completion functions
+see count and slice flags doubled, the flags being parsed twice (cobra/11); completing the
+value of the last letter of a combined short token (`-af <TAB>`) parses only that letter
+(cobra/12); subcommand-name completion ignores `EnableCaseInsensitive` (cobra/13); with
+`TraverseChildren` a subcommand's own persistent flag before a sub-subcommand name stops the
+completion at the subcommand, where `Execute` runs the sub-subcommand (cobra/14);
+`__completeNoDesc` prints the descriptions when an empty argument is prefix-matched
+(cobra/15).
 
 ## Modelled as recorded
 
-All ten are in the model behind `HZKnown` switches (`combinedShortKeepsValue`,
+All fifteen are in the model behind `HZKnown` switches (`combinedShortKeepsValue`,
 `traverseDashDashValue`, `traverseSkipsUnknownCheck`, `validArgsSuggestFirst`,
 `emptyPrefixDispatch`, `traverseHelpFlagError`, `helpCommandChecksFlags`,
-`helpFlagSwallowsNext`, `prefixCaseSensitive`, `duplicateSuggestions`); `ZOO_KNOWN_OFF=name`
-turns a switch off and the property then fails.
+`helpFlagSwallowsNext`, `prefixCaseSensitive`, `duplicateSuggestions`,
+`completionParsesTwice`, `combinedFlagValueDropsLetters`, `completionCaseSensitive`,
+`traverseUnmergedFlags`, `prefixMatchResetsCalledAs`); `ZOO_KNOWN_OFF=name` turns a switch
+off and the property then fails.
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -106,14 +141,22 @@ Design notes the model follows (undocumented, taken from the code):
 - `PreRun` runs before the required flags and flag groups are checked; a deprecation message
   is printed before the flags are parsed; the version flag is honoured before the runnable
   check, so a non-runnable root with `Version` prints it.
+- Completion: a parse error of the final command's flags is not fatal (the flag names are
+  still completed after `-`; nouns give the empty result with directive `Default`, or the
+  `ValidArgsFunction` is still called); `--` before the word ends the flag completion; a flag
+  taking a value that is not registered anywhere completes files (`Default`); a `--flag=`
+  prefix of a bool flag completes nothing; the required flags are listed before the nouns
+  and left out of the flag-name list when set; the `help` command's topic is found from the
+  root over the remaining arguments; the root's persistent hooks run for `__complete`.
 
 ## Not tested
 
-Shell completion (`__complete`, `ValidArgsFunction`, `RegisterFlagCompletionFunc`, the
-completion command), help and usage text, `DisableFlagParsing`, `FParseErrWhitelist`,
+The `completion` command and the generated shell scripts, `COBRA_*` environment settings of
+completion, help and usage text, `DisableFlagParsing`, `FParseErrWhitelist`,
 `SetGlobalNormalizationFunc`, a subcommand's flag shadowing a parent's persistent flag,
 `Command.Context`, `OnInitialize`/`OnFinalize`, documentation generation.
 
 ## History
 
 - 2026-09-22: new target, one property, 10 bugs.
+- 2026-09-22: shell completion (`TestHegelComplete`), 5 more bugs.
