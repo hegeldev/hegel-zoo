@@ -3,15 +3,16 @@
 [xuri/excelize](https://github.com/xuri/excelize) (v2.11.0 plus 38 commits): a library for
 reading and writing Office Open XML spreadsheets, with a formula calculator (`CalcCellValue`)
 of some 530 functions written to Excel's documentation. This target tests the calculator on
-its mathematical, statistical and probability functions, about 220 of them: a formula is
-written to a cell of a fresh workbook, its range arguments to columns A, B, ..., and the
-computed value compared with what Excel documents.
+its mathematical, statistical and probability functions, about 220 of them, and on its 23 date
+and time functions: a formula is written to a cell of a fresh workbook, its range arguments to
+columns A, B, ..., and the computed value compared with what Excel documents.
 
 ## Build
 
 The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of test files:
 `go test -count=1 -run TestHegel -v ./hegel`. `TestHegelMath`, `TestHegelStat` and
-`TestHegelDist` need `python3` with `numpy` and `scipy` on PATH (the zoo's venv in CI).
+`TestHegelDist` need `python3` with `numpy` and `scipy` on PATH (the zoo's venv in CI);
+`TestHegelDate` needs `python3` alone.
 
 ## Oracles
 
@@ -33,6 +34,18 @@ equals its maximum (the numpy standard deviation of eleven copies of -0.17 is no
 library against itself: SUBTOTAL and AGGREGATE against the functions they number,
 ARABIC(ROMAN(n, form)) = n for every form, DECIMAL(BASE(n, radix), radix) = n.
 
+The date model is Excel's 1900 system written out in Python: serial 61 is 1 March 1900 and the
+real calendar follows (`date(1899, 12, 30) + serial`), serials 1 to 59 are 1 January to
+28 February 1900, 60 the fictitious 29 February and 0 the "0 January"; the weekday of a serial is
+(serial − 1) mod 7 from Sunday, the range ends at 2958465 (31 December 9999), DATE adds 1900 to
+years 0..1899 and normalises the month with divmod, EDATE and EOMONTH clamp to the month's length
+(29 days for Excel's February 1900), WEEKNUM's week 1 holds 1 January for the return types 1 to
+17 and type 21 is the ISO week, YEARFRAC's bases follow OpenFormula (US 30/360 with the February
+rules, actual/actual as Excel's whole-year average, actual/360, actual/365, European 30/360),
+DAYS360 and DATEDIF as documented, NETWORKDAYS and WORKDAY (and the `.INTL` forms with weekend
+codes and masks) by counting days, TIME modulo a day, DATEVALUE and TIMEVALUE for ISO and
+US-slash dates and 12/24-hour times.
+
 ## Generator
 
 Numbers of one profile: integers to 1000, decimals of one to three places, multiples of
@@ -46,6 +59,14 @@ shapes from 0 to about 30 with fractional and negative values, and a count of 20
 from -6 to 8 and fractional; every ROMAN form; radixes 2 to 36 and out of range; the Bessel
 orders 0 to 30, arguments to 75. Results are compared at 15 significant digits (Excel's
 precision and the calculator's formatting), tighter for the exact functions.
+Date serials of six profiles: the quirk region 0..62, the rest of 1900, the far end around
+2958465, negatives, 1950..2100 and any year to 9999, a quarter of them with a time fraction;
+year/month/day triples with months −20..30 and days −40..70 for DATE; month offsets that reach a
+December or its neighbours and month ends for EDATE and EOMONTH; the first days of January and
+the last of December with return type 21 for WEEKNUM; the five bases, equal dates and
+February-end starts for YEARFRAC; weekend codes, masks and invalid ones, holiday lists with
+duplicates and holidays before the span for the workday functions; date and time texts in the
+accepted formats with am/pm and out-of-range fields.
 
 ## Properties
 
@@ -60,11 +81,15 @@ precision and the calculator's formatting), tighter for the exact functions.
 - `TestHegelDist`: 70 distribution functions (densities, cumulatives, inverses, legacy
   names, GAMMA, GAMMALN, PHI, GAUSS, the error and Bessel functions) agree with SciPy to
   1e-8 (1e-6 for the Bessel functions), or return the documented error.
+- `TestHegelDate`: 23 date and time functions (DATE, DAY, MONTH, YEAR, WEEKDAY, WEEKNUM,
+  ISOWEEKNUM, EDATE, EOMONTH, DAYS, DAYS360, DATEDIF, NETWORKDAYS, NETWORKDAYS.INTL, WORKDAY,
+  WORKDAY.INTL, YEARFRAC, TIME, HOUR, MINUTE, SECOND, DATEVALUE, TIMEVALUE) agree with the
+  1900-system model to 1e-12, or return the documented error, and never panic.
 - `TestHegelPin…`: one per recorded bug, asserting the Excel behaviour; expected failures.
 
 ## Bugs
 
-Thirty-four, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
+Forty-seven, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
 and QUARTILE.EXC panic with an index out of range for k outside (1/(n+1), n/(n+1)) (excelize/1);
 SEC returns the cosine (2); HARMEAN of a range is always #N/A (3); AVEDEV takes a range as one
 value (4). Several lose most digits: the inverse searches of CHISQ.INV.RT, CHIINV and GAMMA.INV
@@ -92,9 +117,24 @@ MULTINOMIAL accept out-of-range arguments (18, 19, 23); a dozen domain ends are 
 round (25); error codes differ from the documented ones in some 20 functions (21); a negative zero
 is formatted as -0 (34).
 
+Dates and times (35–47): EDATE panics with an index out of range for a December after the 28th
+reached through a multiple of twelve months (40) and lands a year early whenever the month sum
+is 12 to 23, EDATE(DATE(2020,12,15),0) is 15 December 2019 (39); the serials 0 to 60 are placed
+on the real calendar a day before Excel's (MONTH(1) = 12), DATE is a day late in January and
+February 1900 unless the year is literally 1900, and WEEKNUM counts 1900 from a Monday 1 January
+where Excel's is a Sunday (38); DAY of the first sixty serials is serial mod 31 with the fraction
+(DAY(31) = 0, DAY(2.5) = 2.5) (35); DATE does not add 1900 to a year below 1900 and accepts a
+negative one (37); WEEKNUM's return type 21 is not the ISO week where the ISO year differs (44);
+YEARFRAC does not swap a start after the end (42) and skips the 31st-to-30th rule after a
+February start (43); WORKDAY backwards skips only the holidays before the first one found (46);
+NETWORKDAYS and WORKDAY count a holiday listed twice as two (45); TIME does not wrap at 24 hours
+(41). Contract: serials beyond 9999 and DATE results outside the range are accepted (36);
+YEARFRAC of equal dates and WORKDAY.INTL of 0 days return before checking the basis or the
+weekend argument (47).
+
 ## Modelled as recorded
 
-Every bug reached by generated cases has an `HZKnown` switch (33 of them; excelize/34 is pinned
+Every bug reached by generated cases has an `HZKnown` switch (46 of them; excelize/34 is pinned
 only). While a switch is on the generator keeps away from the shape or the check is relaxed: k
 outside the safe range not sent to PERCENTILE.EXC; SEC, HARMEAN and AVEDEV of a range not judged;
 pairs containing a 0 skipped for CORREL and the SUMX functions; COMBIN and COMBINA judged to ±1;
@@ -112,8 +152,16 @@ ranges skipped for the regressions, SKEW, KURT, Z.TEST and T.TEST, and a zero co
 regressions; the wrong domain ends avoided; T.INV judged to 1e-7 within [1e-3, 100] and
 CONFIDENCE.T to 1e-7 for alpha below 0.99; cumulative GAMMA.DIST only within 1.2 α and for α < 20;
 BESSELJ within |x| ≤ 20 and BESSELY within x ≤ 5; GAMMALN below 170; DEGREES(0) and ATAN2(0,0)
-avoided; counts and gamma arguments above 170 avoided. The collector counts the avoidances;
-`ZOO_KNOWN_OFF=name,name` turns switches off and the properties then fail.
+avoided; counts and gamma arguments above 170 avoided. For the dates: serials below 61 and the
+January and February 1900 results of DATE avoided for the functions that read the calendar, and
+WEEKNUM's whole 1900 except type 21; DAY of a multiple of 31 or a fraction below 61 avoided;
+serials and results beyond 2958465 and DATE years outside 1900..9999 avoided; EDATE offsets 0..11 that reach a December and multiples of twelve landing on
+a December after the 28th avoided; TIME totals of a day or more avoided; YEARFRAC only with the
+start before the end, and not with an out-of-range basis on equal dates nor with basis 0 from a
+February end to a 31st; WEEKNUM type 21 avoided where the ISO year differs; holiday lists
+deduplicated and holidays before the span not sent to a negative WORKDAY; WORKDAY.INTL of 0 days
+only with a valid weekend. The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns
+switches off and the properties then fail.
 
 ## Not judged
 
@@ -127,17 +175,22 @@ documentation is unclear); MODE with tied counts (either value); MROUND with mul
 and CSCH beyond |x| = 700 and Bessel values SciPy overflows or underflows; LARGE and SMALL
 with a fractional k; PERCENTRANK of one value; T.TEST with fractional tails or type;
 CONFIDENCE.T to 1e-8, F.INV to 1e-7 and F.TEST to 1e-6 only; 1 − exp(−x) cumulatives to an
-absolute 1e-15; the legacy BETADIST/BETAINV with bounds only when A < B.
+absolute 1e-15; the legacy BETADIST/BETAINV with bounds only when A < B. Dates: DAYS360's US
+method when the end date is the last day of February (Excel's rule there is disputed); DATEDIF's
+MD when the end day precedes the start day and YD from a 29 February; YEARFRAC with a start in
+the quirk region or basis 1 within 1900 (whether Excel's 1900 has 366 days there); WEEKNUM of a
+serial below 1; EDATE of day 0; TIMEVALUE with minutes or seconds above 59, hour 0 with am/pm or
+above 23 without.
 
 ## Not tested
 
-The text, date and time, lookup, logical, information, financial and engineering functions,
+The text, lookup, logical, information, financial and engineering functions, NOW and TODAY,
 the operators (`0^0` = 1 where POWER(0,0) is #NUM!), array formulas, cell references across
-sheets, the cell-name helpers and the file format itself: a second part. Probes in passing
-found UNICODE("é") = 195 (the first UTF-8 byte), UNICHAR(128512) #VALUE!, TIME(25,0,0) =
-1.0417 (no wrap at 24 hours) and a lowercase `1e-7` literal parsed as a name (#NAME?, the
-efp parser's).
+sheets, the cell-name helpers and the file format itself: a third part. Probes in passing
+found UNICODE("é") = 195 (the first UTF-8 byte), UNICHAR(128512) #VALUE! and a lowercase
+`1e-7` literal parsed as a name (#NAME?, the efp parser's).
 
 ## History
 
 - 2026-09-22: new target, three properties, 34 bugs.
+- 2026-09-22: part 2, the date and time functions (`TestHegelDate`), 13 bugs (35–47).
