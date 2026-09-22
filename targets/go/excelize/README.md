@@ -3,16 +3,17 @@
 [xuri/excelize](https://github.com/xuri/excelize) (v2.11.0 plus 38 commits): a library for
 reading and writing Office Open XML spreadsheets, with a formula calculator (`CalcCellValue`)
 of some 530 functions written to Excel's documentation. This target tests the calculator on
-its mathematical, statistical and probability functions, about 220 of them, and on its 23 date
-and time functions: a formula is written to a cell of a fresh workbook, its range arguments to
-columns A, B, ..., and the computed value compared with what Excel documents.
+its mathematical, statistical and probability functions, about 220 of them, its 23 date and
+time functions, 30 text functions and 26 logical and information functions: a formula is
+written to a cell of a fresh workbook, its range arguments to columns A, B, ..., and the
+computed value compared with what Excel documents.
 
 ## Build
 
 The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of test files:
 `go test -count=1 -run TestHegel -v ./hegel`. `TestHegelMath`, `TestHegelStat` and
 `TestHegelDist` need `python3` with `numpy` and `scipy` on PATH (the zoo's venv in CI);
-`TestHegelDate` needs `python3` alone.
+`TestHegelDate`, `TestHegelText` and `TestHegelLogic` need `python3` alone.
 
 ## Oracles
 
@@ -46,6 +47,24 @@ DAYS360 and DATEDIF as documented, NETWORKDAYS and WORKDAY (and the `.INTL` form
 codes and masks) by counting days, TIME modulo a day, DATEVALUE and TIMEVALUE for ISO and
 US-slash dates and 12/24-hour times.
 
+The text model is Python's `str` with Excel's rules written out: a number in a text context
+becomes its General text of at most 15 significant digits (judged between 1E-04 and 1E+15, where
+Excel shows plain digits); TRIM removes only spaces and collapses interior runs; CLEAN drops the
+characters below 32; PROPER capitalises a letter after a non-letter; LEFT/RIGHT/MID/REPLACE/FIND
+count characters (BMP text, where UTF-16 units and characters agree); SEARCH's wildcards `?`, `*`
+and the `~` escape become a regular expression; SUBSTITUTE's instance counts non-overlapping
+occurrences; FIXED and TEXT round the 15-digit decimal half away from zero (`decimal`), with the
+`#,##0`, `0%`, `0.00E+00`, `@`/General and the common date and time formats (`mm` is minutes after
+`hh` or before `ss`); VALUE accepts Excel's spellings (grouped thousands, a percent sign, an
+exponent, surrounding spaces, ISO and US dates, times) and nothing else; CHAR/CODE follow
+Windows-1252 where it agrees with Latin-1 (1–127, 160–255) and UNICHAR/UNICODE are code points
+with the surrogates rejected. The logical model: TRUE/FALSE, non-zero numbers and the texts
+"TRUE"/"FALSE" are logical values, other texts #VALUE!; IF's omitted value_if_false is FALSE;
+SWITCH compares like `=` (numbers with numbers, texts case-insensitively, never across types);
+the IS functions never return errors; ISEVEN/ISODD truncate and reject booleans; N of a text
+is 0; TYPE and ERROR.TYPE as documented. Errors are passed as `NA()`, `1/0`, `SQRT(-1)` and
+`VALUE("a")`.
+
 ## Generator
 
 Numbers of one profile: integers to 1000, decimals of one to three places, multiples of
@@ -67,6 +86,15 @@ the last of December with return type 21 for WEEKNUM; the five bases, equal date
 February-end starts for YEARFRAC; weekend codes, masks and invalid ones, holiday lists with
 duplicates and holidays before the span for the workday functions; date and time texts in the
 accepted formats with am/pm and out-of-range fields.
+Texts of 0 to 12 characters (to 40 a tenth of the time) from an alphabet of letters, digits,
+spaces, the wildcard and regular-expression characters, a few Latin-1 letters and the euro sign,
+with control characters for CLEAN and TRIM (spliced in as `CHAR(n)`); substrings of the text as
+the thing to find or replace; counts −1..14 with fractions; numbers of eight profiles (integers,
+cents, millions and beyond, small fractions, thirds, sums like 0.1 + 0.2) wherever a text
+function takes a value; TEXT's 29 formats with matching values; VALUE texts in fifteen
+spellings (grouped, spaced, percent, exponent, Go-only forms, garbage, dates, times); logical
+arguments as booleans, small numbers, fractions and the texts TRUE/FALSE/true/1/0/x; error
+values for the information functions and the result branches.
 
 ## Properties
 
@@ -85,11 +113,17 @@ accepted formats with am/pm and out-of-range fields.
   ISOWEEKNUM, EDATE, EOMONTH, DAYS, DAYS360, DATEDIF, NETWORKDAYS, NETWORKDAYS.INTL, WORKDAY,
   WORKDAY.INTL, YEARFRAC, TIME, HOUR, MINUTE, SECOND, DATEVALUE, TIMEVALUE) agree with the
   1900-system model to 1e-12, or return the documented error, and never panic.
+- `TestHegelText`: 30 text functions (CHAR, CODE, UNICODE, UNICHAR, CLEAN, TRIM, UPPER, LOWER,
+  PROPER, LEN, LEFT, RIGHT, MID, REPT, CONCAT, CONCATENATE, TEXTJOIN, EXACT, FIND, SEARCH,
+  REPLACE, SUBSTITUTE, FIXED, TEXT, TEXTAFTER, TEXTBEFORE, VALUE, T, N, VALUETOTEXT) return the
+  model's text, number or boolean exactly, or the documented error.
+- `TestHegelLogic`: 26 logical and information functions (AND, OR, XOR, NOT, IF, IFS, SWITCH,
+  IFERROR, IFNA, the IS functions, TYPE, ERROR.TYPE, N, T, NA, TRUE, FALSE) agree with the model.
 - `TestHegelPin…`: one per recorded bug, asserting the Excel behaviour; expected failures.
 
 ## Bugs
 
-Forty-seven, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
+Seventy-eight, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
 and QUARTILE.EXC panic with an index out of range for k outside (1/(n+1), n/(n+1)) (excelize/1);
 SEC returns the cosine (2); HARMEAN of a range is always #N/A (3); AVEDEV takes a range as one
 value (4). Several lose most digits: the inverse searches of CHISQ.INV.RT, CHIINV and GAMMA.INV
@@ -132,10 +166,33 @@ NETWORKDAYS and WORKDAY count a holiday listed twice as two (45); TIME does not 
 YEARFRAC of equal dates and WORKDAY.INTL of 0 days return before checking the basis or the
 weekend argument (47).
 
+Text (48–68, 77, 78): TEXTAFTER and TEXTBEFORE panic with a slice bound below zero when a
+backward search reaches a delimiter at the start of the text and wants another (77) and skip an
+adjacent delimiter when searching backwards (78); a number reaching a text function is formatted with Go's `%g`, so a million
+becomes `1e+06`, 1/3 has 16 digits and 0.1 + 0.2 is `0.30000000000000004` (48); REPLACE slices
+bytes and splits non-ASCII characters into invalid UTF-8, and accepts a negative count (57); MID
+appends a NUL when the range ends one past the text (49); TRIM neither collapses interior spaces
+nor spares tabs (50); SUBSTITUTE with an empty old_text inserts new_text everywhere (53); FIXED
+defaults to the number's own decimals instead of two (54), drops the thousands separators for
+any third argument, reading the flag's type (55), and rounds the binary value through an int that
+overflows (56); CODE and UNICODE return the first UTF-8 byte (58); UNICHAR rejects everything
+above 55295 (60); FIND treats ? and * as wildcards (61) while SEARCH lacks the tilde escape and
+leaks regular-expression syntax (62); TEXTAFTER/TEXTBEFORE cut at byte offsets (65) and return ""
+instead of #N/A when the delimiter is missing (66); VALUE takes Go's number spellings (0x10, 1_000,
+inf, misplaced commas) and rejects surrounding spaces (67); TEXT rounds the binary value (68);
+REPT rejects a number (51) and builds texts beyond the cell limit (52); CHAR(0) is a NUL (59);
+FIND accepts a start of 0 (63); TEXTJOIN wants a literal boolean (64). Logical (69–76): IF and IFS
+treat only the number 1 as TRUE, IF(2,1,0) = 0 (69); ISEVEN is TRUE for every odd number except 1
+(74); AND and OR stop reading their arguments at the first decisive one and miss errors (72); IF
+returns a boolean result as 1/0 and an error result as text (71) and "" instead of FALSE when
+value_if_false is omitted (70); ISTEXT("1") is FALSE, N("1") is 1, ISLOGICAL("TRUE") and
+ISNUMBER(TRUE) are TRUE (75); SWITCH compares texts (76); the logical text coercions differ from
+function to function (73).
+
 ## Modelled as recorded
 
-Every bug reached by generated cases has an `HZKnown` switch (46 of them; excelize/34 is pinned
-only). While a switch is on the generator keeps away from the shape or the check is relaxed: k
+Every bug reached by generated cases has an `HZKnown` switch (78 of them; excelize/34 is pinned
+only, and excelize/15 gained a switch in part 3). While a switch is on the generator keeps away from the shape or the check is relaxed: k
 outside the safe range not sent to PERCENTILE.EXC; SEC, HARMEAN and AVEDEV of a range not judged;
 pairs containing a 0 skipped for CORREL and the SUMX functions; COMBIN and COMBINA judged to ±1;
 ODD in (0, 1), fractional num_digits, num_digits beyond the binary resolution, a quotient by the
@@ -160,7 +217,21 @@ a December after the 28th avoided; TIME totals of a day or more avoided; YEARFRA
 start before the end, and not with an out-of-range basis on equal dates nor with basis 0 from a
 February end to a 31st; WEEKNUM type 21 avoided where the ISO year differs; holiday lists
 deduplicated and holidays before the span not sent to a negative WORKDAY; WORKDAY.INTL of 0 days
-only with a valid weekend. The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns
+only with a valid weekend. For the texts: numbers of a million or more, below 1E-04, of 16
+digits or that Go prints differently are not sent to text functions; MID ranges ending one past
+the text, interior double spaces and tabs for TRIM, REPT of a non-text or beyond 1000 repeats, an
+empty old_text, FIXED without decimals, with a falsy third argument, with a decimal half case or
+more than 15 decimals, REPLACE of non-ASCII text or a negative count, CODE/UNICODE of non-ASCII or
+empty text, CHAR of 0, UNICHAR beyond 55295, FIND with wildcards, SEARCH with a tilde or with
+wildcards beside a backslash or braces, a start_num outside 1..LEN, TEXTJOIN with a non-boolean
+ignore_empty, TEXTAFTER/TEXTBEFORE over non-ASCII text, a missing instance, a backward search over adjacent
+delimiters or reaching a delimiter at the start, VALUE texts that Go
+alone accepts or with surrounding spaces, TEXT at a decimal half case, all avoided. For the
+logical functions: IF/IFS tests other than 0/1 and booleans, IF without value_if_false or with a
+boolean or error branch, texts other than TRUE/FALSE as logical arguments, XOR of a text, a
+decisive OR/AND argument followed by more, odd numbers for ISEVEN and booleans or errors for
+ISODD, numeric or TRUE/FALSE texts for ISTEXT/N/ISLOGICAL and booleans for ISNUMBER, SWITCH
+values of another type or texts, all avoided. The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns
 switches off and the properties then fail.
 
 ## Not judged
@@ -180,17 +251,26 @@ method when the end date is the last day of February (Excel's rule there is disp
 MD when the end day precedes the start day and YD from a 29 February; YEARFRAC with a start in
 the quirk region or basis 1 within 1900 (whether Excel's 1900 has 366 days there); WEEKNUM of a
 serial below 1; EDATE of day 0; TIMEVALUE with minutes or seconds above 59, hour 0 with am/pm or
-above 23 without.
+above 23 without. Texts: numbers beyond 1E+15 or below 1E-04 in a text context (where Excel
+switches to an exponent is not modelled); CHAR 128–159 and CODE of characters beyond Latin-1
+(code-page dependent); UNICHAR(65534) and (65535); lower-case "true"/"false" as logical texts;
+counts in (−1, 0); a space before a percent sign in VALUE; a trailing tilde in a SEARCH pattern;
+the sign of a negative that rounds to zero in FIXED and TEXT; TEXTAFTER with an empty delimiter or
+a fractional instance below 1; the B functions (LENB, LEFTB, ...: DBCS-locale semantics), DBCS,
+BAHTTEXT, ARRAYTOTEXT and UNIQUE; ISBLANK, ISREF, ISFORMULA, SHEET and SHEETS of references.
 
 ## Not tested
 
-The text, lookup, logical, information, financial and engineering functions, NOW and TODAY,
-the operators (`0^0` = 1 where POWER(0,0) is #NUM!), array formulas, cell references across
-sheets, the cell-name helpers and the file format itself: a third part. Probes in passing
-found UNICODE("é") = 195 (the first UTF-8 byte), UNICHAR(128512) #VALUE! and a lowercase
-`1e-7` literal parsed as a name (#NAME?, the efp parser's).
+The lookup, financial and engineering functions (probes saw BITAND(1.5,3) = 1, BITRSHIFT(4,-2)
+= #NUM! where Excel shifts left, BITLSHIFT(1,60) = 1.15E+18 beyond the 2^48 limit, BIN2DEC of
+eleven digits accepted), the database functions, NOW and TODAY, the operators (`0^0` = 1 where
+POWER(0,0) is #NUM!), array formulas, cell references across sheets, the cell-name helpers and
+the file format itself: a fourth part. A lowercase `1e-7` literal is parsed as a name (#NAME?,
+the efp parser's).
 
 ## History
 
 - 2026-09-22: new target, three properties, 34 bugs.
 - 2026-09-22: part 2, the date and time functions (`TestHegelDate`), 13 bugs (35–47).
+- 2026-09-22: part 3, the text, logical and information functions (`TestHegelText`,
+  `TestHegelLogic`), 31 bugs (48–78).
