@@ -221,7 +221,8 @@ rewrite also caught an over-strict check of its own, not a library bug: the per-
 remainders agree" check is only meaningful for single-line changes; the pako rewrite found a
 new bug, pako/5 - drawing the damage and the cut points as one generator reached a shape the
 old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semver4j,
-go/compose-go, rust/dynfmt, java/json-schema-validator, typescript/liquidjs (turn 415).
+go/compose-go, rust/dynfmt, java/json-schema-validator, typescript/liquidjs (turn 415);
+rust/human_format, go/go-udiff, java/commons-csv, typescript/picomatch (turn 417).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -239,4 +240,13 @@ an object with two equal members), its long runs json-schema-validator/4 (a coun
 long runs found seven Shopify differences now recorded as liquidjs/9-15, plus a float
 normalisation hole that had made the committed test flaky. Rewriting the generators as data
 rendered by pure functions is what makes the long runs cheap to read: a failing case is a small
-tree, not a transcript of draws.
+tree, not a transcript of draws. The sixth batch (turn 417) kept the pattern: commons-csv's long
+runs found two latent model bugs of the test's own (an unterminated empty last row, and an escaped
+whitespace-only value that `CSVParser.handleNull` keeps as a string), and picomatch's found a nocase
+model bug plus three library bugs, picomatch/8-10 (a negated bracket with a POSIX class matching
+`/`, a POSIX class after `**/` blocking an explicit dotfile segment, a negated bracket matching a
+kept backslash under `windows`), none of which the 100-case rounds had reached in a week of
+runs. Two review lessons from the batch: an editor can silently normalise non-NFC test data (a
+decomposed `e\u0301` in go-udiff came back composed - write such literals as escapes), and a
+known-bug gate written as a high-rate `Assume` trips the filter-too-much check, so the generator
+itself has to steer most cases away from the shape (go-udiff's disjoint-words pairs).
