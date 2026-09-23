@@ -15,7 +15,7 @@ nothing upstream.
 
 `go test -count=1 -run TestHegel -v .` in the module root (Go 1.27). The patch adds, in the
 package itself as the upstream tests are (to reach the error sentinels), `hegel_test.go`
-(harness, the `Known` switch), `hegel_props_test.go` (model, generators, properties, the Python
+(harness, generator helpers), `hegel_props_test.go` (model, generators, properties, the Python
 reference test) and `hegel_pins_test.go`, and requires `hegel.dev/go/hegel v0.6.33` in go.mod.
 `TestHegelPythonReferenceAgrees` runs `python3` with the `shortuuid` module when it is on
 PATH (the CI's venv installs it) and is skipped otherwise.
@@ -53,9 +53,6 @@ foreign character or an invalid byte inserted 12% of the time.
 | V5FollowsTheRFC | `UUIDv5` is RFC 9562's, `NewV5` its encoding, `NewWithNamespace` picks the documented namespace |
 | PythonReferenceAgrees | the Python `shortuuid` library encodes, decodes and derives v5 names alike (plain test, batch) |
 
-`ZOO_COLLECT=1` records mismatches instead of failing and prints the agreement classes (default,
-single-byte, multibyte, multibyte with binary search; short, exact, long, foreign, overflow).
-
 ## Accepted differences
 
 - `UUIDv5` hashes the name's bytes as given, invalid UTF-8 included; the Python library takes a
@@ -78,3 +75,6 @@ library's output is reproduced for every alphabet tried.
 
 - 2026-09-21 (turn 344): target added at 5cb5511 (v5.0.0) with five properties, a Python
   reference test and 1 pin.
+- 2026-09-23: generators rewritten in combinator style (STYLE.md): package-level generator
+  values, `weighted`/`OneOf` choice, `Lists`/`Binary`/`Text` for collections; the collect
+  harness and the `Known` switch removed. Same properties and pin.
