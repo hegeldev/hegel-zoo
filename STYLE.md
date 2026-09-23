@@ -230,7 +230,8 @@ go/ssh_config, rust/strfmt, typescript/postcss, java/vavr (turn 419); typescript
 go/bbolt, rust/distro-info, java/threeten-extra (turn 422; threeten-extra/7-12 found by the
 rewrite); go/golang-lru, java/caffeine, typescript/whatwg-url, rust/parry (turn 423; parry/3-4
 found by the rewrite's long runs); rust/printf-compat, java/capsule, go/go-re2,
-typescript/superjson (turn 424, quiet).
+typescript/superjson (turn 424, quiet); typescript/structured-clone, rust/uv-requirements-txt,
+go/validator, java/joda-time (turn 425; joda-time/19-21 found by the rewrite's long runs).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -354,3 +355,27 @@ correct and worth knowing when a long run looks too fast. A review lesson repeat
 tool NFC-normalised a Kelvin sign (U+212A) in go-re2's alphabet; the subagent caught it with
 `od -c` against the committed patch - non-ASCII literals in a rewrite are compared byte for
 byte, or written as escapes.
+The twelfth batch (turn 425) reached the large tests of the survey's least-idiomatic lists.
+validator's seventy formats, each a `func(tc) (any, bool)` before, are one `FlatMap` from the
+sampled tag into that format's value generator, so the tag and its value are one draw; its skips
+that fired on a fifth or a quarter of the cases (cross-field pairs the tag does not specify,
+parameters with a space) are generator shape, and its 3000-case run found a latent model bug of
+the old test (a `luhn_checksum` number below ten expected to pass). uv-requirements-txt turned a
+once-per-file budget the old generators carried as mutable state into renderer shape: the first
+`--index-url`, binary policy and `-e` in file order are admitted and a later one renders as an
+empty line, a no-op step the shrinker can delete. structured-clone reused superjson's tree with
+`ref` nodes and made a decoration the old test applied by mutating the built value (`toJSON`) a
+shape flag on the node. joda-time is the batch's find: its long runs (the subagent went to
+30000-case shake-outs) surfaced two model bugs of the old test, one oracle tolerance and three
+library bugs (joda-time/19-21: `GJChronology` rejecting a Julian leap day the Gregorian calendar
+lacks while `DateTime` accepts it, tail-rule zones whose transitions and offsets disagree in the
+last years before `Long.MAX_VALUE`, and an overlap across the date line resolved to the later
+instant) - and, in review, that the harness pom had pinned the 2.14.3 release from Maven Central
+while the setup installs the tree as 2.14.4, so the tests had run against the wrong jar since the
+target was created. A review rule from that: a Java target's harness pom must name the version
+the pinned tree installs, and a bump must move both. Two smaller lessons: a `weighted` that mixes
+a draw-free `just` with a `sampled_from` alternative can leave a shrunk case on the wrong
+alternative, since the shrinker cannot swap between alternatives of different draw counts - for a
+small enum a flat `sampled_from` table with the plain spelling repeated is the cheaper spelling; and
+Python's `splitlines()` splits on U+2028/U+2029, so a code-point comparison of two patches must
+split on the newline alone.
