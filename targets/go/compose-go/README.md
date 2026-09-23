@@ -22,13 +22,19 @@ matching brace with nested `${...}` counted, `$$` is a literal dollar, a `$` fol
 anything else is preserved, `${` followed by anything but a name and an operator is an
 invalid template — evaluated lazily (a default is expanded only when used, an error message
 only when the variable is missing) with the first error in evaluation order reported.
-Templates are generated as text over a mapping with set, empty, unset and dollar-containing
-values, with literal runs including braces, quotes, backslashes and newlines outside words
-(inside words bare braces are left out, since the specification says nothing about them and
-bash and compose-go read them differently), one of twelve invalid forms now and then, and
-nesting to depth two. bash is the second oracle: on templates without invalid forms or
-backslashes, `printf '%s' "<template>"` with `$$` written `\$` must give the same string and
-fail exactly when compose-go reports a required variable.
+Templates are generated as data — a list of one to six pieces (a literal run, `$$`, `$NAME`,
+`${NAME}`, `${NAME op word}` with the word a nested list of pieces, to depth two, or one of
+twelve invalid forms), a weighted choice with the literal run first so counterexamples shrink
+towards plain text — and rendered to a string by a pure function that keeps a name character
+after `$NAME` apart with a space; the model parses the rendered text. The mapping has set,
+empty, unset and dollar-containing values; literal runs include braces, quotes, backslashes
+and newlines outside words (inside words bare braces are left out, since the specification
+says nothing about them and bash and compose-go read them differently, and so are newlines,
+which bug 1 rejects and the pin covers). Three variants of the one generator serve the
+properties: everything, without the invalid forms (`ExtractVariables`), and without the
+invalid forms and backslashes (bash). bash is the second oracle: on that last subset,
+`printf '%s' "<template>"` with `$$` written `\$` must give the same string and fail exactly
+when compose-go reports a required variable.
 
 ## Properties
 
