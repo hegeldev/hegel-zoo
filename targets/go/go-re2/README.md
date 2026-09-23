@@ -61,12 +61,11 @@ its module memory up front and, refused, panics with a nil interface conversion 
 
 Compile acceptance is compared on every pattern (a disagreement is a mismatch); patterns both
 reject are counted. Mismatches are classified by method before they count: a `Known` switch per
-recorded bug gates the input shape (the limit 0 is left out; `\B` is not run on texts with a
-character above U+007F; POSIX patterns with a negated class are not run on texts with a
-newline; the `FindAll...Submatch...` methods are compared with a positive limit only when the
-pattern cannot match the empty string, decided on `regexp/syntax`'s tree); the pins assert
-`regexp`'s behaviour and fail while the bug exists. `ZOO_COLLECT=1` records mismatches instead
-of failing and prints the class counts.
+recorded bug shapes the generator (the limit 0 is left out; a pattern with `\B` draws its texts
+from a pool without characters above U+007F, and a POSIX pattern with a negated class from a
+pool without a newline; the `FindAll...Submatch...` methods are compared with a positive limit
+only when the pattern cannot match the empty string, decided on `regexp/syntax`'s tree); the
+pins assert `regexp`'s behaviour and fail while the bug exists.
 
 ## Accepted differences
 
@@ -93,3 +92,8 @@ few matches.
 ## History
 
 - 2026-09-21 (turn 337): target added at 7f13331 (v1.12.0+17) with six properties, 4 pins.
+- 2026-09-23: generators rewritten in combinator style: the pattern is a syntax tree drawn by
+  a recursive `Composite` and rendered by a pure function, three dialects replace the
+  perl/latin/posix flags, the known-bug skips became the text pool per pattern, and the
+  `ZOO_COLLECT` collector is gone. The PackageFunctions property, which had no go-re2/2
+  gate, now shares the pool. No new bug.
