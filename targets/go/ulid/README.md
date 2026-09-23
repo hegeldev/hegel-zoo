@@ -6,7 +6,15 @@ timestamp and 80 bits of entropy, Crockford base32 text, binary, SQL and JSON en
 monotonic entropy sources.
 
 The patch adds `hegel_test.go` (package `ulid_test`) and the `hegel.dev/go/hegel` requirement to
-`go.mod`. The text encoding is checked against a `math/big` Crockford base32 model; parsing
+`go.mod`. The inputs are `Generator` values built from the binding's combinators (STYLE.md):
+`ids` is a `weighted` choice of the zero ULID, all ones and `Binary(16, 16)` (with edge-value
+timestamp bytes from a `Lists` three times in ten), `millis` a `weighted` choice of the timestamp
+corners, `parseInputs` a `OneOf` of valid-or-overflowing, substituted (`Lists` of position/byte
+pairs), truncated-and-padded and `Binary` strings, `idRuns` a `Lists` of ULIDs with same-time and
+duplicate flags folded by `Map`, and the monotonic tests draw a printable `entropySource` (fast
+path, plain reader, or a reader started 1-200 below 2^80) and a `Lists` of millisecond steps up
+front instead of drawing inside the read loop. The text encoding is checked against a
+`math/big` Crockford base32 model; parsing
 against the documented error contract (`ErrDataSize`, `ErrInvalidCharacters`, `ErrOverflow`, and
 "undefined ULIDs" for lenient parsing of bad characters); ordering against `(time, entropy)`; the
 monotonic sources against the documentation of `Monotonic`.
