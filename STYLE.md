@@ -220,7 +220,8 @@ go/go-shellwords, rust/human-repr, go/godotenv, typescript/pako (turn 414; the j
 rewrite also caught an over-strict check of its own, not a library bug: the per-row "untagged
 remainders agree" check is only meaningful for single-line changes; the pako rewrite found a
 new bug, pako/5 - drawing the damage and the cut points as one generator reached a shape the
-old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semver4j (turn 415).
+old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semver4j,
+go/compose-go, rust/dynfmt, java/json-schema-validator, typescript/liquidjs (turn 415).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -231,4 +232,11 @@ usual). The long runs earn their keep: in turn 415 they found a library bug the 
 reached once in a thousand cases (shell-quote/17), a model bug of the test's own (shell-quote's
 brace fixup braced an escaped `\$` too), a node-semver quirk the semver4j property had to skip,
 and a known-bug shape (semver4j/11) that one generator path had never been tamed against; none
-of them showed in the 100-case rounds.
+of them showed in the 100-case rounds. The second batch of the turn did better still: the first
+rewritten round of json-schema-validator found json-schema-validator/3 (`uniqueItems` rejecting
+an object with two equal members), its long runs json-schema-validator/4 (a count keyword above
+`Integer.MAX_VALUE` refused as a schema) and four oracle differences to tolerate, and liquidjs's
+long runs found seven Shopify differences now recorded as liquidjs/9-15, plus a float
+normalisation hole that had made the committed test flaky. Rewriting the generators as data
+rendered by pure functions is what makes the long runs cheap to read: a failing case is a small
+tree, not a transcript of draws.
