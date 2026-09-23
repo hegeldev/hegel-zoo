@@ -205,7 +205,11 @@ The full per-language surveys, with file and line references, are in the project
     Rust `.alphabet()` users); Java `oneOf` generics (`@SafeVarargs`, `Generator.or`), sizes
     surviving `map`/`oneOf`, a `ThrowingConsumer` overload of `Hegel.test`, a public `StopTest`,
     `nullable(g)`; a clearer Rust error than "cannot print the values it draws" for a missing
-    `PrintableGenerator` bound; hegel-go `Lists` returning an empty non-nil slice.
+    `PrintableGenerator` bound; hegel-go `Lists` returning an empty non-nil slice; a draw-free
+    generator in Go (`Composite(func(hegel.TestCase) T {...})` is the only spelling for "the
+    current time"); `hegel.Integers(uint64(0), n)` needing the typed first argument; Java
+    inference of `Generator<Sub>` where `Generator<Super>` is wanted (`w(3, x.map(Sub::new))`
+    does not infer, a typed field does).
 
 ## Status
 
@@ -216,9 +220,15 @@ go/go-shellwords, rust/human-repr, go/godotenv, typescript/pako (turn 414; the j
 rewrite also caught an over-strict check of its own, not a library bug: the per-row "untagged
 remainders agree" check is only meaningful for single-line changes; the pako rewrite found a
 new bug, pako/5 - drawing the damage and the cut points as one generator reached a shape the
-old loop had not). Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits) draw the whole
-operation or edit list as data, with positions taken modulo the live size when applied, so the
-shrinker can delete steps. The order of the
-rest, smallest and ugliest first, is in the project notes; each rewrite is one commit, run
-through `tools/zoo test` six times, with the same properties and pins unless the rewrite finds
-a new bug (recorded in `bugs.toml` as usual).
+old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semver4j (turn 415).
+Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
+semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
+modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
+smallest and ugliest first, is in the project notes; each rewrite is one commit, run through
+`tools/zoo test` six times and then a few long runs (`HEGEL_TEST_CASES=1000` to `3000`), with
+the same properties and pins unless the rewrite finds a new bug (recorded in `bugs.toml` as
+usual). The long runs earn their keep: in turn 415 they found a library bug the old generator
+reached once in a thousand cases (shell-quote/17), a model bug of the test's own (shell-quote's
+brace fixup braced an escaped `\$` too), a node-semver quirk the semver4j property had to skip,
+and a known-bug shape (semver4j/11) that one generator path had never been tamed against; none
+of them showed in the 100-case rounds.
