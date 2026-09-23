@@ -89,17 +89,24 @@ through `DateTimeFormatter`; word-based formats in other locales; `UtcRules.regi
 | threeten-extra/4 | low | `AmountFormats.wordBased` casts hours and days to int (`PT2147483648H` → "-2147483648 hours") |
 | threeten-extra/5 | low | `wordBased(P-13M)` is "-1 year and -1 month" while `P13M` is "13 months" |
 | threeten-extra/6 | low | `Days…Seconds.parse` throw `ArithmeticException` instead of `DateTimeParseException` on overflowing text |
+| threeten-extra/7 | medium | `InternationalFixedDate.plusWeeks` lands 28 days early when the target is the first week of a month (`1969/13/28 + 1 week` = 1969/13/07) |
+| threeten-extra/8 | medium | `Symmetry454Date.until(WEEKS)` loses a week per five-week month spanned (63 days = 8 weeks) |
+| threeten-extra/9 | medium | `Symmetry010Date.until(WEEKS)` mixes year-aligned weeks with month-aligned days of week (31 days = 3 weeks, 26 days = 4) |
+| threeten-extra/10 | medium | Symmetry454/010 `with(field, 0)` returns the date unchanged (`EPOCH_DAY`, `YEAR`, `ERA`, `PROLEPTIC_MONTH`) |
+| threeten-extra/11 | medium | `PaxDate.plusMonths` computes month 0 for a leap-year month 14 target, so `plus(1, MONTHS)` from 1860-13-01 and `until()` throw |
+| threeten-extra/12 | low | Symmetry454/010: `plus(until(end))` misses `end` by days from a leap-week start (2004/12/37 -> P1Y2M2D -> 2006/03/02) |
 
 Observed, not recorded: `until()` between calendar dates is not invertible for negative periods when the end day is
 clamped (Coptic `2060-05-25 → 2057-13-02` gives `P-2Y-5M-23D`, adding it lands on `2057-12-12`) — the same
 algorithm and documented behaviour as `java.time.LocalDate.until`, and `PeriodDuration.between` inherits it; the
 British cutover month of September 1752 has `lengthOfMonth()` 19 but `range(DAY_OF_MONTH)` 1–30, and month
-arithmetic into it keeps day 23 (the days exist), all consistent with the gap; `Discordian` and `InternationalFixed`
-count weeks in `until(WEEKS)` by their calendar weeks (skipping St. Tib's Day and Year Day), not by five or seven
-days, while `plus(n, WEEKS)` adds plain days — the round trip still holds; `UtcInstant` `23:59:60.999999999`
+arithmetic into it keeps day 23 (the days exist), all consistent with the gap; `Discordian` and `InternationalFixed` count weeks by their calendar weeks (skipping St. Tib's Day and Year Day) in both `until(WEEKS)` and `plus(n, WEEKS)`, keeping the day of the week - the test's week model follows suit (this note used to claim `plus` adds plain days; it does not, and where it goes wrong is threeten-extra/7); a week step from a weekless day itself has no defined answer and is not judged; `UtcInstant` `23:59:60.999999999`
 converts to the next day's `00:00:00Z` (the UTC-SLS smear). `getLeapSecondDates()` begins with 41317 (1972-01-01),
 the start of the 10 s offset, not a leap second.
 
 ## History
 
 - 2026-09-16: created (turn 180) at 7779aa9a7215 (1.10.1-SNAPSHOT of 2026-09-15, after v1.10.0); 6 bugs.
+- 2026-09-23: generators rewritten in combinator style (turn 422); the week oracle became a calendar-week model,
+  per-chronology year bounds replaced a gate that had skipped every IFC, Discordian and Symmetry case in realistic
+  years, and the first runs of the rewritten properties found bugs 7-12.
