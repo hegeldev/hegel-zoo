@@ -232,7 +232,10 @@ rewrite); go/golang-lru, java/caffeine, typescript/whatwg-url, rust/parry (turn 
 found by the rewrite's long runs); rust/printf-compat, java/capsule, go/go-re2,
 typescript/superjson (turn 424, quiet); typescript/structured-clone, rust/uv-requirements-txt,
 go/validator, java/joda-time (turn 425; joda-time/19-21 found by the rewrite's long runs);
-rust/numfmt, typescript/devalue, go/yaml, java/commonmark-java (turn 426).
+rust/numfmt, typescript/devalue, go/yaml, java/commonmark-java (turn 426; six of the
+eight behaviours commonmark-java gated were recorded as commonmark-java/53-58 in turn 427, and the
+verifying run found 59); rust/uv-pypi-types, go/miekg-dns, typescript/smol-toml, java/snakeyaml
+(turn 427; smol-toml/10 and snakeyaml/17-22 found by the rewrites' long runs).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -396,3 +399,27 @@ without friction. Two smaller points: a `flat_map` that must keep the drawn valu
 dependent draw has no combinator in Rust (`tuples!(just(v.clone()), ...)` is the spelling), and a
 per-node style record doubles the draws per node, which is the price of a pure renderer and worth
 paying.
+
+The fourteenth batch (turn 427) was the first whose long runs found bugs in three of four targets,
+and each time through the same door: a drawn list of edits or pieces reaches boundary shapes the
+old loops drew rarely. smol-toml's mutation property, now a `weighted` list of edit records applied
+modulo the live text, met an array-of-tables header closed by one `]` (smol-toml/10) on its second
+1000-case run; snakeyaml's stream of drawn documents met a BOM written as a plain scalar, a tab
+escape, a tab-then-space in flow context, a folded scalar losing its leading space and a block
+scalar taken as an explicit key's value (snakeyaml/17-22, the last two on the second and third
+1000-case runs); miekg-dns's `Lists` of zone entries hit dnspython's singleton rule on its first
+run, a latent model bug the old generator had reached once in the baseline run of the committed
+patch. The lesson for review is that a rewrite's 100-case rounds are not enough: run the
+thousand-case rounds more than once, and when the first finds a gate hole, expect the second to
+find another (smol-toml needed three). Two gate lessons: a predicate on a record's `String()`
+misses what the printer normalises (miekg-dns printed a `\032` escape as a space, so the
+message-level Len gate now compares each record's Len with its packed size, which is what the
+records property already did on the generated text; the fix followed a red CI run); and a regex
+over an inline table cannot cross a nested table, so a trailing comma is looked for on its own.
+Shapes: uv-pypi-types's 30-field record is `tuples!` of three 10-tuples (the macro caps at 12),
+with the header order a drawn `permutations`; miekg-dns's rdata is a `Composite` per type over
+shared value generators chosen by `FlatMap` from the type; snakeyaml's document is a sealed node
+tree with per-node style records (`Doc.java`) like go/yaml's, and its dump options two 8-field
+records because Java's `tuples` caps at 8. The old smol-toml stringify property had skipped every
+case with an astral character because its lone-surrogate regex matched paired surrogates too; the
+rewrite runs them (`isWellFormed()`).
