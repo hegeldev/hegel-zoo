@@ -44,7 +44,8 @@ then sometimes bent (segment dropped or appended, trailing slash, empty segment,
 In the default run the shapes of the recorded bugs are counted and skipped (duplicate parameter
 names, a slash-spanning regexp before a dynamic segment, `*/*`, empty segments against `*`, a
 metacharacter literal after a regexp parameter, a `/` inside a regexp of a middleware route, an
-optional parameter after `*`). Pins (`TestHegelPin*`) reproduce the bugs in `bugs.toml` and are
+optional parameter after `*`, a middle `*` meeting a parameter or `P/*` beside `P*` under RegExpRouter, a
+literal after `.+` that begins twice in the request). Pins (`TestHegelPin*`) reproduce the bugs in `bugs.toml` and are
 listed as expected failures.
 
 ## Not tested
@@ -58,3 +59,4 @@ listed as expected failures.
 ## History
 
 - 2026-09-20: created (turn 320); 7 bugs recorded.
+- 2026-09-23: generators rewritten in combinator style; the long runs found hono/8-10.
