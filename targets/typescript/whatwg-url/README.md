@@ -86,6 +86,18 @@ whatwg-url bug of another kind:
 - `limit/ada-drops-port` — after `protocol = "foo"` whatwg-url keeps `:0` (not the scheme's
   default, which is null), Node drops it; `host = "h:00000000080"` on a non-special URL sets
   port 80 in whatwg-url and no port in Node (parsing the same URL, Node agrees with whatwg-url).
+- `limit/ada-file-normalizations-by-later-setter` — after `protocol = "file"` on
+  `https://localhost/c|/x` (both sides give `file://localhost/c|/x`), Node applies the file host
+  state's normalizations on the *next* setter call of any kind, even a refused `protocol =
+  "foo"`: `localhost` becomes the empty host (`file:///c|/x`) and the drive letter `c|`
+  becomes `c:` (and survives a later switch to `http`); no setter touches the host or path
+  in the standard. Skipped when a `protocol = file` step precedes and Node's URL equals
+  whatwg-url's after exactly those two rewrites.
+- `limit/ada-file-localhost-keeps-scheme` — `https://localhost/x`, `protocol = "file"`,
+  `protocol = "http"`: the scheme state refuses the switch away from `file` only for an
+  empty host, and `localhost` is a non-empty host here (only the file host state maps it),
+  so whatwg-url gives `http://localhost/x`; Node stays at `file://localhost/x`. Both agree
+  on the parse-time cases (`file://localhost/x` → `file:///x`, refusing the switch).
 - `limit/node-searchparams-escape-with-non-ascii` — `new URLSearchParams("a=é%8c")`: the
   standard UTF-8-encodes the string and then parses the bytes (`a=%C3%A9%EF%BF%BD`); Node's
   parser takes a name or value that has non-ASCII characters and percent-escapes which do not
@@ -119,3 +131,9 @@ agree with Node except in the shapes above.
 ## History
 
 - 2026-09-15: created at 37df073c (17.1.1); no bugs, ten Node divergences recorded.
+- 2026-09-23: generators rewritten in combinator style (`test/gen.mjs`); the setters' start
+  URL is drawn valid instead of half the cases returning early; three gates that were too
+  narrow widened (`host = ":80"` on a URL without a port, a bare `?` query under the
+  pathname setter, a port beside an IDNA host difference); two more Node divergences
+  recorded (`limit/ada-file-normalizations-by-later-setter`,
+  `limit/ada-file-localhost-keeps-scheme`). Still no whatwg-url bug.
