@@ -211,10 +211,12 @@ The full per-language surveys, with file and line references, are in the project
 
 Rewritten: go/go-shellquote, typescript/ini, rust/pretty-bytes (turn 413); go/shellescape,
 go/go-units, go/go-rpm-version, rust/dyn-fmt, typescript/entities, java/java-diff-utils,
-rust/shlex, go/timefmt-go, rust/shell-words, go/shortuuid, typescript/rbush, java/re2j
-(turn 414; the java-diff-utils rewrite also caught an over-strict check of its own, not a
-library bug: the per-row "untagged remainders agree" check is only meaningful for single-line
-changes). Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits) draw the whole
+rust/shlex, go/timefmt-go, rust/shell-words, go/shortuuid, typescript/rbush, java/re2j,
+go/go-shellwords, rust/human-repr, go/godotenv, typescript/pako (turn 414; the java-diff-utils
+rewrite also caught an over-strict check of its own, not a library bug: the per-row "untagged
+remainders agree" check is only meaningful for single-line changes; the pako rewrite found a
+new bug, pako/5 - drawing the damage and the cut points as one generator reached a shape the
+old loop had not). Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits) draw the whole
 operation or edit list as data, with positions taken modulo the live size when applied, so the
 shrinker can delete steps. The order of the
 rest, smallest and ugliest first, is in the project notes; each rewrite is one commit, run
