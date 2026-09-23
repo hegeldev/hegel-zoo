@@ -67,8 +67,8 @@ consulted by hand where the two disagreed.
 
 Differences between js-yaml and PyYAML that are not counted (each skipped with a `limit/…`):
 Python cannot hash a list or dict, so Sets with collection members and Maps with collection
-keys are not sent across; Python folds `1`/`True` and `0`/`False` keys, so Map keys avoid 0
-and 1; a lone surrogate has no UTF-8; `y`/`Y`/`n`/`N` are booleans in the YAML 1.1 type
+keys are not sent across; Python folds `1`/`True`, `0`/`False` and two `Date`s of one instant
+into one dict key or set member, so Sets and Maps do not draw such pairs; a lone surrogate has no UTF-8; `y`/`Y`/`n`/`N` are booleans in the YAML 1.1 type
 definition and in js-yaml's YAML11 schema, PyYAML leaves them out; PyYAML's float regexp wants
 a digit before the point (`+.5`, `._5` stay strings there, floats in js-yaml and the spec);
 PyYAML writes U+2028/U+2029 (YAML 1.1 line breaks) raw inside quotes and then cannot read
@@ -78,6 +78,12 @@ means "resolve as plain" in 1.1 and `!!str` in 1.2, which js-yaml follows in eve
 an empty `!!binary` as the last entry of a flow collection is written `[!!binary]`, which the
 grammar allows (a tag ends at a flow indicator; eemeli/yaml reads it) but libyaml rejects
 ("while scanning a tag") — PyYAML writes `!!binary ""`, which everyone reads.
+With `flowLevel`, js-yaml writes a plain scalar that starts with `?` or `:` inside a flow
+collection (`[?x]`, `{:x: null}`, `{_: ?x}`, and `{"_"::a}` with `flowSkipColonSpace`), which
+`ns-plain-first` allows in YAML 1.1 and 1.2 when a plain-safe character follows, and reads all
+of them back; PyYAML's scanners (libyaml and pure Python alike) take any `?` or `:` in flow
+context as an indicator, reading `[?x]` as `[{x: null}]` and rejecting the others
+(`limit/pyyaml-indicator-starts-flow-scalar`).
 
 One divergence deserves a note: for a **top-level** block scalar with an indentation
 indicator, js-yaml counts the indicator from the document's indentation of -1, as the spec's
@@ -104,3 +110,6 @@ round trip.
 
 - 2026-09-15: created at 494400bd (5.4.2); 3 bugs. Later the same day: js-yaml/4 (document-marker
   keys), found by the second run of the committed suite.
+- 2026-09-23: generators rewritten in combinator style (value and document records rendered by
+  pure functions); two PyYAML differences added to the list above; the marker-key check now
+  covers Set members.
