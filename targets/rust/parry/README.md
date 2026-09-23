@@ -46,3 +46,11 @@
   away. Pinned as an intermittent expected failure.
 - 2026-09-13: base bumped 3609fcc6bffe → 3dbc3d0da390 (2026-09-13, "feat: add an analytic ray-capsule intersection test (#446)"; 0.30.2); 1 bug(s) still reproduce. 645 tests pass.
 - 2026-09-18: base bumped 3dbc3d0da390 → 3383f51cbbe9 (2026-09-18, "Release v0.31.1"; 0.31.1); 0 bug(s) still reproduce; intermittent, not seen this run: parry/2. 659 tests pass.
+- 2026-09-23: generators rewritten in combinator style (`tests/common/mod.rs` is generator
+  values: `shape()`/`polytope()` enums, a `Placed { shape, pose }` record, tuples per property).
+  Its 3000-case run failed twice: new bugs **parry/3** (a solid ray cast against a zero-area
+  triangle reports `t = 0` for an origin off the shape: the origin-inside test compares edge
+  perp_dot signs that are all zero) and **parry/4** (`intersection_test` reports a cuboid and
+  a *clockwise* triangle intersecting while separated: the SAT tries each edge's
+  counterclockwise normal in one direction only). Pinned as expected failures; the two
+  properties skip exactly those shapes (4.8% and 3.6% of their cases).
