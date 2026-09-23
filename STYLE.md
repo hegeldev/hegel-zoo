@@ -231,7 +231,8 @@ go/bbolt, rust/distro-info, java/threeten-extra (turn 422; threeten-extra/7-12 f
 rewrite); go/golang-lru, java/caffeine, typescript/whatwg-url, rust/parry (turn 423; parry/3-4
 found by the rewrite's long runs); rust/printf-compat, java/capsule, go/go-re2,
 typescript/superjson (turn 424, quiet); typescript/structured-clone, rust/uv-requirements-txt,
-go/validator, java/joda-time (turn 425; joda-time/19-21 found by the rewrite's long runs).
+go/validator, java/joda-time (turn 425; joda-time/19-21 found by the rewrite's long runs);
+rust/numfmt, typescript/devalue, go/yaml, java/commonmark-java (turn 426).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -379,3 +380,19 @@ alternative, since the shrinker cannot swap between alternatives of different dr
 small enum a flat `sampled_from` table with the plain spelling repeated is the cheaper spelling; and
 Python's `splitlines()` splits on U+2028/U+2029, so a code-point comparison of two patches must
 split on the newline alone.
+The thirteenth batch (turn 426) took the two largest grammars so far. go/yaml's writer had
+interleaved some forty `chance` calls with rendering; once every node of the drawn tree carries a
+`style` record (its YAML spelling) beside its `rep` record (its Go typing), the writer is a pure
+function of the tree and a document style, and the tree itself is the recursive factory go-re2
+introduced, with `Lists` and `Maps` for the collections so keys are distinct by construction.
+java/commonmark-java's forty-odd string-building helpers became a sealed record tree (`Md.java`)
+drawn from a grammar built once per flavour with a level record per depth and rendered by one
+function; its long runs widened several known-bug gates and gated eight behaviours of the library
+and its renderer that are documented in `Known.java` as not yet recorded, to be reproduced and
+recorded on their own. numfmt showed a rewrite reaching a recorded bug from a new direction (a
+round `1e28` under the short scale meets numfmt/4's rounded `log10`), which belongs in that bug's
+notes rather than a new entry; and devalue was the third target on the tree-with-ref-nodes shape
+without friction. Two smaller points: a `flat_map` that must keep the drawn value beside its
+dependent draw has no combinator in Rust (`tuples!(just(v.clone()), ...)` is the spelling), and a
+per-node style record doubles the draws per node, which is the price of a pure renderer and worth
+paying.
