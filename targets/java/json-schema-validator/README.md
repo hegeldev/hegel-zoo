@@ -44,7 +44,9 @@ See `bugs.toml`: `contains` with `maxContains` below `minContains` rejects every
 instance, twice when both bounds are explicit (1); `unevaluatedProperties` ignores `failFast` and
 reports every offending property (2); `uniqueItems` iterates the members of any instance, so an
 object with two equal values is rejected (3, found by the 2026-09-23 rewrite of the generators in
-combinator style: `{"uniqueItems": true}` against `{"a": null, "b": null}`).
+combinator style: `{"uniqueItems": true}` against `{"a": null, "b": null}`); a count keyword above
+`Integer.MAX_VALUE` (`{"minLength": 4294967296}`) is refused as an invalid schema (4, found by the
+1000-case runs of the same day).
 
 ## Notes
 
@@ -63,8 +65,16 @@ combinator style: `{"uniqueItems": true}` against `{"a": null, "b": null}`).
   are skipped in the validity comparison; its `check_schema` accepts a relative `$id` such as
   `"string"` or `""`, which the library's default `SchemaIdValidator` refuses because no base URI
   makes it absolute (the spec requires that), so the meta-schema property tolerates that
-  `SchemaException` as it does the non-string `$ref` (all three found by the 1000-case runs of
-  2026-09-23); its `date`
+  `SchemaException` as it does the non-string `$ref` and a `$ref` to another document (`"string"`),
+  which nothing in the test resolves and `check_schema` does not follow; `check_schema` runs without a
+  format checker, so the library's `format` errors at the meta-schema level (`$id: "^a"` is no
+  `uri-reference`) are dropped from the comparison; a mutation can write `$ref: "#"` (or point a
+  definition back at the root), a loop no instance descent breaks, on which the library's
+  validation overflows the stack (python-jsonschema hits its recursion limit; the specification
+  leaves infinitely recursive schemas undefined), so the property tolerates a `StackOverflowError`
+  when it can find such a loop, and only then (all four found by the 1000-case runs of 2026-09-23,
+  the loop as a Hegel "flaky test" report because the overflow's depth varies between runs); its
+  `date`
   checker rejects year 0; `additionalItems` next to a boolean `items` crashes it (such cases are
   skipped); formats are restricted to those both sides check (ipv4, ipv6; date from draft 7; uuid
   from 2019-09).
