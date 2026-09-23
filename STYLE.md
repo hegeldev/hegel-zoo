@@ -222,7 +222,8 @@ remainders agree" check is only meaningful for single-line changes; the pako rew
 new bug, pako/5 - drawing the damage and the cut points as one generator reached a shape the
 old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semver4j,
 go/compose-go, rust/dynfmt, java/json-schema-validator, typescript/liquidjs (turn 415);
-rust/human_format, go/go-udiff, java/commons-csv, typescript/picomatch (turn 417).
+rust/human_format, go/go-udiff, java/commons-csv, typescript/picomatch (turn 417);
+go/iso8601, rust/uv-normalize, typescript/hono, java/gson (turn 418).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -250,3 +251,19 @@ runs. Two review lessons from the batch: an editor can silently normalise non-NF
 decomposed `e\u0301` in go-udiff came back composed - write such literals as escapes), and a
 known-bug gate written as a high-rate `Assume` trips the filter-too-much check, so the generator
 itself has to steer most cases away from the shape (go-udiff's disjoint-words pairs).
+The seventh batch (turn 418) was quiet on iso8601 and uv-normalize; hono's long runs
+found three more router bugs, hono/8-10 (RegExpRouter attaches a middleware to the routes it
+covers by testing its regexp against their path text, so a middle `*` meeting a `:label`, or
+`P/*` beside `P*`, loses handlers; TrieRouter and LinearRouter compile the literal after a
+slash-spanning regexp as a lookahead with no segment terminator, so `.+` overshoots when the
+literal begins twice in the request), and a 1000-case run of gson's collections property found
+gson/4 (two parsed JSON numbers are equal `JsonElement`s whenever they round to the same double,
+so `9007199254740993` equals `9007199254740992` and `JsonArray.remove(Object)` takes the wrong
+element) - a shape the old grammar could produce too, once in many thousand cases. The hono rewrite also settled how a known-bug shape is
+kept out of a generator when it is a property of a pair of routes rather than of one: a
+`filter` on the table generator (Hegel retries a filter three times before rejecting, so a
+shape a few percent of tables have costs almost nothing), with the case generator taking the
+router's name so that each property is shaped only for the bugs recorded against its router.
+Two review lessons: a build product the setup regenerates (hono's esbuild bundle) must be
+deleted before every `zoo save`, or it is swept into the patch; and a `return` after a
+documented exception inside a `catch` is the property's verdict, not a skip, and stays.
