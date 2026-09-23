@@ -10,10 +10,10 @@ index 0158da4..733feb0 100644
 +serde_json = { workspace = true }
 diff --git a/crates/uv-requirements-txt/tests/hegel.rs b/crates/uv-requirements-txt/tests/hegel.rs
 new file mode 100644
-index 0000000..bcc2574
+index 0000000..2969bb0
 --- /dev/null
 +++ b/crates/uv-requirements-txt/tests/hegel.rs
-@@ -0,0 +1,801 @@
+@@ -0,0 +1,1193 @@
 +//! Hegel properties for `uv-requirements-txt` — uv's `requirements.txt` parser (`RequirementsTxt::
 +//! parse`: requirements with `--hash` tails, `-r`/`-c` includes, `-e` editables, `--index-url`,
 +//! `--extra-index-url`, `--find-links`, `--no-index`, `--require-hashes`, `--no-binary`,
@@ -21,15 +21,27 @@ index 0000000..bcc2574
 +//! requirements-file parser** (`pip._internal.req.req_file`: `RequirementsFileParser`,
 +//! `preprocess`, `get_line_parser`; the format's owner) as the oracle, driven as one persistent
 +//! Python child over the same generated tree of files.
++//!
++//! The generators are values: a property draws one `Tree` — the root file's lines (each a
++//! `Trivia`, a `Req` or an `OptLine`), its line endings, and optionally a `Sub` (with its own
++//! lines and optionally an `Inner` file) and a `Constraints` file, each with the `Include` line
++//! that pulls it in — built from `tuples!`, `one_of!`, `sampled_from`, `vecs`, `text` and a
++//! `weighted` choice (one integer `flat_map`ped to the alternative it selects), and renders it to
++//! files with pure functions (`Tree::files`, `Req::render`, `Join::render`, ...).  The absent or
++//! plainest alternative comes first in every choice, so a shrunk tree is a root file of one plain
++//! requirement.  Include positions are indices taken modulo the live line count, and the options
++//! uv allows once per tree (`--index-url`, `--no-binary`/`--only-binary`, `-e`) are admitted by
++//! the renderer in file order — a second one renders as an empty line — so the shrinker can
++//! delete any line freely.
 +
 +use std::collections::BTreeSet;
-+use std::fmt::Debug;
 +use std::io::{BufRead, BufReader, Write};
 +use std::path::{Path, PathBuf};
 +use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 +use std::sync::{Mutex, OnceLock};
 +
-+use hegel::{generators, TestCase};
++use hegel::generators::{self, BoxedPrintableGenerator, Generator as _};
++use hegel::{PrintableGenerator, TestCase};
 +use url::Url;
 +use uv_configuration::{NoBinary, NoBuild};
 +use uv_pep508::VersionOrUrl;
@@ -209,26 +221,6 @@ index 0000000..bcc2574
 +    }
 +}
 +
-+// --------------------------------------------------------------------------- helpers
-+
-+macro_rules! int {
-+    ($lo:expr, $hi:expr) => {
-+        generators::integers().min_value($lo).max_value($hi)
-+    };
-+}
-+
-+fn n(tc: &TestCase, lo: usize, hi: usize) -> usize {
-+    tc.draw(int!(lo as i64, hi as i64)) as usize
-+}
-+
-+fn pick<T: Clone + Debug + Send + Sync + 'static>(tc: &TestCase, items: &[T]) -> T {
-+    items[n(tc, 0, items.len() - 1)].clone()
-+}
-+
-+fn chance(tc: &TestCase, pct: usize) -> bool {
-+    n(tc, 0, 99) < pct
-+}
-+
 +fn uv_parse(root: &Path, working_dir: &Path) -> Result<RequirementsTxt, String> {
 +    setup_env();
 +    let runtime = tokio::runtime::Builder::new_current_thread()
@@ -240,6 +232,57 @@ index 0000000..bcc2574
 +        .map_err(|e| format!("{e}"))
 +}
 +
++// --------------------------------------------------------------------------- generator helpers
++
++fn ints(lo: i64, hi: i64) -> generators::IntegerGenerator<i64> {
++    generators::integers().min_value(lo).max_value(hi)
++}
++
++/// True `p` of the time; shrinks to false.
++fn chance(p: f64) -> generators::BoolGenerator {
++    generators::weighted_booleans(p)
++}
++
++/// A weight and an alternative for [`weighted`].
++fn w<T>(
++    weight: u32,
++    g: impl PrintableGenerator<T> + Send + Sync + 'static,
++) -> (u32, BoxedPrintableGenerator<'static, T>) {
++    (weight, g.boxed_printable())
++}
++
++/// One of the alternatives, each as often as its weight says: one integer draw `flat_map`ped to
++/// the alternative whose cumulative weight it falls under, so only the chosen one is drawn and
++/// the choice shrinks to the first alternative.  (Hegel has no weighted `one_of!`.)
++fn weighted<T: 'static>(
++    choices: Vec<(u32, BoxedPrintableGenerator<'static, T>)>,
++) -> impl PrintableGenerator<T> {
++    let total: u32 = choices.iter().map(|(weight, _)| weight).sum();
++    ints(0, i64::from(total) - 1).flat_map(move |x| {
++        let mut x = x as u32;
++        for (weight, g) in &choices {
++            if x < *weight {
++                return g.clone();
++            }
++            x -= weight;
++        }
++        unreachable!()
++    })
++}
++
++/// `Some` of `g` `p` of the time, else `None`; shrinks to `None`, and draws `g` only when present.
++fn maybe<T>(
++    p: f64,
++    g: impl PrintableGenerator<T> + Send + Sync + 'static,
++) -> impl PrintableGenerator<Option<T>>
++where
++    T: hegel::PrettyPrintable + Clone + Send + Sync + 'static,
++{
++    let present = g.map(Some).boxed_printable();
++    let absent: BoxedPrintableGenerator<'static, Option<T>> = generators::just(None).boxed_printable();
++    chance(p).flat_map(move |yes| if yes { present.clone() } else { absent.clone() })
++}
++
 +// --------------------------------------------------------------------------- the generated tree
 +
 +/// The files of a generated tree, relative to its root directory.
@@ -249,12 +292,11 @@ index 0000000..bcc2574
 +}
 +
 +impl World {
-+    fn root(&self) -> PathBuf {
-+        self.dir.path().join("requirements.txt")
-+    }
-+
-+    fn write(&self) {
-+        let d = self.dir.path();
++    /// Write `files` (and the fixed `nested/`, `pkg/` and `wheels/` directories) to a fresh
++    /// temporary directory.
++    fn write(files: Vec<(PathBuf, String)>) -> World {
++        let dir = tempfile::tempdir().unwrap();
++        let d = dir.path();
 +        std::fs::create_dir_all(d.join("nested")).unwrap();
 +        std::fs::create_dir_all(d.join("pkg")).unwrap();
 +        std::fs::create_dir_all(d.join("wheels")).unwrap();
@@ -263,9 +305,14 @@ index 0000000..bcc2574
 +            "[project]\nname = \"pkg\"\nversion = \"0.1\"\n",
 +        )
 +        .unwrap();
-+        for (path, content) in &self.files {
++        for (path, content) in &files {
 +            std::fs::write(d.join(path), content).unwrap();
 +        }
++        World { dir, files }
++    }
++
++    fn root(&self) -> PathBuf {
++        self.dir.path().join("requirements.txt")
 +    }
 +}
 +
@@ -286,222 +333,569 @@ index 0000000..bcc2574
 +    "http://localhost:8080/simple",
 +];
 +const HOSTS: &[&str] = &["example.com", "idx.example:8080"];
-+const HEX: &[char] = &['0', '1', '9', 'a', 'b', 'f'];
++/// The characters of a hash digest.
++const HEX: &str = "019abf";
++const ALGORITHMS: &[&str] = &["sha256", "sha384", "sha512"];
 +
-+/// A `--hash` argument, `sha256:<digest>` style.
-+fn arb_hash(tc: &TestCase) -> String {
-+    let algo = pick(tc, &["sha256", "sha384", "sha512"]);
-+    let digest: String = (0..n(tc, 4, 12)).map(|_| pick(tc, HEX)).collect();
-+    format!("{algo}:{digest}")
++/// How an option and its value are joined: a space, two spaces, a tab, or (long options only;
++/// a short option renders `Equals` as a space) `key=value`.
++#[derive(Clone, Copy, Debug, PartialEq, hegel::PrettyPrintable)]
++enum Join {
++    Space,
++    Spaces,
++    Tab,
++    Equals,
 +}
 +
-+/// `key value`, `key=value` or `key\t value`; long options may use `=`.
-+fn opt(tc: &TestCase, key: &str, value: &str) -> String {
-+    if key.starts_with("--") && chance(tc, 35) {
-+        format!("{key}={value}")
-+    } else {
-+        let sep = pick(tc, &[" ", "  ", "\t"]);
-+        format!("{key}{sep}{value}")
-+    }
-+}
-+
-+/// A shell-quoted spelling of `value` (pip runs option strings through `shlex`; uv unquotes).
-+fn maybe_quote(tc: &TestCase, value: &str) -> String {
-+    match n(tc, 0, 5) {
-+        0 => format!("'{value}'"),
-+        1 => format!("\"{value}\""),
-+        _ => value.to_string(),
-+    }
-+}
-+
-+/// A trailing ` # comment` (comments need whitespace before the `#`).
-+fn maybe_comment(tc: &TestCase) -> String {
-+    if chance(tc, 20) {
-+        format!("{}# {}", pick(tc, &[" ", "\t", "   "]), pick(tc, &["note", "pinned by x", "#!"]))
-+    } else {
-+        String::new()
-+    }
-+}
-+
-+/// A PEP 508 requirement line with an optional `--hash` tail (possibly on continuation lines).
-+fn arb_requirement_line(tc: &TestCase, with_hashes: bool) -> String {
-+    let mut s = pick(tc, NAMES).to_string();
-+    if chance(tc, 30) {
-+        let extras: Vec<&str> = (0..n(tc, 1, 2)).map(|_| pick(tc, EXTRAS)).collect();
-+        s.push_str(&format!("[{}]", extras.join(",")));
-+    }
-+    if chance(tc, 60) {
-+        if chance(tc, 30) {
-+            s.push(' ');
++impl Join {
++    fn render(self, key: &str, value: &str) -> String {
++        match self {
++            Join::Space => format!("{key} {value}"),
++            Join::Spaces => format!("{key}  {value}"),
++            Join::Tab => format!("{key}\t{value}"),
++            Join::Equals if key.starts_with("--") => format!("{key}={value}"),
++            Join::Equals => format!("{key} {value}"),
 +        }
-+        s.push_str(pick(tc, SPECS));
 +    }
-+    if chance(tc, 30) {
-+        s.push_str(&format!(" ; {}", pick(tc, MARKERS)));
++}
++
++/// Whitespace (a space first), or `=` two times in five.
++const JOINS: &[Join] = &[Join::Space, Join::Spaces, Join::Tab, Join::Equals, Join::Equals];
++
++fn join() -> generators::SampledFromGenerator<'static, Join> {
++    generators::sampled_from(JOINS)
++}
++
++/// A shell-quoted spelling of a value (pip runs option strings through `shlex`; uv unquotes).
++#[derive(Clone, Copy, Debug, PartialEq, hegel::PrettyPrintable)]
++enum Quote {
++    None,
++    Single,
++    Double,
++}
++
++impl Quote {
++    fn wrap(self, value: &str) -> String {
++        match self {
++            Quote::None => value.to_string(),
++            Quote::Single => format!("'{value}'"),
++            Quote::Double => format!("\"{value}\""),
++        }
 +    }
-+    if with_hashes && chance(tc, 45) {
-+        for _ in 0..n(tc, 1, 3) {
-+            if chance(tc, 50) {
-+                s.push_str(" \\\n    ");
-+            } else {
++}
++
++/// Unquoted four times in six.
++const QUOTES: &[Quote] = &[Quote::None, Quote::None, Quote::None, Quote::None, Quote::Single, Quote::Double];
++
++fn quote() -> generators::SampledFromGenerator<'static, Quote> {
++    generators::sampled_from(QUOTES)
++}
++
++/// A trailing comment: the whitespace before the `#` (a comment needs some) and its text.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Comment {
++    gap: &'static str,
++    text: &'static str,
++}
++
++const GAPS: &[&str] = &[" ", "\t", "   "];
++const COMMENTS: &[&str] = &["note", "pinned by x", "#!"];
++
++/// No comment, or one time in five a trailing ` # comment`.
++fn comment() -> impl PrintableGenerator<Option<Comment>> {
++    maybe(
++        0.2,
++        hegel::tuples!(generators::sampled_from(GAPS), generators::sampled_from(COMMENTS))
++            .map(|(gap, text)| Comment { gap, text }),
++    )
++}
++
++fn render_comment(comment: &Option<Comment>) -> String {
++    match comment {
++        Some(Comment { gap, text }) => format!("{gap}# {text}"),
++        None => String::new(),
++    }
++}
++
++/// A `--hash` value, `sha256:<digest>` style.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Hash {
++    algorithm: &'static str,
++    digest: String,
++}
++
++/// Four to twelve hex-ish characters.
++fn digest() -> generators::TextGenerator {
++    generators::text().alphabet(HEX).min_size(4).max_size(12)
++}
++
++fn hash() -> impl PrintableGenerator<Hash> {
++    hegel::tuples!(generators::sampled_from(ALGORITHMS), digest())
++        .map(|(algorithm, digest)| Hash { algorithm, digest })
++}
++
++/// One `--hash` of a requirement: on the same line, or half the time on a continuation line.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct HashTail {
++    continued: bool,
++    join: Join,
++    hash: Hash,
++}
++
++fn hash_tail() -> impl PrintableGenerator<HashTail> {
++    hegel::tuples!(chance(0.5), join(), hash())
++        .map(|(continued, join, hash)| HashTail { continued, join, hash })
++}
++
++/// A version specifier, three times in ten separated from the name by a space.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Spec {
++    spaced: bool,
++    text: &'static str,
++}
++
++/// A PEP 508 requirement line with an optional `--hash` tail.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Req {
++    name: &'static str,
++    extras: Vec<&'static str>,
++    spec: Option<Spec>,
++    marker: Option<&'static str>,
++    hashes: Vec<HashTail>,
++    comment: Option<Comment>,
++}
++
++impl Req {
++    fn render(&self) -> String {
++        let mut s = self.name.to_string();
++        if !self.extras.is_empty() {
++            s.push_str(&format!("[{}]", self.extras.join(",")));
++        }
++        if let Some(spec) = &self.spec {
++            if spec.spaced {
 +                s.push(' ');
 +            }
-+            s.push_str(&opt(tc, "--hash", &arb_hash(tc)));
++            s.push_str(spec.text);
 +        }
++        if let Some(marker) = self.marker {
++            s.push_str(&format!(" ; {marker}"));
++        }
++        for tail in &self.hashes {
++            s.push_str(if tail.continued { " \\\n    " } else { " " });
++            s.push_str(&tail.join.render("--hash", &format!("{}:{}", tail.hash.algorithm, tail.hash.digest)));
++        }
++        s.push_str(&render_comment(&self.comment));
++        s
 +    }
-+    s.push_str(&maybe_comment(tc));
-+    s
++}
++
++/// A name; extras three times in ten (one or two); a specifier six times in ten; a marker three
++/// times in ten; with `with_hashes`, one to three `--hash` tails nine times in twenty; a comment.
++fn requirement(with_hashes: bool) -> impl PrintableGenerator<Req> {
++    let extras = maybe(0.3, generators::vecs(generators::sampled_from(EXTRAS)).min_size(1).max_size(2))
++        .map(Option::unwrap_or_default);
++    let spec = maybe(
++        0.6,
++        hegel::tuples!(chance(0.3), generators::sampled_from(SPECS)).map(|(spaced, text)| Spec { spaced, text }),
++    );
++    let hashes = if with_hashes {
++        maybe(0.45, generators::vecs(hash_tail()).min_size(1).max_size(3))
++            .map(Option::unwrap_or_default)
++            .boxed_printable()
++    } else {
++        generators::just(Vec::new()).boxed_printable()
++    };
++    hegel::tuples!(
++        generators::sampled_from(NAMES),
++        extras,
++        spec,
++        maybe(0.3, generators::sampled_from(MARKERS)),
++        hashes,
++        comment()
++    )
++    .map(|(name, extras, spec, marker, hashes, comment)| Req { name, extras, spec, marker, hashes, comment })
 +}
 +
 +/// A line that is trivia to both parsers.
-+fn arb_trivia(tc: &TestCase) -> String {
-+    match n(tc, 0, 4) {
-+        0 => String::new(),
-+        1 => pick(tc, &[" ", "\t", "   "]).to_string(),
-+        2 => format!("# {}", pick(tc, &["comment", "-r not-an-include.txt", "requests==1"])),
-+        3 => format!("   # {}", pick(tc, &["indented", "x"])),
-+        _ => "#".to_string(),
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++enum Trivia {
++    /// an empty line
++    Empty,
++    /// whitespace only
++    Blank(&'static str),
++    /// `# text`
++    Comment(&'static str),
++    /// `   # text`
++    Indented(&'static str),
++    /// a lone `#`
++    Hash,
++}
++
++impl Trivia {
++    fn render(&self) -> String {
++        match self {
++            Trivia::Empty => String::new(),
++            Trivia::Blank(ws) => ws.to_string(),
++            Trivia::Comment(text) => format!("# {text}"),
++            Trivia::Indented(text) => format!("   # {text}"),
++            Trivia::Hash => "#".to_string(),
++        }
 +    }
 +}
 +
-+/// Options for a file: the flags that may appear anywhere, with `once`-per-world ones gated.
-+struct Budget {
++const BLANKS: &[&str] = &[" ", "\t", "   "];
++const COMMENT_LINES: &[&str] = &["comment", "-r not-an-include.txt", "requests==1"];
++const INDENTED_COMMENTS: &[&str] = &["indented", "x"];
++
++fn trivia() -> impl PrintableGenerator<Trivia> {
++    hegel::one_of!(
++        generators::just(Trivia::Empty),
++        generators::sampled_from(BLANKS).map(Trivia::Blank),
++        generators::sampled_from(COMMENT_LINES).map(Trivia::Comment),
++        generators::sampled_from(INDENTED_COMMENTS).map(Trivia::Indented),
++        generators::just(Trivia::Hash),
++    )
++}
++
++/// An option line's flag, with the value it takes.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++enum Flag {
++    NoIndex,
++    RequireHashes,
++    Pre,
++    TrustedHost(&'static str),
++    /// once per tree (a second one is an error in uv, where pip takes the last)
++    IndexUrl { key: &'static str, quote: Quote, url: &'static str },
++    ExtraIndexUrl { quote: Quote, url: &'static str },
++    /// a URL, or in the root file a local directory
++    FindLinks { key: &'static str, quote: Quote, target: &'static str },
++    /// `--no-binary`/`--only-binary`, once per tree
++    Binary { key: &'static str, quote: Quote, name: &'static str },
++    /// `-e ./pkg`, once per tree and in the root file only
++    Editable { key: &'static str, path: &'static str },
++}
++
++impl Flag {
++    fn render(&self, join: Join) -> String {
++        match self {
++            Flag::NoIndex => "--no-index".to_string(),
++            Flag::RequireHashes => "--require-hashes".to_string(),
++            Flag::Pre => "--pre".to_string(),
++            Flag::TrustedHost(host) => join.render("--trusted-host", host),
++            Flag::IndexUrl { key, quote, url } => join.render(key, &quote.wrap(url)),
++            Flag::ExtraIndexUrl { quote, url } => join.render("--extra-index-url", &quote.wrap(url)),
++            Flag::FindLinks { key, quote, target } => join.render(key, &quote.wrap(target)),
++            Flag::Binary { key, quote, name } => join.render(key, &quote.wrap(name)),
++            Flag::Editable { key, path } => join.render(key, path),
++        }
++    }
++}
++
++/// `--index-url` two times in three, `-i` otherwise.
++const INDEX_KEYS: &[&str] = &["--index-url", "-i", "--index-url"];
++const FIND_LINKS_KEYS: &[&str] = &["--find-links", "-f"];
++const WHEELS: &[&str] = &["./wheels", "wheels"];
++const BINARY_KEYS: &[&str] = &["--no-binary", "--only-binary"];
++const BINARY_NAMES: &[&str] = &[":all:", ":none:", "requests", "Flask", "a-b_c.d"];
++const EDITABLE_KEYS: &[&str] = &["-e", "--editable"];
++const PKG_PATHS: &[&str] = &["./pkg", "pkg"];
++
++/// Every flag equally often; `-e` only in the root file, and there `--find-links` names the
++/// local `wheels` directory half the time.
++fn flag(in_root: bool) -> impl PrintableGenerator<Flag> {
++    let url = || generators::sampled_from(URLS);
++    let find_links_target = if in_root {
++        hegel::one_of!(url(), generators::sampled_from(WHEELS)).boxed_printable()
++    } else {
++        url().boxed_printable()
++    };
++    let mut choices = vec![
++        w(1, generators::just(Flag::NoIndex)),
++        w(1, generators::just(Flag::RequireHashes)),
++        w(1, generators::just(Flag::Pre)),
++        w(1, generators::sampled_from(HOSTS).map(Flag::TrustedHost)),
++        w(
++            1,
++            hegel::tuples!(generators::sampled_from(INDEX_KEYS), quote(), url())
++                .map(|(key, quote, url)| Flag::IndexUrl { key, quote, url }),
++        ),
++        w(1, hegel::tuples!(quote(), url()).map(|(quote, url)| Flag::ExtraIndexUrl { quote, url })),
++        w(
++            1,
++            hegel::tuples!(generators::sampled_from(FIND_LINKS_KEYS), quote(), find_links_target)
++                .map(|(key, quote, target)| Flag::FindLinks { key, quote, target }),
++        ),
++        w(
++            1,
++            hegel::tuples!(generators::sampled_from(BINARY_KEYS), quote(), generators::sampled_from(BINARY_NAMES))
++                .map(|(key, quote, name)| Flag::Binary { key, quote, name }),
++        ),
++    ];
++    if in_root {
++        choices.push(w(
++            1,
++            hegel::tuples!(generators::sampled_from(EDITABLE_KEYS), generators::sampled_from(PKG_PATHS))
++                .map(|(key, path)| Flag::Editable { key, path }),
++        ));
++    }
++    weighted(choices)
++}
++
++/// An option line: the flag, how its value is joined, a comment.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct OptLine {
++    flag: Flag,
++    join: Join,
++    comment: Option<Comment>,
++}
++
++impl OptLine {
++    fn render(&self) -> String {
++        format!("{}{}", self.flag.render(self.join), render_comment(&self.comment))
++    }
++}
++
++fn option_line(in_root: bool) -> impl PrintableGenerator<OptLine> {
++    hegel::tuples!(flag(in_root), join(), comment())
++        .map(|(flag, join, comment)| OptLine { flag, join, comment })
++}
++
++/// The options uv accepts once per tree; the renderer admits the first of each, in file order,
++/// and renders a later one as an empty line.
++#[derive(Default)]
++struct Admitted {
 +    index_url: bool,
 +    binary: bool,
 +    editable: bool,
 +}
 +
-+fn arb_option_line(tc: &TestCase, budget: &mut Budget, in_root: bool) -> Option<String> {
-+    let line = match n(tc, 0, 9) {
-+        0 if budget.index_url => {
-+            budget.index_url = false;
-+            let key = pick(tc, &["--index-url", "-i", "--index-url"]);
-+            opt(tc, key, &maybe_quote(tc, pick(tc, URLS)))
-+        }
-+        1 => opt(tc, "--extra-index-url", &maybe_quote(tc, pick(tc, URLS))),
-+        2 => {
-+            let value = if in_root && chance(tc, 50) {
-+                pick(tc, &["./wheels", "wheels"]).to_string()
-+            } else {
-+                pick(tc, URLS).to_string()
-+            };
-+            opt(tc, pick(tc, &["--find-links", "-f"]), &maybe_quote(tc, &value))
-+        }
-+        3 => "--no-index".to_string(),
-+        4 => "--require-hashes".to_string(),
-+        5 if budget.binary => {
-+            budget.binary = false;
-+            let key = pick(tc, &["--no-binary", "--only-binary"]);
-+            let value = pick(tc, &[":all:", ":none:", "requests", "Flask", "a-b_c.d"]);
-+            opt(tc, key, &maybe_quote(tc, value))
-+        }
-+        6 => "--pre".to_string(),
-+        7 => opt(tc, "--trusted-host", pick(tc, HOSTS)),
-+        8 if budget.editable && in_root => {
-+            budget.editable = false;
-+            let value = pick(tc, &["./pkg", "pkg"]);
-+            opt(tc, pick(tc, &["-e", "--editable"]), value)
-+        }
-+        _ => return None,
-+    };
-+    Some(format!("{line}{}", maybe_comment(tc)))
++impl Admitted {
++    fn admit(&mut self, flag: &Flag) -> bool {
++        let slot = match flag {
++            Flag::IndexUrl { .. } => &mut self.index_url,
++            Flag::Binary { .. } => &mut self.binary,
++            Flag::Editable { .. } => &mut self.editable,
++            _ => return true,
++        };
++        !std::mem::replace(slot, true)
++    }
 +}
 +
-+/// Generate a world: `requirements.txt` at the root, possibly including `sub.txt` (which may
-+/// include `nested/inner.txt`) and a `constraints.txt`.
-+fn arb_world(tc: &TestCase) -> World {
-+    let dir = tempfile::tempdir().unwrap();
-+    let mut budget = Budget {
-+        index_url: true,
-+        binary: true,
-+        editable: true,
-+    };
-+    let crlf_root = chance(tc, 20);
-+    let include_sub = chance(tc, 55);
-+    let include_inner = include_sub && chance(tc, 40);
-+    let include_constraints = chance(tc, 40);
++/// A line of a requirements file.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++enum Line {
++    Trivia(Trivia),
++    Req(Req),
++    Opt(OptLine),
++}
 +
-+    let mut files = Vec::new();
-+    let mut lines: Vec<String> = Vec::new();
-+    let leading_ws = |tc: &TestCase, line: String| -> String {
-+        if chance(tc, 15) {
-+            format!("{}{line}", pick(tc, &[" ", "\t"]))
-+        } else {
-+            line
++impl Line {
++    fn render(&self, admitted: &mut Admitted) -> String {
++        match self {
++            Line::Trivia(t) => t.render(),
++            Line::Req(r) => r.render(),
++            Line::Opt(o) => {
++                if admitted.admit(&o.flag) {
++                    o.render()
++                } else {
++                    String::new()
++                }
++            }
 +        }
-+    };
++    }
++}
 +
-+    // The nested file (no includes of its own).
-+    if include_inner {
-+        let mut inner = Vec::new();
-+        for _ in 0..n(tc, 0, 3) {
-+            inner.push(match n(tc, 0, 2) {
-+                0 => arb_trivia(tc),
-+                1 => arb_requirement_line(tc, true),
-+                _ => arb_option_line(tc, &mut budget, false).unwrap_or_default(),
-+            });
-+        }
-+        files.push((PathBuf::from("nested/inner.txt"), inner.join("\n") + "\n"));
-+    }
-+    if include_sub {
-+        let mut sub = Vec::new();
-+        for _ in 0..n(tc, 0, 4) {
-+            sub.push(match n(tc, 0, 2) {
-+                0 => arb_trivia(tc),
-+                1 => arb_requirement_line(tc, true),
-+                _ => arb_option_line(tc, &mut budget, false).unwrap_or_default(),
-+            });
-+        }
-+        if include_inner {
-+            let at = n(tc, 0, sub.len());
-+            sub.insert(at, opt(tc, pick(tc, &["-r", "--requirement"]), "nested/inner.txt"));
-+        }
-+        let eol = if chance(tc, 20) { "\r\n" } else { "\n" };
-+        files.push((PathBuf::from("sub.txt"), sub.join(eol) + eol));
-+    }
-+    if include_constraints {
-+        let mut cons = Vec::new();
-+        for _ in 0..n(tc, 0, 3) {
-+            cons.push(match n(tc, 0, 2) {
-+                0 => arb_trivia(tc),
-+                _ => arb_requirement_line(tc, false),
-+            });
-+        }
-+        files.push((PathBuf::from("constraints.txt"), cons.join("\n") + "\n"));
-+    }
++/// Trivia, a requirement (twice as often in the root file) or an option line.
++fn line(in_root: bool) -> impl PrintableGenerator<Line> {
++    weighted(vec![
++        w(1, trivia().map(Line::Trivia)),
++        w(if in_root { 2 } else { 1 }, requirement(true).map(Line::Req)),
++        w(1, option_line(in_root).map(Line::Opt)),
++    ])
++}
 +
-+    // The root file.
-+    for _ in 0..n(tc, 0, 6) {
-+        let line = match n(tc, 0, 3) {
-+            0 => arb_trivia(tc),
-+            1 | 2 => arb_requirement_line(tc, true),
-+            _ => arb_option_line(tc, &mut budget, true).unwrap_or_default(),
-+        };
-+        lines.push(leading_ws(tc, line));
-+    }
-+    if include_sub {
-+        let at = n(tc, 0, lines.len());
-+        let name = match n(tc, 0, 3) {
-+            0 => "${HEGEL_ZOO_REQ_VAR}.txt".to_string(),
-+            1 => maybe_quote(tc, "sub.txt"),
-+            _ => pick(tc, &["sub.txt", "./sub.txt"]).to_string(),
-+        };
-+        lines.insert(at, opt(tc, pick(tc, &["-r", "--requirement"]), &name));
-+    }
-+    if include_constraints {
-+        let at = n(tc, 0, lines.len());
-+        lines.insert(at, opt(tc, pick(tc, &["-c", "--constraint"]), "constraints.txt"));
-+    }
-+    let eol = if crlf_root { "\r\n" } else { "\n" };
-+    let mut root = lines.join(eol);
-+    if chance(tc, 80) {
-+        root.push_str(eol);
-+    }
-+    files.push((PathBuf::from("requirements.txt"), root));
++/// A constraints file's line: trivia, or twice as often a requirement without hashes.
++fn constraint_line() -> impl PrintableGenerator<Line> {
++    weighted(vec![
++        w(1, trivia().map(Line::Trivia)),
++        w(2, requirement(false).map(Line::Req)),
++    ])
++}
 +
-+    let world = World { dir, files };
-+    world.write();
-+    world
++fn render_lines(lines: &[Line], admitted: &mut Admitted) -> Vec<String> {
++    lines.iter().map(|line| line.render(admitted)).collect()
++}
++
++/// A line of the root file, three times in twenty indented.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Entry {
++    indent: &'static str,
++    line: Line,
++}
++
++const INDENTS: &[&str] = &[" ", "\t"];
++
++fn entry() -> impl PrintableGenerator<Entry> {
++    let indent = maybe(0.15, generators::sampled_from(INDENTS)).map(|indent| indent.unwrap_or(""));
++    hegel::tuples!(indent, line(true)).map(|(indent, line)| Entry { indent, line })
++}
++
++/// An `-r`/`-c` line, and where in the including file it goes (an index taken modulo the live
++/// line count).
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Include {
++    key: &'static str,
++    join: Join,
++    quote: Quote,
++    name: &'static str,
++    at: usize,
++}
++
++impl Include {
++    fn insert_into(&self, lines: &mut Vec<String>) {
++        let at = self.at % (lines.len() + 1);
++        lines.insert(at, self.join.render(self.key, &self.quote.wrap(self.name)));
++    }
++}
++
++fn include(
++    keys: &'static [&'static str],
++    name: impl PrintableGenerator<(Quote, &'static str)> + Send + Sync + 'static,
++    max_at: i64,
++) -> impl PrintableGenerator<Include> {
++    hegel::tuples!(generators::sampled_from(keys), join(), name, ints(0, max_at))
++        .map(|(key, join, (quote, name), at)| Include { key, join, quote, name, at: at as usize })
++}
++
++const REQUIREMENT_KEYS: &[&str] = &["-r", "--requirement"];
++const CONSTRAINT_KEYS: &[&str] = &["-c", "--constraint"];
++const SUB_PATHS: &[&str] = &["sub.txt", "./sub.txt"];
++
++/// `sub.txt` or `./sub.txt` half the time, `sub.txt` possibly quoted a quarter, and a quarter
++/// `${HEGEL_ZOO_REQ_VAR}.txt` (which expands to `sub.txt`).
++fn sub_name() -> impl PrintableGenerator<(Quote, &'static str)> {
++    weighted(vec![
++        w(2, generators::sampled_from(SUB_PATHS).map(|name| (Quote::None, name))),
++        w(1, quote().map(|quote| (quote, "sub.txt"))),
++        w(1, generators::just((Quote::None, "${HEGEL_ZOO_REQ_VAR}.txt"))),
++    ])
++}
++
++/// `nested/inner.txt`, included from `sub.txt`; no includes of its own.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Inner {
++    include: Include,
++    lines: Vec<Line>,
++}
++
++fn inner() -> impl PrintableGenerator<Inner> {
++    hegel::tuples!(
++        include(REQUIREMENT_KEYS, generators::just((Quote::None, "nested/inner.txt")), 4),
++        generators::vecs(line(false)).max_size(3)
++    )
++    .map(|(include, lines)| Inner { include, lines })
++}
++
++/// `sub.txt`, included from the root file; two times in five it includes `nested/inner.txt`.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Sub {
++    include: Include,
++    lines: Vec<Line>,
++    crlf: bool,
++    inner: Option<Inner>,
++}
++
++fn sub() -> impl PrintableGenerator<Sub> {
++    hegel::tuples!(
++        include(REQUIREMENT_KEYS, sub_name(), 6),
++        generators::vecs(line(false)).max_size(4),
++        chance(0.2),
++        maybe(0.4, inner())
++    )
++    .map(|(include, lines, crlf, inner)| Sub { include, lines, crlf, inner })
++}
++
++/// `constraints.txt`, included from the root file with `-c`.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Constraints {
++    include: Include,
++    lines: Vec<Line>,
++}
++
++fn constraints() -> impl PrintableGenerator<Constraints> {
++    hegel::tuples!(
++        include(CONSTRAINT_KEYS, generators::just((Quote::None, "constraints.txt")), 7),
++        generators::vecs(constraint_line()).max_size(3)
++    )
++    .map(|(include, lines)| Constraints { include, lines })
++}
++
++/// A tree of requirements files: `requirements.txt` at the root, possibly including `sub.txt`
++/// (which may include `nested/inner.txt`) and a `constraints.txt`.
++#[derive(Clone, Debug, hegel::PrettyPrintable)]
++struct Tree {
++    lines: Vec<Entry>,
++    /// CRLF line endings in the root file
++    crlf: bool,
++    /// no newline after the root file's last line
++    unterminated: bool,
++    sub: Option<Sub>,
++    constraints: Option<Constraints>,
++}
++
++impl Tree {
++    /// The files, relative to the tree's directory.
++    fn files(&self) -> Vec<(PathBuf, String)> {
++        let mut admitted = Admitted::default();
++        let mut files = Vec::new();
++        if let Some(sub) = &self.sub {
++            if let Some(inner) = &sub.inner {
++                let lines = render_lines(&inner.lines, &mut admitted);
++                files.push((PathBuf::from("nested/inner.txt"), lines.join("\n") + "\n"));
++            }
++            let mut lines = render_lines(&sub.lines, &mut admitted);
++            if let Some(inner) = &sub.inner {
++                inner.include.insert_into(&mut lines);
++            }
++            let eol = if sub.crlf { "\r\n" } else { "\n" };
++            files.push((PathBuf::from("sub.txt"), lines.join(eol) + eol));
++        }
++        if let Some(constraints) = &self.constraints {
++            let lines = render_lines(&constraints.lines, &mut admitted);
++            files.push((PathBuf::from("constraints.txt"), lines.join("\n") + "\n"));
++        }
++        let mut lines: Vec<String> = self
++            .lines
++            .iter()
++            .map(|entry| format!("{}{}", entry.indent, entry.line.render(&mut admitted)))
++            .collect();
++        if let Some(sub) = &self.sub {
++            sub.include.insert_into(&mut lines);
++        }
++        if let Some(constraints) = &self.constraints {
++            constraints.include.insert_into(&mut lines);
++        }
++        let eol = if self.crlf { "\r\n" } else { "\n" };
++        let mut root = lines.join(eol);
++        if !self.unterminated {
++            root.push_str(eol);
++        }
++        files.push((PathBuf::from("requirements.txt"), root));
++        files
++    }
++}
++
++/// Up to six root lines, CRLF one time in five, unterminated one time in five, `sub.txt`
++/// eleven times in twenty, `constraints.txt` two times in five.
++fn tree() -> impl PrintableGenerator<Tree> {
++    hegel::tuples!(
++        generators::vecs(entry()).max_size(6),
++        chance(0.2),
++        chance(0.2),
++        maybe(0.55, sub()),
++        maybe(0.4, constraints())
++    )
++    .map(|(lines, crlf, unterminated, sub, constraints)| Tree { lines, crlf, unterminated, sub, constraints })
 +}
 +
 +// --------------------------------------------------------------------------- the model
@@ -674,7 +1068,7 @@ index 0000000..bcc2574
 +/// constraints, editables, index URLs, find-links, and the boolean and binary flags.
 +#[hegel::test]
 +fn trees_flatten_like_pip(tc: TestCase) {
-+    let world = arb_world(&tc);
++    let world = World::write(tc.draw(tree()).files());
 +    let root = world.root();
 +    let pip = pip_parse(&root);
 +    let uv = uv_parse(&root, world.dir.path());
@@ -694,7 +1088,7 @@ index 0000000..bcc2574
 +/// sub-tree's part of the flattened result.
 +#[hegel::test]
 +fn parsing_is_deterministic_and_compositional(tc: TestCase) {
-+    let world = arb_world(&tc);
++    let world = World::write(tc.draw(tree()).files());
 +    let root = world.root();
 +    let first = uv_parse(&root, world.dir.path());
 +    let second = uv_parse(&root, world.dir.path());
@@ -720,49 +1114,49 @@ index 0000000..bcc2574
 +    }
 +}
 +
++// --------------------------------------------------------------------------- pinned bugs
++
++const FRAGMENTS: &[&str] = &["#frag", "#egg=x", "#1"];
++
 +/// Pinned: uv-requirements-txt/1 — a `#` inside an option's value ends the value (`is_terminal`
 +/// treats `#` like a newline), where pip only starts a comment at a `#` preceded by whitespace:
 +/// `--index-url https://h/simple#frag` loses the fragment, `-r sub#1.txt` reads `sub`.
 +#[hegel::test]
 +fn hash_in_option_values_is_not_a_comment(tc: TestCase) {
-+    let world = World {
-+        dir: tempfile::tempdir().unwrap(),
-+        files: vec![
-+            (PathBuf::from("sub#1.txt"), "flask\n".to_string()),
-+            (PathBuf::from("sub.txt"), "requests\n".to_string()),
-+        ],
-+    };
-+    world.write();
++    let world = World::write(vec![
++        (PathBuf::from("sub#1.txt"), "flask\n".to_string()),
++        (PathBuf::from("sub.txt"), "requests\n".to_string()),
++    ]);
 +    let d = world.dir.path();
-+    let frag = pick(&tc, &["#frag", "#egg=x", "#1"]);
-+    let line = match n(&tc, 0, 2) {
-+        0 => opt(&tc, "--index-url", &format!("https://example.com/simple{frag}")),
-+        1 => opt(&tc, "--find-links", &format!("https://example.com/links{frag}")),
-+        _ => opt(&tc, pick(&tc, &["-r", "--requirement"]), "sub#1.txt"),
-+    };
++    let option = hegel::one_of!(
++        generators::sampled_from(FRAGMENTS).map(|frag| ("--index-url", format!("https://example.com/simple{frag}"))),
++        generators::sampled_from(FRAGMENTS).map(|frag| ("--find-links", format!("https://example.com/links{frag}"))),
++        generators::sampled_from(REQUIREMENT_KEYS).map(|key| (key, "sub#1.txt".to_string())),
++    );
++    let ((key, value), join) = tc.draw(hegel::tuples!(option, join()));
++    let line = join.render(key, &value);
 +    let root = d.join("requirements.txt");
 +    std::fs::write(&root, format!("{line}\n")).unwrap();
 +    let pip = pip_parse(&root).unwrap_or_else(|e| panic!("pip: {e}"));
 +    let uv = uv_parse(&root, d).unwrap_or_else(|e| panic!("uv: {e} for {line:?}"));
 +    assert_eq!(model_from_uv(&uv), model_from_pip(&pip), "{line:?}");
 +}
++
++const COMMA_ITEMS: &[&str] = &["requests", "Flask", "a-b_c.d", ":none:"];
 +
 +/// Pinned: uv-requirements-txt/2 — `--no-binary`/`--only-binary` take pip's comma-separated
 +/// list (`--no-binary a,b`, `--only-binary :none:,a`); uv parses the whole value as one package
 +/// name and fails.
 +#[hegel::test]
 +fn binary_options_take_comma_lists(tc: TestCase) {
-+    let world = World {
-+        dir: tempfile::tempdir().unwrap(),
-+        files: vec![],
-+    };
-+    world.write();
++    let world = World::write(vec![]);
 +    let d = world.dir.path();
-+    let key = pick(&tc, &["--no-binary", "--only-binary"]);
-+    let items: Vec<&str> = (0..n(&tc, 2, 3))
-+        .map(|_| pick(&tc, &["requests", "Flask", "a-b_c.d", ":none:"]))
-+        .collect();
-+    let line = opt(&tc, key, &items.join(","));
++    let (key, items, join) = tc.draw(hegel::tuples!(
++        generators::sampled_from(BINARY_KEYS),
++        generators::vecs(generators::sampled_from(COMMA_ITEMS)).min_size(2).max_size(3),
++        join()
++    ));
++    let line = join.render(key, &items.join(","));
 +    let root = d.join("requirements.txt");
 +    std::fs::write(&root, format!("{line}\n")).unwrap();
 +    let pip = pip_parse(&root).unwrap_or_else(|e| panic!("pip: {e}"));
@@ -770,24 +1164,25 @@ index 0000000..bcc2574
 +    assert_eq!(model_from_uv(&uv), model_from_pip(&pip), "{line:?}");
 +}
 +
++const CONTINUATION_INDENTS: &[&str] = &["", "  ", "\t"];
++const CONTINUED_OPTIONS: &[(&str, &str)] = &[
++    ("--index-url", "https://example.com/simple"),
++    ("--extra-index-url", "https://x.example/s"),
++    ("--find-links", "https://example.com/links"),
++    ("-r", "sub.txt"),
++];
++
 +/// Pinned: uv-requirements-txt/3 — the documented grammar allows `wrappable_whitespaces`
 +/// between an option and its value, and pip joins backslash-continued lines before parsing,
 +/// but `parse_value` only eats plain whitespace: `--index-url \` + newline + URL fails.
 +#[hegel::test]
 +fn option_values_may_follow_a_line_continuation(tc: TestCase) {
-+    let world = World {
-+        dir: tempfile::tempdir().unwrap(),
-+        files: vec![(PathBuf::from("sub.txt"), "requests\n".to_string())],
-+    };
-+    world.write();
++    let world = World::write(vec![(PathBuf::from("sub.txt"), "requests\n".to_string())]);
 +    let d = world.dir.path();
-+    let indent = pick(&tc, &["", "  ", "\t"]);
-+    let (key, value) = match n(&tc, 0, 3) {
-+        0 => ("--index-url", "https://example.com/simple"),
-+        1 => ("--extra-index-url", "https://x.example/s"),
-+        2 => ("--find-links", "https://example.com/links"),
-+        _ => ("-r", "sub.txt"),
-+    };
++    let (indent, (key, value)) = tc.draw(hegel::tuples!(
++        generators::sampled_from(CONTINUATION_INDENTS),
++        generators::sampled_from(CONTINUED_OPTIONS)
++    ));
 +    let line = format!("{key} \\\n{indent}{value}");
 +    let root = d.join("requirements.txt");
 +    std::fs::write(&root, format!("{line}\n")).unwrap();
@@ -800,14 +1195,10 @@ index 0000000..bcc2574
 +/// pip refuses a value without the colon; uv keeps any non-whitespace text as a hash.
 +#[hegel::test]
 +fn hash_values_have_the_documented_shape(tc: TestCase) {
-+    let world = World {
-+        dir: tempfile::tempdir().unwrap(),
-+        files: vec![],
-+    };
-+    world.write();
++    let world = World::write(vec![]);
 +    let d = world.dir.path();
-+    let digest: String = (0..n(&tc, 4, 12)).map(|_| pick(&tc, HEX)).collect();
-+    let line = format!("{} {}", pick(&tc, NAMES), opt(&tc, "--hash", &digest));
++    let (name, digest, join) = tc.draw(hegel::tuples!(generators::sampled_from(NAMES), digest(), join()));
++    let line = format!("{name} {}", join.render("--hash", &digest));
 +    let root = d.join("requirements.txt");
 +    std::fs::write(&root, format!("{line}\n")).unwrap();
 +    let pip = pip_parse(&root);
@@ -815,3 +1206,4 @@ index 0000000..bcc2574
 +    assert!(pip.is_err(), "pip accepted {line:?}: {pip:?}");
 +    assert!(uv.is_err(), "pip refuses {line:?} but uv gives {uv:#?}");
 +}
++
