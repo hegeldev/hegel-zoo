@@ -161,9 +161,17 @@ The full per-language surveys, with file and line references, are in the project
 1. **Weighted choice**: `OneOf` with weights (or `Weighted`/`frequency`), and `sampledFrom` with
    weights. Every language faked it with `chance()` dice, `switch` ladders or duplicated list
    entries; the `FlatMap`-over-an-integer helper the rewrites use works in every binding but is
-   twenty lines of boilerplate per test file and hides the choice from the printer.
+   twenty lines of boilerplate per test file and hides the choice from the printer (the draw
+   report shows the index, not which alternative it selected). Alphabets are sets: Rust's
+   `text().alphabet("aab")` draws `b` half the time (the binding passes it as
+   `include_characters`), so a pool that weights characters by repetition has to stay a
+   `vecs(sampled_from(POOL))`.
 2. **`Booleans(p)` / `chance(p)` shrinking to false** (Rust has `weighted_booleans`; Java's
-   `generateBoolean(double)` is public but unwrapped; Go and TS have nothing).
+   `generateBoolean(double)` is public but unwrapped; Go and TS have nothing). The stand-in
+   `Map(Integers(0, 99), x < pct)` is not a fair coin: integer draws are boundary-biased, so in
+   re2j `chance(20)`, `chance(15)`, `chance(15)` gave the all-three-on corner 11% of cases
+   (0.45% if uniform) and no flag 26% (58%); good for coverage, wrong for anyone reading the
+   percentage literally.
 3. **Optional with a probability** (`Optional(g).Probability(p)`); it is 50/50 today, which is
    why 2 443 Go sites and 185 TS sites wrote `if chance(...)` instead.
 4. **Read the environment in every binding** (`HEGEL_TEST_CASES`, `HEGEL_DATABASE`,
@@ -178,17 +186,22 @@ The full per-language surveys, with file and line references, are in the project
    865 manual notes.
 7. **Unique-by, permutations, subsets**: 106 dedupe loops in Go, Fisher-Yates shuffles in every
    language (unshrinkable: shrinking the swap index reorders, it does not simplify), seeded
-   `java.util.Random` in 18 Java sites.
+   `java.util.Random` in 18 Java sites. The shrinkable stand-in (go/shortuuid `permuted`) is a
+   stable sort by one drawn key per element, so all-equal keys are the identity; it should not
+   have to be invented per target.
 8. **A recursive combinator that is easy to find** (`Recursive(base, extend, maxLeaves)`; Rust
-   has `recursive()` with zero users, Java has `deferred()` with zero users) and a doc example
-   shaped like "an arbitrary JSON value".
+   has `recursive()` with zero users, Java has `deferred()` with zero users - and no size bound,
+   so a grammar whose branching factor exceeds one cannot use it safely: java/re2j keeps a
+   depth parameter) and a doc example shaped like "an arbitrary JSON value".
 9. **Statistics and a keep-going mode**: `tc.event(label)` with an end-of-run histogram, and a
    documented `reportMultipleFailures` that groups by shrink key, would replace the zoo's
    per-target collect harness (62 Go, 54 TS, 34 Java copies).
 10. **Stateful testing that fits the zoo's shape**: a recipe (or API) for per-case fixtures, a
     model+system pair and rule arguments drawn from live state; a TS state-machine API; a
     fluent Java builder instead of annotations (`Generated` is package-private).
-11. **Small things**: tuples/concat/join for Go; `FromRegex` more visible (one Go user, four
+11. **Small things**: tuples/concat/join for Go (Rust has `hegel::tuples!(a, b)`, TS
+    `gs.tuples`, Java `Generators.tuples` up to eight - the rewrites' `seq` is a Composite only in
+    Go); a fixed-size `Lists(g).Size(n)`; `FromRegex` more visible (one Go user, four
     Rust `.alphabet()` users); Java `oneOf` generics (`@SafeVarargs`, `Generator.or`), sizes
     surviving `map`/`oneOf`, a `ThrowingConsumer` overload of `Hegel.test`, a public `StopTest`,
     `nullable(g)`; a clearer Rust error than "cannot print the values it draws" for a missing
@@ -197,10 +210,13 @@ The full per-language surveys, with file and line references, are in the project
 ## Status
 
 Rewritten: go/go-shellquote, typescript/ini, rust/pretty-bytes (turn 413); go/shellescape,
-go/go-units, go/go-rpm-version, rust/dyn-fmt, typescript/entities, java/java-diff-utils
+go/go-units, go/go-rpm-version, rust/dyn-fmt, typescript/entities, java/java-diff-utils,
+rust/shlex, go/timefmt-go, rust/shell-words, go/shortuuid, typescript/rbush, java/re2j
 (turn 414; the java-diff-utils rewrite also caught an over-strict check of its own, not a
 library bug: the per-row "untagged remainders agree" check is only meaningful for single-line
-changes). The order of the
+changes). Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits) draw the whole
+operation or edit list as data, with positions taken modulo the live size when applied, so the
+shrinker can delete steps. The order of the
 rest, smallest and ugliest first, is in the project notes; each rewrite is one commit, run
 through `tools/zoo test` six times, with the same properties and pins unless the rewrite finds
 a new bug (recorded in `bugs.toml` as usual).
