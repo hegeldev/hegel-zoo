@@ -32,3 +32,6 @@ Each **target** — one upstream project in one language — lives at `targets/<
 `zoo.toml` pins the Hegel library version per language. `TROPHIES.md` is generated from all
 the `bugs.toml` files. `DESIGN.md` explains the choices.
 `HACKING.md` says how to run the tests and how a target for each language is put together.
+`STYLE.md` says how the tests should be written (idiomatic Hegel: generators as values,
+combinators over hand-rolled choice), what a survey of the existing tests found wrong, and
+what Hegel itself could add to make good tests easier to write.
