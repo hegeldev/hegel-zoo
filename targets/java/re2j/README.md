@@ -70,7 +70,9 @@ See `bugs.toml`. `split` of an input made only of delimiters returns `[""]` (1).
 API: a signed-byte comparison makes every non-ASCII character look like the start of the text to
 `^ \A \b` (2), `find()` after an empty match advances one byte and matches inside a character (3),
 reading a group re-runs the match over a truncated window in which `$` matches and changes
-`group()`/`end()` (7), and invalid UTF-8 bytes swallow the following byte or end the input (10).
+`group()`/`end()` (7), after a match that only the phantom text start allowed, `group(n)` throws
+an internal "inconsistency in matching group data" (17), and invalid UTF-8 bytes swallow the
+following byte or end the input (10).
 Captures: a group inside `{0}` is reported as 0-0 (4), `${name}` of a non-participating group
 inserts "null" (5), a repetition at the root of the pattern that simplification rewrites loses
 `namedGroups()` and `group(name)` (6). `Matcher` contract: a failed `find()` leaves the previous match readable (8),
@@ -98,3 +100,6 @@ Performance (linear-time guarantee, `programSize()` bounds), the GWT super-sourc
 ## History
 
 - 2026-09-18: created at 951a6159 (1.8) with 7 properties and 16 bugs.
+- 2026-09-23: generators rewritten in combinator style; the design gate `empty-iteration-extent`
+  (Java ends an unbounded loop at an empty iteration, RE2 lets a later alternative go on); a
+  1000-case run of the byte-input property found re2j/17.
