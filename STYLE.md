@@ -225,7 +225,8 @@ new bug, pako/5 - drawing the damage and the cut points as one generator reached
 old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semver4j,
 go/compose-go, rust/dynfmt, java/json-schema-validator, typescript/liquidjs (turn 415);
 rust/human_format, go/go-udiff, java/commons-csv, typescript/picomatch (turn 417);
-go/iso8601, rust/uv-normalize, typescript/hono, java/gson (turn 418).
+go/iso8601, rust/uv-normalize, typescript/hono, java/gson (turn 418);
+go/ssh_config, rust/strfmt, typescript/postcss, java/vavr (turn 419).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -269,3 +270,21 @@ router's name so that each property is shaped only for the bugs recorded against
 Two review lessons: a build product the setup regenerates (hono's esbuild bundle) must be
 deleted before every `zoo save`, or it is swept into the patch; and a `return` after a
 documented exception inside a `catch` is the property's verdict, not a skip, and stays.
+The eighth batch (turn 419) was quiet in itself: no new library bugs in ssh_config, strfmt,
+postcss or vavr, and their long runs (two of 1000 cases and one of 3000 per target) passed. Its
+lesson was about the helpers themselves: the `chance(pct)` every earlier rewrite had copied was
+`Integers(0, 99)` mapped through `x < pct`, which shrinks to *true* because the draw shrinks to 0,
+so a minimal counterexample had every optional feature switched on - the opposite of rule 3.
+The ssh_config rewrite spelled it `x >= 100-pct`, and a sweep corrected the eighteen Go,
+TypeScript and Java patches that had the inverted form (one line each; the Rust rewrites use
+`weighted_booleans`, which was right all along). Two smaller ones: hegel-go prints the drawn
+value with `%#v`, so a record's report hook is `GoString()`, not `String()`; and hegel-java's
+`tuples` stops at eight values, so a record with more fields is a tuple of tuples read by
+`t.value1().value3()` - the record combinator in the ergonomics list would remove the worst
+code in the vavr rewrite. A sweep lesson too: liquidjs's setup builds `hegel/liquid.mjs` the
+way hono's builds its bundle, and `zoo save` sweeps it in unless it is deleted first. And the
+sweep's re-runs of re2j paid for themselves: they showed a design difference the test had no gate
+for (Java ends an unbounded loop at an empty iteration, RE2 lets a later, non-empty alternative
+go on, so `(?:\B|a)*` matches "a" of "aa" in one and all of it in the other - now the
+`empty-iteration-extent` gate) and, in a 1000-case run, re2j/17: on byte input, `group(n)` after
+a match that only re2j/2's phantom text start allowed throws an internal IllegalStateException.
