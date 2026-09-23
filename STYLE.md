@@ -228,7 +228,8 @@ rust/human_format, go/go-udiff, java/commons-csv, typescript/picomatch (turn 417
 go/iso8601, rust/uv-normalize, typescript/hono, java/gson (turn 418);
 go/ssh_config, rust/strfmt, typescript/postcss, java/vavr (turn 419); typescript/ipaddr.js,
 go/bbolt, rust/distro-info, java/threeten-extra (turn 422; threeten-extra/7-12 found by the
-rewrite).
+rewrite); go/golang-lru, java/caffeine, typescript/whatwg-url, rust/parry (turn 423; parry/3-4
+found by the rewrite's long runs).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -309,3 +310,24 @@ early, two `until(WEEKS)` miscounts, `with(field, 0)` ignored, Pax `plusMonths` 
 and `until()` throwing with it, and a `plus(until())` round trip that misses from a leap week).
 A review lesson from it: a `return` that the old test used to skip a shape is worth measuring
 before it is kept as an `assume` - here it was skipping everything.
+The tenth batch (turn 423) took the four largest tests so far - golang-lru and caffeine are
+stateful, whatwg-url a grammar of URLs and setter scripts, parry a geometry kit - and the shapes
+held: caffeine's 25-arm draw-inside-switch op loop is a sealed interface of records chosen by
+`weighted` with the reads first and applied by a pattern `switch`, and a shuffle the old test
+took from a seeded `Collections.shuffle` is drawn as a sort key per element (all-equal keys keep
+the declaration order, so it shrinks to the plain order); a bound only the library knows (the
+frequency sketch's sample size) is applied in the body by truncating the drawn list, the
+modulo-live-size idiom. whatwg-url's old generators threaded a mutable Set of "shapes" through
+the draws, which was the reason they had to take the test case; the shapes are now derived from
+the drawn record by a pure function. It also repeated threeten-extra's lesson: the setters test
+had `return`ed on half its cases (a relative start URL never qualifies), so the start is drawn
+valid rather than filtered. And parry's 3000-case run found two library bugs the 100-case
+rounds had not reached in months of weekly runs, both from float boundary bias (13% of drawn
+triangles have zero area): parry/3, a solid `cast_ray` against a zero-area triangle reporting
+`t = 0` for an origin off the shape, and parry/4, `intersection_test` reporting a cuboid and a
+clockwise triangle intersecting while `distance` finds the gap. Measurements from the batch for
+the ergonomics list: `Lists` with only a `MaxSize` skews short (44% of golang-lru's scripts under
+five steps where the old loop was near-uniform), the boundary bias of `Integers(0, 99)` makes
+`chance(75)` come out true 59% of the time, and an index draw beside `flatMap`-built siblings
+leans on index 1 - so `chance` and `weighted` are shrink-direction devices more than calibrated
+coins, and a distribution that matters is worth a throwaway probe test before the patch is saved.
