@@ -229,7 +229,8 @@ go/iso8601, rust/uv-normalize, typescript/hono, java/gson (turn 418);
 go/ssh_config, rust/strfmt, typescript/postcss, java/vavr (turn 419); typescript/ipaddr.js,
 go/bbolt, rust/distro-info, java/threeten-extra (turn 422; threeten-extra/7-12 found by the
 rewrite); go/golang-lru, java/caffeine, typescript/whatwg-url, rust/parry (turn 423; parry/3-4
-found by the rewrite's long runs).
+found by the rewrite's long runs); rust/printf-compat, java/capsule, go/go-re2,
+typescript/superjson (turn 424, quiet).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -331,3 +332,25 @@ five steps where the old loop was near-uniform), the boundary bias of `Integers(
 `chance(75)` come out true 59% of the time, and an index draw beside `flatMap`-built siblings
 leans on index 1 - so `chance` and `weighted` are shrink-direction devices more than calibrated
 coins, and a distribution that matters is worth a throwaway probe test before the patch is saved.
+The eleventh batch (turn 424) was quiet - no library bug in printf-compat, capsule, go-re2 or
+superjson, and every long run passed - and settled two shapes. Recursive data: go-re2 draws a
+regular expression as a syntax tree from a recursive `Composite` with a forward-declared
+alternation generator and a depth counter (hegel-go's recursive example, with a `defer` so an
+aborted draw cannot leave the counter stale), rendered by a pure function that also numbers
+the groups; superjson, whose binding has no recursive combinator, builds a bounded depth as an
+eager chain of levels, each level's containers drawing children from the level below. Shared
+and cyclic references, which the old superjson generators managed with a mutable pool threaded
+through every call, are `ref` nodes in the tree resolved by the builder against the containers
+built so far - an ancestor gives a cycle, a finished container a repeated reference - which is
+the modulo-live-size idiom applied to a graph. Two places where a `filter` is the wrong tool:
+a rejected element inside a `vecs`/`lists` rejects the whole case (printf-compat keeps a fix-up
+as a `map`), and a rejection rate near 20% exhausts Hegel's three retries (superjson's RegExp
+source/flag pairs fall back through a ladder in the renderer instead). Two measurements more:
+hegel-java's `sets(g).maxSize(30)` never reached twenty elements in five hundred draws (median
+about four), so capsule draws the count and then a list of exactly that many when the large-trie
+shapes are the point; and a property whose case space is small (superjson's nesting case has
+fourteen values) stops at the exhaustion point whatever `HEGEL_TEST_CASES` says, which is
+correct and worth knowing when a long run looks too fast. A review lesson repeated: the Write
+tool NFC-normalised a Kelvin sign (U+212A) in go-re2's alphabet; the subagent caught it with
+`od -c` against the committed patch - non-ASCII literals in a rewrite are compared byte for
+byte, or written as escapes.
