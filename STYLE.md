@@ -226,7 +226,9 @@ old loop had not); rust/configparser, go/ulid, typescript/shell-quote, java/semv
 go/compose-go, rust/dynfmt, java/json-schema-validator, typescript/liquidjs (turn 415);
 rust/human_format, go/go-udiff, java/commons-csv, typescript/picomatch (turn 417);
 go/iso8601, rust/uv-normalize, typescript/hono, java/gson (turn 418);
-go/ssh_config, rust/strfmt, typescript/postcss, java/vavr (turn 419).
+go/ssh_config, rust/strfmt, typescript/postcss, java/vavr (turn 419); typescript/ipaddr.js,
+go/bbolt, rust/distro-info, java/threeten-extra (turn 422; threeten-extra/7-12 found by the
+rewrite).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -288,3 +290,22 @@ for (Java ends an unbounded loop at an empty iteration, RE2 lets a later, non-em
 go on, so `(?:\B|a)*` matches "a" of "aa" in one and all of it in the other - now the
 `empty-iteration-extent` gate) and, in a 1000-case run, re2j/17: on byte input, `group(n)` after
 a match that only re2j/2's phantom text start allowed throws an internal IllegalStateException.
+The ninth batch (turn 422) settled the stateful shape without `RunStateful`: bbolt draws a
+script as `Lists(txn)` of `Composite` records whose positions are indices taken modulo the live
+model when the step is walked, so a step that does not fit the state is a no-op (not an `Assume`,
+which would reject most scripts) and the shrinker can delete steps; a known-bug shape that is a
+property of the path (bbolt/2's cycle) is excluded by construction. ipaddr.js showed the "one
+value, many spellings" shape: the text style is an independent record applied by a pure renderer
+to derived data. Its old junk alphabet held a raw NUL byte, which had made a source file a binary
+hunk in the patch - another reason to write such literals as escapes. distro-info put the oracle
+inside a generator once: the empty-list pin draws its date from the windows on which the C tool's
+list is constant (probed once, cached), which is acceptable for a pin whose case shape the oracle
+defines, and not a pattern for properties. And threeten-extra is the batch's argument for the
+whole exercise: its old range gate, written for ISO years, had skipped every International Fixed,
+Discordian and Symmetry case in realistic years, and its week oracle added plain days where those
+calendars skip weekless days; with per-chronology bounds and a calendar-week model the rewritten
+properties found six library bugs on their first runs (threeten-extra/7-12: `plusWeeks` a month
+early, two `until(WEEKS)` miscounts, `with(field, 0)` ignored, Pax `plusMonths` computing month 0
+and `until()` throwing with it, and a `plus(until())` round trip that misses from a leap week).
+A review lesson from it: a `return` that the old test used to skip a shape is worth measuring
+before it is kept as an `assume` - here it was skipping everything.
