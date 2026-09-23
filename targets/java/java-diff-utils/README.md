@@ -49,7 +49,10 @@ texts from generated rows, and the rules stated in the Javadoc and the README.
   `mergeOriginalRevised`, `reportLinesUnchanged`, `decompressDeltas`, HTML or identity
   normaliser, custom tags): stripping tags and `<br/>` from the rows gives the normalised texts,
   EQUAL sides equal, INSERT/DELETE rows have an empty side, tags balanced, no tag inside an HTML
-  entity, no leading or doubled `<br/>`, the README's examples. Bugs /4, /5, /6, /8, /9 are
+  entity, no leading or doubled `<br/>`, the untagged remainders of a single-line inline CHANGE
+  row agree (a multi-line change is diffed as one text, so its common text may sit on different
+  rows of the two sides: `["a"] -> ["b", "a b"]` gives `[CHANGE,a,{+b+}]` then
+  `[CHANGE,,a{+ b+}]`, which is not judged), the README's examples. Bugs /4, /5, /6, /8, /9 are
   skipped by shape.
 - **splittersPreserveTextAndEqualizersFollowTheirRules** — `SPLITTER_BY_WORD` and
   `SPLITTER_BY_CHARACTER` preserve the text, no two adjacent word pieces; the
