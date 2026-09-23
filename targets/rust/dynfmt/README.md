@@ -27,6 +27,11 @@ differential keeps to what both define.
 - The general generator avoids the pinned shapes: widths, precisions, `+`/` `/`0`, floats,
   negative radix forms, `%c` of an integer, non-integers under `%d`, unknown conversions, and
   text beginning with a digit or `*` right after a spec (dynfmt/4).
+- The format strings are built as data and rendered by pure functions: a `Vec<Spec>`
+  (conversion, value, flags, modifier, trailing text) rendered by `Spec::render`, with the
+  `%(key)` names drawn as a set so they are distinct by construction; a `CurlyCall` of `Hole`s
+  for the curly format. The shrinker can therefore drop a spec whole. Rewritten in combinator
+  style 2026-09-23 (same properties and pins).
 
 ## Bugs (10)
 
