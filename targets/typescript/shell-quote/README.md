@@ -5,7 +5,11 @@ downloads): `quote(args)` turns an argument array into POSIX shell text, `parse(
 turns shell text into words, operators, globs and comments, expanding `$VAR`/`${VAR}` from `env`,
 optionally field-splitting unquoted expansions (`splitUnquoted`). Pinned at v1.10.0
 (35c9b97a, 2026-07-14). The tests are `test/hegel.test.mjs` with the zoo's small harness
-`test/hegel-zoo.mjs`; they need `bash` and `dash` on PATH.
+`test/hegel-zoo.mjs`; they need `bash` and `dash` on PATH. The generators are combinator values
+(STYLE.md): the word parts, words, programs and `quote` arguments are built from `weighted`
+(`integers` flat-mapped to the alternative, simplest first), `record`, `arrays`, `tuples` and
+`sampledFrom`, and each property draws one value; a word's three renderings and its model are
+computed from the drawn parts and the drawn `env` by a pure function.
 
 ## What is tested
 
@@ -62,7 +66,7 @@ is a single token even when unquoted"; special parameters `$$`, `$?`, `$#` are l
 
 ## Bugs
 
-Sixteen, shell-quote/1–16 in `bugs.toml`: `quote` writes `\!` inside double quotes and the
+Seventeen, shell-quote/1–17 in `bugs.toml`: `quote` writes `\!` inside double quotes and the
 shell keeps the backslash (/1); `parse` keeps the backslash of `` \` `` in double quotes and so
 cannot read `quote`'s own output (/2); `#` inside a word starts a comment (/3); the chunker
 cannot count backslashes — `"\\" "x"` runs on to the next quote (/4) and `\\ x` is one word,
@@ -73,11 +77,25 @@ is dropped (/7); `$1x` looks up `1x` (/8); env lookups walk the prototype chain,
 split words (/10); an escaped `\*` is a glob (/11); with `splitUnquoted` the fields before a
 glob character are lost (/12); an object value in an object env leaks the internal marker
 (/13); `splitUnquoted: ''` keeps an empty unquoted expansion as an empty word (/15); with
-`splitUnquoted` an empty quoted string after a split expansion vanishes (/16).
+`splitUnquoted` an empty quoted string after a split expansion vanishes (/16), and one before
+a split expansion vanishes when a field follows (/17).
 
-Twelve of the sixteen came from a probe file of one-liners written after reading `parse.js` and
-`quote.js` end to end; /14, /15 and /16 from the properties (the bash oracle).
+Twelve of the seventeen came from a probe file of one-liners written after reading `parse.js`
+and `quote.js` end to end; /14, /15, /16 and /17 from the properties (the bash oracle).
 
 ## History
 
 - 2026-09-15: created at 35c9b97a (v1.10.0); 16 bugs.
+- 2026-09-23: generators rewritten in combinator style (STYLE.md): env, word parts, words,
+  programs and `quote` arguments are generator values (`weighted`, `record`, `arrays`, `tuples`,
+  `sampledFrom`, a `filter` for the plain words of the tokenizer property), the harness lost
+  `n`/`pick`/`chance`/`word`; same properties and pins. Checking the rewrite over many cases
+  showed the split-unquoted property failing about once per thousand cases (in the old generator
+  too): with `splitUnquoted`, an empty quoted string *before* a split expansion vanishes when a
+  field follows (`parse('""$W$C', { W: ' ', C: 'c' }, { splitUnquoted: true })` is `['c']`,
+  bash reads `['', 'c']`), the mirror of shell-quote/16; recorded as /17 with a pin and gated
+  by the `parse/split-drops-leading-empty-quoted` shape. The same long runs showed a model bug
+  of the test's own (also pre-existing, about once per 3 000 cases): the brace fixup for a
+  `$NAME` before a letter inside double quotes was a regex over the rendered text and so also
+  rewrote an escaped `"\$Za"` into `"\${Z}a"` while the model kept saying `$Za`; parse (and
+  the shell) rightly read `${Z}a`. The fixup now applies to expansion items only.
