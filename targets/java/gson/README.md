@@ -80,7 +80,13 @@ instantiation, nesting-limit behaviour.
   `IllegalArgumentException("JSON forbids NaN and infinities: 1E+309")` for a finite BigDecimal
   or BigInteger beyond the double range (`JsonTreeWriter` checks `doubleValue()` whatever the
   class), while `toJson` writes the same value and `fromJson` reads it back.
+- **gson/4 (medium)** — `JsonParser.parseString("9007199254740993").equals(JsonParser.parseString("9007199254740992"))`
+  is true (and `1e-400` equals `0`): a parsed number is a `LazilyParsedNumber`, which
+  `JsonPrimitive.equals` compares only through `getAsDouble()`, so different JSON numbers are equal
+  trees whenever they round to the same double, and `JsonArray.remove(Object)`/`contains` take the
+  wrong element.
 
-All three are pinned (`pin…` tests) and recorded in `bugs.toml`.
+All four are pinned (`pin…` tests) and recorded in `bugs.toml`.
 - 2026-09-16: base bumped 8fe077819b2c → 698ba9ebfdbf (2026-09-15, "use the runtime type for a wildcard element type (#3112)"; 2.14.1-SNAPSHOT); 3 bug(s) still reproduce. 8 tests pass.
 - 2026-09-16: base bumped 698ba9ebfdbf → 854c8255b625 (2026-09-16, "Simplify key removal in `LegacyProtoTypeAdapterFactoryTest` (#3124)"; 2.14.1-SNAPSHOT); 3 bug(s) still reproduce. 8 tests pass.
+- 2026-09-23: generators rewritten in combinator style (`Gen.java`); a 1000-case run found gson/4.
