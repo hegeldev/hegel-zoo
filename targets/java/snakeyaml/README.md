@@ -12,9 +12,11 @@ discussion, there is no CONTRIBUTING.md and nothing about AI — the zoo only re
 contributes nothing. The eighth Java target: the patch adds a Maven module `hegel/` depending on
 `org.yaml:snakeyaml:2.8-SNAPSHOT`, which `[run] setup` builds and installs from the pinned tree
 (tests, Javadoc, sources, enforcer, GPG and the bound formatter plugin skipped). The harness
-`Zoo.java`, the judge's `ZooListener`, the oracle bridge `Oracle.java`, the YAML writer/generator
-`YamlGen.java` and three test classes live in `hegel/src/test/java/zoo/`; the PyYAML side of the
-oracle is `hegel/src/test/resources/hegel-yaml-oracle.py`. See HACKING.md for the Java mechanics.
+`Zoo.java`, the judge's `ZooListener`, the oracle bridge `Oracle.java`, the generator combinators
+`Gen.java`, the document tree with its per-node styles and the pure renderer `Doc.java`, the
+generators `YamlGen.java` and three test classes live in `hegel/src/test/java/zoo/`; the PyYAML
+side of the oracle is `hegel/src/test/resources/hegel-yaml-oracle.py`. See HACKING.md for the
+Java mechanics.
 
 ## The oracle
 
@@ -30,11 +32,12 @@ side for the resolver, as noted per case below.
 
 ## What is tested
 
-`YamlGen` writes random trees (null, bool, int, float, string, timestamp-free — strings from a
-pool with Unicode, controls, NEL, BOM, emoji, indicator characters and YAML-looking words —
-sequences, mappings with scalar and, rarely, collection keys) as YAML in random styles: block and
-flow collections, plain/single/double-quoted/literal/folded scalars with indentation indicators,
-explicit `---`/`...`, `%YAML 1.1`, comments, CRLF variants. It uses SnakeYAML's own `Resolver`
+`YamlGen` draws random trees (`Doc` nodes: null, bool, int, float, string, timestamp-free;
+strings from a pool with Unicode, controls, NEL, BOM, emoji, indicator characters and
+YAML-looking words; sequences, mappings with distinct scalar keys) with the spelling of every
+node drawn beside it, and `Doc.Stream.render` writes them as YAML in those styles: block and flow
+collections, plain/single/double-quoted/literal/folded scalars with indentation indicators,
+explicit `---`/`...`, comments, blank lines, CRLF variants. It uses SnakeYAML's own `Resolver`
 only to decide when a string must be quoted.
 
 `SnakeYamlTest`:
@@ -47,7 +50,7 @@ only to decide when a string must be quoted.
   lines re-indented or swapped): both accept → same value; one rejects → a finding; and whatever
   happens SnakeYAML throws a `YAMLException`, not a `NumberFormatException`, `ClassCastException`
   or the like. Shapes listed in `knownDifference` (below and bugs /1, /2, /5, /7, /10, /11, /13,
-  /15) are compared no further.
+  /15, /18, /19, /20, /22) are compared no further.
 - **plainScalarsResolveLikePyYAML** — YAML 1.1 bool/null/float words, ints in every base with
   signs and underscores, sexagesimals, floats, timestamps, and a list of odd spellings, each as a
   document, after `---`, as a mapping value, a sequence item, in a flow sequence and a flow
@@ -65,8 +68,10 @@ only to decide when a string must be quoted.
   canonical/explicitStart give `---`, explicitEnd gives `...`; it loads back as the value (strings
   with non-printable characters as their UTF-8 bytes under the BINARY style, by design) in
   SnakeYAML and in PyYAML; `dumpAll` of 1–3 values loads back as the list; `new Yaml().dump` round
-  trips. Bugs /6, /12, /14, /16 are skipped by shape; PyYAML is not asked about Java-style float
-  exponents (/7) or a plain `=` (its own gap).
+  trips. Bugs /6, /12, /14, /16, /17, /21 are skipped by shape; PyYAML is not asked about
+  Java-style float exponents (/7), a plain `=` (its own gap), sets or mapping keys that Python's
+  number equality would merge (`false` and `-0.0`), or a BOM at the start of a line (libyaml
+  skips it).
 - **eventsAndNodesSurviveEmitting** — `parse` of a written stream gives a framed event list;
   emitting it with random options and re-parsing gives the same values and the same events up to
   style; `composeAll` → `serialize(node, writer)` → `compose` keeps the node shape (tags and
@@ -88,7 +93,7 @@ below, not counted).
 
 ## Bugs
 
-See bugs.toml. Sixteen so far: a plain scalar continuation line starting `---x` ends the
+See bugs.toml. Twenty-two so far: a plain scalar continuation line starting `---x` ends the
 document (/1); the non-specific tag `!` is ignored so `! 123` is an int and `! ` is null (/2);
 timestamps with out-of-range fields roll over instead of failing (/3); dates before 1582-10-15 are
 Julian (/4); sexagesimal ints overflow `int` (/5); indent 1 and 10 silently become 2, and with an
@@ -99,7 +104,14 @@ scalars (/9); `!!bool maybe` is null (/10); `!!int abc` and `!!binary '***'` thr
 (/12); a tag on the wrong node kind throws `ClassCastException` (/13); block scalars needing an
 indentation indicator under an indicator indent do not parse back (/14); `?` inside a plain
 scalar in flow context ends the scalar (/15); double-quoted scalars indented past the width gain a
-backslash when dumped (/16). All still reproduce.
+backslash when dumped (/16); a string starting with U+FEFF is dumped plain and the scanner strips
+it as a BOM, so `dump("\ufeff")` loads as no document (/17); directives without a document after
+them load as an empty stream instead of failing (/18); `[\t ]`, a tab before a space in flow
+context, is a `ScannerException` (/19); the `\<TAB>` escape in a double-quoted scalar is an
+"unknown escape character" (/20); a folded scalar starting with a space loses it when emitted past
+the width with `splitLines` (/21); a block scalar at the mapping's indentation after an explicit
+key without a value (`? a\n>\n  x`) is taken as that key's value instead of being rejected (/22).
+All still reproduce.
 
 ## Observed and not recorded
 
@@ -110,7 +122,15 @@ backslash when dumped (/16). All still reproduce.
 - PyYAML reads `+.5`/`-.5` and `._5` as strings and `0_`/`0x_` as 0; SnakeYAML follows the 1.1
   regexps (`+.5` a float, `0_` a string) — PyYAML's deviations.
 - A tab as separation after `-`, `:` or `?` is rejected by SnakeYAML and by pure-Python PyYAML
-  and accepted by libyaml; a comment glued to a block scalar header (`|-#x`) likewise.
+  and accepted by libyaml; a comment glued to a block scalar header (`|-#x`) likewise, as are a
+  trailing tab after a quoted scalar or flow collection, a line starting with a tab that continues
+  a plain scalar, a tab right after a block scalar's auto-detected indentation, and an unknown
+  directive name (libyaml rejects it, SnakeYAML and pure PyYAML ignore it).
+- `[?]` and `[a, ?]` are single-pair mappings with an empty key here and in pure PyYAML, an error
+  in libyaml; `{b :[]}` is read here and by pure PyYAML, rejected by libyaml; anchor names may
+  hold any non-space, non-flow-indicator character (YAML 1.2) where PyYAML wants `[0-9A-Za-z_-]`.
+- libyaml skips a U+FEFF at column 0 of any line as a byte order mark; SnakeYAML and pure PyYAML
+  read it as content (the dump side of the BOM is bug /17).
 - `[a:]` is a single-pair flow mapping (the YAML 1.2 reading) where PyYAML reports an error.
 - The `\/` escape is rejected — correct for YAML 1.1 (it arrived in 1.2); PyYAML accepts it.
 - A plain `=` is `!!value` in YAML 1.1: SnakeYAML gives the string "=", PyYAML has no
@@ -127,3 +147,6 @@ backslash when dumped (/16). All still reproduce.
 ## History
 
 - 2026-09-16: created at 7b8b171c (2.8-SNAPSHOT); bugs /1–/16.
+- 2026-09-23: the generators rewritten in combinator style (`Gen`, `Doc`, `YamlGen`: trees with
+  per-node style records and a pure renderer, edits as data, eager depth levels); bugs /17 to /22
+  found by the rewrite's long runs, /12's second face added to its notes.
