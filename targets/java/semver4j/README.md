@@ -23,11 +23,19 @@ the local Maven repository and `npm install`s node-semver 7.8.5 into `hegel/node
   precedence with the pre-release rule; `RangeList`/`Range` built directly from operators and versions as OR of ANDs
   with node's pre-release rule; the fluent `RangeExpression` against the text form written left to right.
 
-`Gen` draws versions as values (small and large numbers, numeric/alphabetic/alphanumeric pre-release identifiers,
-build metadata) and as text (canonical, `v`-prefixed, blank-padded), damaged versions for the parser (dropped and
-inserted characters, leading zeros, double dots, `=`, `V`, non-ASCII digits and letters), npm ranges from a small
-grammar (sets of primitives or one advanced range, joined by `||`; the versions tested are drawn near the numbers in
-the range), Ivy bounds of one to three numbers, and fluent chains with nested operands.
+`Gen` holds the generators as `Generator` values built from `integers`/`sampledFrom`/`lists`/`tuples`/`oneOf` and
+two local combinators the binding lacks (`weighted`, one integer draw `flatMap`ped to the alternative under its
+cumulative weight, and `chance(pct)`, both shrinking towards the first/false): versions as values (small and large
+numbers, numeric/alphabetic/alphanumeric pre-release identifiers, build metadata; a `Shape` record narrows them per
+property), a `Decor` for the text they are written as (canonical, `v`-prefixed, blank-padded), a `Nudge` (a core
+`Move` plus fresh identifiers) that makes a version near another, damaged versions for the parser as a list of
+`Edit`s applied by a pure function (dropped and inserted characters at a position taken modulo the length, leading
+zeros, double dots, `=`, `V`, non-ASCII digits and letters), npm ranges as data (`Alt`s of `*`, one to three
+`Comparator`s sharing a set, or one caret/tilde/`Hyphen` piece, each written against a drawn `Core`) rendered to
+text while collecting the numbers used so the tested versions can be drawn near them, and Ivy bounds of one to
+three numbers. Sets built step by step in the tests (`RangeList` entries, fluent `Chain`s with nested operands) draw
+a `Rel` per version — fresh, or near the version at an index modulo those drawn before it — so the shrinker can
+delete an entry without invalidating the rest.
 
 ## Properties (`Semver4jTest`, 9)
 
@@ -60,7 +68,10 @@ compared with a numeric one (11); caret, tilde and hyphen ranges are never combi
 (3); `^0.x`-shaped carets (4) and bare wildcard operands (5) are not generated (`*` only as a whole alternative);
 Ivy intervals mix no bracket styles (6); range text is well-formed (7), has no trailing `||` (8) and no number above
 `Integer.MAX_VALUE` (9); identifier lists given to `withPreRelease`/`withBuild` have no trailing dot (10); a fluent
-chain ends after an operand containing `or` (12).
+chain ends after an operand containing `or` (12). One node-semver quirk is skipped rather than reported: node
+collapses a range with a bare `*` set to `*` alone, so `1.2.3-a` does not satisfy `* || 1.2.3-a` there without
+`includePrerelease`, while semver4j evaluates each set and says it does (the pre-release rule of the npm spec
+agrees with semver4j); pre-release versions are not compared against such ranges.
 
 ## Not tested
 
@@ -99,3 +110,10 @@ satisfies it", contrary to its Javadoc (the empty-list case is in 7).
 ## History
 
 - 2026-09-16: created (turn 179) at bd961f36a993 (0.0.1-SNAPSHOT of 2026-09-01, after v6.0.0); 12 bugs.
+- 2026-09-23: generators rewritten in combinator style (`Gen` as `Generator` values, `weighted`/`chance`, edit and
+  entry lists applied by pure functions, `tc.assume` for the coerce skip; `n`/`chance`/`pick`/`word` dropped from
+  `Zoo`); same 9 properties, 12 pins and expected failures. A 1 000-case run while checking the rewrite showed
+  the `* || 1.2.3-a` pre-release disagreement with node-semver described above (reachable by the old generator
+  too, about once in 10 000 cases); judged a node-semver quirk and skipped in `npmRangesMatchNodeSemver`; and that a range's pre-release
+  identifiers (`0.0.0-- - 0`) could begin with a hyphen, reaching semver4j/11 through the range property about
+  once in 10 000 cases (the old `tamePre` had the same gap) - they are now tame too.
