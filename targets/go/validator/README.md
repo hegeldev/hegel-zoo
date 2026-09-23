@@ -64,8 +64,7 @@ itself for time comparisons, colour alphas the regex accepts, no bracketed IPv6 
 `hostname_port`, bool conditions written `true`/`false`, one field for `excluded_without`, no
 apostrophes in `oneof`, no IPv4-mapped IPv6 text, valid SSN areas, FQDN labels not ending in a
 hyphen, lower-case UUIDs, ULIDs starting 0-7, base64 data URIs, masked IPv6 prefixes); the
-pins assert the correct behaviour and fail while the bug exists. `ZOO_COLLECT=1` records
-mismatches instead of failing and prints the class counts.
+pins assert the correct behaviour and fail while the bug exists.
 
 ## Accepted differences
 
@@ -100,3 +99,8 @@ plain RFC 2397 form; `cidrv4` and `cidrv6` disagree on host bits.
 ## History
 
 - 2026-09-20 (turn 334): target added at 6a9b666 (v10.30.5) with seven properties, 17 pins.
+- 2026-09-23: generators rewritten in combinator style: each property draws one case record,
+  the format case is a FlatMap from the tag to that format's generator, mutations are a drawn
+  enum rendered by a pure switch, and the high-rate skips became generator shape. The old
+  `luhn_checksum` oracle expected a number below ten to pass (the validator wants two digits);
+  fixed. The `ZOO_COLLECT` collector is gone. No new bug.
