@@ -25,10 +25,12 @@ The oracle is the multiset of item *references* the tree should hold, and the RE
 
 Coordinates mix small integers (so items coincide and overlap), decimals, 1e15-scale values,
 float32 values, `±Infinity` (upstream's tests call these "empty bboxes"), `-0` and the safe-integer
-limits; points, horizontal and vertical lines and rectangles. `ZOO_COLLECT=1` turns mismatches
-into `# COLLECT` counts instead of failures; `HEGEL_TEST_CASES` (default 100) widens the sweep.
-Known bugs are skipped through the `Known` switches at the top of the file (generator-level: no
-fractional or NaN `maxEntries`, no NaN coordinates, no node with more than a few hundred children).
+limits; points, horizontal and vertical lines and rectangles. `HEGEL_TEST_CASES` (default 100)
+widens the sweep. The operation sequence is one `arrays(step)` draw: a step that refers to an item
+of the model carries a slot index taken modulo the model's size when it runs, so the shrinker can
+delete whole steps. Known bugs are skipped through the `Known` switches at the top of the file
+(generator-level: no fractional or NaN `maxEntries`, no NaN coordinates, no node with more than a
+few hundred children).
 
 ## Bugs
 
@@ -72,3 +74,6 @@ sibling packages (`rbush-knn`, `kdbush`, `flatbush`).
 ## History
 
 - 2026-09-17: created at e597127 (v4.0.1), 3 properties, 3 bugs.
+- 2026-09-23: generators rewritten in combinator style (STYLE.md): `weighted`/`oneOf` choices,
+  `arrays`/`tuples`/`record` values, the op sequence drawn as data; collect mode and the
+  `n`/`pick`/`chance`/`word` helpers removed from the harness. Same properties and pins.
