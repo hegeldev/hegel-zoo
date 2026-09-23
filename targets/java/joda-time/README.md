@@ -43,7 +43,7 @@ tables are compiled by the build; about a minute). Upstream's own suite is JUnit
 
 ## What the properties found
 
-The 18 recorded bugs (`bugs.toml`, pinned in `JodaTimePinsTest`) fall into four groups: **overlap and transition
+The 21 recorded bugs (`bugs.toml`, pinned in `JodaTimePinsTest`) fall into four groups: **overlap and transition
 handling** — `convertLocalToUTC(local, strict)` resolves an overlap to the later instant east of Greenwich and the
 earlier west of it while `getOffsetFromLocal` always picks the earlier (273 of 486 zones with overlaps disagree),
 `nextTransition`/`previousTransition` misbehave at `Long.MAX_VALUE`; **calendar bookkeeping** —
@@ -56,6 +56,13 @@ Habash al-Hasib calendar is computed with the 16-based one, `getMaximumValue(Rea
 `int`; **formatter contracts** — `parseLocalDateTime` throwing for a zone id in a DST gap, `ZZZ` printing fixed-offset
 ids it cannot parse, the lenient two-digit year accepting `-#`, an off-by-one failure position, and the basic ISO
 formatters printing five-digit years they refuse to parse.
+
+The generator rewrite of 2026-09-23 added three more: `GJChronology` rejects February 29 of a Julian leap
+year that is not a Gregorian one (300, 1500, BC years) in the four-argument `getDateTimeMillis` while
+`DateTime` and the fields accept it, and `plusYears` onto such a date clamps to the 28th (joda-time/19); in
+zones with a DST tail rule `previousTransition`, `nextTransition` and `getOffset` disagree in the last years
+before `Long.MAX_VALUE` (joda-time/20); and `getOffsetFromLocal` resolves the last hours of an overlap that
+crosses the date line (Pacific/Kwajalein 1969, +11:00 to -12:00) to the later instant (joda-time/21).
 
 Design choices the tests respect rather than record: `previousTransition` returns the millisecond before the
 transition and both transition methods fire on name-key changes without an offset change; `getOffsetFromLocal`'s
@@ -70,3 +77,13 @@ millis (compare `seconds*1000 + millis`); `forOffsetHoursMinutes(-1, 30)` and `(
 `adjustOffset` is documented as best-effort ("non-pathological cases") — it fails inside a few long or adjacent
 historical overlaps, not recorded; the conversions overflow with `ArithmeticException` at the `long` extremes.
 - 2026-09-20: base bumped b80254120c5b → 13691681d373 (2026-09-19, "Release v2.14.4"; 2.14.4); 18 bug(s) still reproduce. 14 tests pass.
+
+## History
+
+- 2026-09-23: generators rewritten in combinator style (`Gen.java`, one case record per property, gaps
+  precomputed per zone and sampled, the Islamic kinds and printable periods as generator shape). The harness
+  pom had pinned `joda.version` 2.14.3, the release from Maven Central, while the target installs the pinned
+  tree as 2.14.4: now 2.14.4, so the tests run against the tree they claim to test. The rewrite's long runs
+  (30000-case shake-outs) found joda-time/19-21 and two model bugs of the old test (a `Long.MIN_VALUE`
+  overflow in the zone property, `normalizedStandard` refusing only a non-zero months total), and one
+  oracle tolerance (`adjustOffset` on the 10-hour 1919 overlap of Antarctica/Macquarie).
