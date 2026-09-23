@@ -235,7 +235,9 @@ go/validator, java/joda-time (turn 425; joda-time/19-21 found by the rewrite's l
 rust/numfmt, typescript/devalue, go/yaml, java/commonmark-java (turn 426; six of the
 eight behaviours commonmark-java gated were recorded as commonmark-java/53-58 in turn 427, and the
 verifying run found 59); rust/uv-pypi-types, go/miekg-dns, typescript/smol-toml, java/snakeyaml
-(turn 427; smol-toml/10 and snakeyaml/17-22 found by the rewrites' long runs).
+(turn 427; smol-toml/10 and snakeyaml/17-22 found by the rewrites' long runs); rust/toml,
+go/jsonschema, java/commons-text, typescript/js-yaml (turn 428, quiet: two oracle tolerances and
+a model gap in js-yaml, no library bug).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -423,3 +425,27 @@ tree with per-node style records (`Doc.java`) like go/yaml's, and its dump optio
 records because Java's `tuples` caps at 8. The old smol-toml stringify property had skipped every
 case with an astral character because its lone-surrogate regex matched paired surrogates too; the
 rewrite runs them (`isWellFormed()`).
+
+The fifteenth batch (turn 428) was quiet - four rewrites, two 1000-case rounds each in review plus
+the subagents' own 1000/1000/3000, and no library bug - but three of the four found that the old
+test had been testing far less than it looked. rust/toml's parsed-document stability property drew
+arbitrary text of which 12% parsed and 94% of that was blank; it now draws a valid document plus up
+to three edits (54% parse, 4% blank). commons-text's gate for commons-text/6 was unsatisfiable for
+72% of the filtered-source cases, so most of that alternative never ran; the source is now drawn
+around an anchor code point its predicates accept. js-yaml `return`ed 6% of its PyYAML-writes
+cases on a bang tag; the shapes PyYAML cannot write are excluded by construction and the guard
+fires once in a thousand. The rule that follows: before keeping any skip as an `assume`, measure
+its rate with a throwaway probe test, and when it is above a few percent it is generator shape,
+not a gate. Shapes: toml is the first zoo use of `recursive(scalar, |inner| ..).max_depth(d)`,
+which mapped one-to-one onto the old depth parameter and was frictionless; jsonschema's schema is
+a data tree from a recursive weighted grammar with references resolved as indices modulo the
+definitions declared so far; commons-text's TextStringBuilder operations are 23 sealed records
+chosen by `weighted` (each needing a `.<Op>map` witness, since a `Generator<Sub>` is not a
+`Generator<Super>`); js-yaml's writer input is a document record with a style record per node,
+rendered by a pure writer, and its folded line breaks a drawn coin list recycled modulo the word
+boundaries. Two oracle tolerances went into js-yaml's README (Python folds `1`/`True` and
+equal-instant `Date`s into one key; PyYAML reads a `?` or `:` that starts a plain scalar in flow
+context as an indicator), and its marker-key check for js-yaml/4 now covers Set members. Probe
+measurements are also the answer to the skewed distributions the Go and TypeScript bindings
+show inside large cases (a nominal 75% came out at 52%): check that every shape is reached rather
+than tune the weights.
