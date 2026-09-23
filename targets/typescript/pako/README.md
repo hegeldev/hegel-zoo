@@ -57,13 +57,17 @@ padding are an error (Node's gunzip agrees); a truncated stream pushed with `Z_F
 
 ## Bugs
 
-Four, pako/1–4 in `bugs.toml`: `chunkSize: 0` (or a fraction) makes `inflate` loop forever and
+Five, pako/1–5 in `bugs.toml`: `chunkSize: 0` (or a fraction) makes `inflate` loop forever and
 `deflate` exhaust the heap (/1); an empty gzip `extra` field sets FEXTRA without its length and
 nothing can read the stream (/2); a header name or comment character outside Latin-1 is
-truncated or mangled (/3); a sync or full flush with `chunkSize` below 7 loops forever (/4).
-Two came from the probe file (/2, /3), two from the properties — /1 from a probe of the option
-edges, /4 by killing the test process the first time the flush property ran.
+truncated or mangled (/3); a sync or full flush with `chunkSize` below 7 loops forever (/4); the
+streaming `Inflate` ignores every push after a gzip member that ended exactly at a chunk
+boundary, so a second member is dropped and trailing garbage goes unreported (/5). Two came from
+the probe file (/2, /3), three from the properties — /1 from a probe of the option edges, /4 by
+killing the test process the first time the flush property ran, /5 from the inflate property
+once its damage and cut points were one generator.
 
 ## History
 
 - 2026-09-15: created at 32be8f8e (3.0.2); 4 bugs.
+- 2026-09-23: generators rewritten in combinator style (STYLE.md): the data textures, options, damage, flush plan and gzip header are generator values (`weighted`, `record`, `arrays`, `binary`, `text`), the harness lost `n`/`pick`/`chance`/`word` and collect mode; same properties and pins. The rewrite surfaced pako/5 (`Inflate` ignores every push after a gzip member that ended exactly at a chunk boundary: trailing garbage accepted, a second member dropped), pinned and gated by `Known.inputAfterStreamEndIgnored` in the property.
