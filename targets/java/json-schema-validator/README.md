@@ -8,12 +8,19 @@ schema walker.
 The patch adds `hegel/` (its own Maven module; `setup` installs the checkout's artifact into the
 local repository first). The oracle is Python's `jsonschema` package (4.26+, with `referencing`),
 driven as a child process speaking one JSON request per line (`Oracle.java`), with an exact
-`multipleOf` (its float division is inexact beyond 2^53). `Gen.java` builds random schemas per
-draft (types, enum/const, numeric bounds, string bounds/pattern/format, items/prefixItems/
-additionalItems/contains/min-maxContains/uniqueItems/unevaluatedItems, properties/required/
-additionalProperties/patternProperties/propertyNames/dependencies/dependentRequired/
+`multipleOf` (its float division is inexact beyond 2^53). `Gen.java` holds the generators as
+values: a schema per draft is `lists` of keyword fragments (small `ObjectNode`s from `weighted`/
+`oneOf` choices over types, enum/const, numeric bounds, string bounds/pattern/format, items/
+prefixItems/additionalItems/contains/min-maxContains/uniqueItems/unevaluatedItems, properties/
+required/additionalProperties/patternProperties/propertyNames/dependencies/dependentRequired/
 dependentSchemas/unevaluatedProperties, allOf/anyOf/oneOf/not/if-then-else, `$ref` into
-`$defs`/`definitions`, boolean subschemas) and random or schema-guided instances.
+`$defs`/`definitions`, boolean subschemas) merged in order by a pure function, recursion through
+`schema(depth)`/`sub(depth)` generator-returning methods with a depth bound; `guided(schema, depth)`
+turns a drawn schema into a generator of instances shaped by its hints (const, enum, a combinator
+branch, the type and its keywords, each with its own weight) or arbitrary values; the meta-schema
+test draws a list of `Mutation` records (object position modulo the live count, keyword, remove or
+a value) applied afterwards. `weighted`/`chance`/`maybe` are the zoo's stand-ins for weighted
+choice, shrinking towards the first (simplest) alternative.
 
 ## What is tested
 
@@ -35,7 +42,9 @@ dependentSchemas/unevaluatedProperties, allOf/anyOf/oneOf/not/if-then-else, `$re
 
 See `bugs.toml`: `contains` with `maxContains` below `minContains` rejects every non-array
 instance, twice when both bounds are explicit (1); `unevaluatedProperties` ignores `failFast` and
-reports every offending property (2).
+reports every offending property (2); `uniqueItems` iterates the members of any instance, so an
+object with two equal values is rejected (3, found by the 2026-09-23 rewrite of the generators in
+combinator style: `{"uniqueItems": true}` against `{"a": null, "b": null}`).
 
 ## Notes
 
@@ -46,7 +55,16 @@ reports every offending property (2).
   subschema's error at the parent location with no keyword (a quirk of its `descend`), so such
   errors are left out on both sides.
 - Oracle limits: python's vendored draft-06/07 meta-schemas lack the `enum` minItems/uniqueItems
-  constraints of the published ones (the library's copies match the published ones); its `date`
+  constraints of the published ones (the library's copies match the published ones; as `items` and
+  `dependencies` values are an `anyOf` there, the library also reports the other branch's `type`
+  error at the parent of such an enum, which the meta-schema property drops as well); its draft
+  2019-09 `unevaluatedProperties` (a `_legacy_keywords` copy) does not count the properties an
+  object-valued `additionalProperties` evaluates, unlike its 2020-12 one, so such 2019-09 schemas
+  are skipped in the validity comparison; its `check_schema` accepts a relative `$id` such as
+  `"string"` or `""`, which the library's default `SchemaIdValidator` refuses because no base URI
+  makes it absolute (the spec requires that), so the meta-schema property tolerates that
+  `SchemaException` as it does the non-string `$ref` (all three found by the 1000-case runs of
+  2026-09-23); its `date`
   checker rejects year 0; `additionalItems` next to a boolean `items` crashes it (such cases are
   skipped); formats are restricted to those both sides check (ipv4, ipv6; date from draft 7; uuid
   from 2019-09).
