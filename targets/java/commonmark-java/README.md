@@ -14,14 +14,16 @@ repository's CONTRIBUTING.md asks for tests and the existing style and says noth
 
 - **commonmark.js**, the reference implementation of the same spec version, as a child process
   (`hegel/node/oracle.js`, one JSON-quoted document per request, the HTML back): the HTML of every generated document
-  must match. Four differences are the reference's, not the library's, and are normalised or avoided (checked against
+  must match. Five differences are the reference's, not the library's, and are normalised or avoided (checked against
   the spec text): commonmark.js knows no tabs between the parts of link and definition syntax (`spnl` matches spaces
   only), so the generator writes none there; it counts a trailing lone CR as an extra line; it trims Unicode spaces
   (U+00A0, U+2028, …) off paragraphs and headings with JavaScript's `trim`, where the spec's blank characters are space
   and tab (the ASCII spaces next to them and a line made of such spaces alone, with its line ending, go too; the library
   rightly keeps them), so for documents with such characters the spaces at the edges of paragraphs and headings are
-  ignored; and it omits an empty `title` attribute where the library writes `title=""`. Otherwise ASCII spaces in the
-  HTML must match exactly. The library's `maxInlineNesting`/
+  ignored; it cuts the info string's first word (the code's `language-` class) at JavaScript whitespace
+  (`split(/\s+/)`, Unicode spaces included) where the library and cmark cut at an ASCII space, so a fence whose first
+  info word holds a Unicode space is skipped (`Known.UNICODE_SPACE_IN_FIRST_WORD`); and it omits an empty `title`
+  attribute where the library writes `title=""`. Otherwise ASCII spaces in the HTML must match exactly. The library's `maxInlineNesting`/
   `maxOpenBlockParsers` limits (100) are never reached by the generator.
 - **The library against itself**: rendering a parsed document to Markdown and parsing that must give the same document
   (compared as HTML, which prints every field of the tree) and rendering it again must give the same Markdown
@@ -75,7 +77,7 @@ autolink rules (it wraps `org.nibor.autolink` and claims no spec), the heading-a
 beyond the round trip, `enabledBlockTypes`, custom block/inline parsers, the `parser.beta` API, the `DingusApp`,
 Android module. The YAML property writes only closed front matter (bug 29) at the document start (bug 41).
 
-## Bugs (52 open; each has a pin in `CommonmarkPinsTest`)
+## Bugs (59 open; each has a pin in `CommonmarkPinsTest`)
 
 | id | severity | what |
 |---|---|---|
@@ -131,6 +133,13 @@ Android module. The YAML property writes only closed front matter (bug 29) at th
 | commonmark-java/50 | low | MarkdownRenderer: the indent of a nested list starting an item is written on the item's first line, so later blocks of the item fall out |
 | commonmark-java/51 | medium | MarkdownRenderer: an empty destination `<>` with a title is written as nothing, so the title re-parses as the destination |
 | commonmark-java/52 | high | a code span after an unclosed backtick string and another code span is left as text (`` `` `a` `c` ``: the backtick position cache is overwritten with earlier positions) |
+| commonmark-java/53 | low | MarkdownRenderer: an entity right before an emphasis opener is decoded, and the opener stops opening (bug 20's mirror) |
+| commonmark-java/54 | medium | MarkdownRenderer: a footnote definition's text is not escaped at its line start (`[^1]: \#` comes back as a heading, `\- a` as a list) |
+| commonmark-java/55 | medium | a blank line inside a nested list makes the outer list loose when a block follows the nested list on the next line |
+| commonmark-java/56 | medium | MarkdownRenderer: inside a tight list item, blocks in a block quote are separated by one line ending, so two paragraphs merge |
+| commonmark-java/57 | medium | a footnote definition inside a container reads its later blocks against the absolute column 4, so a paragraph becomes indented code (and the Markdown rendering grows by four columns each time) |
+| commonmark-java/58 | medium | a list item that may not interrupt a paragraph (`2.`, an empty item) does so right after a link reference definition |
+| commonmark-java/59 | low | MarkdownRenderer: a footnote reference at a line start followed by `:` re-parses as a footnote definition (found by this turn's 1000-case run) |
 
 Observed and left unrecorded (arguable or cosmetic): the renderer's text escaping is not a fixed point (`[^a]:**.**Æ`
 renders unescaped once and escaped the second time, with equal HTML); the Markdown renderer discards `TableCell.getWidth()` and
@@ -144,3 +153,7 @@ commonmark.js.
 ## History
 
 - 2026-09-16: created (turn 184) at b89e72fdb259 (0.30.1-SNAPSHOT, 2026-08-07); 52 bugs.
+- 2026-09-23: 53..59 recorded (53..58 the generator rewrite's shake-outs, reproduced standalone against the installed
+  jars, commonmark.js and cmark-gfm; 59 from the 1000-case round-trip run that verified them); two more of the
+  rewrite's findings extend bugs 2 (a thematic break's literal keeps the partial tab) and 46 (the blank line at the
+  document end, and the mechanism is the HTML writer's, not the parser's).
