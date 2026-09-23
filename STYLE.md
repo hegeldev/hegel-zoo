@@ -26,7 +26,9 @@ guidance; this file is the zoo-specific part.
    cumulative weight it falls under (see the go-shellquote or go-units patch), which shrinks
    towards the first choice and takes percentages as weights; a `OneOf` with each generator
    repeated `weight` times does the same for small weights. `chance(pct)` is likewise
-   `Map(Integers(0, 99), x < pct)`, shrinking to false.
+   `Map(Integers(0, 99), x >= 100-pct)`, shrinking to false: the draw shrinks to 0, so the
+   comparison must make 0 the false case (`x < pct` shrinks to true - the rewrites of turns
+   413-418 had it that way and were corrected in turn 419's sweep).
 3. **The simplest alternative comes first.** `OneOf` shrinks towards its first generator and
    `Integers(lo, hi)` towards `lo`. The old `chance(tc, pct) = n(tc, 1, 100) <= pct` shrank
    towards *true*, so minimal counterexamples arrived with every optional feature switched on;
