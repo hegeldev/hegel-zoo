@@ -22,7 +22,8 @@ differential needs `bash` ≥ 4.4 on PATH (`globstar`, `extglob`, `nullglob`, `d
   what the pattern expands to (`dotglob`/`nocaseglob` mirror `dot`/`nocase`); `picomatch.isMatch`
   must agree on every path. The README's documented deviations from bash are respected by
   construction (no negated extglobs, `(?` never generated, `{a}` without a comma is literal) and its
-  remaining limits are listed below. This property found bugs 2, 3, 5, 6 and 7.
+  remaining limits are listed below. This property found bugs 2, 3, 5, 6 and 7, and after the
+  2026-09-23 rewrite of the generators in combinator style its 1000-3000-case runs found 8 and 9.
 - **The API agrees with itself** (`TestHegelApiIsConsistent`): `isMatch`, the matcher function,
   `makeRe(...).test`, `picomatch.test(...)`, the state-returning matcher and `contains`/`capture`
   give one answer; `!pattern` is the complement (and literal under `nonegate`); an array of patterns
@@ -38,14 +39,14 @@ differential needs `bash` ≥ 4.4 on PATH (`globstar`, `extglob`, `nullglob`, `d
   property found bugs 1 and 4.
 - **`picomatch/posix` and `windows`** (`TestHegelPosixEntryPointAgrees`): the dependency-free
   entry point answers as the main one, and a path with backslashes matches under `windows: true`
-  exactly when its slash form matches.
+  exactly when its slash form matches. This property found bug 10 in the 2026-09-23 long runs.
 
 Under `ZOO_COLLECT=1` the counts show which bug shapes and oracle limits the generator reached and
 how many mismatches had no known shape; the recorded bugs are skipped by shape (`Known` in the test
 file) so the properties stay strict on everything else, and each has a pin. Rounds of 300–1000
 cases per property were run until a round added nothing.
 
-## What was found (7 bugs, `bugs.toml`)
+## What was found (10 bugs, `bugs.toml`)
 
 | id | severity | title |
 |---|---|---|
@@ -56,9 +57,13 @@ cases per property were run until a round added nothing.
 | picomatch/5 | medium | a `?` right after `)` is a regex quantifier, not a one-character wildcard: `@(a)?` matches `a` and rejects `ab` |
 | picomatch/6 | medium | `**` next to a brace group or `@(…)` in one segment crosses path separators: `**{b,c}x` and `**@(b)x` match `a/bx`, `@(a)**` matches `ax/c` |
 | picomatch/7 | low | `a/**/?(b)` matches the bare `a`: the optional `/**/` lets the pattern end before a group that can match nothing |
+| picomatch/8 | medium | a negated bracket expression holding a POSIX class matches the separator: `a[![:upper:]]b` matches `a/b` |
+| picomatch/9 | medium | a POSIX class after a leading `**/` blocks an explicit dotfile segment: `**/.a/[[:digit:]]` rejects `.a/0` |
+| picomatch/10 | low | under `windows: true` a negated bracket matches a backslash kept before a glob-special character: `a[!a]*` matches `a\*` |
 
-Bugs 2, 3, 5, 6 and 7 are in the parser/regex generation (`lib/parse.js`), 1 and 4 in the fast scanner
-(`lib/scan.js`) that fast-glob-style consumers use to split a pattern into a static base and a glob.
+Bugs 2, 3, 5, 6, 7, 8 and 9 are in the parser/regex generation (`lib/parse.js`), 1 and 4 in the fast
+scanner (`lib/scan.js`) that fast-glob-style consumers use to split a pattern into a static base and
+a glob, and 10 in the windows path normalisation (`lib/utils.js` with `lib/constants.js`).
 
 ## Oracle limits and documented behaviour (not recorded)
 
