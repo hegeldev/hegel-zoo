@@ -22,8 +22,11 @@ guidance; this file is the zoo-specific part.
 2. **Choice is `OneOf`/`SampledFrom`, never a `switch` or `if`-chain over a drawn integer.** A
    `switch n(tc, 1, 100)` hides the branch from the shrinker (no `ONE_OF` span, so it cannot
    swap branches) and burns a meaningless draw. Until Hegel has weights, use the local
-   `weighted` helper (a `OneOf` with each generator repeated `weight` times) and keep the
-   weights small integers.
+   `weighted` helper: one `Integers(0, total-1)` draw `FlatMap`ped to the generator whose
+   cumulative weight it falls under (see the go-shellquote or go-units patch), which shrinks
+   towards the first choice and takes percentages as weights; a `OneOf` with each generator
+   repeated `weight` times does the same for small weights. `chance(pct)` is likewise
+   `Map(Integers(0, 99), x < pct)`, shrinking to false.
 3. **The simplest alternative comes first.** `OneOf` shrinks towards its first generator and
    `Integers(lo, hi)` towards `lo`. The old `chance(tc, pct) = n(tc, 1, 100) <= pct` shrank
    towards *true*, so minimal counterexamples arrived with every optional feature switched on;
@@ -157,8 +160,8 @@ The full per-language surveys, with file and line references, are in the project
 
 1. **Weighted choice**: `OneOf` with weights (or `Weighted`/`frequency`), and `sampledFrom` with
    weights. Every language faked it with `chance()` dice, `switch` ladders or duplicated list
-   entries; the repetition trick the rewrites use allocates sum-of-weights generators and reads
-   oddly.
+   entries; the `FlatMap`-over-an-integer helper the rewrites use works in every binding but is
+   twenty lines of boilerplate per test file and hides the choice from the printer.
 2. **`Booleans(p)` / `chance(p)` shrinking to false** (Rust has `weighted_booleans`; Java's
    `generateBoolean(double)` is public but unwrapped; Go and TS have nothing).
 3. **Optional with a probability** (`Optional(g).Probability(p)`); it is 50/50 today, which is
@@ -193,7 +196,11 @@ The full per-language surveys, with file and line references, are in the project
 
 ## Status
 
-Rewritten: go/go-shellquote, typescript/ini, rust/pretty-bytes (turn 413). The order of the
+Rewritten: go/go-shellquote, typescript/ini, rust/pretty-bytes (turn 413); go/shellescape,
+go/go-units, go/go-rpm-version, rust/dyn-fmt, typescript/entities, java/java-diff-utils
+(turn 414; the java-diff-utils rewrite also caught an over-strict check of its own, not a
+library bug: the per-row "untagged remainders agree" check is only meaningful for single-line
+changes). The order of the
 rest, smallest and ugliest first, is in the project notes; each rewrite is one commit, run
 through `tools/zoo test` six times, with the same properties and pins unless the rewrite finds
 a new bug (recorded in `bugs.toml` as usual).
