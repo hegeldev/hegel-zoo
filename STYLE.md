@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -715,3 +715,21 @@ mapped to it. When a classifier cannot be an assume under `HEGEL_NO_KNOWN=1` bec
 still drawn often (compose-go's distinct defaults, 8%), the check of that one item is skipped and
 the rest of the case is judged. Third TypeScript harness with the shared example-database key
 (picomatch, after ini and rbush): every TypeScript target that comes up gets `keyed`.
+
+The twenty-eighth batch (turn 446: sonic, shell-quote, now) was the first in which every target
+had the shapes gated by the oracle as well as by the generators. Removing a shape gate is only
+half the job when the model was written beside it: now's clock model rebuilt the hour with
+`time.Date` and its calendar and parse models took `time.Date` for midnight, sharing the very
+assumptions (a repeated hour, a missing midnight) that now/2-5 and now/11 are about, and sonic's
+stream oracle compared only the presence of an error, so io.EOF against a syntax error (sonic/6)
+was invisible even on the truncated literals the generator did draw. Both showed up as failures
+outside the recorded shapes once the gates went; the remedy is to state the oracle on the
+calendar or the specification and let the library's own primitive be suspect. Shape data
+computed at start-up (now's per-zone transition table from tzdata, 1974-2062) makes a narrow
+property a real property: a zone, one of its shape dates and a random instant, not a fixed
+example. shell-quote's classifier had excused every recorded shape with a `return`, which is
+the TypeScript form of the same steering; two of its bugs (/7, /13) had no property at all
+because the generator never drew special parameters or object env values, which the narrow
+properties now do. Standalone reproduction paid off again: sonic's top-level `-0` keeps its sign
+on the first decode of a process and loses it on every later one (the JIT path), which a
+one-shot probe would have called a non-bug.
