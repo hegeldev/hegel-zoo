@@ -101,7 +101,7 @@ Properties and TOML modules, and the engine's own bugs (see below).
 
 ## Bugs
 
-See `bugs.toml` (11: jackson-yaml/1 … 11). In short: a lone U+0085 string written plain reads back as
+See `bugs.toml` (13: jackson-yaml/1 … 13). In short: a lone U+0085 string written plain reads back as
 null (1); `EMPTY_DOCUMENT_AS_EMPTY_OBJECT` leaves the parser without a context (NPE in `currentName`)
 and `---` still reads as null (2); `!!int +` ends the token stream mid-document (3); under the core
 schema `08`/`09`/`0128…` throw "Invalid base-8 number" (4); `ALWAYS_QUOTE_NUMBERS_AS_STRINGS` uses the
@@ -109,7 +109,10 @@ JSON schema's number shapes so `0x1F`/`.Inf`/`.NaN` strings become numbers under
 an object id before `writeBinary` lands on the next property name (6); the tree model reads aliases
 as the anchor's name — upstream #2 (7); `CANONICAL_OUTPUT` double-quotes every scalar without tags,
 losing all types (8); `writeTypeId` before a scalar is dropped (9); `writeBinary(InputStream)` is
-unsupported (10); `MINIMIZE_QUOTES` leaves the merge key `<<` plain (11).
+unsupported (10); `MINIMIZE_QUOTES` leaves the merge key `<<` plain (11); the anchor-replaying parser
+takes every scalar `<<` for a merge key and throws on a quoted `"<<"` string (12); a string starting
+with U+FEFF is written plain and, first in a document without a start marker, swallowed as a byte order
+mark (13).
 
 ## Observed and not recorded
 
@@ -152,6 +155,8 @@ inherits them — candidates for a `snakeyaml-engine` target):
   value (the snakeyaml `Emitter.writeDoubleQuoted` lineage bug, snakeyaml/16).
 - `DumpSettings` accepts an indicator indent ≥ the indent and then writes block mappings left of
   their sequence indicator.
+- `Dump` writes a root string starting with U+FEFF plain (`\ufeff\n`) and its own `Load` reads it as
+  null: the engine's side of jackson-yaml/13.
 
 ## History
 
@@ -159,3 +164,9 @@ inherits them — candidates for a `snakeyaml-engine` target):
 - 2026-09-18: base bumped b5b62c9b30b8 → 87b33f8d4e82 (2026-09-17, "Bump actions/setup-java from 6.0.0 to 6.0.1 (#732)"; 3.3.0-SNAPSHOT); 11 bug(s) still reproduce. 5 tests pass.
 - 2026-09-18: base bumped 87b33f8d4e82 → 38f4fbbb8118 (2026-09-18, "Fix output lost when writing to OutputStream with auto-close and flush both disabled (#719)"; 3.3.0-SNAPSHOT); 11 bug(s) still reproduce. 5 tests pass.
 - 2026-09-20: base bumped 38f4fbbb8118 → 65db46e9d650 (2026-09-19, "CSV test fix"; 3.3.0-SNAPSHOT); 11 bug(s) still reproduce. 5 tests pass.
+- 2026-09-24: generators rewritten in combinator style (`YamlGen` draws a `Node` tree with style records
+  and two tapes, rendered by a pure `Writer`; one record per property; mutations as a list of edits
+  applied modulo the live text; the write options as a record with the tree shaped for them, so the
+  recorded-loss gates fire on about 1% instead of being the bulk of the cases; the merge-key, anchor
+  and tag gates of the engine comparison narrowed to token starts, 8% not compared where 20% was);
+  jackson-yaml/12-13 found by the rewrite. 5 tests pass, 13 expected failures.
