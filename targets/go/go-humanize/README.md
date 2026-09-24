@@ -7,8 +7,8 @@ reach for to print "83 MB", "1,234,567", "3rd", "2.2345 pF" and "3 weeks ago": b
 `BigComma`, `BigCommaf`), a template-friendly `FormatFloat`/`FormatInteger` with a format
 string, `Ftoa`/`FtoaWithDigits`, SI prefixes (`ComputeSI`, `SI`, `SIWithDigits`, `ParseSI`),
 `Ordinal`, and relative times (`RelTime`, `CustomRelTime`, `Time`). About 1100 lines of Go with
-example-based tests and a fuzz test for `Comma`. Pinned at 4d1d908 (v1.0.1+, 2025-11-24), MIT,
-no AI policy.
+example-based tests and a fuzz test for `Comma`. Base 40736da3 (v1.0.1+, 2026-09-17; first
+pinned at 4d1d908, bumped four times since, see the end of this file), MIT, no AI policy.
 
 ## Oracles
 
@@ -30,25 +30,34 @@ no AI policy.
 
 - `TestHegelBytePrintersFollowTheModel` — `Bytes`/`IBytes`/`BytesN`/`IBytesN` with 1–6 digits
   for uint64 sizes spread over the whole range and biased to unit boundaries: `"%d B"` below
-  10, the right unit, the right number of decimals, the value within the rounding (the double
-  rounding of go-humanize/2 is allowed for), and `ParseBigBytes`/`ParseBytes` of the output
-  give the printed value back (ParseBytes within its float64 rounding, go-humanize/3; an
-  output at or beyond 2^64 must be rejected). Mantissas within one unit of the base are skipped
-  (go-humanize/1).
+  10, the right unit, the right number of decimals, the value within the rounding, and
+  `ParseBigBytes`/`ParseBytes` of the output give the printed value back exactly (an output at
+  or beyond 2^64 must be rejected). Sizes are biased to the unit boundaries, so the property
+  draws mantissas that round up to the base and fails there: it is the expected failure for
+  go-humanize/1 (shrinks to `Bytes(999999)` = `1000 kB`) and also reaches go-humanize/3
+  (`ParseBytes("1.1 EB")` off by 128).
 - `TestHegelBigBytePrintersFollowTheModel` — `BigBytes`/`BigIBytes` for integers up to 36
   digits: one decimal below a mantissa of 10, none above, the unit (the table ends at quetta;
-  beyond it the mantissa grows), the value within the rounding plus the 1/base truncation of
-  go-humanize/9, and the `ParseBigBytes` round trip.
+  beyond it the mantissa grows), the value within the rounding, and the `ParseBigBytes` round
+  trip. Expected failure for go-humanize/1 (`BigBytes(999999)` = `1000 kB`); also reaches
+  go-humanize/9 (`BigBytes(10500001)` = `10 MB`).
 - `TestHegelByteParsersAgreeWithExactArithmetic` — `<digits[,digits]*>[.digits][blank]<suffix>`
   with suffixes `""`, `b`, and `k m g t p e z y r q` bare or with `b`/`i`/`ib`, in any case, with
-  trailing blanks: `ParseBigBytes` exact; `ParseBytes` within float64 rounding, rejecting the
-  suffixes above exa it does not know and values that do not fit a uint64.
+  trailing blanks: `ParseBigBytes` exact; `ParseBytes` exact too, rejecting the suffixes above
+  exa it does not know and values that do not fit a uint64. Reaches go-humanize/3 in about 4%
+  of its cases (`ParseBytes(".1ei")` = 115292150460684704, one short), so at 100 cases it is an
+  intermittent expected failure.
+- `TestHegelDecimalSizesParseExactly` — the region of the size texts where `ParseBytes` goes
+  wrong: a decimal with one to three places and a multiplier from kilo to peta, in any case,
+  with the gaps and trailing blanks of the wide property. Expected failure for go-humanize/3
+  (shrinks to `ParseBytes("64.1k")` = 64099 or `ParseBytes("16.1p")` two over).
 - `TestHegelByteParsersRejectJunk` — leading sign or blank, exponents, two points, no digits,
   unknown suffixes, blanks inside a suffix, `_`, `0x`, `bytes`, `kbps`.
 - `TestHegelCommaFormattersFollowTheModel` — `Comma` over all of int64, `Commaf` over
   decimal/random-bit/huge floats, `CommafWithDigits`, `BigComma` up to 36 digits, `BigCommaf`
-  (handed a copy: go-humanize/5), and `FormatInteger("#,###.", k)` = `Comma(k)` below 2^52
-  (go-humanize/8).
+  (the argument must come back unchanged), and `FormatInteger("#,###.", k)` = `Comma(k)` over
+  all of `int`. Expected failure for go-humanize/5 (shrinks to `BigCommaf(-1)` turning its
+  argument into 1); also reaches go-humanize/8 (`FormatInteger("#,###.", 4503599627370497)`).
 - `TestHegelFormatFloatFollowsItsFormat` — thirteen formats from the documentation (`""`,
   `#,###.##`, `#,###.`, `#,###`, `# ###,##`, `#.###,######`, `#.##`, nine places, no directive,
   `+`), values up to 10^12; the documented-invalid formats panic with a `FormatFloat()` message.
@@ -60,7 +69,15 @@ no AI policy.
 - `TestHegelRelTimeFollowsTheTable` — both argument orders for differences from a nanosecond
   to 40 years, biased to the table boundaries, against the if-chain model with both labels.
 
-All general properties pass at 1000 cases × 3 (under a second). Nine pinned expected failures.
+Five properties are expected failures, each mapped to the recorded bug it shrinks to (the wide
+parser property intermittently), beside the five pins that hold the bugs' examples. `HEGEL_NO_KNOWN=1` switches the known shapes off
+(the carry zone filtered out of the sizes, the float64 tolerance for `ParseBytes`, the 1/base
+truncation for `BigBytes`, a copy handed to `BigCommaf`, `FormatInteger` below 2^52): every
+property then passes at 3000 cases. Rewritten in combinator style on 2026-09-24 (STYLE.md):
+sizes, size texts, comma, format and SI cases are records drawn by package-level generators
+and rendered by pure functions; the rewrite also completed the byte-printer oracle, which
+accepted `1000 kB` as within tolerance of 999.999 and rejected the correct `1.0 PB` for
+999999999999999.
 
 ## Bugs (9)
 
