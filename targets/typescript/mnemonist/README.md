@@ -74,8 +74,12 @@ the empty interval tree (38), the empty k-d tree (39), `VPTree.nearestNeighbors(
 `from` over capacity (30), `FixedReverseHeap` capacity check (32), typings declaring missing
 members (43), `Vector.resize` deallocating (44), an undeclared global in the insertion sort (46).
 
-The properties skip a known-bug shape only when the mismatch actually occurs (`known mnemonist/N`
-in the collect output); once a structure has diverged from its model the case ends there.
+The properties skip a known-bug shape as narrowly as it lets them (`known mnemonist/N` in the
+collect output): a check whose result is wrong is counted and skipped, an operation that would
+corrupt the structure (5-9, 11, 12, 14) is counted and not applied so the rest of the sequence
+stays checked, and a shape that throws or poisons every later step (38-40, 42, 45) is left out of
+the generator while its switch in `known.mjs` is on. Only the SparseQueueSet dequeue at capacity
+(13) still ends the case, about one in a hundred.
 
 ## Conventions followed, not recorded
 
