@@ -242,7 +242,9 @@ java/roaringbitmap, go/kaptinlin-jsonschema, typescript/js-joda (turn 429; kapti
 and js-joda/34 found by the long runs); rust/glam, java/dnsjava, go/mod, typescript/css-tree
 (turn 431; css-tree/17-24 found by the rewrite's new shapes and the reviewer's 20000-case collect
 runs of the fixpoint property); rust/rust-ini, go/x-text, typescript/yaml, java/jsqlparser (turn 432;
-x-text/44-45, yaml/32-40 and jsqlparser/18-19 found by the rewrites' new shapes and long runs).
+x-text/44-45, yaml/32-40 and jsqlparser/18-19 found by the rewrites' new shapes and long runs);
+rust/pep508_rs, go/ugorji-codec, java/json-java, typescript/es-toolkit (turn 433; es-toolkit/43-54,
+nine from the rewrite's shapes and collect runs, three from the reviewer's 2000-case rounds).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -525,3 +527,27 @@ sweeps into the patch unless deleted first; and the binary-hunk sweep was closed
 data files its own tests write, and jsonrepair, msgpackr and regexp-tree held raw control
 characters in one-character string literals - go-diff never had one, its test text merely
 mentions the header).
+
+The nineteenth batch (turn 433) found twelve bugs, all in es-toolkit. Its rewrite draws one
+record per compat function through a per-function generator table (`casesOf`) and shapes the
+recorded bugs out of the inputs by flags instead of skipping them, which took the per-property
+skip rates from 3-17% per hotspot to under 2.2%; the subagent's 20000-case collect runs found
+nine differences from lodash (es-toolkit/43-51), and the reviewer's extra rounds three more
+(52-54) plus two lodash quirks now listed as accepted. The lesson is about the review: a pair of
+1000-case runs passed the saved patch, and each of four further 2000-case rounds failed on a
+different rare shape (a gate that inspected the object before the write and missed what the
+write creates, a known shape read through a primitive's wrapper, a shared function constant
+that earlier cases had written properties onto, so the failure was not reproducible from its
+own draw), so a differential target with a large value space wants several 2000-3000-case
+rounds before its commit, and every module-level constant a property might mutate must be drawn
+fresh. pep508_rs's markers are a `recursive` tree rendered by a pure function with one
+whitespace tape for all gaps; its deprecated-key gate had fired on 40% of cases because a text
+`contains` test saw `python_implementation` inside `platform_python_implementation` - gate on
+the drawn structure, never on the rendered text. ugorji-codec's loose msgpack and CBOR writers
+became pure functions of the value and a drawn tape, so an empty tape is the canonical encoding.
+json-java's baseline was not green either (a cookie model keeping blank attributes the library
+drops), hegel-java's small-budget integer draws lean toward 0 enough that a declared expected
+failure depending on a 15% alternative passed a 100-case round until that alternative was put
+first, and its `longs()` favour NaN/Infinity bit patterns so a finite-double filter rejected
+47% (draw sign, exponent and mantissa instead). The same turn made `zoo save` refuse a patch
+with a binary hunk (`--allow-binary` to override) and `zoo check` report one.
