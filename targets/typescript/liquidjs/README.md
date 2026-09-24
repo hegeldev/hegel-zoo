@@ -7,8 +7,8 @@ accepts). Pinned at 10.29.0, a2cdfb8 (2026-09-20), MIT.
 The source is TypeScript with extensionless imports, so the setup bundles `src/index.ts` with
 esbuild into `hegel/liquid.mjs` (tslib, its one runtime import, is installed under `.hegel/` and
 resolved through `NODE_PATH`). Tests: `hegel/hegel.test.mjs`, run with `node --test`.
-`ZOO_FULL=1` opens the gates around the known bugs and the documented differences; `ZOO_COLLECT=1`
-prints mismatch statistics.
+`HEGEL_NO_KNOWN=1` leaves the shapes of the known bugs out of the generators, `ZOO_FULL=1` opens the
+gates around the documented differences; `ZOO_COLLECT=1` prints mismatch statistics.
 
 ## Oracle
 
@@ -65,32 +65,27 @@ the alternatives of a `when` are distinct (Shopify renders the body once per mat
 | `TestHegelTemplatesRenderLikeShopifyLiquid` | A random template over the random context renders the same in liquidjs and Shopify's liquid (or both reject it) |
 | `TestHegelFilterChainsRenderLikeShopifyLiquid` | A single output of a typed filter chain renders the same in both engines |
 
-In the default run the shapes of the recorded bugs are kept out of the generator (`{%- endraw`,
-unnamed cycles with different candidates, `truncatewords` at a count a string could have exactly,
-`modulo` on floats, `0` among cycle candidates, `else` on a `for` with `limit`/`offset`, booleans
-reaching math filters - also through `people | map: "active"`, which is only printed - and block
-bodies of only whitespace), and so are the shapes the 2026-09-23 long runs found, seven of them
-recorded as liquidjs/9-15 and two kept as differences of the oracle's environment (`nil == blank`
-holds only with ActiveSupport's `blank?`, and `sort_natural`'s ASCII-only `casecmp` is Ruby's):
-an array of arrays reaching an array filter (`people | map: "tags" | sort_natural`;
-Shopify's array filters flatten nested arrays, liquidjs's do not, so `map: "tags"` is only
-printed, which both engines flatten); `truncatewords` under its count (liquidjs trims the string
-and rejoins its words with single spaces where Shopify returns it unchanged, `"  padded  " |
-truncatewords: 8`; the filter runs only under `ZOO_FULL`); `split: " "` (Ruby's `split(" ")` is
-awk-style and skips leading whitespace and runs of it, liquidjs only drops trailing empty strings:
-`" grape" | split: " " | first`); `replace` with an empty pattern (Ruby's `gsub` inserts before
-every character and at the end, liquidjs's `split("").join()` only between characters: `"Hello" |
-replace: "", "a"`); a literal `nil` against `blank` (`nil == blank` is false in liquidjs and
-true in Shopify, though `blank == nil` and a nil variable agree); `escape` and `escape_once` of a
-`"` (`&#34;` in liquidjs, `&quot;` from Shopify's CGI) and `url_encode` of a `'` (left as is by
-`encodeURIComponent`, `%27` from `CGI.escape`; the HTML sample in the context has no quotes in the
-default run); `sort_natural` over accented letters of mixed case (Ruby's `casecmp` folds ASCII
-only, so `Ü` sorts before `é` there and after it in liquidjs; the accented sample is all lower
-case in the default run); and a `for` with `offset: continue` that runs more than once
-(a liquidjs loop with `offset: continue` records a non-numeric position, so its next run restarts
-at 0 where Shopify's continues past the end; the default run puts `offset: continue` only on loops
-outside any other loop). Pins (`TestHegelPin*`) reproduce the bugs in `bugs.toml` and are listed
-as expected failures.
+The generators draw the shapes of the recorded bugs like any other input: a whitespace-controlled
+`{%- endraw %}`, unnamed cycles with different candidates and `0`/`false` among the candidates,
+`truncatewords` at and under its count, a `frac` literal (0.1, 0.3, ...) into `modulo`, booleans
+into the math filters and through `default` (and `people | map: "active"` into the array
+filters), nested arrays from `map: "tags"` into the array filters, `split: " "`, `replace` with an
+empty pattern, block bodies of only whitespace, `else` on a `for` with `limit`/`offset`, `offset:
+continue` on loops inside loops, and `"` and `' ( ) ! *` in the string samples for `escape` and
+`url_encode`. Each shape is in 0.2-7% of the template property's cases (15% of them mismatch in
+all) and 0.1-3% of the filter-chain property's (4%), and a mismatch names the recorded bug;
+`TestHegelTemplatesRenderLikeShopifyLiquid` fails every run and is mapped to liquidjs/7, its
+usual basin (/4 and /1 the next), `TestHegelFilterChainsRenderLikeShopifyLiquid` passes about one
+run in six and is mapped to /7 as intermittent. Each bug also has a property over its shape region
+with random contents, named after what it tests (`TestHegelModuloOfAFloatKeepsItsPrecision`,
+`TestHegelSplitOnASpaceIsAwkStyle`, ...), and a pin (`TestHegelPin*`) as the regression example;
+all are listed as expected failures in `target.toml`. `HEGEL_NO_KNOWN=1` leaves the shapes out
+of the generators for a run that looks past the known bugs (the narrow properties are skipped
+whole); the two wide properties then pass at 1000 cases. Two shapes the 2026-09-23 long runs
+found are differences of the oracle's environment rather than of liquidjs and stay out of the
+default run: a literal `nil` against `blank` (`nil == blank` holds only with ActiveSupport's
+`blank?`) and `sort_natural` over accented letters of mixed case (Ruby's `casecmp` folds ASCII
+only); `ZOO_FULL=1` draws them and the documented differences above.
 
 ## Not tested
 
@@ -118,3 +113,7 @@ as expected failures.
   values (`size` after `first`/`last`, BigDecimal arithmetic after `divided_by: f` or `round: n`),
   all gated in the generator; seven of the candidates are recorded as liquidjs/9-15 with pins
   (the `nil == blank` and `sort_natural` ones are the oracle's environment, not liquidjs).
+- 2026-09-24: the gates around the recorded bugs went (STYLE.md rule 11): the shapes are drawn
+  by default and the two wide properties fail on them; one property per bug over its shape
+  region was added; `HEGEL_NO_KNOWN=1` (not `ZOO_FULL`) now switches the known shapes off, and
+  the harness keys the example database per property.
