@@ -31,14 +31,26 @@ computed from the drawn parts and the drawn `env` by a pure function.
 - **TestHegelSplitUnquotedAgreesWithBash** — the same programs with `splitUnquoted` set to
   `true` (IFS space/tab/newline) or to a custom IFS (`:`, ` :`, `,`, `\t\n`, `:\t`, or `''`
   which disables splitting), compared with bash running the text under that `IFS`.
-- **TestHegelOperatorsAndCommentsTokenize** — words (from the same generator, shapes of pinned
-  bugs excluded), the sixteen control operators and an optional trailing `# comment`, joined
-  with random blanks (none needed between a word and an operator); `parse` must return the
-  modelled words (glob tokens where an unquoted `*`/`?` occurs), `{ op }` objects and the
-  comment text.
+- **TestHegelOperatorsAndCommentsTokenize** — words (from the same generator), the sixteen
+  control operators and an optional trailing `# comment`, joined with random blanks (none
+  needed between a word and an operator); `parse` must return the modelled words (glob tokens
+  where an unquoted `*`/`?` occurs), `{ op }` objects and the comment text.
 
-Each pinned bug has a one-line pin (`TestHegelPin…`, listed in `target.toml`) that fails while
-the bug is present.
+The generators draw the shapes of all seventeen recorded bugs like any other input: `!` and
+`` \` `` inside double quotes, `#` inside a word, `\\` before a closing quote or a blank, a
+backslash-newline, `$_name`, `$*`/`$!` and `$1x`, prototype names such as `$constructor`,
+CR/VT/NBSP and the other odd spaces, escaped glob characters, split expansions next to globs
+and empty quotes, `splitUnquoted: ''`; each shape is in 0.1-10% of a wide property's cases,
+and a mismatch on one names the recorded bug. The four wide properties therefore fail every
+run and are the expected failures mapped to the bug each usually shrinks to (`target.toml`;
+`QuotedWordsSurviveTheShell` lands on /11 or /1, `ParseAgreesWithBash` on /5 or /2, the split
+and tokenizer properties on /2). Each bug also has a property of its own over its shape region
+with random contents (`TestHegelHashInsideAWordAgreesWithBash`, ..., including object env
+values for /13, which no wide property draws), so every bug has a deterministic finder, and a
+one-line pin (`TestHegelPin...`) as the regression example. `HEGEL_NO_KNOWN=1` looks past the
+bugs: the generators draw less of the shapes, a mismatch that still has a recorded shape is
+skipped (about 1% of the parse and split cases, none of the others) and the one-bug properties
+are skipped whole; the four wide properties then pass at 1000 cases.
 
 ## Oracles
 
@@ -48,8 +60,8 @@ generated program; `parse`'s own documented token shapes for operators and comme
 ## Not tested
 
 - Tilde expansion, brace expansion, `$(...)`, backquotes and arithmetic: the shell performs
-  them, `parse` by design does not (README); the generators avoid `~` at word start and
-  `{...,...}` so bash agrees with the model.
+  them, `parse` by design does not (README); no `~` starts a generated word and no `{a,b}`
+  is drawn, so bash agrees with the model.
 - The `escape` option (a custom escape character): only that `parse('a ^"b c^" d', {}, {
   escape: '^' })` behaves like the backslash form was checked by hand.
 - The env-function path beyond object values (shell-quote/13).
@@ -94,8 +106,17 @@ and `quote.js` end to end; /14, /15, /16 and /17 from the properties (the bash o
   too): with `splitUnquoted`, an empty quoted string *before* a split expansion vanishes when a
   field follows (`parse('""$W$C', { W: ' ', C: 'c' }, { splitUnquoted: true })` is `['c']`,
   bash reads `['', 'c']`), the mirror of shell-quote/16; recorded as /17 with a pin and gated
-  by the `parse/split-drops-leading-empty-quoted` shape. The same long runs showed a model bug
+  by the `parse/split-drops-leading-empty-quoted` shape (the gate went with the next entry). The same long runs showed a model bug
   of the test's own (also pre-existing, about once per 3 000 cases): the brace fixup for a
   `$NAME` before a letter inside double quotes was a regex over the rendered text and so also
   rewrote an escaped `"\$Za"` into `"\${Z}a"` while the model kept saying `$Za`; parse (and
   the shell) rightly read `${Z}a`. The fixup now applies to expansion items only.
+- 2026-09-24: the shape gates went (STYLE.md rule 11): the classifier and the filters had kept
+  every recorded shape out of the properties or excused its mismatches, so the properties find
+  the bugs again and are the expected failures; one property per bug over its shape region was
+  added (/7 and /13 had no property before: special parameters were never drawn, env values
+  were always strings), and `HEGEL_NO_KNOWN=1` switches the shapes off. Three shape tests of
+  the test's own were tightened on the way: the /14 shape is read off the parts (the old regex
+  also matched a double-quoted span ending in `\\`), the /15 gate had excused any mismatch
+  under `splitUnquoted: ''` when any expansion existed, and the model's env lookup now uses
+  `Object.hasOwn` (it had special-cased `constructor` alone).
