@@ -74,10 +74,22 @@ SELECT; RANGE frames with offsets need one ORDER BY expression; no subqueries in
 into the schema verbatim, so no comment between it and the `;`; `UPDATE … FROM` needs qualified columns and its
 RETURNING sees the updated table only.
 
-The known bugs' shapes are skipped (the pins carry them): stacked unary operators, a predicate followed by `IS
-TRUE/FALSE`, bare `BINARY`/`RTRIM` collations, type names and `exclude` as bare column names, quoted names with
-dots, `REPLACE … RETURNING`/`DEFAULT VALUES`, row-value SET starting with `(`, signed CASE operands,
-conditions inside CAST, typeless columns in CREATE TABLE, `COLLATE` after `IS NULL`/`IS TRUE`.
+The recorded bugs' shapes are drawn by default (since 2026-09-24; until then they were skipped and the pins
+carried them): stacked unary operators, a predicate followed by `IS TRUE/FALSE`, bare `BINARY`/`RTRIM`
+collations, `exclude` as a bare column name, quoted names with dots, hex literals compared exactly, `REPLACE …
+RETURNING`/`DEFAULT VALUES`, `;;` as the last separator, row-value SET starting with `(`, signed CASE operands,
+conditions inside CAST, typeless columns in CREATE TABLE, `COLLATE` after `IS NULL` and after `LIKE … ESCAPE`,
+predicates as `substr` arguments, and the mutation property no longer assumes away `0 .id`, a bare `DELETE` or
+`REPLACE(… . 5`. So the wide properties fail on them: `statementsSplit` shrinks to `VALUES (0);;` (/9) every
+run; `agreesWithSqlite`, `treeMatchesSqlite` and `mutationsNeverCrash` always fail but land on the empty hex
+literal `X''` (/7) in most runs and on /1, /3, /6 or /8 in others, and `tablesAndFeatures` reaches /3 only in
+long runs, so those four are intermittent expected failures. Each open bug also has a narrow property named
+after what it tests (`stackedUnaryOperatorsAgreeWithSqlite`, `predicateIsTrueAgreesWithSqlite`, ...,
+`unsupportedStatementDotNumberReprintIsFixpoint`), drawing that bug's shape region with random contents and
+failing on it in every run; the pins keep one example each. `HEGEL_NO_KNOWN=1` switches the shapes off (left
+out, or spelled as JSqlParser accepts them: parenthesised or quoted) for a run that looks past the known bugs;
+the few mutation cases it cannot reshape are skipped (under 0.3% of cases), and every property then passes at
+1000 cases.
 
 ## Not tested
 
