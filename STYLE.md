@@ -246,7 +246,10 @@ x-text/44-45, yaml/32-40 and jsqlparser/18-19 found by the rewrites' new shapes 
 rust/pep508_rs, go/ugorji-codec, java/json-java, typescript/es-toolkit (turn 433; es-toolkit/43-54,
 nine from the rewrite's shapes and collect runs, three from the reviewer's 2000-case rounds);
 rust/uv-pep508, typescript/mnemonist, go/go-pretty, java/javaparser (turns 434-435; uv-pep508/7
-found by the reviewer's second 1000-case run, javaparser/22 by the reviewer's first round).
+found by the reviewer's second 1000-case run, javaparser/22 by the reviewer's first round);
+go/sonic, typescript/qs, rust/fancy-regex, java/jackson-yaml (turn 436; qs/13-14 and
+jackson-yaml/12-13 from the subagents' candidates, fancy-regex/2 from the reviewer's 2000-case
+rounds).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -573,3 +576,20 @@ or `LEXICAL_PROGRAM` and draws once; a 1000-case run of it takes three to eight 
 long rounds are single 1000-case runs, one per ten-minute command, not 2000-case ones. The
 javaparser subagent's report never arrived (its 2000-case runs hit the command cap twice); the
 review recovered its edits with `zoo save` and its trace from the session's subagent transcript.
+
+The twenty-first batch (turn 436) found qs/13-14, fancy-regex/2 and jackson-yaml/12-13. qs draws
+its round-trip object from alphabets and literal pools filtered by the classifier itself, so
+98% of round trips are checked where the old test explained 55% away, and its model now treats
+keys as it treats values; `keep(o)` (an already drawn record as `just` fields) lets a `flatMap`
+hold the options beside the draws that depend on them. fancy-regex draws patterns as syntax
+trees through `recursive` (the leaf budget wants a probe: the default made 75-character
+patterns) and splices a witness of the pattern into the haystack instead of skipping a miss
+(31% of cases before); its captures property needed a tolerance no one had written down -
+engines disagree on the capture of a final empty iteration of a repeated group, and the regex
+crate does not even agree with itself between `*` and `{0,3}` - narrowed to the groups
+fancy-regex runs on its own VM. jackson-yaml's writer is a pure function over a `Node` tree,
+style records and two tapes, and its options record shapes the tree it draws, so the
+recorded-loss gates fire on about 1% instead of being the bulk of the cases; a 1000-case run is
+14 seconds, so the single-1000-case-run rule is javaparser's, not Java's. sonic was quiet. Two
+of the four verifies failed only in the 2000-case rounds after the 1000-case pair had passed,
+once more: the extra rounds stay.
