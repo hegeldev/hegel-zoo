@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -703,3 +703,15 @@ needs a leaf of 200000 items, which no sequence property can afford: a narrow pr
 bulk-loads one is the only property that finds it, which is the honest answer. Second TypeScript
 harness (after ini) whose properties shared one example-database key; check the rest when they
 come up.
+
+The twenty-seventh batch (turn 445: compose-go, go-re2, picomatch) added two data points on the
+finding rate. A shape drawn in 14% of a property's cases (picomatch's literal brace group before
+`scan`) still passes a 100-case run a third of the time, and one in 47% (go-re2's limit 0) fails
+every run; between them lies the line where a wide property is intermittent rather than plain.
+Some shapes are so rare in the wide generator (go-re2's `\B` before a multi-byte character: 0 of
+3000 cases; picomatch's /3 and /8-/10 at 0.05% or less) that the narrow property is the only
+property that finds them, and a wide property that can reach a shape only in principle is not
+mapped to it. When a classifier cannot be an assume under `HEGEL_NO_KNOWN=1` because the shape is
+still drawn often (compose-go's distinct defaults, 8%), the check of that one item is skipped and
+the rest of the case is judged. Third TypeScript harness with the shared example-database key
+(picomatch, after ini and rbush): every TypeScript target that comes up gets `keyed`.
