@@ -28,9 +28,8 @@ twelve invalid forms), a weighted choice with the literal run first so counterex
 towards plain text — and rendered to a string by a pure function that keeps a name character
 after `$NAME` apart with a space; the model parses the rendered text. The mapping has set,
 empty, unset and dollar-containing values; literal runs include braces, quotes, backslashes
-and newlines outside words (inside words bare braces are left out, since the specification
-says nothing about them and bash and compose-go read them differently, and so are newlines,
-which bug 1 rejects and the pin covers). Three variants of the one generator serve the
+and newlines, inside words too (bare braces are left out of words, since the specification
+says nothing about them and bash and compose-go read them differently). Three variants of the one generator serve the
 properties: everything, without the invalid forms (`ExtractVariables`), and without the
 invalid forms and backslashes (bash). bash is the second oracle: on that last subset,
 `printf '%s' "<template>"` with `$$` written `\$` must give the same string and fail exactly
@@ -46,7 +45,24 @@ when compose-go reports a required variable.
   that string.
 - `TestHegelExtractVariables`: the variables reported for a configuration holding the
   template are the model's, required when any occurrence is, with the default and presence
-  value when one occurrence defines them.
+  value of the first occurrence that defines them.
+- One narrow property per recorded bug, drawing its shape region with random contents and
+  judged by the same oracles: `TestHegelNewlineInWordSubstitutes` (a word with a newline in a
+  literal run), `TestHegelMessageVariablesExtracted` (a `?` or `:?` message containing a
+  reference to a name used nowhere else) and `TestHegelFirstDefaultOccurrenceKept` (two forms
+  of one name with distinct defaults or presence values). Each fails every run.
+
+The generators draw the recorded bugs' shapes by default: literal runs inside words include a
+newline (about 10% of cases), `?` messages contain variables (17%), and a name may occur with
+distinct defaults in one string (5%). So `TestHegelSubstitute` and `TestHegelBash` fail while
+bug 1 is open (shrinking to `${A:-\n}`), and `TestHegelExtractVariables`, which reaches all
+three, fails every run and is mapped to bug 2, the shape it shrinks to in most 100-case runs
+(`${A:?$B}`; sometimes `${A:-\n}` or `${A:-1}${A:-2}`); a mismatch the model attributes to a
+recorded bug names it in the failure. The pins are regression examples beside the properties.
+`HEGEL_NO_KNOWN=1` switches the shapes off for a run that looks past the bugs: no newline in
+words, literal-only `?` messages, the default kept among several distinct candidates not judged
+(the shape is still drawn in 8% of cases, so it is skipped per name rather than assumed away);
+every property then passes with nothing else discarded.
 
 ## Bugs
 
@@ -69,3 +85,9 @@ with a map-order-dependent result across keys (3).
   empty name for the stray `${`; the property skips invalid templates, which `Substitute`
   rejects first.
 - `Substitute` logs a warning for every unset variable; the tests silence logrus.
+
+## History
+
+- 2026-09-24: unsteered (STYLE.md rule 11): the known shapes are drawn by default, the three
+  wide properties and three narrow ones are the expected failures, `HEGEL_NO_KNOWN=1` switches
+  the shapes off; the `Known` struct is gone.
