@@ -21,6 +21,12 @@ child process, one request per line)
 - `TestHegelMarshalRoundTrip`: `Unmarshal(Marshal(m))` is `m` for maps of up to five values with
   newlines, tabs, references, comment markers, quotes and `$(x)`; Ruby dotenv reads `Marshal`'s
   output to `m` too.
+- One narrow property per recorded bug, drawing its shape region with random contents (name,
+  separator, quoting, the words around it, comment text) and judged by the same Ruby comparison:
+  `TestHegelReferencesExpandInAnyCase` (a reference to a lower-case name),
+  `TestHegelCommentAfterEmptyValueLeavesItEmpty` (`=` or `:` followed by spaces and a comment) and
+  `TestHegelEscapedQuoteBeforeClosingQuoteIsKept` (a quoted value ending in an escaped quote). Each
+  fails every run.
 
 **`hegel/hegel_pins_test.go`**: one deterministic reproducer per recorded bug.
 
@@ -43,15 +49,21 @@ when it arises). In the round trip, values with a backslash before `n` or `r` or
 not judged by Ruby (only the package's own round trip is): it reads `Marshal`'s `\\n` and `\\"`
 differently and cannot express them.
 
-## Known bugs (gated)
+## Known bugs
 
 Three bugs (`bugs.toml`): references to lower-case names not expanded; a comment as the whole value
 crashing the parser; a quoted value ending with an escaped quote losing the quote (and so
-`Marshal`'s output for values ending in `"` not reading back). `hegel/known.go` gates them by
-shape (an unescaped reference with a lower-case letter outside single quotes; `=` or `:` followed
-by spaces and `#`, with the panic; an escaped quote right before the closing quote; a value ending
-in `"` in the round trip) and discards a case with a known shape with `Assume`; `HEGEL_NO_KNOWN=1`
-lifts the gates.
+`Marshal`'s output for values ending in `"` not reading back). The generators draw their shapes by
+default: `TestHegelParseMatchesRuby` reaches them in about 22% (/1), 6% (/2) and 6% (/3) of its
+cases and is an expected failure mapped to /3, the shape it shrinks to in most runs (`A='\''`;
+sometimes `A=$Ax` of /1, rarely `A= #` of /2); `TestHegelMarshalRoundTrip` shrinks to `A="\""`
+(/3); the three narrow properties are the expected failures of their bugs, and the pins are
+regression examples beside them. `hegel/known.go` keeps the shape tests and names the shape in a
+failure. `HEGEL_NO_KNOWN=1` switches the known shapes off for a run that looks past the bugs
+(braced or escaped references to upper-case names only, no `$` word where it would expand, no
+comment after an empty value, no escaped quote at the end of a quoted inside, no marshalled value
+ending in `"`, the narrow properties drawing the neighbouring non-bug shapes), with the residual
+shape-test skips at 0%; every property then passes.
 
 ## Not tested
 
@@ -65,3 +77,6 @@ of `Marshal`), the autoload package.
 - 2026-09-23: generators rewritten in combinator style (package-level `Lists`/`Maps`/`OneOf`/
   `weighted` values, `Assume` for the known-bug gates and Ruby's rejections); the collect mode and
   the `n`/`chance`/`pick`/`count`/`fail` helpers removed. Same properties and pins.
+- 2026-09-24: unsteered (STYLE.md rule 11): the known shapes are drawn by default, the two wide
+  properties and three narrow ones are the expected failures, `HEGEL_NO_KNOWN=1` switches the
+  shapes off (it used to lift the gates).
