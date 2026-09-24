@@ -58,12 +58,13 @@ idempotence); the BOM policies of UTF-16/32 as documented; the HTML and IANA nam
   grouping and the x10 exponent notation undone; catalog messages resolved through the parent chain, `Key`,
   `Languages`, `Matcher`; `plural.Selectf` against `Cardinal.MatchPlural` in fifteen languages.
 
-## Known bugs (43, see bugs.toml)
+## Known bugs (45, see bugs.toml)
 
-Normalization: the forms insert a CGJ into runs of more than 30 non-starters, undocumented (1), and `Iter`
-places it differently from `String` (2). Encodings: the HZ-GB2312 encoder stays in GB mode after an
+Normalization: the forms insert a CGJ into runs of more than 30 non-starters, undocumented (1), `Iter`
+places it differently from `String` (2), and under NFKC `BoundaryBefore` is true for the compatibility
+Hangul letters that compose to the left (45). Encodings: the HZ-GB2312 encoder stays in GB mode after an
 unsupported rune (3); GB18030 does not round-trip 2,068 private-use runes (4); `ianaindex` names UTF-32 but
-cannot look it up (5). Language tags: sorted variants followed by an extension corrupt the tag (6); `-t-`
+cannot look it up (5); the ISO-2022-JP encoder passes ESC through and its decoder reads it as an escape (44). Language tags: sorted variants followed by an extension corrupt the tag (6); `-t-`
 fields after a `tlang` are rejected (7); `SetTypeForKey` is case-sensitive (16); `-u` attributes sort by
 three bytes (17); `ParseBase("heb")` is the deprecated `iw` (18); `Match` overwrites an explicit `-u-rg-`
 (19); `EncodeM49`'s error loses the code (21); `display` has no name for `az-Arab` (22); `Script`/`Region`
@@ -85,7 +86,8 @@ negative int is a bad verb (40), its fmt copy is stale (`%#g` of 0.5, `%#b`, `%O
 a later directive with a precision (43); `plural.Selectf` parses `=x` as 16-bit (42). Bugs 6-23 came from a
 source review with probe programs (`work/x-text-audit-c.md` in the zoo's notes); the language, collation,
 search, matcher and currency properties reach 6, 8-11, 14, 16-20 and 24, the casing, width, bidi and PRECIS
-properties 25-29 and 31-35, the number, message and plural properties 36-43, the rest are carried by pins.
+properties 25-29 and 31-35, the number, message and plural properties 36-43, the encoding and normalization properties 44-45 (found
+when the generators were rewritten in combinator style, 2026-09-24), the rest are carried by pins.
 
 ## Conventions followed, not recorded
 
