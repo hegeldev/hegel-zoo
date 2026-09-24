@@ -55,11 +55,11 @@ commits past the v3.0.1 tag. Pinned at bc59245 (v3.0.1+), MIT, no AI policy.
 - `TestHegelChainWrapsInOrder` — `NewChain(m1..mn).Then(job)` runs m1 outermost; `Recover`
   swallows a panic and logs it once.
 
-All general properties pass at 1000 cases × 3 (under a second). Five pinned expected
+All general properties pass at 1000 cases × 3 (under a second). Six pinned expected
 failures. The run command is `go test -run TestHegel` because the upstream tests sleep for
 about 40 seconds.
 
-## Bugs (5)
+## Bugs (6)
 
 | id | title | severity |
 |----|-------|----------|
@@ -68,12 +68,16 @@ about 40 seconds.
 | cron/3 | Anything after `*` or `?` in a range is ignored: `*-5` parses as `*` and `?-5/2` as `*/2` | low |
 | cron/4 | A field made only of commas (`,`, `,,`) parses to an empty set with a nil error, and the schedule never fires | low |
 | cron/5 | The zone prefix must be followed by a space: `TZ=UTC<tab>0 0 * * *` fails with "provided bad location" although every other separator may be any blank | low |
+| cron/6 | Next loses or misplaces runs across a DST shift that is not a whole hour (Australia/Lord_Howe, Pacific/Chatham): a daily noon job in Lord Howe on the fall-back day is skipped to the next day, and `0 50 3 * * *` in Chatham runs at 02:50 | medium |
 
 cron/1, /3 and /4 were visible from reading `parser.go` (the unchecked `strings.Index`, the
 star branch that never reads `lowAndHigh[1]`, `strings.FieldsFunc` dropping empty items) and
 confirmed by one probe; cron/2 from reading the day loop's hour "correction" and confirmed in
 Asia/Beirut, America/Havana and America/Santiago with the model; cron/5 came out of the parser
-property (a tab after the prefix).
+property (a tab after the prefix); cron/6 came out of the Next property once the rewritten
+generators drew Australia/Lord_Howe and Pacific/Chatham as schedule zones (the hour and minute
+loops assume every wall-clock hour begins on a whole-hour step); the property skips the cases
+whose walk crosses such a shift (6 in 20000).
 
 ## Not bugs (documented, asserted upstream, or lenient by design)
 
