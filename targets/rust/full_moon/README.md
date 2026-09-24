@@ -5,7 +5,7 @@
 ## What is tested
 
 **`src/tokenizer/structs.rs`**
-- `lexer_never_panics_on_arbitrary_text`: The lexer must handle any input text without panicking, whatever the LuaVersion — bad input is reported through LexerResult, never a crash. Backticks are stripped from the input: they DO panic the lexer — see the canonical KNOWN FAILURE test `lexing_backtick_returns_error_for_lua51`.
+- `lexer_never_panics_on_arbitrary_text`: The lexer must handle any input text without panicking, whatever the LuaVersion — bad input is reported through LexerResult, never a crash. Backticks are excluded from the drawn text (`exclude_characters`): they DO panic the lexer — see the canonical KNOWN FAILURE test `lexing_backtick_returns_error_for_lua51`.
 - `lexer_tokens_reprint_to_source`: Losslessness at the token level: when the lexer tokenizes a string cleanly, reprinting every token in order must reproduce the input byte-for-byte.
 - `lexer_token_positions_tile_the_source`: Token positions from a clean lex must tile the source exactly: the first token starts at byte 0, every token starts where the previous one ended, each token's byte range slices the source to that token's own text, and the trailing Eof ends at source.len().
 - `symbol_with_whitespace_roundtrips`: TokenReference::symbol_specific_lua_version documents that it accepts a symbol surrounded by whitespace, storing the whitespace as trivia — so the constructed TokenReference must display as the exact input.
@@ -33,3 +33,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/full_moon.patch`).
 - 2026-09-11: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 47d4bf94104c → 60f02d5dc223 (2026-08-25, "Shrink AST nodes to fix recursive-parse stack overflows (#346) (#355)"; 3.0.0); 1 bug(s) still reproduce; 1 ignored reproducer(s) not run. 59 tests pass. full_moon/2's stack-overflow reproducer (ignored, run by hand) still aborts at 3.0.0 despite upstream's #346/#355.
+- 2026-09-24: generators rewritten in combinator style (a Lua syntax tree drawn with `recursive()` and rendered by a pure writer, trivia as a recycled tape); the arbitrary-text round-trip property now draws a chunk plus edits, since raw text almost never parsed.
