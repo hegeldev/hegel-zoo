@@ -49,7 +49,7 @@ Under `ZOO_COLLECT=1` the counts show which bug shapes and oracle limits the gen
 how many mismatches had no known shape; the recorded bugs are skipped by shape (`Known` in the test
 file) so the properties stay strict on everything else, and each has a pin.
 
-## What was found (9 bugs, `bugs.toml`)
+## What was found (12 bugs, `bugs.toml`)
 
 | id | severity | title |
 |---|---|---|
@@ -62,11 +62,15 @@ file) so the properties stay strict on everything else, and each has a pin.
 | minimatch/7 | medium | a comma-less brace pair stops brace expansion: `{ac}{1..3}` and `{{1..3}}` stay unexpanded (in `brace-expansion` 5.0.12) |
 | minimatch/8 | medium | a star after a leading extglob that can match nothing matches dotfiles: `*(b)*`, `?(b)*`, `@(b|)*` match `.a` |
 | minimatch/9 | low | a trailing slash satisfies a final `?(…)`/`*(…)` part: `a/b/` matches `a/b/?(x)` and `**/?(x)` though not `a/b/*` |
+| minimatch/10 | medium | a dotfile after a second `**` is never matched: `**/a/**/.b` rejects `a/.b`, which `a/**/.b`, `makeRe()` and bash accept |
+| minimatch/11 | low | `makeRe()` of a negated bracket expression matches a slash: `a[!x]b` compiles to `/^a[^x]b$/` and accepts `a/b`, which `match()` rejects |
+| minimatch/12 | medium | a pattern holding a brace pair loses one level of escaping: `{}a\\\\b` matches `{}ab`, not `{}a\\b`; `escape()` with `magicalBraces` breaks on `{\\}` |
 
-Bugs 4–6 are all disagreements between `makeRe()` (the README's "single regular expression
+Bugs 4–6 and 11 are all disagreements between `makeRe()` (the README's "single regular expression
 expressing the entire pattern") and `match()`; 3 is in the fast-path test of `parse()`; 8 is in the
-AST's dot guard (the same shape as picomatch/3); 7 is in the dependency `brace-expansion`, reached
-through `minimatch.braceExpand` and the `Minimatch.set`.
+AST's dot guard (the same shape as picomatch/3); 7 and 12 are in the dependency `brace-expansion`, reached
+through `minimatch.braceExpand` and the `Minimatch.set` (12 through its unescape of the expanded
+pieces); 10 is in the globstar body matcher of `matchOne`.
 
 ## Oracle limits and documented behaviour (not recorded)
 
@@ -82,5 +86,13 @@ through `minimatch.braceExpand` and the `Minimatch.set`.
 - `escape()` does not escape braces unless `magicalBraces` is set (documented in `escape.ts`); the
   strict round trip is checked with `magicalBraces: true` and the default mode only for strings
   without braces.
+- bash reads an empty brace alternative as an empty path component (`a/{b,}/c` lists nothing for
+  `a/c`) where minimatch collapses `a//c`; and bash 5.2 refuses the empty alternative of an `@(…)`
+  or `+(…)` that follows a `*` (or a `*(…)`/`?(…)`) when only optional groups follow to the end of
+  the segment (`*@(|b)` lists `ab` but not `a`; likewise an alternative that is only stars or
+  optional groups, `a*@(*)` lists `aa` but not `a`), where minimatch reads the group as optional; both
+  are counted, not compared.
+- At the default `optimizationLevel` 1 a `..` after a plain portion is removed from the pattern
+  (README), so `escape('a/..')` does not match `a/..`; the escape round trip counts these.
 - POSIX classes match the full Unicode range in minimatch (`[[:alpha:]]` matches `é`, documented);
   the generator's solutions stay ASCII.
