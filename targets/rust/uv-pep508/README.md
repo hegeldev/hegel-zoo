@@ -53,11 +53,11 @@ text for the cases where `packaging` 26 knowingly deviates (below).
   a panic (pep508_rs/7).
 
 The general generators stay away from the pinned shapes: no ordering operators on string keys
-(bug 1 and `packaging`'s own deviation), `===` only with a version operand (bug 3), re-parsed trees compared by equivalence (bug 6), not at all for `false` trees (bug 2), environments are final releases (bug 4), `python_version !=
+(bug 1 and `packaging`'s own deviation), `===` only with a version operand (bug 3), re-parsed trees compared by equivalence (bug 6), not at all for `false` trees (bug 2) or for a rendering that writes a four-part `!=` star (bug 7), environments are final releases (bug 4), `python_version !=
 'X.Y.Z.*'` only with `Z = 0` (bug 5), and marker literals carry no pre-, post- or dev-release
 segment (the crate's documented deviation, below).
 
-## Bugs (6, found 2026-09-14; four inherited from `pep508_rs`, two new)
+## Bugs (7: six found 2026-09-14, four of them inherited from `pep508_rs`; one found 2026-09-24)
 
 - **uv-pep508/1** (medium) — string-keyed markers compare lexicographically even when both sides
   are valid versions: `platform_release < '6'` is true for release `22.6.0`; PEP 508 says PEP 440
@@ -78,6 +78,12 @@ segment (the crate's documented deviation, below).
   or B)` with `A`, `B` on one string key leaves adjacent equal-child edges unmerged (five `os_name`
   ranges where the re-parse of its own `Display` has three), so two equivalent trees are `!=` and
   hash differently. `pep508_rs` has it too (pep508_rs/9).
+- **uv-pep508/7** (medium, new) — `Display` narrows a `!=` star range whose lower bound keeps a
+  trailing zero: in `(python_full_version != '3.6.*' and extra == 'a') or python_full_version ==
+  '3.6.0.*'` the edges `< 3.6.0` and `>= 3.7` to the `extra` child are written `python_full_version
+  != '3.6.0.*'` (`star_range_specifier` matches on the trimmed bound but writes the untrimmed one),
+  so the rendering — and a lock file — is true for Python 3.6.5 with the extra where the tree is
+  false. Not in `pep508_rs`, whose match requires a two-component bound.
 
 ## Not bugs
 
@@ -158,3 +164,4 @@ segment (the crate's documented deviation, below).
 - 2026-09-20: base bumped 7b090fba99bc → 7f9bce21fbcb (2026-09-20, "Fix BSD and Haiku platform tag casing (#21853)"; 0.0.84); 6 bug(s) still reproduce. 128 tests pass.
 - 2026-09-20: base bumped 7f9bce21fbcb → 25ea3bcfbe6e (2026-09-20, "Materialize fake-uv without checkout symlinks (#21855)"; 0.0.84); 6 bug(s) still reproduce. 128 tests pass.
 - 2026-09-20: base bumped 25ea3bcfbe6e → 09f725dfd2d7 (2026-09-20, "Restore project files when remove and version fail (#21856)"; 0.0.84); 6 bug(s) still reproduce. 128 tests pass.
+- 2026-09-24: generators rewritten in combinator style (a recursive marker tree and a requirement record rendered by pure functions, one whitespace tape, syntax edits drawn as a list); the rewrite's 1000-case run found uv-pep508/7. 128 tests pass, 7 expected failures.
