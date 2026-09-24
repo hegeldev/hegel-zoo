@@ -1,0 +1,1257 @@
+diff --git a/go.mod b/go.mod
+index b6914dc..1d36e44 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,5 +1,13 @@
+ module github.com/mattn/go-runewidth
+ 
+-go 1.23
++go 1.26.0
+ 
+-require github.com/clipperhouse/uax29/v2 v2.2.0
++require (
++	github.com/clipperhouse/uax29/v2 v2.2.0
++	hegel.dev/go/hegel v0.6.33
++)
++
++require (
++	github.com/ebitengine/purego v0.11.0-alpha.6.0.20260707033313-5f49e7c49322 // indirect
++	golang.org/x/sys v0.44.0 // indirect
++)
+diff --git a/hegel_test.go b/hegel_test.go
+new file mode 100644
+index 0000000..2dbcfaa
+--- /dev/null
++++ b/hegel_test.go
+@@ -0,0 +1,1231 @@
++// Hegel properties for github.com/mattn/go-runewidth (see README.md in the zoo target).
++//
++// Oracles: Python 3's unicodedata module (Unicode 15.0.0 in Python 3.12) for East_Asian_Width,
++// the general category and the character name, which is what the tables are generated from; Go's
++// unicode package only to note versions. The cluster model of StringWidth, Truncate and Wrap uses
++// the uax29 grapheme segmenter the package itself uses, with the documented rule that a cluster is
++// the sum of its runes' widths capped at two cells. This is an internal test so that the
++// generators can sample the package's own tables; the properties exercise the exported API only.
++//
++// GO_RUNEWIDTH_COLLECT=1 turns failures into a summary printed at the end (shortest first).
++// HEGEL_NO_KNOWN=1 keeps the shapes of the recorded bugs out of the properties (see noKnown).
++package runewidth
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"reflect"
++	"slices"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"unicode/utf8"
++
++	"github.com/clipperhouse/uax29/v2/graphemes"
++	"hegel.dev/go/hegel"
++)
++
++// ---- harness -------------------------------------------------------------------------------
++
++func hegelOpts() []hegel.Option {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if n, err := strconv.Atoi(s); err == nil && n > 0 {
++			return []hegel.Option{hegel.WithTestCases(n)}
++		}
++	}
++	return nil
++}
++
++var (
++	collectMode = os.Getenv("GO_RUNEWIDTH_COLLECT") != ""
++	collectMu   sync.Mutex
++	collectMsgs []string
++)
++
++// noKnown is HEGEL_NO_KNOWN=1: the properties then skip, or do not draw, the shapes of the
++// recorded bugs go-runewidth/1 to /5, for a run that looks past them. By default the shapes
++// are drawn and the properties that found the bugs fail on them (the expected failures).
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") != ""
++
++type collected struct{}
++
++// fail reports a property failure; in collect mode it records the message and ends the case.
++func fail(ht *hegel.T, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if collectMode {
++		collectMu.Lock()
++		collectMsgs = append(collectMsgs, msg)
++		collectMu.Unlock()
++		panic(collected{})
++	}
++	ht.Fatalf("%s", msg)
++}
++
++func property(t *testing.T, fn func(ht *hegel.T)) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			if _, ok := r.(collected); ok {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, hegelOpts()...)
++	if collectMode {
++		collectMu.Lock()
++		msgs := append([]string(nil), collectMsgs...)
++		collectMsgs = nil
++		collectMu.Unlock()
++		sort.Slice(msgs, func(i, j int) bool { return len(msgs[i]) < len(msgs[j]) })
++		t.Logf("COLLECT %s: %d failures", t.Name(), len(msgs))
++		for i, m := range msgs {
++			if i == 40 {
++				t.Logf("  ... %d more", len(msgs)-40)
++				break
++			}
++			t.Logf("  %s", m)
++		}
++	}
++}
++
++func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++
++func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++
++func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
++
++// guard turns a panic in a pin into a failure message instead of killing the test binary.
++func guard(t *testing.T) {
++	if r := recover(); r != nil {
++		t.Fatalf("panic: %v", r)
++	}
++}
++
++// ---- the oracle: Python's unicodedata ------------------------------------------------------
++
++const pyScript = `
++import sys, json, unicodedata as ud
++for line in sys.stdin:
++    req = json.loads(line)
++    ch = chr(req["r"])
++    print(json.dumps({"cat": ud.category(ch), "eaw": ud.east_asian_width(ch),
++                      "name": ud.name(ch, ""), "version": ud.unidata_version}))
++    sys.stdout.flush()
++`
++
++type pyInfo struct {
++	Cat     string `json:"cat"`
++	Eaw     string `json:"eaw"`
++	Name    string `json:"name"`
++	Version string `json:"version"`
++}
++
++type pyChild struct {
++	mu  sync.Mutex
++	cmd *exec.Cmd
++	in  *bufio.Writer
++	out *bufio.Scanner
++}
++
++var (
++	pyOnce  sync.Once
++	pyProc  *pyChild
++	pyError error
++)
++
++func oracle(t *testing.T) *pyChild {
++	pyOnce.Do(func() {
++		cmd := exec.Command("python3", "-c", pyScript)
++		cmd.Stderr = os.Stderr
++		stdin, err := cmd.StdinPipe()
++		if err != nil {
++			pyError = err
++			return
++		}
++		stdout, err := cmd.StdoutPipe()
++		if err != nil {
++			pyError = err
++			return
++		}
++		if err := cmd.Start(); err != nil {
++			pyError = err
++			return
++		}
++		sc := bufio.NewScanner(stdout)
++		sc.Buffer(make([]byte, 1<<16), 1<<22)
++		pyProc = &pyChild{cmd: cmd, in: bufio.NewWriter(stdin), out: sc}
++	})
++	if pyError != nil {
++		t.Fatalf("cannot start the Python oracle: %v", pyError)
++	}
++	return pyProc
++}
++
++func (p *pyChild) call(req any, res any) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	b, err := json.Marshal(req)
++	if err != nil {
++		return err
++	}
++	if _, err := p.in.Write(append(b, '\n')); err != nil {
++		return err
++	}
++	if err := p.in.Flush(); err != nil {
++		return err
++	}
++	if !p.out.Scan() {
++		return fmt.Errorf("oracle died: %v", p.out.Err())
++	}
++	return json.Unmarshal(p.out.Bytes(), res)
++}
++
++func (p *pyChild) info(t *testing.T, r rune) pyInfo {
++	var res pyInfo
++	if err := p.call(map[string]any{"r": int(r)}, &res); err != nil {
++		t.Fatalf("oracle: %v", err)
++	}
++	return res
++}
++
++// ---- the width model -----------------------------------------------------------------------
++
++// zeroWidth is the package's hand-picked list of zero-width code points beyond the combining
++// marks: C0/C1 controls, soft hyphen, the Syriac abbreviation mark, Mongolian variation
++// selectors and vowel separator, the zero-width spaces and bidi controls, the deprecated format
++// characters, the surrogates, the byte-order mark, the interlinear annotation controls and the
++// noncharacters U+FFFE/U+FFFF.
++var zeroWidth = table{
++	{0x0000, 0x001F}, {0x007F, 0x009F}, {0x00AD, 0x00AD},
++	{0x070F, 0x070F}, {0x180B, 0x180E}, {0x200B, 0x200F},
++	{0x2028, 0x202E}, {0x206A, 0x206F}, {0xD800, 0xDFFF},
++	{0xFEFF, 0xFEFF}, {0xFFF9, 0xFFFB}, {0xFFFE, 0xFFFF},
++}
++
++// skew lists the code points whose properties changed between Unicode 15.0 (Python 3.12's data)
++// and 17.0 (the tables'): the Yijing trigrams, monograms/digrams, hexagrams, Tai Xuan Jing and
++// counting rod symbols became Wide in 15.1, and U+1171E AHOM CONSONANT SIGN MEDIAL RA moved from
++// Mn to Mc in 16.0. The property skips them; a probe over every code point found no other
++// difference between the tables and the 17.0 data files read by the package's own rules.
++var skew = table{
++	{0x2630, 0x2637}, {0x268A, 0x268F}, {0x4DC0, 0x4DFF},
++	{0x1171E, 0x1171E}, {0x1D300, 0x1D356}, {0x1D360, 0x1D376},
++}
++
++func (in pyInfo) variationSelector() bool { return strings.Contains(in.Name, "VARIATION SELECTOR") }
++
++// combining is the generator's rule: nonspacing and enclosing marks, anything named COMBINING,
++// and the variation selectors.
++func (in pyInfo) combining() bool {
++	return in.Cat == "Mn" || in.Cat == "Me" || strings.Contains(in.Name, "COMBINING") || in.variationSelector()
++}
++
++// modelWidth is RuneWidth as documented: zero for the zero-width list and combining marks, two
++// for East_Asian_Width Wide and Fullwidth, two for Ambiguous in an East Asian locale, one
++// otherwise.
++func modelWidth(r rune, in pyInfo, eastAsian bool) int {
++	if inTable(r, zeroWidth) || in.combining() {
++		return 0
++	}
++	switch in.Eaw {
++	case "W", "F":
++		return 2
++	case "A":
++		if eastAsian {
++			return 2
++		}
++	}
++	return 1
++}
++
++// ---- conditions ----------------------------------------------------------------------------
++
++// The four flag combinations, each once plain and once with a lookup table.
++var (
++	condsOnce  sync.Once
++	plainConds [4]*Condition
++	lutConds   [4]*Condition
++)
++
++func condIndex(eastAsian, strict bool) int {
++	i := 0
++	if eastAsian {
++		i |= 2
++	}
++	if strict {
++		i |= 1
++	}
++	return i
++}
++
++func conds() {
++	condsOnce.Do(func() {
++		for i := 0; i < 4; i++ {
++			ea, strict := i&2 != 0, i&1 != 0
++			plainConds[i] = &Condition{EastAsianWidth: ea, StrictEmojiNeutral: strict}
++			lutConds[i] = &Condition{EastAsianWidth: ea, StrictEmojiNeutral: strict}
++			lutConds[i].CreateLUT()
++		}
++	})
++}
++
++func condName(c *Condition, lut bool) string {
++	s := fmt.Sprintf("{EastAsianWidth:%v StrictEmojiNeutral:%v}", c.EastAsianWidth, c.StrictEmojiNeutral)
++	if lut {
++		s += "+LUT"
++	}
++	return s
++}
++
++func pickCond(tc hegel.TestCase) (*Condition, string) {
++	conds()
++	i := n(tc, 0, 3)
++	if chance(tc, 40) {
++		return lutConds[i], condName(lutConds[i], true)
++	}
++	return plainConds[i], condName(plainConds[i], false)
++}
++
++// ---- generators ----------------------------------------------------------------------------
++
++var sampleTables = []table{combining, doublewidth, ambiguous, emoji, joiner, nonprint, private, neutral, narrow}
++
++func runeIn(tc hegel.TestCase, t table) rune {
++	iv := pick(tc, t)
++	return rune(n(tc, int(iv.first), int(iv.last)))
++}
++
++var specialRunes = []rune{
++	-1, 0x110000, 0x7FFFFFFF, -0x80000000, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, // invalid or surrogate
++	0xFFFD, 0xAD, 0x200B, 0x200D, 0xFEFF, 0x2028, 0x1F1E6, 0x1F1FF, 0x3000, 0xFF61, 0x20A9,
++	0x0300, 0x036F, 0x1100, 0x115F, 0x1160, 0x11A7, 0x11A8, 0x11FF, 0xAC00, 0xD7A3, 0x3040,
++	0x2FF, 0x0301, 0xFE0F, 0xFE00, 0xE0100, 0xE01EF, 0x1F3FB, 0x1F3FF, 0xE0001, 0xE007F,
++	0x2630, 0x4DC0, 0x1171E, 0x1D300, 0x0600, 0x110BD, 0x094D, 0x0915, 0x00A0, 0x00E9,
++}
++
++// genRune draws a code point: from the tables, at their edges, from the special list, or anywhere.
++func genRune(tc hegel.TestCase) rune {
++	switch n(tc, 1, 10) {
++	case 1:
++		return rune(n(tc, 0, 0x2FF))
++	case 2:
++		return rune(n(tc, 0x300, 0xFFFF))
++	case 3:
++		return rune(n(tc, 0x10000, 0x10FFFF))
++	case 4, 5, 6:
++		return runeIn(tc, pick(tc, sampleTables))
++	case 7:
++		iv := pick(tc, pick(tc, sampleTables))
++		return pick(tc, []rune{iv.first - 1, iv.first, iv.last, iv.last + 1})
++	case 8:
++		return pick(tc, specialRunes)
++	default:
++		return rune(n(tc, 0, 0x10FFFF))
++	}
++}
++
++// Pieces that form multi-rune grapheme clusters, by GraphemeBreakProperty class.
++var (
++	prepends   = []rune{0x0600, 0x0601, 0x0605, 0x06DD, 0x070F, 0x0890, 0x08E2, 0x0D4E, 0x110BD, 0x110CD, 0x111C2, 0x11A3A, 0x11D46, 0x11F02}
++	viramas    = []rune{0x094D, 0x09CD, 0x0A4D, 0x0ACD, 0x0B4D, 0x0C4D, 0x0D4D}
++	consonants = []rune{0x0915, 0x0916, 0x0928, 0x0930, 0x0995, 0x0A15, 0x0A95, 0x0B15, 0x0C15, 0x0D15}
++	invalids   = []string{"\xff", "\x80", "\xc0", "\xc0\x80", "\xe3\x81", "\xf0\x9f", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xef\xbf\xbd"}
++)
++
++func genPiece(tc hegel.TestCase) string {
++	switch n(tc, 1, 24) {
++	case 1, 2, 3:
++		return string(rune(n(tc, 0x20, 0x7E)))
++	case 4:
++		return pick(tc, []string{"\n", "\r", "\r\n", "\t", "\x00", "\x1b", "\x7f", " "})
++	case 5, 6:
++		return string(runeIn(tc, doublewidth))
++	case 7:
++		return string(runeIn(tc, ambiguous))
++	case 8, 9:
++		return string(runeIn(tc, combining))
++	case 10:
++		return string(runeIn(tc, emoji))
++	case 11, 12:
++		return string(runeIn(tc, joiner))
++	case 13:
++		return string(runeIn(tc, nonprint))
++	case 14:
++		return string(runeIn(tc, pick(tc, []table{private, neutral, narrow})))
++	case 15:
++		return pick(tc, []string{"‍", "️", "︎", "‌", "�"})
++	case 16:
++		return string(rune(n(tc, 0x1F3FB, 0x1F3FF))) // skin tone modifiers
++	case 17:
++		return string(rune(n(tc, 0x1F1E6, 0x1F1FF))) // regional indicators
++	case 18:
++		return string(pick(tc, []rune{rune(n(tc, 0x1100, 0x115F)), rune(n(tc, 0x1160, 0x11A7)), rune(n(tc, 0x11A8, 0x11FF)), rune(n(tc, 0xAC00, 0xD7A3))}))
++	case 19:
++		return string(pick(tc, prepends))
++	case 20:
++		return string(pick(tc, consonants)) + string(pick(tc, viramas)) + string(pick(tc, consonants))
++	case 21:
++		return string(rune(n(tc, 0xE0020, 0xE007F))) // tag characters
++	case 22:
++		return pick(tc, invalids)
++	case 23:
++		return pick(tc, []string{"👨‍👩‍👧‍👦", "👩🏽", "🇯🇵", "👍🏻", "🏳️‍🌈", "á", "क्क", "각", "ﷺ", "あ", "ｱ", "①", "■", "☆"})
++	default:
++		return string(rune(n(tc, 0, 0x10FFFF)))
++	}
++}
++
++func genText(tc hegel.TestCase) string {
++	k := n(tc, 0, 12)
++	var b strings.Builder
++	for i := 0; i < k; i++ {
++		b.WriteString(genPiece(tc))
++	}
++	return b.String()
++}
++
++// genWidth draws a cell budget, mostly small and sometimes non-positive.
++func genWidth(tc hegel.TestCase) int {
++	switch n(tc, 1, 10) {
++	case 1:
++		return n(tc, -2, 0)
++	case 2:
++		return n(tc, 9, 40)
++	default:
++		return n(tc, 1, 8)
++	}
++}
++
++// ---- the cluster model ---------------------------------------------------------------------
++
++// incompleteTail reports whether s ends inside a multi-byte UTF-8 sequence as the segmenter
++// reads it: a lead byte announcing two, three or four bytes (0xC2-0xDF, 0xE0-0xEF, 0xF0-0xF7)
++// with fewer bytes left. uax29 then makes the rest of the text part of the cluster it is in,
++// which is go-runewidth/5's shape; the walk advances as it does, over the lead and the
++// continuation bytes that follow it.
++func incompleteTail(s string) bool {
++	for i := 0; i < len(s); {
++		need := 1
++		switch b := s[i]; {
++		case b >= 0xF0 && b < 0xF8:
++			need = 4
++		case b >= 0xE0:
++			need = 3
++		case b >= 0xC2 && b < 0xE0:
++			need = 2
++		}
++		if len(s)-i < need {
++			return true
++		}
++		w := 1
++		for w < need && s[i+w]&0xC0 == 0x80 {
++			w++
++		}
++		i += w
++	}
++	return false
++}
++
++type cluster struct {
++	start, end, width int
++	text              string
++}
++
++// modelClusters segments s into grapheme clusters, each with the documented width: the sum of
++// its runes' widths capped at two cells.
++func modelClusters(c *Condition, s string) []cluster {
++	var out []cluster
++	g := graphemes.FromString(s)
++	for g.Next() {
++		w := 0
++		for _, r := range g.Value() {
++			w += c.RuneWidth(r)
++		}
++		if w > 2 {
++			w = 2
++		}
++		out = append(out, cluster{g.Start(), g.End(), w, g.Value()})
++	}
++	return out
++}
++
++func lastCluster(c *Condition, s string) string {
++	cl := modelClusters(c, s)
++	return cl[len(cl)-1].text
++}
++
++func modelWidthOf(c *Condition, s string) int {
++	w := 0
++	for _, cl := range modelClusters(c, s) {
++		w += cl.width
++	}
++	return w
++}
++
++// modelTruncate keeps the longest prefix of whole clusters that leaves room for tail.
++func modelTruncate(c *Condition, s string, w int, tail string) string {
++	if c.StringWidth(s) <= w {
++		return s
++	}
++	budget := w - c.StringWidth(tail)
++	pos, width := 0, 0
++	for _, cl := range modelClusters(c, s) {
++		if width+cl.width > budget {
++			break
++		}
++		width += cl.width
++		pos = cl.end
++	}
++	return s[:pos] + tail
++}
++
++// modelTruncateLeft removes w cells from the front; a cluster straddling the cut is dropped and
++// the cells of it that lay beyond the cut come back as spaces.
++func modelTruncateLeft(c *Condition, s string, w int, prefix string) string {
++	if c.StringWidth(s) <= w {
++		return prefix
++	}
++	width := 0
++	for _, cl := range modelClusters(c, s) {
++		if width+cl.width > w {
++			if width < w {
++				return prefix + strings.Repeat(" ", width+cl.width-w) + s[cl.end:]
++			}
++			return prefix + s[cl.start:]
++		}
++		width += cl.width
++	}
++	return prefix
++}
++
++// modelTruncatePrefix keeps the longest suffix of whole clusters that fits beside prefix.
++func modelTruncatePrefix(c *Condition, s string, w int, prefix string) string {
++	if c.StringWidth(prefix) >= w {
++		return prefix
++	}
++	sw := c.StringWidth(s)
++	if sw <= w {
++		return s
++	}
++	budget := w - c.StringWidth(prefix)
++	width := 0
++	for _, cl := range modelClusters(c, s) {
++		if sw-(width+cl.width) <= budget {
++			return prefix + s[cl.end:]
++		}
++		width += cl.width
++	}
++	return prefix + s
++}
++
++// modelWrap breaks before any cluster that would take the line past w cells; a cluster ending in
++// a newline (LF or CRLF) starts a fresh line.
++func modelWrap(c *Condition, s string, w int) string {
++	width := 0
++	var out strings.Builder
++	for _, cl := range modelClusters(c, s) {
++		if strings.HasSuffix(cl.text, "\n") {
++			out.WriteString(cl.text)
++			width = 0
++			continue
++		}
++		if width+cl.width > w {
++			out.WriteByte('\n')
++			width = 0
++		}
++		out.WriteString(cl.text)
++		width += cl.width
++	}
++	return out.String()
++}
++
++// ---- properties ----------------------------------------------------------------------------
++
++// TestHegelRuneWidthAgreesWithUnicode: RuneWidth under every flag combination, with and without
++// a lookup table, and the three classification functions agree with the Unicode data as the
++// package's generator reads it (Python's unicodedata; the six 15.1/16.0 changes are skipped).
++func TestHegelRuneWidthAgreesWithUnicode(t *testing.T) {
++	py := oracle(t)
++	conds()
++	property(t, func(ht *hegel.T) {
++		r := genRune(ht)
++		if r < 0 || r > utf8.MaxRune {
++			for i := 0; i < 4; i++ {
++				if w := plainConds[i].RuneWidth(r); w != 0 {
++					fail(ht, "RuneWidth(%#x) %s = %d, want 0 for an invalid rune", r, condName(plainConds[i], false), w)
++				}
++				if w := lutConds[i].RuneWidth(r); w != 0 {
++					fail(ht, "RuneWidth(%#x) %s = %d, want 0 for an invalid rune", r, condName(lutConds[i], true), w)
++				}
++			}
++			if w := RuneWidth(r); w != 0 {
++				fail(ht, "RuneWidth(%#x) = %d, want 0 for an invalid rune", r, w)
++			}
++			return
++		}
++		in := py.info(t, r)
++		if in.Cat == "Cn" {
++			note(ht, "%#U unassigned in Unicode %s", r, in.Version)
++			return
++		}
++		if inTable(r, skew) {
++			note(ht, "%#U changed between Unicode %s and 17.0", r, in.Version)
++			return
++		}
++		want := [2]int{modelWidth(r, in, false), modelWidth(r, in, true)}
++		for i := 0; i < 4; i++ {
++			ea, strict := i&2 != 0, i&1 != 0
++			exp := want[0]
++			if ea {
++				exp = want[1]
++			}
++			got := plainConds[i].RuneWidth(r)
++			switch {
++			case strict || !ea:
++				// StrictEmojiNeutral only matters in an East Asian locale.
++				if got != exp {
++					fail(ht, "RuneWidth(%#U) %s = %d, want %d (%s %s %q)", r, condName(plainConds[i], false), got, exp, in.Cat, in.Eaw, in.Name)
++				}
++			default:
++				// Broken-font mode may widen a neutral emoji to two cells, nothing else.
++				if got != exp && !(exp == 1 && got == 2) {
++					fail(ht, "RuneWidth(%#U) %s = %d, want %d or 2 (%s %s %q)", r, condName(plainConds[i], false), got, exp, in.Cat, in.Eaw, in.Name)
++				}
++			}
++			if lw := lutConds[i].RuneWidth(r); lw != got {
++				fail(ht, "RuneWidth(%#U) %s = %d, without the LUT %d", r, condName(lutConds[i], true), lw, got)
++			}
++		}
++		if got, exp := RuneWidth(r), plainConds[condIndex(EastAsianWidth, StrictEmojiNeutral)].RuneWidth(r); got != exp {
++			fail(ht, "RuneWidth(%#U) = %d, DefaultCondition's flags give %d", r, got, exp)
++		}
++		if got, exp := IsCombiningWidth(r), in.combining(); got != exp {
++			fail(ht, "IsCombiningWidth(%#U) = %v, want %v (%s %q)", r, got, exp, in.Cat, in.Name)
++		}
++		if got, exp := IsAmbiguousWidth(r), (in.Eaw == "A" && !in.variationSelector()) || in.Cat == "Co"; got != exp {
++			fail(ht, "IsAmbiguousWidth(%#U) = %v, want %v (%s %s %q)", r, got, exp, in.Cat, in.Eaw, in.Name)
++		}
++		if got, exp := IsNeutralWidth(r), in.Eaw == "N" && !in.variationSelector(); got != exp {
++			fail(ht, "IsNeutralWidth(%#U) = %v, want %v (%s %s %q)", r, got, exp, in.Cat, in.Eaw, in.Name)
++		}
++	})
++}
++
++// TestHegelStringWidthIsTheClusterSum: StringWidth is the sum of the widths of the grapheme
++// clusters, each capped at two cells, under every flag combination and through every fast path;
++// it never exceeds the sum over any split of the text. A lone byte that is not UTF-8 is
++// measured by a shortcut that ignores the East Asian flag (go-runewidth/3), and a cut that
++// leaves an incomplete sequence at the end of the first half has it attached to the cluster
++// before and capped with it (go-runewidth/5); HEGEL_NO_KNOWN=1 skips the first shape, cuts
++// between runes and leaves a cut of the second shape unmeasured.
++func TestHegelStringWidthIsTheClusterSum(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		s := genText(ht)
++		note(ht, "%s %q", name, s)
++		want := modelWidthOf(c, s)
++		ht.Assume(!(noKnown && len(s) == 1 && s[0] >= 0x80)) // go-runewidth/3
++		if got := c.StringWidth(s); got != want {
++			fail(ht, "StringWidth(%q) %s = %d, cluster model %d", s, name, got, want)
++		}
++		if c == DefaultCondition || (c.EastAsianWidth == DefaultCondition.EastAsianWidth && c.StrictEmojiNeutral == DefaultCondition.StrictEmojiNeutral) {
++			if got := StringWidth(s); got != want {
++				fail(ht, "StringWidth(%q) = %d, cluster model %d", s, got, want)
++			}
++		}
++		if r, size := utf8.DecodeRuneInString(s); size == len(s) && size > 0 && r != utf8.RuneError {
++			if got, exp := c.StringWidth(s), c.RuneWidth(r); got != exp {
++				fail(ht, "StringWidth(%q) %s = %d, RuneWidth %d", s, name, got, exp)
++			}
++		}
++		// Splitting the text never makes it narrower: a cluster spanning the cut may be capped,
++		// its halves are not, and a cut inside a rune leaves bytes that are a replacement glyph
++		// each. Unless the first half then ends in an incomplete sequence, which the segmenter
++		// attaches to the cluster before it and the cap swallows (go-runewidth/5), or a half is
++		// one byte measured by the shortcut (go-runewidth/3); HEGEL_NO_KNOWN=1 cuts between
++		// runes and leaves those two shapes unmeasured.
++		if len(s) > 1 {
++			i := n(ht, 1, len(s)-1)
++			for noKnown && !utf8.RuneStart(s[i]) {
++				i--
++			}
++			known := noKnown && (incompleteTail(s[:i]) || i == 1 && s[0] >= 0x80 || i == len(s)-1 && s[i] >= 0x80)
++			if a, b := c.StringWidth(s[:i]), c.StringWidth(s[i:]); a+b < want && !known {
++				fail(ht, "StringWidth(%q) %s = %d > %d + %d for the halves %q and %q", s, name, want, a, b, s[:i], s[i:])
++			}
++		}
++	})
++}
++
++// TestHegelTruncateFamilyFollowsTheClusterModel: Truncate, TruncateLeft and TruncatePrefix cut
++// on grapheme cluster boundaries exactly as the documented cell arithmetic says, whichever fast
++// path they take, and the result fits when the affix does.
++func TestHegelTruncateFamilyFollowsTheClusterModel(t *testing.T) {
++	affixes := []string{"", "...", "…", "́", "あ", "؀", "\xff", " "}
++	// go-runewidth/3: the lone byte "\xff" is one cell measured on its own and two once appended
++	// to text in an East Asian locale, so the truncation overflows by a cell; HEGEL_NO_KNOWN=1
++	// draws the other affixes there.
++	utf8Affixes := slices.DeleteFunc(slices.Clone(affixes), func(a string) bool { return a == "\xff" })
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		s := genText(ht)
++		w := genWidth(ht)
++		pool := affixes
++		if noKnown && c.EastAsianWidth {
++			pool = utf8Affixes
++		}
++		affix := pick(ht, pool)
++		note(ht, "%s %q w=%d affix=%q", name, s, w, affix)
++		if got, want := c.Truncate(s, w, affix), modelTruncate(c, s, w, affix); got != want {
++			fail(ht, "Truncate(%q, %d, %q) %s = %q, cluster model %q", s, w, affix, name, got, want)
++		} else if aw := c.StringWidth(affix); aw <= w {
++			if sw := c.StringWidth(got); sw > w {
++				fail(ht, "Truncate(%q, %d, %q) %s = %q is %d cells wide", s, w, affix, name, got, sw)
++			}
++		}
++		if got, want := c.TruncateLeft(s, w, affix), modelTruncateLeft(c, s, w, affix); got != want {
++			fail(ht, "TruncateLeft(%q, %d, %q) %s = %q, cluster model %q", s, w, affix, name, got, want)
++		}
++		if got, want := c.TruncatePrefix(s, w, affix), modelTruncatePrefix(c, s, w, affix); got != want {
++			fail(ht, "TruncatePrefix(%q, %d, %q) %s = %q, cluster model %q", s, w, affix, name, got, want)
++		}
++		if c.EastAsianWidth == DefaultCondition.EastAsianWidth && c.StrictEmojiNeutral == DefaultCondition.StrictEmojiNeutral {
++			if a, b := Truncate(s, w, affix), c.Truncate(s, w, affix); a != b {
++				fail(ht, "Truncate(%q, %d, %q) = %q, DefaultCondition's flags give %q", s, w, affix, a, b)
++			}
++			if a, b := TruncateLeft(s, w, affix), c.TruncateLeft(s, w, affix); a != b {
++				fail(ht, "TruncateLeft(%q, %d, %q) = %q, DefaultCondition's flags give %q", s, w, affix, a, b)
++			}
++			if a, b := TruncatePrefix(s, w, affix), c.TruncatePrefix(s, w, affix); a != b {
++				fail(ht, "TruncatePrefix(%q, %d, %q) = %q, DefaultCondition's flags give %q", s, w, affix, a, b)
++			}
++		}
++	})
++}
++
++// TestHegelWrapFollowsTheClusterModel: Wrap only inserts newlines, before the cluster that would
++// overflow the line, never inside a cluster, and gives the same answer whichever fast path
++// handles the text. The ASCII path breaks before the CR of a CRLF at a non-positive width
++// (go-runewidth/1); HEGEL_NO_KNOWN=1 skips that shape.
++func TestHegelWrapFollowsTheClusterModel(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		s := genText(ht)
++		w := genWidth(ht)
++		note(ht, "%s %q w=%d", name, s, w)
++		ht.Assume(!(noKnown && w <= 0 && isASCII(s) && strings.Contains(s, "\r\n"))) // go-runewidth/1
++		got := c.Wrap(s, w)
++		if strings.ReplaceAll(got, "\n", "") != strings.ReplaceAll(s, "\n", "") {
++			fail(ht, "Wrap(%q, %d) %s = %q changes more than newlines", s, w, name, got)
++		}
++		if want := modelWrap(c, s, w); got != want {
++			fail(ht, "Wrap(%q, %d) %s = %q, cluster model %q", s, w, name, got, want)
++		}
++		if w >= 1 {
++			for _, line := range strings.Split(got, "\n") {
++				if lw := c.StringWidth(line); lw > w && len(modelClusters(c, strings.TrimSuffix(line, "\r"))) > 1 {
++					fail(ht, "Wrap(%q, %d) %s has the line %q of %d cells", s, w, name, line, lw)
++				}
++			}
++		}
++		if c.EastAsianWidth == DefaultCondition.EastAsianWidth && c.StrictEmojiNeutral == DefaultCondition.StrictEmojiNeutral {
++			if a := Wrap(s, w); a != got {
++				fail(ht, "Wrap(%q, %d) = %q, DefaultCondition's flags give %q", s, w, a, got)
++			}
++		}
++	})
++}
++
++// TestHegelFillAndConditionsAreConsistent: FillLeft/FillRight pad with exactly the missing cells
++// and the result is w cells wide; NewCondition copies the package flags; CreateLUT reproduces the
++// plain widths and is rebuilt after the flags change.
++func TestHegelFillAndConditionsAreConsistent(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		s := genText(ht)
++		w := genWidth(ht)
++		sw := c.StringWidth(s)
++		pad := strings.Repeat(" ", max(0, w-sw))
++		note(ht, "%s %q w=%d", name, s, w)
++		// The padding reaches the width by the package's own measure. It falls a cell short when
++		// a padding space is absorbed into a capped cluster (go-runewidth/4: a two-cell Extend
++		// rune after it, Prepend runes before it), when the text ends in an incomplete UTF-8
++		// sequence that the segmenter attaches to the cluster before it (go-runewidth/5), and
++		// when the text is a lone byte that is not UTF-8, measured by the one-byte shortcut
++		// (go-runewidth/3). HEGEL_NO_KNOWN=1 skips the one-byte strings and the measure of a
++		// padding beside which one space already changes the model's width by other than one
++		// cell, which is the shape of /4 and /5.
++		ht.Assume(!(noKnown && len(s) == 1 && s[0] >= 0x80)) // go-runewidth/3
++		mw := modelWidthOf(c, s)
++		leftMeasurable := !noKnown || pad == "" || modelWidthOf(c, " "+s) == mw+1
++		rightMeasurable := !noKnown || pad == "" || modelWidthOf(c, s+" ") == mw+1
++		if got := c.FillLeft(s, w); got != pad+s {
++			fail(ht, "FillLeft(%q, %d) %s = %q, want %q", s, w, name, got, pad+s)
++		} else if fw := c.StringWidth(got); fw != max(w, sw) && leftMeasurable {
++			fail(ht, "FillLeft(%q, %d) %s = %q is %d cells wide, want %d", s, w, name, got, fw, max(w, sw))
++		}
++		if got := c.FillRight(s, w); got != s+pad {
++			fail(ht, "FillRight(%q, %d) %s = %q, want %q", s, w, name, got, s+pad)
++		} else if fw := c.StringWidth(got); fw != max(w, sw) && rightMeasurable {
++			fail(ht, "FillRight(%q, %d) %s = %q is %d cells wide, want %d", s, w, name, got, fw, max(w, sw))
++		}
++		if c.EastAsianWidth == DefaultCondition.EastAsianWidth && c.StrictEmojiNeutral == DefaultCondition.StrictEmojiNeutral {
++			if a, b := FillLeft(s, w), c.FillLeft(s, w); a != b {
++				fail(ht, "FillLeft(%q, %d) = %q, DefaultCondition's flags give %q", s, w, a, b)
++			}
++			if a, b := FillRight(s, w), c.FillRight(s, w); a != b {
++				fail(ht, "FillRight(%q, %d) = %q, DefaultCondition's flags give %q", s, w, a, b)
++			}
++		}
++		nc := NewCondition()
++		if nc.EastAsianWidth != EastAsianWidth || nc.StrictEmojiNeutral != StrictEmojiNeutral {
++			fail(ht, "NewCondition() = %+v, package flags %v/%v", nc, EastAsianWidth, StrictEmojiNeutral)
++		}
++		if DefaultCondition.EastAsianWidth != EastAsianWidth || DefaultCondition.StrictEmojiNeutral != StrictEmojiNeutral {
++			fail(ht, "DefaultCondition = %+v, package flags %v/%v", DefaultCondition, EastAsianWidth, StrictEmojiNeutral)
++		}
++		// A lookup table built for one set of flags, then rebuilt after the flags change (a
++		// build costs ~10 ms, so only some cases do this).
++		if !chance(ht, 5) {
++			return
++		}
++		lc := &Condition{EastAsianWidth: chance(ht, 50), StrictEmojiNeutral: chance(ht, 50)}
++		lc.CreateLUT()
++		for round := 0; round < 2; round++ {
++			plain := &Condition{EastAsianWidth: lc.EastAsianWidth, StrictEmojiNeutral: lc.StrictEmojiNeutral}
++			for i := 0; i < 8; i++ {
++				r := genRune(ht)
++				if a, b := lc.RuneWidth(r), plain.RuneWidth(r); a != b {
++					fail(ht, "RuneWidth(%#x) with a LUT %s = %d, plain %d (round %d)", r, condName(lc, true), a, b, round)
++				}
++			}
++			if a, b := lc.StringWidth(s), plain.StringWidth(s); a != b {
++				fail(ht, "StringWidth(%q) with a LUT %s = %d, plain %d (round %d)", s, condName(lc, true), a, b, round)
++			}
++			lc.EastAsianWidth = chance(ht, 50)
++			lc.StrictEmojiNeutral = chance(ht, 50)
++			lc.CreateLUT()
++		}
++	})
++}
++
++// genIncompleteTail draws the start of a multi-byte UTF-8 sequence cut short: a lead byte that
++// announces two, three or four bytes, and fewer continuation bytes than that.
++func genIncompleteTail(tc hegel.TestCase) string {
++	need := n(tc, 2, 4)
++	lo, hi := 0xC2, 0xDF
++	switch need {
++	case 3:
++		lo, hi = 0xE0, 0xEF
++	case 4:
++		lo, hi = 0xF0, 0xF4
++	}
++	b := []byte{byte(n(tc, lo, hi))}
++	for k := n(tc, 0, need-2); k > 0; k-- {
++		b = append(b, byte(n(tc, 0x80, 0xBF)))
++	}
++	return string(b)
++}
++
++// TestHegelIncompleteSequenceAtTheEndKeepsItsCells: the bytes of an incomplete UTF-8 sequence
++// are a replacement glyph each and measure the same after other text as they do on their own,
++// so StringWidth of the whole is the cluster model's width of each part added up. The
++// segmenter has no boundary before a lead byte whose continuation bytes are missing at the end
++// of the text: it is attached to the cluster before it, and the two-cell cap swallows it
++// (go-runewidth/5). HEGEL_NO_KNOWN=1 draws a wide rune after the incomplete sequence, which
++// gives it a boundary on both sides.
++func TestHegelIncompleteSequenceAtTheEndKeepsItsCells(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		var b strings.Builder
++		for i, k := 0, n(ht, 1, 3); i < k; i++ {
++			switch n(ht, 1, 3) {
++			case 1:
++				b.WriteRune(rune(n(ht, 0x20, 0x7E)))
++			case 2:
++				b.WriteRune(runeIn(ht, doublewidth))
++			default:
++				b.WriteRune(runeIn(ht, ambiguous))
++			}
++		}
++		prefix, tail, suffix := b.String(), genIncompleteTail(ht), ""
++		if noKnown {
++			suffix = string(rune(n(ht, 0x3041, 0x3096))) // hiragana: wide, three bytes, no joining
++		}
++		s := prefix + tail + suffix
++		want := modelWidthOf(c, prefix) + modelWidthOf(c, tail) + modelWidthOf(c, suffix)
++		note(ht, "%s %q + %q + %q", name, prefix, tail, suffix)
++		if got := c.StringWidth(s); got != want {
++			fail(ht, "StringWidth(%q) %s = %d, want %d = %d + %d + %d for the parts %q, %q and %q", s, name, got, want, modelWidthOf(c, prefix), modelWidthOf(c, tail), modelWidthOf(c, suffix), prefix, tail, suffix)
++		}
++	})
++}
++
++// TestHegelOneByteStringMeasuresAsItsRune: a one-byte string is as wide as the rune it decodes
++// to, a control zero, a printable ASCII byte one, and a byte that is not UTF-8 as wide as the
++// replacement character, two cells in an East Asian locale. StringWidth answers one-byte strings
++// from a shortcut that ignores the flags (go-runewidth/3); HEGEL_NO_KNOWN=1 draws ASCII only in
++// the East Asian conditions.
++func TestHegelOneByteStringMeasuresAsItsRune(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		hi := 0xFF
++		if noKnown && c.EastAsianWidth {
++			hi = 0x7F
++		}
++		s := string([]byte{byte(n(ht, 0, hi))})
++		if got, want := c.StringWidth(s), modelWidthOf(c, s); got != want {
++			fail(ht, "StringWidth(%q) %s = %d, want %d (RuneWidth of what the byte decodes to)", s, name, got, want)
++		}
++	})
++}
++
++// Grapheme_Cluster_Break=Extend runes that are not combining marks: the variation selectors,
++// the zero-width joiner and non-joiner, the tag characters and the skin tone modifiers, which
++// are the only two-cell Extend runes.
++var (
++	extendRanges     = table{{0xFE00, 0xFE0F}, {0xE0100, 0xE01EF}, {0x200C, 0x200D}, {0xE0020, 0xE007F}}
++	skinToneModifier = table{{0x1F3FB, 0x1F3FF}}
++)
++
++// TestHegelExtendAndPrependRunesAddTheirOwnCells: an Extend rune after a space or a letter, and
++// Prepend runes before one, add their own width to it, so the cluster is as wide as its runes
++// together: nothing in it is an emoji sequence or a Hangul syllable, the sequences the two-cell
++// cap is for. The cap fires on any cluster (go-runewidth/4), so a skin tone modifier swallows the
++// cell of the space or letter before it and two Prepend runes the cell of the one after them;
++// HEGEL_NO_KNOWN=1 draws the zero- and one-cell Extend runes and a single Prepend rune.
++func TestHegelExtendAndPrependRunesAddTheirOwnCells(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		base := string(rune(n(ht, 0x20, 0x7E)))
++		var s string
++		if chance(ht, 50) {
++			ext := runeIn(ht, combining)
++			switch k := n(ht, 1, 4); {
++			case k == 2 || k == 3:
++				ext = runeIn(ht, extendRanges)
++			case k == 4 && !noKnown:
++				ext = runeIn(ht, skinToneModifier)
++			}
++			s = base + string(ext)
++		} else {
++			k := 1
++			if !noKnown {
++				k = n(ht, 1, 3)
++			}
++			for ; k > 0; k-- {
++				s += string(pick(ht, prepends))
++			}
++			s += base
++		}
++		want := 0
++		for _, r := range s {
++			want += c.RuneWidth(r)
++		}
++		note(ht, "%s %q", name, s)
++		if got := c.StringWidth(s); got != want {
++			fail(ht, "StringWidth(%q) %s = %d, want %d, the widths of its runes added up", s, name, got, want)
++		}
++	})
++}
++
++// TestHegelWrapKeepsCRLFTogether: a CRLF is one cluster that ends the line, and Wrap never
++// breaks between its two bytes nor before it, whether the text is ASCII or not and whatever the
++// width; at a non-positive width every other cluster gets a break before it. The ASCII fast
++// path handles bytes one at a time and breaks before the CR of a CRLF that follows text on its
++// line at a non-positive width (go-runewidth/1); HEGEL_NO_KNOWN=1 draws positive widths.
++func TestHegelWrapKeepsCRLFTogether(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c, name := pickCond(ht)
++		var b strings.Builder
++		for i, k := 0, n(ht, 1, 4); i < k; i++ {
++			b.WriteRune(rune(n(ht, 0x20, 0x7E)))
++		}
++		b.WriteString("\r\n")
++		for i, k := 0, n(ht, 0, 4); i < k; i++ {
++			b.WriteRune(rune(n(ht, 0x20, 0x7E)))
++		}
++		s := b.String()
++		w := n(ht, -2, 0)
++		if noKnown {
++			w = n(ht, 1, 8)
++		}
++		note(ht, "%s %q w=%d", name, s, w)
++		got := c.Wrap(s, w)
++		if strings.Contains(got, "\r\n\n") || strings.Contains(got, "\n\r\n") != strings.Contains(s, "\n\r\n") {
++			fail(ht, "Wrap(%q, %d) %s = %q breaks at the CRLF", s, w, name, got)
++		}
++		if want := modelWrap(c, s, w); got != want {
++			fail(ht, "Wrap(%q, %d) %s = %q, cluster model %q", s, w, name, got, want)
++		}
++	})
++}
++
++// ---- locales -------------------------------------------------------------------------------
++
++// cjkCharsets are the CJK multibyte charsets the package recognises (spelled as glibc does, in
++// any case); unlistedCJKCharsets are CJK charsets it does not know, glibc's gb18030, big5hkscs
++// and euctw and the IANA spellings with a hyphen or an underscore (go-runewidth/2);
++// utf8Charsets count as CJK only with a CJK language.
++var (
++	cjkCharsets         = []string{"eucJP", "eucjp", "EUCJP", "jis", "eucKR", "euckr", "eucCN", "SJIS", "sjis", "CP932", "cp51932", "CP936", "cp949", "cp950", "Big5", "big5", "BIG5", "GBK", "gbk", "GB2312", "gb2312"}
++	unlistedCJKCharsets = []string{"GB18030", "gb18030", "big5hkscs", "BIG5-HKSCS", "euctw", "EUC-TW", "EUC-JP", "euc-jp", "EUC-KR", "Shift_JIS", "SHIFT_JIS", "EUC_JP"}
++	utf8Charsets        = []string{"UTF-8", "utf-8", "utf8", "UTF8", "Utf-8"}
++	otherCharsets       = []string{"ISO-8859-1", "iso88591", "CP1252", "KOI8-R", "ASCII", "TIS-620", "latin1"}
++	cjkLangs            = []string{"ja", "ko", "zh"}
++	otherLangs          = []string{"en", "de", "fr", "ru", "th", "vi", "ast", "kab"}
++	countries           = []string{"", "_JP", "_KR", "_CN", "_TW", "_HK", "_US", "_DE", "_GB"}
++	modifiers           = []string{"", "", "", "@euro", "@latin", "@cjk_narrow", "@CJK_NARROW", "@Cjk_Narrow"}
++)
++
++type locale struct {
++	name          string
++	cjkLang       bool
++	charset       string // "cjk", "utf8", "other", "none"
++	narrowModifer bool
++}
++
++// The charset shapes of a locale, for a CJK language and for another: a CJK charset the
++// package lists, UTF-8, a CJK charset it does not list, none at all, another charset. A CJK
++// language with an unlisted CJK charset or with no charset is go-runewidth/2's shape;
++// HEGEL_NO_KNOWN=1 does not draw it.
++var (
++	cjkCharsetKinds   = []string{"cjk", "utf8", "unlisted", "none"}
++	otherCharsetKinds = []string{"cjk", "utf8", "other", "none"}
++)
++
++// genLocale draws a POSIX locale name and whether it is East Asian: with a CJK charset, listed
++// or not, always; with UTF-8 or no charset when the language is Japanese, Korean or Chinese;
++// never with @cjk_narrow.
++func genLocale(tc hegel.TestCase) locale {
++	var l locale
++	var lang string
++	kinds := otherCharsetKinds
++	if l.cjkLang = chance(tc, 50); l.cjkLang {
++		lang = pick(tc, cjkLangs)
++		kinds = cjkCharsetKinds
++		if noKnown {
++			kinds = cjkCharsetKinds[:2]
++		}
++	} else {
++		lang = pick(tc, otherLangs)
++	}
++	var cs string
++	switch l.charset = pick(tc, kinds); l.charset {
++	case "cjk":
++		cs = pick(tc, cjkCharsets)
++	case "unlisted":
++		l.charset, cs = "cjk", pick(tc, unlistedCJKCharsets)
++	case "utf8":
++		cs = pick(tc, utf8Charsets)
++	case "other":
++		cs = pick(tc, otherCharsets)
++	}
++	mod := pick(tc, modifiers)
++	l.narrowModifer = strings.EqualFold(mod, "@cjk_narrow")
++	l.name = lang + pick(tc, countries)
++	if cs != "" {
++		l.name += "." + cs
++	}
++	l.name += mod
++	return l
++}
++
++func (l locale) eastAsian() bool {
++	if l.narrowModifer {
++		return false
++	}
++	switch l.charset {
++	case "cjk":
++		return true
++	case "utf8", "none":
++		return l.cjkLang
++	}
++	return false
++}
++
++var cLocales = []string{"", "C", "POSIX", "C.UTF-8", "C.utf8", "C-UTF-8", "C.ISO-8859-1"}
++
++// TestHegelIsEastAsianFollowsTheLocaleGrammar: IsEastAsian reads LC_ALL, then LC_CTYPE, then
++// LANG; the C and POSIX locales are never East Asian, a CJK charset always is (listed by the
++// package or not), UTF-8 and no charset are with a Japanese, Korean or Chinese language, and
++// @cjk_narrow turns it off. The package keys on its charset list alone, so a CJK language
++// with no charset or with an unlisted CJK charset is reported as not East Asian
++// (go-runewidth/2); HEGEL_NO_KNOWN=1 does not draw those two shapes.
++func TestHegelIsEastAsianFollowsTheLocaleGrammar(t *testing.T) {
++	saved := map[string]string{}
++	for _, k := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
++		saved[k] = os.Getenv(k)
++	}
++	defer func() {
++		for k, v := range saved {
++			os.Setenv(k, v)
++		}
++	}()
++	property(t, func(ht *hegel.T) {
++		var vals [3]string
++		var want bool
++		effective := -1
++		for i := range vals {
++			if chance(ht, 60) {
++				if chance(ht, 25) {
++					vals[i] = pick(ht, cLocales)
++				} else {
++					l := genLocale(ht)
++					vals[i] = l.name
++					if effective < 0 {
++						want = l.eastAsian()
++					}
++				}
++				if effective < 0 && vals[i] != "" {
++					effective = i
++				}
++			}
++		}
++		os.Setenv("LC_ALL", vals[0])
++		os.Setenv("LC_CTYPE", vals[1])
++		os.Setenv("LANG", vals[2])
++		if effective < 0 {
++			want = false
++		}
++		note(ht, "LC_ALL=%q LC_CTYPE=%q LANG=%q", vals[0], vals[1], vals[2])
++		if got := IsEastAsian(); got != want {
++			fail(ht, "IsEastAsian() with LC_ALL=%q LC_CTYPE=%q LANG=%q = %v, want %v", vals[0], vals[1], vals[2], got, want)
++		}
++	})
++}
++
++// ---- pins ----------------------------------------------------------------------------------
++
++// TestHegelPinWrapASCIIAgreesWithTheSegmenterOnCRLF pins go-runewidth/1: at a non-positive
++// width the ASCII fast path of Wrap breaks before a CRLF, which the segmenter path treats as a
++// line ending and never breaks before.
++func TestHegelPinWrapASCIIAgreesWithTheSegmenterOnCRLF(t *testing.T) {
++	defer guard(t)
++	c := &Condition{}
++	for _, w := range []int{0, -1} {
++		ascii := c.Wrap("a\r\nb", w)
++		wide := c.Wrap("あ\r\nb", w)
++		want := modelWrap(c, "a\r\nb", w)
++		if ascii != want {
++			t.Errorf("Wrap(%q, %d) = %q, want %q as the cluster loop gives (Wrap(%q, %d) = %q)", "a\r\nb", w, ascii, want, "あ\r\nb", w, wide)
++		}
++	}
++}
++
++// TestHegelPinIsEastAsianKnowsTheCommonCJKLocales pins go-runewidth/2: CJK locales whose charset
++// is missing or spelled outside the package's short list are reported as not East Asian.
++func TestHegelPinIsEastAsianKnowsTheCommonCJKLocales(t *testing.T) {
++	defer guard(t)
++	saved := os.Getenv("LC_ALL")
++	defer os.Setenv("LC_ALL", saved)
++	for _, l := range []string{"ja_JP", "zh_CN", "ko_KR", "ja_JP.EUC-JP", "ko_KR.EUC-KR", "zh_CN.GB18030", "zh_CN.gb18030", "zh_HK.big5hkscs", "zh_HK.BIG5-HKSCS", "zh_TW.euctw", "zh_TW.EUC-TW", "ja_JP.SHIFT_JIS"} {
++		os.Setenv("LC_ALL", l)
++		if !IsEastAsian() {
++			t.Errorf("IsEastAsian() with LC_ALL=%q = false, want true", l)
++		}
++	}
++}
++
++// TestHegelPinSingleInvalidByteMeasuresLikeAnyOther pins go-runewidth/3: StringWidth answers a
++// one-byte string from a shortcut that ignores the locale, so in an East Asian locale a lone
++// byte that is not UTF-8 is one cell while the same byte inside longer text is two.
++func TestHegelPinSingleInvalidByteMeasuresLikeAnyOther(t *testing.T) {
++	defer guard(t)
++	c := &Condition{EastAsianWidth: true, StrictEmojiNeutral: true}
++	for _, b := range []string{"\x80", "\xff", "\xc3"} {
++		single := c.StringWidth(b)
++		double := c.StringWidth(b + b)
++		if single*2 != double {
++			t.Errorf("StringWidth(%q) East Asian = %d but StringWidth(%q) = %d (U+FFFD is %d cells)", b, single, b+b, double, c.RuneWidth(utf8.RuneError))
++		}
++	}
++}
++
++// TestHegelPinTwoCellExtendRuneKeepsItsBaseVisible pins go-runewidth/4: a skin tone modifier
++// (a two-cell rune of grapheme class Extend) joins the preceding space or letter into one
++// cluster, as a space joins preceding Prepend runes, and the two-cell cap then counts the
++// whole as two cells, so FillLeft/FillRight cannot reach the requested width and a padded
++// column is one cell short.
++func TestHegelPinTwoCellExtendRuneKeepsItsBaseVisible(t *testing.T) {
++	defer guard(t)
++	c := &Condition{}
++	for _, s := range []string{" 🏼", "a🏼", " 🏿", "࢐؁ "} {
++		if got := c.StringWidth(s); got != 3 {
++			t.Errorf("StringWidth(%q) = %d, want 3", s, got)
++		}
++	}
++	if got := c.StringWidth(c.FillLeft("🏼", 4)); got != 4 {
++		t.Errorf("StringWidth(FillLeft(%q, 4)) = %d, want 4 (FillLeft gave %q)", "🏼", got, c.FillLeft("🏼", 4))
++	}
++	if got := c.StringWidth(c.FillRight("࢐؁", 4)); got != 4 {
++		t.Errorf("StringWidth(FillRight(%q, 4)) = %d, want 4 (FillRight gave %q)", "࢐؁", got, c.FillRight("࢐؁", 4))
++	}
++}
++
++// TestHegelPinIncompleteSequenceAtTheEndIsMeasured pins go-runewidth/5: an incomplete UTF-8
++// sequence at the end of the text is attached to the preceding cluster by the segmenter and
++// vanishes under the two-cell cap, while the same bytes followed by anything else count as
++// one cell each.
++func TestHegelPinIncompleteSequenceAtTheEndIsMeasured(t *testing.T) {
++	defer guard(t)
++	c := &Condition{}
++	for _, tt := range []struct{ s, tail string }{{"あ", "\xe3\x81"}, {"a", "\xf0\x98\xb7"}, {"あ", "\xc3"}} {
++		alone := c.StringWidth(tt.tail)
++		atEnd := c.StringWidth(tt.s + tt.tail)
++		followed := c.StringWidth(tt.s + tt.tail + " ")
++		if atEnd != c.StringWidth(tt.s)+alone || followed != atEnd+1 {
++			t.Errorf("StringWidth(%q) = %d, StringWidth(%q) = %d, StringWidth(%q) = %d: the incomplete sequence is %d cells on its own", tt.s+tt.tail, atEnd, tt.s+tt.tail+" ", followed, tt.tail, alone, alone)
++		}
++	}
++	if got := c.Truncate("あ\xe3\x81", 2, ""); got != "あ" {
++		t.Errorf("Truncate(%q, 2, \"\") = %q, want %q", "あ\xe3\x81", got, "あ")
++	}
++}
++
++// ---- fixed examples ------------------------------------------------------------------------
++
++func TestHegelExamples(t *testing.T) {
++	defer guard(t)
++	c := &Condition{}
++	ea := &Condition{EastAsianWidth: true, StrictEmojiNeutral: true}
++	for _, tt := range []struct {
++		s         string
++		w, eaw    int
++		truncated string
++	}{
++		{"つのだ☆HIRO", 11, 12, "つの…"},
++		{"■㈱の世界①", 10, 12, "■㈱の…"},
++		{"👨‍👩‍👧‍👦", 2, 2, "👨‍👩‍👧‍👦"},
++		{"🇩🇰🇯🇵", 4, 4, "🇩🇰🇯🇵"},
++		{"हिन्दी", 5, 5, "हिन्दी"},
++		{"abc\r\ndef", 6, 6, "abc\r\ndef"},
++		{"abc\r\ndefg", 7, 7, "abc\r\nde…"},
++	} {
++		if got := c.StringWidth(tt.s); got != tt.w {
++			t.Errorf("StringWidth(%q) = %d, want %d", tt.s, got, tt.w)
++		}
++		if got := ea.StringWidth(tt.s); got != tt.eaw {
++			t.Errorf("StringWidth(%q) East Asian = %d, want %d", tt.s, got, tt.eaw)
++		}
++		if got := c.Truncate(tt.s, 6, "…"); got != tt.truncated {
++			t.Errorf("Truncate(%q, 6, …) = %q, want %q", tt.s, got, tt.truncated)
++		}
++	}
++}
