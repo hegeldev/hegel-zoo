@@ -19,6 +19,15 @@ queried host, `Config.Get`/`GetAll` must give what `ssh -G` prints.
   IdentityFile, CertificateFile, SendEnv, SetEnv. When the package has no value, ssh's default
   (learnt once from an empty config) is expected.
 
+- One narrow property per recorded bug, drawing its shape region with random contents (names,
+  positions, masks, the directives around it) and judged by the same `ssh -G` comparison:
+  `TestHegelTabSeparatedHostPatternsMatch` (a tab inside a `Host` pattern list),
+  `TestHegelQuestionMarkMatchesOneCharacter` (a `?` pattern against an alias one character
+  shorter or longer), `TestHegelMatchHostCommaListMatchesEachPattern` (a `Match host` comma
+  list), `TestHegelMatchHostSeesTheHostName` (a `HostName` directive before a `Match host` naming
+  it) and `TestHegelMatchHostIgnoresCase` (pattern and alias in different case). Each fails every
+  run.
+
 **`hegel/hegel_pins_test.go`**: one deterministic reproducer per recorded bug, with the value
 `ssh -G` gives.
 
@@ -37,14 +46,22 @@ LocalCommand values (ssh keeps the quotes for these), end-of-line comments on th
 spelling (the package rejects them), `Include`, `%` tokens in anything but commands. A config ssh
 rejects is counted, not judged.
 
-## Known bugs (gated)
+## Known bugs
 
 Five bugs (`bugs.toml`): tab-separated Host patterns read as one pattern; `?` matching zero
 characters; `Match host` not splitting its comma list, matched against the alias instead of the
-hostname, and case-sensitively. `hegel/known.go` gates them by shape (tabs on a Host line, comma
-lists, a HostName directive next to a Match block, upper case in Match patterns or alias) and the
-`?` bug precisely (a pattern with `?` on which ssh's glob and the package disagree);
-`HEGEL_NO_KNOWN=1` makes the generator avoid the coarse shapes so that a round looks past them.
+hostname, and case-sensitively. The generators draw their shapes by default (tabs between Host
+patterns, `?` patterns, Match host comma lists, a HostName directive beside a Match host block,
+upper case in Match patterns and aliases): `TestHegelMatchesSSH` reaches them at their natural
+rates (/1 in about 9% of cases, /2 and /3 in about 4%, /4 and /5 rarely) and is an expected
+failure mapped to /1, the shape it shrinks to in most runs (`Host foo<TAB>foo`; sometimes a `?`
+pattern), and the five narrow properties are the expected failures of their bugs. A mismatch that
+a recorded bug explains says so in the failure (`hegel/known.go` names the shape); the pins are
+regression examples beside the properties. `HEGEL_NO_KNOWN=1` switches the known shapes off for a
+run that looks past the bugs: the wide generator avoids the coarse shapes and skips the precise
+`?` disagreements (about 3% of its cases), and the narrow properties draw the neighbouring
+non-bug shape (spaces for tabs, the `?` given one character, one-pattern lists, HostName equal to
+the alias, one spelling); every property then passes.
 
 ## Not tested
 
@@ -56,3 +73,6 @@ round-trips, comment preservation.
 
 - 2026-09-20: written against bd15f5d44042e84fa6a04fcb0f1d176fc804397f (2026-05-04, "dependabot:
   add 7-day cooldown to all updates") with hegel.dev/go/hegel v0.6.33; 5 bugs.
+- 2026-09-24: unsteered (STYLE.md rule 11): the known shapes are drawn by default, the wide
+  property and five narrow properties are the expected failures, `HEGEL_NO_KNOWN=1` switches
+  the shapes off.
