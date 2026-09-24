@@ -47,7 +47,7 @@ All general properties pass at 1000 cases × 3 (a few seconds; the Python child 
 the work). Eight pinned expected failures; go-ini/1's check runs the crashing call in a child
 process (this test binary with `HEGEL_INI_LOOP=1`), since a stack overflow is fatal.
 
-## Bugs (8)
+## Bugs (9)
 
 | id | title | severity |
 |----|-------|----------|
@@ -59,6 +59,7 @@ process (this test binary with `HEGEL_INI_LOOP=1`), since a stack overflow is fa
 | go-ini/6 | `Key.Strings` drops an empty last element but keeps an empty first one; drops a trailing backslash | low |
 | go-ini/7 | `SpaceBeforeInlineComment` looks for ` ;` only when there is no ` #` | low |
 | go-ini/8 | `UnescapeValueCommentSymbols` never sees the escaped symbol (the inline comment is cut first) | low |
+| go-ini/9 | `Key.Strings` with a multi-character delimiter consumes only the first character of an escaped delimiter (`a\:::b` on `::` is `[a: b]`) | low |
 
 ## Not bugs (documented, asserted upstream, or design)
 
