@@ -26,7 +26,10 @@ string followed by a date-only string combines them (asserted upstream). Strings
 accepts — hour 24+, minute or second 60+, month 13+, day 32+, February 30th, words, leading or
 trailing blanks — are errors with the zero time, and `MustParse` panics. `Between` is strict at
 both ends. The model is a few lines of calendar arithmetic done in UTC (where there are no
-transitions) plus `time.Date` in the location.
+transitions) plus the date's first instant in the location (its midnight when that exists,
+else the first instant after the gap); `BeginningOfHour` is the top of the time's own hour
+(its own occurrence when the hour is repeated) and `EndOfHour` the last instant of the wall
+hour, and a date-only string parses to the day's first instant.
 
 ## Properties
 
@@ -51,18 +54,30 @@ transitions) plus `time.Date` in the location.
   model; `Monday(timeOnly)`/`Sunday(timeOnly)` keep the clock; `Between` with two rendered
   strings is strict.
 
-Twenty thousand cases per property before saving. Daylight-saving transitions inside a unit
-are exercised freely (a 23- or 25-hour day, a week or month with a transition); what the
-generator skips, by redrawing, are the pinned shapes: a transition within two hours of a unit's
-boundary midnight (now/3, now/4, now/5), of the midnight of the given time's date or of the
-first of its month (weeks come from `BeginningOfDay`, quarters and halves from
-`BeginningOfMonth`), a transition within two hours of the time for the minute/hour property
-(now/2), a skipped calendar day (Apia 2011, caught by the same check), sub-minute offsets
-(now/1: years from 1975 and whole-minute fixed zones), fractions of other lengths than 3, 6 or 9
-digits (now/7), the Kitchen and zone-name layouts (now/8; zone names are resolved by Go's own
-rules and add nothing), a month-day string after a time (now/9), a date followed by a time
-(now/10), and an expected wall time — or, for the two-string form, the date's midnight —
-within two hours of a transition (now/11). Zone abbreviations are not compared for zoned strings, because `ParseInLocation`
+Twenty thousand cases per property before saving. The generators draw the recorded shapes at
+their natural rates: fixed-zone offsets in seconds (now/1, about 15% of the clock cases),
+instants anywhere, transition hours and the days without a midnight or with a repeated last
+hour included (now/2-6; 1-2% of the calendar and week cases, one in a million for Apia's
+skipped date), Kitchen among the time-only layouts (now/8, one parse case in sixteen),
+fractions of one to nine digits (now/7), the month-day string as the second string (now/9) and
+both orders of the two-string form (now/10). The wide properties fail when they meet a shape
+and are the expected failures mapped to the bug each usually shrinks to (`target.toml`: the
+clock property to /1, `ParseFillsFromNow` to /7 with /8 and /10 as other basins, the calendar
+and week properties to /3 as intermittent, since their shapes are in a few cases per hundred).
+Each bug also has a narrow property over its shape region with random contents
+(`TestHegelSubMinuteOffsetsBeginAndEndOnTheClock`, `TestHegelHoursAroundATransitionBeginAndEndOnTheClock`,
+`TestHegelDaysWithoutAMidnightBeginOnTheCalendar`, `TestHegelMonthsWithoutAMidnightOnTheFirstBeginOnTheCalendar`,
+`TestHegelDaysWithARepeatedLastHourEndOnTheCalendar`, `TestHegelWeeksAcrossASkippedDateBeginOnTheCalendar`,
+`TestHegelFractionsOfAnyLengthParse`, `TestHegelKitchenTimesAreToday`,
+`TestHegelMonthDayAfterATimeKeepsTheClock`, `TestHegelDateThenTimeKeepsTheDate`,
+`TestHegelDatesWithoutAMidnightParse`); the zones' transitions and the dates with a shape (no
+midnight, a repeated last hour, a skipped date) are computed from tzdata at start-up
+(1974-2062), so each narrow property draws a zone, one of its shape dates and a random instant
+or string on it. The pins are the regression examples beside them. `HEGEL_NO_KNOWN=1` switches
+the shapes off (the wide case generators are filtered by the same shape tests, under 2% of
+draws; the narrow properties draw the neighbouring region instead, and the two-string order is
+fixed) for a run past the known bugs, under which the sixteen properties pass at 3000 cases.
+Zone abbreviations are not compared for zoned strings, because `ParseInLocation`
 reuses the location's zone when the offset matches (documented Go behaviour).
 
 ## Bugs (11; details in bugs.toml)
@@ -104,3 +119,16 @@ magnitudes (an hour, a day, a week, a month).
   `EndOfYear` on a 23- or 25-hour day at the boundary are right when the midnight itself exists
   once (`AddDate` renormalises the wall clock), and `BeginningOfMinute` is right for every
   whole-minute offset including +05:45 and +12:45.
+
+## History
+
+- 2026-09-14: created at 2367773 (v1.1.5+4); 11 bugs, each with a pin, the properties redrawing
+  the pinned shapes.
+- 2026-09-24: the redraws went (STYLE.md rule 11): the properties draw the shapes and fail, one
+  narrow property per bug was added, `HEGEL_NO_KNOWN=1` switches the shapes off. Removing the
+  filters exposed three places where the oracle shared the library's assumptions: the clock
+  model rebuilt the hour with `time.Date` (wrong in a repeated hour, as now/2 is) and now takes
+  the top of the time's own occurrence and the last instant of the wall hour; the calendar and
+  parse models used `time.Date` for midnight (wrong on a day without one, as now/3-5 and now/11
+  are) and now use the date's first instant; and the clean-transition window was two hours,
+  which missed St John's two-hour setback of 1988 (now three).
