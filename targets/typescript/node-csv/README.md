@@ -32,15 +32,24 @@ handling as `io.StringIO(newline="")`), or `csv.writer` on records with a dialec
 The generator (`hegel/csv.mjs`) draws fields from words, punctuation (delimiters, quotes,
 escapes, comment and formula characters), line breaks and odd characters (NBSP, ideographic
 space, U+2028, NUL, BOM, astral); `ZOO_COLLECT=1` turns mismatches into `# COLLECT` counts and
-`HEGEL_TEST_CASES` (default 100) widens the sweep. Known bugs are gated in `hegel/known.mjs` by
-the shape of the case (a bare field with a line break, a lone empty field, a comment line before
-`from_line`, a CRLF in a quoted field, a non-ASCII sample for discovery); `ZOO_NO_KNOWN=1` lifts
-the gates.
+`HEGEL_TEST_CASES` (default 100) widens the sweep. The generators draw the shapes of the recorded
+bugs by default (a bare field with a line break, a lone empty field, a comment line before
+`from_line`, a CRLF in a quoted field, a non-ASCII sample for discovery, a stream cut inside a
+delimiter after a multi-byte quote), so the wide properties fail on them; `hegel/known.mjs` only
+classifies a mismatch after the fact and puts the bug's id in the failure message. Each open bug
+also has a narrow property that draws only its region (`TestHegelFieldsWithBareLineBreaksReadByPython`,
+`TestHegelRawRecordsConcatenateToTheInput`, ...), the deterministic expected failure mapped to it.
+`HEGEL_NO_KNOWN=1` makes the generators leave the shapes out (newline-free bare fields, no lone
+empty field, an ASCII alphabet for discovery, no formula prefix with an apostrophe quote, no
+comment line right before `from_line`, no CRLF in quotes when lines are counted), skips the rare
+residue that cannot be shaped away (a stream cut after a multi-byte closing quote, discovery on an
+empty stream: well under 0.1% of cases) and registers the narrow properties as skipped, so the
+whole suite passes.
 
 ## Bugs
 
-10 open, all pinned (see `bugs.toml`). In 1000-case sweeps, every property agrees with its oracle
-or model on every case not touched by them:
+10 open, each found by a property and pinned (see `bugs.toml`). In 1000-case sweeps, every
+property agrees with its oracle or model on every case not touched by them:
 
 - `stringify` leaves a field holding a CR or LF bare unless it is the configured record
   delimiter, so Python (and csv-parse's own record-delimiter discovery) split the record (1);
@@ -50,7 +59,8 @@ or model on every case not touched by them:
 - `parse` drops the record at `from_line` when a comment line precedes it (4); counts a CRLF
   inside a quoted field as two lines, so `info.lines`, `from_line` and `to_line` are off (5);
   `delimiter_auto` throws on any character beyond U+007E (6) and on a stream that ends without
-  data (9); `raw` keeps one byte of a CRLF record delimiter or of a multi-character delimiter (7);
+  data (9); `raw` keeps one byte of a CRLF record delimiter, of a multi-character delimiter or of
+  a multi-byte quote or escape (7);
   `cast` turns `0x10`, `0b11`, `0o7` into 0 (8).
 - The `Parser` stream, with a quote of several bytes, throws `CSV_INVALID_CLOSING_QUOTE` (or
   drops the record under `skip_records_with_error`) when a chunk ends inside a delimiter of
@@ -61,8 +71,8 @@ or model on every case not touched by them:
 - csv-parse's `escape` acts only inside quoted fields and csv-stringify doubles the escape only
   when it quotes; Python's `escapechar` acts everywhere and its writer always escapes it. The
   interop properties therefore quote everything (`quoted: true`, `QUOTE_ALL`) when the escape is
-  not the quote. Python's reader also gives no fields for an empty line where csv-parse gives
-  `[""]`: canonicalised in the comparisons.
+  not the quote. (Python's reader gives no fields for an empty line where csv-parse gives `[""]`;
+  that is the shape of node-csv/2, compared as it stands, not an accepted difference.)
 - The line count advances on the CR/LF bytes csv-parse meets: a custom record delimiter that
   does not start with a CR or LF (`;\n`, `||`, U+001E) never advances it, so `from_line`,
   `to_line` and `info.lines` refer to line 1 throughout; a `\n\n` delimiter counts as one line.
@@ -92,3 +102,6 @@ and `stream-transform` packages.
 ## History
 
 - 2026-09-20: created at 745f045 (csv-parse 6.8.3, csv-stringify 7.0.2), 7 properties, 10 bugs.
+- 2026-09-24: the properties find the ten bugs instead of gating them (`HEGEL_NO_KNOWN=1` replaces
+  the inverse `ZOO_NO_KNOWN=1`); one narrow property per bug; `raw` also compared to the input
+  (7) and `cast` on prefixed numerals (8) as properties; the `[""]` canonicalisation removed (2).
