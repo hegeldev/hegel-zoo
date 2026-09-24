@@ -14,8 +14,16 @@
 
 **`tests/event_writer.rs`**
 - `document_write_read_roundtrip`: Property (the crown round-trip): a document built from arbitrary well-formed elements, attributes, text (PCDATA and CDATA), and comments, written with `EventWriter`, reads back with `EventReader` as exactly the same canonical structure — element names, attribute names/values (in order), and text content all survive, which requires the writer to escape every character the reader would otherwise mis-parse.
-- `pcdata_text_write_read_roundtrip`: Property: arbitrary text (generated at the PCDATA encode-set boundary: `<`, `>`, `&`, quotes, `]]>`, entity-reference look-alikes) written as `Characters` is recovered exactly by the reader. `\r` is excluded — its loss is pinned by `known_bug_pcdata_carriage_return_lost_in_roundtrip`.
-- `attribute_write_read_roundtrip`: Property: arbitrary attribute names and values — including quotes, `<`, `&`, and `\r`/`\n` (which the writer must escape as character references to survive attribute-value normalization) — round-trip exactly through write→read. `\t` is excluded from the generator; its loss is pinned by `known_bug_attribute_tab_lost_in_roundtrip`.
+- `pcdata_text_write_read_roundtrip`: Property: arbitrary text (generated at the PCDATA encode-set boundary: `<`, `>`, `&`, quotes, `]]>`, entity-reference look-alikes) written as `Characters` is recovered exactly by the reader. `\r` and `\r\n` are drawn as pieces too, so the property fails on xml-rs/1 (it shrinks to the text `\r`, read back as `\n`); `known_bug_pcdata_carriage_return_lost_in_roundtrip` pins the example. `document_write_read_roundtrip` reaches the same bug through either a text child or an attribute value.
+
+The generators draw the recorded bug's shapes by default (`\r` and `\r\n` text pieces, `\t` in
+attribute values: 16-26% of the cases, so the three round-trip properties fail in every run) and
+the two pins hold one example each; `HEGEL_NO_KNOWN=1` leaves the pieces out, for a run that
+looks past xml-rs/1, and every property then passes at 3000 cases. Rewritten in combinator style
+on 2026-09-24 (STYLE.md): documents are a `recursive` tree of text, comment and element nodes
+under a root element, reader configurations a nine-switch record, malformed documents a record
+with a seven-way fault, all rendered by pure functions.
+- `attribute_write_read_roundtrip`: Property: arbitrary attribute names and values — including quotes, `<`, `&`, and `\r`/`\n` (which the writer must escape as character references to survive attribute-value normalization) — round-trip exactly through write→read. `\t` is drawn too, so the property fails on xml-rs/1 (it shrinks to the attribute `a="\t"` read back as a space); `known_bug_attribute_tab_lost_in_roundtrip` pins the example.
 
 ## Oracles
 
