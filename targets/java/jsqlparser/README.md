@@ -88,7 +88,7 @@ quoting, `allowComplexParsing` off), the visitor/deparser API beyond `StatementD
 
 ## Bugs found
 
-See `bugs.toml` (16, all open at the pinned commit, all pinned in `JSqlParserPinsTest`): stacked unary
+See `bugs.toml` (19; jsqlparser/4 fixed upstream, the rest open at the pinned commit, all pinned in `JSqlParserPinsTest`): stacked unary
 operators rejected (1); predicate `IS TRUE/FALSE` rejected (2); `COLLATE BINARY`/`RTRIM` rejected (3); type
 names as bare columns rejected (4); `exclude` column rejected (5); quoted identifiers with dots split, `"."`
 throws `RuntimeException` (6); `HexValue` keeps trailing white space, toString grows (7); `REPLACE INTO` takes
@@ -96,7 +96,9 @@ neither RETURNING nor DEFAULT VALUES (8); `parseStatements("SELECT 1;;")` reject
 with a subquery rejected (10); `CASE -1 WHEN …` rejected (11); `CAST(a = 1 AS …)` and other conditions in CAST
 rejected (12); typeless columns with constraints or next to typed ones rejected (13); `3 ."id"` prints as
 `3."id"`, which does not parse (14); `DELETE` without a table accepted, prints `DELETE null` (15); `a IS NULL
-COLLATE NOCASE` and `a IS TRUE COLLATE NOCASE` rejected (16).
+COLLATE NOCASE` and `a IS TRUE COLLATE NOCASE` rejected (16); `a LIKE 'x' ESCAPE '!' COLLATE NOCASE` rejected (17); a
+predicate as the first argument of `substr` rejected when another argument follows (18); an `UnsupportedStatement`
+prints a bare `.` glued to the following number, so its toString() is not a fixpoint (19).
 
 ## Observed, not recorded
 
@@ -120,3 +122,4 @@ COLLATE NOCASE` and `a IS TRUE COLLATE NOCASE` rejected (16).
 - 2026-09-17: base bumped dec8f5def498 → c945986f1824 (2026-09-17, "Support DuckDB syntax: FROM-first, SEMI/ANTI joins, COPY, ATTACH, MACRO, PRAGMA and DuckDB 2.0 additions (#2643)"; 5.5-SNAPSHOT); 16 bug(s) still reproduce. 5 tests pass.
 - 2026-09-17: base bumped c945986f1824 → 0036c7558ce5 (2026-09-17, "feat: support ClickHouse WITH expression aliases including lambdas (#2644)"; 5.5-SNAPSHOT); 16 bug(s) still reproduce; fixed upstream: jsqlparser/4. 5 tests pass.
 - 2026-09-20: base bumped 0036c7558ce5 → 2fc6e3efbe29 (2026-09-20, "fix: preserve statement boundaries after PostgreSQL routines (#2650)"; 5.5-SNAPSHOT); 16 bug(s) still reproduce. 6 tests pass.
+- 2026-09-24: the generators were rewritten in combinator style (turn 432): `SqlGen.PROGRAM` is a generator value built from a drawn schema, statements are small records rendered by pure functions, trivia (white space, comments, case) is a drawn record applied at the end, the tests draw one value each; five latent gaps of the old model fixed and an oracle normaliser that stripped `--` inside string literals corrected; the new shapes found jsqlparser/18-19. 19 bugs.
