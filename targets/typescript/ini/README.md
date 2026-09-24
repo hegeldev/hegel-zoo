@@ -28,10 +28,18 @@ it only asks contributors not to touch the template-managed files); the zoo only
 - **`decode` is a normal form**: on random INI-ish text (headers, comments, `k=v` lines with the
   format's characters, CRLF and blank lines) it must not throw, and decoding what it encodes
   must give the same object again (minus empty sections).
-- The shapes of the recorded bugs are read off the input by a classifier (`shapes()`), counted,
-  and a case that has one is only checked when it happens to round-trip anyway; a case with
-  none must round-trip exactly. Each shape has a pin. Under `ZOO_COLLECT=1` the counts show
-  which shapes the generator reached and how many mismatches had no known shape.
+- The generators draw the shapes of all twelve recorded bugs by default and the properties fail
+  on them: `TestHegelEncodeDecodeRoundTrips` and `TestHegelDecodeIsStable` shrink to the empty
+  key (ini/12: `{ '': true }`, and the text `[]\n1=\n`), `TestHegelUnsafeUndoesSafe` to `\;`
+  (ini/5; about one run in four lands on the lone quote of ini/8 instead, an equally minimal
+  case). One property per bug (`TestHegelLiteralStringValuesRoundTrip`,
+  `TestHegelKeysContainingEqualsRoundTrip`, ..., `TestHegelEmptyKeysRoundTrip`, listed below)
+  draws that bug's shape region with random contents around it and shrinks to that bug; the
+  pins remain as one regression example each. The classifier `shapes()` reads the recorded
+  shapes off the input, counts them and names them in a failure message. `HEGEL_NO_KNOWN=1`
+  makes the generators leave the shapes out (restricted alphabets and literal pools, blank-name
+  fix-ups in the INI text, the residue filtered by the classifier, gates firing on under 1.5%
+  of cases) and skips the per-bug properties, for a run that looks past the known bugs.
 
 ## Properties
 
@@ -40,6 +48,18 @@ it only asks contributors not to touch the template-managed files); the zoo only
 | `TestHegelEncodeDecodeRoundTrips` | `decode(encode(obj, opt), opt)` against the model, all options |
 | `TestHegelUnsafeUndoesSafe` | `unsafe(safe(s)) === s` |
 | `TestHegelDecodeIsStable` | `decode` never throws on INI-ish text; `decode(encode(decode(t)))` is `decode(t)` minus empty sections |
+| `TestHegelLiteralStringValuesRoundTrip` | values that read as literals (`true`, `1.5`, `null`) round-trip (draws the shape region of ini/1; expected failure) |
+| `TestHegelKeysContainingEqualsRoundTrip` | keys containing `=` round-trip (draws the shape region of ini/2; expected failure) |
+| `TestHegelKeysEndingInBracketsRoundTrip` | keys ending in `[]` round-trip (draws the shape region of ini/3; expected failure) |
+| `TestHegelDottedSectionsWithChildrenRoundTrip` | dotted section names whose parent has children round-trip (draws the shape region of ini/4; expected failure) |
+| `TestHegelBackslashBeforeEscapableUndoesSafe` | `unsafe(safe(s))` for strings with a backslash before an escapable character (draws the shape region of ini/5; expected failure) |
+| `TestHegelSectionNamesContainingBracketRoundTrip` | section names containing `]` round-trip (draws the shape region of ini/6; expected failure) |
+| `TestHegelNullUnderDottedKeysRoundTrip` | `null` under a dotted key round-trips (draws the shape region of ini/7; expected failure) |
+| `TestHegelLoneQuotesRoundTrip` | values that are a lone quote round-trip (draws the shape region of ini/8; expected failure) |
+| `TestHegelRepeatedKeysAcrossSectionsRoundTrip` | the same key in the root and a section round-trips (draws the shape region of ini/9; expected failure) |
+| `TestHegelRepeatedBracketKeysRoundTrip` | repeated `[]` keys (arrays) round-trip with `bracketedArray` off (draws the shape region of ini/10; expected failure) |
+| `TestHegelBackslashDotSectionNamesRoundTrip` | section names with a backslash before a dot round-trip (draws the shape region of ini/11; expected failure) |
+| `TestHegelEmptyKeysRoundTrip` | the empty key round-trips (draws the shape region of ini/12; expected failure) |
 
 ## Bugs (see `bugs.toml`)
 
@@ -64,7 +84,11 @@ the source and pinned; the classifier's shapes are `ini/literal-string` (/1), `i
 (/2), `ini/key-brackets` (/3 and /10), `ini/dotted-parent` (/4), `ini/backslash` (/5),
 `ini/section-bracket` (/6), `ini/null-dotted` (/7), `ini/lone-quote` (/8),
 `ini/duplicates-across-sections` (/9), `ini/backslash-dot` (/11) and `ini/empty-key` (/12).
-With every shape excluded three runs of 4 000 cases per property had no unexplained mismatch.
+Under `HEGEL_NO_KNOWN=1` runs of 1000 and 3000 cases per property have no mismatch; by default
+every failure at 3000 cases carries a recorded shape. Until 2026-09-24 the classifier was used
+the other way round, to excuse a mismatch that had a known shape; the generators now draw the
+shapes and the properties find the bugs (the harness also gained a per-property example
+database key: all properties had shared one).
 
 ## Not bugs (modelled as documented)
 
@@ -84,7 +108,7 @@ With every shape excluded three runs of 4 000 cases per property had no unexplai
 The `align` padding widths themselves (only that the result reads back), comments inside a
 round trip (the encoder writes none), `bin/ini` (the CLI), and the merging of a
 `[a.b]` section into an existing `a` object when `a` also has a scalar `b` (a collision the
-generator avoids by using distinct keys per object).
+generator reaches only rarely).
 
 ## History
 
