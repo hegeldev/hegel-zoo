@@ -23,6 +23,15 @@
 
 ## Oracles
 
+## Known bugs
+
+See bugs.toml (3): a panic on malformed bytes (diamond-types/1), an incomplete unwind of a failed
+decode (diamond-types/2), and a process abort on a corrupted uncompressed length in the
+compressed-fields chunk (diamond-types/3, 2026-09-24). The two decode-robustness properties
+recognise the abort shape up front (header and first chunk walked, an uncompressed length above
+64 MiB) and reject it, since an allocation failure cannot be caught; its pin runs the decode in a
+child process (the test binary re-run on itself) and asserts the child exits normally.
+
 ## Not tested
 
 ## History
@@ -31,3 +40,4 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/diamond-types.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped ad48b9cced1d → 89ae3a0ab8d9 (2026-09-02, "Added span helpers for i32, fixes tests"; 2.0.0); 2 bug(s) still reproduce; add/add conflicts in src/list/encoding/tests.rs resolved by keeping both sides. 157 tests pass.
+- 2026-09-24: generators rewritten in combinator style (records of changes, mutations, script ops and sync rounds drawn as lists and applied modulo the live length); the 3000-case rounds found diamond-types/3.
