@@ -5,7 +5,7 @@ the reference implementation of JSR-310 / `java.time` (3.2M weekly downloads; `@
 6.1.0). Its AGENTS.md says "the API closely mirrors `java.time` — method names and semantics
 intentionally match Java's JSR-310 API", so the oracle is the JDK: `hegel/Oracle.java` answers
 the same operation on the same ISO strings, and every property compares js-joda's result — or
-the name of the exception it throws — with Java's (JDK 25). The patch pins 32 bugs.
+the name of the exception it throws — with Java's (JDK 25). The patch pins 34 bugs.
 
 ## How it is built
 
@@ -87,7 +87,8 @@ from the calendar year and the aligned week, so 2024-12-30 is `2024-W53-1` (2, h
 `ISO_ORDINAL_DATE` leaves the day of year unpadded (3); the three date-only variants lack the
 optional offset (4) and `BASIC_ISO_DATE`'s year takes a sign and ten digits (5);
 `ISO_ZONED_DATE_TIME` prints `[+02:00]` and `ISO_DATE_TIME` has no zone section (29); the offset
-parser ignores `parseLenient`, so `2020-01-01T10:00:00+01` is rejected (21). Patterns and
+parser ignores `parseLenient`, so `2020-01-01T10:00:00+01` is rejected (21), and accepts an
+hour of 24 to 59, so `ISO_DATE` parses `2020-01-01+31:00` where Java refuses it (34). Patterns and
 resolution: `A`, `n`, `N` and `DD` are fixed-width (17); `F` maps to another field than the
 JDK's (18); only the first `''` in a literal is unescaped (19); `xx`/`xxx`/`Z` swallow trailing
 seconds (20); parsed time fields are neither cross-checked nor validated (22), a milli/nano
@@ -115,6 +116,12 @@ the base `DateTimeException` (14).
   recorded as bugs: `ZoneOffset.isSupported/range`, `DateTimeFormatter.RFC_1123_DATE_TIME`,
   `withZone`, `parseBest`, `withResolverFields`, `appendZoneRegionId`, `appendOptional`, the
   pattern letter `g`, 13 of Java's 22 `appendOffset` patterns, `Duration.dividedBy(Duration)`.
+- 2026-09-24: the generators were rewritten in combinator style (a drawn pattern is a list of
+  parts and separators rendered by one function; an edited text is a drawn list of edits applied
+  by one function). The long runs then reached texts the old shape-based guards had not: an offset
+  field with a six-digit text (20), a quarter conflicting with the date without adjacency (24) and
+  the new 34 are now recognised on the mismatch itself and counted as `accepted-known-js-joda/N`,
+  each well under 1% of the cases.
 - Message texts are not compared (js-joda's often name a derived field, e.g. `ofYearDay(2024, 0)`
   reports "Invalid value for MonthOfYear"); `Month.valueOf('FOO')` throws `DateTimeException`
   where Java throws `IllegalArgumentException`.
