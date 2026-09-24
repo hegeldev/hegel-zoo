@@ -261,7 +261,10 @@ rounds); go/go-ini, rust/diamond-types, java/sbe, typescript/minimatch (turn 440
 minimatch/10-12 from the subagents' candidates, diamond-types/3 from the reviewer's 3000-case
 rounds); go/cron, rust/chalk, typescript/semver, java/commons-collections (turn 441; cron/6 and
 semver/15-16 from the subagents' candidates); go/now, rust/bs58, typescript/pathe,
-java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate).
+java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-humanize, rust/xml-rs
+(turn 443, the first rewrites under the unsteering standard of rule 11: the properties find the recorded
+bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
+and the sibling go/go-runewidth@14205cc.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -666,3 +669,19 @@ rule 11 (the property finds the bug and is the expected failure; `HEGEL_NO_KNOWN
 it) and for sibling targets that keep failing suites for fixed bugs (DESIGN.md decision 6), so
 the rewrites from here on unsteer as they go, and the 70 targets `zoo check --warn` lists are
 the worklist for the ones already done.
+The twenty-fifth batch (turn 443) was the first under rule 11 and settled its shape. A wide
+property reaches a recorded bug at the shape's natural rate, and at 100 cases Hegel finds a
+shape drawn in 4.6% of cases in only about six runs of ten (go-humanize/3), a 1% one rarely; so
+the deterministic evidence for each bug is a narrow property (its shape region with random
+contents, named after what it tests: `TestHegelDecimalSizesParseExactly`,
+`TestHegelKeysContainingEqualsRoundTrip`, `collateAfterIsNullAgreesWithSqlite`), and the wide
+properties that also reach it are declared `{ bug = "...", intermittent = true }` in
+`target.toml`: honest data on what Hegel finds at the default budget, rather than generators
+bent toward the bugs. Where one wide property covers several bugs it is mapped to the one it
+shrinks to, and shrinking can land in either of two equally minimal basins (ini's
+`UnsafeUndoesSafe` on `\;` three runs in four and on a lone quote otherwise), which the mapping
+tolerates. `HEGEL_NO_KNOWN=1` is read once into a boolean; `zoo test` under it reports the
+properties that then pass as "known shapes off", not as unexpected passes. xml-rs's shapes were
+common enough (16-26% of cases) that its three round-trip properties fail every run without
+a narrow property; ini's classifier, which had excused mismatches with a known shape, now names
+the shape in the failure and is what `HEGEL_NO_KNOWN=1` filters with.
