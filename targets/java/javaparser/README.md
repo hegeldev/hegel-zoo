@@ -90,17 +90,23 @@ reference-type cast, and JavaParser rightly rejects it).
 
 ## Bugs found
 
-21, in bugs.toml: JavaParser rejects valid programs (a cast lambda as an operand, `var` lambda parameters in
+22, in bugs.toml: JavaParser rejects valid programs (a cast lambda as an operand, `var` lambda parameters in
 initializers, local enums, `'\''`, and — grammatical but never well-typed — a method reference as an
-operand), gives wrong literal values (`\s`, Unicode-escaped backslashes, text blocks with white space after the
-opening delimiter or containing a form feed), prints wrongly (`- -x` as `--x`, `int m()[]` as `int ()[]m`, the
+operand and a relational operator or second `instanceof` after an `instanceof`, bug 22), gives wrong literal
+values (`\s`, Unicode-escaped backslashes, text blocks with white space after the opening delimiter or
+containing a form feed), prints wrongly (`- -x` as `--x`, `int m()[]` as `int ()[]m`, the
 form feed as a line break, `A { }` as `A`), has five range bugs (type parameters' annotations, patterns'
 modifiers, `int x[]` names, catch parameters with qualified types, type annotations), does not make a
 pattern's type its child in `instanceof`, accepts `import static x;` and `permits Foo<T>`, and keeps Unicode
 escapes in identifiers (`\u0041b` is not `Ab`, bug 20), and crashes on a qualified type starting with `var` (bug 21).
 
 Observed, not recorded: JavaParser accepts `import y;` (a single identifier), which the JLS grammar allows and
-javac rejects; javac's parser refuses lambdas inside `case … when` guards and
+javac rejects; JavaParser accepts `a ? b : c = d` as `a ? b : (c = d)` where javac's parser assigns to the
+conditional and the JLS (15.25, 15.26) allows neither, so `mutationsNeverCrash` does not compare the trees of a
+program javac parses with an assignment to an expression; javac's parser also accepts a compilation unit of bare
+annotations (`@F`) and drops them without a diagnostic, takes any expression as a case constant (`case a = b:`) and a
+nameless annotation value beside named ones (`@A(a = 1, {0})`), where JavaParser reports the missing declaration,
+the `=` or the `{`; javac's parser refuses lambdas inside `case … when` guards and
 `;` right after the imports, both of which JavaParser accepts and the JLS allows, so the generator does
 not produce them.
 
@@ -110,3 +116,4 @@ not produce them.
 - 2026-09-18: base bumped a99f4dc25b72 → 554c6f70674f (2026-09-18, "fix: resolve qualified nested types against members only (fixes #5140)"; 3.29.0-SNAPSHOT); 19 bug(s) still reproduce. 7 tests pass.
 - 2026-09-19: base bumped 554c6f70674f -> 98c8b8c43e7a (2026-09-18, "refactor: look up values among members, and drop the thread-local guard"); bug 20 (Unicode escapes in identifiers) found by `mutationsNeverCrash` during the bump, bug 21 (`var.X`) by `agreesWithJavac`, and the javac assignment-target leniency gated. 21 bugs.
 - 2026-09-19: base bumped 554c6f70674f → 98c8b8c43e7a (2026-09-19, "refactor: look up values among members, and drop the thread-local guard"; 3.29.0-SNAPSHOT); 21 bug(s) still reproduce. 7 tests pass.
+- 2026-09-24: generators rewritten in combinator style (`JavaGen` builds Generator values through a small `Gen` library, with memoised depth levels per flag set instead of draws inside helpers); bug 22 (`a instanceof T p < s`) found by `mutationsNeverCrash` in the rewrite's first review round. 7 tests pass, 22 expected failures.
