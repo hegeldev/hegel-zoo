@@ -42,9 +42,29 @@ differential needs `bash` ≥ 4.4 on PATH (`globstar`, `extglob`, `nullglob`, `d
   exactly when its slash form matches. This property found bug 10 in the 2026-09-23 long runs.
 
 Under `ZOO_COLLECT=1` the counts show which bug shapes and oracle limits the generator reached and
-how many mismatches had no known shape; the recorded bugs are skipped by shape (`Known` in the test
-file) so the properties stay strict on everything else, and each has a pin. Rounds of 300–1000
-cases per property were run until a round added nothing.
+how many mismatches had no known shape. Rounds of 300–1000 cases per property were run until a
+round added nothing.
+
+The generators draw the recorded shapes like any other, and a wide property that meets one fails
+naming the shape: `TestHegelMatchesLikeBashGlobbing` reaches bug 5 in 1.6% of its cases and bug 2 in
+0.8% (an intermittent expected failure at 100 cases, mapped to bug 2, the shape it shrinks to:
+`a*/**` over `a`), `TestHegelDisabledFeaturesAreLiteral` reaches bug 1 in 14% (`scan("{a}*")`;
+intermittent too: a shape in one case of seven still passes a 100-case run a third of the time),
+and `TestHegelApiIsConsistent`'s capture check meets bug 5 below once in a thousand cases
+(`a*+(a)?` on `aab`; intermittent). The other bugs are rare or unreachable in the wide generator
+(bug 6 in 0.2% of cases, bug 7 in 0.05%, bugs 3 and 8-10 hardly ever), so each bug has a property of
+its own drawing its shape region with random filler and a witness path, checked by the same
+bash, scan and windows comparisons, which fails every run:
+`TestHegelScanSeesGlobsAfterALiteralBraceGroup` (1), `TestHegelTrailingGlobstarMatchesTheSegmentAfterAStar`
+(2), `TestHegelStarAfterAnEmptyGroupSkipsDotfiles` (3), `TestHegelScanTreatsAnEscapedBraceAsLiteral` (4),
+`TestHegelQuestionMarkAfterAGroupMatchesOneCharacter` (5), `TestHegelGlobstarNextToAGroupStaysInTheSegment`
+(6), `TestHegelGlobstarSegmentNeedsTheSlashBeforeAnOptionalGroup` (7),
+`TestHegelNegatedPosixClassExcludesTheSlash` (8), `TestHegelPosixClassAfterGlobstarKeepsTheExplicitDot` (9)
+and `TestHegelNegatedBracketExcludesTheWindowsSeparator` (10); the pins are regression examples beside
+them. `HEGEL_NO_KNOWN=1` skips the shapes for a run that looks past the known bugs: the bash
+classifier drops the mismatching path (2.5% of cases have one), the generator leaves out the
+literal brace group and the `\{` escape before `scan`, and the narrow properties are skipped;
+every wide property then passes. The example database is keyed per property.
 
 ## What was found (10 bugs, `bugs.toml`)
 
@@ -88,3 +108,10 @@ a glob, and 10 in the windows path normalisation (`lib/utils.js` with `lib/const
   length: M` for the glob); the README's option table says "the input string", which elsewhere in
   the README is the string being tested. Doc-only inconsistency, so not recorded.
 - A leading `./` in a pattern is stripped (documented); `.` and `..` segments are not generated.
+
+## History
+
+- 2026-09-17: created; 2026-09-23: generators rewritten in combinator style.
+- 2026-09-24: unsteered (STYLE.md rule 11): the known shapes are drawn by default, three wide
+  properties are intermittent expected failures and ten narrow properties fail every run;
+  `HEGEL_NO_KNOWN=1` skips the shapes; the `Known` switches are gone.
