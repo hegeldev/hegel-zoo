@@ -22,19 +22,37 @@ The oracle is the multiset of item *references* the tree should hold, and the RE
 | `TestHegelSearchLikeBruteForce` | random `maxEntries` (default, 4–40, and the clamped values 0–3, negative, `Infinity`, a numeric string) and data format (default objects; a subclass overriding `toBBox`/`compareMinX`/`compareMinY` on `{minLng, minLat, …}`; the same overrides assigned on an instance over `[x0, y0, x1, y1, id]` arrays), then 1–30 steps of `insert` (one or a run), `load` (0–60 items, below and above the minimum fill), `remove` by reference (present, a duplicate reference, or a foreign copy), `remove(copy, equals)` with a JSON copy, `clear`, `toJSON` → `JSON` → `fromJSON` into a fresh tree, and the documented no-ops (`insert`/`remove` of `undefined`, `load` of nothing). After every step: `all()` is the model, three random queries (item boxes, points inside items, the whole plane, inverted boxes, random clusters) `search` exactly the brute-force set and `collides` agrees, and the tree's shape is checked — balanced, every node's bbox exactly the bbox of its children, no node over `maxEntries`, no empty non-root node, every stored item in some leaf exactly once |
 | `TestHegelLoadLikeInserts` | `load(data)` and inserting the same items one by one hold the same multiset and answer the same queries; a second `load` into a non-empty tree (STLT) keeps everything; up to `maxEntries` items bulk-load into a single leaf, more need a second level |
 | `TestHegelApiSurface` | an empty tree's `all`/`search`/`collides`/`toJSON`; the chainable API; the default `toBBox`/`compareMinX`/`compareMinY`; `fromJSON(toJSON())` with the same `maxEntries` answers like the original and adopts the data object |
+| `TestHegelHugeLeavesSearchLikeBruteForce` | a leaf of 200000-350000 items (a small pool of boxes repeated along a step, bulk-loaded with `maxEntries` equal to the count, in some cases under a root with one earlier item): `search` of the plane and `all()` give the multiset (rbush/1, which a sequence cannot afford) |
+| `TestHegelNaNMaxEntriesSearchLikeBruteForce` | a tree built with `maxEntries` NaN, loaded with two or more items after some inserts, answers like brute force (rbush/2) |
+| `TestHegelFractionalMaxEntriesSearchLikeBruteForce` | a tree built with a fractional `maxEntries` (4.1-12.9) bulk-loads a well-formed tree and answers like brute force (rbush/2) |
+| `TestHegelNaNCoordinateItemsSearchLikeBruteForce` | items with one NaN or missing coordinate among clean ones: the clean items are still found (rbush/3) |
 
 Coordinates mix small integers (so items coincide and overlap), decimals, 1e15-scale values,
 float32 values, `±Infinity` (upstream's tests call these "empty bboxes"), `-0` and the safe-integer
 limits; points, horizontal and vertical lines and rectangles. `HEGEL_TEST_CASES` (default 100)
 widens the sweep. The operation sequence is one `arrays(step)` draw: a step that refers to an item
 of the model carries a slot index taken modulo the model's size when it runs, so the shrinker can
-delete whole steps. Known bugs are skipped through the `Known` switches at the top of the file
-(generator-level: no fractional or NaN `maxEntries`, no NaN coordinates, no node with more than a
-few hundred children).
+delete whole steps. The example database is keyed per property.
+
+The generators draw the recorded bugs' shapes by default: `maxEntries` includes NaN and fractional
+values 4.1-12.9 beside the clamped ones (rbush/2; 5-8% of the draws), and in the sequence property
+one item's box in a hundred has a NaN or missing coordinate (rbush/3; about a quarter of the
+sequences carry one). The sequence property reaches rbush/3 at that rate and is an expected failure
+mapped to it (it shrinks to `insert(1)` of a NaN item and a point query finding nothing; once in
+thirteen runs it lands on rbush/2 instead); `TestHegelLoadLikeInserts` and `TestHegelApiSurface`
+reach rbush/2 in 2-3% of their cases and are intermittent expected failures at 100 cases (shrinking
+to `load(2)` under a NaN `maxEntries`); each bug also has a property over its shape alone (the four
+in the table above), which fails every run: rbush/1 needs a leaf of 200000 items, which only the
+narrow property draws. The bbox comparison is NaN-aware, so what fails is the blindness, not `NaN
+!== NaN`. `HEGEL_NO_KNOWN=1` leaves the shapes out (clamped `maxEntries` only, clean boxes) and
+skips the four narrow properties, for a run that looks past the bugs; every wide property then
+passes with no cases discarded. Kept out in both modes: a one-item `load()` under a NaN
+`maxEntries`, which spins for two seconds and a gigabyte before it throws (a symptom of rbush/2
+that would make the shrinker crawl).
 
 ## Bugs
 
-3 open, all pinned (see `bugs.toml`), all in the "unusual but accepted input" class — the core
+3 open (see `bugs.toml`), each found by the properties above and pinned, all in the "unusual but accepted input" class — the core
 index answered every random query correctly in 1000-case sweeps:
 
 - `all()` (and `search()` through its containment shortcut) spreads a node's children into
@@ -77,3 +95,7 @@ sibling packages (`rbush-knn`, `kdbush`, `flatbush`).
 - 2026-09-23: generators rewritten in combinator style (STYLE.md): `weighted`/`oneOf` choices,
   `arrays`/`tuples`/`record` values, the op sequence drawn as data; collect mode and the
   `n`/`pick`/`chance`/`word` helpers removed from the harness. Same properties and pins.
+- 2026-09-24: unsteered (STYLE.md rule 11): the known shapes are drawn by default, the wide
+  properties and four narrow ones are the expected failures, `HEGEL_NO_KNOWN=1` leaves the shapes
+  out; the harness compares NaN-aware and keys the example database per property; two more
+  symptoms of rbush/2 noted.
