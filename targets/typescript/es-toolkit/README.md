@@ -85,7 +85,7 @@ of all eight properties run clean at the pin).
 
 ## Bugs
 
-All 42 are open at the pin; each has a pin `TestHegelPin…` asserting lodash's result that fails
+All 54 are open at the pin; each has a pin `TestHegelPin…` asserting lodash's result that fails
 while the bug exists (see `bugs.toml` for the exact inputs).
 
 | id | function(s) | difference from lodash |
@@ -132,6 +132,18 @@ while the bug exists (see `bugs.toml` for the exact inputs).
 | 40 | xorBy, xorWith | with three or more arrays, a value shared by non-adjacent arrays survives |
 | 41 | cloneDeep, cloneDeepWith | a boxed Symbol is cloned without its symbol data (`valueOf()` throws) |
 | 42 | get, has, hasIn, at, property, unset, pick, omit | an empty segment of a string path (`"a."`, `".a"`) is dropped; `toPath`/`set`/`invoke` keep it |
+| 43 | findKey, findLastKey | `undefined` on a string (lodash: the key of the matching character) |
+| 44 | truncate | `{ length: NaN }` on `""` gives `"..."`, `{ length: -1 }` gives `""` (lodash: the reverse) |
+| 45 | truncate | a separator match at the start of the kept part is ignored (`"abcd..."` for lodash `"..."`) |
+| 46 | defaultsDeep | an array and a plain object at a shared key are not merged |
+| 47 | defaultsDeep | an inherited key gets an own default (lodash leaves it inherited) |
+| 48 | merge, mergeWith, defaultsDeep | source objects are mutated when a later source merges into them (lodash clones) |
+| 49 | defaultsDeep | an `arguments` object is kept as is (lodash: copied to a plain object) |
+| 50 | merge, mergeWith | a `0`/`-0` source value replaces a SameValueZero-equal target value |
+| 51 | intersectionWith | a string argument counts as an array of characters (lodash: dropped, as `intersection` does) |
+| 52 | isMatch, matches, matchesProperty | a `null` element of an array source matches any element |
+| 53 | clone, cloneWith | a function with own properties clones to `{}` (lodash copies the properties) |
+| 54 | omit | with a deep path, an array under a nested own `constructor` key is cloned (lodash keeps the reference) |
 
 ## Accepted differences (skipped, not counted)
 
@@ -168,6 +180,13 @@ Upstream's documented scope or lodash's own defects, kept out of `bugs.toml`:
 - `max`/`min`/`sum`/`mean` and their `By` forms over collections containing symbols: lodash throws
   on the comparison, compat skips them.
 - `isFunction` of an async generator function is true in compat, false in lodash 4.17.21.
+- lodash's `compareAscending` returns 1 for NaN against NaN whichever way round, so `orderBy` with
+  a `desc` order reverses tied NaN elements (an inconsistent comparator); compat keeps them
+  stable. `orderBy` over a collection holding NaN is skipped.
+- lodash's `truncate` tests `string.slice(end).search(separator)` for truthiness, so when the cut-off
+  remainder starts with a separator match (index 0) it skips the cut at the last separator
+  (`truncate("foo_bar   padded  ", { length: 12, separator: /,? +/ })` is `"foo_bar  ..."`);
+  compat cuts (`"foo_bar..."`). Skipped when the remainder starts with a match.
 
 ## Not tested
 
@@ -180,3 +199,4 @@ modified built-in prototypes.
 - 2026-09-17: target added at 60fe20d3 (1.52.0), 8 properties, 42 bugs.
 - 2026-09-17: base bumped 60fe20d333e6 → 82ce4af4f35e (2026-09-17, "docs(contributing): limit compat fixes to inputs Lodash's types allow or real code passes (#2108)"; 1.52.0); 42 bug(s) still reproduce. 8 tests pass.
 - 2026-09-20: base bumped 82ce4af4f35e → ee72fc74b763 (2026-09-19, "fix(compat/words): match emoji sequences, non-ASCII numerals and symbols (#2110)"; 1.52.0); 42 bug(s) still reproduce. 8 tests pass.
+- 2026-09-24: generators rewritten in combinator style (one drawn record per property, shapes for the known bugs instead of skips); twelve more differences found by the new shapes, 20000-case collect runs and 2000-case rounds, es-toolkit/43-54. 8 tests pass.
