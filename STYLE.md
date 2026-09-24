@@ -249,6 +249,8 @@ rust/uv-pep508, typescript/mnemonist, go/go-pretty, java/javaparser (turns 434-4
 found by the reviewer's second 1000-case run, javaparser/22 by the reviewer's first round);
 go/sonic, typescript/qs, rust/fancy-regex, java/jackson-yaml (turn 436; qs/13-14 and
 jackson-yaml/12-13 from the subagents' candidates, fancy-regex/2 from the reviewer's 2000-case
+rounds); go/go-ini, rust/diamond-types, java/sbe, typescript/minimatch (turn 440; go-ini/9 and
+minimatch/10-12 from the subagents' candidates, diamond-types/3 from the reviewer's 3000-case
 rounds).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
@@ -593,3 +595,26 @@ recorded-loss gates fire on about 1% instead of being the bulk of the cases; a 1
 14 seconds, so the single-1000-case-run rule is javaparser's, not Java's. sonic was quiet. Two
 of the four verifies failed only in the 2000-case rounds after the 1000-case pair had passed,
 once more: the extra rounds stay.
+
+The twenty-second batch (turns 437-440) found go-ini/9, diamond-types/3 and minimatch/10-12.
+go-ini's grammar is built once per parse mode and its records rendered by pure functions; the
+writer's value pool needed a filter for a go-ini/2 shape (`"""` inside the writer's own `"""`
+quotes) that the old generator never drew. diamond-types' corruptions are records applied by a
+pure function, and its verify was the batch's lesson: a 3000-case round printed "63 passed, 13
+patch tests not run" with no failure text, which is the signature of a test binary killed by an
+abort (here `memory allocation of 1170968169863 bytes failed`, SIGABRT, from a corrupted LZ4
+chunk's declared length); the full text lives only in `work/<t>.log`, overwritten by the next run.
+An uncatchable crash cannot be a `should_panic` pin: the properties reject the recognisable shape
+after walking the header with the crate's own `pub(super)` reader, and the pin re-runs the test
+binary on itself (`std::env::current_exe()`, `--exact`, a marker environment variable) and asserts
+the child's exit status. sbe's schema is a record tree from a grammar built once per `extended`
+flag, rendered to XML and a named layout by a pure function, the message values a tree matched to
+that layout; its 1000-case run (three and a half minutes each, so no 3000-case run fits the
+ten-minute cap) met a wider shape of the recorded sbe/10 that the new `sinceVersion` field made
+reachable, resolved by padding to the current schema's block length rather than skipping.
+minimatch's atoms are records carrying their own solutions, so the candidate paths derive from
+the pattern tree; its bash oracle needed two more recorded limits (an empty brace alternative, the
+empty alternative of `@(...)` after a star), found only in the 1000- and 3000-case rounds. Two
+process restarts cut the batch's subagents short; a subagent resumed by message is not waited for
+and dies with the turn, so a cut-short subagent is relaunched with a continuation prompt that
+describes the partial work in its work dir.
