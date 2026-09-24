@@ -32,8 +32,16 @@ installs it on CI.
 `zoo test` applies the patch, runs `[run] command` and judges the test results against
 `[expected_failures]`: every test the patch adds must run and pass, except those pinned to a bug
 in `bugs.toml`, which must fail (a pinned test that passes is reported — the bug may be fixed
-upstream, `zoo bump --accept-fixed` records that). Upstream's own tests failing are reported as
-`UPSTREAM` and not judged. `--test-cases N` sets Hegel's budget (the weekly `full.yml` run uses
+upstream, `zoo bump --accept-fixed` records that, and scaffolds a sibling target `<name>@<sha7>`
+at the old base so that the fixed bugs keep reproducing under the pinned Hegel; the sibling's
+README says what is left to do by hand, and `zoo check` holds it to a pinned base with a failing
+test per kept bug). Upstream's own tests failing are reported as `UPSTREAM` and not judged.
+
+A known bug is found by a property, not avoided by one: the property keeps drawing the failing
+shape and is listed in `[expected_failures]` mapped to the bug, with a pin beside it as the
+regression example. `HEGEL_NO_KNOWN=1` switches the known shapes off for a run that looks past
+them. `zoo check --warn` lists the targets where only pins are expected failures and the README
+says the generators avoid shapes (the older practice; a worklist). `--test-cases N` sets Hegel's budget (the weekly `full.yml` run uses
 1000, ten times the default).
 
 ## Per language

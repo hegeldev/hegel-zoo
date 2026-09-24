@@ -62,7 +62,15 @@ guidance; this file is the zoo-specific part.
     so a `note("input=%q", input)` repeating a drawn value is noise; note derived values (the
     oracle's answer, a normalised form).
 11. **Pins stay plain tests** (`TestHegelPin...`, `pin(...)`, `#[test]`), named after the bug,
-    listed in `[expected_failures]`; a pin is not a property and needs no Hegel.
+    listed in `[expected_failures]`; a pin is not a property and needs no Hegel. But a pin is
+    never the only evidence of a bug (2026-09-24, David): the property that found it keeps
+    drawing the failing shape and is itself the expected failure, mapped to the bug. Known-bug
+    gates in a property are therefore off by default and switched on by `HEGEL_NO_KNOWN=1`
+    (one env var read once, in the harness), for a run that looks past the known bugs; a gate
+    that is on by default sidesteps the bug, which DESIGN.md decision 3 forbids and `zoo check
+    --warn` flags. Rewrites done before this date kept the old gates on; unsteering them is a
+    worklist, starting with targets whose bugs have been fixed upstream (those get sibling
+    targets, DESIGN.md decision 6).
 12. **The harness is as small as the binding forces it to be.** What remains and why is in
     HACKING.md: Go needs `hegelOpts()` (hegel-go reads no environment variable) and the panic
     wrapper (hegel-go re-raises a panic after shrinking, aborting the test binary); TypeScript

@@ -134,6 +134,11 @@ those keep a skipped minimal reproducer in the patch, since an abort takes the w
 
 `TROPHIES.md` at the root is generated from all `bugs.toml` files by `zoo report`.
 
+When a bump records a bug as fixed, the pre-bump target is kept as a **sibling**
+`<name>@<sha7>` with a pinned base so that the bug keeps reproducing under the current Hegel
+(Decisions, 6). A sibling's `[base]` carries `pinned = "..."` and `keeps = [...]`, its
+`[expected_failures]` name the main target's bug ids, and it has no `bugs.toml`.
+
 Only the tests the patch adds are judged. Upstream's own suite runs alongside (the patch sits
 in its test files) and can fail for reasons that are not the zoo's: patches exclude lockfiles,
 so dependencies float, and toolchains drift. Such failures are reported as `UPSTREAM` and do not
@@ -251,7 +256,26 @@ note an MSRV below hegeltest's 1.86, which the runner must handle.
 1. **Patches** against pinned upstream commits, as above; new files preferred for new targets.
 2. **Seed by importing the predecessor** wholesale, updating each patch to the pinned Hegel.
 3. **Known-bug tests stay as written and are listed as `expected_failures`.** The zoo's tests
-   never work around a known bug.
+   never work around a known bug. (Restated 2026-09-24, after a survey found 261 targets whose
+   only expected failures are pins and 64 READMEs saying the generators avoid the pinned shapes:
+   a property that has found a bug keeps drawing the failing shape and *is* the expected failure,
+   mapped to the bug; a pin is a regression example beside it, never the only evidence, since a
+   pin says nothing about whether Hegel finds the bug. Where a run that looks past the known bugs
+   is wanted, the shapes are switched off by `HEGEL_NO_KNOWN=1`, never by default. `zoo check
+   --warn` flags the pin-only targets; they are a worklist.)
+6. **Sibling targets keep failing suites for fixed bugs** (David, 2026-09-24). One use of the
+   zoo is evaluating Hegel's bug finding and shrinking, which needs suites that fail; a bump
+   that records a bug as fixed would otherwise leave nothing failing anywhere. So the pre-bump
+   target lives on as `targets/<lang>/<name>@<sha7>/`, a full target (test, check, CI,
+   `bump-hegel`, so it always runs on the pinned Hegel) whose `[base]` is pinned (`pinned =
+   "why"`, `keeps = ["<name>/1", ...]`; `bump` and `drift` skip it). It has no `bugs.toml`: its
+   `[expected_failures]` map to the main target's ids, which TROPHIES.md counts once, and `zoo
+   check` insists every bug it keeps has a failing test, so a Hegel that stops finding one shows
+   up as an unexpected pass. Its properties must find the bugs, not sidestep them, and behaviour
+   the newer upstream changed on purpose is tolerated by its model, not counted; both are
+   per-target judgement, which is why `zoo bump --accept-fixed` only scaffolds the sibling and
+   prints what is left to do by hand. A frozen snapshot was considered and rejected: the failing
+   configuration must track the current Hegel and the tests' improvements.
 4. **CI on GitHub Actions** as above; `tools/zoo` must equally run everything locally, since
    porting to new Hegel versions is done locally.
 5. **The zoo only records bugs.** Most predecessor bugs have already been filed upstream;
