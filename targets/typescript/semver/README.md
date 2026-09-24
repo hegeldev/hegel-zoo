@@ -74,12 +74,18 @@ policy (checked 2026-09-15); the zoo only records bugs.
 | semver/12 | low | a range with a component at MAX_SAFE_INTEGER throws Invalid minor/patch version from the desugaring, so validRange rejects it and satisfies is false for its versions |
 | semver/13 | medium | subset and intersects take a set with an exact prerelease comparator and a bound as empty: a subset of everything, intersecting nothing |
 | semver/14 | low | gtr and ltr with both bounds on one version (1.1.2 - 1.1.2) report a higher version as lower than the range |
+| semver/15 | low | inc with identifierBase false and an identifier equal to the current prerelease returns the input unchanged when the prerelease ends in a number (`inc('1.2.3-0', 'prerelease', undefined, '0', false)` is `1.2.3-0`), where the alphanumeric case returns null |
+| semver/16 | low | intersects is false for a range below a prerelease of 0.0.0 (`<0.0.0-alpha` against itself or `>=0.0.0-0`) although 0.0.0-0 satisfies it and minVersion returns 0.0.0-0 |
 
 /1, /2 and /3 came from a probe file written after reading the source (`classes/range.js`
 577 lines, `classes/semver.js` 350, `ranges/subset.js` 249, `ranges/outside.js` 82 and the
 rest); /4–/14 were found by the properties in three collect rounds (the membership property
 found nine of them). With every shape excluded, 4 000 cases per property had no unexplained
 mismatch.
+/15 and /16 were found when the generators were rewritten in combinator style (the increment
+case draws its identifierBase and identifier as one record, and `<0.0.0-alpha` is an ordinary
+comparator of the range grammar); the same rewrite reached semver/4 and semver/13 from new
+directions, noted in `bugs.toml`.
 
 ## Not bugs (modelled as documented)
 
