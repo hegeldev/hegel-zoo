@@ -260,7 +260,8 @@ jackson-yaml/12-13 from the subagents' candidates, fancy-regex/2 from the review
 rounds); go/go-ini, rust/diamond-types, java/sbe, typescript/minimatch (turn 440; go-ini/9 and
 minimatch/10-12 from the subagents' candidates, diamond-types/3 from the reviewer's 3000-case
 rounds); go/cron, rust/chalk, typescript/semver, java/commons-collections (turn 441; cron/6 and
-semver/15-16 from the subagents' candidates).
+semver/15-16 from the subagents' candidates); go/now, rust/bs58, typescript/pathe,
+java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -647,3 +648,21 @@ of the time (hegel-go v0.6.33, measured with 5000 cases; the Java binding shows 
 the first when its weight is 2 or more - and a rare alternative must not come first; `chance`
 spelled `x >= 100-pct` is unaffected. The commons-collections rewrite moved its rare `""` key to
 the second alternative for this reason.
+
+The twenty-fourth batch (turn 442) found pathe/16 and rewrote now, bs58 and snakeyaml-engine
+without a new bug. now's cases are records with the pinned DST-boundary shapes kept out by a
+`Filter` on the case generator (1-2% raw rejection), and its layout table is a flat `SampledFrom`
+with repetition because a draw-free `Just` alternative wins shrinking over every drawing one,
+whatever the order. bs58's alphabet and candidate alphabets are enums rendered by pure functions
+and its checksum corruption a record applied modulo the live length; a `no_std` crate needs
+`use std::{format, string::ToString}` for the `#[hegel::test]` expansion. pathe's globs are
+segments of atoms carrying their own regex and solutions, and the candidates derive from the
+glob; the rewrite reached an escaped character glued to `**` (pathe/16, the `**` crosses slashes
+because the folding rule cannot see the escape token) and closed several latent gaps of the old
+model. snakeyaml-engine's stream is a sealed node tree with style records, drawn by a grammar
+built once per schema, replacing a generator object that drew while writing. This batch was
+the last under the old rule on known bugs: the same day David asked for the gate pattern in
+rule 11 (the property finds the bug and is the expected failure; `HEGEL_NO_KNOWN=1` looks past
+it) and for sibling targets that keep failing suites for fixed bugs (DESIGN.md decision 6), so
+the rewrites from here on unsteer as they go, and the 70 targets `zoo check --warn` lists are
+the worklist for the ones already done.
