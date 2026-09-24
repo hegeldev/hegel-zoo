@@ -244,7 +244,9 @@ and js-joda/34 found by the long runs); rust/glam, java/dnsjava, go/mod, typescr
 runs of the fixpoint property); rust/rust-ini, go/x-text, typescript/yaml, java/jsqlparser (turn 432;
 x-text/44-45, yaml/32-40 and jsqlparser/18-19 found by the rewrites' new shapes and long runs);
 rust/pep508_rs, go/ugorji-codec, java/json-java, typescript/es-toolkit (turn 433; es-toolkit/43-54,
-nine from the rewrite's shapes and collect runs, three from the reviewer's 2000-case rounds).
+nine from the rewrite's shapes and collect runs, three from the reviewer's 2000-case rounds);
+rust/uv-pep508, typescript/mnemonist, go/go-pretty, java/javaparser (turns 434-435; uv-pep508/7
+found by the reviewer's second 1000-case run, javaparser/22 by the reviewer's first round).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -551,3 +553,23 @@ failure depending on a 15% alternative passed a 100-case round until that altern
 first, and its `longs()` favour NaN/Infinity bit patterns so a finite-double filter rejected
 47% (draw sign, exponent and mantissa instead). The same turn made `zoo save` refuse a patch
 with a binary hunk (`--allow-binary` to override) and `zoo check` report one.
+
+The twentieth batch (turns 434-435) found uv-pep508/7 and javaparser/22. uv-pep508 mirrors
+pep508_rs (a ten-arm comparison `one_of!`, `flat_map` from the key to a version fit for it, a
+`recursive` marker tree, one record per requirement with a whitespace tape) and the bug was a
+`Display` that narrows a `!=` star range, missed by the two 1000-case runs and found by the next
+one: a Rust tree-shaped domain wants the 2000-3000-case rounds too, not only the differential
+targets. mnemonist's model-based properties stopped ending a case at a known bug: an operation
+the bug would corrupt is counted and not applied, a check it would falsify is counted and
+skipped, and only the one shape that poisons every later step is still an assume (about 1% of
+cases instead of case-ending returns in nine properties). go-pretty's package-level generators
+initialise after the known-bug switches (`loadKnown()` first), its `Size.WidthMax` is mapped
+onto the checkable range instead of assumed, and its second 1000-case run found four latent
+model gaps of the old test (a NaN sort key, a greedy row matcher, a slice index after dropped
+rows). javaparser's 1800-line `JavaGen` of `if (chance)` sites became Generator values over a
+small `Gen` library (`w`/`v` weighted choices, `all` for tuples of any arity, `opt`, `many`) with
+a tower of depth levels memoised per flag set, so a property picks `PROGRAM`, `PRINTABLE_PROGRAM`
+or `LEXICAL_PROGRAM` and draws once; a 1000-case run of it takes three to eight minutes, so its
+long rounds are single 1000-case runs, one per ten-minute command, not 2000-case ones. The
+javaparser subagent's report never arrived (its 2000-case runs hit the command cap twice); the
+review recovered its edits with `zoo save` and its trace from the session's subagent transcript.
