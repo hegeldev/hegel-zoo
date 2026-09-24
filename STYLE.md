@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -745,3 +745,14 @@ reached by the wide grammar at all in 2000 cases. Two `bugs.toml` notes were wro
 standalone check against both engines settled (liquidjs/9's list of flattening filters,
 liquidjs/12's claim about `replace_first`): the notes deserve the same reproduction discipline
 as the bugs. Fifth TypeScript harness with the shared example-database key.
+
+The thirtieth batch (turn 450: node-csv alone, the last of a day's budget) added two things.
+The gate was not only in `known.mjs`: the Python comparison canonicalised `[]` to `[""]` at width
+one and the README listed it as an accepted difference, when it is exactly the shape of
+node-csv/2 (a lone empty field written as an empty line). A tolerance in the comparison is a gate
+with a different name; an accepted difference must be a difference of the oracle's environment,
+not of the library. Two bugs (/7, /8) had a pin and no property at all; a property for `raw`
+(the records' raw text concatenates to the input) widened /7 from delimiters to multi-byte quotes
+and escapes within its first run. And a helper shrinking the wrong way (`chance` shrank to true,
+so every shrunk case had every option on) had gone unnoticed while the shapes were gated: the
+direction a helper shrinks in only shows once something fails.
