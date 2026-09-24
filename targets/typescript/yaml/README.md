@@ -59,8 +59,8 @@ in a worker with a five-second limit.
 
 Two source reviews (parser/composer; nodes/stringify/schemas) named yaml/1-8, 10-19 and 21 before or
 alongside the properties; every claim was confirmed with a pin, and the properties found yaml/1
-(as a hang), 4, 5, 6, 7, 8, 9, 15, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30 and 31 on their own (the writer's mutated documents
-hit the CST shapes).
+(as a hang), 4, 5, 6, 7, 8, 9, 15, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 and 32-40 on their own (the writer's
+mutated documents hit the CST shapes; 32-40 came from the combinator rewrite of the generators).
 
 ## Not tested
 
@@ -74,3 +74,4 @@ hit the CST shapes).
 
 - 2026-09-20: created (turn 323); 30 bugs recorded.
 - 2026-09-20 (turn 324): `-0` under the JSON schema is not judged either (first CI run failed on it); yaml/31 (a leading U+FEFF lost at the stream start) recorded; 31 bugs.
+- 2026-09-24: the generators were rewritten in combinator style (one case record per property, a tree with per-node style records for the writer, edits as lists applied modulo the live size, every gate an assume); eight latent gaps of the old model fixed on the way; the new shapes found yaml/32-40 (a mixed dash-dot marker rejected and lost from the CST, an anchor cut at a no-break space, three more CST order and blank-line losses, a plain flow scalar with a colon before a line break, NaN from 0b_, a flow !!omap long key, and the explicit-key sequence indentation); 40 bugs.
