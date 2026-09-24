@@ -237,7 +237,9 @@ eight behaviours commonmark-java gated were recorded as commonmark-java/53-58 in
 verifying run found 59); rust/uv-pypi-types, go/miekg-dns, typescript/smol-toml, java/snakeyaml
 (turn 427; smol-toml/10 and snakeyaml/17-22 found by the rewrites' long runs); rust/toml,
 go/jsonschema, java/commons-text, typescript/js-yaml (turn 428, quiet: two oracle tolerances and
-a model gap in js-yaml, no library bug).
+a model gap in js-yaml, no library bug); rust/full_moon,
+java/roaringbitmap, go/kaptinlin-jsonschema, typescript/js-joda (turn 429; kaptinlin-jsonschema/9-10
+and js-joda/34 found by the long runs).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -449,3 +451,25 @@ context as an indicator), and its marker-key check for js-yaml/4 now covers Set 
 measurements are also the answer to the skewed distributions the Go and TypeScript bindings
 show inside large cases (a nominal 75% came out at 52%): check that every shape is reached rather
 than tune the weights.
+
+The sixteenth batch (turn 429) applied the probe rule from the start and every subagent reported
+its rates. full_moon's arbitrary-text round-trip property drew `text()` that almost never parsed as
+non-blank Lua; it now draws a program from the grammar plus up to three edits. roaringbitmap's
+BitSet bridge was skipped in 62% of the serialization cases (the drawn bitmap was too wide) and is
+now its own small-bitmap draw; a 35% forEach gate became a check on a run-decompressed clone
+instead of a skip. kaptinlin-jsonschema's defaults property skipped 24.5% of its cases under
+unmodelled applicators; the unmodelled keywords are now stripped from the rendered schema, and the
+property found two library bugs at once (a `default: null` never applied, `not`/`contains`/`if`
+with an empty subschema dropped by `json/v2`'s omitempty on marshal). js-joda's parsing
+properties draw a pattern as parts and separators and an edited text as a list of edits, both
+rendered by pure functions; the long runs then produced texts that the old pattern-shape guards for
+three recorded bugs never saw (a six-digit offset text for js-joda/20, a quarter conflict without
+adjacency for /24) and one new bug (the offset parser passes hours 24-59, js-joda/34), so those
+are recognised on the mismatch itself and counted. Shapes: full_moon builds a syntax tree from two
+`recursive()` generators, the statement grammar nested inside the expression one's closure with
+the inner subtree boxed - the way to mutual recursion until proptest offers one - and its
+`max_leaves` default of 100 had to be cut hard for a grammar; the kaptinlin rewrite ported the
+go/jsonschema rewrite almost whole, one more argument for a shared Go schema harness (see
+Ergonomics). Lesson on delegation: a subagent that leaves its final 1000/3000-case runs in the
+background reports before they finish, and the runs die with the turn; the reviewer's own two
+1000-case rounds are what actually catch what those runs would have.
