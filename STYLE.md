@@ -241,7 +241,8 @@ a model gap in js-yaml, no library bug); rust/full_moon,
 java/roaringbitmap, go/kaptinlin-jsonschema, typescript/js-joda (turn 429; kaptinlin-jsonschema/9-10
 and js-joda/34 found by the long runs); rust/glam, java/dnsjava, go/mod, typescript/css-tree
 (turn 431; css-tree/17-24 found by the rewrite's new shapes and the reviewer's 20000-case collect
-runs of the fixpoint property).
+runs of the fixpoint property); rust/rust-ini, go/x-text, typescript/yaml, java/jsqlparser (turn 432;
+x-text/44-45, yaml/32-40 and jsqlparser/18-19 found by the rewrites' new shapes and long runs).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -498,3 +499,29 @@ plain 100-case round failed once without detail - which is the lesson of this ba
 node --test --test-name-pattern=<Name>` in the work dir is how a one-in-20000 mismatch is seen
 and shrunk. The css-tree pin file was a binary hunk of the patch because one pin held a raw
 NUL; it is an escape now, and the go-diff patch has the same problem still.
+
+The eighteenth batch (turn 432) took the largest targets so far and found thirteen bugs. x-text
+(4921 lines, seven test files, 43 pins) went file by file with a test after each; its baseline
+was not even green (three deterministic failures: an oracle table difference, a latent model
+bug, a known bug reaching an ungated property), ten known-bug skips became count-and-continue
+(one had been dropping 69% of the tag test), and the new shapes found the ISO-2022-JP encoder
+passing ESC through (x-text/44) and NFKC `BoundaryBefore` wrong for the compatibility jamo
+(x-text/45). yaml's writer draws a tree whose nodes carry style records and renders it with a
+pure function instead of sixty coin flips inside the rendering; the new shapes found nine bugs
+(yaml/32-40: a mixed dash-dot line rejected and lost from the CST, an anchor cut at a no-break
+space, three more CST losses, a plain flow scalar with a colon before a line break read back as
+a map, NaN from `0b_`, a flow `!!omap` long key, the explicit-key sequence indentation under
+`indent: 4`). jsqlparser's SQL programs are a generator value built from a drawn schema, with
+scope-parameterised expression generators memoised per case - the honest compromise when column
+references need the drawn schema - and trivia drawn as one record applied at the end; its
+3000-case runs failed six times in a row on latent gaps of the old model before passing, and an
+oracle normaliser that stripped `--` inside string literals was among them (jsqlparser/18-19 from
+the new shapes). rust-ini reached zero filters: alphabets computed per escape policy replace the
+retry loops, and a `Source` tree rendered by a pure fitter replaces the hand-rolled state machine.
+Lessons: a rewrite's baseline must be run and classified before the generators are touched; TS
+work dirs hold build products the setup regenerates (yaml3.mjs, test-events.mjs) that `zoo save`
+sweeps into the patch unless deleted first; and the binary-hunk sweep was closed the same turn
+(`grep -l '^GIT binary patch$' targets/*/*/hegel.patch` is empty: diamond-types carried three
+data files its own tests write, and jsonrepair, msgpackr and regexp-tree held raw control
+characters in one-character string literals - go-diff never had one, its test text merely
+mentions the header).
