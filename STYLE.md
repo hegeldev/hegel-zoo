@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -733,3 +733,15 @@ because the generator never drew special parameters or object env values, which 
 properties now do. Standalone reproduction paid off again: sonic's top-level `-0` keeps its sign
 on the first decode of a process and loses it on every later one (the JIT path), which a
 one-shot probe would have called a non-bug.
+
+The twenty-ninth batch (turn 449: liquidjs, jsonschema) was a short one, run late in a day's
+budget, and mostly confirmed the pattern. liquidjs's `ZOO_FULL` had been doing two jobs, lifting
+the known-bug gates and the documented-difference gates together; they are different things (one
+is the standard's `HEGEL_NO_KNOWN=1`, the other a tolerance of the oracle's environment) and are
+now two switches. jsonschema shows the intermittent case cleanly: every shape is a few cases per
+hundred of its wide property, so all four wide properties are intermittent at 100 cases and the
+narrow properties carry the determinism; one shape (/7, the aliased `instanceLocation`) is not
+reached by the wide grammar at all in 2000 cases. Two `bugs.toml` notes were wrong in details a
+standalone check against both engines settled (liquidjs/9's list of flattening filters,
+liquidjs/12's claim about `replace_first`): the notes deserve the same reproduction discipline
+as the bugs. Fifth TypeScript harness with the shared example-database key.
