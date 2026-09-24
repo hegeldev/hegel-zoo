@@ -18,9 +18,10 @@ tests in its own patch and files nothing upstream.
 build (no cgo, nothing to install; the first build compiles the generated RE2 module, about ten
 seconds). `GOWORK=off` because upstream carries a `go.work` (the root module and `./build`) and
 workspace mode refuses the zoo's `GOFLAGS=-mod=mod`.
-The patch adds, as the external package `re2_test`, `hegel_test.go` (harness, the `Known`
-switches), `hegel_gen_test.go` (pattern and text generators), `hegel_methods_test.go`,
-`hegel_experimental_test.go` and `hegel_pins_test.go` (one plain test per bug), and requires
+The patch adds, as the external package `re2_test`, `hegel_test.go` (harness, the
+`HEGEL_NO_KNOWN` switch), `hegel_gen_test.go` (pattern and text generators), `hegel_methods_test.go`,
+`hegel_experimental_test.go`, `hegel_shapes_test.go` (one narrow property per recorded bug) and
+`hegel_pins_test.go` (one plain test per bug), and requires
 `hegel.dev/go/hegel v0.6.33` in go.mod. RE2 logs every pattern it rejects to stderr
 (`E0000 ... re2.cc:242] Error parsing ...`); those lines are noise from the patterns both
 packages reject, not failures. Not to be run under `ulimit -v`: the wasm2go runtime reserves
@@ -58,14 +59,25 @@ its module memory up front and, refused, panics with a nil interface conversion 
 | PackageFunctionsAgreeWithRegexp | `MatchString`, `Match` and their errors, `QuoteMeta` (and matching the quoted text), `MustCompile` panics on the same patterns, `Copy` gives the same results |
 | SetAgreesWithEachPattern | `CompileSet` of 1–4 patterns: `FindAllString`/`FindAll` with n = -1 equal the set of matching patterns, n = 0 gives nil, a positive n gives min(n, matching) of them |
 | Latin1AgreesWithRegexp | `CompileLatin1`: acceptance, `FindAllStringSubmatchIndex` (offsets transcoded) and `MatchString` against `regexp` on the UTF-8 text |
+| FindAllWithZeroLimitAgreesWithRegexp | a `FindAll` method with n = 0 on a generated pattern and text gives nil, as `regexp` does (go-re2/1) |
+| NonBoundaryOnMultiByteTextAgreesWithRegexp | a pattern with `\B` on a text with a word character before a multi-byte character (go-re2/2) |
+| POSIXNegatedClassOnNewlineAgreesWithRegexp | a POSIX pattern with a negated class on a text containing a newline (go-re2/3) |
+| SubmatchLimitPastEmptyMatchAgreesWithRegexp | a `FindAll...Submatch...` method with a positive limit on a nullable pattern whose text has an empty match before a non-empty one (go-re2/4) |
 
 Compile acceptance is compared on every pattern (a disagreement is a mismatch); patterns both
-reject are counted. Mismatches are classified by method before they count: a `Known` switch per
-recorded bug shapes the generator (the limit 0 is left out; a pattern with `\B` draws its texts
-from a pool without characters above U+007F, and a POSIX pattern with a negated class from a
-pool without a newline; the `FindAll...Submatch...` methods are compared with a positive limit
-only when the pattern cannot match the empty string, decided on `regexp/syntax`'s tree); the
-pins assert `regexp`'s behaviour and fail while the bug exists.
+reject are counted. The generators draw the recorded bugs' shapes by default: the limit 0 is
+among the `FindAll` limits (about half of Methods' cases, so Methods fails every run on go-re2/1
+and shrinks to `FindAllString("", 0)`), texts beside `\B` include multi-byte characters, POSIX
+negated classes run on texts with newlines, and the Submatch methods are compared with positive
+limits on nullable patterns too; a mismatch names the bug whose shape it has. The wide
+properties reach /2, /3 and /4 rarely (0.1-0.5% of cases: Longest is an intermittent expected
+failure for /4, the wide POSIX property for /3, and PackageFunctions and Set can reach /2 only
+in principle), so each bug also has a narrow property in `hegel_shapes_test.go` over its shape
+region with random contents, which fails every run; the pins assert `regexp`'s behaviour beside
+them. `HEGEL_NO_KNOWN=1` switches the shapes off for a run that looks past the bugs: the limit 0
+is left out, a pattern with `\B` draws its texts from a pool without characters above U+007F, a
+POSIX pattern with a negated class from a pool without a newline, and a /4-shaped mismatch is
+skipped (under 1% of Methods' and Longest's cases); every property then passes.
 
 ## Accepted differences
 
@@ -97,3 +109,6 @@ few matches.
   perl/latin/posix flags, the known-bug skips became the text pool per pattern, and the
   `ZOO_COLLECT` collector is gone. The PackageFunctions property, which had no go-re2/2
   gate, now shares the pool. No new bug.
+- 2026-09-24: unsteered (STYLE.md rule 11): the known shapes are drawn by default, Methods and
+  (intermittently) Longest and POSIX are the expected failures with four narrow properties in
+  `hegel_shapes_test.go`; `HEGEL_NO_KNOWN=1` switches the shapes off; the `Known` struct is gone.
