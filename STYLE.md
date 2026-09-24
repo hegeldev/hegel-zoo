@@ -251,7 +251,8 @@ go/sonic, typescript/qs, rust/fancy-regex, java/jackson-yaml (turn 436; qs/13-14
 jackson-yaml/12-13 from the subagents' candidates, fancy-regex/2 from the reviewer's 2000-case
 rounds); go/go-ini, rust/diamond-types, java/sbe, typescript/minimatch (turn 440; go-ini/9 and
 minimatch/10-12 from the subagents' candidates, diamond-types/3 from the reviewer's 3000-case
-rounds).
+rounds); go/cron, rust/chalk, typescript/semver, java/commons-collections (turn 441; cron/6 and
+semver/15-16 from the subagents' candidates).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -618,3 +619,23 @@ empty alternative of `@(...)` after a star), found only in the 1000- and 3000-ca
 process restarts cut the batch's subagents short; a subagent resumed by message is not waited for
 and dies with the turn, so a cut-short subagent is relaunched with a continuation prompt that
 describes the partial work in its work dir.
+
+The twenty-third batch (turn 441) found cron/6 and semver/15-16, and rewrote chalk and
+commons-collections without a new bug. cron's grammar is data built once per parser layout, an
+invalid spec a good spec plus a corruption record applied by a pure render; its old "too few
+fields" corruption rendered a bare `TZ=` prefix (the cron/1 panic) in 0.56% of bad specs and made
+the committed test fail at 1000 cases, fixed by shape. The Next property drew Lord Howe and
+Chatham as schedule zones and met cron/6 (Next steps whole hours as if every wall-clock hour
+began on a step, so a 30- or 45-minute DST shift loses or misplaces runs). chalk's term is a data
+tree from `recursive()` over a leaf grammar built once per variable mode, since `one_of!` cannot
+make an alternative conditional and the function form `generators::one_of(Vec<Boxed...>)` can;
+the old shift property silently passed 3.2% of its cases when `shifted_out` failed, now a filter
+on the tree. semver's range grammar is data rendered by pure functions and its candidates are
+drawn up front; the rewrite reached semver/12, /4 and /13 from new directions and found semver/15
+(an increment that returns its input) and /16 (`<0.0.0-alpha` intersects nothing). The batch's
+lesson is about the bindings themselves: an integer draw over 0..99 lands on the value 1 about 15%
+of the time (hegel-go v0.6.33, measured with 5000 cases; the Java binding shows the same), so a
+`weighted` choice built on it gives ~15 extra points to whichever alternative owns that value -
+the first when its weight is 2 or more - and a rare alternative must not come first; `chance`
+spelled `x >= 100-pct` is unaffected. The commons-collections rewrite moved its rare `""` key to
+the second alternative for this reason.
