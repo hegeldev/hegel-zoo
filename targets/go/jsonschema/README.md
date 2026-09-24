@@ -8,12 +8,13 @@ the flag/basic/detailed output formats. Pinned at `ec6106e` (v6.0.3, the
 
 ## Build
 
-The patch adds `go.mod` changes and six test files: `hegel_test.go`
-(plumbing, the `Known` gates), `hegel_gen_test.go` (random schemas valid by
+The patch adds `go.mod` changes and seven test files: `hegel_test.go`
+(plumbing, the `Known` gates that `HEGEL_NO_KNOWN=1` turns on), `hegel_gen_test.go` (random schemas valid by
 construction for their draft, guided and random instances, a schema
 mutator), `hegel_oracle_test.go` (the Python oracle process),
 `hegel_props_test.go` and `hegel_refs_test.go` and `hegel_more_test.go` (the
-seven properties) and `hegel_pins_test.go` (seven pins). `go get
+wide properties), `hegel_shapes_test.go` (one property per bug) and `hegel_pins_test.go`
+(seven pins). `go get
 hegel.dev/go/hegel` raises the `go` directive to 1.26; the tests run with
 `GOWORK=off` because the repository's `go.work` pins an older Go.
 **Needs `python3` with the `jsonschema` package (4.x, with `referencing`)**;
@@ -81,9 +82,21 @@ functions plus the format table.)
 | jsonschema/6 | low | a `dependencies` failure is reported at `/dependency/<prop>` |
 | jsonschema/7 | medium | a `propertyNames` failure's `instanceLocation` aliases the path buffer and points at a sibling |
 
-Each bug has a `Known` gate that keeps its input shape out of the
-properties and a pin in `hegel_pins_test.go` asserting the correct
-behaviour; the pins fail while the bugs exist (`[expected_failures]`).
+The generators draw the recorded shapes by default: count keywords at and beyond 2^63 (one
+draw in ten), `const` beside `$ref` in drafts 6 and 7 (in the schemas and in the transparency
+wrappings), signed fields among the format edge cases and mutations, property names that
+percent-encode, `propertyNames` and the array form of `dependencies`. The properties that meet
+a shape fail naming it and are the expected failures mapped to the bugs (`target.toml`); each
+shape is in a few cases per hundred of its wide property, so the four wide properties are
+intermittent at 100 cases (`ValidationMatchesPython` to /2, `OutputsAreWellFormed` to /4 with /5
+and /6 as other basins, `FormatsFollowTheirRFCs` to /3, `ReferencesAreTransparent` to /1), and
+`hegel_shapes_test.go` has one property per bug over its shape region with random contents
+(`TestHegelConstBesideRefIsIgnored`, ..., `TestHegelPropertyNamesFailuresLocateTheObject`,
+whose shape the wide grammar reaches in none of 2000 cases), which fails every run. The pins in
+`hegel_pins_test.go` are the regression examples. `HEGEL_NO_KNOWN=1` switches the shapes off
+(the `Known` gates come on: the generators leave the shapes out and a mismatch that still has
+one is skipped, about 2% of the output cases and under 1% of the format cases) for a run that
+looks past the bugs, under which the thirteen properties pass at 1000 cases.
 
 ## Not bugs (accepted differences, modelled in the tests)
 
@@ -96,7 +109,8 @@ behaviour; the pins fail while the bugs exist (`[expected_failures]`).
   Python divides floats. The differential uses exact binary divisors.
 - Draft 4 reads `2.0` as an integer here (Python: not an integer, per the
   draft's wording); the draft-4 pool has no integral numbers written with a
-  fraction or exponent.
+  fraction or exponent. The count keywords' draft-4 pool likewise has no
+  `1e19`/`1e30` (Python calls them non-integers).
 - A float64 instance is read as the JSON number it would be written as
   (its shortest round-tripping decimal), so `float64(1<<64)` is
   `18446744073709552000`, not `2^64`; the exact-arithmetic property feeds
