@@ -239,7 +239,9 @@ verifying run found 59); rust/uv-pypi-types, go/miekg-dns, typescript/smol-toml,
 go/jsonschema, java/commons-text, typescript/js-yaml (turn 428, quiet: two oracle tolerances and
 a model gap in js-yaml, no library bug); rust/full_moon,
 java/roaringbitmap, go/kaptinlin-jsonschema, typescript/js-joda (turn 429; kaptinlin-jsonschema/9-10
-and js-joda/34 found by the long runs).
+and js-joda/34 found by the long runs); rust/glam, java/dnsjava, go/mod, typescript/css-tree
+(turn 431; css-tree/17-24 found by the rewrite's new shapes and the reviewer's 20000-case collect
+runs of the fixpoint property).
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -473,3 +475,26 @@ go/jsonschema rewrite almost whole, one more argument for a shared Go schema har
 Ergonomics). Lesson on delegation: a subagent that leaves its final 1000/3000-case runs in the
 background reports before they finish, and the runs die with the turn; the reviewer's own two
 1000-case rounds are what actually catch what those runs would have.
+
+The seventeenth batch (turn 431) told the subagents to run every verification run in the
+foreground, and all four reported after their runs. glam's helpers became `arrays` of bounded
+reals mapped to the vector types, with the unit-length and near-singular gates as `filter`s at
+0.1-0.5% and the glam/1 region a filter at 1.7%; a record defined inside a `macro_rules!` cannot
+derive `PrettyPrintable` (the macro's field types break the derive's hygiene), so it prints as
+Debug. dnsjava's fifty-arm rdata switch became per-type generator values with `sets` for the
+distinct type lists and ports and sealed record families for SVCB parameters, update operations,
+master-file entries and zone shapes; a probe showed the truncation property reaching its
+"message fits" checks in only 3.7% of cases, so the length spec gained a Fits alternative (now
+19%). go/mod's three latent model bugs surfaced in the 1000-case runs (a symlink `sub/go.mod` is
+no submodule, a base64 tamper that decodes to the same bytes, equal tlog proofs for two sizes),
+and the old `TrimRight` over the identifier characters had made two version shapes degenerate.
+css-tree's rewrite moved the fixpoint property's clean path from 60% to 84% of cases and found
+eight bugs: five from the new shapes themselves (whitespace before a media comma, quoted grammar
+tokens before commas, signed numbers after unicode ranges, an escaped quote ending an unterminated
+string, operator whitespace after a comment) and three from the reviewer's collect runs after a
+plain 100-case round failed once without detail - which is the lesson of this batch: a plain
+`tools/zoo test` round that fails keeps only its summary line, so the review rounds want
+`--show-failures` (or the log copied after each), and `ZOO_COLLECT=1 HEGEL_TEST_CASES=20000
+node --test --test-name-pattern=<Name>` in the work dir is how a one-in-20000 mismatch is seen
+and shrunk. The css-tree pin file was a binary hunk of the patch because one pin held a raw
+NUL; it is an escape now, and the go-diff patch has the same problem still.
