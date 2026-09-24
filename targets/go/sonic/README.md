@@ -13,8 +13,9 @@ about AI-written code; the zoo keeps its tests in its own patch and files nothin
 
 `go test -count=1 -vet=off -run TestHegel -v .` in the module root (`-vet=off` because Go 1.27's
 vet rejects an unexported tagged field in upstream's `decode_test.go`; `-run TestHegel` leaves
-upstream's own suite alone). The patch adds `hegel_test.go` (properties) and
-`hegel_pins_test.go` (one plain test per bug), requires `hegel.dev/go/hegel v0.6.33` in go.mod
+upstream's own suite alone). The patch adds `hegel_test.go` (the wide properties),
+`hegel_shapes_test.go` (one narrow property per bug) and `hegel_pins_test.go` (one plain test
+per bug), requires `hegel.dev/go/hegel v0.6.33` in go.mod
 and deletes upstream's `go.work`/`go.work.sum` (workspace mode refuses the zoo's
 `GOFLAGS=-mod=mod`, and the root module is the only one under test). The JIT path is what runs
 on the zoo's amd64 machine and in CI's `ubuntu` job.
@@ -58,13 +59,23 @@ backends disagree with each other are listed under "Not bugs" and kept out of th
 - `TestHegelMarshalUnmarshalRoundTrip` — sonic alone: `Unmarshal(Marshal(v))` re-encodes to the
   same bytes for the struct universe and for `interface{}` trees.
 
-A `Known` switch per recorded bug gates the input shape: no `-0` in floats or number literals
-(/1, /2), no `<>&` or U+2028/9 in the `,string` string field (/3), mutated texts with a
-malformed escape are dropped (/4), no `]`/`}`/`,` garbage after a stream (/5, /6), a bare number
-that is not the last value of a stream is wrapped in an array (/7, /8), no tab in the mutation
-alphabet (/9). With everything gated the six properties run clean at 1000 cases × 3 (about 3 s)
-under both Go backends; `SONIC_COLLECT=1` makes them record mismatches instead of failing and
-print them shortest-first.
+The generators draw the shapes of the recorded bugs at their natural rate: `-0` among the floats
+and number literals (/1, /2; about a third of the struct-decoding cases hold one), `<>&` and
+U+2028/9 in the `,string` string field (/3), malformed escapes and tabs among the mutations (/4,
+/9; 4% and 1% of the validity cases), a stray `]`, `}` or `,` or a truncated literal after a
+stream (/5, /6), bare numbers among a stream's values (/7). The properties that meet a shape
+fail, naming it, and are the expected failures mapped to the bugs (`target.toml`); a wide
+property that reaches several bugs is mapped to the one it shrinks to (the validity property
+to /4, the stream property to /6, `Marshal` to /2, with /3 the basin now and then).
+`hegel_shapes_test.go` has one narrow property per bug over its shape region alone (for /8 a
+reader that delivers the stream in random pieces, which no wide property uses), so every bug
+has a deterministic finder; the pins are the regression examples. `HEGEL_NO_KNOWN=1` switches
+the shapes off (the `Known` gates come on, the generators draw the neighbouring regions, and a
+mismatch that still has a known shape is skipped: under 1% of cases) for a run that looks past
+the bugs, under which the fifteen properties pass at 1000 cases; the io.EOF check of the stream
+oracle is off then too, since after a literal sonic reports io.EOF for a stray letter or sign
+as well. `SONIC_COLLECT=1` makes the properties record mismatches instead of failing and print
+them shortest-first.
 
 ## Bugs (9; details in bugs.toml)
 
@@ -104,7 +115,19 @@ values and the reader-boundary split). /9 was the last property failure standing
 - A number directly followed by a number (`0.95464-6e-09`) is one malformed token to sonic and
   two values to encoding/json; not generated (separators are only dropped between values that
   are self-delimiting on both sides).
-- Only the presence of an error is compared, never its type or message.
+- Only the presence of an error is compared, never its type or message, except that in the
+  stream property io.EOF, the `Decoder`'s clean end of input, is a verdict of its own (/6).
 - `ConfigDefault` and `ConfigFastest` differ deliberately (unsorted keys, no HTML escaping, no
   string validation); only `ConfigStd` is tested. The `ast`/`Get` API, `Pretouch`, the
   `encoder`/`decoder` option packages and `unquote`/`utf8` are not tested.
+
+## History
+
+The harness was first written with a `Known` switch per bug that kept the shapes out of the
+generators, leaving the bugs to the pins; the switches were turned round under STYLE.md rule 11
+(the properties find the bugs by default, `HEGEL_NO_KNOWN=1` turns the switches on) and the
+narrow properties were added. That pass also made io.EOF a verdict of its own in the stream
+oracle (before, only the presence of an error was compared, so /6's io.EOF against a syntax
+error was invisible to the property even on the truncated literals it drew), found that /6
+covers a stray letter or sign after a literal too, and that a top-level `-0` into `interface{}`
+loses its sign as well (/1), which the interface property now sees by re-encoding.
