@@ -77,12 +77,18 @@ No AI-contribution policy is published in the repository (README, SECURITY.md an
 | qs/10 | medium | with allowEmptyArrays the k[] of an empty array is written without the encoder, so a key containing & (or =, +, %XX) breaks the query string |
 | qs/11 | medium | encodeDotInKeys re-encodes the dots of the prefix at every level, including the allowDots separator, so nesting three levels deep collapses |
 | qs/12 | medium | under iso-8859-1 with interpretNumericEntities a comma-split value is joined back into one string |
+| qs/13 | medium | with comma: true a comma-split value under an empty-bracket key (a[]=x,y) is wrapped before the arrayLimit check, so the inner array escapes the limit |
+| qs/14 | medium | with arrayFormat comma and encodeValuesOnly the array elements are encoded without the charset, so under iso-8859-1 a character above U+007F is written as utf-8 bytes instead of an entity |
 
 /1, /2, /3, /4, /5, /6 and /8 came from probing the source (`lib/parse.js` 416 lines,
 `lib/stringify.js` 378, `lib/utils.js` 451) before the properties were written; /7, /9, /10,
 /11 and /12 were found by the round-trip and normal-form properties in their first collect
 runs (the `]`-in-a-nested-key half of /4 as well). With every shape excluded, 6 000 cases per
-property had no unexplained mismatch.
+property had no unexplained mismatch. /13 and /14 came with the rewrite of the generators
+(2026-09-24): the old test had met /13 about once in 8 000 normal-form cases as an unexplained
+failure, and /14 lay behind the 55% of round trips its classifier explained away; the rewrite
+draws alphabets and literals filtered by the classifier itself, so 98% of round trips are
+checked and the remaining gates fire on under 2%.
 
 ## Not bugs (modelled as documented)
 
@@ -116,3 +122,6 @@ beyond what the round trip draws, and `allowSparse` in the round trip.
 ## History
 
 - 2026-09-15: created at 07b1d4d8 (6.16.0); 12 bugs.
+- 2026-09-24: generators rewritten in combinator style (test/gen.mjs; one record per property,
+  the round trip's object drawn from alphabets filtered by the classifier, the query as a list
+  of parts); qs/13-14 found by the rewrite. 3 properties pass, 14 expected failures.
