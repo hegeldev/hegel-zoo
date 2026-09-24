@@ -264,7 +264,9 @@ semver/15-16 from the subagents' candidates); go/now, rust/bs58, typescript/path
 java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-humanize, rust/xml-rs
 (turn 443, the first rewrites under the unsteering standard of rule 11: the properties find the recorded
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
-and the sibling go/go-runewidth@14205cc.
+and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
+`HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
+typescript/rbush.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -685,3 +687,19 @@ properties that then pass as "known shapes off", not as unexpected passes. xml-r
 common enough (16-26% of cases) that its three round-trip properties fail every run without
 a narrow property; ini's classifier, which had excused mismatches with a known shape, now names
 the shape in the failure and is what `HEGEL_NO_KNOWN=1` filters with.
+
+The twenty-sixth batch (turn 444) unsteered four rewritten targets and confirmed the shape. Three
+Go targets (ssh_config, go-udiff, godotenv) had a classifier that discarded, with `Assume`, every
+mismatch a recorded bug explains, and a `HEGEL_NO_KNOWN` that lifted the gates; the classifier is
+kept as the shape test, but by default it names the shape in the failure and only under
+`HEGEL_NO_KNOWN=1` does it skip (godotenv's skips fell to 0% by shaping the generators under the
+flag; ssh_config keeps a 3% skip for the `?` disagreements that only the oracle can tell). A wide
+property that covers several bugs at once (ssh_config's `MatchesSSH`: /1 at 9%, /2 and /3 at 4%)
+fails every run but shrinks to different bugs in different runs; it is mapped to the majority
+basin and is not intermittent. rbush showed the other end of the finding-rate curve: a property
+whose failing shape is in 2.5% of its cases passed a 1000-case run, so the effective number of
+independent samples is well below the case count and `intermittent` is right even at 1000. rbush/1
+needs a leaf of 200000 items, which no sequence property can afford: a narrow property that
+bulk-loads one is the only property that finds it, which is the honest answer. Second TypeScript
+harness (after ini) whose properties shared one example-database key; check the rest when they
+come up.
