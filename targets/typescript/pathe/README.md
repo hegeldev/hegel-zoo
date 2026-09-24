@@ -64,7 +64,8 @@ alternatives including empty ones and numeric ranges, `\`-escapes).
   character of the class, `{a,b}` = alternatives, `{1..3}` = the numbers, `\x` = literal `x`), and
   pathe's answer on random candidate paths (built from the glob's own literals plus decoys) must
   equal the model's; globs without `**`, escapes, ranges or empty alternatives are also checked
-  against `node:path.posix.matchesGlob`. Found bugs 7, 8, 9, 13 and 14.
+  against `node:path.posix.matchesGlob`. Found bugs 7, 8, 9, 13 and 14, and 16 once the
+  generators were rewritten with escapes as atoms of a segment.
 - **`pathe/utils` agrees with `parse`** (`TestHegelUtilsAgreeWithParse`): `filename(p)` equals
   `parse(p).name` (paths with a trailing slash skipped: `filename` returns `undefined` there);
   `normalizeAliases` orders `{"/root/a", "/root/a/sub", "/root/b"}`-style maps so that
@@ -90,6 +91,7 @@ alternatives including empty ones and numeric ranges, `\`-escapes).
 | pathe/13 | `matchesGlob("a", "[a-0]")` throws `SyntaxError` from the RegExp constructor (also `[!-.]`) | crash | low |
 | pathe/14 | `*/**` at the end of a glob no longer matches the segment itself (`a/**` does) | inconsistent | low |
 | pathe/15 | A UNC server starting with `.` is rewritten as the device namespace (`//.a/c` → `//./.a/c`) | wrong-result | low |
+| pathe/16 | An escaped character followed by `**` at the end of its segment lets the `**` cross slashes: `matchesGlob(".y/z/w", "\\.**/w")` is true (node: false) | wrong-result | low |
 
 ## Oracle limits and design differences (not counted)
 
@@ -108,6 +110,11 @@ alternatives including empty ones and numeric ranges, `\`-escapes).
 - `filename("a/b/")` is `undefined` (documented: "returns undefined for paths ending in a slash").
 - `resolve("//")` is `//` in pathe (the UNC design again) and `/` in node.
 - `toNamespacedPath` is the identity in pathe (documented) and is not compared.
+- A `.` or `..` segment in a glob: node (minimatch) folds `./` and `x/../` out of the pattern, pathe
+  keeps them literal (it normalizes the path, not the pattern), so `matchesGlob("a/a", "a/./a")` is
+  false in pathe and true in node; not compared against node.
+- A trailing slash on the candidate path: node reads an empty last segment (`a/` does not match
+  `a/*`), pathe's `*` matches the empty string and the model follows pathe; not compared against node.
 
 ## History
 
