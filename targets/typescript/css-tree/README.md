@@ -5,7 +5,7 @@ tools (~30M weekly downloads). It promises a CSS Syntax Level 3 tokenizer, a det
 source positions, a `generate` that writes an equivalent style sheet back, a walker over that AST
 and a lexer that matches property values against the mdn-data value grammars. The patch checks
 those promises against a second spec tokenizer, against each other and against the grammars over a
-structured CSS generator, and pins 16 bugs.
+structured CSS generator, and pins 24 bugs.
 
 ## How it is built
 
@@ -48,7 +48,7 @@ grammars (definition-syntax AST), and a third builds random definition-syntax AS
 
 ## Bugs
 
-See `bugs.toml` (css-tree/1–16): tokenizer deviations from CSS Syntax 3 (bad-string swallows the
+See `bugs.toml` (css-tree/1–24): tokenizer deviations from CSS Syntax 3 (bad-string swallows the
 newline, backslash at EOF, NUL not replaced, bad-url remnants skip the code point after an escape,
 an escaped `url(` name is not a url token),
 `url.decode` of whitespace-only and escaped-trailing-space urls, `string.encode`/`url.encode` inserting a
@@ -57,6 +57,15 @@ backslash-newline and writing `-- >` as a CDC token, the walker's `visit: 'Decla
 @supports conditions, `property()` descriptors not shared across spellings, the descendant combinator
 without `loc`, `onParseError` fired for valid nested conditions, and two CSS Nesting gaps (relaxed
 nesting without `&` is Raw — upstream #268 —, nested `@layer` blocks are not style blocks).
+The 2026-09-24 rewrite of the generators added eight: a media query list with whitespace before
+the comma after a media type fails to parse (17), `generate` gluing an open-ended unicode range to
+a signed number (18) and an `e` unit to a plus-signed number (22), `string.decode` of an
+unterminated string ending in an escaped quote (19), Operator values keeping the source's
+whitespace so a `-` after a comment, `)` or `%` is not a fixpoint (20), the lexer never matching a
+quoted grammar token directly before a comma, which rejects `*, #foo` as a compound selector
+list (21), a `style()` container feature with Raw content failing css-tree's own `checkStructure`
+(23), and an unclosed block at the end of the input reported as no parse error, with `expression()`
+swallowing it silently so that `generate` adds closers the source lacked (24).
 
 ## Accepted differences and notes (not counted as bugs)
 
@@ -88,3 +97,9 @@ Source map output (`generate(ast, {sourceMap: true})`), the `TokenStream` class,
 
 - 2026-09-19: created at f898015 (3.2.1, 2026-09-16) with 9 properties and 15 bugs; the first CI run found
   css-tree/16 (100 cases hit a control character followed by NUL), gated and pinned the same day.
+- 2026-09-24: the generators were rewritten in combinator style (`hegel/gen.mjs` exports generator values,
+  the harness is js-joda's; one case record per property). The rewritten shapes (whitespace before media
+  commas, quoted grammar tokens before commas, signed numbers after unicode ranges, `expression()` with
+  unbalanced content) found css-tree/17-24; the fixpoint property's clean path rose from about 60% to
+  84% of cases. The known-bug gates fire on 0.1-2.4% of cases each (measured with ZOO_COLLECT=1 over
+  20000 cases); the media comma gate (17) is the largest at 0.8%.
