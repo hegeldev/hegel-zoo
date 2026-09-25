@@ -37,23 +37,32 @@ documented definition, and round trips.
 - `TestHegelNameBasedAgreeWithPython` — `NewMD5`/`NewSHA1` are `uuid3`/`uuid5` for arbitrary name
   spaces and byte names; `NewHash` with MD5/SHA-1/SHA-256 and any version is the documented
   truncation with the bits set, resets the hash, and is deterministic. Clean.
-- `TestHegelTimeBasedLayoutsFollowTheRFC` — `SetClockSequence`/`SetNodeID` then `NewUUID` (v1:
-  fields, wall-clock bracket), `NewV6WithTime` at a drawn instant in 1678–2262 (exact `Time()`,
-  the clock sequence advancing for a repeated instant), a v1 re-laid as v6 keeping its `Time()`,
-  `NewV7FromReader` (our random bits, the wall clock in ms, strictly increasing). Clean.
+- `TestHegelTimeBasedLayoutsFollowTheRFC` — `SetClockSequence`/`SetNodeID` (one node in ten
+  all zeros) then `NewUUID` (v1: fields, wall-clock bracket), `NewV6WithTime` at a drawn instant
+  (exact `Time()`, the clock sequence advancing for a repeated instant; 15% of the instants lie
+  outside 1678–2262), a v1 re-laid as v6 keeping its `Time()`, `NewV7FromReader` (our random
+  bits, the wall clock in ms, strictly increasing). Finds /5 (and /6).
 - `TestHegelDCEFieldsRoundTrip` — `NewDCESecurity(domain, id)`: version 2, `Domain()`, `ID()`,
   node, `Domain.String()`. Clean.
 - `TestHegelEncodingsRoundTrip` — a struct with a `UUID`, a `NullUUID` and a `UUIDs` through
   `encoding/json` both ways (null included), `NullUUID.MarshalJSON`/`UnmarshalJSON`, text and
-  binary of the UUID and of a valid `NullUUID`, `FromBytes`, `Value`→`Scan` on fresh
-  destinations, wrong binary lengths rejected. Clean.
+  binary of the UUID and of a `NullUUID` valid or null, `FromBytes`, `Value`→`Scan` on fresh
+  and on prefilled destinations, `Scan` of NULL as nil, `""` and an empty `[]byte`, wrong
+  binary lengths rejected. Finds /4 (and /2, /3).
 - `TestHegelRandomVersionsSetOnlyTheirBits` — `NewRandomFromReader`/`NewV7FromReader` keep the
   reader's bits and set only the version/variant, short readers are errors, `New`/`NewRandom`/
   `NewString` are v4. Clean.
 
-What the general generators avoid (pinned separately): the null `NullUUID` through
-`MarshalText`/`MarshalBinary` (/4), `Scan` into a non-fresh destination and `Scan("")` (/2, /3),
-instants outside 1678–2262 (/5), an all-zero node (/6), concurrent `NewV6WithTime` (/1).
+The generators draw the shapes of the six recorded bugs and the properties that meet them are
+the expected failures mapped to the bugs (STYLE.md rule 11); every mismatch names the shape it
+has. One narrow property per bug in `hegel_shapes_test.go` draws the bug's shape region with
+random contents: `ConcurrentNewV6WithTimeCallsAreDistinct` (/1, two to four goroutines calling
+`NewV6WithTime` at one instant, intermittent like the pin), `ScanOfNullResetsTheDestination`
+(/2), `NullUUIDScanOfEmptyIsNull` (/3), `NullUUIDTextAndBinaryRoundTrip` (/4),
+`NewV6WithTimeRejectsUnrepresentableInstants` (/5) and `SetNodeIDKeepsTheZeroNode` (/6).
+`HEGEL_NO_KNOWN=1` switches the shapes off (instants inside 1678–2262, non-zero nodes, fresh
+destinations, a valid `NullUUID` through text and binary, one goroutine) and all fifteen
+properties pass.
 
 ## Bugs
 
@@ -67,8 +76,9 @@ instants outside 1678–2262 (/5), an all-zero node (/6), concurrent `NewV6WithT
 | uuid/6 | low | `SetNodeID` of six zero bytes returns true but the node is replaced by the hardware address on the next use |
 
 uuid/1 is marked `intermittent` in target.toml: the pin fails whenever one of eight rounds of
-12 000 concurrent calls yields a duplicate, which on this machine is every run, but a race is
-not a certainty.
+12 000 concurrent calls yields a duplicate, and the narrow property whenever one of twelve rounds
+of its drawn calls does; on this two-core machine the goroutines often run in streaks and a
+race is not a certainty.
 
 ## Not bugs
 
