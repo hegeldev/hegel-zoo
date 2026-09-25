@@ -84,12 +84,26 @@ engine builds a non-string key are not compared.
 `hegel/src/test/java/zoo/JacksonYamlPinsTest.java`: one pin per bug below; each asserts the correct
 behaviour and fails while the bug exists.
 
-Known shapes are skipped by the properties and carried by the pins: strings resolving to numbers
-under `MINIMIZE_QUOTES` without `ALWAYS_QUOTE_NUMBERS_AS_STRINGS` (documented), Java spellings of
-non-finite numbers (documented), `CANONICAL_OUTPUT` (bug 8), a lone NEL (bug 1), core-schema number
-strings (bug 5), the merge key (bug 11), `writeBinary(InputStream)` (bug 10), leading zeros under the
-core schema (`017` = 15 is the `PARSE_OCTAL_NUMBERS` feature, `08` is bug 4), and the engine-only
-defects listed below.
+The generators draw the recorded bugs' shapes by default (STYLE.md rule 11): `CANONICAL_OUTPUT` on
+30 % of the write options, `<<`, a lone NEL and U+FEFF-led strings, core-schema number strings under
+`ALWAYS_QUOTE_NUMBERS_AS_STRINGS`, leading zeros before an 8 or 9 under the core schema (`017` = 15 is
+the `PARSE_OCTAL_NUMBERS` feature and stays tolerated; `08` is bug 4), aliases at token starts, type
+and object ids around scalars and binary, and `writeBinary(InputStream)`. The wide properties fail on
+them and are listed in `[expected_failures]` mapped to the bug they shrink to (`treesWrittenByJacksonReadBack`
+and `generatorCallsAgreeWithTheTreeWriter` to bug 8, `scalarsTypeLikeTheSchema` to bug 4 and
+`mutatedDocumentsReadLikeTheEngine` to bug 7 intermittently, their shapes being rare); one narrow
+property per bug (section 4 of `JacksonYamlTest`, section 3 of `JacksonYamlWriteTest`), a generator over
+the bug's shape region with random contents, fails every run: `nextLineStringsRoundTripUnderMinimizeQuotes`
+(1), `emptyDocumentsReadAsAnEmptyObjectWithAContext` (2), `taggedLoneSignReadsAsAStringOrFails` (3),
+`leadingZeroBeforeEightOrNineUnderTheCoreSchemaReadsLikeTheEngine` (4), `coreSchemaNumberStringsAreQuoted`
+(5), `objectIdBeforeBinaryAnchorsTheBinary` (6), `aliasesReadAsTheAnchoredValue` (7),
+`canonicalOutputKeepsScalarTypes` (8), `typeIdOnAScalarIsWritten` (9), `binaryFromAStreamReadsBack` (10),
+`mergeKeyStringsAreQuotedUnderTheCoreSchema` (11), `replayingParserReadsQuotedMergeKeyStrings` (12),
+`leadingByteOrderMarkStringsRoundTrip` (13). The pins stay as regression examples. `HEGEL_NO_KNOWN=1`
+(read once into `Zoo.NO_KNOWN`) steers the shapes away, like the documented differences (strings
+resolving to numbers under `MINIMIZE_QUOTES` without `ALWAYS_QUOTE_NUMBERS_AS_STRINGS`, Java spellings
+of non-finite numbers) and the engine-only defects listed below always are, for a run past the known
+bugs; every property then passes.
 
 ## Not tested
 
@@ -157,6 +171,11 @@ inherits them — candidates for a `snakeyaml-engine` target):
   their sequence indicator.
 - `Dump` writes a root string starting with U+FEFF plain (`\ufeff\n`) and its own `Load` reads it as
   null: the engine's side of jackson-yaml/13.
+- The scanner takes U+0085 (NEL) inside a single-quoted scalar for a line break and folds it, while the
+  emitter writes it literally: `Dump` with `ScalarStyle.SINGLE_QUOTED` turns `" \u0085"` into `' \u0085'`,
+  which `Load` reads as `" "`, and `"a \u0085 b"` comes back as `"a b"` (a NEL not beside a space
+  survives; double-quoted style writes `\N` and round-trips). The `readsBack` engine-dump check skips
+  the shape (0.1 % of cases).
 
 ## History
 
@@ -170,3 +189,8 @@ inherits them — candidates for a `snakeyaml-engine` target):
   recorded-loss gates fire on about 1% instead of being the bulk of the cases; the merge-key, anchor
   and tag gates of the engine comparison narrowed to token starts, 8% not compared where 20% was);
   jackson-yaml/12-13 found by the rewrite. 5 tests pass, 13 expected failures.
+- 2026-09-25: unsteered under rule 11: the known-bug gates run only under `HEGEL_NO_KNOWN=1`, thirteen
+  narrow properties added, `CANONICAL_OUTPUT` back to 30 %; a latent generator bug fixed (the NEL pool
+  entries had been decoded to empty strings, so bug 1's shape was never drawn); the engine's
+  single-quoted NEL folding found and listed above. 1 test passes, 28 expected failures (30 when the
+  two intermittent wide properties meet their shapes).
