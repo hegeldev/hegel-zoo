@@ -44,26 +44,41 @@ defaults.
 - `TestHegelTypedValuesRoundTripThroughGet` — one flag of one of 23 kinds, 0–3 occurrences with
   valid text: the bound variable equals the parsers' value (last wins for scalars, append for
   slices, merge for maps, `+1` for counts), the `GetX` accessor equals the bound variable, and
-  for scalars `Set(Value.String())` on a fresh flag reproduces the value.
+  for scalars `Set(Value.String())` on a fresh flag reproduces the value. Lands on pflag/3 (an
+  `ipMask`/`ipNet` flag left at its nil default, 2 % of cases; pflag/2 and /1 at 1.3 % and
+  0.4 %; intermittent at 100 cases).
 - `TestHegelUsageFollowsTheDocumentedLayout` — 1–4 flags of 14 kinds with zero or non-zero
   defaults, random ASCII usage text with backquoted names, `cols` 0 or 10–120: one entry per
   flag with the README's column, the words of `UnquoteUsage` plus `(default X)` iff the default
-  is non-zero, no line wider than `cols` unless it is a single word, and greedy filling
-  (`wrap`'s five-column slop and its 16-column fallback modelled).
+  is non-zero, no line wider than `cols` unless it is a single word, greedy filling (`wrap`'s
+  five-column slop and its 16-column fallback modelled), and `Value.String()` stable across
+  calls. Lands on pflag/4 (an empty collection default shown as `(default [])`, a third of the
+  cases; pflag/5 and /7 are in its region too).
 - `TestHegelNormalizedNamesAreInterchangeable` — a normaliser folding `_`/`.`/case to `-`
   installed before or after the flags are defined, flags defined and used under random
   spellings: parse results, `Lookup`, `Changed`, `Args` and `FlagUsages` equal the canonical
   spelling's.
 
-The generators avoid the pinned shapes: `stringSlice`/`stringArray` texts contain no lone empty
-element or CR (pflag/1), `float64Slice` texts are values `%f` renders exactly (pflag/2), the
-accessor is not called on a `ipMask`/`ipNet` flag left at its nil default (pflag/3), the usage
-property gives `boolSlice`/`durationSlice`/`stringToString` flags a non-empty default
-(pflag/4) and ASCII usage text (pflag/5), map values carry no quotes (pflag/6) and only
-`stringToString` (which sorts) appears with a multi-key default in the usage property
-(pflag/7). In ignore-unknown mode a bundle gets glued text only after a letter that consumes
-it: an unknown shorthand followed by more letters strips (or not) the next argument by rules
-the README does not state.
+## Known bugs
+
+The generators draw the shape of every recorded bug (STYLE.md rule 11): the two wide properties
+above are expected failures mapped to the bug they land on, and each bug has a narrow property
+over its own shape region in `hegel_shapes_test.go`, the deterministic expected failure beside
+the pin: `TestHegelGetStringArrayReturnsTheBoundElements` (pflag/1),
+`TestHegelGetFloat64SliceKeepsEveryDigit` (/2), `TestHegelGetMaskAndNetReturnTheDefault` (/3),
+`TestHegelEmptyCollectionDefaultsAreNotShown` (/4), `TestHegelUsageWrapsByColumnWidth` (/5),
+`TestHegelStringToStringSinglePairKeepsItsValue` (/6) and `TestHegelStringToIntDefaultTextIsSorted`
+(/7). `HEGEL_NO_KNOWN=1` (read once) switches the shapes off: `stringSlice`/`stringArray` texts
+contain no lone empty element or CR, `float64Slice` texts are values `%f` renders exactly, the
+accessor check is skipped by name on an `ipMask`/`ipNet` flag left at its nil default, the usage
+property gives `boolSlice`/`durationSlice`/`stringToString` flags a non-empty default and ASCII
+usage text, map values carry no quotes and only `stringToString` (which sorts) appears with a
+multi-key default; every property then passes at 1000 cases with no skips. The pflag/7 shape
+(a map default rendered in Go's map order) made a case's verdict random, which Hegel's final
+replay could pass and so swallow the counterexample; the usage property's stability check makes
+it deterministic. In ignore-unknown mode a bundle gets glued text only after a letter that
+consumes it: an unknown shorthand followed by more letters strips (or not) the next argument by
+rules the README does not state.
 
 ## Bugs
 
