@@ -87,14 +87,27 @@ rejects, fasthttp keeps the byte); `=` alone as a query pair; `+` with a sign in
 normalises paths (dot segments, duplicate slashes, `%2F`), so `Path()` is compared only for
 paths with none of those; RFC 850 and asctime dates (ParseHTTPDate reads RFC 1123 only).
 
-## Known bugs (gated)
+## Known bugs
 
 Seven bugs (`bugs.toml`): a negative Max-Age rejects the cookie; an unparsable Max-Age or Expires
 (or an RFC 1123 date with a non-GMT zone) drops the cookie instead of the attribute; the Connection
 close token is matched only as the whole value `close`; ParseIPv4 accepts leading zeros; SameSite
 with an unknown or empty value is read as absent; FullURI writes an IPv6 zone identifier
-unescaped; Secure/HttpOnly/Partitioned with a value are not recognised. `hegel/known.go` gates
-them by generated shape; `HEGEL_NO_KNOWN=1` lifts the gates.
+unescaped; Secure/HttpOnly/Partitioned with a value are not recognised. The properties draw
+these shapes and are the expected failures mapped to the bugs (STYLE.md rule 11): one narrow
+property per bug in `hegel/hegel_shapes_test.go` draws only the bug's shape and fails every run
+(`NegativeMaxAgeKeepsTheCookie` /1, `UnparsableAttributeKeepsTheCookie` /2,
+`CloseTokenAnywhereInConnectionCloses` /3, `LeadingZeroOctetsAreRejected` /4,
+`UnknownSameSiteValueIsDefault` /5, `ZoneIdentifierStaysEscapedInFullURI` /6,
+`FlagAttributesWithValuesAreSet` /7); the wide properties reach them at their natural rates
+(`SetCookieMatchesNetHTTP` lands on /1, `ResponseReadMatchesNetHTTP` on /3,
+`RequestReadMatchesNetHTTP` on /3 in most runs, `ParseIPv4MatchesNetip` on /4,
+`URIMatchesNetURL` on /6). `HEGEL_NO_KNOWN=1`, read once, switches the known shapes off:
+the pools lose their bug-shaped values, the narrow properties are skipped and every property
+passes. The pins in `hegel_pins_test.go` stay as regression examples. One tolerance of the
+narrow properties: net/http ignores a `Max-Age` with a leading zero (RFC 6265 4.1.1 grammar)
+where fasthttp reads it (the 5.2.2 algorithm), so the narrow Max-Age digits have no leading
+zero; the wide pool's `00` agrees on both sides.
 
 ## Not tested
 
@@ -109,3 +122,7 @@ forms, `Args` numeric getters, `URI.Update`, header parameter parsing (`VisitHea
 - 2026-09-20: written against 0e13c85e8ed5b41b489c502eeccdf90a45eb8dfe (2026-09-19, after
   v1.69.0) with hegel.dev/go/hegel v0.6.33; 7 bugs.
 - 2026-09-20: base bumped 0e13c85e8ed5 → 5687435d22d1 (2026-09-20, "fix: request time left at zero, and an opt in Server.LazyRequestTime (#2404)"; v1.74.0+); 7 bug(s) still reproduce. 14 tests pass.
+- 2026-09-25: generators rewritten in combinator style (STYLE.md) and unsteered: the
+  properties draw the recorded bugs' shapes and are mapped to them, `known.go` is gone, seven
+  narrow properties added; `HEGEL_NO_KNOWN=1` now means "known shapes off" (until today it
+  lifted the gates instead).
