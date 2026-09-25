@@ -4,11 +4,16 @@
 2026-09-01): the Go DNS library — presentation and wire forms of some 90 record types, messages
 with EDNS(0) and compression, a zone-file parser, DNSSEC and TSIG primitives, client and server.
 
-The patch adds the `hegel.dev/go/hegel` requirement to `go.mod` and eight test files (package
-`dns_test`): `hegel_test.go` (plumbing, the `Known` gates), `hegel_gen_test.go` (names, character
+The patch adds the `hegel.dev/go/hegel` requirement to `go.mod` and nine test files (package
+`dns_test`): `hegel_test.go` (plumbing, the `noKnown` switch), `hegel_gen_test.go` (names, character
 strings and the rdata of 59 record types in presentation form), `hegel_oracle_test.go` (the
 dnspython child process), `hegel_records_test.go`, `hegel_names_test.go`, `hegel_messages_test.go`,
-`hegel_dnssec_test.go` (the nine properties) and `hegel_pins_test.go` (nineteen pins). **Needs
+`hegel_dnssec_test.go` (the nine wide properties), `hegel_shapes_test.go` (nineteen narrow properties,
+one per recorded bug over that bug's shape region with random contents) and `hegel_pins_test.go`
+(nineteen pins, kept as regression examples). The generators draw the shapes of the recorded bugs by
+default, so the wide properties fail on them (each mapped to the bug it most often shrinks to; the
+names and DNSSEC properties reach theirs only in some runs) and the narrow ones fail every run;
+`HEGEL_NO_KNOWN=1` switches the shapes off and every property passes. **Needs
 `python3` with the `dnspython` package (2.8) on PATH**: it is the second implementation everything
 is compared with. The whole run takes about six seconds; the library's own tests run in the same
 `go test`.
@@ -49,17 +54,22 @@ spelt `IPIX` instead of `IPKIX` (19).
 - Names, TXT strings and hex fields are kept in the presentation form they were parsed from;
   `String()` normalises escapes when printing, so two records can print identically and still
   compare unequal (bug 3). The properties therefore compare wire forms, not text.
-- dnspython differences that are not judged (the generator avoids them or the check is skipped):
-  its class-specific rdata types exist only in class IN (the oracle always parses rdata in IN);
+- dnspython differences that are not judged (the generator avoids them or the comparison
+  tolerates them): its class-specific rdata types exist only in class IN (the oracle always parses rdata in IN);
   it validates DS digest lengths for digest types 1-4, rejects empty URI targets (RFC 7553) and
   `no-default-alpn` without `alpn` (RFC 9460), treats TTLs at or above 2^31 as 0 when reading
   a message (RFC 2181), compresses names case-insensitively, keeps the first spelling of a name
   for all records at a zone node, wants the SOA at the origin and CNAMEs alone, ignores
   out-of-zone records, and reads GPOS latitude before longitude; it writes the strings of NAPTR,
   ISDN, HINFO, URI, CAA and X25 through UTF-8 (a `\200` escape becomes two bytes) and does not
-  escape backslashes in URI targets, prints HIP servers through IDNA decoding, and truncates
-  `0.58*100` to 57 in LOC altitudes (the generator uses exact binary fractions there, which also
-  sidesteps bug 9).
+  escape backslashes in URI targets, prints HIP servers through IDNA decoding, truncates
+  `0.58*100` to 57 in LOC altitudes (the generator uses exact binary fractions for the altitude
+  centimetres; the seconds are drawn freely), keeps `S`/`W` for a zero LOC angle read from text
+  but prints `N`/`E` from the wire (the comparison normalises zero angles), echoes an
+  IPSECKEY/AMTRELAY gateway's text as written where the library prints the canonical address
+  (fields that parse to the same address are taken as equal), and spells the CERT algorithm
+  mnemonics DSA-NSEC3-SHA1, RSASHA1-NSEC3-SHA1 and ECC-GOST without hyphens (the CERT shape
+  property draws only the spellings both share).
 - The library rejects APL prefixes with bits set beyond the prefix length and dnspython does not;
   RFC 3123 does not say, so the generator masks its addresses. The library prints the equator as
   `S` and the prime meridian as `W` (RFC 1876's reference code prints `N`/`E`); the wire is the
