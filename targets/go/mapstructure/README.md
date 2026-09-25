@@ -42,12 +42,21 @@ struct. The standard library parsers behind the string decode hooks.
   `StringToSliceHookFunc(",")` and `StringToBasicTypeHookFunc` vs `time.ParseDuration`,
   `strings.Split` and `strconv`.
 
-Twenty thousand cases per property before saving, plus three plain runs. The generators avoid
-the pinned shapes: integers stay within their target's range and floats integral when they
-meet an integer field (mapstructure/1, /2); no float32 is converted to a string (/4); the
-pre-filled struct for `ZeroFields` has a nil `any`, a nil pointer field and zero in every
-field an `omitempty`/`omitzero` key can omit — a key that is absent is never written, by
-design (/5, /6); the Metadata struct has no unexported field (/3).
+Twenty thousand cases per property before the first save, plus three plain runs. The
+generators draw the recorded bugs' shapes by default (rule 11 of STYLE.md): integers beyond
+their target's range and fractional floats meet integer fields (mapstructure/1, /2), float32
+values are converted to strings (/4), the pre-filled struct for `ZeroFields` keeps a non-nil
+`any` and a set pointer (/5, /6), and the Metadata property decodes into a struct with an
+unexported field 30 % of the time (/3). The wide properties fail on those shapes and are listed
+in `[expected_failures]` mapped to the bug they shrink to (the JSON property lands on /5 in most
+runs, on /6 in the rest); `hegel_shapes_test.go` adds one narrow property per bug over its shape
+region with random contents (`TestHegelOutOfRangeNumbersAreRefused`,
+`TestHegelFractionalFloatsIntoIntegersAreRefused`, `TestHegelErrorUnsetSkipsUnexportedFields`,
+`TestHegelWeakFloat32ToStringKeepsItsShortestForm`, `TestHegelZeroFieldsReplacesAnInterfaceValue`,
+`TestHegelNilInputClearsAPrefilledPointer`), each a deterministic expected failure, with the
+example-based pins kept as regression examples. `HEGEL_NO_KNOWN=1` switches the known shapes
+off: the wide properties stop drawing them and the narrow ones test a neighbouring region, and
+every property passes.
 
 ## Bugs (6; details in bugs.toml)
 
