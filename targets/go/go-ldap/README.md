@@ -14,7 +14,7 @@ its own patch and files nothing upstream.
 ## Build
 
 `go test -count=1 -run TestHegel -v .` in `v3/`. The patch adds, as the external package
-`ldap_test`, `hegel_test.go` (harness, the `Known` switches), `hegel_dn_test.go` (DN model,
+`ldap_test`, `hegel_test.go` (harness, the `noKnown` switch), `hegel_shapes_test.go` (one narrow property per recorded bug), `hegel_dn_test.go` (DN model,
 generators, properties), `hegel_filter_test.go` (filter model, generators, properties) and
 `hegel_pins_test.go` (one plain test per bug), and requires `hegel.dev/go/hegel v0.6.33` in
 go.mod.
@@ -63,11 +63,30 @@ attributes from a pool of descrs, OIDs and options), rendered with random escapi
 | FilterMutationsAreStable | grammar-valid mutations compile as the grammar says; whatever `CompileFilter` accepts is a well-formed packet whose decompiled form is grammatical and recompiles to the same packet |
 | EscapeFilterRoundTrip | `EscapeFilter(v)` in equality and substring positions parses back to `v` |
 
-Each recorded bug has a `Known` switch: the model reproduces the behaviour or the generator
-avoids the shape while it is on; the pins assert the documented behaviour and fail while the bug
-exists. `ZOO_COLLECT=1` records mismatches instead of failing and prints the agreement classes
-(in the mutation properties about a third of the strings are grammar-valid and agreed, half are
-rejected by both, the rest are lenient acceptances checked for stability).
+## Known bugs
+
+The generators draw the shape of every recorded bug (STYLE.md rule 11), so five of the wide
+properties are expected failures mapped to the bug they land on, all intermittent because each
+shape is a few percent of the cases: DNParsesGrammar on go-ldap/9 (a hexstring value with a
+space, about 5 %), DNMutationsAreStable and EscapeDNRoundTrip on go-ldap/8 (a byte that is not
+UTF-8, turned into U+FFFD by `ParseDN` and by `EscapeDN` alike; 9 % and 11 %),
+FilterCompilesGrammar on go-ldap/4 (`(cn=\ufffd)`, 12 %; /3 in some runs) and
+FilterMutationsAreStable on go-ldap/5 (`(*cn=)`, 13 %; /4, /3, /6, /1 and /2 at lower rates;
+/7 is never reached by the mutations). DNComparisons and EscapeFilterRoundTrip have no bug
+shape and pass. Each bug also has a narrow property over its own shape region in
+`hegel_shapes_test.go`, the deterministic expected failure beside the pin:
+`TestHegelFilterListClosersAreChecked` (go-ldap/1), `TestHegelStarOnlyConditionsAreNotEmptySubstrings`
+(/2), `TestHegelDnattrsMarkerIsCaseInsensitive` (/3), `TestHegelReplacementCharacterCompiles`
+(/4), `TestHegelFilterAttributesAreValidated` (/5), `TestHegelExtensibleMatchNeedsAttributeOrRule`
+(/6), `TestHegelEmptyAttributeTypesAreRejected` (/7), `TestHegelDNRejectsOrKeepsBytesThatAreNotUTF8`
+(/8) and `TestHegelHexstringValuesIgnoreInsignificantSpaces` (/9). `HEGEL_NO_KNOWN=1` (read
+once) switches the shapes off: the model reproduces each recorded behaviour, the pools lose
+`\xff` and U+FFFD, mutations stay on rune boundaries and off the protected head of a filter,
+and the residual lenient acceptances that only a recorded bug explains are assumed away (0.4 %
+of the filter mutations); every property then passes at 1000 cases. `ZOO_COLLECT=1` records
+mismatches instead of failing and prints the agreement classes (in the mutation properties
+about a third of the strings are grammar-valid and agreed, half are rejected by both, the rest
+are lenient acceptances checked for stability).
 
 ## Accepted differences
 
@@ -96,3 +115,6 @@ around a hexstring value are not insignificant (leading: literal, trailing: erro
 ## History
 
 - 2026-09-21 (turn 342): target added at 2f8603f (v3.4.14) with seven properties, 9 pins.
+- 2026-09-25: generators rewritten in combinator style; the properties draw the known shapes and
+  nine narrow properties were added; go-ldap/8's notes gained EscapeDN; a classifier defect fixed
+  (lenient acceptances of compound filters were all reported as go-ldap/5).
