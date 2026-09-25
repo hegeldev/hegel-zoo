@@ -20,7 +20,9 @@ nothing upstream.
 the import). The patch adds `hegel_test.go` (harness, the model, generators, the API builder,
 the RFC writer and the three serialization/parsing properties), `hegel_api_test.go`
 (recurrence rules, time getters, the property API), `hegel_oracle_test.go` (the icalendar
-child) and `hegel_pins_test.go` (one plain test per bug), all in the external package
+child), `hegel_shapes_test.go` (one narrow property per bug, drawing the bug's shape alone;
+skipped under `HEGEL_NO_KNOWN=1`) and `hegel_pins_test.go` (one plain test per bug), all in
+the external package
 `ics_test`, and requires `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive moves from
 1.20 to 1.26.0 for it).
 
@@ -57,11 +59,30 @@ child) and `hegel_pins_test.go` (one plain test per bug), all in the external pa
 | TimesFollowTheModel | DTSTART/DTEND/DUE/DTSTAMP/RECURRENCE-ID and EXDATE/RDATE lists in the DATE, floating and UTC forms with or without TZID (six IANA zones and an unknown one) read back as the model's instant in the model's zone or fail; malformed values fail; `vDDDTypes` agrees on kind, wall clock and zone |
 | PropertyEditsFollowTheModel | random sequences of Add/Set/Replace/Remove/RemoveByValue and the typed setters against the model list, with GetProperty/GetProperties/HasProperty after each step and a serialize/parse round trip at the end |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (parameter values with `: ; , " ' \`, lower-case names, CATEGORIES/RESOURCES lists after
-a parse, out-of-range RRULE values, floating UNTIL on `String()`, `RemovePropertyByValue`);
-the pins assert the correct behaviour and fail while the bug exists. `ZOO_COLLECT=1` records
-mismatches instead of failing and prints the class counts.
+Mismatches are classified before they count and named after the recorded bug whose shape they
+are; `ZOO_COLLECT=1` records mismatches instead of failing and prints the class counts.
+
+## Known bugs
+
+The properties draw the recorded bugs' shapes by default and are the expected failures mapped
+to them (STYLE.md rule 11): `PropertyEditsFollowTheModel` lands on golang-ical/2
+(`RemovePropertyByValue`), `IcalendarReadsTheOutput` on /4 (parameter values with `: ; , " ' \`),
+`ParsesLikeIcalendar` on /8 (lower-case names, also reaching /4), and
+`RecurrenceRulesFollowTheModel` on /8 in most runs (also /12, floating UNTIL, and /13,
+out-of-range values). One narrow property per bug in `hegel_shapes_test.go` draws only that
+bug's shape and fails every run: `ExtendedPropertyNameKeepsTheName` /1,
+`RemovePropertyByValueRemovesOnlyTheMatches` /2, `IdIsTheUid` /3,
+`ParameterValuesAreQuotedNotEscaped` /4, `BackslashInQuotedParameterIsKept` /5,
+`TextListsKeepTheirCommas` /6 (the one shape the harness writer cannot draw, since it escapes
+TEXT commas), `SerializeTerminatesForEveryLineLength` /7, `LowerCaseNamesParse` /8,
+`ErrorLineNumbersArePhysical` /9, `RefreshIntervalIsReplacedOnAParsedCalendar` /10,
+`TodoDurationOnAnAllDayStartGivesAnAllDayDue` /11, `FloatingUntilStaysFloating` /12,
+`RecurrenceValuesOutOfRangeAreRejected` /13, `NamesAreAnchored` /14. `HEGEL_NO_KNOWN=1`, read
+once, switches the known shapes off (the generators stop drawing them, the narrow properties
+are skipped) and every property passes. The pins in `hegel_pins_test.go` stay as regression
+examples. The one remaining skip is not a gate: a UTC value (trailing Z) that also carries a
+TZID parameter is not compared with icalendar, on about 5% of the time cases, after golang-ical's
+own checks have run.
 
 ## Accepted differences
 
@@ -91,3 +112,7 @@ are found by an unanchored search.
 ## History
 
 - 2026-09-20 (turn 332): target added at v0.3.6 with six properties, fourteen pins.
+- 2026-09-25: generators rewritten in combinator style (STYLE.md) and unsteered: the
+  properties draw the recorded bugs' shapes and are mapped to them, fourteen narrow
+  properties added in `hegel_shapes_test.go`, `HEGEL_NO_KNOWN=1` switches the known shapes
+  off.
