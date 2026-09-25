@@ -57,14 +57,24 @@ models and the properties) and `hegel_pins_test.go` (one plain test per bug) and
 | CaseConversions | word-like and arbitrary strings through the four conversions: content preserved, idempotence of the lower-case forms, kebab = snake with `-`, no upper case or separators left, the camel/pascal relation, FirstRuneToUpper/Lower |
 | DocumentedSamples | every sample in the package documentation (except the three wrong `Count` samples, below) |
 
-`Known` switches gate the six recorded bugs (the generators avoid the shapes: Scrub is not
-compared on strings containing U+FFFD, WordSplit not on strings with ideographs outside the
-package's ranges, the camel/pascal relation is skipped when the last word is one upper-case
-letter, the snake/kebab laws when a connector touches other punctuation, and Translate is
-not compared when a `from` range ends on a single rune of `to` or a pattern contains
-U+FFFD). With them on, the five properties run clean at 1000 cases in under a second
-(`XSTRINGS_COLLECT=1` records mismatches instead of failing and prints them shortest-first
-with the case's description; `HEGEL_VERBOSE=1` turns on the engine's log).
+| ScrubKeepsTheReplacementCharacter | strings holding U+FFFD among invalid bytes and other runes through Scrub: the character stays, the invalid bytes become the replacement (bug 1) |
+| IdeographsAreNotWordCharacters | ideographs from the blocks added since Unicode 6.1 among letters and spaces: WordSplit/WordCount treat them as the model does (bug 2) |
+| CamelCaseCapitalisesAOneLetterWord | words whose last one is a single letter through ToCamelCase/ToPascalCase (bug 3) |
+| ConnectorsNextToPunctuationAreConverted | connectors inside punctuation runs through ToSnakeCase/ToKebabCase (bug 4) |
+| RangeMapsOntoSingleRunes | a from range whose runes land on single runes of the to pattern, through Translate and the model (bug 5) |
+| ReplacementCharacterInAPattern | patterns with a U+FFFD followed by another rune, through Translate/Delete/Count (bug 6) |
+
+The generators draw the known bugs' shapes at their natural rates and the wide properties fail
+on them naming the shape: DocumentedModels lands on bug 2 (or 1), CaseConversions on bug 3 (or
+4) and TranslatePatterns on bug 5 (or 6), the last two passing a default run now and then
+(intermittent). The six narrow properties, one per bug, draw the bug's region with random
+contents and are the deterministic expected failures. The `TestHegelPin*` tests are regression
+examples of the recorded cases. `HEGEL_NO_KNOWN=1` (read once) looks past the recorded bugs:
+the shape pools drop U+FFFD and the stale ideographs, the to pattern is drawn so that no range
+runs onto singles, case-conversion texts are filtered clean, and the narrow properties draw the
+neighbouring region instead; every property then passes. (`XSTRINGS_COLLECT=1` records
+mismatches instead of failing and prints them shortest-first with the case's description;
+`HEGEL_VERBOSE=1` turns on the engine's log.)
 
 ## Bugs (6; details in bugs.toml)
 
