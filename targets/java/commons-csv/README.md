@@ -38,7 +38,7 @@ the predefined formats (`EXCEL`, `MYSQL`, `POSTGRESQL_CSV`, ...); values are str
 special character of the format plus control characters, Unicode whitespace and surrogate pairs, `null`, JDK numbers,
 `StringBuilder`s, `Reader`s and `InputStream`s (printed as Base64).
 
-## Properties (`CommonsCsvTest`, 2; `CommonsCsvParserTest`, 3)
+## Properties (`CommonsCsvTest`, 5; `CommonsCsvParserTest`, 6)
 
 - `printerParserRoundTrip`: random format, records printed through `printRecord(Object...)`, `printRecord(Iterable)`,
   `printRecord(Stream)` and `print`/`println`, optional header comments; the parser gives the modelled values back,
@@ -66,11 +66,20 @@ special character of the format plus control characters, Unicode whitespace and 
   `QuoteMode.ALL` whatever the order of `setQuote`/`setNullString`, `format()` and `printRecord(Appendable)` against
   the printer, `Predefined`/`valueOf`, `newFormat`.
 
-Known-bug shapes are skipped, never worked around: a null whose null string starts with the comment marker and a null
-in a quote-less `QuoteMode.ALL` format are replaced by a plain value (1, 6); multi-character delimiters made of the
-letters `r n t b f` are not generated (2); `isConsistent` is not checked when header names repeat (3);
-`getFirstEndOfLine` is not checked when the text starts with a comment line (4); a format the parser refuses for a
-case-insensitive duplicate header is accepted from the builder (5).
+The generators draw the recorded bugs' shapes: null strings starting with the comment marker (1), multi-character
+delimiters made of the letters `r n t b f` (`nn`, `aba`, `t~t`) in escape mode (2), repeated header names (3), a
+comment line first (4), header names differing only in case under `ignoreHeaderCase` (5) and a null string in a
+quote-less `QuoteMode.ALL` (6), so `printerParserRoundTrip`, `headersMatchTheModel`, `positionsAndCommentsMatchTheText`
+and `formatsAreValues` fail on them (intermittently at 100 cases, each mapped to the bug it shrinks to), and one narrow
+property per bug draws that bug's shape region with random contents through the same oracle and fails every run:
+`nullStringStartingWithCommentMarkerRoundTrips`, `straddlingLetterDelimiterPrefixRoundTripsInEscapeMode`,
+`quotelessAllModeNullStringRoundTrips` (`CommonsCsvTest`), `isConsistentCountsRepeatedHeaderNames`,
+`firstEndOfLineCountsCommentLines`, `formatRefusesCaseInsensitiveDuplicateHeader` (`CommonsCsvParserTest`). The pins
+stay as regression examples. `HEGEL_NO_KNOWN=1` switches the shapes off: the nulls of shapes 1 and 6 are replaced by a
+plain value, the values of an escaping letter-delimiter format keep clear of the delimiter, and the `isConsistent`,
+first-end-of-line and format-refuses checks are left out for their shapes. A raw format (no quote, no escape) whose
+null string starts with the comment marker never draws the null string as a value: nothing in such a format can keep it
+from reading as a comment line.
 
 ## Not tested
 
