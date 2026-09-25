@@ -30,30 +30,45 @@ shared buffers, SharedArrayBuffers, objects with internal slots, plain objects w
 `Symbol.toStringTag`s, and with `share` repeated references and cycles), and `hegel/known.mjs`
 the predicates that attribute a mismatch to a recorded bug from the shape of the value.
 
-Two value spaces: `CLEAN` leaves out every shape a recorded bug is about, and the properties on
-it must agree with native `structuredClone` outright; `FULL` includes them all, and a mismatch
-there must be explained by one of the recorded bugs' shapes (`known(v)`), so anything new fails.
+Two value spaces: `FULL`, the default space of every property, draws the shapes of every
+recorded bug like any other value, so every property fails on them and the failure names the bug
+(`shapesOf(v)`); anything without a recorded shape is a new bug. Under `HEGEL_NO_KNOWN=1` the
+properties draw `CLEAN` (`JSON_CLEAN` for the json module), which leaves those shapes out, and
+skip the rare value that still has one (a -0 after a +0, bug 17, about 2% of cases).
 
 | Property | What it checks |
 |---|---|
-| `TestHegelCloneMatchesNative` | on `CLEAN`, `deserialize(serialize(v))` equals `structuredClone(v)` (views by elements) — or both throw |
-| `TestHegelCloneMatchesNativeEverywhere` | on `FULL`, the same with the strict rendering; every mismatch has a recorded bug's shape |
-| `TestHegelJsonRoundTripMatchesNative` | `parse(stringify(v))` of the json module equals `structuredClone(v)` on `CLEAN` |
+| `TestHegelCloneMatchesNative` | `deserialize(serialize(v))` equals `structuredClone(v)` (views by elements) — or both throw |
+| `TestHegelCloneMatchesNativeEverywhere` | the same with the strict rendering (views by buffer, offset and length) |
+| `TestHegelJsonRoundTripMatchesNative` | `parse(stringify(v))` of the json module equals `structuredClone(v)` |
 | `TestHegelRecordsSurviveJsonText` | README: `deserialize(JSON.parse(JSON.stringify(serialize(v))))` equals `deserialize(serialize(v))` |
 | `TestHegelLossyDropsFunctionsAndSymbolsLikeJson` | with functions and symbols inserted, `{ lossy: true }` equals `structuredClone` of the value with them removed as the README describes (properties dropped, array elements `null`, Map entries and Set elements dropped) |
 | `TestHegelStrictRefusesFunctionsAndSymbols` | without options, a function or symbol anywhere makes `serialize` throw `TypeError: unable to serialize function|symbol`, and native `structuredClone` refuses the value too; without one nothing throws |
 | `TestHegelJsonModeAppliesToJSONLikeJsonStringify` | with `toJSON` members inserted (returning a fresh value, a primitive, `this`, or not callable), `{ json: true }` equals `structuredClone` of what `JSON.stringify` would see |
 | `TestHegelDeserializeReturnsOrThrowsAndNeverPollutes` | random records with bad indices, `__proto__`/`constructor` keys, error and regexp payloads: `deserialize` returns or throws an Error and no built-in prototype changes |
 
-`TestHegelPin…` are plain tests, one per bug in `bugs.toml`. `ZOO_TRACE=<file>` appends every
+Seventeen narrow properties, one per bug in `bugs.toml`, draw that bug's shape region with random
+contents (the shape bare or placed in an array, object, Map or Set among plain siblings) through the
+same oracle and fail every run: `TestHegelSparseArraysKeepTheirHoles` (1),
+`TestHegelArrayOwnPropertiesClone` (2), `TestHegelErrorCausesClone` (3),
+`TestHegelAggregateErrorsCloneAsErrors` (4), `TestHegelErrorsNamedAfterGlobalsCloneAsErrors` (5),
+`TestHegelDOMExceptionsCloneAsDOMExceptions` (6), `TestHegelUncloneableObjectsAreRefusedLikeNative` (7),
+`TestHegelSharedArrayBuffersClone` (8), `TestHegelDataViewsOverPartOfABufferKeepTheirRange` (9),
+`TestHegelRepeatedBufferReferencesCloneAsOneObject` (10), `TestHegelViewsOverOneBufferKeepSharingIt` (11),
+`TestHegelTaggedPlainObjectsCloneAsPlainObjects` (12),
+`TestHegelJsonModeNonCallableOrSelfToJSONLikeJsonStringify` (13), `TestHegelNullOptionsCloneLikeNative` (14),
+`TestHegelJsonModuleKeepsNonFiniteNumbersAndBoxedNegativeZero` (15), `TestHegelBigIntArraysSurviveJsonText` (16),
+`TestHegelNegativeZeroAfterZeroStaysNegative` (17); under `HEGEL_NO_KNOWN=1` they are registered skipped.
+The wide properties fail every run too, each mapped to the bug it most often shrinks to.
+`TestHegelPin…` are plain tests, one per bug in `bugs.toml`, kept as regression examples. `ZOO_TRACE=<file>` appends every
 value the full-space property is about to clone, to find one that hangs.
 
 Accepted differences, not recorded: `stack` is never compared (the polyfill's Errors get the
 deserializer's stack); an Error's extra own properties (`code`) are dropped by both; Node's
 `Buffer` clones as a `Uint8Array` in both; a `Proxy` cannot be told from its target in
-JavaScript, so it is not generated; the clean-space properties skip a value in which a -0
-follows a +0 (bug 17), the only recorded shape the generator cannot avoid without changing the
-numbers it draws.
+JavaScript, so it is not generated; under `HEGEL_NO_KNOWN=1` the properties skip a value in which
+a -0 follows a +0 (bug 17), the only recorded shape the clean generator cannot avoid without changing
+the numbers it draws.
 
 ## Bugs
 
