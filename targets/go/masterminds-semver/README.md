@@ -44,7 +44,9 @@ increment and set functions.
 - `TestHegelPrecedenceFollowsTheSpec` — pairs of related versions (shared core, derived
   pre-releases, different metadata): `Compare` and the six comparison methods agree with the
   model in both directions; `sort.Sort(Collection)` orders 2–6 related versions as the model
-  does and loses nothing.
+  does and loses nothing. Numeric identifiers beyond uint64 are drawn (a quarter of the numeric
+  ones), so the property lands on masterminds-semver/1 when such an identifier meets a `-`, a
+  `0` or another huge number (most 1000-case runs, not every 100-case one; intermittent).
 - `TestHegelIncrementsFollowTheDocs` — `IncPatchE/MinorE/MajorE` and their panicking variants
   follow the doc comments (a pre-release version's patch stays, metadata and pre-release are
   cleared, lower segments zeroed), overflow at MaxUint64 is `ErrIncrementOverflow` / a panic
@@ -56,16 +58,26 @@ increment and set functions.
   comma separators, `IncludePrerelease` on or off) against versions near their own:
   `Check` agrees with the README model, `Validate` agrees with `Check` and returns messages
   exactly when it fails, and the constraint survives `String()` → `NewConstraint` and
-  `MarshalText` → `UnmarshalText` with the same verdict. Pre-release versions are checked
-  against comparators with full versions only (see below).
+  `MarshalText` → `UnmarshalText` with the same verdict. A known shape is in about a quarter
+  of the constraints, so the property lands on masterminds-semver/5 in most runs (a hyphen
+  range after a blank-separated comparator), on /3, /4 or /7 in the rest.
 
-The generators avoid the pinned shapes and say where: numeric pre-release identifiers stay
-within uint64 (/1); a bare wildcard is generated only with `=`, `>=`, `<`, `~` (/2, /3); `~`
-never gets a 0.0.0 core (/4); a hyphen range is preceded by a comma, not a blank (/5); `||` is
-blank-separated whenever a hyphen range is present (/6); `!=` with a wildcard is not checked
-against pre-release versions (/7). All six pass at 20 000 cases (about 12 s); at the default
-100 cases the run takes well under a second. `MASTERMINDS_SEMVER_COLLECT=1` makes the
-properties record mismatches instead of failing and print them shortest-first.
+## Known bugs
+
+The generators draw the shape of every recorded bug (STYLE.md rule 11): the two wide
+properties above are expected failures mapped to the bugs they land on, and each bug has a
+narrow property over its own shape region in `hegel_shapes_test.go`, the deterministic
+expected failure beside the pin: `TestHegelHugeNumericIdentifiersCompareNumerically`
+(masterminds-semver/1), `TestHegelCaretWildcardIsAnyVersion` (/2),
+`TestHegelBareWildcardIsNotZero` (/3), `TestHegelTildeZeroIsAPatchRange` (/4),
+`TestHegelHyphenRangeAfterBlankSeparatedComparator` (/5), `TestHegelOrGluedToHyphenRange` (/6)
+and `TestHegelNotEqualWildcardsAgreeOnPrereleases` (/7). `HEGEL_NO_KNOWN=1` (read once)
+switches the known shapes off: numeric identifiers stay within uint64, a bare wildcard comes
+only with `=`, `>=`, `<`, `~`, `~` never gets a 0.0.0 core, a hyphen range follows a comma,
+`||` is blank-separated beside a hyphen range and `!=` with a wildcard is not checked against
+pre-releases; every property then passes at 3000 cases with no skips. At the default 100
+cases the run takes well under a second. `MASTERMINDS_SEMVER_COLLECT=1` makes the properties
+record mismatches instead of failing and print them shortest-first.
 
 ## Bugs (7; details in bugs.toml)
 
@@ -80,8 +92,8 @@ properties record mismatches instead of failing and print them shortest-first.
 | masterminds-semver/7 | With IncludePrerelease `!= 1.2.x` accepts 1.2.3-alpha but `!= 1.x` rejects it | low |
 
 How they were found: /1, /2, /3, /4 and /7 from reading `comparePrePart` and the constraint
-functions while writing the model, each confirmed by a probe before the property was made to
-avoid it; /5 by the probe that checked how hyphen ranges combine with other comparators; /6 by
+functions while writing the model, each confirmed by a probe (the properties draw the shapes
+since 2026-09-25); /5 by the probe that checked how hyphen ranges combine with other comparators; /6 by
 the constraint property's first 20 000-case run ("improper constraint: \"3.3 .1\"" for
 `2.3.1 - 0.*||3.3.1`, and `"<2.>= 3"` for `<2.3||0.1.2 - 3.1.1`), traced to the `|` in the
 character class.
@@ -100,7 +112,9 @@ character class.
 - Which versions a wildcard, `~` or `^` comparator admits when the *version* is a pre-release
   (`1.2.x` vs `1.2.0-alpha`, `< 1.3.x` vs `1.3.0-alpha`) is not defined by the README, and
   the code's answers differ from npm's; only `!=`'s internal inconsistency (/7) is recorded.
-  The property checks pre-release versions against full-version comparators only.
+  The property checks pre-release versions against full-version comparators only, except
+  that `!=` takes a version of any shape (masterminds-semver/7's region; full versions only
+  under `HEGEL_NO_KNOWN=1`).
 - The empty constraint and a trailing `||` are "improper constraint" errors; `1|2.3` is a
   "constraint parser error" (mentioned under /6). Error texts are not compared.
 - A trailing hyphen after a pre-release or build identifier (`1.2.3-1-`) is a valid identifier
