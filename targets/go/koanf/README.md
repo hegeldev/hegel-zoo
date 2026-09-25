@@ -15,9 +15,10 @@ nothing upstream.
 ## Build
 
 `GOWORK=off go test -count=1 -run TestHegel -v .` in the module root (Go 1.23+). The patch
-adds, in the external test package, `hegel_test.go` (harness, the `Known` switch, a map
+adds, in the external test package, `hegel_test.go` (harness, the `noKnown` switch, a map
 provider), `hegel_model_test.go` (the model, the conversions, the generators),
-`hegel_props_test.go` (properties) and `hegel_pins_test.go`, and in go.mod requires
+`hegel_props_test.go` (the wide properties), `hegel_shapes_test.go` (one narrow property per
+recorded bug) and `hegel_pins_test.go`, and in go.mod requires
 `hegel.dev/go/hegel v0.6.33` and replaces `github.com/knadh/koanf/maps` by the repository's
 `./maps` (the workspace file is switched off, so the pinned `maps` is tested rather than the
 released v0.1.2).
@@ -66,6 +67,24 @@ exist, extend an existing key, or are fresh.
 
 `ZOO_COLLECT=1` records mismatches instead of failing and prints the agreement classes.
 
+## Known bugs
+
+The generators draw the shape of every recorded bug but koanf/6 (STYLE.md rule 11), so the
+wide properties are expected failures mapped to the bug they land on: OperationsFollowTheModel
+on koanf/1 in most runs (a failed strict Load that has already written a key; the failed
+merge is repeated on up to twenty fresh copies so that Go's map order cannot hide it), on /2
+or /5 in the rest; ValuesAreCopied on koanf/3 (the provider's map rewritten in place); and
+GettersConvert on koanf/4 (`Float64` of `"1e400"`; about 2.6 % of cases, intermittent). Each
+bug also has a narrow property over its own shape region in `hegel_shapes_test.go`, the
+deterministic expected failure beside the pin: `TestHegelStrictLoadIsAtomic` (koanf/1),
+`TestHegelSetWithAMapReplacesTheValue` (/2), `TestHegelLoadCopiesTheProvider` (/3),
+`TestHegelFloat64OutOfRangeIsZero` (/4), `TestHegelNestedSliceMapsAreConverted` (/5) and
+`TestHegelSetOnAKeyWithTheDelimiterIsDeterministic` (/6, the one shape the flat-key model
+cannot hold, so it is covered by the narrow property alone). `HEGEL_NO_KNOWN=1` (read once)
+switches the shapes off: the model then reproduces each recorded behaviour (the partial merge
+is counted and the instance rebuilt, `Set` with a map merges, the alias is accepted, Inf and
+the unconverted map are expected) and every property passes at 3000 cases with no skips.
+
 ## Accepted differences
 
 - Keys containing the delimiter and an empty top-level key are not generated: the empty path
@@ -74,8 +93,8 @@ exist, extend an existing key, or are fresh.
 - `StringsMap` keeps a nil entry for an empty `[]string` and none for an empty `[]any`; the
   test drops empty entries on both sides.
 - `Bools` returns nil rather than an empty slice for a missing key; compared by length.
-- After a failed strict merge the instance is rebuilt from the model (bug 1 leaves it
-  half-merged with stale flattened keys).
+- After a failed strict merge the instance is rebuilt from the model under `HEGEL_NO_KNOWN=1`
+  (bug 1 leaves it half-merged with stale flattened keys); by default the property fails there.
 - The documentation of `All`, `Raw` and `Get` still says numbers come back as float64 from
   `json.Marshal`; `maps.Copy` uses copystructure and keeps the types, which the model follows.
 
@@ -95,3 +114,8 @@ the copies on the way out.
 ## History
 
 - 2026-09-21 (turn 346): target added at 6ad56fe with three properties and 6 pins.
+- 2026-09-25: generators rewritten in combinator style; the properties draw the known shapes
+  and six narrow properties were added; three latent model bugs fixed (the strict conflict
+  check ran after the removal of the existing subtree, the koanf/5 shape test missed a
+  `map[any]any` under a `map[string]any` in a slice in a slice, the Copy/Cut comparisons
+  lacked the koanf/2 shape).
