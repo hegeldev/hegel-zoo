@@ -12,8 +12,9 @@ only project documents and say nothing about AI-written code.
 
 `go test -count=1 -run TestHegel -v .` in the module root (the repository's `go.work` is
 removed by the patch so the module builds alone). The patch adds `hegel_test.go` (the model
-and the properties) and `hegel_pins_test.go` (one plain test per bug) and requires
-`hegel.dev/go/hegel v0.6.33` in go.mod.
+and the nine wide properties), `hegel_gen_test.go` (the combinator-built generators),
+`hegel_shapes_test.go` (one narrow property per recorded bug) and `hegel_pins_test.go` (one
+plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in go.mod.
 
 ## Oracles
 
@@ -52,10 +53,25 @@ and the properties) and `hegel_pins_test.go` (one plain test per bug) and requir
 | LiteralConstructorsRoundTrip | `String`/`Int`/`Uint`/`Float`/`Bool` produce valid literals of the right kind that read back; `IsValid`, `Kind` and the accessors on drawn and hand-picked literals (valid or not) match the documentation |
 | CloneIsDeep | a clone packs the same with the same offsets; formatting, minimizing, standardizing, patching or scribbling on the clone leaves the original; scribbling on the parsed input leaves the clone |
 
-`Known` switches gate the eight recorded bugs (the generators avoid the shapes; the
-convenience functions are called on copies of the input). With them on, the nine properties
-run clean at 500 cases in about a second (`HUJSON_COLLECT=1` records mismatches instead of
-failing and prints them shortest-first; `HEGEL_VERBOSE=1` turns on the engine's log).
+## Known bugs
+
+The properties draw the shapes of the eight recorded bugs by default and are the expected
+failures mapped to them in `target.toml` (STYLE.md rule 11); the pins are the regression
+examples. One narrow property per bug is the deterministic finder:
+`TestHegelAddBeyondArrayEndFails` (/1), `TestHegelLeadingZeroIndexNamesNothing` (/2),
+`TestHegelMoveToSelfAndCopyFromRootSucceed` (/3), `TestHegelReplaceAtRootSucceeds` (/4),
+`TestHegelLiteralIsValidRejectsComposites` (/5),
+`TestHegelConvenienceFunctionsLeaveTheInputAlone` (/6), `TestHegelCloneKeepsTrailingCommas`
+(/7) and `TestHegelTestAgainstNullSucceeds` (/8). The wide properties reach the bugs at their
+natural rates: Grammar, Standardize/Minimize and Format land on /6 every run (the
+convenience functions overwrite their input on about half the documents); Find (/2, 0.4% of
+cases), Patch (/4 most runs, /1 in some), Literal (/5, 0.35%) and Clone (/7) are mapped
+intermittent. `HEGEL_NO_KNOWN=1` (read once) switches the shapes off: the Patch property
+steers its live-document operations away from the out-of-range, move-onto-self and
+test-null shapes at resolution, the other properties name a known shape and assume it away,
+and the convenience functions are called on copies of the input; then every property
+passes (`HUJSON_COLLECT=1` records mismatches instead of failing and prints them
+shortest-first; `HEGEL_VERBOSE=1` turns on the engine's log).
 
 ## Bugs (8; details in bugs.toml)
 
@@ -103,3 +119,12 @@ The `hujsonfmt` command, comment placement after `Patch` (the source calls it a 
 taste and documents which comments travel with a member), `alignObjectValues` column
 alignment beyond the whitespace discipline, and error message wording beyond the
 `line, column` prefix.
+
+## History
+
+- 2026-09-25: generators rewritten in combinator style (STYLE.md) into `hegel_gen_test.go`;
+  the properties draw the known shapes by default and are the expected failures, with a
+  narrow property per bug in `hegel_shapes_test.go`; `HEGEL_NO_KNOWN=1` switches the shapes
+  off. Two latent model bugs fixed: `Literal(...).Int()` on an overflowing integer is 0 (the
+  documented non-integer result), not `MaxInt64`; "beyond the end" for a `move` is judged
+  on the document after the removal (which found hujson/1's second route).
