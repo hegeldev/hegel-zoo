@@ -231,12 +231,455 @@ index 0000000..ef9e3e1
 +		}
 +	}
 +}
+diff --git a/hegel_shapes_test.go b/hegel_shapes_test.go
+new file mode 100644
+index 0000000..e544821
+--- /dev/null
++++ b/hegel_shapes_test.go
+@@ -0,0 +1,437 @@
++package brotli_test
++
++// One property per recorded bug (bugs.toml): a generator over the bug's shape
++// region with random contents, judged by the oracle of the wide property that
++// found it, so that each bug has a property that finds it every run (the wide
++// properties in hegel_test.go reach the shapes at their natural rate). Under
++// HEGEL_NO_KNOWN=1 each draws the neighbouring region the bug does not touch
++// instead (a repeat that fits a 258-byte match, lower-case codings, a "*" no
++// heavier than the listed br, levels up to 9, the finders that do not read
++// dst, matches of four bytes or more, a truncated stream before Reset, a
++// block of 20 bytes or more) and passes.
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"math/rand"
++	"strings"
++	"testing"
++
++	"github.com/andybalholm/brotli"
++	bflate "github.com/andybalholm/brotli/flate"
++	"github.com/andybalholm/brotli/matchfinder"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- brotli/1
++
++// longRepeatCase: a flate or gzip writer at a level, given random bytes
++// around a repeat: a run of one byte, or a random segment written twice,
++// of length bytes, so the matchfinder returns a match about length bytes
++// long. Under HEGEL_NO_KNOWN=1 the repeat is at most 200 bytes, within
++// DEFLATE's 258-byte maximum match.
++type longRepeatCase struct {
++	gzip           bool
++	level          int
++	run            bool
++	length         int
++	prefix, suffix []byte
++	seed           int64
++}
++
++func (c longRepeatCase) GoString() string {
++	kind := "flate.NewWriter"
++	if c.gzip {
++		kind = "flate.NewGZIPWriter"
++	}
++	form := "random segment written twice"
++	if c.run {
++		form = "run of one byte"
++	}
++	return fmt.Sprintf("%s level %d: %d random bytes, a %d-byte %s, %d random bytes (seed %d)", kind, c.level, len(c.prefix), c.length, form, len(c.suffix), c.seed)
++}
++
++func (c longRepeatCase) shapes() []string { return shapeIf(c.length > 258, "brotli/1") }
++
++// bytes renders the data.
++func (c longRepeatCase) bytes() []byte {
++	r := rand.New(rand.NewSource(c.seed))
++	var repeat []byte
++	if c.run {
++		repeat = bytes.Repeat([]byte{byte(r.Intn(256))}, c.length)
++	} else {
++		segment := make([]byte, c.length)
++		r.Read(segment)
++		repeat = append(segment, segment...)
++	}
++	return append(append(append([]byte(nil), c.prefix...), repeat...), c.suffix...)
++}
++
++var (
++	// repeatLengths: over 258 bytes (brotli/1), or under HEGEL_NO_KNOWN=1 at most 200.
++	repeatLengths   = shaped(hegel.Integers(300, 3000), hegel.Integers(1, 200))
++	longRepeatCases = hegel.Composite(func(tc hegel.TestCase) longRepeatCase {
++		return longRepeatCase{
++			gzip:   hegel.Draw(tc, chance(50)),
++			level:  hegel.Draw(tc, writerLevels),
++			run:    hegel.Draw(tc, chance(50)),
++			length: hegel.Draw(tc, repeatLengths),
++			prefix: hegel.Draw(tc, hegel.Binary(0, 64)),
++			suffix: hegel.Draw(tc, hegel.Binary(0, 64)),
++			seed:   hegel.Draw(tc, seeds),
++		}
++	})
++)
++
++// TestHegelFlateWritersSplitLongMatches: a flate or gzip writer given a repeat
++// longer than DEFLATE's 258-byte maximum match writes a stream the standard
++// library decodes to the data, splitting the match as compress/flate does;
++// the flate encoder panics with "match too long" instead (brotli/1).
++func TestHegelFlateWritersSplitLongMatches(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, longRepeatCases)
++		begin(c)
++		data := c.bytes()
++		var buf bytes.Buffer
++		kind := "flate"
++		w := bflate.NewWriter(&buf, c.level)
++		if c.gzip {
++			kind = "gzip"
++			w = bflate.NewGZIPWriter(&buf, c.level)
++		}
++		if _, err := w.Write(data); err != nil {
++			mismatch(ht, "Write: %v", err)
++		}
++		if err := w.Close(); err != nil {
++			mismatch(ht, "Close: %v", err)
++		}
++		got, err := decodeStream(ht, kind, buf.Bytes(), decodeSpec{}, data)
++		if err != nil {
++			mismatch(ht, "the standard library rejects the %s writer's stream: %v", kind, err)
++		}
++		if !bytes.Equal(got, data) {
++			mismatch(ht, "the %s writer's stream decodes to %d bytes, want %d", kind, len(got), len(data))
++		}
++	})
++}
++
++// --------------------------------------------------------------------------- the Accept-Encoding shapes
++
++// withCase writes the coding with the letters of the mask in upper case.
++func withCase(coding string, mask int) string {
++	b := []byte(coding)
++	for i := range b {
++		if mask&(1<<i) != 0 {
++			b[i] = strings.ToUpper(string(b[i]))[0]
++		}
++	}
++	return string(b)
++}
++
++var (
++	// otherCodings: the codings that are neither offer nor "*".
++	otherCodings = hegel.SampledFrom([]string{"identity", "deflate", "zstd", "x-br"})
++	// otherEntries: an entry of another coding with a valid weight (an odd
++	// weight would leave the model without a verdict).
++	otherEntries = entriesOf(otherCodings, weightsOf(validQs))
++	// positiveWeights: a weight that makes a coding acceptable.
++	positiveWeights = weightsOf(hegel.SampledFrom([]string{"1", "0.5", "0.9", "1.0", "0.75", "0.1"}))
++)
++
++// lineWith: a header line of up to three other entries with the special
++// entries inserted at drawn positions (modulo the live length), in order.
++func lineWith(specials hegel.Generator[[]acceptEntry]) hegel.Generator[acceptLine] {
++	return hegel.Composite(func(tc hegel.TestCase) acceptLine {
++		entries := hegel.Draw(tc, many(otherEntries, 0, 3))
++		for _, e := range hegel.Draw(tc, specials) {
++			at := hegel.Draw(tc, positions) % (len(entries) + 1)
++			entries = append(entries[:at], append([]acceptEntry{e}, entries[at:]...)...)
++		}
++		return acceptLine{entries: entries, sep: hegel.Draw(tc, listSeps)}
++	})
++}
++
++// oneLine: a request with one header line.
++func oneLine(line hegel.Generator[acceptLine]) hegel.Generator[[]acceptLine] { return many(line, 1, 1) }
++
++// --------------------------------------------------------------------------- brotli/2
++
++// casedOffers: br or gzip with at least one upper-case letter (brotli/2); under
++// HEGEL_NO_KNOWN=1 in lower case.
++var casedOffers = hegel.FlatMap(hegel.SampledFrom([]string{"br", "gzip"}), func(coding string) hegel.Generator[string] {
++	return hegel.Map(shaped(hegel.Integers(1, 1<<len(coding)-1), hegel.Just(0)), func(mask int) string { return withCase(coding, mask) })
++})
++
++// casedOfferCases: the cased offer, acceptable, as the only br or gzip of the
++// header, so the RFC's choice is that offer.
++var casedOfferCases = httpCasesOf(oneLine(lineWith(many(entriesOf(casedOffers, positiveWeights), 1, 1))), hegel.Integers(0, 9), 30)
++
++// TestHegelContentCodingsMatchInAnyCase: a br or gzip written in upper or
++// mixed case is the coding it names (content codings are case-insensitive,
++// RFC 9110 section 8.4.1), so the response is compressed with it;
++// HTTPCompressor compares the spelling and sends identity (brotli/2).
++func TestHegelContentCodingsMatchInAnyCase(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, casedOfferCases)
++		begin(c)
++		checkNegotiation(ht, c)
++	})
++}
++
++// --------------------------------------------------------------------------- brotli/3
++
++var (
++	// lowWeights: a br weight below the "*"'s (brotli/3); under HEGEL_NO_KNOWN=1
++	// a full weight.
++	lowWeights = shaped(hegel.SampledFrom([]string{"0", "0.1", "0.5", "0.9"}), hegel.SampledFrom([]string{"", "1", "1.0"}))
++	// starWeights: a "*" of weight 1 (brotli/3); under HEGEL_NO_KNOWN=1 at most
++	// the br's.
++	starWeights = shaped(hegel.SampledFrom([]string{"", "1", "1.0"}), hegel.SampledFrom([]string{"", "1", "0.5", "0"}))
++	// starPairs: a listed br and a "*".
++	starPairs = hegel.Composite(func(tc hegel.TestCase) []acceptEntry {
++		return []acceptEntry{
++			{coding: "br", q: hegel.Draw(tc, lowWeights), sep: hegel.Draw(tc, qSeps)},
++			{coding: "*", q: hegel.Draw(tc, starWeights), sep: hegel.Draw(tc, qSeps)},
++		}
++	})
++	starCases = httpCasesOf(oneLine(lineWith(starPairs)), hegel.Integers(0, 9), 30)
++)
++
++// TestHegelStarDoesNotOutweighAListedBr: a "*" sets the weight of the codings
++// not listed (RFC 9110 section 12.5.3), so with br listed below the "*"'s
++// weight gzip wins; HTTPCompressor gives br the "*"'s weight too and br wins
++// the tie as the first offer (brotli/3).
++func TestHegelStarDoesNotOutweighAListedBr(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, starCases)
++		begin(c)
++		checkNegotiation(ht, c)
++	})
++}
++
++// --------------------------------------------------------------------------- brotli/4
++
++var (
++	// highLevels: 10 or 11 (brotli/4); under HEGEL_NO_KNOWN=1 0 to 9.
++	highLevels = shaped(hegel.SampledFrom([]int{10, 11}), hegel.Integers(0, 9))
++	// gzipOnlyCases: a client accepting gzip (and other codings, but not br)
++	// at a high level.
++	gzipOnlyCases = httpCasesOf(oneLine(lineWith(many(entriesOf(hegel.Just("gzip"), positiveWeights), 1, 1))), highLevels, 0)
++)
++
++// TestHegelGzipOnlyClientsGetGzipAtHighLevels: a client accepting gzip and
++// not br gets a gzip response at every level of the helper's 0-11 scale;
++// HTTPCompressorWithLevel hands levels 10 and 11 to gzip.NewWriterLevel,
++// which rejects them, and sends identity (brotli/4).
++func TestHegelGzipOnlyClientsGetGzipAtHighLevels(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, gzipOnlyCases)
++		begin(c)
++		checkNegotiation(ht, c)
++	})
++}
++
++// --------------------------------------------------------------------------- brotli/5
++
++var (
++	// dstReaders: the finders that take their previous match from dst
++	// (brotli/5); under HEGEL_NO_KNOWN=1 the finders that do not.
++	dstReaders = findersOf(shaped([]string{"M4", "AutoReset"}, []string{"Pathfinder", "Bargain1", "Bargain2", "Bargain3", "Trio", "ZFast", "ZDFast", "ZM"})...)
++	// dstCases: two or three non-empty blocks whose matches accumulate in dst
++	// (so every block after the first starts with dst ending in the previous
++	// block's literal-only Match), dst pre-filled half of the time.
++	dstCases = hegel.Composite(func(tc hegel.TestCase) lz77Case {
++		return lz77Case{
++			finder:  hegel.Draw(tc, dstReaders),
++			prefill: hegel.Draw(tc, maybe(50, many(matchEntries, 1, 5))),
++			keep:    true,
++			blocks:  hegel.Draw(tc, many(lz77BlocksOf(dataOf(hegel.Integers(1, 3000))), 2, 3)),
++		}
++	})
++)
++
++// TestHegelMatchFindersIgnoreThePreviousMatchesInDst: FindMatches appends to
++// dst whatever dst holds, so the matches of consecutive blocks accumulated in
++// one slice are valid LZ77 for each block; M4 reads the last entry of dst as
++// its previous match and returns distance-0 matches, or panics on a far
++// distance (brotli/5).
++func TestHegelMatchFindersIgnoreThePreviousMatchesInDst(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, dstCases)
++		begin(c)
++		checkLZ77(ht, c)
++	})
++}
++
++// --------------------------------------------------------------------------- brotli/6
++
++// shortMatchCase: a block of lit random literals, a match of length bytes at
++// distance (1 to lit), and tail random literals, encoded by the FastEncoder
++// as one final block.
++type shortMatchCase struct {
++	lit, length, distance, tail int
++	seed                        int64
++	decode                      decodeSpec
++}
++
++func (c shortMatchCase) GoString() string {
++	return fmt.Sprintf("FastEncoder: %d literals, a %d-byte match at distance %d, %d literals (seed %d), %s", c.lit, c.length, c.distance, c.tail, c.seed, c.decode.GoString())
++}
++
++func (c shortMatchCase) shapes() []string { return shapeIf(c.length < 4, "brotli/6") }
++
++// block renders the block and its matches.
++func (c shortMatchCase) block() ([]byte, []matchfinder.Match) {
++	r := rand.New(rand.NewSource(c.seed))
++	block := make([]byte, c.lit, c.lit+c.length+c.tail)
++	r.Read(block)
++	for k := 0; k < c.length; k++ {
++		block = append(block, block[len(block)-c.distance])
++	}
++	matches := []matchfinder.Match{{Unmatched: c.lit, Length: c.length, Distance: c.distance}}
++	if c.tail > 0 {
++		tail := make([]byte, c.tail)
++		r.Read(tail)
++		block = append(block, tail...)
++		matches = append(matches, matchfinder.Match{Unmatched: c.tail})
++	}
++	return block, matches
++}
++
++// shortMatches: the match length and the literals before it: a 3-byte match
++// after any literals, or a 2-byte match after six or more (brotli/6); under
++// HEGEL_NO_KNOWN=1 a match of 4 to 12 bytes.
++var shortMatches = hegel.FlatMap(shaped(hegel.SampledFrom([]int{3, 2}), hegel.Integers(4, 12)), func(length int) hegel.Generator[[2]int] {
++	lits := hegel.Integers(1, 30)
++	if length == 2 {
++		lits = hegel.Integers(6, 30)
++	}
++	return hegel.Map(lits, func(lit int) [2]int { return [2]int{length, lit} })
++})
++
++var shortMatchCases = hegel.Composite(func(tc hegel.TestCase) shortMatchCase {
++	m := hegel.Draw(tc, shortMatches)
++	return shortMatchCase{
++		lit:      m[1],
++		length:   m[0],
++		distance: 1 + hegel.Draw(tc, positions)%m[1],
++		tail:     hegel.Draw(tc, maybe(50, hegel.Integers(1, 20))),
++		seed:     hegel.Draw(tc, seeds),
++		decode:   hegel.Draw(tc, decodeSpecs),
++	}
++})
++
++// TestHegelFastEncoderEncodesTwoAndThreeByteMatches: brotli copy lengths
++// start at 2 and the Match contract has no minimum, so the FastEncoder given
++// a valid 2- or 3-byte match writes a stream the reference tool and the
++// Reader decode to the block; it writes a stream both reject for a 3-byte
++// match, and panics for a 2- or 3-byte match after six literals (brotli/6).
++func TestHegelFastEncoderEncodesTwoAndThreeByteMatches(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, shortMatchCases)
++		begin(c)
++		block, matches := c.block()
++		if msg := checkMatches(matches, nil, block, 0); msg != "" {
++			ht.Fatalf("harness: generated matches are invalid: %s", msg)
++		}
++		stream := (&brotli.FastEncoder{}).Encode(nil, block, matches, true)
++		got, err := decodeStream(ht, "brotli", stream, c.decode, block)
++		if err != nil {
++			mismatch(ht, "the reference tool rejects the FastEncoder's stream: %v", err)
++		}
++		if !bytes.Equal(got, block) {
++			mismatch(ht, "the FastEncoder's stream decodes to %d bytes, want %d", len(got), len(block))
++		}
++	})
++}
++
++// --------------------------------------------------------------------------- brotli/7
++
++// trailingCase: a valid stream with a damage before it is read, then Reset
++// onto the good stream: extra bytes after the stream (brotli/7), or under
++// HEGEL_NO_KNOWN=1 a truncation.
++type trailingCase struct {
++	data   dataSpec
++	source streamSource
++	dmg    damage
++}
++
++func (c trailingCase) GoString() string {
++	return fmt.Sprintf("%s of %s, %s, then Reset onto the good stream", c.source.GoString(), c.data.GoString(), c.dmg.GoString())
++}
++
++func (c trailingCase) shapes() []string { return shapeIf(c.dmg.kind == "append", "brotli/7") }
++
++var (
++	appendDamages   = hegel.Composite(func(tc hegel.TestCase) damage { return damage{kind: "append", extra: hegel.Draw(tc, trailers)} })
++	truncateDamages = hegel.Composite(func(tc hegel.TestCase) damage { return damage{kind: "truncate", at: hegel.Draw(tc, offsets)} })
++	trailingCases   = hegel.Composite(func(tc hegel.TestCase) trailingCase {
++		return trailingCase{
++			data:   hegel.Draw(tc, smallBlocks),
++			source: hegel.Draw(tc, streamSources),
++			dmg:    hegel.Draw(tc, shaped(appendDamages, truncateDamages)),
++		}
++	})
++)
++
++// TestHegelReaderResetRecoversFromTrailingBytes: Reset makes a Reader
++// equivalent to a new one (its documentation), so after a stream followed by
++// extra bytes (reported as excessive input) a Reset Reader decodes the good
++// stream; the leftover bytes stay in the Reader and the next stream fails
++// (brotli/7).
++func TestHegelReaderResetRecoversFromTrailingBytes(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, trailingCases)
++		begin(c)
++		data := c.data.bytes()
++		stream := c.source.stream(ht, data)
++		rd := brotli.NewReader(bytes.NewReader(c.dmg.apply(stream)))
++		_, firstErr := io.ReadAll(rd)
++		note(ht, "the damaged stream reads with error %v", firstErr)
++		if err := rd.Reset(bytes.NewReader(stream)); err != nil {
++			mismatch(ht, "Reset after the damaged stream: %v", err)
++		}
++		got, err := io.ReadAll(rd)
++		if err != nil || !bytes.Equal(got, data) {
++			mismatch(ht, "after the damaged stream and Reset, the good stream decodes to %d bytes, %v; want %d", len(got), err, len(data))
++		}
++	})
++}
++
++// --------------------------------------------------------------------------- brotli/8
++
++// textOrRandom: bytes without long runs of one value, so a match at the
++// wrong distance copies wrong bytes.
++var textOrRandom = hegel.SampledFrom([][]string{{"random"}, {"text"}})
++
++// shortBlockCases: Trio or ZM given a block, a block under 20 (16) bytes
++// (brotli/8; under HEGEL_NO_KNOWN=1 20 to 40 bytes), and a block that echoes
++// the tail of the first two, so its matches reach back past the short one.
++var shortBlockCases = hegel.FlatMap(findersOf("Trio", "ZM"), func(f finderSpec) hegel.Generator[lz77Case] {
++	limit := 20
++	if f.name == "ZM" {
++		limit = 16
++	}
++	shortSizes := shaped(hegel.Integers(1, limit-1), hegel.Integers(20, 40))
++	return hegel.Composite(func(tc hegel.TestCase) lz77Case {
++		return lz77Case{finder: f, blocks: []lz77Block{
++			{data: hegel.Draw(tc, dataWith(hegel.Integers(20, 300), textOrRandom))},
++			{data: hegel.Draw(tc, dataWith(shortSizes, textOrRandom))},
++			{data: hegel.Draw(tc, dataWith(hegel.Integers(0, 50), textOrRandom)), echo: hegel.Draw(tc, hegel.Integers(60, 300))},
++		}}
++	})
++})
++
++// TestHegelShortBlocksStayInTheFindersHistory: a finder that refers to
++// earlier blocks measures its distances over every block it was given, so a
++// match reaching past a short block copies the right bytes; Trio and ZM
++// return a block under 20 (16) bytes as literals without adding it to their
++// history, and every later distance past it is short by its length (brotli/8).
++func TestHegelShortBlocksStayInTheFindersHistory(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		c := hegel.Draw(ht, shortBlockCases)
++		begin(c)
++		checkLZ77(ht, c)
++	})
++}
 diff --git a/hegel_test.go b/hegel_test.go
 new file mode 100644
-index 0000000..b70a053
+index 0000000..24bc904
 --- /dev/null
 +++ b/hegel_test.go
-@@ -0,0 +1,1328 @@
+@@ -0,0 +1,2234 @@
 +package brotli_test
 +
 +// Hegel property tests for github.com/andybalholm/brotli.
@@ -250,6 +693,20 @@ index 0000000..b70a053
 +// must turn into a decodable stream (brotli: the tool; flate/gzip: the
 +// standard library); RFC 9110's Accept-Encoding negotiation for the HTTP
 +// helper; and the package's documented contracts.
++//
++// Every property draws one case record built from the binding's combinators
++// and renders it with pure functions: the bytes of a block are a dataSpec
++// (size, character, seed; the bulk comes from a PRNG seeded by the drawn
++// seed, since 128 KiB cannot be drawn byte by byte), the Writes of a stream
++// are cut positions taken modulo the data's length, a chunked source reads
++// its piece sizes off a drawn tape (an empty tape is the plain source), a
++// damage is a record applied to the stream, a match finder a record of its
++// parameters. The shapes of the recorded bugs (bugs.toml) are drawn at their
++// natural rate, so the properties that meet them fail, naming the shape, and
++// are the expected failures mapped to the bugs (STYLE.md rule 11);
++// hegel_shapes_test.go has one property per bug over its shape region alone,
++// and hegel_pins_test.go the regression examples. HEGEL_NO_KNOWN=1 switches
++// the known shapes off (noKnown, below) for a run that looks past the bugs.
 +//
 +// Set BROTLI_COLLECT=1 to make the properties record mismatches instead of
 +// failing and print them (shortest first) at the end of each test.
@@ -312,15 +769,115 @@ index 0000000..b70a053
 +func fail(ht *hegel.T, format string, args ...any) {
 +	if collecting {
 +		collectedMu.Lock()
-+		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...)+"\n  case: "+lastNote)
++		collectedMsgs = append(collectedMsgs, fmt.Sprintf(format, args...)+"\n  case: "+lastCase)
 +		collectedMu.Unlock()
 +		panic(collected{})
 +	}
 +	ht.Fatalf(format, args...)
 +}
 +
-+var lastNote string // the notes of the running case, for collect mode
++// noKnown: HEGEL_NO_KNOWN=1 looks past the recorded bugs (bugs.toml), read
++// once. By default the generators draw the bugs' shapes and the properties
++// that meet them fail, naming the shape; under HEGEL_NO_KNOWN=1 the gates of
++// Known are on: the shapes are left out of the generators (shaped) or the one
++// check they falsify is skipped, and a failure that still has a known shape
++// is skipped.
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") == "1"
 +
++// shaped is the value for a recorded bug's shape region or, under
++// HEGEL_NO_KNOWN=1, for the neighbouring region past it.
++func shaped[T any](known, past T) T {
++	if noKnown {
++		return past
++	}
++	return known
++}
++
++// Known gates the input shapes of recorded bugs (see bugs.toml); on means the
++// shape is left out, which is so only under HEGEL_NO_KNOWN=1. The pin tests
++// in hegel_pins_test.go assert the correct behaviour and fail while a bug is
++// open, and hegel_shapes_test.go has a property per bug.
++var Known = struct {
++	flateLongMatchPanics bool // brotli/1: the flate encoder panics on a match longer than 258 bytes instead of splitting it, so flate.NewWriter and NewGZIPWriter panic on long repeats
++	acceptCaseSensitive  bool // brotli/2: HTTPCompressor matches Accept-Encoding codings case-sensitively
++	starOverridesListed  bool // brotli/3: an Accept-Encoding "*" overrides the weight of an explicitly listed coding
++	gzipLevelOverNine    bool // brotli/4: HTTPCompressorWithLevel at level 10 or 11 sends gzip clients an uncompressed response
++	previousMatchFromDst bool // brotli/5: M4 takes the last entry of dst for its previous match (distance-0 matches, or a panic)
++	fastEncoderShort     bool // brotli/6: FastEncoder writes a corrupt stream, or panics, for a match of length 2 or 3
++	resetAfterExcess     bool // brotli/7: Reader.Reset after a stream with trailing bytes (excessive input) leaves the Reader unable to decode
++	shortBlockDropped    bool // brotli/8: Trio and ZM leave a block shorter than 20 bytes out of their history, so later distances are wrong
++}{
++	flateLongMatchPanics: noKnown,
++	acceptCaseSensitive:  noKnown,
++	starOverridesListed:  noKnown,
++	gzipLevelOverNine:    noKnown,
++	previousMatchFromDst: noKnown,
++	fastEncoderShort:     noKnown,
++	resetAfterExcess:     noKnown,
++	shortBlockDropped:    noKnown,
++}
++
++// shapeIf names the bug when the case has its shape.
++func shapeIf(has bool, id string) []string {
++	if has {
++		return []string{id}
++	}
++	return nil
++}
++
++// known names the bug a property over its shape region is about, or nothing
++// under HEGEL_NO_KNOWN=1, when the property draws the neighbouring region.
++func known(id string) []string { return shapeIf(!noKnown, id) }
++
++// shapedCase is a drawn case: what the draw report prints, and the shapes of
++// the recorded bugs it has.
++type shapedCase interface {
++	GoString() string
++	shapes() []string
++}
++
++var (
++	caseShapes []string // the shapes of the running case, named in its failures
++	lastCase   string   // the running case's description, for collect mode
++)
++
++// begin records the running case for the failure reports.
++func begin(c shapedCase) {
++	caseShapes = c.shapes()
++	if collecting {
++		lastCase = c.GoString()
++	}
++}
++
++// alsoShape adds a shape the running case turns out to have (one the body
++// can only tell from the library's response).
++func alsoShape(id string) {
++	for _, s := range caseShapes {
++		if s == id {
++			return
++		}
++	}
++	caseShapes = append(caseShapes, id)
++}
++
++// mismatch reports a failure of the running case: the message names the
++// shapes of the recorded bugs the case has, and under HEGEL_NO_KNOWN=1 a
++// failure on a known shape is skipped instead (rare then, since the
++// generators leave the shapes out).
++func mismatch(ht *hegel.T, format string, args ...any) {
++	if noKnown {
++		ht.Assume(len(caseShapes) == 0)
++	}
++	if len(caseShapes) > 0 {
++		format += " (the shape of " + strings.Join(caseShapes, ", ") + ")"
++	}
++	fail(ht, format, args...)
++}
++
++// property runs fn as a Hegel property, turning a panic in the code under
++// test into a failure of the current test case (hegel-go re-raises panics
++// after shrinking, which would abort the test binary and hide every later
++// test). Hegel's own control-flow panics pass.
 +func property(t *testing.T, fn func(ht *hegel.T)) {
 +	t.Helper()
 +	if brotliPath == "" {
@@ -344,7 +901,7 @@ index 0000000..b70a053
 +		}()
 +	}
 +	hegel.Test(t, func(ht *hegel.T) {
-+		lastNote = ""
++		caseShapes, lastCase = nil, ""
 +		defer func() {
 +			r := recover()
 +			if r == nil {
@@ -357,41 +914,126 @@ index 0000000..b70a053
 +			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
 +				panic(r)
 +			}
-+			ht.Fatalf("panic in the code under test: %v", r)
++			mismatch(ht, "panic in the code under test: %v", r)
 +		}()
 +		fn(ht)
 +	}, hegelOpts()...)
 +}
 +
-+func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
 +
-+func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
++// ---------------------------------------------------------------------------
++// Generator idioms.
 +
-+func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
-+
-+func note(ht *hegel.T, format string, args ...any) {
-+	m := fmt.Sprintf(format, args...)
-+	lastNote += "\n  " + m
-+	ht.Note(m)
++// choice is one alternative of a weighted choice.
++type choice[T any] struct {
++	weight int
++	gen    hegel.Generator[T]
 +}
 +
-+// prng returns a seeded random source: bulk bytes come from it so that Hegel
-+// only has to draw (and shrink) the structure of a case.
-+func prng(ht *hegel.T) *rand.Rand { return rand.New(rand.NewSource(int64(n(ht, 0, 1<<30)))) }
++// weighted generates from one of the choices, chosen with probability
++// proportional to its weight; it shrinks towards the first choice, so the
++// simplest comes first.
++func weighted[T any](choices ...choice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	return hegel.FlatMap(hegel.Integers(0, total-1), func(i int) hegel.Generator[T] {
++		for _, c := range choices {
++			if i < c.weight {
++				return c.gen
++			}
++			i -= c.weight
++		}
++		panic("unreachable")
++	})
++}
 +
-+// Known gates the input shapes of recorded bugs (see bugs.toml); every switch
-+// is on while the bug is open so the properties run clean, and the pin tests
-+// in hegel_pins_test.go assert the correct behaviour and fail meanwhile.
-+var Known = struct {
-+	flateLongMatchPanics bool // brotli/1: the flate encoder panics on a match longer than 258 bytes instead of splitting it, so flate.NewWriter and NewGZIPWriter panic on long repeats
-+	acceptCaseSensitive  bool // brotli/2: HTTPCompressor matches Accept-Encoding codings case-sensitively
-+	starOverridesListed  bool // brotli/3: an Accept-Encoding "*" overrides the weight of an explicitly listed coding
-+	gzipLevelOverNine    bool // brotli/4: HTTPCompressorWithLevel at level 10 or 11 sends gzip clients an uncompressed response
-+	previousMatchFromDst bool // brotli/5: M4 takes the last entry of dst for its previous match (distance-0 matches, or a panic)
-+	fastEncoderShort     bool // brotli/6: FastEncoder writes a corrupt stream, or panics, for a match of length 2 or 3
-+	resetAfterExcess     bool // brotli/7: Reader.Reset after a stream with trailing bytes (excessive input) leaves the Reader unable to decode
-+	shortBlockDropped    bool // brotli/8: Trio and ZM leave a block shorter than 20 bytes out of their history, so later distances are wrong
-+}{flateLongMatchPanics: true, acceptCaseSensitive: true, starOverridesListed: true, gzipLevelOverNine: true, previousMatchFromDst: true, fastEncoderShort: true, resetAfterExcess: true, shortBlockDropped: true}
++// chance is true pct percent of the time; it shrinks to false (Integers
++// shrinks to 0, so the true range is the top of the die, not the bottom).
++func chance(pct int) hegel.Generator[bool] {
++	return hegel.Map(hegel.Integers(0, 99), func(x int) bool { return x >= 100-pct })
++}
++
++// maybe generates from g pct percent of the time and the zero value
++// otherwise, which is what it shrinks to.
++func maybe[T any](pct int, g hegel.Generator[T]) hegel.Generator[T] {
++	var zero T
++	return weighted(choice[T]{100 - pct, hegel.Just(zero)}, choice[T]{pct, g})
++}
++
++func ptrTo[T any](x T) *T { return &x }
++
++// optional generates a pointer to a value of g pct percent of the time and
++// nil otherwise (for values whose zero value is a value in its own right).
++func optional[T any](pct int, g hegel.Generator[T]) hegel.Generator[*T] {
++	return maybe(pct, hegel.Map(g, ptrTo[T]))
++}
++
++// many is a list of lo to hi elements.
++func many[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	return hegel.Lists(g).MinSize(lo).MaxSize(hi)
++}
++
++// positions: an index into live data of unknown size, taken modulo the size
++// when applied (so every drawn value fits and the shrinker is free).
++var positions = hegel.Integers(0, 99)
++
++// offsets: a byte position in a block of unknown size, taken modulo the size.
++var offsets = hegel.Integers(0, 1<<20)
++
++// bytesOf: a byte value.
++var bytesOf = hegel.Map(hegel.Integers(0, 255), func(b int) byte { return byte(b) })
++
++// tape is a drawn list of small integers that a pure consumer reads in
++// order, recycled modulo its length. An empty tape answers 0 to every
++// question, so the shrunk form of every choice is its first, plainest one.
++type tape struct {
++	vals []int
++	at   int
++}
++
++// next is the next value of the tape in 0..n-1.
++func (t *tape) next(n int) int {
++	if len(t.vals) == 0 || n <= 0 {
++		return 0
++	}
++	v := t.vals[t.at%len(t.vals)]
++	t.at++
++	return v % n
++}
++
++// coin is true pct percent of the time (false on an empty tape).
++func (t *tape) coin(pct int) bool { return t.next(100) >= 100-pct }
++
++// tapes: up to a hundred values of 0 to 99.
++var tapes = many(hegel.Integers(0, 99), 0, 100)
++
++// cutsOf splits data at the cut positions (taken modulo len(data)+1, in
++// order, repeats and the ends dropped) into non-empty pieces; no cuts is one
++// piece (the empty data is one empty piece).
++func cutsOf(data []byte, cuts []int) [][]byte {
++	at := make([]int, 0, len(cuts))
++	for _, c := range cuts {
++		if p := c % (len(data) + 1); p > 0 && p < len(data) {
++			at = append(at, p)
++		}
++	}
++	sort.Ints(at)
++	var pieces [][]byte
++	prev := 0
++	for _, p := range at {
++		if p > prev {
++			pieces = append(pieces, data[prev:p])
++			prev = p
++		}
++	}
++	return append(pieces, data[prev:])
++}
++
++// cutLists: the cut positions of a stream written in up to pieces pieces.
++func cutLists(pieces int) hegel.Generator[[]int] { return many(offsets, 0, pieces-1) }
 +
 +// ---------------------------------------------------------------------------
 +// The reference implementation's tool.
@@ -471,28 +1113,46 @@ index 0000000..b70a053
 +// ---------------------------------------------------------------------------
 +// Input data.
 +
-+// genSizes are the lengths the data generators reach for; the readers' buffers
-+// below must be able to hold the largest of them.
++// genSizes are the lengths the data generators reach for; the readers'
++// buffers below must be able to hold the largest of them.
 +var genSizes = []int{0, 1, 2, 3, 7, 16, 64, 200, 1000, 4096, 20000, 65535, 65536, 65537, 100000, 1 << 17}
 +
-+func genSize(ht *hegel.T) int {
-+	if chance(ht, 50) {
-+		return n(ht, 0, 300)
-+	}
-+	if chance(ht, 60) {
-+		return pick(ht, genSizes...)
-+	}
-+	return n(ht, 0, 1<<17)
-+}
++// byteSizes: the size of a block of data: up to 300 bytes half of the time,
++// one of genSizes 30% of the time, anything up to 128 KiB otherwise.
++var byteSizes = weighted(
++	choice[int]{50, hegel.Integers(0, 300)},
++	choice[int]{30, hegel.SampledFrom(genSizes)},
++	choice[int]{20, hegel.Integers(0, 1<<17)},
++)
 +
 +var words = []string{"the", "of", "and", "to", "in", "light", "rays", "Newton", "prism", "colour", "glass", "refracted", "angle", "\n", "  ", ", ", ". "}
 +
-+// genData produces bytes of a chosen character: random, repetitive, textual,
-+// runs, or a mixture. Bulk bytes come from r.
-+func genData(ht *hegel.T, r *rand.Rand, size int) []byte {
-+	kind := pick(ht, "random", "text", "runs", "repeat", "mixed", "zeros", "sparse")
-+	note(ht, "data: %d bytes, %s", size, kind)
-+	out := make([]byte, 0, size)
++// dataKinds are the characters of a block of bytes.
++var dataKinds = []string{"random", "zeros", "text", "runs", "repeat", "sparse"}
++
++// dataSpec: a block of bytes of a size and a character (one kind throughout,
++// or several kinds in segments, "mixed"); the bulk bytes come from a PRNG
++// seeded with seed, so the record is what shrinks.
++type dataSpec struct {
++	size  int
++	kinds []string
++	seed  int64
++}
++
++func (d dataSpec) GoString() string {
++	return fmt.Sprintf("%d bytes of %s (seed %d)", d.size, strings.Join(d.kinds, "+"), d.seed)
++}
++
++// sized is the same data cut or grown to size bytes.
++func (d dataSpec) sized(size int) dataSpec {
++	d.size = size
++	return d
++}
++
++// bytes renders the block.
++func (d dataSpec) bytes() []byte {
++	r := rand.New(rand.NewSource(d.seed))
++	out := make([]byte, 0, d.size)
 +	fill := func(k string, limit int) {
 +		switch k {
 +		case "random":
@@ -541,41 +1201,69 @@ index 0000000..b70a053
 +			out = out[:limit]
 +		}
 +	}
-+	if kind == "mixed" {
-+		for len(out) < size {
-+			k := pick(ht, "random", "text", "runs", "repeat", "zeros")
-+			fill(k, min(size, len(out)+r.Intn(size-len(out)+1)+1))
-+		}
++	if len(d.kinds) == 1 {
++		fill(d.kinds[0], d.size)
 +		return out
 +	}
-+	fill(kind, size)
-+	return out
-+}
-+
-+// chunks splits data into random pieces.
-+func chunks(r *rand.Rand, data []byte, maxPieces int) [][]byte {
-+	var out [][]byte
-+	for len(data) > 0 && len(out) < maxPieces-1 {
-+		k := r.Intn(len(data)) + 1
-+		if r.Intn(3) == 0 {
-+			k = r.Intn(min(len(data), 8)) + 1
-+		}
-+		out = append(out, data[:k])
-+		data = data[k:]
-+	}
-+	if len(data) > 0 || len(out) == 0 {
-+		out = append(out, data)
++	for i := 0; len(out) < d.size; i++ {
++		fill(d.kinds[i%len(d.kinds)], min(d.size, len(out)+r.Intn(d.size-len(out)+1)+1))
 +	}
 +	return out
 +}
 +
-+// chunkReader hands out data in random pieces, occasionally returning
-+// (0, nil), and reports EOF either with the last piece or on its own.
-+type chunkReader struct {
-+	r           *rand.Rand
-+	data        []byte
-+	eofWithData bool
++var (
++	seeds    = hegel.Integers(int64(0), 1<<30)
++	oneKind  = many(hegel.SampledFrom(dataKinds), 1, 1)
++	kindList = weighted(choice[[]string]{6, oneKind}, choice[[]string]{1, many(hegel.SampledFrom(dataKinds), 2, 5)})
++)
++
++// dataWith: a block of bytes of a drawn size and one of the characters.
++func dataWith(sizes hegel.Generator[int], kinds hegel.Generator[[]string]) hegel.Generator[dataSpec] {
++	return hegel.Composite(func(tc hegel.TestCase) dataSpec {
++		return dataSpec{size: hegel.Draw(tc, sizes), kinds: hegel.Draw(tc, kinds), seed: hegel.Draw(tc, seeds)}
++	})
++}
++
++// dataOf: a block of bytes of a drawn size and any character.
++func dataOf(sizes hegel.Generator[int]) hegel.Generator[dataSpec] { return dataWith(sizes, kindList) }
++
++var (
++	blocks      = dataOf(byteSizes)
++	smallBlocks = dataOf(hegel.Integers(0, 3000))
++)
++
++// ---------------------------------------------------------------------------
++// Reading streams.
++
++// readSpec: how a source hands a stream to the Reader: in pieces of up to
++// maxPiece bytes whose sizes, and the occasional (0, nil), come off a tape
++// (an empty tape: full pieces and no empty reads), reporting EOF with the
++// last piece or on its own.
++type readSpec struct {
 +	maxPiece    int
++	eofWithData bool
++	tape        []int
++}
++
++func (s readSpec) GoString() string {
++	return fmt.Sprintf("pieces up to %d, EOF with data %v, tape of %d", s.maxPiece, s.eofWithData, len(s.tape))
++}
++
++var readSpecs = hegel.Composite(func(tc hegel.TestCase) readSpec {
++	return readSpec{
++		maxPiece:    hegel.Draw(tc, hegel.SampledFrom([]int{1 << 20, 4096, 512, 17, 3, 1})),
++		eofWithData: hegel.Draw(tc, chance(30)),
++		tape:        hegel.Draw(tc, tapes),
++	}
++})
++
++// chunkReader hands out data as its readSpec says; an empty read never
++// follows another, so a tape of empty reads cannot stall the caller.
++type chunkReader struct {
++	data  []byte
++	spec  readSpec
++	tape  tape
++	empty bool // the last Read returned (0, nil)
 +}
 +
 +func (c *chunkReader) Read(p []byte) (int, error) {
@@ -585,26 +1273,24 @@ index 0000000..b70a053
 +	if len(p) == 0 {
 +		return 0, nil
 +	}
-+	if c.r.Intn(10) == 0 {
++	if !c.empty && c.tape.coin(10) {
++		c.empty = true
 +		return 0, nil
 +	}
-+	k := c.r.Intn(min(len(p), c.maxPiece)) + 1
-+	if k > len(c.data) {
-+		k = len(c.data)
-+	}
++	c.empty = false
++	limit := min(len(p), c.spec.maxPiece, len(c.data))
++	k := limit - c.tape.next(limit)
 +	copy(p, c.data[:k])
 +	c.data = c.data[k:]
-+	if len(c.data) == 0 && c.eofWithData {
++	if len(c.data) == 0 && c.spec.eofWithData {
 +		return k, io.EOF
 +	}
 +	return k, nil
 +}
 +
-+func newChunkReader(ht *hegel.T, r *rand.Rand, data []byte) *chunkReader {
-+	maxPiece := pick(ht, 1, 3, 17, 512, 4096, 1<<20)
-+	eof := chance(ht, 30)
-+	note(ht, "source read pieces up to %d, EOF with data %v", maxPiece, eof)
-+	return &chunkReader{r: r, data: data, eofWithData: eof, maxPiece: maxPiece}
++// reader is the source over the stream.
++func (s readSpec) reader(stream []byte) io.Reader {
++	return &chunkReader{data: stream, spec: s, tape: tape{vals: s.tape}}
 +}
 +
 +// readAllWith drains a Reader with buffers of a chosen size, returning what it
@@ -630,125 +1316,230 @@ index 0000000..b70a053
 +	}
 +}
 +
-+// libDecode decodes a whole stream with the library, reading it in pieces.
-+func libDecode(ht *hegel.T, r *rand.Rand, stream []byte) ([]byte, error) {
-+	var src io.Reader = bytes.NewReader(stream)
-+	if chance(ht, 60) {
-+		src = newChunkReader(ht, r, stream)
++// bufSizes: the Read buffer of a decode, the largest first.
++var bufSizes = hegel.SampledFrom([]int{1 << 17, 32 * 1024, 4096, 100, 7, 2, 1})
++
++// decodeSpec: how the library decodes a stream: from a plain bytes.Reader or
++// (60%) a chunked source, with Read buffers of bufSize.
++type decodeSpec struct {
++	source  *readSpec
++	bufSize int
++}
++
++func (d decodeSpec) GoString() string {
++	if d.source == nil {
++		return fmt.Sprintf("plain source, buffer %d", d.bufSize)
 +	}
-+	rd := brotli.NewReader(src)
-+	bufSize := pick(ht, 1, 2, 7, 100, 4096, 32*1024, 1<<17)
-+	note(ht, "decode buffer %d", bufSize)
-+	return readAllWith(rd, bufSize)
++	return fmt.Sprintf("%s, buffer %d", d.source.GoString(), d.bufSize)
++}
++
++var decodeSpecs = hegel.Composite(func(tc hegel.TestCase) decodeSpec {
++	return decodeSpec{source: hegel.Draw(tc, optional(60, readSpecs)), bufSize: hegel.Draw(tc, bufSizes)}
++})
++
++// reader is the source over the stream.
++func (d decodeSpec) reader(stream []byte) io.Reader {
++	if d.source == nil {
++		return bytes.NewReader(stream)
++	}
++	return d.source.reader(stream)
++}
++
++// decode decodes a whole stream with the library.
++func (d decodeSpec) decode(stream []byte) ([]byte, error) {
++	return readAllWith(brotli.NewReader(d.reader(stream)), d.bufSize)
 +}
 +
 +// ---------------------------------------------------------------------------
 +// Property 1: the Writer's streams.
 +
++// writeStep: one Write of a stream: its piece ends at cut (modulo the data's
++// length, in order) and a Flush follows when flush.
++type writeStep struct {
++	cut   int
++	flush bool
++}
++
++var writeSteps = hegel.Composite(func(tc hegel.TestCase) writeStep {
++	return writeStep{cut: hegel.Draw(tc, offsets), flush: hegel.Draw(tc, chance(40))}
++})
++
++// writePlan: the Writes of a stream, n steps making n+1 pieces (a Flush
++// never follows the last).
++type writePlan []writeStep
++
++// pieces splits the data and says which pieces a Flush follows.
++func (p writePlan) pieces(data []byte) ([][]byte, []bool) {
++	cuts := make([]int, len(p))
++	for i, s := range p {
++		cuts[i] = s.cut
++	}
++	pieces := cutsOf(data, cuts)
++	flushes := make([]bool, len(pieces))
++	for i := range pieces[:len(pieces)-1] {
++		flushes[i] = p[i%len(p)].flush
++	}
++	return pieces, flushes
++}
++
++var writePlans = hegel.Map(many(writeSteps, 0, 5), func(s []writeStep) writePlan { return writePlan(s) })
++
++var (
++	qualities = hegel.SampledFrom([]int{-3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20})
++	lgwins    = hegel.SampledFrom([]int{0, 0, 5, 10, 11, 12, 14, 16, 17, 18, 20, 22, 24, 25, 30})
++	ctors     = hegel.SampledFrom([]string{"default", "level", "options"})
++)
++
++// writerCase: a Writer made by one of the three constructors (the default
++// one ignores the quality and window, NewWriterLevel the window), Reset onto
++// its destination before use or not, the data written in pieces with Flushes,
++// how the library decodes the stream, and a second stream after Reset.
++type writerCase struct {
++	ctor       string
++	quality    int
++	lgwin      int
++	resetFirst bool
++	data       dataSpec
++	plan       writePlan
++	decode     decodeSpec
++	again      *dataSpec
++}
++
++// settings are the quality and window the constructor gives the Writer.
++func (c writerCase) settings() (quality, lgwin int) {
++	switch c.ctor {
++	case "default":
++		return brotli.DefaultCompression, 0
++	case "level":
++		return c.quality, 0
++	}
++	return c.quality, c.lgwin
++}
++
++func (c writerCase) GoString() string {
++	q, w := c.settings()
++	s := fmt.Sprintf("%s Writer quality %d lgwin %d, reset first %v\ndata %s in %d writes, %s", c.ctor, q, w, c.resetFirst, c.data.GoString(), len(c.plan)+1, c.decode.GoString())
++	if c.again != nil {
++		s += "\nthen after Reset " + c.again.GoString()
++	}
++	return s
++}
++
++func (c writerCase) shapes() []string { return nil }
++
++var writerCases = hegel.Composite(func(tc hegel.TestCase) writerCase {
++	return writerCase{
++		ctor:       hegel.Draw(tc, ctors),
++		quality:    hegel.Draw(tc, qualities),
++		lgwin:      hegel.Draw(tc, lgwins),
++		resetFirst: hegel.Draw(tc, chance(20)),
++		data:       hegel.Draw(tc, blocks),
++		plan:       hegel.Draw(tc, writePlans),
++		decode:     hegel.Draw(tc, decodeSpecs),
++		again:      hegel.Draw(tc, optional(50, smallBlocks)),
++	}
++})
++
 +func TestHegelWriterStreamsDecode(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
-+		quality := pick(ht, -3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20)
-+		lgwin := pick(ht, 0, 0, 5, 10, 11, 12, 14, 16, 17, 18, 20, 22, 24, 25, 30)
-+		note(ht, "Writer quality %d lgwin %d", quality, lgwin)
++		c := hegel.Draw(ht, writerCases)
++		begin(c)
++		quality, lgwin := c.settings()
 +		var buf bytes.Buffer
 +		var w *brotli.Writer
-+		switch pick(ht, "options", "level", "default") {
++		switch c.ctor {
 +		case "options":
 +			w = brotli.NewWriterOptions(&buf, brotli.WriterOptions{Quality: quality, LGWin: lgwin})
 +		case "level":
-+			lgwin = 0
 +			w = brotli.NewWriterLevel(&buf, quality)
 +		default:
-+			quality, lgwin = brotli.DefaultCompression, 0
 +			w = brotli.NewWriter(&buf)
 +		}
-+		if chance(ht, 20) {
++		if c.resetFirst {
 +			// Reset onto the same destination before any use: a no-op.
 +			w.Reset(&buf)
 +		}
-+		size := genSize(ht)
-+		data := genData(ht, r, size)
-+		pieces := chunks(r, data, n(ht, 1, 6))
++		data := c.data.bytes()
++		pieces, flushes := c.plan.pieces(data)
 +		var written []byte
 +		for i, p := range pieces {
 +			m, err := w.Write(p)
 +			if err != nil || m != len(p) {
-+				fail(ht, "Write(%d bytes) = %d, %v", len(p), m, err)
++				mismatch(ht, "Write(%d bytes) = %d, %v", len(p), m, err)
 +			}
 +			written = append(written, p...)
-+			if i < len(pieces)-1 && chance(ht, 40) {
++			if flushes[i] {
 +				if err := w.Flush(); err != nil {
-+					fail(ht, "Flush: %v", err)
++					mismatch(ht, "Flush: %v", err)
 +				}
 +				// The bytes so far decode to everything written so far and
 +				// then want more input.
 +				got, err := readAllWith(brotli.NewReader(bytes.NewReader(buf.Bytes())), 4096)
 +				if !bytes.Equal(got, written) || !errors.Is(err, io.ErrUnexpectedEOF) {
-+					fail(ht, "after Flush the %d bytes so far decode to %d bytes (want %d) with error %v (want unexpected EOF)", buf.Len(), len(got), len(written), err)
++					mismatch(ht, "after Flush the %d bytes so far decode to %d bytes (want %d) with error %v (want unexpected EOF)", buf.Len(), len(got), len(written), err)
 +				}
 +			}
 +		}
 +		if err := w.Close(); err != nil {
-+			fail(ht, "Close: %v", err)
++			mismatch(ht, "Close: %v", err)
 +		}
 +		stream := buf.Bytes()
 +		note(ht, "stream: %d bytes", len(stream))
 +		// The header.
 +		wbits, large, err := parseWindowBits(stream)
 +		if err != nil || large {
-+			fail(ht, "stream header: wbits %d large %v err %v (stream % x)", wbits, large, err, stream[:min(len(stream), 8)])
++			mismatch(ht, "stream header: wbits %d large %v err %v (stream % x)", wbits, large, err, stream[:min(len(stream), 8)])
 +		}
 +		if wbits < 10 || wbits > 24 {
-+			fail(ht, "stream declares WBITS %d", wbits)
++			mismatch(ht, "stream declares WBITS %d", wbits)
 +		}
 +		if lgwin >= 18 && lgwin <= 24 && wbits > lgwin {
-+			fail(ht, "stream declares WBITS %d with LGWin %d", wbits, lgwin)
++			mismatch(ht, "stream declares WBITS %d with LGWin %d", wbits, lgwin)
 +		}
 +		// The reference tool decodes it.
 +		got, err := toolDecompress(stream)
 +		if err != nil {
-+			fail(ht, "the reference tool rejects the Writer's stream: %v", err)
++			mismatch(ht, "the reference tool rejects the Writer's stream: %v", err)
 +		}
 +		if !bytes.Equal(got, data) {
-+			fail(ht, "the reference tool decodes the Writer's stream to %d bytes, want %d", len(got), len(data))
++			mismatch(ht, "the reference tool decodes the Writer's stream to %d bytes, want %d", len(got), len(data))
 +		}
 +		// The library decodes it.
-+		got, err = libDecode(ht, r, stream)
++		got, err = c.decode.decode(stream)
 +		if err != nil {
-+			fail(ht, "the Reader rejects the Writer's stream: %v", err)
++			mismatch(ht, "the Reader rejects the Writer's stream: %v", err)
 +		}
 +		if !bytes.Equal(got, data) {
-+			fail(ht, "the Reader decodes the Writer's stream to %d bytes, want %d", len(got), len(data))
++			mismatch(ht, "the Reader decodes the Writer's stream to %d bytes, want %d", len(got), len(data))
 +		}
 +		// After Close the Writer is closed.
 +		if _, err := w.Write([]byte("x")); err == nil {
-+			fail(ht, "Write after Close succeeds")
++			mismatch(ht, "Write after Close succeeds")
 +		}
 +		if err := w.Close(); err == nil {
-+			fail(ht, "second Close succeeds")
++			mismatch(ht, "second Close succeeds")
 +		}
 +		if err := w.Flush(); err == nil {
-+			fail(ht, "Flush after Close succeeds")
++			mismatch(ht, "Flush after Close succeeds")
 +		}
 +		// Reset revives it with the same options.
-+		if chance(ht, 50) {
++		if c.again != nil {
 +			var buf2 bytes.Buffer
 +			w.Reset(&buf2)
-+			data2 := genData(ht, r, n(ht, 0, 3000))
++			data2 := c.again.bytes()
 +			if _, err := w.Write(data2); err != nil {
-+				fail(ht, "Write after Reset: %v", err)
++				mismatch(ht, "Write after Reset: %v", err)
 +			}
 +			if err := w.Close(); err != nil {
-+				fail(ht, "Close after Reset: %v", err)
++				mismatch(ht, "Close after Reset: %v", err)
 +			}
 +			got, err := toolDecompress(buf2.Bytes())
 +			if err != nil || !bytes.Equal(got, data2) {
-+				fail(ht, "the stream after Reset decodes to %d bytes, %v; want %d", len(got), err, len(data2))
++				mismatch(ht, "the stream after Reset decodes to %d bytes, %v; want %d", len(got), err, len(data2))
 +			}
 +			w2, _, _ := parseWindowBits(buf2.Bytes())
 +			if w2 != wbits {
-+				fail(ht, "WBITS %d after Reset, %d before", w2, wbits)
++				mismatch(ht, "WBITS %d after Reset, %d before", w2, wbits)
 +			}
 +		}
 +	})
@@ -757,35 +1548,89 @@ index 0000000..b70a053
 +// ---------------------------------------------------------------------------
 +// Property 2: the Reader on the reference tool's streams.
 +
++var (
++	toolQualities = hegel.Integers(0, 11)
++	toolWindows   = hegel.SampledFrom([]int{0, 0, 10, 12, 16, 18, 22, 24})
++	readModes     = hegel.SampledFrom([]string{"readall", "copy", "buffers"})
++)
++
++// readerRound: one stream of the tool through the Reader: its quality and
++// window (0: the tool's choice), the data, the source (plain or chunked), and
++// how it is drained (io.ReadAll, io.Copy, or Reads with buffers of bufSize).
++type readerRound struct {
++	quality, lgwin int
++	data           dataSpec
++	source         *readSpec
++	mode           string
++	bufSize        int
++}
++
++func (r readerRound) GoString() string {
++	s := fmt.Sprintf("tool -q %d -w %d on %s, %s", r.quality, r.lgwin, r.data.GoString(), r.mode)
++	if r.mode == "buffers" {
++		s += fmt.Sprintf(" of %d", r.bufSize)
++	}
++	if r.source != nil {
++		s += ", " + r.source.GoString()
++	}
++	return s
++}
++
++var readerRounds = hegel.Composite(func(tc hegel.TestCase) readerRound {
++	return readerRound{
++		quality: hegel.Draw(tc, toolQualities),
++		lgwin:   hegel.Draw(tc, toolWindows),
++		data:    hegel.Draw(tc, blocks),
++		source:  hegel.Draw(tc, optional(60, readSpecs)),
++		mode:    hegel.Draw(tc, readModes),
++		bufSize: hegel.Draw(tc, bufSizes),
++	}
++})
++
++// readerCase: one to three streams through one Reader, made fresh over the
++// first stream (fresh) or Reset onto each.
++type readerCase struct {
++	fresh  bool
++	rounds []readerRound
++}
++
++func (c readerCase) GoString() string {
++	lines := []string{fmt.Sprintf("Reader fresh %v", c.fresh)}
++	for i, r := range c.rounds {
++		lines = append(lines, fmt.Sprintf("round %d: %s", i, r.GoString()))
++	}
++	return strings.Join(lines, "\n")
++}
++
++func (c readerCase) shapes() []string { return nil }
++
++var readerCases = hegel.Composite(func(tc hegel.TestCase) readerCase {
++	return readerCase{fresh: hegel.Draw(tc, chance(50)), rounds: hegel.Draw(tc, many(readerRounds, 1, 3))}
++})
++
 +func TestHegelReaderDecodesReferenceStreams(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
++		c := hegel.Draw(ht, readerCases)
++		begin(c)
 +		rd := brotli.NewReader(bytes.NewReader(nil))
-+		rounds := n(ht, 1, 3)
-+		for i := 0; i < rounds; i++ {
-+			quality := n(ht, 0, 11)
-+			lgwin := pick(ht, 0, 0, 10, 12, 16, 18, 22, 24)
-+			data := genData(ht, r, genSize(ht))
-+			stream := toolCompress(ht, data, quality, lgwin)
-+			note(ht, "round %d: tool -q %d -w %d: %d bytes", i, quality, lgwin, len(stream))
++		for i, round := range c.rounds {
++			data := round.data.bytes()
++			stream := toolCompress(ht, data, round.quality, round.lgwin)
++			note(ht, "round %d: %d bytes of stream", i, len(stream))
 +			var src io.Reader = bytes.NewReader(stream)
-+			if chance(ht, 60) {
-+				src = newChunkReader(ht, r, stream)
++			if round.source != nil {
++				src = round.source.reader(stream)
 +			}
-+			if i == 0 && chance(ht, 50) {
++			if i == 0 && c.fresh {
 +				rd = brotli.NewReader(src)
-+			} else {
-+				if err := rd.Reset(src); err != nil {
-+					fail(ht, "Reset: %v", err)
-+				}
++			} else if err := rd.Reset(src); err != nil {
++				mismatch(ht, "Reset: %v", err)
 +			}
 +			var got []byte
 +			var err error
-+			switch pick(ht, "buffers", "copy", "readall") {
++			switch round.mode {
 +			case "buffers":
-+				bufSize := pick(ht, 1, 2, 7, 100, 4096, 32*1024, 1<<17)
-+				note(ht, "buffer %d", bufSize)
-+				got, err = readAllWith(rd, bufSize)
++				got, err = readAllWith(rd, round.bufSize)
 +			case "copy":
 +				var out bytes.Buffer
 +				_, err = io.Copy(&out, rd)
@@ -794,19 +1639,19 @@ index 0000000..b70a053
 +				got, err = io.ReadAll(rd)
 +			}
 +			if err != nil {
-+				fail(ht, "the Reader fails on the tool's stream: %v", err)
++				mismatch(ht, "the Reader fails on the tool's stream: %v", err)
 +			}
 +			if !bytes.Equal(got, data) {
-+				fail(ht, "the Reader decodes the tool's stream to %d bytes, want %d", len(got), len(data))
++				mismatch(ht, "the Reader decodes the tool's stream to %d bytes, want %d", len(got), len(data))
 +			}
 +			// At the end, Read keeps returning (0, io.EOF).
 +			m, err := rd.Read(make([]byte, 10))
 +			if m != 0 || err != io.EOF {
-+				fail(ht, "Read at the end = %d, %v", m, err)
++				mismatch(ht, "Read at the end = %d, %v", m, err)
 +			}
 +			// Read with an empty buffer is harmless.
 +			if m, err := rd.Read(nil); m != 0 || (err != nil && err != io.EOF) {
-+				fail(ht, "Read(nil) at the end = %d, %v", m, err)
++				mismatch(ht, "Read(nil) at the end = %d, %v", m, err)
 +			}
 +		}
 +	})
@@ -815,85 +1660,191 @@ index 0000000..b70a053
 +// ---------------------------------------------------------------------------
 +// Property 3: damaged streams.
 +
++// streamSource: where a valid stream comes from: the tool at a quality and
++// window (0: its choice), or NewWriterLevel at the quality.
++type streamSource struct {
++	tool           bool
++	quality, lgwin int
++}
++
++func (s streamSource) GoString() string {
++	if s.tool {
++		return fmt.Sprintf("tool -q %d -w %d", s.quality, s.lgwin)
++	}
++	return fmt.Sprintf("Writer level %d", s.quality)
++}
++
++// stream compresses the data.
++func (s streamSource) stream(ht *hegel.T, data []byte) []byte {
++	if s.tool {
++		return toolCompress(ht, data, s.quality, s.lgwin)
++	}
++	var buf bytes.Buffer
++	w := brotli.NewWriterLevel(&buf, s.quality)
++	w.Write(data)
++	w.Close()
++	return buf.Bytes()
++}
++
++var streamSources = hegel.Composite(func(tc hegel.TestCase) streamSource {
++	return streamSource{
++		tool:    hegel.Draw(tc, chance(50)),
++		quality: hegel.Draw(tc, toolQualities),
++		lgwin:   hegel.Draw(tc, hegel.SampledFrom([]int{0, 10, 16, 24})),
++	}
++})
++
++// damage: one way of breaking a stream: the kind, a position (taken modulo
++// the live size), a bit or a byte value, and extra bytes to append or to
++// replace the stream with.
++type damage struct {
++	kind  string
++	at    int
++	bit   int
++	val   byte
++	extra []byte
++}
++
++func (d damage) GoString() string {
++	switch d.kind {
++	case "flip":
++		return fmt.Sprintf("flip bit %d of byte %d", d.bit, d.at)
++	case "byte", "insert":
++		return fmt.Sprintf("%s %#x at %d", d.kind, d.val, d.at)
++	case "delete", "truncate":
++		return fmt.Sprintf("%s at %d", d.kind, d.at)
++	case "append", "garbage":
++		return fmt.Sprintf("%s of % x", d.kind, d.extra)
++	}
++	return d.kind
++}
++
++// apply damages the stream.
++func (d damage) apply(stream []byte) []byte {
++	out := append([]byte(nil), stream...)
++	if len(out) == 0 && (d.kind == "flip" || d.kind == "byte" || d.kind == "delete" || d.kind == "truncate") {
++		return out
++	}
++	switch d.kind {
++	case "flip":
++		out[d.at%len(out)] ^= 1 << d.bit
++	case "byte":
++		out[d.at%len(out)] = d.val
++	case "delete":
++		i := d.at % len(out)
++		out = append(out[:i], out[i+1:]...)
++	case "insert":
++		i := d.at % (len(out) + 1)
++		out = append(out[:i], append([]byte{d.val}, out[i:]...)...)
++	case "truncate":
++		out = out[:d.at%len(out)]
++	case "append":
++		out = append(out, d.extra...)
++	case "empty":
++		out = nil
++	case "garbage":
++		out = append([]byte(nil), d.extra...)
++	}
++	return out
++}
++
++// zeroBytes: n zero bytes.
++func zeroBytes(lo, hi int) hegel.Generator[[]byte] {
++	return hegel.Map(hegel.Integers(lo, hi), func(n int) []byte { return make([]byte, n) })
++}
++
++var (
++	// trailers: the extra bytes after a stream, zeros 30% of the time.
++	trailers = weighted(choice[[]byte]{30, zeroBytes(1, 20)}, choice[[]byte]{70, hegel.Binary(1, 20)})
++	// damages: the eight kinds, the plainest first (an empty input, a
++	// truncation), then the in-place edits, then the appended tail (the shape
++	// of brotli/7 for the Reset check) and a stream of garbage.
++	damages = hegel.OneOf(
++		hegel.Just(damage{kind: "empty"}),
++		hegel.Composite(func(tc hegel.TestCase) damage { return damage{kind: "truncate", at: hegel.Draw(tc, offsets)} }),
++		hegel.Composite(func(tc hegel.TestCase) damage {
++			return damage{kind: "flip", at: hegel.Draw(tc, offsets), bit: hegel.Draw(tc, hegel.Integers(0, 7))}
++		}),
++		hegel.Composite(func(tc hegel.TestCase) damage {
++			return damage{kind: "byte", at: hegel.Draw(tc, offsets), val: hegel.Draw(tc, bytesOf)}
++		}),
++		hegel.Composite(func(tc hegel.TestCase) damage { return damage{kind: "delete", at: hegel.Draw(tc, offsets)} }),
++		hegel.Composite(func(tc hegel.TestCase) damage {
++			return damage{kind: "insert", at: hegel.Draw(tc, offsets), val: hegel.Draw(tc, bytesOf)}
++		}),
++		hegel.Composite(func(tc hegel.TestCase) damage { return damage{kind: "append", extra: hegel.Draw(tc, trailers)} }),
++		hegel.Composite(func(tc hegel.TestCase) damage {
++			return damage{kind: "garbage", extra: hegel.Draw(tc, hegel.Binary(1, 64))}
++		}),
++	)
++)
++
++// damageCase: a valid stream of some data, a damage, and how the library
++// decodes the damaged stream.
++type damageCase struct {
++	data   dataSpec
++	source streamSource
++	dmg    damage
++	decode decodeSpec
++}
++
++func (c damageCase) GoString() string {
++	return fmt.Sprintf("%s of %s, %s, %s", c.source.GoString(), c.data.GoString(), c.dmg.GoString(), c.decode.GoString())
++}
++
++// shapes: an appended tail is the shape of brotli/7 (the Reset check); a
++// garbage stream that happens to read as a complete stream with bytes after
++// it has the shape too, told by the error when read.
++func (c damageCase) shapes() []string { return shapeIf(c.dmg.kind == "append", "brotli/7") }
++
++var damageCases = hegel.Composite(func(tc hegel.TestCase) damageCase {
++	return damageCase{
++		data:   hegel.Draw(tc, smallBlocks),
++		source: hegel.Draw(tc, streamSources),
++		dmg:    hegel.Draw(tc, damages),
++		decode: hegel.Draw(tc, decodeSpecs),
++	}
++})
++
 +func TestHegelDamagedStreams(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
-+		data := genData(ht, r, n(ht, 0, 3000))
-+		var stream []byte
-+		if chance(ht, 50) {
-+			stream = toolCompress(ht, data, n(ht, 0, 11), pick(ht, 0, 10, 16, 24))
-+		} else {
-+			var buf bytes.Buffer
-+			w := brotli.NewWriterLevel(&buf, n(ht, 0, 11))
-+			w.Write(data)
-+			w.Close()
-+			stream = buf.Bytes()
-+		}
-+		damaged := append([]byte(nil), stream...)
-+		switch kind := pick(ht, "flip", "byte", "delete", "insert", "truncate", "append", "empty", "garbage"); kind {
-+		case "flip":
-+			i := n(ht, 0, len(damaged)-1)
-+			damaged[i] ^= 1 << n(ht, 0, 7)
-+			note(ht, "flip bit in byte %d of %d", i, len(damaged))
-+		case "byte":
-+			i := n(ht, 0, len(damaged)-1)
-+			damaged[i] = byte(n(ht, 0, 255))
-+			note(ht, "replace byte %d of %d", i, len(damaged))
-+		case "delete":
-+			i := n(ht, 0, len(damaged)-1)
-+			damaged = append(damaged[:i], damaged[i+1:]...)
-+			note(ht, "delete byte %d of %d", i, len(stream))
-+		case "insert":
-+			i := n(ht, 0, len(damaged))
-+			damaged = append(damaged[:i], append([]byte{byte(n(ht, 0, 255))}, damaged[i:]...)...)
-+			note(ht, "insert a byte at %d of %d", i, len(stream))
-+		case "truncate":
-+			k := n(ht, 0, len(damaged)-1)
-+			damaged = damaged[:k]
-+			note(ht, "truncate to %d of %d", k, len(stream))
-+		case "append":
-+			extra := make([]byte, n(ht, 1, 20))
-+			r.Read(extra)
-+			if chance(ht, 30) {
-+				for i := range extra {
-+					extra[i] = 0
-+				}
-+			}
-+			damaged = append(damaged, extra...)
-+			note(ht, "append %d bytes", len(extra))
-+		case "empty":
-+			damaged = nil
-+			note(ht, "empty input")
-+		default:
-+			damaged = make([]byte, n(ht, 1, 64))
-+			r.Read(damaged)
-+			note(ht, "garbage of %d bytes", len(damaged))
-+		}
++		c := hegel.Draw(ht, damageCases)
++		begin(c)
++		data := c.data.bytes()
++		stream := c.source.stream(ht, data)
++		damaged := c.dmg.apply(stream)
++		note(ht, "stream of %d bytes, damaged %d bytes", len(stream), len(damaged))
 +		want, toolErr := toolDecompress(damaged)
-+		got, err := libDecode(ht, r, damaged)
++		got, err := c.decode.decode(damaged)
 +		switch {
 +		case toolErr == nil && err != nil:
-+			fail(ht, "the reference tool decodes the damaged stream (%d bytes) but the Reader fails: %v", len(want), err)
++			mismatch(ht, "the reference tool decodes the damaged stream (%d bytes) but the Reader fails: %v", len(want), err)
 +		case toolErr == nil && !bytes.Equal(got, want):
-+			fail(ht, "the reference tool decodes the damaged stream to %d bytes, the Reader to %d", len(want), len(got))
++			mismatch(ht, "the reference tool decodes the damaged stream to %d bytes, the Reader to %d", len(want), len(got))
 +		case toolErr != nil && err == nil:
-+			fail(ht, "the reference tool rejects the damaged stream (%v) but the Reader decodes it to %d bytes", toolErr, len(got))
++			mismatch(ht, "the reference tool rejects the damaged stream (%v) but the Reader decodes it to %d bytes", toolErr, len(got))
 +		}
 +		if err != nil && errors.Is(err, io.EOF) {
-+			fail(ht, "the Reader reports a damaged stream as a clean EOF")
++			mismatch(ht, "the Reader reports a damaged stream as a clean EOF")
 +		}
-+		// A Reader that has seen the damage is reusable after Reset.
++		// A Reader that has seen the damage is reusable after Reset. Under
++		// HEGEL_NO_KNOWN=1 the check is skipped after excessive input (the
++		// shape of brotli/7, an eighth of the cases: too many for an Assume).
 +		rd := brotli.NewReader(bytes.NewReader(damaged))
 +		_, firstErr := io.ReadAll(rd)
-+		if Known.resetAfterExcess && firstErr != nil && strings.Contains(firstErr.Error(), "excessive input") {
++		excessive := firstErr != nil && strings.Contains(firstErr.Error(), "excessive input")
++		if excessive {
++			alsoShape("brotli/7")
++		}
++		if Known.resetAfterExcess && excessive {
 +			return
 +		}
 +		if err := rd.Reset(bytes.NewReader(stream)); err != nil {
-+			fail(ht, "Reset after a damaged stream: %v", err)
++			mismatch(ht, "Reset after a damaged stream: %v", err)
 +		}
 +		got, err = io.ReadAll(rd)
 +		if err != nil || !bytes.Equal(got, data) {
-+			fail(ht, "after a damaged stream and Reset, the good stream decodes to %d bytes, %v; want %d", len(got), err, len(data))
++			mismatch(ht, "after a damaged stream and Reset, the good stream decodes to %d bytes, %v; want %d", len(got), err, len(data))
 +		}
 +	})
 +}
@@ -901,69 +1852,97 @@ index 0000000..b70a053
 +// ---------------------------------------------------------------------------
 +// The matchfinder package: LZ77 validity.
 +
++// finderSpec: a MatchFinder and what is known about it.
 +type finderSpec struct {
 +	name        string
++	params      string
 +	mf          matchfinder.MatchFinder
 +	maxDist     int  // the window the finder was told about (0: its default)
 +	maxBlock    int  // the largest block it accepts (0: any)
 +	crossBlocks bool // may refer to earlier blocks
-+	minLength   int  // the shortest match it promises (0: unknown)
 +	readsDst    bool // brotli/5: takes its previous match from dst
 +	dropsShort  bool // brotli/8: leaves blocks under 20 bytes out of its history
 +}
 +
-+func genFinder(ht *hegel.T) finderSpec {
-+	dist := pick(ht, 0, 0, 64, 1000, 65535, 65536, 1<<20)
-+	switch pick(ht, "M0", "M4", "Pathfinder", "Bargain1", "Bargain2", "Bargain3", "Trio", "ZFast", "ZDFast", "ZM", "None", "AutoReset") {
-+	case "M0":
-+		m := matchfinder.M0{Lazy: chance(ht, 50), MaxDistance: dist, MaxLength: pick(ht, 0, 0, 4, 100, 65536)}
-+		note(ht, "M0 lazy %v maxdist %d maxlen %d", m.Lazy, m.MaxDistance, m.MaxLength)
-+		return finderSpec{name: "M0", mf: m, maxDist: dist, maxBlock: 65536}
-+	case "M4":
-+		m := &matchfinder.M4{MaxDistance: dist, MinLength: pick(ht, 0, 0, 4, 5, 8), HashLen: pick(ht, 0, 0, 4, 5, 6, 8), TableBits: pick(ht, 0, 0, 10, 14), ChainLength: pick(ht, 0, 1, 8, 32), DistanceBitCost: pick(ht, 0, 0, 32, 66)}
-+		note(ht, "M4 %+v", *m)
-+		return finderSpec{name: "M4", mf: m, maxDist: dist, crossBlocks: true, readsDst: true}
-+	case "Pathfinder":
-+		m := &matchfinder.Pathfinder{MaxDistance: dist, MinLength: pick(ht, 0, 0, 4, 5, 8), HashLen: pick(ht, 0, 0, 4, 5, 6, 8), TableBits: pick(ht, 0, 0, 10, 14), ChainLength: pick(ht, 0, 1, 8, 32)}
-+		note(ht, "Pathfinder %+v", *m)
-+		return finderSpec{name: "Pathfinder", mf: m, maxDist: dist, crossBlocks: true}
-+	case "Bargain1":
-+		m := &matchfinder.Bargain1{MaxDistance: dist, Skip: chance(ht, 50)}
-+		note(ht, "Bargain1 maxdist %d skip %v", dist, m.Skip)
-+		return finderSpec{name: "Bargain1", mf: m, maxDist: dist, crossBlocks: true}
-+	case "Bargain2":
-+		m := &matchfinder.Bargain2{MaxDistance: dist, Skip: chance(ht, 50)}
-+		note(ht, "Bargain2 maxdist %d skip %v", dist, m.Skip)
-+		return finderSpec{name: "Bargain2", mf: m, maxDist: dist, crossBlocks: true}
-+	case "Bargain3":
-+		m := &matchfinder.Bargain3{MaxDistance: dist, Skip: chance(ht, 50)}
-+		note(ht, "Bargain3 maxdist %d skip %v", dist, m.Skip)
-+		return finderSpec{name: "Bargain3", mf: m, maxDist: dist, crossBlocks: true}
-+	case "Trio":
-+		m := &matchfinder.Trio{MaxDistance: dist}
-+		note(ht, "Trio maxdist %d", dist)
-+		return finderSpec{name: "Trio", mf: m, maxDist: dist, crossBlocks: true, dropsShort: true}
-+	case "ZFast":
-+		m := &matchfinder.ZFast{MaxDistance: dist}
-+		note(ht, "ZFast maxdist %d", dist)
-+		return finderSpec{name: "ZFast", mf: m, maxDist: dist, crossBlocks: true}
-+	case "ZDFast":
-+		m := &matchfinder.ZDFast{MaxDistance: dist}
-+		note(ht, "ZDFast maxdist %d", dist)
-+		return finderSpec{name: "ZDFast", mf: m, maxDist: dist, crossBlocks: true}
-+	case "ZM":
-+		m := &matchfinder.ZM{MaxDistance: dist}
-+		note(ht, "ZM maxdist %d", dist)
-+		return finderSpec{name: "ZM", mf: m, maxDist: dist, crossBlocks: true, dropsShort: true}
-+	case "None":
-+		note(ht, "NoMatchFinder")
-+		return finderSpec{name: "None", mf: matchfinder.NoMatchFinder{}}
-+	default:
-+		inner := &matchfinder.M4{MaxDistance: dist}
-+		note(ht, "AutoReset{M4 maxdist %d}", dist)
-+		return finderSpec{name: "AutoReset", mf: matchfinder.AutoReset{MatchFinder: inner}, maxDist: dist, readsDst: true}
-+	}
++func (f finderSpec) GoString() string { return f.name + f.params }
++
++var (
++	windows    = hegel.SampledFrom([]int{0, 0, 64, 1000, 65535, 65536, 1 << 20})
++	minLengths = hegel.SampledFrom([]int{0, 0, 4, 5, 8})
++	hashLens   = hegel.SampledFrom([]int{0, 0, 4, 5, 6, 8})
++	tableBits  = hegel.SampledFrom([]int{0, 0, 10, 14})
++	chainLens  = hegel.SampledFrom([]int{0, 1, 8, 32})
++	distCosts  = hegel.SampledFrom([]int{0, 0, 32, 66})
++	m0Lengths  = hegel.SampledFrom([]int{0, 0, 4, 100, 65536})
++)
++
++// bargains: a Bargain finder made by mk from its window and Skip flag.
++func bargains(name string, mk func(dist int, skip bool) matchfinder.MatchFinder) hegel.Generator[finderSpec] {
++	return hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		dist, skip := hegel.Draw(tc, windows), hegel.Draw(tc, chance(50))
++		return finderSpec{name: name, params: fmt.Sprintf(" maxdist %d skip %v", dist, skip), mf: mk(dist, skip), maxDist: dist, crossBlocks: true}
++	})
 +}
++
++// windowed: a finder with only a window, made by mk.
++func windowed(name string, mk func(dist int) matchfinder.MatchFinder, dropsShort bool) hegel.Generator[finderSpec] {
++	return hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		dist := hegel.Draw(tc, windows)
++		return finderSpec{name: name, params: fmt.Sprintf(" maxdist %d", dist), mf: mk(dist), maxDist: dist, crossBlocks: true, dropsShort: dropsShort}
++	})
++}
++
++// finderGens: the finders by name, each a record of its parameters.
++var finderGens = map[string]hegel.Generator[finderSpec]{
++	"None": hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		return finderSpec{name: "None", mf: matchfinder.NoMatchFinder{}}
++	}),
++	"M0": hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		m := matchfinder.M0{Lazy: hegel.Draw(tc, chance(50)), MaxDistance: hegel.Draw(tc, windows), MaxLength: hegel.Draw(tc, m0Lengths)}
++		return finderSpec{name: "M0", params: fmt.Sprintf(" %+v", m), mf: m, maxDist: m.MaxDistance, maxBlock: 65536}
++	}),
++	"M4": hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		m := &matchfinder.M4{
++			MaxDistance:     hegel.Draw(tc, windows),
++			MinLength:       hegel.Draw(tc, minLengths),
++			HashLen:         hegel.Draw(tc, hashLens),
++			TableBits:       hegel.Draw(tc, tableBits),
++			ChainLength:     hegel.Draw(tc, chainLens),
++			DistanceBitCost: hegel.Draw(tc, distCosts),
++		}
++		return finderSpec{name: "M4", params: fmt.Sprintf(" %+v", *m), mf: m, maxDist: m.MaxDistance, crossBlocks: true, readsDst: true}
++	}),
++	"Pathfinder": hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		m := &matchfinder.Pathfinder{
++			MaxDistance: hegel.Draw(tc, windows),
++			MinLength:   hegel.Draw(tc, minLengths),
++			HashLen:     hegel.Draw(tc, hashLens),
++			TableBits:   hegel.Draw(tc, tableBits),
++			ChainLength: hegel.Draw(tc, chainLens),
++		}
++		return finderSpec{name: "Pathfinder", params: fmt.Sprintf(" %+v", *m), mf: m, maxDist: m.MaxDistance, crossBlocks: true}
++	}),
++	"Bargain1": bargains("Bargain1", func(d int, s bool) matchfinder.MatchFinder { return &matchfinder.Bargain1{MaxDistance: d, Skip: s} }),
++	"Bargain2": bargains("Bargain2", func(d int, s bool) matchfinder.MatchFinder { return &matchfinder.Bargain2{MaxDistance: d, Skip: s} }),
++	"Bargain3": bargains("Bargain3", func(d int, s bool) matchfinder.MatchFinder { return &matchfinder.Bargain3{MaxDistance: d, Skip: s} }),
++	"Trio":     windowed("Trio", func(d int) matchfinder.MatchFinder { return &matchfinder.Trio{MaxDistance: d} }, true),
++	"ZFast":    windowed("ZFast", func(d int) matchfinder.MatchFinder { return &matchfinder.ZFast{MaxDistance: d} }, false),
++	"ZDFast":   windowed("ZDFast", func(d int) matchfinder.MatchFinder { return &matchfinder.ZDFast{MaxDistance: d} }, false),
++	"ZM":       windowed("ZM", func(d int) matchfinder.MatchFinder { return &matchfinder.ZM{MaxDistance: d} }, true),
++	"AutoReset": hegel.Composite(func(tc hegel.TestCase) finderSpec {
++		dist := hegel.Draw(tc, windows)
++		return finderSpec{name: "AutoReset", params: fmt.Sprintf("{M4 maxdist %d}", dist), mf: matchfinder.AutoReset{MatchFinder: &matchfinder.M4{MaxDistance: dist}}, maxDist: dist, readsDst: true}
++	}),
++}
++
++// findersOf: one of the named finders, with its parameters.
++func findersOf(names ...string) hegel.Generator[finderSpec] {
++	return hegel.FlatMap(hegel.SampledFrom(names), func(name string) hegel.Generator[finderSpec] { return finderGens[name] })
++}
++
++var finderNames = []string{"None", "M0", "M4", "Pathfinder", "Bargain1", "Bargain2", "Bargain3", "Trio", "ZFast", "ZDFast", "ZM", "AutoReset"}
++
++var finders = findersOf(finderNames...)
 +
 +// checkMatches verifies the LZ77 contract of matches for block, given the
 +// bytes history that preceded it in the stream (empty when the finder may not
@@ -1014,61 +1993,145 @@ index 0000000..b70a053
 +
 +// Property 4: every MatchFinder's matches are valid LZ77.
 +
++// lz77Block: one block fed to a finder: its data, the number of bytes of the
++// history's tail prepended so that the block echoes earlier data (0: none),
++// and whether the finder is Reset after it.
++type lz77Block struct {
++	data  dataSpec
++	echo  int
++	reset bool
++}
++
++func (b lz77Block) GoString() string {
++	s := b.data.GoString()
++	if b.echo > 0 {
++		s += fmt.Sprintf(" after %d echoed bytes", b.echo)
++	}
++	if b.reset {
++		s += ", then Reset"
++	}
++	return s
++}
++
++// lz77Blocks: a block of any size.
++var lz77Blocks = lz77BlocksOf(blocks)
++
++func lz77BlocksOf(data hegel.Generator[dataSpec]) hegel.Generator[lz77Block] {
++	return hegel.Composite(func(tc hegel.TestCase) lz77Block {
++		return lz77Block{data: hegel.Draw(tc, data), echo: hegel.Draw(tc, maybe(30, hegel.Integers(1, 300))), reset: hegel.Draw(tc, chance(15))}
++	})
++}
++
++// matchEntries: an entry of a pre-filled dst (a literal-only Match shrinks
++// first; a Distance beyond the block's position is what makes M4 panic).
++var matchEntries = hegel.Composite(func(tc hegel.TestCase) matchfinder.Match {
++	return matchfinder.Match{Unmatched: hegel.Draw(tc, hegel.Integers(0, 8)), Length: hegel.Draw(tc, hegel.Integers(0, 8)), Distance: hegel.Draw(tc, hegel.Integers(0, 1000))}
++})
++
++// lz77Case: a finder, the entries dst holds before the first block, whether
++// the matches of every block accumulate in dst, and the blocks.
++type lz77Case struct {
++	finder  finderSpec
++	prefill []matchfinder.Match
++	keep    bool
++	blocks  []lz77Block
++}
++
++func (c lz77Case) GoString() string {
++	lines := []string{fmt.Sprintf("%s, dst starts with %d entries, accumulates %v", c.finder.GoString(), len(c.prefill), c.keep)}
++	for i, b := range c.blocks {
++		lines = append(lines, fmt.Sprintf("block %d: %s", i, b.GoString()))
++	}
++	return strings.Join(lines, "\n")
++}
++
++// shortBefore reports whether a block under 20 bytes precedes another.
++func (c lz77Case) shortBefore() bool {
++	for _, b := range c.blocks[:len(c.blocks)-1] {
++		if b.data.size < 20 {
++			return true
++		}
++	}
++	return false
++}
++
++// shapes: a finder that reads dst given entries in it (brotli/5); a finder
++// that drops short blocks given one before another block (brotli/8).
++func (c lz77Case) shapes() []string {
++	return append(
++		shapeIf(c.finder.readsDst && (len(c.prefill) > 0 || c.keep), "brotli/5"),
++		shapeIf(c.finder.dropsShort && c.shortBefore(), "brotli/8")...)
++}
++
++var lz77Cases = hegel.Composite(func(tc hegel.TestCase) lz77Case {
++	return lz77Case{
++		finder:  hegel.Draw(tc, finders),
++		prefill: hegel.Draw(tc, maybe(30, many(matchEntries, 1, 5))),
++		keep:    hegel.Draw(tc, chance(40)),
++		blocks:  hegel.Draw(tc, many(lz77Blocks, 1, 4)),
++	}
++})
++
++// checkLZ77 feeds the blocks to the finder and checks every block's matches.
++// Under HEGEL_NO_KNOWN=1 a finder that reads dst gets an empty one (brotli/5)
++// and a finder that drops short blocks gets none under 20 bytes before
++// another (brotli/8).
++func checkLZ77(ht *hegel.T, c lz77Case) {
++	spec := c.finder
++	var history []byte
++	dst := append([]matchfinder.Match(nil), c.prefill...)
++	keep := c.keep
++	if Known.previousMatchFromDst && spec.readsDst {
++		dst, keep = nil, false
++	}
++	for b, blk := range c.blocks {
++		last := b == len(c.blocks)-1
++		size := blk.data.size
++		if spec.maxBlock > 0 && size > spec.maxBlock {
++			size = spec.maxBlock
++		}
++		if Known.shortBlockDropped && spec.dropsShort && size < 20 && !last {
++			size = 20
++		}
++		block := blk.data.sized(size).bytes()
++		if blk.echo > 0 && len(history) > 0 {
++			// The block echoes earlier data so cross-block matches appear.
++			k := min(len(history), blk.echo)
++			block = append(append([]byte(nil), history[len(history)-k:]...), block...)
++			if spec.maxBlock > 0 && len(block) > spec.maxBlock {
++				block = block[:spec.maxBlock]
++			}
++		}
++		before := len(dst)
++		got := spec.mf.FindMatches(dst, block)
++		if len(got) < before || (before > 0 && !reflect.DeepEqual(got[:before], dst[:before])) {
++			mismatch(ht, "%s.FindMatches did not append to dst", spec.name)
++		}
++		matches := got[before:]
++		hist := history
++		if !spec.crossBlocks {
++			hist = nil
++		}
++		if msg := checkMatches(matches, hist, block, spec.maxDist); msg != "" {
++			mismatch(ht, "%s block %d (%d bytes, %d before it): %s", spec.name, b, len(block), len(history), msg)
++		}
++		history = append(history, block...)
++		dst = got[:0]
++		if keep {
++			dst = got
++		}
++		if blk.reset {
++			spec.mf.Reset()
++			history = nil
++		}
++	}
++}
++
 +func TestHegelMatchFindersAreValidLZ77(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
-+		spec := genFinder(ht)
-+		blocks := n(ht, 1, 4)
-+		var history []byte
-+		var dst []matchfinder.Match
-+		keep := false // accumulate the matches of every block in dst
-+		if !(Known.previousMatchFromDst && spec.readsDst) {
-+			if chance(ht, 30) {
-+				dst = make([]matchfinder.Match, n(ht, 0, 5)) // FindMatches appends
-+			}
-+			keep = chance(ht, 40)
-+		}
-+		note(ht, "dst starts with %d entries, accumulates %v", len(dst), keep)
-+		for b := 0; b < blocks; b++ {
-+			size := genSize(ht)
-+			if spec.maxBlock > 0 && size > spec.maxBlock {
-+				size = spec.maxBlock
-+			}
-+			if Known.shortBlockDropped && spec.dropsShort && size < 20 && b < blocks-1 {
-+				size = 20
-+			}
-+			block := genData(ht, r, size)
-+			if chance(ht, 30) && len(history) > 0 {
-+				// Make the block echo earlier data so cross-block matches appear.
-+				k := min(len(history), n(ht, 1, 300))
-+				block = append(append([]byte(nil), history[len(history)-k:]...), block...)
-+				if spec.maxBlock > 0 && len(block) > spec.maxBlock {
-+					block = block[:spec.maxBlock]
-+				}
-+			}
-+			before := len(dst)
-+			got := spec.mf.FindMatches(dst, block)
-+			if len(got) < before || (before > 0 && !reflect.DeepEqual(got[:before], dst[:before])) {
-+				fail(ht, "%s.FindMatches did not append to dst", spec.name)
-+			}
-+			matches := got[before:]
-+			hist := history
-+			if !spec.crossBlocks {
-+				hist = nil
-+			}
-+			if msg := checkMatches(matches, hist, block, spec.maxDist); msg != "" {
-+				fail(ht, "%s block %d (%d bytes, %d before it): %s", spec.name, b, len(block), len(history), msg)
-+			}
-+			history = append(history, block...)
-+			dst = got[:0]
-+			if keep {
-+				dst = got
-+			}
-+			if chance(ht, 15) {
-+				spec.mf.Reset()
-+				history = nil
-+			}
-+		}
++		c := hegel.Draw(ht, lz77Cases)
++		begin(c)
++		checkLZ77(ht, c)
 +	})
 +}
 +
@@ -1146,55 +2209,160 @@ index 0000000..b70a053
 +// Property 5: the encoders turn any valid match sequence into a stream that
 +// the reference decoders accept.
 +
++var encoderKinds = []string{"brotli", "brotli-fast", "flate", "gzip"}
++
++// encBlock: one Encode call: the block's size (its matches come from
++// buildBlock), whether an empty block gets one literal-only Match rather than
++// none, and whether Encode appends to a nil dst rather than to the stream.
++type encBlock struct {
++	size        int
++	literalOnly bool
++	fresh       bool
++}
++
++var encBlocks = hegel.Composite(func(tc hegel.TestCase) encBlock {
++	return encBlock{
++		size:        hegel.Draw(tc, weighted(choice[int]{85, hegel.Integers(0, 3000)}, choice[int]{15, hegel.SampledFrom([]int{0, 1, 65536, 100000})})),
++		literalOnly: hegel.Draw(tc, chance(50)),
++		fresh:       hegel.Draw(tc, chance(30)),
++	}
++})
++
++// encoderCase: an encoder, the window the distances stay within (0: the
++// format's), the longest match (0: 20000), a warm-up Encode and Reset before
++// use (with the warm-up's final flag), the blocks, the seed of the literals
++// and match choices, and how the library decodes a brotli stream.
++type encoderCase struct {
++	kind   string
++	window int
++	maxLen int
++	warm   *bool
++	blocks []encBlock
++	seed   int64
++	decode decodeSpec
++}
++
++// minLen is the shortest match the encoder's format admits (brotli 2, flate
++// 3); FastEncoder is given 4 under HEGEL_NO_KNOWN=1 (brotli/6).
++func (c encoderCase) minLen() int {
++	switch c.kind {
++	case "brotli-fast":
++		return shaped(2, 4)
++	case "flate", "gzip":
++		return 3
++	}
++	return 2
++}
++
++// limits are the longest match and the farthest distance of the case: the
++// format's, narrowed by the drawn window and maxLen; the flate encoders are
++// kept at 258 under HEGEL_NO_KNOWN=1 (brotli/1).
++func (c encoderCase) limits() (maxLen, maxDist int) {
++	maxLen, maxDist = 20000, 1<<24-16
++	if c.kind == "flate" || c.kind == "gzip" {
++		maxDist = 32768
++	}
++	if c.window > 0 {
++		maxDist = min(maxDist, c.window)
++	}
++	if c.maxLen > 0 {
++		maxLen = max(c.minLen(), c.maxLen)
++	}
++	if Known.flateLongMatchPanics && (c.kind == "flate" || c.kind == "gzip") {
++		maxLen = min(maxLen, 258)
++	}
++	return maxLen, maxDist
++}
++
++func (c encoderCase) GoString() string {
++	maxLen, maxDist := c.limits()
++	s := fmt.Sprintf("%s encoder, min length %d, max length %d, max distance %d, seed %d", c.kind, c.minLen(), maxLen, maxDist, c.seed)
++	if c.warm != nil {
++		s += fmt.Sprintf(", warmed up (final %v) and Reset", *c.warm)
++	}
++	for i, b := range c.blocks {
++		s += fmt.Sprintf("\nblock %d: %d bytes, literal-only %v, fresh dst %v", i, b.size, b.literalOnly, b.fresh)
++	}
++	return s
++}
++
++// shapes: a flate encoder given matches over 258 bytes (brotli/1); the
++// FastEncoder given matches under 4 bytes (brotli/6).
++func (c encoderCase) shapes() []string {
++	maxLen, _ := c.limits()
++	return append(
++		shapeIf((c.kind == "flate" || c.kind == "gzip") && maxLen > 258, "brotli/1"),
++		shapeIf(c.kind == "brotli-fast" && c.minLen() < 4, "brotli/6")...)
++}
++
++var encoderCases = hegel.Composite(func(tc hegel.TestCase) encoderCase {
++	return encoderCase{
++		kind:   hegel.Draw(tc, hegel.SampledFrom(encoderKinds)),
++		window: hegel.Draw(tc, maybe(50, hegel.SampledFrom([]int{100, 1000, 65536}))),
++		maxLen: hegel.Draw(tc, maybe(30, hegel.SampledFrom([]int{1, 10, 258, 259, 1000}))),
++		warm:   hegel.Draw(tc, optional(20, chance(50))),
++		blocks: hegel.Draw(tc, many(encBlocks, 1, 4)),
++		seed:   hegel.Draw(tc, seeds),
++		decode: hegel.Draw(tc, decodeSpecs),
++	}
++})
++
++// encoderOf is a fresh encoder of the kind.
++func encoderOf(kind string) matchfinder.Encoder {
++	switch kind {
++	case "brotli":
++		return &brotli.Encoder{}
++	case "brotli-fast":
++		return &brotli.FastEncoder{}
++	case "flate":
++		return bflate.NewEncoder()
++	}
++	return bflate.NewGZIPEncoder()
++}
++
++// decodeStream decodes a stream of the kind with the reference decoder (the
++// tool for brotli, the standard library for flate and gzip); for brotli the
++// Reader must agree with the tool.
++func decodeStream(ht *hegel.T, kind string, stream []byte, decode decodeSpec, want []byte) ([]byte, error) {
++	switch kind {
++	case "flate":
++		return io.ReadAll(flate.NewReader(bytes.NewReader(stream)))
++	case "gzip":
++		zr, err := gzip.NewReader(bytes.NewReader(stream))
++		if err != nil {
++			return nil, err
++		}
++		return io.ReadAll(zr)
++	}
++	got, err := toolDecompress(stream)
++	if err == nil {
++		lib, lerr := decode.decode(stream)
++		if lerr != nil || !bytes.Equal(lib, want) {
++			mismatch(ht, "the Reader decodes the %s stream to %d bytes, %v; want %d", kind, len(lib), lerr, len(want))
++		}
++	}
++	return got, err
++}
++
 +func TestHegelEncodersAcceptAnyMatches(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
-+		kind := pick(ht, "brotli", "brotli-fast", "flate", "gzip")
-+		var enc matchfinder.Encoder
-+		minLen, maxLen, maxDist := 2, 20000, 1<<24-16
-+		switch kind {
-+		case "brotli":
-+			enc = &brotli.Encoder{}
-+		case "brotli-fast":
-+			enc = &brotli.FastEncoder{}
-+			if Known.fastEncoderShort {
-+				minLen = 4
-+			}
-+		case "flate":
-+			enc = bflate.NewEncoder()
-+			minLen, maxDist = 3, 32768
-+		default:
-+			enc = bflate.NewGZIPEncoder()
-+			minLen, maxDist = 3, 32768
-+		}
-+		if chance(ht, 50) {
-+			// Distances stay within a small window most of the time so that
-+			// the stream (and its history) stays small.
-+			maxDist = min(maxDist, pick(ht, 100, 1000, 65536))
-+		}
-+		if chance(ht, 30) {
-+			maxLen = pick(ht, minLen, 10, 258, 259, 1000)
-+		}
-+		if Known.flateLongMatchPanics && minLen == 3 && maxLen > 258 {
-+			maxLen = 258
-+		}
-+		note(ht, "%s encoder, min length %d, max length %d, max distance %d", kind, minLen, maxLen, maxDist)
-+		if chance(ht, 20) {
++		c := hegel.Draw(ht, encoderCases)
++		begin(c)
++		r := rand.New(rand.NewSource(c.seed))
++		enc := encoderOf(c.kind)
++		minLen := c.minLen()
++		maxLen, maxDist := c.limits()
++		if c.warm != nil {
 +			// A used encoder, Reset.
-+			enc.Encode(nil, []byte("warm up"), []matchfinder.Match{{Unmatched: 7}}, chance(ht, 50))
++			enc.Encode(nil, []byte("warm up"), []matchfinder.Match{{Unmatched: 7}}, *c.warm)
 +			enc.Reset()
 +		}
-+		blocks := n(ht, 1, 4)
 +		var history, stream []byte
-+		for b := 0; b < blocks; b++ {
-+			size := n(ht, 0, 3000)
-+			if chance(ht, 15) {
-+				size = pick(ht, 0, 1, 65536, 100000)
-+			}
-+			block, matches := buildBlock(r, history, size, minLen, maxLen, maxDist)
-+			if size == 0 {
++		for b, blk := range c.blocks {
++			block, matches := buildBlock(r, history, blk.size, minLen, maxLen, maxDist)
++			if blk.size == 0 {
 +				block, matches = nil, nil
-+				if chance(ht, 50) {
++				if blk.literalOnly {
 +					matches = []matchfinder.Match{{}}
 +				}
 +			}
@@ -1202,14 +2370,14 @@ index 0000000..b70a053
 +				ht.Fatalf("harness: generated matches are invalid: %s", msg)
 +			}
 +			note(ht, "block %d: %d bytes, %d matches", b, len(block), len(matches))
-+			last := b == blocks-1
++			last := b == len(c.blocks)-1
 +			dst := stream
-+			if chance(ht, 30) {
++			if blk.fresh {
 +				dst = nil
 +			}
 +			out := enc.Encode(dst, block, matches, last)
 +			if dst != nil && (len(out) < len(dst) || !bytes.Equal(out[:len(dst)], dst)) {
-+				fail(ht, "%s Encode did not append to dst", kind)
++				mismatch(ht, "%s Encode did not append to dst", c.kind)
 +			}
 +			if dst == nil {
 +				stream = append(stream, out...)
@@ -1219,31 +2387,12 @@ index 0000000..b70a053
 +			history = append(history, block...)
 +		}
 +		note(ht, "stream: %d bytes for %d", len(stream), len(history))
-+		var got []byte
-+		var err error
-+		switch kind {
-+		case "brotli", "brotli-fast":
-+			got, err = toolDecompress(stream)
-+			if err == nil {
-+				lib, lerr := libDecode(ht, r, stream)
-+				if lerr != nil || !bytes.Equal(lib, history) {
-+					fail(ht, "the Reader decodes the %s encoder's stream to %d bytes, %v; want %d", kind, len(lib), lerr, len(history))
-+				}
-+			}
-+		case "flate":
-+			got, err = io.ReadAll(flate.NewReader(bytes.NewReader(stream)))
-+		default:
-+			var zr *gzip.Reader
-+			zr, err = gzip.NewReader(bytes.NewReader(stream))
-+			if err == nil {
-+				got, err = io.ReadAll(zr)
-+			}
-+		}
++		got, err := decodeStream(ht, c.kind, stream, c.decode, history)
 +		if err != nil {
-+			fail(ht, "the reference decoder rejects the %s encoder's stream: %v", kind, err)
++			mismatch(ht, "the reference decoder rejects the %s encoder's stream: %v", c.kind, err)
 +		}
 +		if !bytes.Equal(got, history) {
-+			fail(ht, "the %s encoder's stream decodes to %d bytes, want %d", kind, len(got), len(history))
++			mismatch(ht, "the %s encoder's stream decodes to %d bytes, want %d", c.kind, len(got), len(history))
 +		}
 +	})
 +}
@@ -1252,135 +2401,203 @@ index 0000000..b70a053
 +// Property 6: the matchfinder-based writers (NewWriterV2, flate, gzip, and
 +// hand-assembled matchfinder.Writers).
 +
++// customWriter: a matchfinder.Writer assembled by hand: a finder, the
++// FastEncoder rather than the Encoder, and a block size (0: one block per
++// Write).
++type customWriter struct {
++	finder    finderSpec
++	fast      bool
++	blockSize int
++}
++
++func (w customWriter) GoString() string {
++	enc := "Encoder"
++	if w.fast {
++		enc = "FastEncoder"
++	}
++	return fmt.Sprintf("custom Writer %s + %s, block size %d", w.finder.GoString(), enc, w.blockSize)
++}
++
++var customWriters = hegel.Composite(func(tc hegel.TestCase) customWriter {
++	return customWriter{
++		finder:    hegel.Draw(tc, finders),
++		fast:      hegel.Draw(tc, chance(30)),
++		blockSize: hegel.Draw(tc, hegel.SampledFrom([]int{65536, 4096, 100, 1, 0})),
++	}
++})
++
++// writerReuse: a second stream through the Writer after Reset.
++type writerReuse struct {
++	data dataSpec
++	cuts []int
++}
++
++var writerReuses = hegel.Composite(func(tc hegel.TestCase) writerReuse {
++	return writerReuse{data: hegel.Draw(tc, dataOf(hegel.Integers(0, 5000))), cuts: hegel.Draw(tc, cutLists(3))}
++})
++
++// writerV2Case: a matchfinder-based writer (NewWriterV2, flate.NewWriter,
++// flate.NewGZIPWriter at a level, or a custom one), the data written in
++// pieces, how the library decodes the stream, and a reuse after Reset.
++type writerV2Case struct {
++	kind   string
++	level  int
++	custom customWriter
++	data   dataSpec
++	cuts   []int
++	decode decodeSpec
++	again  *writerReuse
++}
++
++// flate reports whether the writer is one of the flate package's.
++func (c writerV2Case) flate() bool { return c.kind == "flate" || c.kind == "gzip" }
++
++// dataWritten is the data as written: random bytes only (no repeats over
++// 258 bytes) for the flate writers under HEGEL_NO_KNOWN=1 (brotli/1).
++func (c writerV2Case) dataWritten(d dataSpec) dataSpec {
++	if Known.flateLongMatchPanics && c.flate() {
++		d.kinds = []string{"random"}
++	}
++	return d
++}
++
++// writer builds the writer; under HEGEL_NO_KNOWN=1 the FastEncoder is not
++// paired with a Bargain finder (brotli/6) and a finder that drops short
++// blocks gets blocks of 4096 (brotli/8).
++func (c writerV2Case) writer(buf *bytes.Buffer) *matchfinder.Writer {
++	switch c.kind {
++	case "v2":
++		return brotli.NewWriterV2(buf, c.level)
++	case "flate":
++		return bflate.NewWriter(buf, c.level)
++	case "gzip":
++		return bflate.NewGZIPWriter(buf, c.level)
++	}
++	cw := c.custom
++	var enc matchfinder.Encoder = &brotli.Encoder{}
++	if cw.fast && !(Known.fastEncoderShort && cw.shortMatches()) {
++		enc = &brotli.FastEncoder{}
++	}
++	blockSize := cw.blockSize
++	if Known.shortBlockDropped && cw.finder.dropsShort && blockSize < 20 {
++		blockSize = 4096 // only the last block may then be short
++	}
++	if cw.finder.maxBlock > 0 && blockSize > cw.finder.maxBlock {
++		blockSize = cw.finder.maxBlock
++	}
++	return &matchfinder.Writer{Dest: buf, MatchFinder: cw.finder.mf, Encoder: enc, BlockSize: blockSize}
++}
++
++// shortMatches reports whether the finder returns matches as short as three
++// bytes (the Bargain finders).
++func (w customWriter) shortMatches() bool { return strings.HasPrefix(w.finder.name, "Bargain") }
++
++func (c writerV2Case) GoString() string {
++	var s string
++	switch c.kind {
++	case "v2":
++		s = fmt.Sprintf("NewWriterV2 level %d", c.level)
++	case "flate", "gzip":
++		s = fmt.Sprintf("flate.New%sWriter level %d", map[string]string{"flate": "", "gzip": "GZIP"}[c.kind], c.level)
++	default:
++		s = c.custom.GoString()
++	}
++	s += fmt.Sprintf("\ndata %s in %d writes, %s", c.dataWritten(c.data).GoString(), len(c.cuts)+1, c.decode.GoString())
++	if c.again != nil {
++		s += fmt.Sprintf("\nthen after Reset %s in %d writes", c.dataWritten(c.again.data).GoString(), len(c.again.cuts)+1)
++	}
++	return s
++}
++
++// shapes: a flate writer given data with repeats (brotli/1); the FastEncoder
++// behind a Bargain finder (brotli/6); a finder that drops short blocks with
++// blocks under 20 bytes or one block per Write (brotli/8).
++func (c writerV2Case) shapes() []string {
++	repeats := len(c.data.kinds) > 1 || c.data.kinds[0] != "random" || (c.again != nil && (len(c.again.data.kinds) > 1 || c.again.data.kinds[0] != "random"))
++	return append(append(
++		shapeIf(c.flate() && repeats, "brotli/1"),
++		shapeIf(c.kind == "custom" && c.custom.fast && c.custom.shortMatches(), "brotli/6")...),
++		shapeIf(c.kind == "custom" && c.custom.finder.dropsShort && c.custom.blockSize < 20, "brotli/8")...)
++}
++
++var (
++	writerKinds = weighted(
++		choice[string]{2, hegel.Just("v2")},
++		choice[string]{1, hegel.Just("flate")},
++		choice[string]{1, hegel.Just("gzip")},
++		choice[string]{1, hegel.Just("custom")},
++	)
++	writerLevels = hegel.SampledFrom([]int{-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
++)
++
++var writerV2Cases = hegel.Composite(func(tc hegel.TestCase) writerV2Case {
++	return writerV2Case{
++		kind:   hegel.Draw(tc, writerKinds),
++		level:  hegel.Draw(tc, writerLevels),
++		custom: hegel.Draw(tc, customWriters),
++		data:   hegel.Draw(tc, blocks),
++		cuts:   hegel.Draw(tc, cutLists(6)),
++		decode: hegel.Draw(tc, decodeSpecs),
++		again:  hegel.Draw(tc, optional(40, writerReuses)),
++	}
++})
++
++// writeAll writes the data in its pieces, none longer than maxWrite.
++func writeAll(ht *hegel.T, w *matchfinder.Writer, data []byte, cuts []int, maxWrite int) {
++	for _, p := range cutsOf(data, cuts) {
++		for len(p) > maxWrite {
++			if _, err := w.Write(p[:maxWrite]); err != nil {
++				mismatch(ht, "Write(%d bytes): %v", maxWrite, err)
++			}
++			p = p[maxWrite:]
++		}
++		m, err := w.Write(p)
++		if err != nil || m != len(p) {
++			mismatch(ht, "Write(%d bytes) = %d, %v", len(p), m, err)
++		}
++	}
++}
++
 +func TestHegelMatchfinderWritersRoundTrip(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
-+		kind := pick(ht, "v2", "v2", "flate", "gzip", "custom")
++		c := hegel.Draw(ht, writerV2Cases)
++		begin(c)
 +		var buf bytes.Buffer
-+		var w *matchfinder.Writer
-+		level := pick(ht, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
++		w := c.writer(&buf)
 +		maxWrite := 1 << 17
-+		switch kind {
-+		case "v2":
-+			w = brotli.NewWriterV2(&buf, level)
-+			note(ht, "NewWriterV2 level %d", level)
-+		case "flate":
-+			w = bflate.NewWriter(&buf, level)
-+			note(ht, "flate.NewWriter level %d", level)
-+		case "gzip":
-+			w = bflate.NewGZIPWriter(&buf, level)
-+			note(ht, "flate.NewGZIPWriter level %d", level)
-+		default:
-+			spec := genFinder(ht)
-+			var enc matchfinder.Encoder = &brotli.Encoder{}
-+			encName := "Encoder"
-+			// The Bargain finders return matches as short as three bytes.
-+			shortMatches := strings.HasPrefix(spec.name, "Bargain")
-+			if chance(ht, 30) && !(Known.fastEncoderShort && shortMatches) {
-+				enc = &brotli.FastEncoder{}
-+				encName = "FastEncoder"
-+			}
-+			w = &matchfinder.Writer{Dest: &buf, MatchFinder: spec.mf, Encoder: enc, BlockSize: pick(ht, 0, 1, 100, 4096, 65536)}
-+			if Known.shortBlockDropped && spec.dropsShort && w.BlockSize < 20 {
-+				w.BlockSize = 4096 // only the last block may then be short
-+			}
-+			note(ht, "custom Writer %s + %s, block size %d", spec.name, encName, w.BlockSize)
-+			if spec.maxBlock > 0 && w.BlockSize == 0 {
-+				maxWrite = spec.maxBlock
-+			}
-+			if spec.maxBlock > 0 && w.BlockSize > spec.maxBlock {
-+				w.BlockSize = spec.maxBlock
-+			}
++		if c.kind == "custom" && c.custom.finder.maxBlock > 0 && w.BlockSize == 0 {
++			maxWrite = c.custom.finder.maxBlock
 +		}
-+		var data []byte
-+		if Known.flateLongMatchPanics && (kind == "flate" || kind == "gzip") {
-+			// Random bytes have no repeats over 258 bytes.
-+			data = make([]byte, genSize(ht))
-+			r.Read(data)
-+			note(ht, "data: %d random bytes", len(data))
-+		} else {
-+			data = genData(ht, r, genSize(ht))
-+		}
-+		var pieces [][]byte
-+		for _, p := range chunks(r, data, n(ht, 1, 6)) {
-+			for len(p) > maxWrite {
-+				pieces = append(pieces, p[:maxWrite])
-+				p = p[maxWrite:]
-+			}
-+			pieces = append(pieces, p)
-+		}
-+		for _, p := range pieces {
-+			m, err := w.Write(p)
-+			if err != nil || m != len(p) {
-+				fail(ht, "Write(%d bytes) = %d, %v", len(p), m, err)
-+			}
-+		}
++		data := c.dataWritten(c.data).bytes()
++		writeAll(ht, w, data, c.cuts, maxWrite)
 +		if err := w.Close(); err != nil {
-+			fail(ht, "Close: %v", err)
++			mismatch(ht, "Close: %v", err)
 +		}
 +		stream := buf.Bytes()
 +		note(ht, "stream: %d bytes", len(stream))
-+		var got []byte
-+		var err error
-+		switch kind {
-+		case "flate":
-+			got, err = io.ReadAll(flate.NewReader(bytes.NewReader(stream)))
-+		case "gzip":
-+			var zr *gzip.Reader
-+			zr, err = gzip.NewReader(bytes.NewReader(stream))
-+			if err == nil {
-+				got, err = io.ReadAll(zr)
-+			}
-+		default:
-+			got, err = toolDecompress(stream)
-+			if err == nil {
-+				lib, lerr := libDecode(ht, r, stream)
-+				if lerr != nil || !bytes.Equal(lib, data) {
-+					fail(ht, "the Reader decodes the %s writer's stream to %d bytes, %v; want %d", kind, len(lib), lerr, len(data))
-+				}
-+			}
++		kind := c.kind
++		if kind == "v2" || kind == "custom" {
++			kind = "brotli"
 +		}
++		got, err := decodeStream(ht, kind, stream, c.decode, data)
 +		if err != nil {
-+			fail(ht, "the reference decoder rejects the %s writer's stream: %v", kind, err)
++			mismatch(ht, "the reference decoder rejects the %s writer's stream: %v", c.kind, err)
 +		}
 +		if !bytes.Equal(got, data) {
-+			fail(ht, "the %s writer's stream decodes to %d bytes, want %d", kind, len(got), len(data))
++			mismatch(ht, "the %s writer's stream decodes to %d bytes, want %d", c.kind, len(got), len(data))
 +		}
 +		// Reset and reuse.
-+		if chance(ht, 40) {
++		if c.again != nil {
 +			var buf2 bytes.Buffer
 +			w.Reset(&buf2)
-+			var data2 []byte
-+			if Known.flateLongMatchPanics && (kind == "flate" || kind == "gzip") {
-+				data2 = make([]byte, n(ht, 0, 5000))
-+				r.Read(data2)
-+			} else {
-+				data2 = genData(ht, r, n(ht, 0, 5000))
-+			}
-+			for _, p := range chunks(r, data2, n(ht, 1, 3)) {
-+				if _, err := w.Write(p); err != nil {
-+					fail(ht, "Write after Reset: %v", err)
-+				}
-+			}
++			data2 := c.dataWritten(c.again.data).bytes()
++			writeAll(ht, w, data2, c.again.cuts, maxWrite)
 +			if err := w.Close(); err != nil {
-+				fail(ht, "Close after Reset: %v", err)
++				mismatch(ht, "Close after Reset: %v", err)
 +			}
-+			var got2 []byte
-+			var err2 error
-+			switch kind {
-+			case "flate":
-+				got2, err2 = io.ReadAll(flate.NewReader(bytes.NewReader(buf2.Bytes())))
-+			case "gzip":
-+				var zr *gzip.Reader
-+				zr, err2 = gzip.NewReader(bytes.NewReader(buf2.Bytes()))
-+				if err2 == nil {
-+					got2, err2 = io.ReadAll(zr)
-+				}
-+			default:
-+				got2, err2 = toolDecompress(buf2.Bytes())
-+			}
++			got2, err2 := decodeStream(ht, kind, buf2.Bytes(), c.decode, data2)
 +			if err2 != nil || !bytes.Equal(got2, data2) {
-+				fail(ht, "the stream after Reset decodes to %d bytes, %v; want %d", len(got2), err2, len(data2))
++				mismatch(ht, "the stream after Reset decodes to %d bytes, %v; want %d", len(got2), err2, len(data2))
 +			}
 +		}
 +	})
@@ -1389,71 +2606,203 @@ index 0000000..b70a053
 +// ---------------------------------------------------------------------------
 +// Property 7: HTTPCompressor's content negotiation (RFC 9110 section 12.5.3).
 +
++// acceptEntry: one coding of an Accept-Encoding header: as written (its
++// case), its weight as written ("" for none; oddQ: a weight that breaks the
++// grammar, written bare half of the time), and the separator before "q=".
 +type acceptEntry struct {
-+	coding string // as written
-+	q      string // as written, "" for none
-+	weight float64
-+	valid  bool // the entry follows the grammar
++	coding string
++	q      string
++	oddQ   bool
++	bareQ  bool // an odd weight written as "q=" alone
++	sep    string
 +}
 +
-+// genAccept makes Accept-Encoding header values (possibly several lines) and
-+// the entries they contain.
-+func genAccept(ht *hegel.T) ([]string, []acceptEntry) {
-+	var lines []string
-+	var entries []acceptEntry
-+	nLines := pick(ht, 0, 1, 1, 1, 2)
-+	for l := 0; l < nLines; l++ {
-+		k := n(ht, 0, 4)
-+		var parts []string
-+		for i := 0; i < k; i++ {
-+			e := acceptEntry{valid: true, weight: 1}
-+			e.coding = pick(ht, "br", "gzip", "*", "identity", "deflate", "zstd", "br", "gzip", "BR", "Gzip", "x-br")
++// valid reports whether the entry follows the grammar.
++func (e acceptEntry) valid() bool { return !e.oddQ }
++
++// weight is the entry's weight (1 for none).
++func (e acceptEntry) weight() float64 {
++	if e.q == "" {
++		return 1
++	}
++	w, _ := strconv.ParseFloat(e.q, 64)
++	return w
++}
++
++// text renders the entry.
++func (e acceptEntry) text() string {
++	if e.q == "" && !(e.oddQ && e.bareQ) {
++		return e.coding
++	}
++	return e.coding + e.sep + "q=" + e.q
++}
++
++var (
++	codings  = hegel.SampledFrom([]string{"br", "gzip", "*", "identity", "deflate", "zstd", "br", "gzip", "BR", "Gzip", "x-br"})
++	validQs  = hegel.SampledFrom([]string{"0", "1", "0.5", "0.9", "0.001", "0.000", "1.0", "1.000", "0.75", "0.1"})
++	oddQs    = hegel.SampledFrom([]string{"1.5", "2", ".5", "0.1234", "abc", "", "1.001", "-1", "0,5", "01"})
++	qSeps    = hegel.SampledFrom([]string{";", " ;", "; ", " ; "})
++	listSeps = hegel.SampledFrom([]string{",", ", ", " ,", " , ", ",  "})
++)
++
++// weightsOf: an entry's weight: one of the qs, or none.
++func weightsOf(qs hegel.Generator[string]) hegel.Generator[acceptEntry] {
++	return weighted(
++		choice[acceptEntry]{1, hegel.Just(acceptEntry{})},
++		choice[acceptEntry]{1, hegel.Map(qs, func(q string) acceptEntry { return acceptEntry{q: q} })},
++	)
++}
++
++var (
++	// oddWeights: a weight that breaks the grammar.
++	oddWeights = hegel.Composite(func(tc hegel.TestCase) acceptEntry {
++		return acceptEntry{q: hegel.Draw(tc, oddQs), oddQ: true, bareQ: hegel.Draw(tc, chance(50))}
++	})
++	// anyWeights: none (2), valid (2) or odd (1), by weight.
++	anyWeights = weighted(choice[acceptEntry]{4, weightsOf(validQs)}, choice[acceptEntry]{1, oddWeights})
++)
++
++// entriesOf: an entry with one of the codings and one of the weights.
++func entriesOf(coding hegel.Generator[string], weights hegel.Generator[acceptEntry]) hegel.Generator[acceptEntry] {
++	return hegel.Composite(func(tc hegel.TestCase) acceptEntry {
++		e := hegel.Draw(tc, weights)
++		e.coding = hegel.Draw(tc, coding)
++		e.sep = hegel.Draw(tc, qSeps)
++		return e
++	})
++}
++
++// acceptLine: one Accept-Encoding header line: its entries and the separator
++// between them.
++type acceptLine struct {
++	entries []acceptEntry
++	sep     string
++}
++
++// text renders the line (a server trims the whitespace around a field value
++// before a handler sees it, as net/textproto does).
++func (l acceptLine) text() string {
++	parts := make([]string, len(l.entries))
++	for i, e := range l.entries {
++		parts[i] = e.text()
++	}
++	return strings.TrimSpace(strings.Join(parts, l.sep))
++}
++
++// linesOf: a line of lo to hi entries.
++func linesOf(entries hegel.Generator[acceptEntry], lo, hi int) hegel.Generator[acceptLine] {
++	return hegel.Composite(func(tc hegel.TestCase) acceptLine {
++		return acceptLine{entries: hegel.Draw(tc, many(entries, lo, hi)), sep: hegel.Draw(tc, listSeps)}
++	})
++}
++
++// acceptLists: zero to two header lines of up to four entries (one line
++// three times in five).
++var acceptLists = weighted(
++	choice[[]acceptLine]{1, hegel.Just([]acceptLine(nil))},
++	choice[[]acceptLine]{3, many(linesOf(entriesOf(codings, anyWeights), 0, 4), 1, 1)},
++	choice[[]acceptLine]{1, many(linesOf(entriesOf(codings, anyWeights), 0, 4), 2, 2)},
++)
++
++// httpCase: the Accept-Encoding lines of a request, a preset Vary header,
++// the level (or the default helper at level 4), and the body written in
++// pieces.
++type httpCase struct {
++	accept       []acceptLine
++	presetVary   bool
++	level        int
++	defaultLevel bool
++	data         dataSpec
++	cuts         []int
++}
++
++// entries are the entries of every line as the helper sees them: under
++// HEGEL_NO_KNOWN=1 lower-cased (brotli/2), and a "*" beside a listed br or
++// gzip made "identity" (brotli/3).
++func (c httpCase) entries() []acceptEntry {
++	var out []acceptEntry
++	listed := false
++	for _, l := range c.accept {
++		for _, e := range l.entries {
 +			if Known.acceptCaseSensitive {
 +				e.coding = strings.ToLower(e.coding)
 +			}
-+			switch pick(ht, "none", "none", "valid", "valid", "odd") {
-+			case "valid":
-+				e.q = pick(ht, "0", "1", "0.5", "0.9", "0.001", "0.000", "1.0", "1.000", "0.75", "0.1")
-+				e.weight, _ = strconv.ParseFloat(e.q, 64)
-+			case "odd":
-+				e.q = pick(ht, "1.5", "2", ".5", "0.1234", "abc", "", "1.001", "-1", "0,5", "01")
-+				e.valid = false
-+			}
-+			s := e.coding
-+			if e.q != "" || (!e.valid && chance(ht, 50)) {
-+				sep := pick(ht, ";", " ;", "; ", " ; ")
-+				s += sep + "q=" + e.q
-+			}
-+			entries = append(entries, e)
-+			parts = append(parts, s)
-+		}
-+		// A server trims the whitespace around a field value before a
-+		// handler sees it (net/textproto does), so the lines here are trimmed.
-+		line := strings.TrimSpace(strings.Join(parts, pick(ht, ",", ", ", " ,", " , ", ",  ")))
-+		lines = append(lines, line)
-+	}
-+	if Known.starOverridesListed {
-+		// Keep "*" out of headers that also list br or gzip.
-+		listed := false
-+		for _, e := range entries {
-+			c := strings.ToLower(e.coding)
-+			if c == "br" || c == "gzip" {
++			if lc := strings.ToLower(e.coding); lc == "br" || lc == "gzip" {
 +				listed = true
 +			}
++			out = append(out, e)
 +		}
-+		if listed {
-+			for i := range lines {
-+				lines[i] = strings.TrimSpace(strings.Trim(strings.ReplaceAll(strings.ReplaceAll(","+lines[i]+",", "*", "identity"), ",,", ","), ","))
-+			}
-+			for i := range entries {
-+				if entries[i].coding == "*" {
-+					entries[i].coding = "identity"
-+				}
++	}
++	if Known.starOverridesListed && listed {
++		for i := range out {
++			if out[i].coding == "*" {
++				out[i].coding = "identity"
 +			}
 +		}
 +	}
-+	return lines, entries
++	return out
 +}
++
++// lines are the header lines, rendered from the entries.
++func (c httpCase) lines() []string {
++	entries := c.entries()
++	var lines []string
++	for _, l := range c.accept {
++		n := len(l.entries)
++		lines = append(lines, acceptLine{entries: entries[:n], sep: l.sep}.text())
++		entries = entries[n:]
++	}
++	return lines
++}
++
++// effectiveLevel is the level the helper compresses at.
++func (c httpCase) effectiveLevel() int {
++	if c.defaultLevel {
++		return 4
++	}
++	return c.level
++}
++
++func (c httpCase) GoString() string {
++	return fmt.Sprintf("Accept-Encoding %q, level %d (default helper %v), preset Vary %v, body %s in %d writes", c.lines(), c.effectiveLevel(), c.defaultLevel, c.presetVary, c.data.GoString(), len(c.cuts)+1)
++}
++
++// shapes: a br or gzip not in lower case (brotli/2); a "*" beside a listed br
++// or gzip (brotli/3); a level over 9 (brotli/4).
++func (c httpCase) shapes() []string {
++	var upper, star, listed bool
++	for _, e := range c.entries() {
++		lc := strings.ToLower(e.coding)
++		if lc == "br" || lc == "gzip" {
++			listed = true
++			upper = upper || e.coding != lc
++		}
++		star = star || e.coding == "*"
++	}
++	return append(append(
++		shapeIf(upper, "brotli/2"),
++		shapeIf(star && listed, "brotli/3")...),
++		shapeIf(c.effectiveLevel() > 9, "brotli/4")...)
++}
++
++// httpCasesOf: a request with the Accept-Encoding lines and a level.
++func httpCasesOf(accepts hegel.Generator[[]acceptLine], levels hegel.Generator[int], defaultPct int) hegel.Generator[httpCase] {
++	return hegel.Composite(func(tc hegel.TestCase) httpCase {
++		return httpCase{
++			accept:       hegel.Draw(tc, accepts),
++			presetVary:   hegel.Draw(tc, chance(20)),
++			level:        hegel.Draw(tc, levels),
++			defaultLevel: hegel.Draw(tc, chance(defaultPct)),
++			data:         hegel.Draw(tc, smallBlocks),
++			cuts:         hegel.Draw(tc, cutLists(4)),
++		}
++	})
++}
++
++// httpLevels: 0 to 11; under HEGEL_NO_KNOWN=1 0 to 9 (brotli/4).
++var httpLevels = shaped(hegel.Integers(0, 11), hegel.Integers(0, 9))
++
++var httpCases = httpCasesOf(acceptLists, httpLevels, 30)
 +
 +// negotiate is the RFC's choice among the offers br and gzip: an explicit
 +// listing (case-insensitive) sets a coding's weight, "*" sets the weight of
@@ -1466,21 +2815,21 @@ index 0000000..b70a053
 +	weights := map[string]float64{}
 +	star := -1.0
 +	for _, e := range entries {
-+		if !e.valid {
++		if !e.valid() {
 +			return "", false
 +		}
 +		c := strings.ToLower(e.coding)
 +		if c == "*" {
-+			if star >= 0 && star != e.weight {
++			if star >= 0 && star != e.weight() {
 +				return "", false
 +			}
-+			star = e.weight
++			star = e.weight()
 +			continue
 +		}
-+		if q, dup := weights[c]; dup && q != e.weight {
++		if q, dup := weights[c]; dup && q != e.weight() {
 +			return "", false
 +		}
-+		weights[c] = e.weight
++		weights[c] = e.weight()
 +	}
 +	best, bestQ := "", 0.0
 +	for _, offer := range []string{"br", "gzip"} {
@@ -1498,70 +2847,70 @@ index 0000000..b70a053
 +	return best, true
 +}
 +
++// checkNegotiation runs the request through the helper and checks the
++// Content-Encoding against the RFC's choice, the Vary header, and that the
++// body decodes with the coding announced.
++func checkNegotiation(ht *hegel.T, c httpCase) {
++	lines := c.lines()
++	req := httptest.NewRequest("GET", "/", nil)
++	for _, l := range lines {
++		req.Header.Add("Accept-Encoding", l)
++	}
++	rec := httptest.NewRecorder()
++	if c.presetVary {
++		rec.Header().Set("Vary", "Cookie")
++	}
++	var wc io.WriteCloser
++	if c.defaultLevel {
++		wc = brotli.HTTPCompressor(rec, req)
++	} else {
++		wc = brotli.HTTPCompressorWithLevel(rec, req, c.level)
++	}
++	data := c.data.bytes()
++	for _, p := range cutsOf(data, c.cuts) {
++		if _, err := wc.Write(p); err != nil {
++			mismatch(ht, "Write: %v", err)
++		}
++	}
++	if err := wc.Close(); err != nil {
++		mismatch(ht, "Close: %v", err)
++	}
++	enc := rec.Header().Get("Content-Encoding")
++	if want, ok := negotiate(c.entries()); ok && enc != want {
++		mismatch(ht, "Content-Encoding %q for Accept-Encoding %q, want %q", enc, lines, want)
++	}
++	if vary := rec.Header().Get("Vary"); (c.presetVary && vary != "Cookie") || (!c.presetVary && vary != "Accept-Encoding") {
++		mismatch(ht, "Vary = %q (preset %v)", vary, c.presetVary)
++	}
++	body := rec.Body.Bytes()
++	var got []byte
++	var err error
++	switch enc {
++	case "br":
++		got, err = toolDecompress(body)
++	case "gzip":
++		var zr *gzip.Reader
++		zr, err = gzip.NewReader(bytes.NewReader(body))
++		if err == nil {
++			got, err = io.ReadAll(zr)
++		}
++	case "":
++		got = body
++	default:
++		mismatch(ht, "Content-Encoding %q is neither offer", enc)
++	}
++	if err != nil {
++		mismatch(ht, "the %q body does not decode: %v", enc, err)
++	}
++	if !bytes.Equal(got, data) {
++		mismatch(ht, "the %q body decodes to %d bytes, want %d", enc, len(got), len(data))
++	}
++}
++
 +func TestHegelHTTPCompressorNegotiates(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		r := prng(ht)
-+		lines, entries := genAccept(ht)
-+		req := httptest.NewRequest("GET", "/", nil)
-+		for _, l := range lines {
-+			req.Header.Add("Accept-Encoding", l)
-+		}
-+		note(ht, "Accept-Encoding: %q", lines)
-+		rec := httptest.NewRecorder()
-+		presetVary := chance(ht, 20)
-+		if presetVary {
-+			rec.Header().Set("Vary", "Cookie")
-+		}
-+		level := n(ht, 0, 11)
-+		if Known.gzipLevelOverNine {
-+			level = n(ht, 0, 9)
-+		}
-+		var wc io.WriteCloser
-+		if chance(ht, 30) {
-+			level = 4
-+			wc = brotli.HTTPCompressor(rec, req)
-+		} else {
-+			wc = brotli.HTTPCompressorWithLevel(rec, req, level)
-+		}
-+		note(ht, "level %d", level)
-+		data := genData(ht, r, n(ht, 0, 3000))
-+		for _, p := range chunks(r, data, n(ht, 1, 4)) {
-+			if _, err := wc.Write(p); err != nil {
-+				fail(ht, "Write: %v", err)
-+			}
-+		}
-+		if err := wc.Close(); err != nil {
-+			fail(ht, "Close: %v", err)
-+		}
-+		enc := rec.Header().Get("Content-Encoding")
-+		if want, ok := negotiate(entries); ok && enc != want {
-+			fail(ht, "Content-Encoding %q for Accept-Encoding %q, want %q", enc, lines, want)
-+		}
-+		if vary := rec.Header().Get("Vary"); (presetVary && vary != "Cookie") || (!presetVary && vary != "Accept-Encoding") {
-+			fail(ht, "Vary = %q (preset %v)", vary, presetVary)
-+		}
-+		body := rec.Body.Bytes()
-+		var got []byte
-+		var err error
-+		switch enc {
-+		case "br":
-+			got, err = toolDecompress(body)
-+		case "gzip":
-+			var zr *gzip.Reader
-+			zr, err = gzip.NewReader(bytes.NewReader(body))
-+			if err == nil {
-+				got, err = io.ReadAll(zr)
-+			}
-+		case "":
-+			got = body
-+		default:
-+			fail(ht, "Content-Encoding %q is neither offer", enc)
-+		}
-+		if err != nil {
-+			fail(ht, "the %q body does not decode: %v", enc, err)
-+		}
-+		if !bytes.Equal(got, data) {
-+			fail(ht, "the %q body decodes to %d bytes, want %d", enc, len(got), len(data))
-+		}
++		c := hegel.Draw(ht, httpCases)
++		begin(c)
++		checkNegotiation(ht, c)
 +	})
 +}

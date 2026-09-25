@@ -57,14 +57,32 @@ in go.mod.
 | MatchfinderWritersRoundTrip | `NewWriterV2` (levels −1–12), `flate.NewWriter`, `NewGZIPWriter` and `matchfinder.Writer`s assembled from a random finder, `Encoder` or `FastEncoder` and block size (0–65 536), fed in chunks: the stream decodes with the reference decoders and the `Reader`; Reset and reuse |
 | HTTPCompressorNegotiates | generated Accept-Encoding headers (zero to two lines of up to four codings among br, gzip, `*`, identity, deflate, zstd and others, in either case, with valid, absent or malformed weights, random separators) at levels 0–11 with and without a preset Vary: Content-Encoding is the RFC's choice, Vary is set unless preset, the body decodes with the announced coding |
 
-`Known` switches gate the eight recorded bugs (the generators avoid the shapes: flate matches
-no longer than 258 bytes and random data for the flate writers, lowercase codings, no `*`
-beside a listed br or gzip, levels up to 9 for the HTTP helper, an empty `dst` for M4,
-matches of at least four bytes for `FastEncoder` and no Bargain finder in front of it, no Reset check after trailing data, no
-block under 20 bytes before another for Trio and ZM). With them on, the seven properties run
-clean at 1000 cases in under a minute, most of it the tool's round trips (`BROTLI_COLLECT=1` records mismatches instead of failing and
-prints them shortest-first with the case's description; `HEGEL_VERBOSE=1` turns on the
-engine's log).
+## Known bugs
+
+The generators draw the shape of every recorded bug (STYLE.md rule 11), so five of the wide
+properties are expected failures mapped to the bug they land on: DamagedStreams on brotli/7
+(the Reset check after trailing bytes), MatchFindersAreValidLZ77 on brotli/5 (M4 with an
+accumulated `dst`; brotli/8 in some runs, a pass in others: intermittent),
+EncodersAcceptAnyMatches on brotli/6 (two- and three-byte matches into `FastEncoder`; on
+brotli/1 nearly as often), MatchfinderWritersRoundTrip on brotli/1 (flate matches over 258
+bytes) and HTTPCompressorNegotiates on brotli/2 (mixed-case codings; brotli/4 now and then).
+Three of the eight bugs surface as panics, which the harness recovers and names. Each bug also
+has a narrow property over its own shape region in `hegel_shapes_test.go`, the deterministic
+expected failure beside the pin: `TestHegelFlateWritersSplitLongMatches` (brotli/1),
+`TestHegelContentCodingsMatchInAnyCase` (/2), `TestHegelStarDoesNotOutweighAListedBr` (/3),
+`TestHegelGzipOnlyClientsGetGzipAtHighLevels` (/4),
+`TestHegelMatchFindersIgnoreThePreviousMatchesInDst` (/5),
+`TestHegelFastEncoderEncodesTwoAndThreeByteMatches` (/6),
+`TestHegelReaderResetRecoversFromTrailingBytes` (/7) and
+`TestHegelShortBlocksStayInTheFindersHistory` (/8). `HEGEL_NO_KNOWN=1` (read once) switches
+the shapes off: flate matches no longer than 258 bytes and random data for the flate writers,
+lowercase codings, no `*` beside a listed br or gzip, levels up to 9 for the HTTP helper, an
+empty `dst` for M4, matches of at least four bytes for `FastEncoder` and no Bargain finder in
+front of it, no block under 20 bytes before another for Trio and ZM, and the Reset check after
+trailing data skipped (11.6 % of the damaged streams, too many for an assume); every property
+then passes at 1000 cases in under a minute, most of it the tool's round trips.
+`BROTLI_COLLECT=1` records mismatches instead of failing and prints them shortest-first with
+the case's description; `HEGEL_VERBOSE=1` turns on the engine's log.
 
 ## Bugs (8; details in bugs.toml)
 
