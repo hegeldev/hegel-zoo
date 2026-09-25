@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -803,3 +803,23 @@ of the subagent's runs passed once in the reviewer's (semver4j's fluent property
 `intermittent` is earned by observation, never by argument; and where the library panics inside
 a drawn call, the property has to recover the panic itself for the failure to be attributed to a
 shape (termenv's `catching`).
+
+The thirty-third batch (turn 488: gofrs-uuid, bitset, go-version and uuid rewritten straight to
+the standard, javaparser unsteered; 47 narrow properties) was mostly quiet, which is the point
+of the template by now, and its lessons are about what a title asserts. Bug 17 of javaparser
+said `x * this::m` was a parse error; a probe of that claim with the library and javac's tree
+API, made to name the narrow property's region precisely, showed the text is accepted and parsed
+as `(x * this)::m` - a wrong tree that no rejection check can see, recorded as javaparser/23
+with a pin, a narrow property and a right-operand shape in the wide generators, and bug 17's
+title corrected. A bug's title is a claim about the library like any other and is checked
+before a property is built on it. Two more model gaps were found by the freed generators
+rather than by the library (go-version compared numeric identifiers by length, so leading zeros
+could never mismatch; its `~> 1` was unbounded in the model as in the library), a reminder that
+a model written beside a gate often shares the gate's assumption. Three wide properties were
+declared intermittent after passing once in the reviewer's rounds (bitset's ExtractAndDeposit at
+100 cases, go-version's malformed and constraint properties at 3-4% of cases), and a race
+property (uuid/1) stays intermittent on a two-core machine whatever its rounds, with hegel-go
+printing no failure line when the shrunk case's final replay passes. Java targets of
+javaparser's size verify at 1000 cases in four to nine minutes and 3000 does not fit a
+ten-minute command; the impossible headers of bitset/7 are drawn from 2^52 up because 2^51 is a
+fatal out-of-memory rather than a recoverable panic.
