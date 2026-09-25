@@ -27,10 +27,13 @@ require consistency between the paths that should agree (typed function, `ToE[T]
   (truncated toward zero) when it fits the target, an error for negative values into unsigned
   types, the plain variant the same value or zero, and `ToE[T]`/`ToNumberE[T]` agree; floats
   follow `strconv.ParseFloat` for text and Go conversion otherwise. Out-of-range values are
-  pinned (/1, /2) and only noted.
+  drawn too, so the property lands on cast/1 (the text ones are cast/2's region).
 - `TestHegelMalformedTextIsRefused` — words, doubled signs, exponents, blanks, units, hex
   floats, non-ASCII digits, random ASCII: every integer conversion errors with a zero result;
-  the float conversions follow `strconv`'s verdict.
+  the float conversions follow `strconv`'s verdict; decimals such as `"1."` and `".5"` get
+  cast's documented reading (the integer part). The `.` family (cast/4), base prefixes
+  (cast/3) and doubled signs (cast/10) are in the pool, so the property lands on cast/4 in
+  most runs (about 3 % of cases; intermittent).
 - `TestHegelToStringRoundTrips` — `ToString` of every integer width, floats (no exponent
   notation, shortest repr), bools, durations and times (UTC and named fixed zones) reads back
   with the matching conversion; bare-number strings are nanoseconds for `ToDuration`.
@@ -40,26 +43,41 @@ require consistency between the paths that should agree (typed function, `ToE[T]
   the zone-name-only layouts, by design) give the wall clock in the default location; time-only
   layouts give year 0 in UTC; two-digit years follow Go's 69/68 rule; fractional seconds appended
   to a seconds field are accepted; `ToTimeE`, `ToE[time.Time]` and `StringToDate` agree.
-- `TestHegelIntegersAreUnixSeconds` — `int`, `int32`, `int64`, `uint32`, `uint64` and
+  RubyDate texts with an offset under an hour are drawn, so the property lands on cast/5
+  (about 1 % of cases; intermittent).
+- `TestHegelIntegersAreUnixSeconds` — every integer kind, named integer types, floats and
   `json.Number` inputs are Unix seconds; `time.Time` is returned as is; `nil` is the zero time.
+  Lands on cast/9 (the narrow kinds).
 - `TestHegelSlicesConvertElementWise` — `[]any`, typed slices and arrays of convertible scalars
   through every `ToXxxSliceE`; an unconvertible element is an error and a nil plain result; a
   string splits on white space; a scalar is a one-element string slice.
 - `TestHegelMapsConvertValueWise` — the same data as `map[string]any`, `map[any]any`,
   `map[any]string`, `map[string]int64`, `map[string]string` and JSON text through
   `ToStringMapIntE`/`Int64E`/`StringE`/`BoolE`/`ToStringMapE`, with keys stringified; the
-  reflect path reports an unconvertible value.
+  reflect path reports an unconvertible value. Lands on cast/12 (cast/7 and cast/11 are in
+  its region too).
 - `TestHegelStringSliceMapsKeepValuesWhole` — `ToStringMapStringSliceE` stringifies slice values
   element-wise and wraps scalars, for `map[string]any`, `map[any]any` and `map[string][]any`.
+  Lands on cast/8.
 
-The generators avoid the pinned shapes and say where: out-of-range values (/1, /2), leading
-zeros and base prefixes (/3), `.`/`-.`/`+.` (/4), RubyDate strings with offsets under an hour
-(/5), fractional `json.Number`s into bools (/6), unconvertible values in `map[string]any`/`map[any]any`
-(/7), string values with blanks in `map[any]…` string-slice maps (/8), `ToTime` of the narrow
-and named integer kinds (/9), doubled plus signs (/10), integer maps from `map[any]string` (/11),
-`ToStringMapE`/`StringE`/`BoolE` of maps with other value types (/12). All eight pass at 1000
-cases (under a second). `CAST_COLLECT=1` makes the properties record mismatches instead of
-failing and print them shortest-first.
+## Known bugs
+
+The generators draw the shape of every recorded bug (STYLE.md rule 11): the properties above
+are the expected failures mapped to the bugs they land on, and each bug also has a narrow
+property over its own shape region, the deterministic expected failure beside the pin:
+`TestHegelNumbersBeyondTheTargetAreErrors` (cast/1), `TestHegelTextsBeyondTheTargetAreErrors`
+(/2), `TestHegelZeroPaddedTextsAreDecimal` (/3), `TestHegelBareDotIsRefused` (/4),
+`TestHegelRubyDateTextsKeepTheirOffset` (/5), `TestHegelJSONNumberBoolsFollowTheValue` (/6),
+`TestHegelAnyValuedMapsReportValueErrors` (/7), `TestHegelAnyKeyedMapsKeepStringValuesWhole`
+(/8), `TestHegelNarrowIntegerKindsAreUnixSeconds` (/9), `TestHegelDoubledPlusIsRefused` (/10),
+`TestHegelIntegerMapsFromAnyKeyedMapsDoNotPanic` (/11, the panic is caught and named) and
+`TestHegelStringMapsAcceptOtherValueTypes` (/12). `HEGEL_NO_KNOWN=1` (read once) switches the
+known shapes off: out-of-range values, leading zeros and base prefixes, the `.` family, doubled
+signs and the narrow RubyDate offsets leave the generators, and the sub-checks that only a
+recorded bug can fail (out-of-range integers, `json.Number` bools, the `map[any]…` and
+other-value-type map paths) are skipped by name; every property then passes at 3000 cases.
+`CAST_COLLECT=1` makes the properties record mismatches instead of failing and print them
+shortest-first.
 
 ## Bugs (12; details in bugs.toml)
 
@@ -79,8 +97,8 @@ failing and print them shortest-first.
 | cast/12 | `ToStringMapE(map[string]string)`, `ToStringMapStringE(map[string]int)` are "unable to cast" | low |
 
 How they were found: /1, /2, /3, /6, /7, /8, /9, /10 and /12 from reading `number.go`,
-`time.go` and `map.go` while writing the models (each confirmed by its pin before the property
-was made to avoid it); /4 by the malformed-text property's first run (`"."` → 0); /5 by the
+`time.go` and `map.go` while writing the models (each confirmed by its pin; the properties
+draw the shapes since 2026-09-25); /4 by the malformed-text property's first run (`"."` → 0); /5 by the
 layout round-trip property (`"Mon Feb 08 19:19:01 +0000 1971"` came back with the default
 location's offset), then narrowed with a probe of which layout claims each layout's output and
 a look at Go's `parseSignedOffset`; /11 by the map property's first run (a panic on
