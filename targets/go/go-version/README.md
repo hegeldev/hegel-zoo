@@ -34,34 +34,42 @@ settles the one case the table leaves out (`~> 1`).
   int64, build identifiers: the canonical text and a loose spelling (segments as written,
   zero-padded, `v` prefix, hyphen-less letter-first pre-release) parse to the same segments
   (padded to three), pre-release and metadata, with `Original` the input and `String` the
-  canonical form; `NewSemver` accepts the canonical three-segment text and refuses the
-  hyphen-less one; `Must`, `Core`, `MarshalText`/`UnmarshalText`, `Value`/`Scan(string)`,
-  `NewVersion(String())` and `WithPrefix` (six prefixes; a missing prefix is an error) agree.
+  canonical form; `NewSemver` accepts the canonical three-segment text and refuses every
+  loose spelling; `Must`, `Core`, `MarshalText`/`UnmarshalText`, `Value`/`Scan` (strings and
+  bytes), `NewVersion(String())` and `WithPrefix` (six prefixes; a missing prefix is an error)
+  agree. Finds /4 (and /7).
 - `TestHegelMalformedVersionsAreRefused` — twelve mutations (empty, surrounding blanks, `V`
   prefix, empty segment, empty pre-release or build identifier, an invalid or non-ASCII
   character anywhere, a sign, a segment beyond int64, a second `+`, trailing `+` or `.`):
   `NewVersion`, `NewSemver`, `UnmarshalText` and `Scan` refuse with a nil result; `Must` panics.
+  Finds /6 (3% of its cases put the empty identifier first).
 - `TestHegelPrecedenceFollowsSemver` — pairs of related versions (shared or neighbouring
   segments, the same value with more or fewer trailing zeros, derived pre-releases, different
   metadata): `Compare` and the five comparison methods agree with the model both ways;
-  `sort.Sort(Collection)` orders 2–6 related versions as the model does.
+  `sort.Sort(Collection)` orders 2–6 related versions as the model does. Finds /1 (and /2, /3).
 - `TestHegelConstraintsFollowTheirRules` — one to three comparators with every operator
   (including the bare version), versions of one to four segments with optional pre-release,
   `v` prefix and zero padding, random blanks: `Check` of the whole and of each `Constraint`
   matches the model, `Prerelease()` and `String()` of each constraint are right, the printed
   constraints read back with the same verdict and are `Equals` to the original, and a
   re-spaced, reordered spelling with `=` for the bare operator is `Equals` too and checks the
-  same.
+  same. Finds /5 (and /2, /8, /1) in about 4% of its cases, so it is mapped intermittent.
 
-The generators avoid the pinned shapes and say where: pre-release pairs where one is a proper
-prefix of the other followed by an alphanumeric identifier (/1); a pre-release on either side
-with a different segment count of equal value (/2); leading zeros in numeric identifiers (/3);
-`NewSemver` is only fed canonical three-segment texts (/4); `~>` gets at least two segments
-(/5) and versions with at least as many segments as the constraint when equal (/8); the
-malformed-text generator never places the empty identifier first (/6); `Scan` is given
-strings (/7). All four pass at 20 000 cases (about 9 s); the default 100 cases take under a
-second. `GO_VERSION_COLLECT=1` makes the properties record mismatches instead of failing and
-print them shortest-first.
+The generators draw the shapes of the eight recorded bugs and the properties that meet them
+are the expected failures mapped to the bugs (STYLE.md rule 11); every mismatch names the shape
+it has. One narrow property per bug in `hegel_shapes_test.go` draws the bug's shape region with
+random contents and fails every run: `PrereleasePrefixSortsLower` (/1, a pre-release that is a
+proper prefix of the other followed by an alphanumeric identifier),
+`PrereleaseCountsAcrossSegmentCounts` (/2, equal values of different segment counts, a
+pre-release on one side), `LeadingZeroIdentifiersCompareNumerically` (/3),
+`NewSemverRefusesLooseSpellings` (/4), `PessimisticSingleSegmentStaysInMajor` (/5, `~>` with
+one segment), `EmptyLeadingIdentifierIsRefused` (/6), `ScanReadsBytes` (/7) and
+`PessimisticMatchesShorterEqualVersion` (/8). `HEGEL_NO_KNOWN=1` switches the shapes off: the
+generators draw the neighbouring regions (the same value written with the base's segment
+count, `Scan` of strings, `~>` with two segments or more, no leading zeros) and all twelve
+properties pass; the parse property then skips only its `NewSemver` refusal check on loose
+spellings, which are half of its cases. `GO_VERSION_COLLECT=1` makes the properties record
+mismatches instead of failing and print them shortest-first.
 
 ## Bugs (8; details in bugs.toml)
 
