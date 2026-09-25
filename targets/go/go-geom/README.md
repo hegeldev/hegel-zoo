@@ -9,11 +9,12 @@ GeoJSON codecs and an `xy` package of planar algorithms. Pinned at
 
 ## Build
 
-The patch adds `go.mod` changes and four test files: `hegel_test.go`
-(plumbing, the `Known` gates), `hegel_gen_test.go` (random geometries,
-structural equality bit for bit, model encoders for WKT, WKB, EWKB and
-GeoJSON, exact-arithmetic helpers), `hegel_props_test.go` (nine
-properties) and `hegel_pins_test.go` (six pins). No external tool is
+The patch adds `go.mod` changes and five test files: `hegel_test.go`
+(plumbing, the `noKnown` switch), `hegel_gen_test.go` (combinator-built
+random geometries, structural equality bit for bit, model encoders for WKT,
+WKB, EWKB and GeoJSON, exact-arithmetic helpers), `hegel_props_test.go`
+(nine wide properties), `hegel_shapes_test.go` (one narrow property per
+recorded bug) and `hegel_pins_test.go` (six pins). No external tool is
 needed. The whole run takes well under a second at the default case count;
 `HEGEL_TEST_CASES=2000` about 3 s.
 
@@ -60,6 +61,27 @@ needed. The whole run takes well under a second at the default case count;
 | `TestHegelAlgorithmsMatchModels` | convex hull, point in ring, centroids, point-segment distance, Douglas-Peucker against exact models |
 | `TestHegelStructuralIdentities` | Coords/SetCoords, Clone, Reverse, Bounds union, collection layout |
 
+## Known bugs
+
+The properties draw the shapes of the recorded bugs by default and are the
+expected failures mapped to them in `target.toml` (STYLE.md rule 11); the
+pins are the regression examples. One narrow property per bug is the
+deterministic finder: `TestHegelNestedCollectionBoundsDoNotPanic` (/1),
+`TestHegelGeoJSONEmptyMultiPointMembersRoundTrip` (/2),
+`TestHegelGeoJSONEmptyFirstMemberRoundTrips` (/3),
+`TestHegelWKTMixedLayoutCollectionRoundTrips` (/4),
+`TestHegelConvexHullOfFewDistinctPoints` (/5) and
+`TestHegelConvexHullOfManyPointsKeepsExtremes` (/6). The wide properties
+reach the bugs at their natural rates: `TestHegelGeoJSONMatchesModelAndRoundTrips`
+lands on /2 every run; `TestHegelWKTRoundTripsAndMatchesModel` (/4),
+`TestHegelCodecsAgree` (/2), `TestHegelAlgorithmsMatchModels` (/5, sometimes
+/6) and `TestHegelStructuralIdentities` (/1) are mapped intermittent since
+each has been seen to pass a 100-case run. `HEGEL_NO_KNOWN=1` (read once)
+switches the known shapes off: mixed layouts leave the WKT grammar, empty
+MultiPoint members and empty-first Z/M members leave the GeoJSON grammars,
+the Bounds checks skip nested collections, and the hull is checked for 3 to
+50 input points with at least 3 distinct; then every property passes.
+
 ## Bugs
 
 | Id | Pin | Summary |
@@ -93,8 +115,15 @@ needed. The whole run takes well under a second at the default case count;
   component and is not generated for WKT.
 - `xy.ConvexHull` returns the extreme points only (collinear boundary points
   removed), a LineString for two distinct or collinear points; the model
-  does the same. While go-geom/5 and /6 are open the hull is checked for 3
-  to 50 input points with at least 3 distinct.
+  does the same. Under `HEGEL_NO_KNOWN=1` the hull is checked for 3 to 50
+  input points with at least 3 distinct (go-geom/5 and /6 live outside).
 - `Bounds.IsEmpty` is true for a collection of mixed layouts whose extra
   dimension no member fills (a `FIXME` in `GeometryCollection.Bounds`);
   checked only for collections of one layout.
+
+## History
+
+- 2026-09-25: generators rewritten in combinator style (STYLE.md); the
+  properties draw the known shapes by default and are the expected
+  failures, with a narrow property per bug in `hegel_shapes_test.go`;
+  `HEGEL_NO_KNOWN=1` switches the shapes off.
