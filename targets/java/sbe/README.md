@@ -59,32 +59,54 @@ custom ranges and null values, constants, deprecated and versioned members, tric
    pruned to v (members with `sinceVersion > v` removed) gives the old IR from which a message is
    encoded; the current schema's `JsonPrinter` must show the old values plus defaults for everything added
    after v (`addDefaults`), and the current DTO must decode it (acting version v) and re-encode it as a
-   current message that prints the same. Where the message has no groups, upstream's
-   `SchemaTransformerFactory("*:v")` must give the same message tokens as the pruned XML.
+   current message that prints the same. Upstream's `SchemaTransformerFactory("*:v")` must give the
+   same message tokens as the pruned XML, offsets included.
+7. One narrow property per recorded bug, a generator over the bug's shape region with random contents
+   (schemas without uint64 fields, so each shrinks to its own bug), judged by the oracles above:
+   `largeUint64ValuesPrintUnsigned` (1), `bigEndianSetsPrintTheirChoices` (2),
+   `olderMessagesPrintWithoutLaterComposites` (3), `olderMessagesDecodeIntoDtosWithLaterComposites` (4),
+   `goFlyweightSetsReadTheirWholeRawValue` (5: every set type's generated Go `RawValue()` must read the
+   set's whole width), `javaCodecsCompileWithGroupsNamedLikeTheirTypes` (6),
+   `transformerAgreesWithPruningOnGroups` (7), `dtosReencodeLaterArraysAsNulls` (8),
+   `laterSetsPrintNoChoicesOnOlderMessages` (9), `constantEnumTrailersPrintFromExactBuffers` (10).
 
 `SbePinsTest` holds one pin per recorded bug; each asserts the correct behaviour on a minimal schema and is
 listed in `[expected_failures]`.
 
-## What the generator avoids
+## What the generators draw
 
-- Parser rules found by running: `nullValue` only with `presence="optional"`; enum `encodingType` in
-  {char, uint8, int8, int16, uint16, int32}; `numInGroup` uint8/uint16; `semanticType` not differing
+The generators draw every recorded bug's shape by default (STYLE.md rule 11) and the properties fail on
+them: the wide ones are listed in `[expected_failures]` mapped to the bug they shrink to
+(`printerShowsTheEncodedValues` to sbe/1, in a quarter of the runs landing on sbe/2's big-endian set;
+`olderMessagesDecodeWithNewerCodecs` to sbe/9, sometimes on sbe/7's stale var-data offset;
+`javaDtosRoundTrip` to sbe/6 intermittently, a `type` group colliding with a `Type<n>` in one case in a
+few hundred), the narrow ones every run. `SbePinsTest` keeps one pin per bug as the regression example.
+
+- uint64 fields span 0..2^64-2 and the model expects the unsigned value the printer should show (sbe/1);
+  bit sets are encoded trusting the IR, in the `BEGIN_SET` token's byte order, so big-endian schemas
+  with multi-byte sets print wrongly (sbe/2; the codec round trips encode per schema, since a
+  token-order message is invalid input for them).
+- A group drawn as `type` is named after the first set or composite type among its fields (`type0` for
+  `Type0`; sbe/6).
+- In the evolution property the acting version keeps only the composite *members* present (composite
+  fields added later are drawn; sbe/3, sbe/4), the message buffer is exactly the message (sbe/10, also
+  for the printer properties), the transformer is compared on every message with offsets unmasked
+  (sbe/7), and the DTO route expects nulls for not-present optional arrays (sbe/8) and no choices for a
+  not-present set on the printer route (sbe/9).
+- `HEGEL_NO_KNOWN=1` (read once into `Zoo.NO_KNOWN`) switches the shapes off for a run past the known
+  bugs: uint64 values stay within `long`, sets are written in the schema's order, every composite field
+  is present at the acting version, buffers get eight bytes of slack, the transformer is compared on
+  group-free messages with offsets masked, zeros and all-true are expected, `type` groups are renamed
+  `member<id>`, the Go check judges 8-bit sets and the sbe/3-4 region takes a version-0 composite; every
+  property then passes.
+- Parser rules found by running are kept: `nullValue` only with `presence="optional"`; enum `encodingType`
+  in {char, uint8, int8, int16, uint16, int32}; `numInGroup` uint8/uint16; `semanticType` not differing
   between a type and its field; fields with `sinceVersion` are optional and sorted after earlier ones;
   var data with `sinceVersion` only at message level (the C# generator refuses "Cannot extend var data
   inside a group"); constant chars from a safe alphabet, no `"` or control characters in attributes.
-- Groups are never named `type<n>` (bug sbe/6: a group named like a type used inside it does not compile).
-- The model writes bit sets (and enum null values) in the schema's byte order rather than the set token's
-  (bug sbe/2), and records uint64 values as the signed longs the printer shows (bug sbe/1).
-- In the evolution property the acting version is chosen so that every composite field, and every composite
-  member, of the message is present (bugs sbe/3 and sbe/4; the parser cannot express members newer than the
-  schema), the older schema is derived by pruning the XML rather than by upstream's transformer (bug sbe/7,
-  whose var-data offsets are also stale), and the DTO route expects zeros for not-present optional numeric
-  arrays (bug sbe/8); a not-present set is expected with all choices true on the printer route (bug sbe/9).
-- Messages are printed from a buffer with eight bytes of slack (bug sbe/10: a trailing constant enum field makes
-  the printer read past the message); float constants and null values are expected as the printer shows them,
-  widened to double (1.0E-10 prints as 1.000000013351432E-10).
-- Only valid values and choices with `sinceVersion <= actingVersion` are written; UTF-8 var data is valid
-  UTF-8 within the type's `maxValue`.
+- Float constants and null values are expected as the printer shows them, widened to double (1.0E-10
+  prints as 1.000000013351432E-10). Only valid values and choices with `sinceVersion <= actingVersion`
+  are written; UTF-8 var data is valid UTF-8 within the type's `maxValue`.
 
 ## Not tested
 
@@ -131,3 +153,8 @@ behaviour; `IrDecoder` on hand-crafted IR frames.
 
 - 2026-09-16: created (turn 177) at 89bb53644fad (1.41.0-SNAPSHOT of 2026-09-09); 10 bugs.
 - 2026-09-17: base bumped 89bb53644fad → 1c38f620763e (2026-09-17, "post release bump"; 1.41.0-SNAPSHOT); 10 bug(s) still reproduce. 6 tests pass.
+- 2026-09-25: unsteered under rule 11: the known-bug gates run only under `HEGEL_NO_KNOWN=1`, ten narrow
+  properties added; two latent test bugs fixed (`minimumActingVersion` read composite members' versions
+  from the IR tokens, where the IR raises them to the field's, so the sbe/3-4 region had rejected every
+  case; a compile error of the generated Java NPE'd instead of being reported). 3 tests pass, 22-23
+  expected failures.
