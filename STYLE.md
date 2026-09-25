@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -781,3 +781,25 @@ like the library's, and now lower-cases under `ignoreHeaderCase`); a wide proper
 only after enough runs - miekg-dns's `TruncateFits` failed seventeen runs for the subagent and
 passed one of eight for the reviewer, and is intermittent; and Java's `--show-failures` prints
 only unexpected failures, so a Java target's shapes are read from the surefire reports.
+
+The thirty-second batch (turn 487: mapstructure and termenv rewritten straight to the standard,
+jackson-yaml, semver4j and sbe unsteered; 48 narrow properties) added two lessons about the
+tests' own tooling. Escapes do not survive every editor: jackson-yaml's pool of NEL strings had
+been written as `"\u0085"` and reached the file as an empty string, because the tool that wrote
+it decoded the escape, so bug 1's shape had never been drawn and the test passed on it for a
+week - a literal that matters is checked with `od -c` after writing, and a generator whose shape
+is a single character is worth a probe that prints what it drew. And an `assume` that rejects
+every case is silent in hegel-java (sbe's evolution region computed the acting version from the
+IR tokens, whose member versions are raised to the field's, rejected every on-shape case and
+passed vacuously; Hegel's filter-too-much check did not trip), so a region's acceptance rate is
+measured before it is trusted, in every binding. Freed generators again found what the gates had
+hidden: semver4j desugars partial and x-range upper bounds without node-semver's `-0` (`<0.1` is
+`<0.1.0`, node `<0.1.0-0`), a difference visible only when the set also names a pre-release of
+the excluded version, met about twice in 100 000 cases by the wide property and recorded as
+semver4j/13 with a narrow property that meets it every time; jackson-yaml's met an engine-side
+defect (snakeyaml-engine folds a NEL inside a single-quoted scalar it wrote itself), listed among
+the engine's defects rather than recorded. Also seen: a wide property that had failed every one
+of the subagent's runs passed once in the reviewer's (semver4j's fluent property), so
+`intermittent` is earned by observation, never by argument; and where the library panics inside
+a drawn call, the property has to recover the panic itself for the failure to be attributed to a
+shape (termenv's `catching`).
