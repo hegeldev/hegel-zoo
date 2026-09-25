@@ -47,14 +47,31 @@ random contents through the same oracle and fails every run; the pins stay as re
 `HEGEL_NO_KNOWN=1` leaves the shapes out of the generators (brackets stripped from a container's last
 string, plain whitespace after numbers, no adjacent or `/`-leading comments, no ellipsis after a dropped
 or leading comma, Buffer chunks cut at code points, ...), skips the mismatch that still has one (under
-2% of cases per property) and registers the narrow properties skipped. Ten more library bugs reproduced
-during the unsteering but not yet recorded are skipped behind `candidate/typescript/jsonrepair-1..10`
-gates in `hegel/known.mjs`, to be recorded with pins and properties of their own.
+2% of cases per property) and registers the narrow properties skipped. The nine bugs the unsteering found
+(23-31) are drawn the same way: an unquoted `undefined` key, entity-encoded control characters and a
+comment before a fence at a small rate by default, and under `HEGEL_NO_KNOWN=1` the unquoted
+`undefined` key, the escaped wrapper with a missing comma or an empty string, the missing colon before
+a bracket-leading string and an NDJSON document starting with `.` or `$` (jsonrepair/18's gap) are left
+out.
 
 ## Bugs
 
-22 open, all pinned and each found by a property of its own (see `bugs.toml`). Under
+31 open, all pinned and each found by a property of its own (see `bugs.toml`). Under
 `HEGEL_NO_KNOWN=1`, 5000-case sweeps of every property had no mismatch.
+
+Nine (23-31) came out of unsteering the generators: shapes the gated generators had never drawn.
+`jsonrepairTransform` pushes its output in pieces of `chunkSize` UTF-16 units, so a surrogate pair cut
+between two pieces comes out as two replacement characters (23, the output-side twin of 8). An
+unquoted key `undefined` is written as the unquoted word `null` (24). Inside an entity-quoted string a
+numeric entity for a control character without a short escape (`&#3;`) is decoded into the output raw
+(25). In a JSON-stringified document an escaped empty string is read as an embedded quote (`[\"\"]`
+gives `["\""]`, `{\"\":null}` throws) (26) and a missing comma after a string value throws instead of
+being inserted (28). A missing colon before a string value starting with `[ ] { } ( ) , /` or `+` throws
+or mangles the value (27). A comment before a markdown fence makes the regular implementation throw, or
+read the backticks as strings, while the streaming one repairs the text (29). A string followed by
+whitespace and an ellipsis without a comma swallows the rest of the text up to the next quote
+(`["a" ...],1`) (30). A buffer exactly one larger than the whitespace run around a trailing comma
+returns invalid output instead of throwing (31).
 
 Valid JSON and the repairs of the regular implementation (shared by the streaming one unless
 said otherwise):
