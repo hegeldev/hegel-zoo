@@ -23,11 +23,15 @@ request per line)
   boundaries with specials, quoted, with trailing white space; preamble, epilogue, body lines that
   start with the boundary; LF or CRLF. Python's reading (leaf parts in document order; Subject,
   From, To decoded) must be enmime's, with `DisableCharacterDetection`; a message Python rejects
-  is counted.
+  is counted. The property draws every recorded shape and lands on enmime/5 (a comment before
+  an address, 7 % of cases; the other shapes are 0.2-6 %, met first in some runs).
 - **`hegel/hegel_build_test.go`** `TestHegelBuildReadByPython`: `Builder` with From, To, Subject,
   text, HTML, attachments and inlines (text and binary, file names with specials and non-ASCII),
   `Build` and `Encode`; Python reads the leaves (type, file name, content), Subject and addresses
   as given; enmime reads back its own Subject, Text and HTML.
+
+**`hegel/hegel_shapes_test.go`**: one narrow property per recorded bug, the wide generators with
+one leaf (drawn by position modulo the leaf count) replaced by the bug's shape region.
 
 **`hegel/hegel_pins_test.go`**: one deterministic reproducer per recorded bug.
 
@@ -43,16 +47,26 @@ Not generated, because the parsers differ by design: comments after an address (
 them the display name, Python drops them); `message/*` parts (Python nests a message); unpadded
 base64 in encoded words (Python decodes, enmime keeps the word, as RFC 2047 allows); a missing
 closing boundary and multiparts without a boundary (both parsers recover, with different trailing
-line ends); raw 8-bit headers; enmime's charset detection.
+line ends); raw 8-bit headers; enmime's charset detection. A part with no charset anywhere and
+100 or more runes of content can still get a detected charset (`MinCharsetDetectRunes`;
+`DisableCharacterDetection` only keeps a declared one: a 109-rune body of digits comes back
+`ISO-8859-1`), so the charset of such a part is counted and not compared, the content still is.
 
-## Known bugs (gated)
+## Known bugs
 
 Five bugs (`bugs.toml`): a part without Content-Type losing its disposition and file name;
 RFC 2231 file names in non-UTF-8 charsets dropped; body lines starting with the boundary taken as
 delimiters or terminators; encoded words with a language tag not decoded; a comment before an
-address breaking the list. `hegel/known.go` gates them by generated shape (a disposition on a part
-without Content-Type; a non-UTF-8 RFC 2231 file name; a boundary-like content line; a language tag;
-a comment before an address); `HEGEL_NO_KNOWN=1` lifts the gates.
+address breaking the list. The generators draw every shape (STYLE.md rule 11): the wide property
+is the expected failure mapped to enmime/5, and each bug has a narrow property in
+`hegel/hegel_shapes_test.go`, the deterministic expected failure beside the pin:
+`TestHegelDispositionSurvivesMissingContentType` (enmime/1), `TestHegelRFC2231FileNamesDecodeInLatin1`
+(/2), `TestHegelBoundaryLikeBodyLinesStayInTheContent` (/3), `TestHegelLanguageTaggedEncodedWordsDecode`
+(/4) and `TestHegelCommentsBeforeAddressesParse` (/5). `HEGEL_NO_KNOWN=1` (read once in
+`hegel/known.go`) switches the shapes off (no disposition on a part without Content-Type, RFC 2231
+file names in UTF-8 only, no boundary-like content line, no language tag, no comment before an
+address); every property then passes at 3000 cases. Until 2026-09-25 the switch had the inverse
+meaning (the gates were on by default and `HEGEL_NO_KNOWN=1` lifted them).
 
 ## Not tested
 
@@ -65,3 +79,6 @@ repairs of malformed headers (nothing malformed is generated), errors and warnin
 
 - 2026-09-20: written against 6c69c1c37bf7d273337b7d568f971013aa4b38d6 (2026-09-05, v2.5.0) with
   hegel.dev/go/hegel v0.6.33; 5 bugs.
+- 2026-09-25: generators rewritten in combinator style; the properties draw the known shapes and
+  five narrow properties were added; the NO_KNOWN switch flipped to the zoo's meaning; the
+  charset-detection tolerance above added.
