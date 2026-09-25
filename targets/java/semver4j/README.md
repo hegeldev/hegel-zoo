@@ -62,16 +62,30 @@ delete an entry without invalidating the rest.
 - `buildersRoundTrip`: `Semver.builder()`, `of`, `create` produce the canonical text, equal the parsed version, and
   refuse malformed identifiers and negative numbers with `SemverException`.
 
-Known-bug shapes are skipped, never worked around: identifiers with more than 18 digits and pairs of alphanumeric
-identifiers that both contain digits are not compared (1, 2); an identifier beginning with a hyphen is never
-compared with a numeric one (11); caret, tilde and hyphen ranges are never combined with other comparators in a set
-(3); `^0.x`-shaped carets (4) and bare wildcard operands (5) are not generated (`*` only as a whole alternative);
-Ivy intervals mix no bracket styles (6); range text is well-formed (7), has no trailing `||` (8) and no number above
-`Integer.MAX_VALUE` (9); identifier lists given to `withPreRelease`/`withBuild` have no trailing dot (10); a fluent
-chain ends after an operand containing `or` (12). One node-semver quirk is skipped rather than reported: node
-collapses a range with a bare `*` set to `*` alone, so `1.2.3-a` does not satisfy `* || 1.2.3-a` there without
-`includePrerelease`, while semver4j evaluates each set and says it does (the pre-release rule of the npm spec
-agrees with semver4j); pre-release versions are not compared against such ranges.
+The generators draw every recorded bug's shape by default (STYLE.md rule 11): pre-release identifiers with more
+than 18 digits and pairs of alphanumeric identifiers containing digits, with same-core siblings half the time
+(1, 2); identifiers beginning with a hyphen beside numeric ones (11); caret, tilde and hyphen ranges beside other
+comparators in a set (`MIXED`, 3); `^0.x`-shaped carets (4); bare wildcard operands, from depth-0 comparator
+bodies (5); Ivy intervals mixing bracket styles (6); junk operators in 3 % of primitives (7); a trailing `||`
+in 8 % of ranges (8); range numbers above `Integer.MAX_VALUE` in 1 %, with `fit()` keeping the versions tested
+near them (9); identifier lists with a trailing dot (10); a fluent `and()` after an operand containing `or`
+(12). The wide properties fail on them and are listed in `[expected_failures]` mapped to the bug they shrink to
+(`npmRangesMatchNodeSemver` to 5, `ivyRangesMatchTheIntervalModel` to 6, `modifiersMatchTheModel` to 10,
+`fluentExpressionsMatchStrings` to 12; `precedenceMatchesTheSpec` to 1 and `rangeListsEvaluateLikeTheModel` to
+11 intermittently); one narrow property per bug, a generator over the bug's shape region with random contents,
+fails every run (`longNumericIdentifiersCompare`, `alphanumericIdentifiersCompareInAsciiOrder`,
+`caretBesideComparatorsMatchesNodeSemver`, `caretZeroOpenMatchesNodeSemver`, `bareWildcardOperandsMatchNodeSemver`,
+`ivyMixedBracketsMatchTheIntervalModel`, `rangesWithJunkPartsAreRefused`, `trailingOrMatchesNodeSemver`,
+`bigRangeNumbersAreRefusedAsTooBig`, `trailingDotIdentifierListsAreRefused`, `hyphenIdentifiersRankAboveNumeric`,
+`fluentAndAfterMultiSetOperandJoinsTheLastSet`). The pins stay as regression examples. `HEGEL_NO_KNOWN=1` (read
+once into `Zoo.NO_KNOWN`) leaves the shapes out, and every property passes. Two node-semver differences are
+handled in the oracle rather than reported: node collapses a range with a bare `*` set to `*` alone, so `1.2.3-a`
+does not satisfy `* || 1.2.3-a` there without `includePrerelease`, while semver4j evaluates each set and says it
+does (the pre-release rule of the npm spec agrees with semver4j), so pre-release versions are not compared
+against such ranges; and node reads `>*` as `<0.0.0-0` (nothing) where semver4j reads `>=0.0.0`, so `>*` is
+written `>=*`. One shape is skipped as a candidate (`candidate/java/semver4j-1`, about one case in a thousand):
+semver4j desugars partial and x-range upper bounds without the `-0` node-semver adds (`<0.1` is `<0.1.0`, node
+`<0.1.0-0`), so `0.1.0-5` satisfies `<0.1 >0.1.0-1` in semver4j and not in node.
 
 ## Not tested
 
@@ -117,3 +131,7 @@ satisfies it", contrary to its Javadoc (the empty-list case is in 7).
   too, about once in 10 000 cases); judged a node-semver quirk and skipped in `npmRangesMatchNodeSemver`; and that a range's pre-release
   identifiers (`0.0.0-- - 0`) could begin with a hyphen, reaching semver4j/11 through the range property about
   once in 10 000 cases (the old `tamePre` had the same gap) - they are now tame too.
+- 2026-09-25: unsteered under rule 11 (the known-bug gates only under `HEGEL_NO_KNOWN=1`; twelve narrow properties;
+  `>*` written `>=*`; the precedence transitivity check wraps `compareTo` so bug 1's exception is a failure, not
+  an error); the `-0` upper-bound difference above found by the freed generators. 4 tests pass, 29-30 expected
+  failures.
