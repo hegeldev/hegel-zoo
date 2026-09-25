@@ -33,20 +33,29 @@ policy; the README asks for issues.
 
 ## Properties
 
-| Test | What it checks | Gates |
+| Test | What it checks | Finds |
 | --- | --- | --- |
-| `PaletteConversionsRoundTrip` | table = computed palette; Convert identities per profile; hex of entry *i* converts back to *i* | greys 233–255 counted (termenv/1) |
-| `ConvertFollowsTheDocumentedAlgorithm` | random RGB → ANSI256 equals the model; idempotence; ANSI via ANSI256; result ranges; `FromColor` | cases where the model picks a grey, or the code picks grey 232, counted (termenv/1) |
-| `ColourSequencesFollowTheSGRTable` | `Sequence(bg)` of every colour kind; `ConvertToRGB` of `#rgb`/`#rrggbb` | RGB channels drawn from the 232 values that survive the float round trip (termenv/2) |
-| `StyledFollowsTheSGRTable` | styles built through the methods in every profile vs the SGR model; `Styled` = `String`; `String(a, b)` joins with a space; `Width` | styles containing `NoColor` counted (termenv/3) |
-| `ProfileColorParsesTheDocumentedForms` | `#rgb`/`#rrggbb`/0–15/16–255/invalid strings → the converted colour or nil | out-of-range numbers pinned (termenv/4) |
-| `TemplateHelpersRenderStyles` | `Color`/`Foreground`/`Background`/attribute helpers vs the style model, in every profile | — |
-| `OutputReadsTheTerminalsColours` | fake-TTY OSC 10/11 replies, fallbacks, written queries, full consumption, `HasDarkBackground`, multiplexers not queried | replies use four-digit components (termenv/6, /7) |
+| `PaletteConversionsRoundTrip` | table = computed palette; Convert identities per profile; hex of entry *i* converts back to *i* | termenv/1 (grey entries convert back to a cube colour) |
+| `ConvertFollowsTheDocumentedAlgorithm` | random RGB → ANSI256 equals the model; idempotence; ANSI via ANSI256; result ranges; `FromColor` | termenv/1 (25 % of random colours are nearest a grey) |
+| `ColourSequencesFollowTheSGRTable` | `Sequence(bg)` of every colour kind; `ConvertToRGB` of `#rgb`/`#rrggbb` | termenv/2 (all 256 channel values are drawn) |
+| `StyledFollowsTheSGRTable` | styles built through the methods in every profile vs the SGR model; `Styled` = `String`; `String(a, b)` joins with a space; `Width` | termenv/3, intermittent (a `NoColor` step in 3 % of styles) |
+| `ProfileColorParsesTheDocumentedForms` | `#rgb`/`#rrggbb`/0–15/16–255/invalid strings → the converted colour or nil | termenv/4 (numbers outside 0–255 are one of five text forms) |
+| `TemplateHelpersRenderStyles` | `Color`/`Foreground`/`Background`/attribute helpers vs the style model, in every profile | termenv/2, intermittent (1 % of cases) |
+| `OutputReadsTheTerminalsColours` | fake-TTY OSC 10/11 replies, fallbacks, written queries, full consumption, `HasDarkBackground`, multiplexers not queried | termenv/7 (component widths 1–4, `rgba:` replies and right-length garbage are drawn; it reaches /5 and /6 too but shrinks to /7) |
 | `EnvColorProfileFollowsNoColorAndCliColor` | `EnvNoColor`, `EnvColorProfile`, `NewOutput`'s profile, spot rules | — |
 | `Examples` | fixed sanity examples | — |
 
-Each `TestHegelPin…` reproduces one bug and is an expected failure. `TERMENV_COLLECT=1`
-turns failures into a tally per property.
+The generators draw every recorded bug's shape by default (STYLE.md rule 11) and the wide
+properties are expected failures mapped to the bug they shrink to. `hegel_shapes_test.go` adds
+one narrow property per bug over its shape region with random contents, each failing every
+run: `PaletteGreysConvertBackToTheirIndex` (/1), `RGBSequencesCarryEveryChannelValue` (/2),
+`NoColorInAStyleIsANop` (/3), `ProfileColorRejectsNumbersOutsideThePalette` (/4),
+`ColorFGBGOutsideThePaletteFallsBackToTheDefaults` (/5), `MalformedColourRepliesFallBack`
+(/6, the reply panics the parser; recovered and named), `ColourRepliesOfEveryComponentWidthAreRead`
+(/7). Each `TestHegelPin…` reproduces one bug as a regression example. `HEGEL_NO_KNOWN=1`
+switches the known shapes off (the narrow properties then draw the neighbouring region: cube
+entries, exact channels, in-range numbers, four-digit replies) and every property passes.
+`TERMENV_COLLECT=1` turns failures into a tally per property.
 
 ## Bugs
 
