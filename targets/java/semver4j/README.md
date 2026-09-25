@@ -71,8 +71,8 @@ in 8 % of ranges (8); range numbers above `Integer.MAX_VALUE` in 1 %, with `fit(
 near them (9); identifier lists with a trailing dot (10); a fluent `and()` after an operand containing `or`
 (12). The wide properties fail on them and are listed in `[expected_failures]` mapped to the bug they shrink to
 (`npmRangesMatchNodeSemver` to 5, `ivyRangesMatchTheIntervalModel` to 6, `modifiersMatchTheModel` to 10,
-`fluentExpressionsMatchStrings` to 12; `precedenceMatchesTheSpec` to 1 and `rangeListsEvaluateLikeTheModel` to
-11 intermittently); one narrow property per bug, a generator over the bug's shape region with random contents,
+`precedenceMatchesTheSpec` to 1, `rangeListsEvaluateLikeTheModel` to 11 and `fluentExpressionsMatchStrings`
+to 12 intermittently); one narrow property per bug, a generator over the bug's shape region with random contents,
 fails every run (`longNumericIdentifiersCompare`, `alphanumericIdentifiersCompareInAsciiOrder`,
 `caretBesideComparatorsMatchesNodeSemver`, `caretZeroOpenMatchesNodeSemver`, `bareWildcardOperandsMatchNodeSemver`,
 `ivyMixedBracketsMatchTheIntervalModel`, `rangesWithJunkPartsAreRefused`, `trailingOrMatchesNodeSemver`,
@@ -83,9 +83,13 @@ handled in the oracle rather than reported: node collapses a range with a bare `
 does not satisfy `* || 1.2.3-a` there without `includePrerelease`, while semver4j evaluates each set and says it
 does (the pre-release rule of the npm spec agrees with semver4j), so pre-release versions are not compared
 against such ranges; and node reads `>*` as `<0.0.0-0` (nothing) where semver4j reads `>=0.0.0`, so `>*` is
-written `>=*`. One shape is skipped as a candidate (`candidate/java/semver4j-1`, about one case in a thousand):
-semver4j desugars partial and x-range upper bounds without the `-0` node-semver adds (`<0.1` is `<0.1.0`, node
-`<0.1.0-0`), so `0.1.0-5` satisfies `<0.1 >0.1.0-1` in semver4j and not in node.
+written `>=*`. semver4j desugars a partial or x-range upper bound without the `-0` node-semver adds (`<0.1` is
+`<0.1.0`, node `<0.1.0-0`; likewise `<=1.2`, `1.2.x` and the caret, tilde and hyphen bounds), so when another
+comparator of the set names a pre-release of the excluded version (`<0.1 >0.1.0-1`) a pre-release of it
+(`0.1.0-5`) satisfies the range in semver4j and not in node-semver (13); the wide npm property meets the shape
+about twice in 100 000 cases, `openUpperBoundsExcludePreReleasesOfTheBound` draws it directly. Only the primitive
+forms show it: with pre-releases included semver4j writes the `-0` too, a caret or tilde beside another
+comparator is dropped altogether (3), and node-semver refuses a hyphen range there.
 
 ## Not tested
 
@@ -110,6 +114,7 @@ doubles).
 | semver4j/10 | low | `withPreRelease`/`withBuild` drop a trailing dot; `"."` clears the identifiers instead of being refused |
 | semver4j/11 | low | a pre-release identifier beginning with a hyphen is ordered below numeric identifiers |
 | semver4j/12 | medium | `RangeExpression`: an `and()` after an operand holding several sets starts a new set instead of joining the last |
+| semver4j/13 | low | a partial or x-range upper bound is written without node-semver's `-0`, so a pre-release of the excluded version can satisfy a set (`0.1.0-5` satisfies `<0.1 >0.1.0-1`) |
 
 Observed, not recorded: with `includePreRelease`, `1.2.3 - 2.3.4` is `>=1.2.3 <2.3.5-0` in semver4j (as its
 Javadoc says) but `>=1.2.3-0 <2.3.5-0` in node-semver, so `1.2.3-alpha` satisfies it only in node — a documented
@@ -133,5 +138,5 @@ satisfies it", contrary to its Javadoc (the empty-list case is in 7).
   once in 10 000 cases (the old `tamePre` had the same gap) - they are now tame too.
 - 2026-09-25: unsteered under rule 11 (the known-bug gates only under `HEGEL_NO_KNOWN=1`; twelve narrow properties;
   `>*` written `>=*`; the precedence transitivity check wraps `compareTo` so bug 1's exception is a failure, not
-  an error); the `-0` upper-bound difference above found by the freed generators. 4 tests pass, 29-30 expected
-  failures.
+  an error); the `-0` upper-bound difference above found by the freed generators and recorded as semver4j/13 (pin and
+  narrow property; the wide property's gate fails by default). 4 tests pass, 31-32 expected failures.
