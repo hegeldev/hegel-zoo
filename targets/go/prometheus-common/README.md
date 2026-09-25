@@ -15,10 +15,11 @@ no agent instructions. The zoo keeps its tests in its own patch and files nothin
 
 `go test -count=1 -run TestHegel -v ./expfmt` in the module root (Go 1.26+: `go mod tidy`
 raised the directive from 1.25.0 for the hegel dependency). The patch adds, in the external
-test package of `expfmt`, `hegel_test.go` (harness, the `Known` switch), `hegel_model_test.go`
-(the canonical form, generators, the model writer), `hegel_props_test.go` (properties),
-`hegel_ref_test.go` (the prometheus_client reference test) and `hegel_pins_test.go`, and
-requires `hegel.dev/go/hegel v0.6.33` in go.mod. `TestHegelPrometheusClientAgrees` runs
+test package of `expfmt`, `hegel_test.go` (harness, the `noKnown` switch, the generator idioms),
+`hegel_model_test.go` (the canonical form, the grammar as generator values, the pure model
+writer), `hegel_props_test.go` (the wide properties), `hegel_shapes_test.go` (one narrow
+property per recorded bug), `hegel_ref_test.go` (the prometheus_client reference test) and
+`hegel_pins_test.go`, and requires `hegel.dev/go/hegel v0.6.33` in go.mod. `TestHegelPrometheusClientAgrees` runs
 `python3` with the `prometheus_client` module when it is on PATH (the CI's venv installs it)
 and is skipped otherwise.
 
@@ -84,6 +85,23 @@ timestamps and units.
 
 `ZOO_COLLECT=1` records mismatches instead of failing and prints the agreement classes.
 
+## Known bugs
+
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11), so the wide
+properties fail on the bug they meet and are listed in `[expected_failures]` mapped to it, with
+the pin beside them as the regression example. `HEGEL_NO_KNOWN=1`, read once, switches the
+known shapes off, and every property then passes (3000 cases). One narrow property per bug in
+`hegel_shapes_test.go` draws just that shape: `SummaryCountsAreChecked` (1),
+`QuoteInsideNameIsRejected` (2), `ExtractSamplesWorksWithoutOptions` (3),
+`CreatedLinesCarryTheTimestamp` (4), `ExemplarsWithoutLabelsAreWritten` (5),
+`GaugeHistogramsUseGcountGsum` (6), `TrailingWhitespaceIsIgnored` (7),
+`SummaryLinesWithoutQuantileAreRejected` (8), `BracedNamesParseLikePlainOnes` (9),
+`UnknownCountersHaveNoExemplar` (10). Of the wide properties, `ParseFollowsTheFormat` meets
+bugs 1, 2, 7, 8 and 9 and shrinks to 7 (`a_count 0 ` with a trailing blank), `TextRoundTrips`
+meets 3 (a summary or histogram family, or a sample without a timestamp, under nil options),
+`OpenMetricsIsWellFormed` meets 5, 6 and 10 and shrinks to 5 or 6, and `PrometheusClientAgrees`
+meets 5 and 10; the failure message names the shape met.
+
 ## Accepted differences
 
 - Help texts are generated non-empty and without leading blanks: the parser drops an empty
@@ -122,3 +140,9 @@ content negotiation.
 
 - 2026-09-21 (turn 347): target added at db5c9e8 with four properties, the prometheus_client
   reference test and 10 pins.
+- 2026-09-25: generators rewritten in combinator style (the grammar as generator values, a
+  drawn tape driving the pure writer, edits as drawn data applied modulo the live size) and the
+  known-bug gates turned off by default; ten narrow properties added. Bug 3 is wider than
+  recorded: `ExtractSamples` with nil options panics on every summary and histogram family, not
+  only on a sample without a timestamp (`extractSummary`/`extractHistogram` read `o.Timestamp`
+  unconditionally); bug 1 also lets `NaN`, `+Inf` and huge summary counts through.
