@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -756,3 +756,28 @@ not of the library. Two bugs (/7, /8) had a pin and no property at all; a proper
 and escapes within its first run. And a helper shrinking the wrong way (`chance` shrank to true,
 so every shrunk case had every option on) had gone unnoticed while the shapes were gated: the
 direction a helper shrinks in only shows once something fails.
+
+The thirty-first batch (turn 486: commons-csv, structured-clone, miekg-dns, jsonrepair,
+css-tree; 89 narrow properties between them) was the first with a fresh day's budget since the
+standard settled, and the largest. Three things stand out. A wide property over a grammar with
+several bugs at comparable rates has no stable shrink basin: css-tree's fixpoint property landed
+on css-tree/3, /9, /14, /12 and /11 across sixteen runs (Hegel's shrinker cannot cross from one
+failing shape to a structurally different one, so where it lands is where the first failure was),
+and the mapping names the most frequent basin while the narrow properties carry the certainty;
+where a single-piece pool decides the shape, putting the smallest shape first in the pool (css-tree's
+`SOUP`) makes the basin stable. Filter rates are not what a uniform estimate says: miekg-dns's
+`exactSeconds` filter rejected 7% of draws where uniform sampling would reject 0.6%, because Hegel
+biases integers towards small values, so a filter over a numeric shape should be a table of the
+shapes wanted (`SampledFrom`) rather than a rejection, and the rate has to be measured, not
+computed. And freeing the shapes finds bugs: jsonrepair's unsteered generators met ten shapes the
+gated ones had never drawn (an output chunk boundary splitting a surrogate pair, `{undefined:1}`
+becoming `{null:1}`, a numeric entity for a control character decoded raw, escaped empty strings
+and missing commas in JSON-stringified documents, ...), reproduced standalone and recorded as
+jsonrepair/23-31 with pins and properties of their own; miekg-dns's met three dnspython printing
+differences that had been hidden behind the same gates and are now tolerated narrowly, with the
+oracle's spelling normalised rather than the shape avoided. Also seen again: the oracle written
+beside the gate shares its assumption (commons-csv's duplicate-header check was case-sensitive,
+like the library's, and now lower-cases under `ignoreHeaderCase`); a wide property can be plain
+only after enough runs - miekg-dns's `TruncateFits` failed seventeen runs for the subagent and
+passed one of eight for the reviewer, and is intermittent; and Java's `--show-failures` prints
+only unexpected failures, so a Java target's shapes are read from the surefire reports.
