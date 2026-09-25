@@ -30,9 +30,25 @@ that the rest of the language stays under test.
 ## Properties
 
 - `TestHegelDecode`: a tic-compiled entry decodes to what infocmp prints (names, every
-  capability, cancellations, extended capabilities by name).
-- `TestHegelDatabase`: the same for random entries of the installed database.
+  capability, cancellations, extended capabilities by name). Lands on terminfo/4 (an entry
+  without `acsc`, half the cases; /1 and /6 at 3-4 %).
+- `TestHegelDatabase`: the same for random entries of the installed database. Lands on
+  terminfo/4 (most installed entries have no `acsc`).
 - `TestHegelPrintf`: `Printf` of a compiled string with int parameters gives tput's output.
+  Lands on terminfo/3 (`%c` of a number, 17 % of cases; /2 at 9 %, /5 at 4 %).
+
+## Known bugs
+
+The generators draw the shape of every recorded bug (STYLE.md rule 11): the three properties
+above are expected failures mapped to the bug they land on, and each bug has a narrow property
+over its own shape region in `hegel/hegel_shapes_test.go`, the deterministic expected failure
+beside the pin: `TestHegelOddAcscDecodes` (terminfo/1), `TestHegelNumbersAreTrueWhenNonZero` (/2),
+`TestHegelCharactersAreNumbers` (/3), `TestHegelAbsentAcscStaysAbsent` (/4),
+`TestHegelColonBeforeTheConversionIsAPlainFormat` (/5) and `TestHegelAcscRepeatedKeyKeepsTheLastMapping`
+(/6). `HEGEL_NO_KNOWN=1` (read once) switches the shapes off (every entry gets an even `acsc`
+without repeated keys, `%c` and the truth operators are not applied to numbers, `%:` is followed
+by a flag) and every property passes at 1000 cases (Printf's remaining assumes 3.7 %, the
+ncurses specifics below).
 
 ## Bugs
 
@@ -45,8 +61,9 @@ first mapping of a repeated key where ncurses' repair, which it cites, keeps the
 
 ## Modelled as recorded, not counted
 
-- ncurses specifics the generators avoid or the property leaves out: `%i` increments at most
-  once per evaluation in ncurses (the package increments at every `%i`); `%o`/`%x`/`%X` of a
+- ncurses specifics the generators leave out or the property does not count: `%i` increments at
+  most once per evaluation in ncurses (the package increments at every `%i`; the renderer writes
+  only the first `%i`); `%o`/`%x`/`%X` of a
   negative value print two's complement in C and `-N` in Go; `%c` of a non-zero multiple of
   256 truncates the C string; int32 overflow; `%#x` of zero and `%#0` (Go's `fmt` differs
   from C's printf); the `+` flag, which ncurses 6.4 does not implement after `%:`; `%s` and
@@ -56,6 +73,8 @@ first mapping of a repeated key where ncurses' repair, which it cites, keeps the
   drops a cancelled boolean, stores an extended number above 32767 as cancelled unless a
   standard number forces the 32-bit format, derives `acsc` from `box1`, and rejects
   aliases that are not filenames and names starting with `_`; infocmp prints the character
-  after `%` and a backslash after a caret raw. The generators avoid these.
+  after `%` and a backslash after a caret raw. The generators leave these out. tic synthesizes
+  the VT100 `acsc` when `smacs` and `rmacs` are present and `acsc` absent (modelled), and
+  infocmp trims a trailing `% ` from the last capability it prints (such strings are respelled).
 - `tput` evaluates a string only when it refers to a parameter, so the property appends
   `%p1%Pa` to strings without one.
