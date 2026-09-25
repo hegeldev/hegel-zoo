@@ -17,10 +17,11 @@ own patch and files nothing upstream.
 
 `go test -count=1 -run TestHegel -v .` in the module root, with `python3` on PATH able to
 `import feedparser` (feedparser 6.0.12; the setup command checks the import). The patch adds
-`hegel_test.go` (harness, the model, the three writers, the universal-feed mapping and the
-three format properties), `hegel_dates_test.go` (date layouts, detection and robustness),
-`hegel_oracle_test.go` (the feedparser child) and `hegel_pins_test.go` (one plain test per
-bug), all in the external package `gofeed_test`, and requires `hegel.dev/go/hegel v0.6.33` in
+`hegel_test.go` (harness, the combinator-built generators, the model, the tape-driven
+writers, the universal-feed mapping and the three format properties), `hegel_dates_test.go`
+(date layouts, detection and robustness), `hegel_shapes_test.go` (one narrow property per
+recorded bug), `hegel_oracle_test.go` (the feedparser child) and `hegel_pins_test.go` (one
+plain test per bug), all in the external package `gofeed_test`, and requires `hegel.dev/go/hegel v0.6.33` in
 go.mod (the `go` directive moves from 1.25.0 to 1.26.0 for it).
 
 ## Oracles
@@ -59,11 +60,26 @@ go.mod (the `go` directive moves from 1.25.0 to 1.26.0 for it).
 | DatesFollowTheirLayout | a date written with any of 130 layouts from gofeed's list (numeric offsets, zone names from its table, two-digit years) parses as an RSS `pubDate` to what `time.Parse` gives for that layout, and feedparser agrees whenever it reads the text (its own misreadings excepted) |
 | DetectionSurvivesTheProlog | a document with a byte order mark, XML declaration, comments, DOCTYPE, processing instructions, leading whitespace, RSS names in another case or an ISO-8859-1 encoding is detected as its type and parses to the same feed as the plain document; every prefix parses or fails within five seconds without panic |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (author strings kept to the four supported forms, no HTML named entities, no BOM before
-JSON, RFC 3339 in upper case, two-digit years within Go's window, JSON items following the
-current no-inheritance rule); the pins assert the correct behaviour and fail while the bug
-exists. `ZOO_COLLECT=1` records mismatches instead of failing and prints the class counts.
+## Known bugs
+
+The properties draw the shapes of the ten recorded bugs by default and are the expected
+failures mapped to them in `target.toml` (STYLE.md rule 11); the pins are the regression
+examples. One narrow property per bug is the deterministic finder:
+`TestHegelAuthorFormsAreRead` (/1), `TestHegelKeywordsAreTrimmed` (/2),
+`TestHegelEntitiesDecodeInExtensions` (/3), `TestHegelItemAtomLinkIsPromoted` (/4),
+`TestHegelJSONItemsInheritAuthors` (/5), `TestHegelLowerCaseRFC3339Parses` (/6),
+`TestHegelTwoDigitYearsFollowRFC5322` (/7), `TestHegelEnclosureURLResolvesAgainstBase` (/8),
+`TestHegelRDFAboutIsTheGUID` (/9) and `TestHegelJSONWithBOMParses` (/10). The wide
+properties fail every run and are mapped to the bug they shrink to most often: RSS to /2 (it
+reaches /1, /2, /4, /6 and /8 on 13-36% of cases each and /3 on about 1%), Atom to /6, JSON
+Feed to /5 (or /1: JSON author names go through the same parser, see gofeed/1), Dates to /7
+and Detection to /10 (the BOM-prefixed document runs in a child process with a capped
+address space and a five-second deadline). Mismatches name the shape they fall in.
+`HEGEL_NO_KNOWN=1` (read once) switches the shapes off: author strings keep to the four
+supported forms, no HTML named entities, no BOM before JSON, RFC 3339 in upper case,
+two-digit years within Go's window, JSON items following the current no-inheritance rule;
+then every property passes. `ZOO_COLLECT=1` records mismatches instead of failing and prints
+the class counts.
 
 ## Accepted differences
 
@@ -95,3 +111,11 @@ is not its GUID; a JSON Feed with a byte order mark is detected and then rejecte
 ## History
 
 - 2026-09-20 (turn 333): target added at 253ddbe with five properties, ten pins.
+- 2026-09-25: generators rewritten in combinator style (STYLE.md); the properties draw the
+  known shapes by default and are the expected failures, with a narrow property per bug in
+  `hegel_shapes_test.go`; `HEGEL_NO_KNOWN=1` switches the shapes off. The freed JSON Feed
+  property showed gofeed/1 applies to JSON author names too (notes widened). Two feedparser
+  tolerances added: its loose SGML parser (used when a document carries an HTML named entity)
+  leaves `&amp;` undecoded in ids, names, links and tags, and its Atom author list re-reads a
+  preceding "name (email)" when an author has no name; both are skipped only where they
+  occur.
