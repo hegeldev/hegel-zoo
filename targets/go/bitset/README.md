@@ -14,7 +14,8 @@ self-consistency checks; the zoo's properties compare against an independent mod
 ## Build
 
 `go test -count=1 -run TestHegel -v .` in the module root. The patch adds `hegel_test.go`
-(the model and the properties) and `hegel_pins_test.go` (one plain test per bug) and requires
+(the model and the wide properties), `hegel_shapes_test.go` (one narrow property per bug) and
+`hegel_pins_test.go` (one plain regression example per bug) and requires
 `hegel.dev/go/hegel v0.6.33` in go.mod.
 
 ## Oracles
@@ -50,14 +51,24 @@ self-consistency checks; the zoo's properties compare against an independent mod
 | Serialization | MarshalBinary and WriteTo equal the independent encoding in both byte orders, BinaryStorageSize equals its size; UnmarshalBinary and ReadFrom (into a fresh or a used set, with trailing bytes left in the stream) give an Equal set; MarshalJSON is the base64 of the encoding and round-trips; truncated inputs fail and leave the set empty or unchanged |
 | WordsAndConstructors | From shares its words (changes show through), SetBitsetFrom replaces the content, writing through Words changes the set, Bytes is Words, Cap, FromWithLength panics on a short slice |
 
-`Known` switches gate the seven recorded bugs (the generators avoid the shapes: PreviousSet and
-PreviousClear are queried only below the length, InPlaceIntersection is compared bit by bit,
-Copy destinations are no longer than the source unless the source ends on a word boundary,
-ExtractTo destinations are long enough when the source is empty, DepositTo masks have no more
-positions than the source has allocated bits, no impossible length headers). With them on, the five properties run clean at
-1000 cases in about two seconds (`BITSET_COLLECT=1` records mismatches instead of failing and
-prints them shortest-first with the case's description; `HEGEL_VERBOSE=1` turns on the
-engine's log).
+The generators draw the shapes of the seven recorded bugs and the properties that meet them
+are the expected failures mapped to the bugs (STYLE.md rule 11): SingleSetOperations lands on
+/2 (queries beyond the length; half of its cases also meet /1), TwoSetOperations on /3
+(operands of different lengths; /4 in a few percent of cases), ExtractAndDeposit on /5
+(zero-value sources; /6 in some; it passed one run in a hundred cases, so it is mapped
+intermittent), Serialization on /7 (a quarter of its cases carry a header
+of 2^52 to 2^64-1 - smaller impossible headers, 2^51 say, are a fatal out-of-memory rather
+than a recoverable panic, so the test does not draw them). One narrow property per bug in
+`hegel_shapes_test.go` draws the bug's shape region with random contents and fails every run:
+`PreviousSetLooksBackBeyondTheLastWord` (/1), `PreviousClearStaysWithinTheLength` (/2),
+`InPlaceIntersectionEqualsIntersection` (/3, both length orders), `CopyLeavesTheRestOfTheDestination`
+(/4), `ExtractToExtendsForAnEmptySource` (/5), `DepositToClearsBeyondTheSource` (/6) and
+`ReadFromRejectsAnImpossibleLength` (/7). `HEGEL_NO_KNOWN=1` switches the shapes off (the
+`Known` gates come on and the generators draw the neighbouring regions: queries below the
+length, equal lengths, masks within the source's words, honest headers) and all twelve
+properties pass, at 1000 cases in about two seconds. `BITSET_COLLECT=1` records mismatches
+instead of failing and prints them shortest-first with the case's description; `HEGEL_VERBOSE=1`
+turns on the engine's log.
 
 ## Bugs (7; details in bugs.toml)
 
