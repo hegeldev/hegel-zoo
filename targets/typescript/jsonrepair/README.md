@@ -34,15 +34,27 @@ two implementations.
 
 `ZOO_COLLECT=1` turns mismatches into `# COLLECT` counts and `HEGEL_TEST_CASES` (default 100)
 widens the sweep; `ZOO_TRACE=<file>` appends every text handed to either implementation, which
-is how the hang (22) was located. Known bugs are gated in `hegel/known.mjs` by shape (a container's last string
-holding an unmatched bracket, ellipsis before a comma and whitespace, special whitespace after a
-number, repeated commas, a Buffer chunk that does not decode on its own, ...); `ZOO_NO_KNOWN=1`
-lifts the gates.
+is how the hang (22) was located. The generators draw the recorded bugs' shapes like any other (a
+container's last string holding an unmatched bracket, ellipsis before a comma and whitespace, special
+whitespace after a number, repeated commas, a Buffer chunk that does not decode on its own, ...), and a
+wide property that meets one fails naming it (`hegel/known.mjs` classifies the mismatch by shape:
+`(recorded shape jsonrepair/N)`), so the wide properties are expected failures at their natural rates
+(`FiniteBuffers` and `Transform` every run, `DocumentedRepairs` and `Streaming` most runs,
+`SmallBuffers`, `RepairedOutput` and `ValidJSON` in some), each mapped to the bug it most often shrinks
+to. One narrow property per bug (`TestHegelValidJSONEndingInAStringWithAnUnmatchedBracketIsUnchanged`,
+..., `TestHegelStreamingTerminatesOnAnArrayAfterAPropertyValue`) draws that bug's shape region with
+random contents through the same oracle and fails every run; the pins stay as regression examples.
+`HEGEL_NO_KNOWN=1` leaves the shapes out of the generators (brackets stripped from a container's last
+string, plain whitespace after numbers, no adjacent or `/`-leading comments, no ellipsis after a dropped
+or leading comma, Buffer chunks cut at code points, ...), skips the mismatch that still has one (under
+2% of cases per property) and registers the narrow properties skipped. Ten more library bugs reproduced
+during the unsteering but not yet recorded are skipped behind `candidate/typescript/jsonrepair-1..10`
+gates in `hegel/known.mjs`, to be recorded with pins and properties of their own.
 
 ## Bugs
 
-22 open, all pinned (see `bugs.toml`). In 300–600-case sweeps every property agrees with its
-model on every case not touched by them.
+22 open, all pinned and each found by a property of its own (see `bugs.toml`). Under
+`HEGEL_NO_KNOWN=1`, 5000-case sweeps of every property had no mismatch.
 
 Valid JSON and the repairs of the regular implementation (shared by the streaming one unless
 said otherwise):
