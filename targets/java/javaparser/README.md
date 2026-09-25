@@ -50,15 +50,15 @@ hex floats, octal and Unicode escapes, text blocks with escapes and `\<newline>`
 contextual keywords as identifiers, optional trivia (comments everywhere, odd white space, CRLF):
 
 - **`agreesWithJavac`** — javac accepts the program (else the generator is at fault: reported as
-  "generator"), JavaParser accepts it, and the two shapes are equal. Lands on bug 1 most runs (7, 5 and
+  "generator"), JavaParser accepts it, and the two shapes are equal. Lands on bug 1 most runs (23, 7, 5 and
   22 in others).
 - **`prettyPrintRoundTrip`** — JavaParser accepts the program (a rejection of a javac-accepted program
   fails here too), `cu.toString()` is accepted by javac and by JavaParser with the same shape;
   where the program has no legacy array brackets and no text blocks (documented `ArrayType.origin` and raw
   text-block differences), the reparsed unit `equals` the original with the same `hashCode`.
-  Lands on bug 5 most runs.
+  Lands on bug 23, 1 or 5, whichever shape it meets first.
 - **`lexicalPreservationIsIdentity`** — JavaParser accepts the program and
-  `LexicalPreservingPrinter.setup(cu); print(cu)` is the original text. Lands on bug 10 or bug 1.
+  `LexicalPreservingPrinter.setup(cu); print(cu)` is the original text. Lands on bug 1, 23 or 10.
 - **`positionsAreConsistent`** — every node has a range that ends after it begins and lies within its
   parent's (except a `VariableDeclarator`'s type, which JavaParser places before the declarator by design);
   literals and simple names cover exactly their own text; text blocks start and end with `"""`.
@@ -76,7 +76,8 @@ contextual keywords as identifiers, optional trivia (comments everywhere, odd wh
 (`[expected_failures]`), as regression examples beside the properties.
 
 The generators draw the shapes of the known bugs (STYLE.md rule 11): cast lambdas and primary method
-references as first operands (bugs 1, 17), `var` lambda parameters in initializers (2), local enums (3),
+references as first operands (bugs 1, 17) and a primary method reference as the right operand of a binary
+operator (23; one right operand in 33), `var` lambda parameters in initializers (2), local enums (3),
 `\u005c` and `\s` escapes (4–6), text blocks with white space after the opening delimiter and with form
 feeds (7, 8), `- -x`/`+ +x` (9), `int m()[]` (10), `int x[]`, annotated type parameters and types,
 `final` in type patterns, qualified catch types (11–15), pattern types (16), `A { }` enum constants (18),
@@ -95,10 +96,12 @@ property per bug draws that bug's shape region with random contents and fails ev
 `typeAnnotationsLieInsideTheirType` (15), `patternTypesCloneAsChildren` (16),
 `methodReferenceOperandsAgreeWithJavac` (17), `enumConstantEmptyBodiesAgreeWithJavac` (18),
 `unqualifiedStaticImportsAndPermitsTypeArgumentsAreRejected` (19),
-`unicodeEscapedIdentifiersAgreeWithJavac` (20), `varQualifiedTypesAgreeWithJavac` (21) and
-`relationalOperatorsAfterInstanceOfAgreeWithJavac` (22). `HEGEL_NO_KNOWN=1` switches the shapes off:
+`unicodeEscapedIdentifiersAgreeWithJavac` (20), `varQualifiedTypesAgreeWithJavac` (21),
+`relationalOperatorsAfterInstanceOfAgreeWithJavac` (22) and `methodReferencesAfterOperatorsAgreeWithJavac`
+(23). `HEGEL_NO_KNOWN=1` switches the shapes off:
 the generators draw the neighbouring shapes, the bugs' checks are left out (the position exemptions,
-the clone check's pattern types, the mutation classifier's tolerances, all under a fraction of a percent
+the clone check's pattern types, the mutation classifier's tolerances - a wrong tree of bug 23's shape is
+skipped by name - all under a fraction of a percent
 of nodes or cases) and every property passes.
 
 ## Not tested
@@ -113,15 +116,18 @@ reference-type cast, and JavaParser rightly rejects it).
 
 ## Bugs found
 
-22, in bugs.toml: JavaParser rejects valid programs (a cast lambda as an operand, `var` lambda parameters in
-initializers, local enums, `'\''`, and — grammatical but never well-typed — a method reference as an
-operand and a relational operator or second `instanceof` after an `instanceof`, bug 22), gives wrong literal
+23, in bugs.toml: JavaParser rejects valid programs (a cast lambda as an operand, `var` lambda parameters in
+initializers, local enums, `'\''`, and — grammatical but never well-typed — a primary method reference as a
+first operand and a relational operator or second `instanceof` after an `instanceof`, bug 22), gives wrong literal
 values (`\s`, Unicode-escaped backslashes, text blocks with white space after the opening delimiter or
 containing a form feed), prints wrongly (`- -x` as `--x`, `int m()[]` as `int ()[]m`, the
 form feed as a line break, `A { }` as `A`), has five range bugs (type parameters' annotations, patterns'
 modifiers, `int x[]` names, catch parameters with qualified types, type annotations), does not make a
 pattern's type its child in `instanceof`, accepts `import static x;` and `permits Foo<T>`, and keeps Unicode
-escapes in identifiers (`\u0041b` is not `Ab`, bug 20), and crashes on a qualified type starting with `var` (bug 21).
+escapes in identifiers (`\u0041b` is not `Ab`, bug 20), crashes on a qualified type starting with `var` (bug 21),
+and parses a method reference on a primary after a binary or unary operator or a cast with the whole left side as
+its scope: `x * this::m` is `(x * this)::m` where javac reads `x * (this::m)` (bug 23; a type or name before `::`,
+`x * Foo::m`, is right, and so is `super::m`).
 
 Observed, not recorded: JavaParser accepts `import y;` (a single identifier), which the JLS grammar allows and
 javac rejects; JavaParser accepts `a ? b : c = d` as `a ? b : (c = d)` where javac's parser assigns to the
@@ -141,3 +147,4 @@ not produce them.
 - 2026-09-19: base bumped 554c6f70674f → 98c8b8c43e7a (2026-09-19, "refactor: look up values among members, and drop the thread-local guard"; 3.29.0-SNAPSHOT); 21 bug(s) still reproduce. 7 tests pass.
 - 2026-09-24: generators rewritten in combinator style (`JavaGen` builds Generator values through a small `Gen` library, with memoised depth levels per flag set instead of draws inside helpers); bug 22 (`a instanceof T p < s`) found by `mutationsNeverCrash` in the rewrite's first review round. 7 tests pass, 22 expected failures.
 - 2026-09-25: generators unsteered (STYLE.md rule 11): they draw the known bugs' shapes, one narrow property per bug, `HEGEL_NO_KNOWN=1` switches the shapes off; the three round-trip properties no longer assume JavaParser's acceptance (a rejection of a javac-accepted program fails). 0 tests pass, 51 expected failures (50 when `mutationsNeverCrash` passes).
+- 2026-09-25: bug 23 (`x * this::m` parsed as `(x * this)::m`) found by a probe of bug 17's title while unsteering, pinned and given a narrow property; the wide generators draw a primary method reference as a right operand one time in 33. 0 tests pass, 53 expected failures.
