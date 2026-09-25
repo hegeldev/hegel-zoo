@@ -50,11 +50,15 @@ hex floats, octal and Unicode escapes, text blocks with escapes and `\<newline>`
 contextual keywords as identifiers, optional trivia (comments everywhere, odd white space, CRLF):
 
 - **`agreesWithJavac`** — javac accepts the program (else the generator is at fault: reported as
-  "generator"), JavaParser accepts it, and the two shapes are equal.
-- **`prettyPrintRoundTrip`** — `cu.toString()` is accepted by javac and by JavaParser with the same shape;
+  "generator"), JavaParser accepts it, and the two shapes are equal. Lands on bug 1 most runs (7, 5 and
+  22 in others).
+- **`prettyPrintRoundTrip`** — JavaParser accepts the program (a rejection of a javac-accepted program
+  fails here too), `cu.toString()` is accepted by javac and by JavaParser with the same shape;
   where the program has no legacy array brackets and no text blocks (documented `ArrayType.origin` and raw
   text-block differences), the reparsed unit `equals` the original with the same `hashCode`.
-- **`lexicalPreservationIsIdentity`** — `LexicalPreservingPrinter.setup(cu); print(cu)` is the original text.
+  Lands on bug 5 most runs.
+- **`lexicalPreservationIsIdentity`** — JavaParser accepts the program and
+  `LexicalPreservingPrinter.setup(cu); print(cu)` is the original text. Lands on bug 10 or bug 1.
 - **`positionsAreConsistent`** — every node has a range that ends after it begins and lies within its
   parent's (except a `VariableDeclarator`'s type, which JavaParser places before the declarator by design);
   literals and simple names cover exactly their own text; text blocks start and end with `"""`.
@@ -62,21 +66,40 @@ contextual keywords as identifiers, optional trivia (comments everywhere, odd wh
   is fine), `toString()`/`clone()` of the partial result never throw, and if javac's parser accepts the
   mutated text JavaParser does too with the same shape (only syntactic rejections count: JavaParser's
   validators check things javac checks after parsing).
-- **`fragmentParsersAgree`** — printed expressions and statements of the unit re-parse with
-  `parseExpression`/`parseStatement`/`parseBlock` to the same shape.
+- **`fragmentParsersAgree`** — JavaParser accepts the program, and printed expressions and statements of
+  the unit re-parse with `parseExpression`/`parseStatement`/`parseBlock` to the same shape. Lands on
+  bug 1 most runs.
 - **`cloneEqualsLaws`** — `clone()` is `equals` with the same `hashCode`, shape and printed form, has the
   same node classes and ranges (as a multiset), and shares no node or parent with the original.
 
-`JavaParserPinsTest`: one pin per bug in bugs.toml, asserting the JLS behaviour; all 19 fail today
-(`[expected_failures]`).
+`JavaParserPinsTest`: one pin per bug in bugs.toml, asserting the JLS behaviour; all fail today
+(`[expected_failures]`), as regression examples beside the properties.
 
-The generator avoids the shapes of the known bugs, which the pins carry: cast lambdas and method
-references appear only as whole arguments, parenthesised or as an assignment's right side (bugs 1, 17);
-`var` lambda parameters only outside variable initializers (2); no local enums (3); no `\` and no
-`\s` escapes (4–6); text blocks without white space after the opening delimiter and without form feeds
-(7, 8). The properties skip the rest: the round trips skip programs with `- -x`/`+ +x` (9) and the
-lexical-preservation check skips `int m()[]` (10); the position check exempts the five range bugs (11–15)
-and the clone check ignores pattern types (16).
+The generators draw the shapes of the known bugs (STYLE.md rule 11): cast lambdas and primary method
+references as first operands (bugs 1, 17), `var` lambda parameters in initializers (2), local enums (3),
+`\u005c` and `\s` escapes (4–6), text blocks with white space after the opening delimiter and with form
+feeds (7, 8), `- -x`/`+ +x` (9), `int m()[]` (10), `int x[]`, annotated type parameters and types,
+`final` in type patterns, qualified catch types (11–15), pattern types (16), `A { }` enum constants (18),
+Unicode-escaped identifiers (20), `var.X` qualifiers (21) and relational operators after `instanceof`
+(22). So the seven wide properties fail on them and are mapped to the bug each lands on most often
+(`mutationsNeverCrash` reaches the bugs only through the eighth of its mutations javac accepts and is
+mapped intermittent; `positionsAreConsistent` lands on 13, `cloneEqualsLaws` on 16), and one narrow
+property per bug draws that bug's shape region with random contents and fails every run:
+`castLambdaOperandsAgreeWithJavac` (1), `varLambdaParametersInInitializersAgreeWithJavac` (2),
+`localEnumsAgreeWithJavac` (3), `unicodeEscapedBackslashCharLiteralsAgreeWithJavac` (4),
+`spaceEscapesAgreeWithJavac` (5), `unicodeEscapedBackslashStringsAgreeWithJavac` (6),
+`textBlockOpeningWhitespaceAgreesWithJavac` (7), `textBlockFormFeedsAgreeWithJavac` (8),
+`nestedUnarySignsPrintBack` (9), `methodDimensionsPreserveText` (10),
+`typeParameterAnnotationsLieInsideTheirRange` (11), `typePatternModifiersLieInsideTheirRange` (12),
+`declaratorNamesExcludeTheirBrackets` (13), `catchParametersCoverTheirQualifiedType` (14),
+`typeAnnotationsLieInsideTheirType` (15), `patternTypesCloneAsChildren` (16),
+`methodReferenceOperandsAgreeWithJavac` (17), `enumConstantEmptyBodiesAgreeWithJavac` (18),
+`unqualifiedStaticImportsAndPermitsTypeArgumentsAreRejected` (19),
+`unicodeEscapedIdentifiersAgreeWithJavac` (20), `varQualifiedTypesAgreeWithJavac` (21) and
+`relationalOperatorsAfterInstanceOfAgreeWithJavac` (22). `HEGEL_NO_KNOWN=1` switches the shapes off:
+the generators draw the neighbouring shapes, the bugs' checks are left out (the position exemptions,
+the clone check's pattern types, the mutation classifier's tolerances, all under a fraction of a percent
+of nodes or cases) and every property passes.
 
 ## Not tested
 
@@ -117,3 +140,4 @@ not produce them.
 - 2026-09-19: base bumped 554c6f70674f -> 98c8b8c43e7a (2026-09-18, "refactor: look up values among members, and drop the thread-local guard"); bug 20 (Unicode escapes in identifiers) found by `mutationsNeverCrash` during the bump, bug 21 (`var.X`) by `agreesWithJavac`, and the javac assignment-target leniency gated. 21 bugs.
 - 2026-09-19: base bumped 554c6f70674f → 98c8b8c43e7a (2026-09-19, "refactor: look up values among members, and drop the thread-local guard"; 3.29.0-SNAPSHOT); 21 bug(s) still reproduce. 7 tests pass.
 - 2026-09-24: generators rewritten in combinator style (`JavaGen` builds Generator values through a small `Gen` library, with memoised depth levels per flag set instead of draws inside helpers); bug 22 (`a instanceof T p < s`) found by `mutationsNeverCrash` in the rewrite's first review round. 7 tests pass, 22 expected failures.
+- 2026-09-25: generators unsteered (STYLE.md rule 11): they draw the known bugs' shapes, one narrow property per bug, `HEGEL_NO_KNOWN=1` switches the shapes off; the three round-trip properties no longer assume JavaParser's acceptance (a rejection of a javac-accepted program fails). 0 tests pass, 51 expected failures (50 when `mutationsNeverCrash` passes).
