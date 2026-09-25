@@ -70,7 +70,7 @@ spaces or newlines (both processors' resolution is arbitrary), an empty node und
 property, a reverse term with an `@index` container (both compact it to an index map inside an
 array and then expand that differently).
 
-## Known bugs (gated)
+## Known bugs
 
 Fourteen bugs (`bugs.toml`): relative IRI compaction against a base ending in `/` climbs one
 directory too many (the compacted `@id` denotes another resource); IRI resolution
@@ -81,8 +81,18 @@ and fails on numbers beyond int64/float64; the N-Quads parser mangles a literal 
 `@` that has a language tag; the serializer writes an empty language tag for rdf:langString
 without a language; `ToRDF` writes `<@id>`; errors inside `@set`/`@list` items are swallowed;
 an empty `@list` under a typed term is not compacted to the term; a documentation default.
-`hegel/known.go` gates them by generated shape or by the shape of the one disagreement;
-`HEGEL_NO_KNOWN=1` lifts the gates.
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11): the
+properties fail on the bug they meet, with the shape named in the failure message, and are
+listed in `[expected_failures]` mapped to the basin the shrinker lands in most (`Expand`,
+`ToRDF` and `Normalize` on bug 2, `Compact` on 3, `Flatten` on 4, the compact/expand round
+trip on 1, `FromRDF` on 7, the N-Quads parse on 9, the RDF round trip on 6; the ones whose
+shape is a few percent of cases are marked intermittent), the pins beside them as the
+regression examples. `HEGEL_NO_KNOWN=1`, read once, switches the known shapes off in the
+generators (`docOpts`/`nqOpts` per property) and every property then passes at 1000 cases;
+the shapes that live in the output of ordinary inputs (bugs 2, 3, 4, 11 and 13: `{}`, an
+empty `@list`, a percent-encoded IRI) are recognised in `hegel/known.go` by comparing the two
+outputs up to the defect. Narrow one-per-bug properties in the style of the other rewritten
+targets are still to come.
 
 ## Not tested
 
@@ -95,3 +105,12 @@ contexts and document loaders, HTML extraction, `@json` literals, `@direction`/`
 
 - 2026-09-20: written against 667ee761535c9c52c0d5c40b7dd863fa56454be9 (2026-09-12, v0.8.0+8)
   with hegel.dev/go/hegel v0.6.33; 14 bugs.
+- 2026-09-25: generators rewritten in combinator style (`hegel/gen.go`: word, IRI, literal
+  and context pools as generator values, the document grammar recursive through a deferred
+  generator, one case record per property) and the known-bug gates turned off by default.
+  Tolerances added: an empty compaction (`{}` vs pyld's `{"@graph":[]}`) is not judged; quads
+  whose IRI is ill-formed after percent-decoding are dropped before comparing (pyld skips them,
+  json-gold percent-encodes); the empty-list and empty-graph recognisers also cover an index or
+  value map emptied by the stripping. The string-under-`xsd:double` check now descends into
+  `@list`/`@set`. Bug 8 has a second door: the value `"id"` under a `@vocab`-typed term reaches
+  `@id` through the `id` alias.
