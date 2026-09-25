@@ -25,10 +25,13 @@ so that every field of every generated UUID is predicted exactly from the script
 - `TestHegelParseAgreesWithPython` — canonical/hash forms, braced, `urn:uuid:`-prefixed, random
   hex case: `FromString`, `FromStringOrNil`, `Parse`, `UnmarshalText`, `Scan` (string and text
   bytes), `json.Unmarshal` into `UUID` and `NullUUID` agree with Python; `String`, `MarshalText`,
-  `Value`, `%v %s %x %X %S %q %#v` are Python's spellings. Clean.
+  `Value`, `%v %s %x %X %S %q %#v` are Python's spellings; a quarter of the JSON literals carry a
+  `\u00XX` escape, which finds /3.
 - `TestHegelParseFollowsTheDocumentedGrammar` — near-valid text (mutations, wrong-case prefixes,
   other brackets, junk of plausible lengths): the grammar and its error values; `FromStringOrNil`
-  is Nil on error; accepted text parses identically in Python. Clean.
+  is Nil on error; accepted text parses identically in Python; the receivers are prefilled and
+  a rejected text must leave them unchanged and a `NullUUID` invalid, which finds /1 (and draws
+  the shape of /2).
 - `TestHegelFieldsAgreeWithPython` — arbitrary bytes: `Version`, `Variant`, `TimestampFromV1`
   vs Python's `time` (and the v6/v7 layouts), the version guards (`ErrInvalidVersion`),
   `Timestamp.Time` inverting the tick count, the clock-sequence/node layouts, `SetVersion`/
@@ -43,16 +46,23 @@ so that every field of every generated UUID is predicted exactly from the script
   `rand_b` from the stream, clamping for a backwards clock vs honouring an older explicit
   instant, strict ordering otherwise), v8 (custom fields with the bits set; wrong lengths are
   `ErrV8FieldLength`), and streams too short for the request (errors and Nil, never a panic).
-  Clean.
+  Three in ten scripts use instants outside 1678-2262, which finds /4.
 - `TestHegelEncodingsRoundTrip` — JSON (struct with `UUID`, `NullUUID` incl. null, a slice),
   `NullUUID.MarshalJSON`/`UnmarshalJSON`, text/binary, `FromBytes`/`FromBytesOrNil`,
   `Value`→`Scan` for strings, 16-byte binaries, text bytes and `UUID` values on fresh
   destinations, `NullUUID.Scan(nil)`, unsupported sources (`ErrTypeConvertError`), wrong binary
   lengths (`ErrIncorrectByteLength`). Clean.
 
-What the general generators avoid (pinned separately): `Scan`/`Parse` into a non-fresh
-destination with rejected text (/1, /2), JSON numbers or escapes for `NullUUID` (/3), instants
-outside 1678–2262 for `NewV1AtTime`/`NewV6AtTime` (/4).
+The generators draw the shapes of the known bugs and the properties that meet them are the
+expected failures mapped to the bugs (STYLE.md rule 11): the three wide properties above, and
+one narrow property per bug on its shape region with random contents —
+`TestHegelNullUUIDScanOfRejectedSourceClearsValid` (/1),
+`TestHegelRejectedTextLeavesTheReceiverUnchanged` (/2), `TestHegelNullUUIDUnmarshalJSONReadsJSON`
+(/3, JSON numbers and escapes into `NullUUID`) and
+`TestHegelTimeBasedAtTimeRejectUnrepresentableInstants` (/4). The four `TestHegelPin*` tests are
+the regression examples. `HEGEL_NO_KNOWN=1` switches the shapes off: the generators draw the
+neighbouring regions (fresh receivers, plain JSON strings, instants inside 1678-2262) and every
+property passes.
 
 ## Bugs
 
