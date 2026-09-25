@@ -48,12 +48,29 @@ in go.mod.
 | CompressingReaderMatchesTheWriter | `CompressingReader` with the same options as a `Writer` produces the same bytes, read with random buffer sizes (including one byte); `Source`, `Close` closes the source, `OnBlockDone` once per block |
 | OptionsAndStatesFollowTheContract | `Option.String`; invalid block sizes and levels; inapplicable options on a Reader; Apply after the first Write or Read; Write and ReadFrom after Close; Close twice; Reset writes the same frame again with the same options; Reader Reset and Apply; empty, truncated and garbage inputs give `io.EOF`, `io.ErrUnexpectedEOF` and `ErrInvalidFrame` |
 
-`Known` switches gate the fourteen recorded bugs (the generators avoid the shapes: options
-applied in one call, ReadFrom only on a fresh Writer, frames ordered so that WriteTo keeps its
-buffer, no legacy frame before another kind, handler checks on non-concurrent Writers). With
-them on, the seven properties run clean at 1000 cases in about six seconds (`LZ4_COLLECT=1`
-records mismatches instead of failing and prints them shortest-first with the case's
-description; `HEGEL_VERBOSE=1` turns on the engine's log).
+`LZ4_COLLECT=1` records mismatches instead of failing and prints them shortest-first with the
+case's description; `HEGEL_VERBOSE=1` turns on the engine's log.
+
+## Known bugs
+
+The generators draw the shapes of the fourteen recorded bugs by default (options applied in
+several calls, ReadFrom after a Write, frames in any order, legacy frames before other kinds,
+handler checks on concurrent Writers, frames cut anywhere), and the properties that reach them
+are the expected failures mapped to the bugs (STYLE.md rule 11): `WriterFramesFollowTheSpec`
+lands on lz4/2 or lz4/8 (the basin is fixed for a given test binary and moves when the binary
+changes, so it is declared intermittent), `ReaderAcceptsSpecAndReferenceFrames` on lz4/12,
+`CorruptFramesAreRejected` on lz4/6 and `OptionsAndStatesFollowTheContract` on lz4/13. One
+narrow property per bug in `hegel_shapes_test.go` draws only that bug's shape and fails every
+run: `SizeOptionSurvivesASecondApplyAndReset` /1, `ReadFromCallsTheHandlerOncePerBlock` /2,
+`ReadCallsTheHandlerOncePerBlock` /3, `ReaderRejectsUnknownVersionsAndReservedBits` /4,
+`ReaderChecksTheContentSize` /5, `FramesCutBeforeTheEndMarkAreRejected` /6,
+`LegacyBlocksAreNotMistakenForTheSizeTrailer` /7, `ReadFromFollowsEarlierWrites` /8,
+`LegacyFramesMayBeFollowedByOtherFrames` /9, `HandlerCallsCompleteBeforeClose` /10,
+`WriteToReadsEveryFollowingFrame` /11, `WriteToOnAStreamWithoutFramesIsNotAnError` /12,
+`RefusedApplyLeavesTheObjectUsable` /13, `SizeSurvivesTheEndOfTheFrame` /14.
+`HEGEL_NO_KNOWN=1`, read once, switches the known shapes off (the generators stop drawing
+them, the narrow properties are skipped) and every property passes. The pins in
+`hegel_pins_test.go` stay as regression examples.
 
 ## Bugs (14; details in bugs.toml)
 
@@ -107,3 +124,12 @@ with the format and the reference on every generated block.
 
 The `cmd/lz4c` command, `internal/` packages directly, the frozen `--favor-decSpeed` levels of
 the reference beyond decoding its output, and performance.
+
+## History
+
+- 2026-09-25: generators rewritten in combinator style (STYLE.md) and unsteered: the
+  properties draw the recorded bugs' shapes and are mapped to them, fourteen narrow
+  properties added in `hegel_shapes_test.go`, `HEGEL_NO_KNOWN=1` switches the known shapes
+  off; lz4/6 gained a third cut (a block-size field with nothing after it). Two latent
+  defects of the old test fixed: the block builder's tail budget for a literal-only ending,
+  and `Size()` demanded of a legacy reference frame, which carries none.
