@@ -266,7 +266,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -844,3 +844,32 @@ excused agreeing texts), the usual shape of a gate written beside the model. Six
 properties were declared intermittent on an observed pass (uniseg's widths at 100 cases twice
 in three), and go-git's example database lives under the package directory
 (`work/go/go-git/hegel/.hegel`), which the cleanup between runs has to know.
+
+The thirty-fifth batch (turn 490: cast, masterminds-semver, koanf, brotli and compress rewritten
+straight to the standard; 37 narrow properties) found no new bug and several things the gates
+had been hiding in the tests themselves. koanf's model had three latent defects that only a
+drawn shape could reach (the strict conflict check ran after the existing subtree was removed,
+so a strict `Set` over a leaf reported no error; the koanf/5 shape test missed a `map[any]any`
+under a `map[string]any` in a slice in a slice; the Copy/Cut comparisons lacked the koanf/2
+shape). compress's corruption property, once it drew the truncated-deflate shape, also met two
+oracle differences the old test had never reached: klauspost refuses a gzip header with a
+reserved FLG bit where the standard library ignores it (RFC 1952 says the bits must be zero,
+so tolerated, not recorded), and a zstd frame asking for a 144 MiB window is decoded by
+klauspost up to its documented 512 MiB cap but refused by the tool's default 128 MiB limit,
+so the property now passes `--memory` to the tool. One shape cannot be drawn by a wide
+generator and lives in its narrow property alone: koanf/6, a key containing the delimiter,
+which the flat-key model cannot represent; others are drawn but never the basin (cast/7 and
+cast/11 sit behind cast/12 in the map property, which a failing run reports first). Basin
+splits were as before (brotli's Encoders 4:3 between /6 and /1, koanf's Operations 10:3:1,
+masterminds-semver's Constraints mostly /5 with /3, /4 and /7 in the rest): mapped to the
+majority, plain. A nominally rare shape can be met every run because Hegel starts at the
+smallest case (compress/4 is the empty `EncodeAll` frame, 0.1 % of cases and found first in
+every run so far); it is declared intermittent on its rate, not its record. A check that only
+a recorded bug can fail and that fires on a large share of cases (cast's out-of-range
+integers at 60 %, brotli's Reset after trailing bytes at 11.6 %) is skipped by name under
+`HEGEL_NO_KNOWN=1` rather than assumed away, the rest of the case still judged. One rewrite
+hung for ten minutes on a tape-driven reader that could return `(0, nil)` forever where the
+PRNG it replaced could not: a drawn list that drives a reader needs the progress guarantee the
+random source gave for free. Two subagents put the mapping into target.toml for their own
+verification runs and restored the committed file before reporting; that is fine, and the
+template now says so.
