@@ -31,15 +31,26 @@ mean:
 
 ## Properties
 
-| Test | What it checks | Gates |
+| Test | What it checks | Lands on |
 | --- | --- | --- |
-| `SequencesDecodeToTheirEvents` | every encoded event decodes to itself, consuming exactly its bytes, leaving the buffer untouched, with a non-empty `String()` | the pinned shapes (/1 alternate keys with a base key, /2 event types on `~` keys, /3 num lock) are counted, `CSI n $` is exempt from the immutability check (/4) |
-| `StreamsSplitIntoTheirEvents` | 1–6 encoded events back to back parse (via `parseSequence` and via `Reader.ReadEvents`) into the concatenated event lists | a lone ESC or `ESC ESC` only as the last event (alt+esc followed by a key is ambiguous by nature); `CSI 1;mod R` alone skips the Reader check (whole-buffer table lookup gives F3 only, by design) |
-| `KittyAndModifyOtherKeysAgree` | `CSI code;mod u` and `CSI 27;mod;code ~` give the same code and modifiers (shift/alt/ctrl), and the same text without shift | — |
-| `KeyTableAgreesWithTheParser` | every built-in table entry for random flags and terminals decodes to the same key (F3/CPR ambiguity allowed) | terminfo-sourced entries (/10), `ESC`/`ESC ESC` with `FlagCtrlOpenBracket` (/9) |
-| `ReaderPastesRoundTrip` | bracketed paste of random text (including ESC, `[`, digits, `~`, controls) through the Reader, between other events | pastes containing the end marker; reads over 250 bytes (the Reader's buffer is 256) |
-| `GraphemesAreOneKey` | a multi-rune grapheme cluster is one `KeyExtended` press with the whole text | clusters starting with an ASCII byte (/6) |
-| `Examples` | fixed examples from the protocols | — |
+| `SequencesDecodeToTheirEvents` | every encoded event decodes to itself, consuming exactly its bytes, leaving the buffer untouched, with a non-empty `String()` | bug 6 (an ASCII-led cluster); the shapes of bugs 1, 2, 3 and 4 are drawn too |
+| `StreamsSplitIntoTheirEvents` | 1–6 encoded events back to back parse (via `parseSequence` and via `Reader.ReadEvents`) into the concatenated event lists; a lone ESC, `ESC ESC`, `ESC` + introducer and `CSI n $` only as the last event (ambiguous with a follower by nature); `CSI 1;mod R` alone skips the Reader check (whole-buffer table lookup gives F3 only, by design) | bug 6 |
+| `KittyAndModifyOtherKeysAgree` | `CSI code;mod u` and `CSI 27;mod;code ~` give the same code and modifiers (shift/alt/ctrl), and the same text without shift | clean |
+| `KeyTableAgreesWithTheParser` | every built-in and terminfo table entry for random flags and terminals decodes to the same key (F3/CPR ambiguity allowed) | bug 10 in most runs (about four cases in a thousand; bug 9's shape is rarer), passing a default run now and then |
+| `ReaderPastesRoundTrip` | bracketed paste of random text (including ESC, `[`, digits, `~`, controls) through the Reader, between other events; pastes containing the end marker and reads over 250 bytes (the Reader's buffer is 256) are not drawn | bug 6 or 1 through the neighbouring events, passing a default run now and then |
+| `GraphemesAreOneKey` | a multi-rune grapheme cluster is one `KeyExtended` press with the whole text | bug 6 |
+| `Examples` | fixed examples from the protocols | clean |
+
+One narrow property per bug draws its region with random contents and is the deterministic
+expected failure mapped to it: `KittyAlternateKeysKeepTheShiftedKey` (1),
+`TildeKeysHonourEventTypes` (2), `NumLockKeepsTheKeyText` (3),
+`URxvtDollarKeysLeaveTheInputUntouched` (4), `InvalidUTF8BytesAreReportedRaw` (5),
+`ASCIILedGraphemeClustersAreOneKey` (6), `AltIntroducerKeysLookLikeOtherAltKeys` (7),
+`CSIWithManyParametersIsConsumedWhole` (8), `CtrlOpenBracketFlagAppliesToALoneEscape` (9),
+`TerminfoKeysParseLikeTheTable` (10). A failure names the shape it hit. `HEGEL_NO_KNOWN=1`
+(read once) looks past the recorded bugs: the pools are built without the shapes and the narrow
+properties draw the neighbouring region (caps lock for 3, C1 bytes for 5, `] _ ^` introducers
+for 7, up to 32 parameters for 8, ...); every property then passes.
 
 Each `TestHegelPin…` reproduces one bug and is an expected failure. `XINPUT_COLLECT=1` turns
 failures into a tally per property. Pin /10 needs the `screen`, `vt220` and `tmux` terminfo
