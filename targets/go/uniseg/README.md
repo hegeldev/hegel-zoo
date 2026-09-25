@@ -36,29 +36,42 @@ break rule.
   equal the reference; `FirstWord[InString]`/`FirstSentence[InString]` equal it; `Step`'s
   word/sentence flags equal it at cluster ends; the final cluster carries all three boundaries
   and `LineMustBreak`; byte and string forms agree; `GraphemeClusterCount` is the cluster count.
-  Clean.
+  Lands on bug 3 (a word boundary inside a cluster, after a Prepend or before SARA AM); the
+  shapes of bugs 5, 6 and 8 are drawn at their natural rates too.
 - `TestHegelWidthsFollowTheDocumentedRules` — every cluster width from `Step` and
   `FirstGraphemeCluster`, and `StringWidth` as their sum, follow doc.go's rules with
-  `EastAsianAmbiguousWidth` 1 or 2. Clean.
+  `EastAsianAmbiguousWidth` 1 or 2. Lands on bug 2 most runs (a syllable plus a vowel jamo,
+  width 3), on bug 1 in others, and passes a default run now and then (intermittent).
 - `TestHegelGraphemesIteratorMatchesStep` — `Graphemes` before, during and after iteration and
   after `Reset`: `Positions` (0,0 / 1,1 sentinels), `Str`, `Bytes`, `Runes`, `Width`,
   `IsWordBoundary`, `IsSentenceBoundary`, `LineBreak`, `String`. Clean.
 - `TestHegelLineSegmentsMatchStepFlags` — `FirstLineSegment[InString]` cut exactly where `Step`
-  flags a break opportunity at a cluster end (cuts inside clusters are noted, see uniseg/3), the
-  `mustBreak` flag equals `LineMustBreak`, the last segment must break (LB3), `HasTrailingLineBreak`
-  both forms agree and match the final rune, and a mandatory break in the middle follows exactly
-  BK/CR/LF/NL (the two pinned shapes noted, not judged). Clean.
+  flags a break opportunity at a cluster end, the `mustBreak` flag equals `LineMustBreak`, the
+  last segment must break (LB3), `HasTrailingLineBreak` both forms agree and match the final
+  rune, and a mandatory break in the middle follows exactly BK/CR/LF/NL. Lands on bug 3 (a cut
+  inside a cluster, before an emoji modifier); the shapes of bugs 4 and 7 are drawn too.
 - `TestHegelReverseStringReversesClusters` — the clusters in reverse order; an involution when
   the reversed text re-segments into the same clusters. Clean.
 
-What the general generators avoid or do not judge (pinned separately): text-presentation
-pictograph + modifier/ZWJ sequence widths (/1), LV/LVT + trailing jamo widths (/2), word,
-sentence and line boundaries inside clusters (/3), the line flag after an emoji modifier (/4),
-U+FFFD after an ATerm (/5), a terminator followed by a paragraph separator (/6), a newline
-followed by a hyphen and a digit (/7), a ZWJ between spaces (/8). Not judged and
-not recorded: clusters starting with a V or T jamo, VS16 after a non-pictograph (doc.go is
-ambiguous on both), and ZWJ + Extend/Format + pictograph for WB3c (the UCD test file has no such
-case; the package keeps them in one word, the literal rule order breaks).
+The generators draw the known bugs' shapes at their natural rates, and one narrow property per
+bug draws its region (random contents around the shape) and is the deterministic expected
+failure mapped to it: `TestHegelTextPictographSequencesAreTwoCellsWide` (1),
+`TestHegelSyllablesWithTrailingJamoAreTwoCellsWide` (2),
+`TestHegelStepReportsTheWordBoundaryAfterAPrepend` (3),
+`TestHegelNoMandatoryBreakAfterAnEmojiModifierSequence` (4),
+`TestHegelSentenceLookAheadReadsPastReplacementCharacters` (5),
+`TestHegelSentenceTerminatorBeforeAParagraphSeparator` (6),
+`TestHegelMandatoryBreakSurvivesAHyphenAndDigit` (7) and
+`TestHegelZWJBetweenSpacesDoesNotJoinThem` (8). A failure names the shape it hit. The
+`TestHegelPin*` tests are regression examples of the recorded cases. `HEGEL_NO_KNOWN=1` looks
+past the recorded bugs: the narrow properties draw the neighbouring shape instead (a text
+pictograph alone, a syllable with a spacing mark, ...), and the wide properties skip only the one
+check that a known shape decides (a boundary inside a cluster, a known width, a known flag),
+still judging the rest of the case; every property then passes. Not judged and not recorded:
+clusters starting with a V or T jamo, a Hangul syllable or jamo followed by a mark or ZWJ (doc.go's
+Hangul rule is for clusters composed of conjoining jamo), VS16 after a non-pictograph (doc.go is
+ambiguous on both), and ZWJ + Extend/Format + pictograph for WB3c (the UCD test file has no such case; the package
+keeps them in one word, the literal rule order breaks).
 
 ## Bugs
 
