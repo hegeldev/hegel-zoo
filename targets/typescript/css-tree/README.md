@@ -43,8 +43,19 @@ grammars (definition-syntax AST), and a third builds random definition-syntax AS
 | `TestHegelDefinitionSyntaxRoundTrips` | random definition-syntax ASTs generate/parse/generate to the same text, `walk` counts and `decorate`; the real grammars round-trip and `lexer.dump()` (compact and pretty) equals `definitionSyntax.generate` |
 
 `ZOO_COLLECT=1` turns mismatches into `# COLLECT` counts instead of failures; `HEGEL_TEST_CASES`
-(default 100) widens the sweep. Known bugs are gated through the `Known` switches at the top of
-`hegel/hegel.test.mjs`, so the properties pass while the pins in `hegel/pins.mjs` fail.
+(default 100) widens the sweep. The generators draw the recorded bugs' shapes by default (the
+`KNOWN:` comments in `hegel/gen.mjs` mark them: whitespace-only `url( )`, backslash-newline in custom
+properties, relaxed nested rules, nested `@layer` blocks, whitespace before media commas, `style()`
+junk in `@container`, NUL and `\url(` in the token soup, a CDC-making `-- >`, ...), and a property
+that meets one fails naming the shape (`knownMismatch`/`knownWrong` with the `SHAPE` table of
+`hegel/hegel.test.mjs`), so the tokenizer, fixpoint, walk, names and positions properties are
+expected failures, each mapped to the bug it most often shrinks to (the lexer reaches css-tree/21
+only in long runs). Section 10 of `hegel.test.mjs` adds one narrow property per bug (all but
+css-tree/7, which the positions property finds alone in 65% of its cases) over that bug's shape
+region with random contents, through the same `checkX(tc, ...)` oracle as the wide property; the
+pins in `hegel/pins.mjs` stay as regression examples. `HEGEL_NO_KNOWN=1` leaves the shapes out of
+the generators, skips the rare case that still has one (about 2% of tokenizer cases, a `"\n`
+bad-string) and registers the narrow properties skipped.
 
 ## Bugs
 
@@ -101,5 +112,9 @@ Source map output (`generate(ast, {sourceMap: true})`), the `TokenStream` class,
   the harness is js-joda's; one case record per property). The rewritten shapes (whitespace before media
   commas, quoted grammar tokens before commas, signed numbers after unicode ranges, `expression()` with
   unbalanced content) found css-tree/17-24; the fixpoint property's clean path rose from about 60% to
-  84% of cases. The known-bug gates fire on 0.1-2.4% of cases each (measured with ZOO_COLLECT=1 over
-  20000 cases); the media comma gate (17) is the largest at 0.8%.
+  84% of cases. The known-bug gates fired on 0.1-2.4% of cases each (measured with ZOO_COLLECT=1 over
+  20000 cases); the media comma gate (17) was the largest at 0.8%.
+- 2026-09-25: the generators draw the recorded shapes by default and 23 narrow properties were added
+  (see above); the default shape rates per wide case are css-tree/7 65%, /6 23%, /5 10%, /8 6.6%,
+  /12 3.3%, /14 3.1%, /9 3.0%, /4 2.8%, /1 and /15 2.5%, /3 1.2-1.5%, the rest under 1%, /21 not
+  reached in 1000 lexer cases (measured with ZOO_COLLECT=1 over 1000 cases).
