@@ -58,7 +58,17 @@ requests instantiating a template with plain and percent-encoded segment values,
 - `TestHegelRouters`: the legacy and gorillamux routers find the route the rules give, with the
   path parameters' values, or report a missing path or method (ambiguous documents, several
   templated matches with no concrete one, are skipped).
+- Eighteen narrow properties in `hegel_zoo_shapes_test.go`, one per recorded bug, each a
+  generator over the bug's shape region with random contents judged by the same oracle
+  (`TestHegelConstNullSchema`, `TestHegelParamBoolSpellings`, `TestHegelLegacyTrailingVariable`,
+  ...): the deterministic expected failure of each bug.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
+
+The generators are combinator values (`hegel_zoo_test.go` holds the idioms: `weighted`, `chance`,
+`maybe`, `pairs`, `many`, `deferred`, `positions`, `shaped`/`known`): schemas from a memoised
+grammar per dialect with keyword fragments merged into a node, values guided by the node,
+parameters as a record of layout, value, presence and malformation, documents as lists of path
+items with requests rendered against the live document.
 
 ## Bugs
 
@@ -77,19 +87,22 @@ splits after percent-decoding so `%2F` separates segments (16), and returns enco
 values when the document has servers (18); the gorillamux router returns encoded values always
 (17).
 
-## Modelled as recorded
+## Known shapes
 
-Every bug has an `HZKnown` switch. While a switch is on the generator keeps away from the
-shape or the checks skip it: no `const: null`; the 2020 mode not compared when `nullable`
-occurs; no enum/const/not/combinator beside `nullable` or a null type; a combinator with a
-nullable branch dropped from a typed parent; integer formats only where the type requires an
-integer; values of magnitude 2^51 or more not judged against `multipleOf`, 2^63 or more not in
-the 2020 mode with `format: int64`; a type added to an otherwise empty `not`/`oneOf` schema;
-the Go-syntax and ParseBool texts not sent; gorillamux's (and, with servers, legacy's) parameter
-values decoded before comparison; the legacy router not compared for a missing method on a
-templated path, a concrete path with another matching template, a path that is a template's
-prefix, or `%2F`. The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns switches
-off and the properties then fail.
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): `const: null`, nullable
+schemas compared in the 2020 mode, enum/const/not/combinators beside `nullable`, integer formats
+on number-typed values, 2^53 against `multipleOf`, 1e300 against `format: int64`, empty `not` and
+`oneOf` schemas, the Go-syntax and ParseBool texts, encoded parameter values compared as decoded,
+the legacy router compared on every request. A mismatch names the bug whose shape it has (the
+`Known` switches keep the shape tests) and the property fails: `TestHegelRouters` every run
+(bugs 15 and 17 are the most frequent shapes), `TestHegelSchema` and `TestHegelParameters` in
+most runs (their shapes are a few percent of cases), and each narrow property on its own bug.
+`HEGEL_NO_KNOWN=1`, read once, switches the known shapes off: the narrow properties skip, the
+wide ones skip a mismatching case only when it has a known shape (measured at a fraction of a
+percent of cases), the 2020 comparison is left out for schemas holding `nullable` (8.7% of
+cases) and requests the legacy router would mishandle are reshaped rather than skipped (`%2F` to
+`%20`, trailing slashes dropped, a method the item has for a templated path), so the test passes
+and shows what the library gets right beside the recorded bugs.
 
 ## Not judged
 
@@ -114,3 +127,5 @@ schema), server variables and per-path servers in the routers.
 ## History
 
 - 2026-09-22: new target, three properties, 18 bugs.
+- 2026-09-26: generators rewritten in combinator style; the known shapes are drawn by default
+  and eighteen narrow properties, one per bug, are the expected failures beside the pins.
