@@ -22,8 +22,14 @@ directly. Two caveats, both handled in the tests:
   each such case is listed under "Not bugs" below. Every recorded bug was checked against the
   classic semantics as well (the documented contract, RFC 8259, or behaviour go-json itself
   shows elsewhere).
-- Go 1.27.1's `encoding/json.Indent` loops forever on at least one invalid input with a
-  non-empty prefix and an empty indent (the mutated text
+- Go 1.27.1's `encoding/json.Indent` (`v2_indent.go`) is wrong when the prefix holds
+  characters other than space and tab and the text's trailing whitespace holds a newline
+  followed by more spaces than the prefix is long: with an empty indent its
+  placeholder-replacement loop never returns (`Indent(&b, []byte("null\n  "), "\n", "")`
+  hangs), otherwise it overwrites the trailing spaces with the prefix (`"null\n  "` with
+  prefix `"xx"` gives `"null\nxx"`). `indentOracleBroken` skips only the Indent output
+  comparison on those inputs (Valid and Compact are still compared, and go-json's Indent is
+  still checked to succeed). It first showed as a hang on a mutated text
   `"\t\r [[\n [-0],\r\n\r{\"&\\u005B\":\n  \"à\\u0022\",\"\":63721660033986015349.584769,\t\n\"\u2029日本\":true \n\r,\"-0Ȥ\":-356165845450043768.3E+32}],fal:se,\"Ĥᆕÿÿ\",\",\\/\\f\"\n ]"`
   with prefix `"\n"`), so the Indent comparison only calls the oracle on texts it considers
   valid; for the others its contract is simply an error. Not a go-json matter, but worth a
@@ -55,17 +61,29 @@ directly. Two caveats, both handled in the tests:
 - `TestHegelMarshalUnmarshalRoundTrip` — go-json alone: `Unmarshal(Marshal(v))` re-encodes to
   the same bytes for the struct universe and for `interface{}` trees.
 
-The generators avoid the pinned shapes and say where: floats in [1e-9, 1e-6) (go-json/13),
-`\b`/`\f` on the encode side (/23), map keys that need escaping, are empty or contain bytes
-below `"` (/14), zero-length arrays under `omitempty` (/15), pointer-receiver Marshalers in
-arrays (/16), trailing whitespace for `Indent` (/18), out-of-range numbers (/22), mutations
-that would split a number or an escape or leave a value before a stray bracket or after a
-leading comma (/7, /10, /24), and optional escapes in the text given to the stream `Decoder`
-(/25). All six pass at 1000 cases × 10 (about 3 s); 25 pinned expected failures. The run
-command carries `-vet=off` because Go 1.27's vet rejects three upstream test files (printf
-checks), which would otherwise fail the build of the test binary.
+**`hegel_shapes_test.go`**: one narrow property per recorded bug (twenty-six), each a
+generator over that bug's shape region with random contents (a float in [1e-9, 1e-6), a `\b`
+or `\f` between two words, map keys that need escaping, a zero-length array under
+`omitempty`, a number with a three-digit exponent, a stray closer after a value, a `\u`
+escape in a struct key at a buffer boundary, ...), judged by the same helper as the wide
+property that found it, so every bug has a deterministic expected failure that shrinks to a
+minimal example. **`hegel_pins_test.go`**: the 26 pins, the regression examples.
 
-## Bugs (25)
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11): the wide
+properties fail on the first shape they meet, named in the failure message, and are listed in
+`[expected_failures]` mapped to the basin the shrinker lands in (`Marshal` on /9,
+`UnmarshalIntoStructs` on /5, `Valid`/`Compact`/`Indent` on /18, `DecoderStream` on /10, the
+round trip on /3, marked intermittent since a non-finite float32 is a few percent of cases; `UnmarshalIntoInterface` passes, since both libraries reject the numbers it
+would differ on). `HEGEL_NO_KNOWN=1`, read once into a `Known` struct, switches the shapes
+off: the wide generators draw the neighbouring region instead (two-digit exponents, spaces
+for `\b`, ASCII keys, ...) and so do the narrow ones, and every property passes at 3000
+cases. Filters are rare (a float in the padded band 0.2-0.8% of draws, an edited text with a
+known shape 14% per draw behind Hegel's three retries) and the one `Assume` (a `Number`
+beyond float64 in the struct universe under `HEGEL_NO_KNOWN=1`) fires on about 2% of cases.
+The run command carries `-vet=off` because Go 1.27's vet rejects three upstream test files
+(printf checks), which would otherwise fail the build of the test binary.
+
+## Bugs (26)
 
 | id | title | severity |
 |----|-------|----------|
@@ -94,6 +112,7 @@ checks), which would otherwise fail the build of the test binary.
 | go-json/23 | `\u0008`/`\u000c` where encoding/json (Go ≥ 1.22) writes `\b`/`\f` | low |
 | go-json/24 | A stray `]`/`}` after a top-level value is fine for Valid and Decoder.Token | low |
 | go-json/25 | The stream Decoder fails on valid input when a `\uXXXX` escape in a struct key straddles its buffer refill | medium |
+| go-json/26 | A well-formed number outside float64 range cannot be decoded into a `json.Number` | medium |
 
 Most came out of a hand-written differential probe of edge cases run before the properties
 (/2–/4, /6–/9, /11–/13, /15–/22); the properties themselves added /14's prefix-key and
@@ -130,3 +149,9 @@ as a 17-field struct in the probe behaving differently from an 8-field one.
 - `MarshalNoEscape`, `UnmarshalNoEscape`, the `*Context` variants, `path.go`/`query.go` (JSON
   path and field queries) and the colour/debug output are not covered.
 - 2026-09-20: base bumped f1e755401429 → 15fe6a58bfc7 (2026-09-21, "Add bench-check task to fail CI on performance degradation (#623)"; v0.10.6+); 25 bug(s) still reproduce. 177 tests pass.
+- 2026-09-26: generators rewritten in combinator style (weighted choices, `chance`, `maybe`,
+  one case record per property rendered by a tape-driven writer, edits as mutation lists
+  applied modulo the live text) and the known-bug steering turned off by default;
+  `hegel_shapes_test.go` (26 narrow properties) and `hegel_pins_test.go` split out. go-json/26
+  recorded (a `Number` beyond float64 is rejected), bug 6's notes gained `"5 "` and bug 7's
+  title `-.0`, both met by the freed shapes and reproduced standalone.
