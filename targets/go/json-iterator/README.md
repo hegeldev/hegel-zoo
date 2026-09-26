@@ -52,18 +52,25 @@ encoder output, `reflect.DeepEqual` on decoded values, the same verdict on valid
 - `TestHegelMarshalUnmarshalRoundTrip` — json-iterator alone: `Unmarshal(Marshal(v))` re-encodes
   to the same bytes for the struct universe and for `interface{}` trees.
 
-The generators avoid the pinned shapes and say where: indents other than runs of spaces (/1, /2,
-/4), empty maps (/3), containers as map values and container RawMessages under indentation
-(/5, /14), texts with anything after the first value and bare top-level numbers in the `Valid`
-property (/6, /7), `0.`-mantissa literals with exponents above 38 and out-of-range numbers
-(/8, /9), the `Decode` call after the last value of a stream (/10), a scalar Marshaler output and
-RawMessages without `<`, `>`, `&` (/14), `\b`/`\f` and invalid UTF-8 on the encode side (/15,
-/16), mutations inside a multi-byte character (/20), `\u` escapes in struct texts (/30), a bare
-`null` RawMessage (/24), negative numbers with leading zeros and inserted tabs in the `Valid`
-property (/31, /32), a surrogate pair right after a lone surrogate escape (/21). All six pass at
-1000 cases × 10 (about 3 s); the 32 pinned differences are expected failures. `JSONITER_COLLECT=1` makes the properties record
-mismatches instead of failing and print them shortest-first — that is how the list below was
-built, one collect run per generator change.
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11): indents of
+any string, empty maps, containers as map values and container RawMessages under indentation,
+trailing bytes and bare numbers at top level, big and out-of-range numbers, the `Decode` call
+after the last value, raw Marshaler output, `\b`/`\f` and invalid UTF-8 on both sides, escapes
+in struct texts, a bare `null` RawMessage, negative leading zeros, control characters after an
+escape, a surrogate pair after a lone surrogate. The wide properties fail on the first shape
+they meet, named in the failure message, and are listed in `[expected_failures]` mapped to the
+basin the shrinker lands in (`Marshal` on /1, `UnmarshalIntoInterface` on /7,
+`UnmarshalIntoStructs` on /30, `Valid` on /24, `DecoderStream` on /10, the round trip on /15).
+`hegel_shapes_test.go` holds one narrow property per bug whose shape has random contents
+(nineteen: /1-/10, /14-/16, /20, /21, /24, /30-/32), each a generator over that bug's region,
+judged like the wide property that found it, so every one of them fails deterministically and
+shrinks to a minimal example; the thirteen bugs whose shape is a single fixed input (/11-/13,
+/17-/19, /22, /23, /25-/29) have pins only. `HEGEL_NO_KNOWN=1`, read once into a `Known`
+struct, switches the shapes off: the wide generators stop drawing them, the narrow properties
+draw the neighbouring region the bug does not touch, and all 25 properties pass at 3000 cases.
+The 32 pins in `hegel_pins_test.go` are the regression examples. `JSONITER_COLLECT=1` makes
+the properties record mismatches instead of failing and print them shortest-first - that is
+how the list below was built, one collect run per generator change.
 
 The run command carries `-vet=off`: Go 1.27's vet (run by `go test`) rejects a non-constant
 format string in upstream's `example_test.go`, so the package would not build otherwise.
@@ -78,7 +85,7 @@ format string in upstream's `example_test.go`, so the package would not build ot
 | json-iterator/4 | `MarshalIndent` with an empty indent is compact instead of line-broken | low |
 | json-iterator/5 | Containers that are map values are not indented one level deeper | low |
 | json-iterator/6 | `Valid` checks only the first value: `1 2`, `[1]]`, `truex` are valid | medium |
-| json-iterator/7 | `Valid` rejects top-level `-1`, `1.5`, `1e5` | medium |
+| json-iterator/7 | `Valid` rejects every bare top-level number (`0`, `-1`, `1.5`) unless whitespace follows | medium |
 | json-iterator/8 | `Valid` rejects in-range `0.`-mantissa numbers above float32 range | low |
 | json-iterator/9 | `Valid` rejects out-of-range numbers encoding/json calls valid | low |
 | json-iterator/10 | `Decoder.Decode` after the last value returns a syntax error, not `io.EOF` | medium |
@@ -140,3 +147,15 @@ was guarded — the 1000-case runs kept finding one more shape after each collec
 - Error messages and error types differ everywhere; only the presence of an error is compared.
 - `Any`, `Get`, `RegisterExtension`, the naming/fuzzy-decode extensions under `extra/`, and the
   iterator/stream API itself are json-iterator's own and not covered.
+
+## History
+
+- 2026-09-14: written against 71ac16282d122fdd1e3a6d3e7f79b79b4cc3b50e with hegel v0.6.33;
+  32 bugs.
+- 2026-09-26: generators rewritten in combinator style (weighted choices, `chance`, `maybe`,
+  case records rendered by pure functions, edits as mutation lists applied modulo the live
+  size) and the known-bug steering turned off by default; `hegel_shapes_test.go` (nineteen
+  narrow properties) and `hegel_pins_test.go` split out. The stream judge now tells `io.EOF`
+  from an error, and `MarshalIndent`'s panic is reported as an error rather than crashing the
+  run. Bug 7's notes widened: no bare top-level number passes `Valid` without trailing
+  whitespace, unsigned integers included.
