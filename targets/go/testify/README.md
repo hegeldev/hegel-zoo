@@ -75,10 +75,12 @@ The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): negativ
 against unsigned, fractional floats against integers, int/string pairs, slices against arrays of
 every length, nil to the collection assertions, NaN deltas, big integers in documents, `NotSame`
 on non-pointers, and so on. A mismatch names the bug whose shape it has (the `Known` switches
-keep the shape tests) and the property fails: the six other wide properties fail every run on
-the shape they reach most often (`EqualValues` on 65 against "A", `Positive("a")`, ...),
-`CollectionsFollowTheModel`, `MapAndStringCollectionsFollowTheModel` and
-`AssertionsKeepTheContract` in most runs (their shapes are a few percent of cases), and the nineteen narrow properties of `hegel_shapes_test.go`
+keep the shape tests) and the property fails: the wide properties fail on the shape they reach most
+often (`EqualValues` on 65 against "A", `Positive("a")`, ...): `Equality`, `EqualExportedValues`,
+`Ordering` and `Deltas` every run, `EqualValues`, `JSONEq`, `Collections`,
+`MapAndStringCollections` and `AssertionsKeepTheContract` in most runs (their shapes are a few
+percent of cases, and hegel-go's case sequence differs per test binary, so a run on another
+machine can miss them), and the nineteen narrow properties of `hegel_shapes_test.go`
 (`TestHegelEqualValuesKeepsSignedAndUnsignedApart`, `TestHegelInDeltaRejectsANaNDelta`, ...) each
 on its own bug: they are the deterministic expected failures beside the pins. `HEGEL_NO_KNOWN=1`,
 read once, switches the known shapes off: the generators draw the neighbouring regions instead
