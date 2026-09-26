@@ -46,8 +46,12 @@ comments, trailing spaces and non-ASCII text; empty lines between items and insi
 the time gofumpt gets the raw file, the other half its gofmt-formatted form. Two directed
 scenarios keep rare shapes frequent (a case list of a length around gofumpt's short-line limit
 with a trailing comment; a std import sorting after a third-party one with a comment group
-ending the file). A text-level `fixup` pass, and a parse-based one, keep the recorded bugs'
-shapes out of the file (below).
+ending the file). The file is drawn as a tree of declaration, statement, expression and type
+records by combinator values (`hegel_zoo_gen_test.go`: `weighted` choices with the plainest
+alternative first, forward references read at draw time for the recursion, a statement budget
+per file) and rendered by a pure writer (`hegel_zoo_render_test.go`) with the token-gap spacing
+and end-of-line comments taken from a drawn tape recycled modulo its length, so a case shrinks
+to plain text; a text-level `fixup` pass and a parse-based one keep the file valid Go.
 
 ## Properties
 
@@ -80,23 +84,27 @@ comment directly followed by another multi-line declaration (gofumpt/12), group_
 equal only once printed (gofumpt/13), a case list collapsed only when its measured length has
 shrunk (gofumpt/15).
 
-## Modelled as recorded
+## Known shapes
 
-Every bug has an `HZKnown` switch. While a switch is on the generator keeps away from the shape:
-lone const declarations with iota get an empty line between them; empty lines between a line
-ending in a respaced comment and a closing brace or parenthesis are removed, and such comments
-on the closing line of a multi-line call, in a parameter list or in an import group get their
-space; a var statement's comment goes after the value; adjacent lone declarations with a comment
-or spanning lines, and a comment group after two lone imports, get an empty line; a doc comment
-with an indented line has its last line spaced; third-party directives before lone declarations
-are spaced; one-spec var groups carry no comment and get an empty line after a comment line;
-import groups with a std import to move up carry no comments; a comment before the spec of a
-one-spec top-level var group is not generated; empty types in parameter lists carry no comment
-and stay on one line, parenthesised types are unwrapped there; a multi-line top-level
-declaration with a trailing comment gets an empty line after it; a case list spanning lines
-holds no expression over lines and its trailing comment has no trailing spaces. The collector
-counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns switches off and the properties then
-fail on them.
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): adjacent lone iota
+constants, respaced comments before a closing brace, a var statement's comment before its value,
+adjacent lone declarations spanning lines, doc comments with an indented line, directives before
+lone declarations, comments in one-spec var groups and in import groups with a std import to move
+up, comments in empty types in parameter lists, multi-line declarations with a trailing comment,
+case lists spanning lines with an expression over lines. The properties fail on them every run:
+`TestHegelConstValues` shrinks to two lone `iota` constants (gofumpt/1), `TestHegelGofmtStable`
+to a doc comment with an indented line that gofmt reflows (gofumpt/5, and gofumpt/3 in a quarter
+of its hits), `TestHegelIdempotent` to gofumpt/5 most often and to gofumpt/11, /14 or /4 in
+other runs (it meets a mismatch in about 14% of cases); `TestHegelSyntax` passes. So that the
+two formatting properties fail reliably at 100 cases, top-level declarations are documented
+60% of the time and a var statement's value continuation is drawn as an explicit kind (space,
+newline or comment): a distortion of the corpus confined to those two generators, to be replaced
+by one narrow property per bug (as go/kin-openapi and go/testify have) in a follow-up.
+`HEGEL_NO_KNOWN=1`, read once, switches the `HZKnown` gates on: the renderer and the fixup pass
+then keep the shapes out of the file (they depend on the rendered text, comment placement and
+line spans, so the avoidance lives there rather than in the generators) and every property
+passes; the remaining skips are gofmt's own doc-comment reflow non-idempotence (0.5-0.7% of
+cases). The collector counts the avoidances.
 
 ## gofmt's business
 
@@ -117,3 +125,8 @@ comments are checked).
 ## History
 
 - 2026-09-22: new target, four properties, 15 bugs.
+- 2026-09-26: generators rewritten in combinator style (a tree of records, a pure writer, a
+  spacing tape); the known shapes are drawn by default and the three properties that find them
+  are the expected failures beside the pins. Two latent model bugs fixed (a conversion to a type
+  spelled with `func` rendered without parentheses; an avoidance hole for a block comment inside
+  an empty struct in a parameter list).
