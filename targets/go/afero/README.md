@@ -7,8 +7,8 @@ wrappers that restrict (`BasePathFs`, `ReadOnlyFs`, `RegexpFs`) or layer (`CopyO
 `WriteFile`, `Walk`, `Glob`, `TempFile`, ...).
 
 The patch adds `hegel/`, a test-only package inside the module: `hegel_test.go` (plumbing), one file per
-area, `hegel_pins_test.go` (one plain test per recorded bug) and `known.go` (one switch per bug the
-properties gate on). The oracle for `MemMapFs` and the helpers is `OsFs` itself (restricted to a fresh
+area, `hegel_pins_test.go` (one plain test per recorded bug) and `known.go` (`noKnown`, read once from
+`HEGEL_NO_KNOWN`, and the table of known shapes the properties name in their failures). The oracle for `MemMapFs` and the helpers is `OsFs` itself (restricted to a fresh
 temporary directory through `BasePathFs`) together with `os` and `path/filepath`; the wrappers are checked
 against small models of their documented semantics and the adapter against `testing/fstest`. The process
 umask is cleared so that both sides keep the modes they are given.
@@ -39,7 +39,7 @@ umask is cleared so that both sides keep the modes they are given.
   touched, `RealPath`, `File.Name`, `FullBaseFsPath`. `IOFS`: `fstest.TestFS` on a random tree, bare and
   behind a `BasePathFs`, plus `ReadFile`/`ReadDir` and the leading-slash check.
 
-## Known bugs (38, see bugs.toml)
+## Known bugs (39, see bugs.toml)
 
 `MemMapFs` (1-18, 29-31): `Mkdir` creates parents (1) and so do `Create`, `OpenFile(O_CREATE)` and `Rename`
 (2); `Remove` deletes a non-empty directory, its children stay reachable and removing one of them panics
@@ -51,7 +51,8 @@ modes are not enforced (12); `OpenFile(O_RDONLY)` needs write permission (13); d
 files (14); `Create` of an existing file resets its mode and detaches open handles (15) and ignores a
 read-only mode (30); `RemoveAll("")` wipes the file system (16), `Mkdir("")` adds an entry named `""` (17);
 `Seek` accepts any whence (18); `Rename(x, x)` of a missing file is nil (29); an empty `WriteAt` past the
-end grows the file (31). Helpers: `FileContainsBytes` matches its buffer's zero padding (19), `Walk` returns
+end grows the file (31); `Rename` of an entry to a path below itself whose parent is missing aborts the
+whole process (39). Helpers: `FileContainsBytes` matches its buffer's zero padding (19), `Walk` returns
 `SkipDir`/`SkipAll` (27), `Glob` ignores backslash escapes (28). Unions: `UnionFile.Close` returns `BADFD`
 so `WriteFile` through a `CacheOnReadFs` fails after writing (20); `CopyOnWriteFs` `Remove`/`RemoveAll` of
 a base-only file are not `EPERM` (21), `Mkdir`/`MkdirAll` only check the base (22), `Rename` into a
@@ -62,6 +63,19 @@ base-only directory fails (37); `CacheOnReadFs.Remove` of an uncached file remov
 recreated parent directory the child's mode (34). `RegexpFs`: `Rename` of a directory is a no-op (24),
 `OpenFile(O_CREATE)` cannot create (25), `Readdir(n)` returns empty pages (26), `RemoveAll` of a missing
 path errors (35).
+
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11), with one exception:
+the properties fail on the first shape they meet, the failure message ends in the shape's name, and the
+wide properties are listed in `[expected_failures]` mapped to the basin the shrinker lands in most
+(`MemMapFs` on 1, sometimes 29; the helpers on 14; `CopyOnWriteFs` on 20; `CacheOnReadFs` on 34, 33 or
+36; `RegexpFs` on 35), the pins beside them as the regression examples. Shapes that depend on the live
+tree (a parent missing, a base-only entry) are recognised when the step is applied: by default the step
+runs and the mismatch names the bug, under `HEGEL_NO_KNOWN=1` the step is a counted no-op instead, so no
+case is rejected and every property passes at 3000 cases. Comparison-time differences (9, 10, 18, 19, 20,
+27, 33, 34) are tolerated the same way under the switch. The exception is 39: the shape kills the test
+binary (a fatal runtime error after a panic, which no `recover` reaches), so the property keeps it out in
+both modes and the pin runs the call in a child process. The empty path (16, 17) is not generated: beyond
+the recorded bugs `MemMapFs` and `OsFs` differ on `""` for most calls, and the pins cover both.
 
 ## Conventions followed, not recorded
 
@@ -75,3 +89,12 @@ through a file, and directories have size 42. `ReadOnlyFs.MkdirAll` of an existi
 has an empty name on `MemMapFs`. `CopyOnWriteFs.Create` over a base directory fails with `EIO` rather than
 `EISDIR`. With an `OsFs` layer the modes the layer bugs (33, 34) produce are additionally reduced by the
 umask.
+
+## History
+
+- 2026-09-19: written against 768f1fb0e5535b77d90e44c531aacd652aabd96a (v1.15.0+, 2026-06-09) with hegel
+  v0.6.33; 38 bugs.
+- 2026-09-26: generators rewritten in combinator style (scripts as lists of step records, paths as
+  positions modulo the live tree, handle scripts as data, weighted choices, `chance`, `shaped`) and the
+  known-bug steering turned off by default; afero/39 recorded (a process-killing `Rename`), found by the
+  freed shapes and reproduced standalone.

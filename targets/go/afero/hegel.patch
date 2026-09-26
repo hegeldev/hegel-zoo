@@ -37,14 +37,14 @@ index 0000000..423df59
 +package hegel
 diff --git a/hegel/hegel_memmap_test.go b/hegel/hegel_memmap_test.go
 new file mode 100644
-index 0000000..7d1c097
+index 0000000..21bbcf4
 --- /dev/null
 +++ b/hegel/hegel_memmap_test.go
-@@ -0,0 +1,798 @@
+@@ -0,0 +1,1075 @@
 +package hegel
 +
-+// MemMapFs against OsFs: the same random sequence of operations is applied
-+// to a MemMapFs and to an OsFs restricted (BasePathFs) to a fresh temporary
++// MemMapFs against OsFs: the same drawn script of operations is applied to a
++// MemMapFs and to an OsFs restricted (BasePathFs) to a fresh temporary
 +// directory; every result and, after every step, the visible tree must agree.
 +
 +import (
@@ -54,6 +54,7 @@ index 0000000..7d1c097
 +	"io/fs"
 +	"os"
 +	"path"
++	"slices"
 +	"sort"
 +	"strings"
 +	"syscall"
@@ -86,28 +87,63 @@ index 0000000..7d1c097
 +	}
 +}
 +
++// ---------------------------------------------------------------------------
++// Paths.
++
 +var pathComps = []string{"a", "b", "c"}
 +
-+// genPath draws a clean absolute path of depth 1..3 over three names; with
-+// some probability it is decorated with redundant separators and dots that
++// pathSpec is a drawn path: an absolute path of 1..3 names, or (Below >= 0)
++// a child of the live directory at that position, so that trees grow deep;
++// either one decorated with redundant separators and dots that
 +// filepath.Clean removes.
-+func genPath(tc hegel.TestCase) string {
-+	parts := make([]string, n(tc, 1, 3))
-+	for i := range parts {
-+		parts[i] = pick(tc, pathComps...)
++type pathSpec struct {
++	Below int      // -1: the absolute path of Parts; else a position among the live directories
++	Parts []string // 1..3 names; below a live directory only the first is used
++	Deco  string   // "", "double", "trailing", "dot", "relative", "updir"
++}
++
++var pathDecos = hegel.SampledFrom([]string{"", "", "", "", "", "double", "trailing", "dot", "relative", "updir"})
++
++var pathSpecs = hegel.Composite(func(tc hegel.TestCase) pathSpec {
++	return pathSpec{
++		Below: hegel.Draw(tc, weighted(choice[int]{40, hegel.Just(-1)}, choice[int]{60, positions})),
++		Parts: hegel.Draw(tc, many(hegel.SampledFrom(pathComps), 1, 3)),
++		Deco:  hegel.Draw(tc, pathDecos),
 +	}
-+	p := "/" + strings.Join(parts, "/")
-+	switch n(tc, 0, 9) {
-+	case 0:
++})
++
++// render resolves the spec against the live directories (the root first).
++func (s pathSpec) render(live []string) string {
++	p := "/" + strings.Join(s.Parts, "/")
++	if s.Below >= 0 {
++		d := at(live, s.Below)
++		if d == "/" {
++			d = ""
++		}
++		p = d + "/" + s.Parts[0]
++	}
++	switch s.Deco {
++	case "double":
 +		p = strings.Replace(p, "/", "//", 1)
-+	case 1:
++	case "trailing":
 +		p = p + "/"
-+	case 2:
++	case "dot":
 +		p = "/./" + p[1:]
-+	case 3:
-+		p = p[1:] // relative: both file systems root it
-+	case 4:
++	case "relative":
++		p = p[1:] // both file systems root it
++	case "updir":
 +		p = p + "/x/.."
++	}
++	return p
++}
++
++func (s pathSpec) GoString() string {
++	p := "/" + strings.Join(s.Parts, "/")
++	if s.Below >= 0 {
++		p = fmt.Sprintf("<dir %d>/%s", s.Below, s.Parts[0])
++	}
++	if s.Deco != "" {
++		p += "+" + s.Deco
 +	}
 +	return p
 +}
@@ -151,6 +187,18 @@ index 0000000..7d1c097
 +	return kindFile
 +}
 +
++// liveDirs lists the root and the directories of depth 1 and 2 that exist on
++// the truth side, the pool a pathSpec below a live directory resolves in.
++func liveDirs(f afero.Fs) []string {
++	dirs := []string{"/"}
++	for _, u := range universe {
++		if strings.Count(u, "/") < 3 && kindOf(f, u) == kindDir {
++			dirs = append(dirs, u)
++		}
++	}
++	return dirs
++}
++
 +func hasChildren(f afero.Fs, p string) bool {
 +	d, err := f.Open(p)
 +	if err != nil {
@@ -163,26 +211,320 @@ index 0000000..7d1c097
 +
 +func isRoot() bool { return os.Geteuid() == 0 }
 +
++// ---------------------------------------------------------------------------
++// Modes, data, flags.
++
 +var dirModes = []os.FileMode{0o755, 0o700, 0o777, 0o750}
 +var fileModes = []os.FileMode{0o644, 0o600, 0o666, 0o755, 0o444, 0o400}
 +
-+func genFileMode(tc hegel.TestCase) os.FileMode {
-+	m := pick(tc, fileModes...)
++var dirPerms = hegel.SampledFrom(dirModes)
++
++// filePerms never yields a read-only mode when running as root, who ignores it.
++var filePerms = hegel.Map(hegel.SampledFrom(fileModes), func(m os.FileMode) os.FileMode {
 +	if isRoot() && m&0o222 == 0 {
-+		m = 0o644
++		return 0o644
 +	}
 +	return m
++})
++
++var dataAlphabet = hegel.SampledFrom([]byte("abcxyz0\x00\xff"))
++
++// dataBytes is a file content of 0..12 bytes.
++var dataBytes = many(dataAlphabet, 0, 12)
++
++// writeData is what a handle writes; an empty write is afero/31's shape.
++var writeData = shaped(dataBytes, many(dataAlphabet, 1, 12))
++
++const (
++	accessR = iota
++	accessW
++	accessRW
++)
++
++// openFlags is a drawn OpenFile flag set. O_TRUNC without write access and
++// O_EXCL without O_CREATE are not generated (convention).
++type openFlags struct {
++	Acc                         int
++	Create, Excl, Trunc, Append bool
 +}
 +
-+func genData(tc hegel.TestCase) []byte {
-+	k := n(tc, 0, 12)
-+	b := make([]byte, k)
-+	alphabet := []byte("abcxyz0\x00\xff")
-+	for i := range b {
-+		b[i] = alphabet[n(tc, 0, len(alphabet)-1)]
++func (f openFlags) flag() int {
++	flag := [...]int{os.O_RDONLY, os.O_WRONLY, os.O_RDWR}[f.Acc]
++	for _, b := range []struct {
++		on  bool
++		bit int
++	}{{f.Create, os.O_CREATE}, {f.Excl, os.O_EXCL}, {f.Trunc, os.O_TRUNC}, {f.Append, os.O_APPEND}} {
++		if b.on {
++			flag |= b.bit
++		}
 +	}
-+	return b
++	return flag
 +}
++
++var openFlagSets = hegel.Composite(func(tc hegel.TestCase) openFlags {
++	f := openFlags{Acc: hegel.Draw(tc, hegel.SampledFrom([]int{accessR, accessW, accessRW}))}
++	f.Create = hegel.Draw(tc, chance(50))
++	if f.Create {
++		f.Excl = hegel.Draw(tc, chance(30))
++	}
++	if f.Acc != accessR {
++		f.Append = hegel.Draw(tc, chance(30))
++		// MemMapFs seeks to the end before truncating, so the first write of
++		// an O_TRUNC|O_APPEND handle lands past a zero (afero/11): the
++		// combination is left out while the bug is switched off.
++		if !f.Append || !noKnown {
++			f.Trunc = hegel.Draw(tc, chance(30))
++		}
++	}
++	return f
++})
++
++func flagString(flag int) string {
++	var parts []string
++	switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
++	case os.O_RDONLY:
++		parts = append(parts, "O_RDONLY")
++	case os.O_WRONLY:
++		parts = append(parts, "O_WRONLY")
++	case os.O_RDWR:
++		parts = append(parts, "O_RDWR")
++	}
++	for _, f := range []struct {
++		bit  int
++		name string
++	}{{os.O_CREATE, "O_CREATE"}, {os.O_EXCL, "O_EXCL"}, {os.O_TRUNC, "O_TRUNC"}, {os.O_APPEND, "O_APPEND"}} {
++		if flag&f.bit != 0 {
++			parts = append(parts, f.name)
++		}
++	}
++	return strings.Join(parts, "|")
++}
++
++// ---------------------------------------------------------------------------
++// Operations on an open handle.
++
++// handleOp is one operation on the two open files.
++type handleOp struct {
++	Op     string // Stat, Readdir, Read, ReadAt, Seek, Write, WriteString, WriteAt, Truncate
++	Data   []byte
++	Size   int
++	Off    int64
++	Whence int
++	Page   int
++	Names  bool
++}
++
++func (h handleOp) GoString() string {
++	switch h.Op {
++	case "Readdir":
++		if h.Names {
++			return fmt.Sprintf("Readdirnames(%d)", h.Page)
++		}
++		return fmt.Sprintf("Readdir(%d)", h.Page)
++	case "Read":
++		return fmt.Sprintf("Read(%d)", h.Size)
++	case "ReadAt":
++		return fmt.Sprintf("ReadAt(%d, %d)", h.Size, h.Off)
++	case "Seek":
++		return fmt.Sprintf("Seek(%d, %d)", h.Off, h.Whence)
++	case "Write", "WriteString":
++		return fmt.Sprintf("%s(%q)", h.Op, h.Data)
++	case "WriteAt":
++		return fmt.Sprintf("WriteAt(%q, %d)", h.Data, h.Off)
++	case "Truncate":
++		return fmt.Sprintf("Truncate(%d)", h.Off)
++	}
++	return h.Op
++}
++
++func hop(op string, fields func(tc hegel.TestCase, h *handleOp)) hegel.Generator[handleOp] {
++	return hegel.Composite(func(tc hegel.TestCase) handleOp {
++		h := handleOp{Op: op}
++		if fields != nil {
++			fields(tc, &h)
++		}
++		return h
++	})
++}
++
++var bufSizes = hegel.Integers(0, 8)
++var offsets = hegel.Integers(0, 14)
++
++// whences: the three valid ones and, while afero/18 is switched on, an
++// invalid one about one time in twenty.
++var whences = shaped(
++	hegel.SampledFrom(slices.Concat(slices.Repeat([]int{io.SeekStart, io.SeekCurrent, io.SeekEnd}, 6), []int{7})),
++	hegel.SampledFrom([]int{io.SeekStart, io.SeekCurrent, io.SeekEnd}),
++)
++
++var (
++	hStat    = hop("Stat", nil)
++	hReaddir = hop("Readdir", func(tc hegel.TestCase, h *handleOp) {
++		h.Page = hegel.Draw(tc, hegel.SampledFrom([]int{-1, 0, 1, 2, 5}))
++		h.Names = hegel.Draw(tc, chance(50))
++	})
++	hRead   = hop("Read", func(tc hegel.TestCase, h *handleOp) { h.Size = hegel.Draw(tc, bufSizes) })
++	hReadAt = hop("ReadAt", func(tc hegel.TestCase, h *handleOp) {
++		h.Size = hegel.Draw(tc, bufSizes)
++		h.Off = int64(hegel.Draw(tc, offsets))
++	})
++	hSeek = hop("Seek", func(tc hegel.TestCase, h *handleOp) {
++		h.Off = int64(hegel.Draw(tc, hegel.Integers(-3, 14)))
++		h.Whence = hegel.Draw(tc, whences)
++	})
++	hWrite       = hop("Write", func(tc hegel.TestCase, h *handleOp) { h.Data = hegel.Draw(tc, writeData) })
++	hWriteString = hop("WriteString", func(tc hegel.TestCase, h *handleOp) { h.Data = hegel.Draw(tc, writeData) })
++	hWriteAt     = hop("WriteAt", func(tc hegel.TestCase, h *handleOp) {
++		h.Data = hegel.Draw(tc, writeData)
++		h.Off = int64(hegel.Draw(tc, offsets))
++	})
++	hTruncate = hop("Truncate", func(tc hegel.TestCase, h *handleOp) { h.Off = int64(hegel.Draw(tc, hegel.Integers(-1, 14))) })
++)
++
++// handleScript builds the generator of 0..6 handle operations for a handle
++// opened with the given access mode. While the bugs are switched off, the
++// operations the mode does not allow (afero/12) and the ones an O_APPEND
++// handle gets wrong (afero/11) are left out.
++func handleScript(acc int, appendMode bool) hegel.Generator[[]handleOp] {
++	reads := acc != accessW || !noKnown
++	writes := acc != accessR || !noKnown
++	moves := !appendMode || !noKnown
++	ops := []choice[handleOp]{{1, hStat}, {1, hReaddir}}
++	if reads && moves {
++		ops = append(ops, choice[handleOp]{1, hRead})
++	}
++	if reads {
++		ops = append(ops, choice[handleOp]{1, hReadAt})
++	}
++	if moves {
++		ops = append(ops, choice[handleOp]{1, hSeek})
++	}
++	if writes {
++		ops = append(ops, choice[handleOp]{1, hWrite}, choice[handleOp]{1, hWriteString})
++	}
++	if writes && moves {
++		ops = append(ops, choice[handleOp]{1, hWriteAt}, choice[handleOp]{1, hTruncate})
++	}
++	return many(weighted(ops...), 0, 6)
++}
++
++var handleScripts = func() map[[2]int]hegel.Generator[[]handleOp] {
++	m := map[[2]int]hegel.Generator[[]handleOp]{}
++	for acc := accessR; acc <= accessRW; acc++ {
++		for app := 0; app < 2; app++ {
++			m[[2]int{acc, app}] = handleScript(acc, app == 1)
++		}
++	}
++	return m
++}()
++
++func scriptFor(acc int, appendMode bool) hegel.Generator[[]handleOp] {
++	app := 0
++	if appendMode {
++		app = 1
++	}
++	return handleScripts[[2]int{acc, app}]
++}
++
++// ---------------------------------------------------------------------------
++// Steps.
++
++// memStep is one operation of the script. Only the fields the operation uses
++// are drawn.
++type memStep struct {
++	Op       string
++	Path     pathSpec
++	Path2    pathSpec // Rename destination
++	Perm     os.FileMode
++	FilePerm os.FileMode // Chmod of a file (Perm is for a directory)
++	Flags    openFlags
++	When     int64
++	Handle   []handleOp
++	Again    bool // a second Close
++}
++
++func (s memStep) GoString() string {
++	again := ""
++	if s.Again {
++		again = " Close again"
++	}
++	switch s.Op {
++	case "Rename":
++		return fmt.Sprintf("Rename(%#v, %#v)", s.Path, s.Path2)
++	case "Mkdir", "MkdirAll":
++		return fmt.Sprintf("%s(%#v, %o)", s.Op, s.Path, s.Perm)
++	case "Chmod":
++		return fmt.Sprintf("Chmod(%#v, dir %o / file %o)", s.Path, s.Perm, s.FilePerm)
++	case "Chtimes":
++		return fmt.Sprintf("Chtimes(%#v, %d)", s.Path, s.When)
++	case "Create", "Open":
++		return fmt.Sprintf("%s(%#v) %#v%s", s.Op, s.Path, s.Handle, again)
++	case "OpenFile":
++		return fmt.Sprintf("OpenFile(%#v, %s, %o) %#v%s", s.Path, flagString(s.Flags.flag()), s.Perm, s.Handle, again)
++	}
++	return fmt.Sprintf("%s(%#v)", s.Op, s.Path)
++}
++
++func step(op string, fields func(tc hegel.TestCase, s *memStep)) hegel.Generator[memStep] {
++	return hegel.Composite(func(tc hegel.TestCase) memStep {
++		s := memStep{Op: op, Path: hegel.Draw(tc, pathSpecs)}
++		if fields != nil {
++			fields(tc, &s)
++		}
++		return s
++	})
++}
++
++var memSteps = weighted(
++	choice[memStep]{2, step("Stat", nil)},
++	choice[memStep]{1, step("ReadDir", nil)},
++	choice[memStep]{1, step("ReadFile", nil)},
++	choice[memStep]{1, step("Mkdir", func(tc hegel.TestCase, s *memStep) { s.Perm = hegel.Draw(tc, dirPerms) })},
++	choice[memStep]{1, step("MkdirAll", func(tc hegel.TestCase, s *memStep) { s.Perm = hegel.Draw(tc, dirPerms) })},
++	choice[memStep]{1, step("Create", func(tc hegel.TestCase, s *memStep) {
++		s.Handle = hegel.Draw(tc, scriptFor(accessRW, false))
++		s.Again = hegel.Draw(tc, chance(20))
++	})},
++	choice[memStep]{1, step("Open", func(tc hegel.TestCase, s *memStep) {
++		s.Handle = hegel.Draw(tc, scriptFor(accessR, false))
++		s.Again = hegel.Draw(tc, chance(20))
++	})},
++	choice[memStep]{1, step("OpenFile", func(tc hegel.TestCase, s *memStep) {
++		s.Flags = hegel.Draw(tc, openFlagSets)
++		s.Perm = hegel.Draw(tc, filePerms)
++		s.Handle = hegel.Draw(tc, scriptFor(s.Flags.Acc, s.Flags.Append))
++		s.Again = hegel.Draw(tc, chance(20))
++	})},
++	choice[memStep]{1, step("Remove", nil)},
++	choice[memStep]{1, step("RemoveAll", nil)},
++	choice[memStep]{1, step("Rename", func(tc hegel.TestCase, s *memStep) { s.Path2 = hegel.Draw(tc, pathSpecs) })},
++	choice[memStep]{1, step("Chmod", func(tc hegel.TestCase, s *memStep) {
++		s.Perm = hegel.Draw(tc, dirPerms)
++		s.FilePerm = hegel.Draw(tc, filePerms)
++	})},
++	choice[memStep]{1, step("Chtimes", func(tc hegel.TestCase, s *memStep) {
++		s.When = int64(hegel.Draw(tc, hegel.Integers(0, 2_000_000_000)))
++	})},
++)
++
++// memScript is the case of the MemMapFs property: 1..25 steps.
++type memScript []memStep
++
++func (s memScript) GoString() string {
++	var b strings.Builder
++	b.WriteString("memScript{")
++	for _, st := range s {
++		b.WriteString("\n\t")
++		b.WriteString(st.GoString())
++	}
++	b.WriteString("\n}")
++	return b.String()
++}
++
++var memScripts = hegel.Map(many(memSteps, 1, 25), func(s []memStep) memScript { return memScript(s) })
++
++// ---------------------------------------------------------------------------
++// Snapshots and the pair of file systems.
 +
 +// entry is one node of a tree snapshot.
 +type entry struct {
@@ -240,16 +582,89 @@ index 0000000..7d1c097
 +	return b.String()
 +}
 +
-+// pair holds the two file systems under comparison.
++// pair holds the two file systems under comparison and the known-bug shapes
++// of the step being applied (mem is the system under test, os the truth).
 +type pair struct {
-+	ht  *hegel.T
-+	mem afero.Fs
-+	os  afero.Fs
++	ht     *hegel.T
++	mem    afero.Fs
++	os     afero.Fs
++	shapes []string // shapes of the current step
++	seen   []string // shapes of the earlier steps of the case
++}
++
++// shapeIf names a recorded bug's shape when cond holds.
++func shapeIf(cond bool, id string) string {
++	if cond {
++		return known(id)
++	}
++	return ""
++}
++
++// gate records the shapes a step (or one of its operations) has and reports
++// whether it runs: by default it does and a mismatch names the shapes; with
++// HEGEL_NO_KNOWN=1 a step with a shape is a no-op.
++func (p *pair) gate(shapes ...string) bool {
++	var real []string
++	for _, s := range shapes {
++		if s != "" {
++			real = append(real, s)
++		}
++	}
++	if len(real) == 0 {
++		return true
++	}
++	if noKnown {
++		for _, s := range real {
++			count(p.ht, "skip: "+s)
++		}
++		return false
++	}
++	p.shapes = append(p.shapes, real...)
++	p.seen = append(p.seen, real...)
++	return true
++}
++
++// accept reports whether a recorded outcome met at comparison time is
++// accepted (HEGEL_NO_KNOWN=1); by default it is not and the mismatch that
++// follows names the bug.
++func (p *pair) accept(id string) bool {
++	if noKnown {
++		count(p.ht, "accepted: "+known(id))
++		return true
++	}
++	p.shapes = append(p.shapes, known(id))
++	p.seen = append(p.seen, known(id))
++	return false
++}
++
++func (p *pair) fail(format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	switch {
++	case len(p.shapes) > 0:
++		msg += fmt.Sprintf(" (the shape of %s)", strings.Join(p.shapes, "; "))
++	case len(p.seen) > 0:
++		msg += fmt.Sprintf(" (after steps with the shape of %s)", strings.Join(p.seen, "; "))
++	}
++	fail(p.ht, "%s", msg)
++}
++
++// recoverPanics (deferred in a property's body) turns a panic of the library
++// into a failure that names the shapes of the case; the harness alone would
++// report it without them.
++func (p *pair) recoverPanics() {
++	r := recover()
++	if r == nil {
++		return
++	}
++	if _, ok := r.(collected); ok || controlFlow(r) {
++		panic(r)
++	}
++	p.fail("panic in the code under test: %v", r)
 +}
 +
 +func (p *pair) same(what string, memv, osv any) bool {
 +	if fmt.Sprint(memv) != fmt.Sprint(osv) {
-+		fail(p.ht, "%s: MemMapFs %v, OsFs %v", what, memv, osv)
++		p.fail("%s: %s %v, %s %v", what, p.memName(), memv, p.osName(), osv)
 +		return false
 +	}
 +	return true
@@ -258,11 +673,14 @@ index 0000000..7d1c097
 +func (p *pair) sameErr(what string, memErr, osErr error) bool {
 +	mc, oc := errClass(memErr), errClass(osErr)
 +	if mc != oc {
-+		fail(p.ht, "%s: MemMapFs %v (%s), OsFs %v (%s)", what, memErr, mc, osErr, oc)
++		p.fail("%s: %s %v (%s), %s %v (%s)", what, p.memName(), memErr, mc, p.osName(), osErr, oc)
 +		return false
 +	}
 +	return true
 +}
++
++func (p *pair) memName() string { return p.mem.Name() }
++func (p *pair) osName() string  { return p.os.Name() }
 +
 +// checkTrees compares the reachable trees and the Stat of every path of the
 +// universe (which also finds entries a bug left reachable by name only).
@@ -270,17 +688,17 @@ index 0000000..7d1c097
 +	ms, merr := snapshot(p.mem)
 +	oss, oerr := snapshot(p.os)
 +	if merr != nil || oerr != nil {
-+		fail(p.ht, "snapshot: MemMapFs %v, OsFs %v", merr, oerr)
++		p.fail("snapshot: %s %v, %s %v", p.memName(), merr, p.osName(), oerr)
 +		return false
 +	}
 +	if joinEntries(ms) != joinEntries(oss) {
-+		fail(p.ht, "trees differ\nMemMapFs:\n%sOsFs:\n%s", joinEntries(ms), joinEntries(oss))
++		p.fail("trees differ\n%s:\n%s%s:\n%s", p.memName(), joinEntries(ms), p.osName(), joinEntries(oss))
 +		return false
 +	}
 +	for _, u := range universe {
 +		mk, ok := kindOf(p.mem, u), kindOf(p.os, u)
 +		if mk != ok {
-+			fail(p.ht, "Stat(%s) kind: MemMapFs %d, OsFs %d (missing/file/dir)", u, mk, ok)
++			p.fail("Stat(%s) kind: %s %d, %s %d (missing/file/dir)", u, p.memName(), mk, p.osName(), ok)
 +			return false
 +		}
 +	}
@@ -299,257 +717,6 @@ index 0000000..7d1c097
 +		s += " name=" + fi.Name()
 +	}
 +	return s
-+}
-+
-+// TestHegelMemMapFsMatchesTheOs: MemMapFs and OsFs agree on every operation
-+// and on the resulting tree. Steps that would reach a recorded bug are
-+// skipped (see known.go).
-+func TestHegelMemMapFsMatchesTheOs(t *testing.T) {
-+	root, err := os.MkdirTemp("", "hegel-afero-")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	defer os.RemoveAll(root)
-+	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
-+		dir, err := os.MkdirTemp(root, "case-")
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		defer os.RemoveAll(dir)
-+		p := &pair{ht: ht, mem: afero.NewMemMapFs(), os: afero.NewBasePathFs(afero.NewOsFs(), dir)}
-+		steps := n(tc, 1, 25)
-+		for i := 0; i < steps; i++ {
-+			if !p.step(tc) {
-+				return
-+			}
-+			if !p.checkTrees() {
-+				return
-+			}
-+		}
-+	})
-+}
-+
-+// existingPath draws a path below an existing directory of the OsFs (the
-+// truth) so that trees grow deep; falls back to genPath.
-+func (p *pair) existingPath(tc hegel.TestCase) string {
-+	if chance(tc, 40) {
-+		return genPath(tc)
-+	}
-+	dirs := []string{"/"}
-+	for _, u := range universe {
-+		if strings.Count(u, "/") < 3 && kindOf(p.os, u) == kindDir {
-+			dirs = append(dirs, u)
-+		}
-+	}
-+	d := pick(tc, dirs...)
-+	if d == "/" {
-+		d = ""
-+	}
-+	return d + "/" + pick(tc, pathComps...)
-+}
-+
-+// step performs one random operation on both file systems; false ends the case.
-+func (p *pair) step(tc hegel.TestCase) bool {
-+	ht := p.ht
-+	raw := p.existingPath(tc)
-+	cp := canon(raw)
-+	parent := path.Dir(cp)
-+	parentKind := kindOf(p.os, parent)
-+	kind := kindOf(p.os, cp)
-+	switch n(tc, 0, 12) {
-+	case 0: // Mkdir
-+		perm := pick(tc, dirModes...)
-+		if Known.MkdirCreatesParents && parentKind == kindMissing {
-+			count(ht, "skip: Mkdir without parent (afero/1)")
-+			return true
-+		}
-+		if Known.FileBecomesDir && parentKind == kindFile {
-+			count(ht, "skip: Mkdir below a file (afero/5)")
-+			return true
-+		}
-+		note(ht, "Mkdir(%q, %o)", raw, perm)
-+		return p.sameErr("Mkdir("+raw+")", p.mem.Mkdir(raw, perm), p.os.Mkdir(raw, perm))
-+	case 1: // MkdirAll
-+		perm := pick(tc, dirModes...)
-+		if Known.MkdirAllOverFile && kind == kindFile {
-+			count(ht, "skip: MkdirAll over a file (afero/4)")
-+			return true
-+		}
-+		if Known.FileBecomesDir && fileOnTheWay(p.os, cp) {
-+			count(ht, "skip: MkdirAll through a file (afero/5)")
-+			return true
-+		}
-+		note(ht, "MkdirAll(%q, %o)", raw, perm)
-+		return p.sameErr("MkdirAll("+raw+")", p.mem.MkdirAll(raw, perm), p.os.MkdirAll(raw, perm))
-+	case 2: // Create
-+		if Known.CreateCreatesParents && parentKind == kindMissing {
-+			count(ht, "skip: Create without parent (afero/2)")
-+			return true
-+		}
-+		if Known.FileBecomesDir && parentKind == kindFile {
-+			count(ht, "skip: Create below a file (afero/5)")
-+			return true
-+		}
-+		if Known.CreateOverDir && kind == kindDir {
-+			count(ht, "skip: Create over a directory (afero/6)")
-+			return true
-+		}
-+		if Known.CreateIgnoresPermission && kind == kindFile && !writable(p.os, cp) {
-+			count(ht, "skip: Create over a read-only file (afero/30)")
-+			return true
-+		}
-+		if Known.CreateReplacesFile && kind == kindFile && permOf(p.os, cp) != 0o666 {
-+			count(ht, "skip: Create over a file with another mode (afero/15)")
-+			return true
-+		}
-+		note(ht, "Create(%q)", raw)
-+		mf, merr := p.mem.Create(raw)
-+		of, oerr := p.os.Create(raw)
-+		if !p.sameErr("Create("+raw+")", merr, oerr) {
-+			return false
-+		}
-+		if merr != nil {
-+			return true
-+		}
-+		return p.handleOps(tc, cp, mf, of, accessRW, false, false)
-+	case 3: // Open
-+		note(ht, "Open(%q)", raw)
-+		mf, merr := p.mem.Open(raw)
-+		of, oerr := p.os.Open(raw)
-+		if !p.sameErr("Open("+raw+")", merr, oerr) {
-+			return false
-+		}
-+		if merr != nil {
-+			return true
-+		}
-+		return p.handleOps(tc, cp, mf, of, accessR, false, kind == kindDir)
-+	case 4: // OpenFile
-+		flag, acc := genFlags(tc)
-+		perm := genFileMode(tc)
-+		create := flag&os.O_CREATE != 0
-+		if create && Known.CreateCreatesParents && parentKind == kindMissing {
-+			count(ht, "skip: OpenFile(O_CREATE) without parent (afero/2)")
-+			return true
-+		}
-+		if create && Known.FileBecomesDir && parentKind == kindFile {
-+			count(ht, "skip: OpenFile below a file (afero/5)")
-+			return true
-+		}
-+		if kind == kindDir && Known.DirectoryHandleIsAFile && flag != os.O_RDONLY {
-+			count(ht, "skip: OpenFile on a directory with flags (afero/14)")
-+			return true
-+		}
-+		if kind == kindFile && Known.ReadOnlyOpenNeedsWrite && !writable(p.os, cp) && (acc == accessR || flag&os.O_EXCL != 0) {
-+			count(ht, "skip: OpenFile(O_RDONLY or O_EXCL) on a read-only file (afero/13)")
-+			return true
-+		}
-+		note(ht, "OpenFile(%q, %s, %o)", raw, flagString(flag), perm)
-+		mf, merr := p.mem.OpenFile(raw, flag, perm)
-+		of, oerr := p.os.OpenFile(raw, flag, perm)
-+		if !p.sameErr("OpenFile("+raw+", "+flagString(flag)+")", merr, oerr) {
-+			return false
-+		}
-+		if merr != nil {
-+			return true
-+		}
-+		return p.handleOps(tc, cp, mf, of, acc, flag&os.O_APPEND != 0, kind == kindDir)
-+	case 5: // Remove
-+		if Known.RemoveNonEmptyDir && kind == kindDir && hasChildren(p.os, cp) {
-+			count(ht, "skip: Remove of a non-empty directory (afero/3)")
-+			return true
-+		}
-+		note(ht, "Remove(%q)", raw)
-+		return p.sameErr("Remove("+raw+")", p.mem.Remove(raw), p.os.Remove(raw))
-+	case 6: // RemoveAll
-+		if fileOnTheWay(p.os, cp) {
-+			// os.RemoveAll reports ENOTDIR for a path below a regular file;
-+			// MemMapFs returns nil as for any missing path. Convention.
-+			count(ht, "skip: RemoveAll below a file")
-+			return true
-+		}
-+		note(ht, "RemoveAll(%q)", raw)
-+		return p.sameErr("RemoveAll("+raw+")", p.mem.RemoveAll(raw), p.os.RemoveAll(raw))
-+	case 7: // Rename
-+		raw2 := p.existingPath(tc)
-+		cq := canon(raw2)
-+		qKind := kindOf(p.os, cq)
-+		qParentKind := kindOf(p.os, path.Dir(cq))
-+		switch {
-+		case cp == cq && kind == kindMissing && Known.RenameSelfMissing:
-+			count(ht, "skip: Rename(x, x) of a missing path (afero/29)")
-+			return true
-+		case cp == cq && kind == kindDir:
-+			// Go's os.Rename reports EEXIST for a directory renamed onto
-+			// itself; MemMapFs treats equal names as a no-op. Convention.
-+			count(ht, "skip: Rename(dir, dir)")
-+			return true
-+		case kind == kindMissing:
-+			// fails on both; nothing else to guard
-+		case cq != cp && strings.HasPrefix(cq, cp+"/") && Known.RenameIntoItself:
-+			count(ht, "skip: Rename into itself (afero/8)")
-+			return true
-+		case qKind == kindDir && cq != cp:
-+			// Go's os.Rename refuses any existing directory as destination
-+			// (EEXIST), even an empty one. Convention.
-+			count(ht, "skip: Rename onto a directory")
-+			return true
-+		case qKind == kindFile && kind == kindDir && Known.RenameOverwrites:
-+			count(ht, "skip: Rename of a directory over a file (afero/7)")
-+			return true
-+		case qParentKind == kindMissing && Known.CreateCreatesParents:
-+			count(ht, "skip: Rename into a missing directory (afero/2)")
-+			return true
-+		case qParentKind == kindFile && Known.FileBecomesDir:
-+			count(ht, "skip: Rename below a file (afero/5)")
-+			return true
-+		}
-+		note(ht, "Rename(%q, %q)", raw, raw2)
-+		return p.sameErr("Rename("+raw+", "+raw2+")", p.mem.Rename(raw, raw2), p.os.Rename(raw, raw2))
-+	case 8: // Chmod
-+		var mode os.FileMode
-+		if kind == kindDir {
-+			mode = pick(tc, dirModes...)
-+		} else {
-+			mode = genFileMode(tc)
-+		}
-+		note(ht, "Chmod(%q, %o)", raw, mode)
-+		return p.sameErr("Chmod("+raw+")", p.mem.Chmod(raw, mode), p.os.Chmod(raw, mode))
-+	case 9: // Chtimes
-+		when := time.Unix(int64(n(tc, 0, 2_000_000_000)), 0)
-+		note(ht, "Chtimes(%q, %v)", raw, when)
-+		if !p.sameErr("Chtimes("+raw+")", p.mem.Chtimes(raw, when, when), p.os.Chtimes(raw, when, when)) {
-+			return false
-+		}
-+		mfi, merr := p.mem.Stat(raw)
-+		ofi, oerr := p.os.Stat(raw)
-+		if merr == nil && oerr == nil {
-+			return p.same("ModTime after Chtimes("+raw+")", mfi.ModTime().Unix(), ofi.ModTime().Unix())
-+		}
-+		return true
-+	case 10, 11: // Stat
-+		note(ht, "Stat(%q)", raw)
-+		mfi, merr := p.mem.Stat(raw)
-+		ofi, oerr := p.os.Stat(raw)
-+		return p.same("Stat("+raw+")", statSummary(mfi, merr, cp != "/"), statSummary(ofi, oerr, cp != "/"))
-+	default: // ReadDir / ReadFile
-+		if kind == kindDir || chance(tc, 30) {
-+			note(ht, "ReadDir(%q)", raw)
-+			ml, merr := afero.ReadDir(p.mem, raw)
-+			ol, oerr := afero.ReadDir(p.os, raw)
-+			if !p.sameErr("ReadDir("+raw+")", merr, oerr) {
-+				return false
-+			}
-+			return p.same("ReadDir("+raw+")", dirList(ml), dirList(ol))
-+		}
-+		note(ht, "ReadFile(%q)", raw)
-+		md, merr := afero.ReadFile(p.mem, raw)
-+		od, oerr := afero.ReadFile(p.os, raw)
-+		if !p.sameErr("ReadFile("+raw+")", merr, oerr) {
-+			return false
-+		}
-+		return p.same("ReadFile("+raw+")", string(md), string(od))
-+	}
 +}
 +
 +func dirList(l []os.FileInfo) string {
@@ -583,191 +750,312 @@ index 0000000..7d1c097
 +	return err == nil && fi.Mode().Perm()&0o222 != 0
 +}
 +
-+const (
-+	accessR = iota
-+	accessW
-+	accessRW
-+)
++// ---------------------------------------------------------------------------
++// The property.
 +
-+func genFlags(tc hegel.TestCase) (int, int) {
-+	acc := pick(tc, accessR, accessW, accessRW)
-+	flag := [...]int{os.O_RDONLY, os.O_WRONLY, os.O_RDWR}[acc]
-+	if chance(tc, 50) {
-+		flag |= os.O_CREATE
-+		if chance(tc, 30) {
-+			flag |= os.O_EXCL
-+		}
++// TestHegelMemMapFsMatchesTheOs: MemMapFs and OsFs agree on every operation
++// and on the resulting tree. A step whose shape is a recorded bug runs by
++// default and its mismatch names the bug (see known.go).
++func TestHegelMemMapFsMatchesTheOs(t *testing.T) {
++	root, err := os.MkdirTemp("", "hegel-afero-")
++	if err != nil {
++		t.Fatal(err)
 +	}
-+	if acc != accessR {
-+		if chance(tc, 30) {
-+			flag |= os.O_TRUNC
++	defer os.RemoveAll(root)
++	property(t, func(ht *hegel.T) {
++		script := hegel.Draw(ht, memScripts)
++		dir, err := os.MkdirTemp(root, "case-")
++		if err != nil {
++			t.Fatal(err)
 +		}
-+		if chance(tc, 30) {
-+			flag |= os.O_APPEND
-+			if Known.AppendSeeksOnce {
-+				// MemMapFs seeks to the end before truncating: the first write
-+				// of an O_TRUNC|O_APPEND handle lands past a zero (afero/11).
-+				flag &^= os.O_TRUNC
++		defer os.RemoveAll(dir)
++		p := &pair{ht: ht, mem: afero.NewMemMapFs(), os: afero.NewBasePathFs(afero.NewOsFs(), dir)}
++		defer p.recoverPanics()
++		for _, s := range script {
++			if !p.step(s) || !p.checkTrees() {
++				return
 +			}
 +		}
-+	}
-+	return flag, acc
++	})
 +}
 +
-+func flagString(flag int) string {
-+	var parts []string
-+	switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
-+	case os.O_RDONLY:
-+		parts = append(parts, "O_RDONLY")
-+	case os.O_WRONLY:
-+		parts = append(parts, "O_WRONLY")
-+	case os.O_RDWR:
-+		parts = append(parts, "O_RDWR")
-+	}
-+	for _, f := range []struct {
-+		bit  int
-+		name string
-+	}{{os.O_CREATE, "O_CREATE"}, {os.O_EXCL, "O_EXCL"}, {os.O_TRUNC, "O_TRUNC"}, {os.O_APPEND, "O_APPEND"}} {
-+		if flag&f.bit != 0 {
-+			parts = append(parts, f.name)
++// step applies one operation to both file systems; false ends the case.
++func (p *pair) step(s memStep) bool {
++	ht := p.ht
++	p.shapes = nil
++	live := liveDirs(p.os)
++	raw := s.Path.render(live)
++	cp := canon(raw)
++	parent := path.Dir(cp)
++	parentKind := kindOf(p.os, parent)
++	kind := kindOf(p.os, cp)
++	switch s.Op {
++	case "Mkdir":
++		if !p.gate(shapeIf(parentKind == kindMissing, "afero/1"), shapeIf(parentKind == kindFile, "afero/5")) {
++			return true
 +		}
++		note(ht, "Mkdir(%q, %o)", raw, s.Perm)
++		return p.sameErr("Mkdir("+raw+")", p.mem.Mkdir(raw, s.Perm), p.os.Mkdir(raw, s.Perm))
++	case "MkdirAll":
++		if !p.gate(shapeIf(kind == kindFile, "afero/4"), shapeIf(fileOnTheWay(p.os, cp), "afero/5")) {
++			return true
++		}
++		note(ht, "MkdirAll(%q, %o)", raw, s.Perm)
++		return p.sameErr("MkdirAll("+raw+")", p.mem.MkdirAll(raw, s.Perm), p.os.MkdirAll(raw, s.Perm))
++	case "Create":
++		if !p.gate(
++			shapeIf(parentKind == kindMissing, "afero/2"),
++			shapeIf(parentKind == kindFile, "afero/5"),
++			shapeIf(kind == kindDir, "afero/6"),
++			shapeIf(kind == kindFile && !writable(p.os, cp), "afero/30"),
++			shapeIf(kind == kindFile && permOf(p.os, cp) != 0o666, "afero/15"),
++		) {
++			return true
++		}
++		note(ht, "Create(%q)", raw)
++		mf, merr := p.mem.Create(raw)
++		of, oerr := p.os.Create(raw)
++		if !p.sameErr("Create("+raw+")", merr, oerr) {
++			return false
++		}
++		if merr != nil {
++			return true
++		}
++		return p.handleOps(s, cp, mf, of, accessRW, false, false)
++	case "Open":
++		note(ht, "Open(%q)", raw)
++		mf, merr := p.mem.Open(raw)
++		of, oerr := p.os.Open(raw)
++		if !p.sameErr("Open("+raw+")", merr, oerr) {
++			return false
++		}
++		if merr != nil {
++			return true
++		}
++		return p.handleOps(s, cp, mf, of, accessR, false, kind == kindDir)
++	case "OpenFile":
++		f := s.Flags
++		flag := f.flag()
++		if !p.gate(
++			shapeIf(f.Create && parentKind == kindMissing, "afero/2"),
++			shapeIf(f.Create && parentKind == kindFile, "afero/5"),
++			shapeIf(kind == kindDir && flag != os.O_RDONLY, "afero/14"),
++			shapeIf(kind == kindFile && !writable(p.os, cp) && (f.Acc == accessR || f.Excl), "afero/13"),
++			shapeIf(f.Trunc && f.Append, "afero/11"),
++		) {
++			return true
++		}
++		note(ht, "OpenFile(%q, %s, %o)", raw, flagString(flag), s.Perm)
++		mf, merr := p.mem.OpenFile(raw, flag, s.Perm)
++		of, oerr := p.os.OpenFile(raw, flag, s.Perm)
++		if !p.sameErr("OpenFile("+raw+", "+flagString(flag)+")", merr, oerr) {
++			return false
++		}
++		if merr != nil {
++			return true
++		}
++		return p.handleOps(s, cp, mf, of, f.Acc, f.Append, kind == kindDir)
++	case "Remove":
++		if !p.gate(shapeIf(kind == kindDir && hasChildren(p.os, cp), "afero/3")) {
++			return true
++		}
++		note(ht, "Remove(%q)", raw)
++		return p.sameErr("Remove("+raw+")", p.mem.Remove(raw), p.os.Remove(raw))
++	case "RemoveAll":
++		if fileOnTheWay(p.os, cp) {
++			// os.RemoveAll reports ENOTDIR for a path below a regular file;
++			// MemMapFs returns nil as for any missing path. Convention.
++			count(ht, "convention: RemoveAll below a file")
++			return true
++		}
++		note(ht, "RemoveAll(%q)", raw)
++		return p.sameErr("RemoveAll("+raw+")", p.mem.RemoveAll(raw), p.os.RemoveAll(raw))
++	case "Rename":
++		raw2 := s.Path2.render(live)
++		cq := canon(raw2)
++		qKind := kindOf(p.os, cq)
++		qParentKind := kindOf(p.os, path.Dir(cq))
++		switch {
++		case cp == cq && kind == kindDir:
++			// Go's os.Rename reports EEXIST for a directory renamed onto
++			// itself; MemMapFs treats equal names as a no-op. Convention.
++			count(ht, "convention: Rename(dir, dir)")
++			return true
++		case kind != kindMissing && qKind == kindDir && cq != cp:
++			// Go's os.Rename refuses any existing directory as destination
++			// (EEXIST), even an empty one. Convention.
++			count(ht, "convention: Rename onto a directory")
++			return true
++		case kind != kindMissing && strings.HasPrefix(cq, cp+"/") && (kind == kindFile || qParentKind == kindMissing):
++			// MemMapFs.Rename of an entry to a path below itself whose parent
++			// does not exist (or of a file to any path below itself) panics
++			// in unRegisterWithParent ("parent of ... is nil", memmap.go:74)
++			// and the deferred RUnlock then aborts the process; OsFs returns
++			// EINVAL/ENOTDIR. Not recorded yet; the shape is left out in
++			// both modes because the crash cannot be recovered in-process.
++			count(ht, "candidate/go/afero-1: Rename below itself with a missing parent panics")
++			return true
++		}
++		var shapes []string
++		if kind == kindMissing {
++			shapes = []string{shapeIf(cp == cq, "afero/29")} // fails on both otherwise
++		} else {
++			shapes = []string{
++				shapeIf(strings.HasPrefix(cq, cp+"/"), "afero/8"),
++				shapeIf(qKind == kindFile && kind == kindDir, "afero/7"),
++				shapeIf(qParentKind == kindMissing, "afero/2"),
++				shapeIf(qParentKind == kindFile, "afero/5"),
++			}
++		}
++		if !p.gate(shapes...) {
++			return true
++		}
++		note(ht, "Rename(%q, %q)", raw, raw2)
++		return p.sameErr("Rename("+raw+", "+raw2+")", p.mem.Rename(raw, raw2), p.os.Rename(raw, raw2))
++	case "Chmod":
++		mode := s.FilePerm
++		if kind == kindDir {
++			mode = s.Perm
++		}
++		note(ht, "Chmod(%q, %o)", raw, mode)
++		return p.sameErr("Chmod("+raw+")", p.mem.Chmod(raw, mode), p.os.Chmod(raw, mode))
++	case "Chtimes":
++		when := time.Unix(s.When, 0)
++		note(ht, "Chtimes(%q, %v)", raw, when)
++		if !p.sameErr("Chtimes("+raw+")", p.mem.Chtimes(raw, when, when), p.os.Chtimes(raw, when, when)) {
++			return false
++		}
++		mfi, merr := p.mem.Stat(raw)
++		ofi, oerr := p.os.Stat(raw)
++		if merr == nil && oerr == nil {
++			return p.same("ModTime after Chtimes("+raw+")", mfi.ModTime().Unix(), ofi.ModTime().Unix())
++		}
++		return true
++	case "Stat":
++		note(ht, "Stat(%q)", raw)
++		mfi, merr := p.mem.Stat(raw)
++		ofi, oerr := p.os.Stat(raw)
++		return p.same("Stat("+raw+")", statSummary(mfi, merr, cp != "/"), statSummary(ofi, oerr, cp != "/"))
++	case "ReadDir":
++		note(ht, "ReadDir(%q)", raw)
++		ml, merr := afero.ReadDir(p.mem, raw)
++		ol, oerr := afero.ReadDir(p.os, raw)
++		if !p.sameErr("ReadDir("+raw+")", merr, oerr) {
++			return false
++		}
++		return p.same("ReadDir("+raw+")", dirList(ml), dirList(ol))
++	default: // ReadFile
++		if !p.gate(shapeIf(kind == kindDir, "afero/14")) {
++			return true
++		}
++		note(ht, "ReadFile(%q)", raw)
++		md, merr := afero.ReadFile(p.mem, raw)
++		od, oerr := afero.ReadFile(p.os, raw)
++		if !p.sameErr("ReadFile("+raw+")", merr, oerr) {
++			return false
++		}
++		return p.same("ReadFile("+raw+")", string(md), string(od))
 +	}
-+	return strings.Join(parts, "|")
 +}
 +
-+// handleOps runs a short random sequence of operations on the two open
-+// files, compares every result and closes both.
-+func (p *pair) handleOps(tc hegel.TestCase, cp string, mf, of afero.File, acc int, appendMode, isDir bool) bool {
-+	ok := p.handleOpsInner(tc, cp, mf, of, acc, appendMode, isDir)
++// handleOps applies the step's handle operations to the two open files,
++// compares every result and closes both.
++func (p *pair) handleOps(s memStep, cp string, mf, of afero.File, acc int, appendMode, isDir bool) bool {
++	ok := p.handleOpsInner(s.Handle, cp, mf, of, acc, appendMode, isDir)
 +	merr, oerr := mf.Close(), of.Close()
 +	if ok {
 +		ok = p.sameErr("Close", merr, oerr)
 +	}
-+	if ok && chance(tc, 20) {
++	if ok && s.Again {
 +		ok = p.sameErr("second Close", mf.Close(), of.Close())
 +	}
-+	return true
++	return ok
 +}
 +
-+func (p *pair) handleOpsInner(tc hegel.TestCase, cp string, mf, of afero.File, acc int, appendMode, isDir bool) bool {
++func (p *pair) handleOpsInner(ops []handleOp, cp string, mf, of afero.File, acc int, appendMode, isDir bool) bool {
 +	ht := p.ht
 +	if cp != "/" && !p.same("Name()", mf.Name(), of.Name()) {
 +		return false
 +	}
-+	for k := n(tc, 0, 6); k > 0; k-- {
-+		var op int
-+		if isDir {
-+			op = pick(tc, 6, 7, 8)
-+		} else {
-+			op = n(tc, 0, 8)
++	for _, h := range ops {
++		fileOp := h.Op != "Stat" && h.Op != "Readdir"
++		writeOp := h.Op == "Write" || h.Op == "WriteString" || h.Op == "WriteAt" || h.Op == "Truncate"
++		readOp := h.Op == "Read" || h.Op == "ReadAt"
++		moveOp := h.Op == "Read" || h.Op == "WriteAt" || h.Op == "Seek" || h.Op == "Truncate"
++		if !p.gate(
++			shapeIf(isDir && fileOp, "afero/14"),
++			shapeIf(writeOp && acc == accessR, "afero/12"),
++			shapeIf(readOp && acc == accessW, "afero/12"),
++			shapeIf(moveOp && appendMode, "afero/11"),
++			shapeIf((h.Op == "Write" || h.Op == "WriteString" || h.Op == "WriteAt") && len(h.Data) == 0, "afero/31"),
++		) {
++			continue
 +		}
-+		switch op {
-+		case 0, 1: // Write / WriteString
-+			if acc == accessR && Known.AccessModeIgnored {
-+				count(ht, "skip: write on a read-only handle (afero/12)")
-+				continue
-+			}
-+			data := genData(tc)
-+			if len(data) == 0 && Known.EmptyWriteAtGrows {
-+				count(ht, "skip: Write of an empty slice (afero/31)")
-+				continue
-+			}
++		switch h.Op {
++		case "Write", "WriteString":
 +			var mn, on int
 +			var merr, oerr error
-+			if op == 0 {
-+				mn, merr = mf.Write(data)
-+				on, oerr = of.Write(data)
++			if h.Op == "Write" {
++				mn, merr = mf.Write(h.Data)
++				on, oerr = of.Write(h.Data)
 +			} else {
-+				mn, merr = mf.WriteString(string(data))
-+				on, oerr = of.WriteString(string(data))
++				mn, merr = mf.WriteString(string(h.Data))
++				on, oerr = of.WriteString(string(h.Data))
 +			}
-+			note(ht, "  Write(%q)", data)
-+			if !p.sameErr("Write", merr, oerr) || !p.same("Write count", mn, on) {
++			note(ht, "  %s(%q)", h.Op, h.Data)
++			if !p.sameErr(h.Op, merr, oerr) || !p.same(h.Op+" count", mn, on) {
 +				return false
 +			}
-+		case 2: // Read
-+			if acc == accessW && Known.AccessModeIgnored {
-+				count(ht, "skip: read on a write-only handle (afero/12)")
-+				continue
-+			}
-+			if appendMode && Known.AppendSeeksOnce {
-+				count(ht, "skip: Read on an O_APPEND handle (afero/11)")
-+				continue
-+			}
-+			buf1, buf2 := make([]byte, n(tc, 0, 8)), make([]byte, 0)
-+			buf2 = append(buf2, buf1...)
++		case "Read":
++			buf1, buf2 := make([]byte, h.Size), make([]byte, h.Size)
 +			mn, merr := mf.Read(buf1)
 +			on, oerr := of.Read(buf2)
-+			note(ht, "  Read(%d) -> %d %v / %d %v", len(buf1), mn, merr, on, oerr)
-+			if Known.UnexpectedEOF && errors.Is(merr, io.ErrUnexpectedEOF) && (errors.Is(oerr, io.EOF) || (oerr == nil && on == 0)) {
-+				count(ht, "accepted: Read past the end gives ErrUnexpectedEOF (afero/10)")
++			note(ht, "  Read(%d) -> %d %v / %d %v", h.Size, mn, merr, on, oerr)
++			if errors.Is(merr, io.ErrUnexpectedEOF) && (errors.Is(oerr, io.EOF) || (oerr == nil && on == 0)) && p.accept("afero/10") {
 +				merr = oerr
 +			}
 +			if !p.sameErr("Read", merr, oerr) || !p.same("Read result", fmt.Sprintf("%d %q", mn, buf1[:mn]), fmt.Sprintf("%d %q", on, buf2[:on])) {
 +				return false
 +			}
-+		case 3: // ReadAt
-+			if acc == accessW && Known.AccessModeIgnored {
-+				count(ht, "skip: ReadAt on a write-only handle (afero/12)")
-+				continue
-+			}
-+			buf1, buf2 := make([]byte, n(tc, 0, 8)), make([]byte, 0)
-+			buf2 = append(buf2, buf1...)
-+			off := int64(n(tc, 0, 14))
-+			mn, merr := mf.ReadAt(buf1, off)
-+			on, oerr := of.ReadAt(buf2, off)
-+			note(ht, "  ReadAt(%d, %d) -> %d %v / %d %v", len(buf1), off, mn, merr, on, oerr)
-+			if Known.UnexpectedEOF && errors.Is(merr, io.ErrUnexpectedEOF) && (errors.Is(oerr, io.EOF) || (oerr == nil && on == 0)) {
-+				count(ht, "accepted: ReadAt past the end gives ErrUnexpectedEOF (afero/10)")
++		case "ReadAt":
++			buf1, buf2 := make([]byte, h.Size), make([]byte, h.Size)
++			mn, merr := mf.ReadAt(buf1, h.Off)
++			on, oerr := of.ReadAt(buf2, h.Off)
++			note(ht, "  ReadAt(%d, %d) -> %d %v / %d %v", h.Size, h.Off, mn, merr, on, oerr)
++			if errors.Is(merr, io.ErrUnexpectedEOF) && (errors.Is(oerr, io.EOF) || (oerr == nil && on == 0)) && p.accept("afero/10") {
 +				merr = oerr
 +			}
 +			if !p.sameErr("ReadAt", merr, oerr) || !p.same("ReadAt result", fmt.Sprintf("%d %q", mn, buf1[:mn]), fmt.Sprintf("%d %q", on, buf2[:on])) {
 +				return false
 +			}
-+		case 4: // WriteAt
-+			if acc == accessR && Known.AccessModeIgnored {
-+				count(ht, "skip: WriteAt on a read-only handle (afero/12)")
-+				continue
-+			}
-+			if appendMode && Known.AppendSeeksOnce {
-+				count(ht, "skip: WriteAt on an O_APPEND handle (afero/11)")
-+				continue
-+			}
-+			data := genData(tc)
-+			off := int64(n(tc, 0, 14))
-+			if len(data) == 0 && Known.EmptyWriteAtGrows {
-+				count(ht, "skip: WriteAt of an empty slice (afero/31)")
-+				continue
-+			}
-+			mn, merr := mf.WriteAt(data, off)
-+			on, oerr := of.WriteAt(data, off)
-+			note(ht, "  WriteAt(%q, %d)", data, off)
++		case "WriteAt":
++			mn, merr := mf.WriteAt(h.Data, h.Off)
++			on, oerr := of.WriteAt(h.Data, h.Off)
++			note(ht, "  WriteAt(%q, %d)", h.Data, h.Off)
 +			if !p.sameErr("WriteAt", merr, oerr) || !p.same("WriteAt count", mn, on) {
 +				return false
 +			}
-+		case 5: // Seek
-+			if appendMode && Known.AppendSeeksOnce {
-+				count(ht, "skip: Seek on an O_APPEND handle (afero/11)")
-+				continue
-+			}
-+			whence := pick(tc, io.SeekStart, io.SeekCurrent, io.SeekEnd)
-+			if !Known.SeekBadWhence && chance(tc, 5) {
-+				whence = 7
-+			}
-+			off := int64(n(tc, -3, 14))
-+			mpos, merr := mf.Seek(off, whence)
-+			opos, oerr := of.Seek(off, whence)
-+			note(ht, "  Seek(%d, %d) -> %d %v / %d %v", off, whence, mpos, merr, opos, oerr)
-+			if oerr != nil && merr == nil && Known.NegativeSeek {
-+				// The MemMapFs position is negative now and the next Read or
-+				// Write would panic: end the handle's life here.
-+				count(ht, "accepted: Seek to a negative position succeeded (afero/9)")
-+				return true
++		case "Seek":
++			mpos, merr := mf.Seek(h.Off, h.Whence)
++			opos, oerr := of.Seek(h.Off, h.Whence)
++			note(ht, "  Seek(%d, %d) -> %d %v / %d %v", h.Off, h.Whence, mpos, merr, opos, oerr)
++			if oerr != nil && merr == nil {
++				// MemMapFs accepted what the OS refused: a bad whence
++				// (afero/18) or a negative position (afero/9), after which
++				// its next Read or Write would panic. While accepted, the
++				// handle's life ends here.
++				id := "afero/9"
++				if h.Whence == 7 {
++					id = "afero/18"
++				}
++				if p.accept(id) {
++					return true
++				}
 +			}
 +			if !p.sameErr("Seek", merr, oerr) || (merr == nil && !p.same("Seek position", mpos, opos)) {
 +				return false
 +			}
-+		case 6: // Stat / Sync
++		case "Stat":
 +			mfi, merr := mf.Stat()
 +			ofi, oerr := of.Stat()
 +			if !p.same("File.Stat()", statSummary(mfi, merr, !isDir || mf.Name() != "/"), statSummary(ofi, oerr, !isDir || mf.Name() != "/")) {
@@ -776,29 +1064,27 @@ index 0000000..7d1c097
 +			if !p.sameErr("Sync", mf.Sync(), of.Sync()) {
 +				return false
 +			}
-+		case 7: // Readdir / Readdirnames pages
++		case "Readdir":
 +			if !isDir {
 +				merr := errClass(func() error { _, err := mf.Readdir(-1); return err }())
 +				oerr := errClass(func() error { _, err := of.Readdir(-1); return err }())
 +				if merr == "ok" || oerr == "ok" {
-+					fail(ht, "Readdir on a file handle: MemMapFs %s, OsFs %s", merr, oerr)
++					p.fail("Readdir on a file handle: %s %s, %s %s", p.memName(), merr, p.osName(), oerr)
 +					return false
 +				}
 +				continue
 +			}
-+			page := pick(tc, -1, 0, 1, 2, 5)
-+			names := chance(tc, 50)
 +			var mAll, oAll []string
 +			for calls := 0; calls < 5; calls++ {
 +				var mn, on []string
 +				var merr, oerr error
-+				if names {
-+					mn, merr = mf.Readdirnames(page)
-+					on, oerr = of.Readdirnames(page)
++				if h.Names {
++					mn, merr = mf.Readdirnames(h.Page)
++					on, oerr = of.Readdirnames(h.Page)
 +				} else {
 +					var ml, ol []os.FileInfo
-+					ml, merr = mf.Readdir(page)
-+					ol, oerr = of.Readdir(page)
++					ml, merr = mf.Readdir(h.Page)
++					ol, oerr = of.Readdir(h.Page)
 +					for _, fi := range ml {
 +						mn = append(mn, fi.Name())
 +					}
@@ -806,13 +1092,13 @@ index 0000000..7d1c097
 +						on = append(on, fi.Name())
 +					}
 +				}
-+				note(ht, "  Readdir(%d) -> %v %v / %v %v", page, mn, merr, on, oerr)
++				note(ht, "  Readdir(%d) -> %v %v / %v %v", h.Page, mn, merr, on, oerr)
 +				if !p.sameErr("Readdir page error", merr, oerr) || !p.same("Readdir page size", len(mn), len(on)) {
 +					return false
 +				}
 +				mAll = append(mAll, mn...)
 +				oAll = append(oAll, on...)
-+				if merr != nil || page <= 0 {
++				if merr != nil || h.Page <= 0 {
 +					break
 +				}
 +			}
@@ -821,18 +1107,9 @@ index 0000000..7d1c097
 +			if !p.same("Readdir names", mAll, oAll) {
 +				return false
 +			}
-+		case 8: // Truncate
-+			if acc == accessR && Known.AccessModeIgnored {
-+				count(ht, "skip: Truncate on a read-only handle (afero/12)")
-+				continue
-+			}
-+			if appendMode && Known.AppendSeeksOnce {
-+				count(ht, "skip: Truncate on an O_APPEND handle (afero/11)")
-+				continue
-+			}
-+			size := int64(n(tc, -1, 14))
-+			note(ht, "  Truncate(%d)", size)
-+			if !p.sameErr("Truncate", mf.Truncate(size), of.Truncate(size)) {
++		case "Truncate":
++			note(ht, "  Truncate(%d)", h.Off)
++			if !p.sameErr("Truncate", mf.Truncate(h.Off), of.Truncate(h.Off)) {
 +				return false
 +			}
 +		}
@@ -841,10 +1118,10 @@ index 0000000..7d1c097
 +}
 diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
 new file mode 100644
-index 0000000..570294a
+index 0000000..e13be77
 --- /dev/null
 +++ b/hegel/hegel_pins_test.go
-@@ -0,0 +1,545 @@
+@@ -0,0 +1,590 @@
 +package hegel
 +
 +// One plain test per recorded bug (bugs.toml), asserting the correct
@@ -853,13 +1130,17 @@ index 0000000..570294a
 +
 +import (
 +	"bytes"
++	"context"
 +	"errors"
 +	"io"
 +	"os"
++	"os/exec"
 +	"path/filepath"
 +	"regexp"
++	"strings"
 +	"syscall"
 +	"testing"
++	"time"
 +
 +	"github.com/spf13/afero"
 +)
@@ -1390,19 +1671,69 @@ index 0000000..570294a
 +	}
 +	f.Close()
 +}
++
++// afero/39. The Rename aborts the whole process (a log.Panic inside a read lock, then the
++// deferred RUnlock's fatal error), so the call runs in a child: the test binary itself,
++// running only this test with HEGEL_AFERO_CHILD set.
++func TestHegelPinRenameBelowAMissingParentIsAnError(t *testing.T) {
++	if os.Getenv("HEGEL_AFERO_CHILD") == "1" {
++		m := afero.NewMemMapFs()
++		m.MkdirAll("/b", 0o755)
++		err := m.Rename("/b", "/b/c/c")
++		os.Stdout.WriteString("rename returned: " + errString(err) + "\n")
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run", "^TestHegelPinRenameBelowAMissingParentIsAnError$", "-test.v")
++	cmd.Env = append(os.Environ(), "HEGEL_AFERO_CHILD=1")
++	cmd.WaitDelay = 5 * time.Second
++	out, err := cmd.CombinedOutput()
++	text := string(out)
++	if !strings.Contains(text, "rename returned: ") {
++		t.Errorf("MemMapFs.Rename(/b, /b/c/c) of a directory below itself to a path whose parent does not exist aborted the process (OsFs: ENOENT); child exit %v, output:\n%s", err, short(text))
++		return
++	}
++	if strings.Contains(text, "rename returned: <nil>") {
++		t.Errorf("MemMapFs.Rename(/b, /b/c/c) of a directory below itself to a path whose parent does not exist succeeded (OsFs: ENOENT)")
++	}
++}
++
++func errString(err error) string {
++	if err == nil {
++		return "<nil>"
++	}
++	return err.Error()
++}
++
++func short(s string) string {
++	if len(s) > 1500 {
++		return s[:1500] + "..."
++	}
++	return s
++}
 diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
 new file mode 100644
-index 0000000..10c7847
+index 0000000..205a01f
 --- /dev/null
 +++ b/hegel/hegel_test.go
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,199 @@
 +package hegel
 +
-+// Hegel properties for golang.org/x/mod: semver and module against their
-+// documented grammars and orders, modfile against parse/format round trips
-+// and its editing API, sumdb/tlog against the Merkle tree definitions,
-+// sumdb/note against its signature format, and zip against Create/Unzip
-+// round trips and CheckFiles. No external tools.
++// Hegel properties for github.com/spf13/afero: MemMapFs against an OsFs
++// confined to a temporary directory, the package-level helpers against os
++// and path/filepath, and the wrapping file systems (ReadOnlyFs,
++// CopyOnWriteFs, CacheOnReadFs, RegexpFs, BasePathFs, IOFS) against small
++// models. No external tools.
++//
++// Every property draws one case record (a tree to build and a list of
++// operations) from generator values and applies it with positions taken
++// modulo the live tree, so a step that does not fit the state is a no-op the
++// shrinker can delete. The recorded bugs (bugs.toml) are reached by default:
++// a step whose shape is a recorded bug runs, and a mismatch names the bug.
++// With HEGEL_NO_KNOWN=1 such steps are no-ops (or the shape is left out of
++// the generator) and the recorded outcomes are accepted, so the properties
++// must pass; see known.go.
 +
 +import (
 +	"fmt"
@@ -1433,8 +1764,8 @@ index 0000000..10c7847
 +	counts   = map[string]int{}
 +)
 +
-+// count tallies the gated shapes of each property so a run shows how often
-+// the Known gates fire (printed with -v as COUNTS).
++// count tallies the no-op steps and accepted outcomes of each property so a
++// run shows how often the known-bug gates fire (printed with -v as COUNTS).
 +func count(_ *hegel.T, label string) {
 +	countsMu.Lock()
 +	counts[label]++
@@ -1479,11 +1810,7 @@ index 0000000..10c7847
 +			if _, ok := r.(collected); ok {
 +				return
 +			}
-+			tn := reflect.TypeOf(r).String()
-+			if err, ok := r.(error); ok && strings.Contains(err.Error(), "hegel_") {
-+				panic(r) // libhegel control flow
-+			}
-+			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++			if controlFlow(r) {
 +				panic(r)
 +			}
 +			if collecting {
@@ -1496,6 +1823,16 @@ index 0000000..10c7847
 +		}()
 +		fn(ht)
 +	}, hegelOpts()...)
++}
++
++// controlFlow reports whether a recovered value is Hegel's own (a Fatalf,
++// an Assume, libhegel's stop), which must propagate.
++func controlFlow(r any) bool {
++	if err, ok := r.(error); ok && strings.Contains(err.Error(), "hegel_") {
++		return true
++	}
++	tn := reflect.TypeOf(r).String()
++	return strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.")
 +}
 +
 +func hegelOpts() []hegel.Option {
@@ -1521,22 +1858,65 @@ index 0000000..10c7847
 +	ht.Fatalf(format, args...)
 +}
 +
-+func n(tc hegel.TestCase, lo, hi int) int {
-+	if lo > hi {
-+		panic(fmt.Sprintf("n(%d, %d): empty range", lo, hi))
-+	}
-+	return hegel.Draw(tc, hegel.Integers(lo, hi))
-+}
-+
-+func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
-+
-+func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
-+
 +func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
 +
-+// show renders a string with every non-ASCII or control rune escaped, so a
-+// failure message can be read and replayed.
-+func show(s string) string { return strconv.QuoteToASCII(s) }
++// ---------------------------------------------------------------------------
++// Generator idioms (the same in the other Go targets of the zoo).
++
++// choice is one alternative of a weighted choice.
++type choice[T any] struct {
++	weight int
++	gen    hegel.Generator[T]
++}
++
++// weighted draws one of the alternatives with probability proportional to
++// its weight. The first alternative is the shrink target, so it should be
++// the plainest one.
++func weighted[T any](choices ...choice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	return hegel.FlatMap(hegel.Integers(0, total-1), func(x int) hegel.Generator[T] {
++		for _, c := range choices {
++			if x < c.weight {
++				return c.gen
++			}
++			x -= c.weight
++		}
++		return choices[len(choices)-1].gen
++	})
++}
++
++// chance is a biased coin that shrinks to false.
++func chance(pct int) hegel.Generator[bool] {
++	return hegel.Map(hegel.Integers(0, 99), func(x int) bool { return x >= 100-pct })
++}
++
++// many draws lo..hi values of g.
++func many[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	return hegel.Lists(g).MinSize(lo).MaxSize(hi)
++}
++
++// positions are indices taken modulo a live size when a case is applied.
++var positions = hegel.Integers(0, 99)
++
++// at picks the element of xs at a drawn position (modulo the live size).
++func at[T any](xs []T, pos int) T { return xs[pos%len(xs)] }
++
++// shaped picks the generator for the current mode: withBugs draws the shapes
++// of the recorded bugs too, without leaves them out (HEGEL_NO_KNOWN=1).
++func shaped[T any](withBugs, without hegel.Generator[T]) hegel.Generator[T] {
++	if noKnown {
++		return without
++	}
++	return withBugs
++}
++
++// join renders drawn pieces as one string (a Map over many).
++func join(g hegel.Generator[[]string]) hegel.Generator[string] {
++	return hegel.Map(g, func(xs []string) string { return strings.Join(xs, "") })
++}
 diff --git a/hegel/hegel_unix_test.go b/hegel/hegel_unix_test.go
 new file mode 100644
 index 0000000..1d2fe91
@@ -1554,10 +1934,10 @@ index 0000000..1d2fe91
 +func init() { syscall.Umask(0) }
 diff --git a/hegel/hegel_util_test.go b/hegel/hegel_util_test.go
 new file mode 100644
-index 0000000..4185695
+index 0000000..aee0986
 --- /dev/null
 +++ b/hegel/hegel_util_test.go
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,681 @@
 +package hegel
 +
 +// The package-level helpers (ReadDir, ReadFile, WriteFile, Exists, DirExists,
@@ -1567,7 +1947,6 @@ index 0000000..4185695
 +
 +import (
 +	"bytes"
-+	"errors"
 +	"fmt"
 +	"io/fs"
 +	"os"
@@ -1583,27 +1962,71 @@ index 0000000..4185695
 +	"hegel.dev/go/hegel"
 +)
 +
++// ---------------------------------------------------------------------------
++// Trees.
++
 +var treeNames = []string{"a", "b", "c", "x y", "\u00e9", ".h", "a-b", "b.txt", "c.log"}
 +
-+// buildTree creates the same random tree (directories first, then files) on
-+// every given file system and returns the directories and files created.
-+func buildTree(tc hegel.TestCase, fss ...afero.Fs) (dirs, files []string, content map[string][]byte) {
++var names = hegel.SampledFrom(treeNames)
++
++// treeDir is a directory to create below the live directory at a position;
++// treeFile a file with its content. A name already taken is a no-op.
++type treeDir struct {
++	At   int
++	Name string
++}
++
++type treeFile struct {
++	At   int
++	Name string
++	Data []byte
++}
++
++// treeSpec is a drawn tree: up to 5 directories, then up to 7 files.
++type treeSpec struct {
++	Dirs  []treeDir
++	Files []treeFile
++}
++
++var treeDirs = hegel.Composite(func(tc hegel.TestCase) treeDir {
++	return treeDir{At: hegel.Draw(tc, positions), Name: hegel.Draw(tc, names)}
++})
++
++var treeFiles = hegel.Composite(func(tc hegel.TestCase) treeFile {
++	return treeFile{At: hegel.Draw(tc, positions), Name: hegel.Draw(tc, names), Data: hegel.Draw(tc, dataBytes)}
++})
++
++var treeSpecs = hegel.Composite(func(tc hegel.TestCase) treeSpec {
++	return treeSpec{Dirs: hegel.Draw(tc, many(treeDirs, 0, 5)), Files: hegel.Draw(tc, many(treeFiles, 0, 7))}
++})
++
++func (t treeSpec) GoString() string {
++	var parts []string
++	for _, d := range t.Dirs {
++		parts = append(parts, fmt.Sprintf("dir <%d>/%s", d.At, d.Name))
++	}
++	for _, f := range t.Files {
++		parts = append(parts, fmt.Sprintf("file <%d>/%s %q", f.At, f.Name, f.Data))
++	}
++	return "tree{" + strings.Join(parts, ", ") + "}"
++}
++
++// build creates the tree (directories first, then files) on every given file
++// system and returns the directories and files created, sorted.
++func (t treeSpec) build(fss ...afero.Fs) (dirs, files []string, content map[string][]byte) {
 +	dirs = []string{"/"}
 +	content = map[string][]byte{}
-+	for i, k := 0, n(tc, 0, 5); i < k; i++ {
-+		d := pick(tc, dirs...)
-+		if d == "/" {
-+			d = ""
-+		}
-+		nd := d + "/" + pick(tc, treeNames...)
-+		if content[nd] != nil {
-+			continue
-+		}
-+		dup := false
++	isDir := func(p string) bool {
 +		for _, e := range dirs {
-+			dup = dup || e == nd
++			if e == p {
++				return true
++			}
 +		}
-+		if dup {
++		return false
++	}
++	for _, d := range t.Dirs {
++		nd := childOf(at(dirs, d.At), d.Name)
++		if content[nd] != nil || isDir(nd) {
 +			continue
 +		}
 +		for _, f := range fss {
@@ -1613,50 +2036,238 @@ index 0000000..4185695
 +		}
 +		dirs = append(dirs, nd)
 +	}
-+	for i, k := 0, n(tc, 0, 7); i < k; i++ {
-+		d := pick(tc, dirs...)
-+		if d == "/" {
-+			d = ""
-+		}
-+		nf := d + "/" + pick(tc, treeNames...)
-+		isDir := false
-+		for _, e := range dirs {
-+			isDir = isDir || e == nf
-+		}
-+		if isDir || content[nf] != nil {
++	for _, fl := range t.Files {
++		nf := childOf(at(dirs, fl.At), fl.Name)
++		if isDir(nf) || content[nf] != nil {
 +			continue
 +		}
-+		data := genData(tc)
 +		for _, f := range fss {
-+			if err := afero.WriteFile(f, nf, data, 0o644); err != nil {
++			if err := afero.WriteFile(f, nf, fl.Data, 0o644); err != nil {
 +				panic(err)
 +			}
 +		}
 +		files = append(files, nf)
-+		content[nf] = data
++		content[nf] = fl.Data
 +	}
 +	sort.Strings(dirs)
 +	sort.Strings(files)
 +	return dirs, files, content
 +}
 +
-+func anyPath(tc hegel.TestCase, dirs, files []string) string {
-+	switch n(tc, 0, 3) {
-+	case 0:
-+		return pick(tc, dirs...)
-+	case 1:
-+		if len(files) > 0 {
-+			return pick(tc, files...)
-+		}
-+		return pick(tc, dirs...)
-+	default:
-+		d := pick(tc, dirs...)
-+		if d == "/" {
-+			d = ""
-+		}
-+		return d + "/" + pick(tc, treeNames...)
++// childOf joins a directory and a name without doubling the root's slash.
++func childOf(d, name string) string {
++	if d == "/" {
++		d = ""
 +	}
++	return d + "/" + name
 +}
++
++// pathPick is a drawn path of a built tree: one of its directories, one of
++// its files (a directory when there are none), or a fresh name below one of
++// its directories.
++type pathPick struct {
++	Kind int // 0 directory, 1 file, 2 fresh name
++	At   int
++	Name string
++}
++
++var pathPicks = hegel.Composite(func(tc hegel.TestCase) pathPick {
++	return pathPick{
++		Kind: hegel.Draw(tc, hegel.SampledFrom([]int{0, 1, 2, 2})),
++		At:   hegel.Draw(tc, positions),
++		Name: hegel.Draw(tc, names),
++	}
++})
++
++func (q pathPick) resolve(dirs, files []string) string {
++	switch {
++	case q.Kind == 0, q.Kind == 1 && len(files) == 0:
++		return at(dirs, q.At)
++	case q.Kind == 1:
++		return at(files, q.At)
++	}
++	return childOf(at(dirs, q.At), q.Name)
++}
++
++func (q pathPick) GoString() string {
++	switch q.Kind {
++	case 0:
++		return fmt.Sprintf("dir<%d>", q.At)
++	case 1:
++		return fmt.Sprintf("file<%d>", q.At)
++	}
++	return fmt.Sprintf("dir<%d>/%s", q.At, q.Name)
++}
++
++// ---------------------------------------------------------------------------
++// Steps of the helpers property.
++
++// subSpec is one needle of FileContainsAnyBytes: fresh bytes, or a slice of
++// the file's content between two positions.
++type subSpec struct {
++	Slice  bool
++	Lo, Hi int
++	Fresh  []byte
++}
++
++var subSpecs = weighted(
++	choice[subSpec]{1, hegel.Composite(func(tc hegel.TestCase) subSpec {
++		return subSpec{Fresh: hegel.Draw(tc, dataBytes)}
++	})},
++	choice[subSpec]{1, hegel.Composite(func(tc hegel.TestCase) subSpec {
++		return subSpec{Slice: true, Lo: hegel.Draw(tc, positions), Hi: hegel.Draw(tc, positions)}
++	})},
++)
++
++func (s subSpec) resolve(data []byte) []byte {
++	if !s.Slice {
++		return s.Fresh
++	}
++	if len(data) == 0 {
++		return nil
++	}
++	lo := s.Lo % len(data)
++	hi := lo + s.Hi%(len(data)-lo+1)
++	return append([]byte(nil), data[lo:hi]...)
++}
++
++// Glob decorations of one path element: plain, "*", first letter and "*",
++// "?" and the rest, a class around the first letter, and (while afero/28 is
++// switched on) a backslash escape.
++var globDecos = shaped(
++	hegel.SampledFrom([]string{"plain", "plain", "star", "prefix", "question", "class", "backslash"}),
++	hegel.SampledFrom([]string{"plain", "plain", "star", "prefix", "question", "class"}),
++)
++
++func decorate(part, deco string) string {
++	switch deco {
++	case "star":
++		return "*"
++	case "prefix":
++		return part[:1] + "*"
++	case "question":
++		return "?" + part[1:]
++	case "class":
++		return "[" + part[:1] + "x]" + part[1:]
++	case "backslash":
++		return `\` + part
++	}
++	return part
++}
++
++// pattern renders the glob pattern of a path: every element takes the
++// decoration at its index of the tape (plain when the tape is empty).
++func pattern(base string, tape []string) string {
++	parts := strings.Split(strings.TrimPrefix(base, "/"), "/")
++	for i, part := range parts {
++		if part == "" || len(tape) == 0 {
++			continue
++		}
++		parts[i] = decorate(part, at(tape, i))
++	}
++	return "/" + strings.Join(parts, "/")
++}
++
++var unicodePool = []string{"a", "Z", "9", ".", "/", "\\", "_", "-", "%", " ", "#", "\u00e9", "e\u0301", "\u4e2d", "!", "*", ":", "\u0301", "\u0f04", "\ufb01"}
++
++var unicodeNames = join(many(hegel.SampledFrom(unicodePool), 0, 8))
++
++// helperStep is one operation of the helpers property; only the fields the
++// operation uses are drawn.
++type helperStep struct {
++	Op      string // Exists, ReadDir, ReadFile, Walk, WalkSkip, Glob, Contains, Temp, Unicode, Write
++	Path    pathPick
++	Stop    int  // WalkSkip: position among the tree's entries
++	SkipAll bool // WalkSkip: SkipAll instead of SkipDir
++	Tape    []string
++	Subs    []subSpec
++	Prefix  string
++	Suffix  string
++	Star    bool
++	Data    []byte
++	Kind    int // Write: 0 WriteReader, 1 SafeWriteReader, 2 WriteFile
++	Name    string
++}
++
++func (s helperStep) GoString() string {
++	switch s.Op {
++	case "WalkSkip":
++		return fmt.Sprintf("WalkSkip(%#v, stop <%d>, all %v)", s.Path, s.Stop, s.SkipAll)
++	case "Glob":
++		return fmt.Sprintf("Glob(%#v, %v)", s.Path, s.Tape)
++	case "Contains":
++		return fmt.Sprintf("Contains(file<%d>, %#v)", s.Path.At, s.Subs)
++	case "Temp":
++		return fmt.Sprintf("Temp(dir<%d>, %q, %q, star %v)", s.Path.At, s.Prefix, s.Suffix, s.Star)
++	case "Unicode":
++		return fmt.Sprintf("Unicode(%q)", s.Name)
++	case "Write":
++		return fmt.Sprintf("%s(%#v, %q)", [...]string{"WriteReader", "SafeWriteReader", "WriteFile"}[s.Kind], s.Path, s.Data)
++	}
++	return fmt.Sprintf("%s(%#v)", s.Op, s.Path)
++}
++
++func helperStepOf(op string, fields func(tc hegel.TestCase, s *helperStep)) hegel.Generator[helperStep] {
++	return hegel.Composite(func(tc hegel.TestCase) helperStep {
++		s := helperStep{Op: op, Path: hegel.Draw(tc, pathPicks)}
++		if fields != nil {
++			fields(tc, &s)
++		}
++		return s
++	})
++}
++
++var helperSteps = weighted(
++	choice[helperStep]{1, helperStepOf("Exists", nil)},
++	choice[helperStep]{1, helperStepOf("ReadDir", nil)},
++	choice[helperStep]{1, helperStepOf("ReadFile", nil)},
++	choice[helperStep]{1, helperStepOf("Walk", nil)},
++	choice[helperStep]{1, helperStepOf("WalkSkip", func(tc hegel.TestCase, s *helperStep) {
++		s.Stop = hegel.Draw(tc, positions)
++		s.SkipAll = hegel.Draw(tc, hegel.Booleans())
++	})},
++	choice[helperStep]{1, helperStepOf("Glob", func(tc hegel.TestCase, s *helperStep) {
++		s.Tape = hegel.Draw(tc, many(globDecos, 0, 4))
++	})},
++	choice[helperStep]{1, helperStepOf("Contains", func(tc hegel.TestCase, s *helperStep) {
++		s.Subs = hegel.Draw(tc, many(subSpecs, 1, 3))
++	})},
++	choice[helperStep]{1, helperStepOf("Temp", func(tc hegel.TestCase, s *helperStep) {
++		s.Prefix = hegel.Draw(tc, hegel.SampledFrom([]string{"tmp", "", "x-"}))
++		s.Suffix = hegel.Draw(tc, hegel.SampledFrom([]string{"", ".txt"}))
++		s.Star = hegel.Draw(tc, chance(30))
++	})},
++	choice[helperStep]{1, helperStepOf("Unicode", func(tc hegel.TestCase, s *helperStep) {
++		s.Name = hegel.Draw(tc, unicodeNames)
++	})},
++	choice[helperStep]{1, helperStepOf("Write", func(tc hegel.TestCase, s *helperStep) {
++		s.Data = hegel.Draw(tc, dataBytes)
++		s.Kind = hegel.Draw(tc, hegel.SampledFrom([]int{0, 1, 2}))
++	})},
++)
++
++// helperCase is the case of the helpers property: a tree and 1..8 steps.
++type helperCase struct {
++	Tree  treeSpec
++	Steps []helperStep
++}
++
++func (c helperCase) GoString() string {
++	var b strings.Builder
++	b.WriteString("helperCase{\n\t" + c.Tree.GoString())
++	for _, s := range c.Steps {
++		b.WriteString("\n\t" + s.GoString())
++	}
++	b.WriteString("\n}")
++	return b.String()
++}
++
++var helperCases = hegel.Composite(func(tc hegel.TestCase) helperCase {
++	return helperCase{Tree: hegel.Draw(tc, treeSpecs), Steps: hegel.Draw(tc, many(helperSteps, 1, 8))}
++})
++
++// ---------------------------------------------------------------------------
++// The property.
 +
 +// TestHegelHelpersMatchTheOs: the helpers give the same answers on a
 +// MemMapFs and on an OsFs holding the same tree, and the answers are the
@@ -1668,7 +2279,7 @@ index 0000000..4185695
 +	}
 +	defer os.RemoveAll(root)
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		c := hegel.Draw(ht, helperCases)
 +		dir, err := os.MkdirTemp(root, "case-")
 +		if err != nil {
 +			t.Fatal(err)
@@ -1677,12 +2288,13 @@ index 0000000..4185695
 +		mem := afero.NewMemMapFs()
 +		osfs := afero.NewBasePathFs(afero.NewOsFs(), dir)
 +		p := &pair{ht: ht, mem: mem, os: osfs}
-+		dirs, files, content := buildTree(tc, mem, osfs)
-+		note(ht, "dirs %v files %v", dirs, files)
-+		for i, k := 0, n(tc, 1, 8); i < k; i++ {
-+			q := anyPath(tc, dirs, files)
-+			switch n(tc, 0, 9) {
-+			case 0: // ReadDir
++		defer p.recoverPanics()
++		dirs, files, content := c.Tree.build(mem, osfs)
++		for _, s := range c.Steps {
++			p.shapes = nil
++			q := s.Path.resolve(dirs, files)
++			switch s.Op {
++			case "ReadDir":
 +				ml, merr := afero.ReadDir(mem, q)
 +				ol, oerr := afero.ReadDir(osfs, q)
 +				if !p.sameErr("ReadDir("+q+")", merr, oerr) || !p.same("ReadDir("+q+")", dirList(ml), dirList(ol)) {
@@ -1692,14 +2304,14 @@ index 0000000..4185695
 +					// Sorted by name, as documented.
 +					for j := 1; j < len(ml); j++ {
 +						if ml[j-1].Name() >= ml[j].Name() {
-+							fail(ht, "ReadDir(%s) is not sorted: %v", q, dirList(ml))
++							p.fail("ReadDir(%s) is not sorted: %v", q, dirList(ml))
 +							return
 +						}
 +					}
 +				}
-+			case 1: // ReadFile / ReadAll
-+				if isDir, _ := afero.IsDir(osfs, q); isDir && Known.DirectoryHandleIsAFile {
-+					count(ht, "skip: ReadFile of a directory (afero/14)")
++			case "ReadFile": // ReadFile / ReadAll
++				isDir, _ := afero.IsDir(osfs, q)
++				if !p.gate(shapeIf(isDir, "afero/14")) {
 +					continue
 +				}
 +				md, merr := afero.ReadFile(mem, q)
@@ -1708,7 +2320,7 @@ index 0000000..4185695
 +					return
 +				}
 +				if want, ok := content[q]; ok && string(md) != string(want) {
-+					fail(ht, "ReadFile(%s) = %q, want %q", q, md, want)
++					p.fail("ReadFile(%s) = %q, want %q", q, md, want)
 +					return
 +				}
 +				if merr == nil {
@@ -1716,11 +2328,11 @@ index 0000000..4185695
 +					all, err := afero.ReadAll(f)
 +					f.Close()
 +					if err != nil || string(all) != string(md) {
-+						fail(ht, "ReadAll(Open(%s)) = %q, %v; ReadFile gave %q", q, all, err, md)
++						p.fail("ReadAll(Open(%s)) = %q, %v; ReadFile gave %q", q, all, err, md)
 +						return
 +					}
 +				}
-+			case 2: // Exists / DirExists / IsDir / IsEmpty
++			case "Exists": // Exists / DirExists / IsDir / IsEmpty
 +				type answers struct {
 +					exists, dirExists, isDir, isEmpty bool
 +					isDirErr, isEmptyErr              string
@@ -1742,10 +2354,10 @@ index 0000000..4185695
 +				}
 +				_, serr := os.Stat(filepath.Join(dir, q))
 +				if ma.exists != (serr == nil) {
-+					fail(ht, "Exists(%s) = %v, os.Stat says %v", q, ma.exists, serr)
++					p.fail("Exists(%s) = %v, os.Stat says %v", q, ma.exists, serr)
 +					return
 +				}
-+			case 3: // Walk
++			case "Walk":
 +				mw, merr := walkList(mem, q, "")
 +				ow, oerr := walkList(osfs, q, "")
 +				if !p.sameErr("Walk("+q+")", merr, oerr) || !p.same("Walk("+q+")", mw, ow) {
@@ -1753,7 +2365,7 @@ index 0000000..4185695
 +				}
 +				want, werr := walkList(nil, filepath.Join(dir, q), dir)
 +				if errClass(werr) != errClass(oerr) || fmt.Sprint(want) != fmt.Sprint(ow) {
-+					fail(ht, "Walk(%s) visited %v (%v); filepath.Walk visited %v (%v)", q, ow, oerr, want, werr)
++					p.fail("Walk(%s) visited %v (%v); filepath.Walk visited %v (%v)", q, ow, oerr, want, werr)
 +					return
 +				}
 +				// WalkDir agrees with Walk on the visited paths.
@@ -1765,15 +2377,15 @@ index 0000000..4185695
 +					return nil
 +				})
 +				if fmt.Sprint(wd) != fmt.Sprint(mw) {
-+					fail(ht, "WalkDir(%s) visited %v, Walk visited %v", q, wd, mw)
++					p.fail("WalkDir(%s) visited %v, Walk visited %v", q, wd, mw)
 +					return
 +				}
-+			case 4: // Walk with SkipDir / SkipAll
-+				if len(mw(dirs, files)) == 0 {
-+					continue
++			case "WalkSkip": // Walk with SkipDir / SkipAll
++				stopAt := at(entries(dirs, files), s.Stop)
++				skip := filepath.SkipDir
++				if s.SkipAll {
++					skip = filepath.SkipAll
 +				}
-+				stopAt := pick(tc, mw(dirs, files)...)
-+				skip := pick(tc, filepath.SkipDir, filepath.SkipAll)
 +				visit := func(f afero.Fs) (string, error) {
 +					var seen []string
 +					err := afero.Walk(f, q, func(pth string, info os.FileInfo, err error) error {
@@ -1798,19 +2410,20 @@ index 0000000..4185695
 +				os_, oerr := visit(osfs)
 +				note(ht, "Walk(%s) with %v at %s: mem %q %v, os %q %v, filepath %q %v", q, skip, stopAt, ms, merr, os_, oerr, strings.Join(want, " "), werr)
 +				if ms != os_ || ms != strings.Join(want, " ") {
-+					fail(ht, "Walk(%s) returning %v at %s visited: MemMapFs %q, OsFs %q, filepath.Walk %q", q, skip, stopAt, ms, os_, strings.Join(want, " "))
++					p.fail("Walk(%s) returning %v at %s visited: MemMapFs %q, OsFs %q, filepath.Walk %q", q, skip, stopAt, ms, os_, strings.Join(want, " "))
 +					return
 +				}
-+				if Known.WalkReturnsSkip && merr == skip && oerr == skip && werr == nil {
-+					count(ht, "accepted: Walk returned the skip sentinel (afero/27)")
-+				} else if !p.sameErr("Walk error", merr, oerr) || !p.sameErr("Walk error vs filepath.Walk", oerr, werr) {
++				if merr == skip && oerr == skip && werr == nil && p.accept("afero/27") {
++					continue
++				}
++				if !p.sameErr("Walk error", merr, oerr) || !p.sameErr("Walk error vs filepath.Walk", oerr, werr) {
 +					return
 +				}
-+			case 5: // Glob
-+				pattern := genPattern(tc, dirs, files)
-+				mg, merr := afero.Glob(mem, pattern)
-+				og, oerr := afero.Glob(osfs, pattern)
-+				want, werr := filepath.Glob(filepath.Join(dir, pattern))
++			case "Glob":
++				pat := pattern(q, s.Tape)
++				mg, merr := afero.Glob(mem, pat)
++				og, oerr := afero.Glob(osfs, pat)
++				want, werr := filepath.Glob(filepath.Join(dir, pat))
 +				for i := range want {
 +					want[i] = canon(strings.TrimPrefix(want[i], dir))
 +				}
@@ -1820,37 +2433,30 @@ index 0000000..4185695
 +				for i := range mg {
 +					mg[i] = canon(mg[i])
 +				}
-+				note(ht, "Glob(%s): mem %v %v, os %v %v, filepath %v %v", pattern, mg, merr, og, oerr, want, werr)
-+				if !p.sameErr("Glob("+pattern+")", merr, oerr) || !p.same("Glob("+pattern+")", mg, og) {
++				note(ht, "Glob(%s): mem %v %v, os %v %v, filepath %v %v", pat, mg, merr, og, oerr, want, werr)
++				if !p.sameErr("Glob("+pat+")", merr, oerr) || !p.same("Glob("+pat+")", mg, og) {
 +					return
 +				}
-+				if Known.GlobBackslash && strings.Contains(pattern, `\`) {
-+					count(ht, "skip: Glob with a backslash escape (afero/28)")
++				if !p.gate(shapeIf(strings.Contains(pat, `\`), "afero/28")) {
 +					continue
 +				}
 +				if (werr != nil) != (oerr != nil) || fmt.Sprint(want) != fmt.Sprint(og) {
-+					fail(ht, "Glob(%s) = %v, %v; filepath.Glob = %v, %v", pattern, og, oerr, want, werr)
++					p.fail("Glob(%s) = %v, %v; filepath.Glob = %v, %v", pat, og, oerr, want, werr)
 +					return
 +				}
-+			case 6: // FileContainsBytes / FileContainsAnyBytes
++			case "Contains": // FileContainsBytes / FileContainsAnyBytes
 +				if len(files) == 0 {
 +					continue
 +				}
-+				q = pick(tc, files...)
++				q = at(files, s.Path.At)
 +				data := content[q]
 +				var subs [][]byte
-+				for i, k := 0, n(tc, 1, 3); i < k; i++ {
-+					if len(data) > 0 && chance(tc, 50) {
-+						lo := n(tc, 0, len(data)-1)
-+						hi := n(tc, lo, len(data))
-+						subs = append(subs, append([]byte(nil), data[lo:hi]...))
-+					} else {
-+						subs = append(subs, genData(tc))
-+					}
++				for _, sub := range s.Subs {
++					subs = append(subs, sub.resolve(data))
 +				}
 +				want := false
-+				for _, s := range subs {
-+					want = want || (len(s) > 0 && bytes.Contains(data, s))
++				for _, sub := range subs {
++					want = want || (len(sub) > 0 && bytes.Contains(data, sub))
 +				}
 +				got, err := afero.FileContainsAnyBytes(mem, q, subs)
 +				got1, err1 := afero.FileContainsBytes(mem, q, subs[0])
@@ -1858,107 +2464,98 @@ index 0000000..4185695
 +				ogot, oerr := afero.FileContainsAnyBytes(osfs, q, subs)
 +				note(ht, "FileContainsAnyBytes(%s=%q, %q) = %v %v (os %v %v), want %v", q, data, subs, got, err, ogot, oerr, want)
 +				if err != nil || err1 != nil || oerr != nil {
-+					fail(ht, "FileContainsBytes errors: %v %v %v", err, err1, oerr)
++					p.fail("FileContainsBytes errors: %v %v %v", err, err1, oerr)
 +					return
 +				}
 +				if got != ogot {
-+					fail(ht, "FileContainsAnyBytes(%s, %q): MemMapFs %v, OsFs %v", q, subs, got, ogot)
++					p.fail("FileContainsAnyBytes(%s, %q): MemMapFs %v, OsFs %v", q, subs, got, ogot)
 +					return
 +				}
 +				if got != want || got1 != want1 {
-+					if Known.ContainsBytesPadding && ((got && !want) || (got1 && !want1)) {
-+						count(ht, "accepted: FileContainsBytes false positive (afero/19)")
++					if ((got && !want) || (got1 && !want1)) && p.accept("afero/19") {
 +						continue
 +					}
-+					fail(ht, "FileContainsAnyBytes(%q, %q) = %v, want %v; FileContainsBytes(%q) = %v, want %v", data, subs, got, want, subs[0], got1, want1)
++					p.fail("FileContainsAnyBytes(%q, %q) = %v, want %v; FileContainsBytes(%q) = %v, want %v", data, subs, got, want, subs[0], got1, want1)
 +					return
 +				}
-+			case 7: // TempFile / TempDir
-+				d := pick(tc, dirs...)
-+				prefix := pick(tc, "tmp", "", "x-")
-+				suffix := pick(tc, "", ".txt")
-+				pattern := prefix
-+				if suffix != "" || chance(tc, 30) {
-+					pattern = prefix + "*" + suffix
++			case "Temp": // TempFile / TempDir
++				d := at(dirs, s.Path.At)
++				pat := s.Prefix
++				if s.Suffix != "" || s.Star {
++					pat = s.Prefix + "*" + s.Suffix
 +				}
 +				for _, f := range []afero.Fs{mem, osfs} {
-+					tf, err := afero.TempFile(f, d, pattern)
++					tf, err := afero.TempFile(f, d, pat)
 +					if err != nil {
-+						fail(ht, "TempFile(%s, %s) on %s: %v", d, pattern, f.Name(), err)
++						p.fail("TempFile(%s, %s) on %s: %v", d, pat, f.Name(), err)
 +						return
 +					}
 +					name := tf.Name()
 +					fi, serr := tf.Stat()
 +					tf.Close()
 +					base := path.Base(name)
-+					if canon(path.Dir(name)) != canon(d) || !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, suffix) || len(base) <= len(prefix)+len(suffix) {
-+						fail(ht, "TempFile(%s, %s) on %s named the file %q", d, pattern, f.Name(), name)
++					if canon(path.Dir(name)) != canon(d) || !strings.HasPrefix(base, s.Prefix) || !strings.HasSuffix(base, s.Suffix) || len(base) <= len(s.Prefix)+len(s.Suffix) {
++						p.fail("TempFile(%s, %s) on %s named the file %q", d, pat, f.Name(), name)
 +						return
 +					}
 +					if serr != nil || fi.IsDir() || fi.Size() != 0 || fi.Mode().Perm() != 0o600 {
-+						fail(ht, "TempFile(%s, %s) on %s: Stat %v %v", d, pattern, f.Name(), statSummary(fi, serr, true), fi.Mode())
++						p.fail("TempFile(%s, %s) on %s: Stat %v %v", d, pat, f.Name(), statSummary(fi, serr, true), fi.Mode())
 +						return
 +					}
 +					if ex, _ := afero.Exists(f, name); !ex {
-+						fail(ht, "TempFile %q does not exist afterwards on %s", name, f.Name())
++						p.fail("TempFile %q does not exist afterwards on %s", name, f.Name())
 +						return
 +					}
-+					td, err := afero.TempDir(f, d, prefix)
++					td, err := afero.TempDir(f, d, s.Prefix)
 +					if err != nil {
-+						fail(ht, "TempDir(%s, %s) on %s: %v", d, prefix, f.Name(), err)
++						p.fail("TempDir(%s, %s) on %s: %v", d, s.Prefix, f.Name(), err)
 +						return
 +					}
 +					tfi, serr := f.Stat(td)
-+					if serr != nil || !tfi.IsDir() || tfi.Mode().Perm() != 0o700 || canon(path.Dir(td)) != canon(d) || !strings.HasPrefix(path.Base(td), prefix) {
-+						fail(ht, "TempDir(%s, %s) on %s = %q: %s", d, prefix, f.Name(), td, statSummary(tfi, serr, true))
++					if serr != nil || !tfi.IsDir() || tfi.Mode().Perm() != 0o700 || canon(path.Dir(td)) != canon(d) || !strings.HasPrefix(path.Base(td), s.Prefix) {
++						p.fail("TempDir(%s, %s) on %s = %q: %s", d, s.Prefix, f.Name(), td, statSummary(tfi, serr, true))
 +						return
 +					}
 +					if _, err := afero.TempDir(f, d, "a/b"); err == nil {
-+						fail(ht, "TempDir with a separator in the prefix succeeded on %s", f.Name())
++						p.fail("TempDir with a separator in the prefix succeeded on %s", f.Name())
 +						return
 +					}
 +					f.Remove(name)
 +					f.Remove(td)
 +				}
-+			case 8: // WriteReader / SafeWriteReader / WriteFile
-+				data := genData(tc)
++			case "Write": // WriteReader / SafeWriteReader / WriteFile
 +				exists, _ := afero.Exists(osfs, q)
 +				isDir, _ := afero.IsDir(osfs, q)
-+				var merr, oerr error
 +				parentIsDir, _ := afero.IsDir(osfs, path.Dir(canon(q)))
-+				if Known.CreateCreatesParents && !parentIsDir {
-+					count(ht, "skip: write below a missing directory (afero/2)")
++				if !p.gate(
++					shapeIf(!parentIsDir, "afero/2"),
++					shapeIf(isDir, "afero/6"),
++					shapeIf(exists && !isDir && permOf(osfs, q) != 0o666, "afero/15"),
++				) {
 +					continue
 +				}
-+				if Known.CreateOverDir && isDir {
-+					count(ht, "skip: write over a directory (afero/6)")
-+					continue
-+				}
-+				if Known.CreateReplacesFile && exists && permOf(osfs, q) != 0o666 {
-+					count(ht, "skip: write over a file with another mode (afero/15)")
-+					continue
-+				}
-+				switch n(tc, 0, 2) {
++				var merr, oerr error
++				switch s.Kind {
 +				case 0:
-+					merr = afero.WriteReader(mem, q, bytes.NewReader(data))
-+					oerr = afero.WriteReader(osfs, q, bytes.NewReader(data))
++					merr = afero.WriteReader(mem, q, bytes.NewReader(s.Data))
++					oerr = afero.WriteReader(osfs, q, bytes.NewReader(s.Data))
 +				case 1:
-+					merr = afero.SafeWriteReader(mem, q, bytes.NewReader(data))
-+					oerr = afero.SafeWriteReader(osfs, q, bytes.NewReader(data))
++					merr = afero.SafeWriteReader(mem, q, bytes.NewReader(s.Data))
++					oerr = afero.SafeWriteReader(osfs, q, bytes.NewReader(s.Data))
 +					if (merr == nil) == exists {
-+						fail(ht, "SafeWriteReader(%s) with exists=%v: %v", q, exists, merr)
++						p.fail("SafeWriteReader(%s) with exists=%v: %v", q, exists, merr)
 +						return
 +					}
 +				default:
-+					merr = afero.WriteFile(mem, q, data, 0o600)
-+					oerr = afero.WriteFile(osfs, q, data, 0o600)
++					merr = afero.WriteFile(mem, q, s.Data, 0o600)
++					oerr = afero.WriteFile(osfs, q, s.Data, 0o600)
 +				}
-+				note(ht, "write %s (%d bytes): %v / %v", q, len(data), merr, oerr)
++				note(ht, "write %s (%d bytes): %v / %v", q, len(s.Data), merr, oerr)
 +				if !p.sameErr("write("+q+")", merr, oerr) {
 +					return
 +				}
 +				if merr == nil {
-+					content[q] = data
++					content[q] = s.Data
 +					if !isDir && !exists {
 +						files = append(files, q)
 +					}
@@ -1967,33 +2564,32 @@ index 0000000..4185695
 +					return
 +				}
 +			default: // UnicodeSanitize / NeuterAccents
-+				s := genUnicodeName(tc)
-+				san := afero.UnicodeSanitize(s)
++				san := afero.UnicodeSanitize(s.Name)
 +				for _, r := range san {
 +					if !(unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || strings.ContainsRune("./\\_-% #", r)) {
-+						fail(ht, "UnicodeSanitize(%q) = %q keeps %q", s, san, r)
++						p.fail("UnicodeSanitize(%q) = %q keeps %q", s.Name, san, r)
 +						return
 +					}
 +				}
 +				var keep []rune
-+				for _, r := range s {
++				for _, r := range s.Name {
 +					if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || strings.ContainsRune("./\\_-% #", r) {
 +						keep = append(keep, r)
 +					}
 +				}
 +				if san != string(keep) {
-+					fail(ht, "UnicodeSanitize(%q) = %q, want %q", s, san, string(keep))
++					p.fail("UnicodeSanitize(%q) = %q, want %q", s.Name, san, string(keep))
 +					return
 +				}
-+				neu := afero.NeuterAccents(s)
++				neu := afero.NeuterAccents(s.Name)
 +				var want []rune
-+				for _, r := range norm.NFD.String(s) {
++				for _, r := range norm.NFD.String(s.Name) {
 +					if !unicode.Is(unicode.Mn, r) {
 +						want = append(want, r)
 +					}
 +				}
 +				if neu != norm.NFC.String(string(want)) {
-+					fail(ht, "NeuterAccents(%q) = %q, want %q", s, neu, norm.NFC.String(string(want)))
++					p.fail("NeuterAccents(%q) = %q, want %q", s.Name, neu, norm.NFC.String(string(want)))
 +					return
 +				}
 +			}
@@ -2001,7 +2597,8 @@ index 0000000..4185695
 +	})
 +}
 +
-+func mw(dirs, files []string) []string {
++// entries lists the directories and files of a built tree.
++func entries(dirs, files []string) []string {
 +	out := append([]string(nil), dirs...)
 +	return append(out, files...)
 +}
@@ -2022,45 +2619,12 @@ index 0000000..4185695
 +	}
 +	return out, afero.Walk(f, q, fn)
 +}
-+
-+func genPattern(tc hegel.TestCase, dirs, files []string) string {
-+	base := anyPath(tc, dirs, files)
-+	parts := strings.Split(strings.TrimPrefix(base, "/"), "/")
-+	for i, part := range parts {
-+		if part == "" {
-+			continue
-+		}
-+		switch n(tc, 0, 6) {
-+		case 0:
-+			parts[i] = "*"
-+		case 1:
-+			parts[i] = part[:1] + "*"
-+		case 2:
-+			parts[i] = "?" + part[1:]
-+		case 3:
-+			parts[i] = "[" + part[:1] + "x]" + part[1:]
-+		case 4:
-+			parts[i] = `\` + part
-+		}
-+	}
-+	return "/" + strings.Join(parts, "/")
-+}
-+
-+func genUnicodeName(tc hegel.TestCase) string {
-+	var b strings.Builder
-+	for i, k := 0, n(tc, 0, 8); i < k; i++ {
-+		b.WriteString(pick(tc, "a", "Z", "9", ".", "/", "\\", "_", "-", "%", " ", "#", "\u00e9", "e\u0301", "\u4e2d", "!", "*", ":", "\u0301", "\u0f04", "\ufb01"))
-+	}
-+	return b.String()
-+}
-+
-+var _ = errors.New
 diff --git a/hegel/hegel_wrappers_test.go b/hegel/hegel_wrappers_test.go
 new file mode 100644
-index 0000000..01913e7
+index 0000000..5beee60
 --- /dev/null
 +++ b/hegel/hegel_wrappers_test.go
-@@ -0,0 +1,1060 @@
+@@ -0,0 +1,1299 @@
 +package hegel
 +
 +// The wrapping file systems: ReadOnlyFs, CopyOnWriteFs, CacheOnReadFs,
@@ -2085,29 +2649,122 @@ index 0000000..01913e7
 +
 +var time0 = time.Unix(1_000_000_000, 0)
 +
++// wrapStep is one operation of a wrapper property; only the fields the
++// operation uses are drawn.
++type wrapStep struct {
++	Op       string
++	Path     pathPick
++	Path2    pathPick // Rename destination
++	Flag     int      // ReadOnlyFs.OpenFile
++	Data     []byte
++	DirMode  os.FileMode
++	FileMode os.FileMode
++	Paged    bool // RegexpFile.Readdirnames in pages of two
++}
++
++func (s wrapStep) GoString() string {
++	switch s.Op {
++	case "Rename":
++		return fmt.Sprintf("Rename(%#v, %#v)", s.Path, s.Path2)
++	case "OpenFile":
++		return fmt.Sprintf("OpenFile(%#v, %s)", s.Path, flagString(s.Flag))
++	case "WriteFile", "CreateWrite":
++		return fmt.Sprintf("%s(%#v, %q)", s.Op, s.Path, s.Data)
++	case "Chmod":
++		if s.DirMode != 0 {
++			return fmt.Sprintf("Chmod(%#v, dir %o / file %o)", s.Path, s.DirMode, s.FileMode)
++		}
++	case "List":
++		return fmt.Sprintf("List(%#v, paged %v)", s.Path, s.Paged)
++	}
++	return fmt.Sprintf("%s(%#v)", s.Op, s.Path)
++}
++
++func wrapStepOf(op string, fields func(tc hegel.TestCase, s *wrapStep)) hegel.Generator[wrapStep] {
++	return hegel.Composite(func(tc hegel.TestCase) wrapStep {
++		s := wrapStep{Op: op, Path: hegel.Draw(tc, pathPicks)}
++		if fields != nil {
++			fields(tc, &s)
++		}
++		return s
++	})
++}
++
++func plain(op string) choice[wrapStep] { return choice[wrapStep]{1, wrapStepOf(op, nil)} }
++
++var withDest = func(tc hegel.TestCase, s *wrapStep) { s.Path2 = hegel.Draw(tc, pathPicks) }
++
++var withData = func(tc hegel.TestCase, s *wrapStep) { s.Data = hegel.Draw(tc, dataBytes) }
++
++var withModes = func(tc hegel.TestCase, s *wrapStep) {
++	s.DirMode = hegel.Draw(tc, hegel.SampledFrom([]os.FileMode{0o700, 0o755}))
++	s.FileMode = hegel.Draw(tc, hegel.SampledFrom([]os.FileMode{0o600, 0o644, 0o700}))
++}
++
++// wrapCase is the case of a wrapper property: a tree and a script.
++type wrapCase struct {
++	Tree  treeSpec
++	Steps []wrapStep
++}
++
++func (c wrapCase) GoString() string {
++	var b strings.Builder
++	b.WriteString("wrapCase{\n\t" + c.Tree.GoString())
++	for _, s := range c.Steps {
++		b.WriteString("\n\t" + s.GoString())
++	}
++	b.WriteString("\n}")
++	return b.String()
++}
++
++func wrapCases(steps hegel.Generator[wrapStep], lo, hi int) hegel.Generator[wrapCase] {
++	return hegel.Composite(func(tc hegel.TestCase) wrapCase {
++		return wrapCase{Tree: hegel.Draw(tc, treeSpecs), Steps: hegel.Draw(tc, many(steps, lo, hi))}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// ReadOnlyFs.
++
++var roSteps = weighted(
++	plain("Read"),
++	plain("Create"),
++	plain("Mkdir"),
++	plain("MkdirAll"),
++	plain("Remove"),
++	plain("RemoveAll"),
++	choice[wrapStep]{1, wrapStepOf("Rename", withDest)},
++	plain("Chmod"),
++	plain("Chtimes"),
++	choice[wrapStep]{1, wrapStepOf("OpenFile", func(tc hegel.TestCase, s *wrapStep) {
++		s.Flag = hegel.Draw(tc, hegel.SampledFrom([]int{os.O_WRONLY, os.O_RDWR, os.O_RDONLY | os.O_CREATE, os.O_RDONLY | os.O_APPEND, os.O_RDONLY | os.O_TRUNC}))
++	})},
++)
++
++var roCases = wrapCases(roSteps, 1, 8)
++
 +// TestHegelReadOnlyFsRefusesEveryWrite: on a ReadOnlyFs every mutating call
 +// returns EPERM and leaves the source unchanged (MkdirAll of an existing
 +// directory is the documented exception), and every reading call answers
 +// like the source.
 +func TestHegelReadOnlyFsRefusesEveryWrite(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		c := hegel.Draw(ht, roCases)
 +		src := afero.NewMemMapFs()
-+		dirs, files, _ := buildTree(tc, src)
++		dirs, files, _ := c.Tree.build(src)
 +		ro := afero.NewReadOnlyFs(src)
 +		before, _ := snapshot(src)
-+		for i, k := 0, n(tc, 1, 8); i < k; i++ {
-+			q := anyPath(tc, dirs, files)
++		for _, s := range c.Steps {
++			q := s.Path.resolve(dirs, files)
 +			isDir, _ := afero.IsDir(src, q)
 +			var err error
-+			var op string
-+			switch n(tc, 0, 11) {
-+			case 0:
-+				op, err = "Create", func() error { _, err := ro.Create(q); return err }()
-+			case 1:
-+				op, err = "Mkdir", ro.Mkdir(q, 0o755)
-+			case 2:
-+				op, err = "MkdirAll", ro.MkdirAll(q, 0o755)
++			switch s.Op {
++			case "Create":
++				_, err = ro.Create(q)
++			case "Mkdir":
++				err = ro.Mkdir(q, 0o755)
++			case "MkdirAll":
++				err = ro.MkdirAll(q, 0o755)
 +				if isDir {
 +					if err != nil {
 +						fail(ht, "ReadOnlyFs.MkdirAll(%s) of an existing directory: %v, want nil", q, err)
@@ -2115,20 +2772,19 @@ index 0000000..01913e7
 +					}
 +					continue
 +				}
-+			case 3:
-+				op, err = "Remove", ro.Remove(q)
-+			case 4:
-+				op, err = "RemoveAll", ro.RemoveAll(q)
-+			case 5:
-+				op, err = "Rename", ro.Rename(q, anyPath(tc, dirs, files))
-+			case 6:
-+				op, err = "Chmod", ro.Chmod(q, 0o600)
-+			case 7:
-+				op, err = "Chtimes", ro.Chtimes(q, time0, time0)
-+			case 8:
-+				flag := pick(tc, os.O_WRONLY, os.O_RDWR, os.O_RDONLY|os.O_CREATE, os.O_RDONLY|os.O_APPEND, os.O_RDONLY|os.O_TRUNC)
-+				op, err = "OpenFile(write flags)", func() error { _, err := ro.OpenFile(q, flag, 0o644); return err }()
-+			case 9: // reads
++			case "Remove":
++				err = ro.Remove(q)
++			case "RemoveAll":
++				err = ro.RemoveAll(q)
++			case "Rename":
++				err = ro.Rename(q, s.Path2.resolve(dirs, files))
++			case "Chmod":
++				err = ro.Chmod(q, 0o600)
++			case "Chtimes":
++				err = ro.Chtimes(q, time0, time0)
++			case "OpenFile":
++				_, err = ro.OpenFile(q, s.Flag, 0o644)
++			default: // reads
 +				sfi, serr := src.Stat(q)
 +				rfi, rerr := ro.Stat(q)
 +				if statSummary(sfi, serr, true) != statSummary(rfi, rerr, true) {
@@ -2157,12 +2813,10 @@ index 0000000..01913e7
 +					f.Close()
 +				}
 +				continue
-+			default:
-+				continue
 +			}
-+			note(ht, "%s(%s) = %v", op, q, err)
++			note(ht, "%s(%s) = %v", s.Op, q, err)
 +			if !errors.Is(err, syscall.EPERM) {
-+				fail(ht, "ReadOnlyFs.%s(%s) = %v, want EPERM", op, q, err)
++				fail(ht, "ReadOnlyFs.%s(%s) = %v, want EPERM", s.Op, q, err)
 +				return
 +			}
 +		}
@@ -2172,6 +2826,9 @@ index 0000000..01913e7
 +		}
 +	})
 +}
++
++// ---------------------------------------------------------------------------
++// CopyOnWriteFs.
 +
 +// cowModel is the expected content of a CopyOnWriteFs: the base never
 +// changes; the layer holds what was written; the view is the layer over the
@@ -2205,21 +2862,25 @@ index 0000000..01913e7
 +}
 +
 +// permUnknown marks a directory the layer recreated with some other mode
-+// (afero/34): its permissions are not compared while the bug is known.
++// (afero/34) or a file it copied with mode 0666 (afero/33): while the bugs
++// are switched off (HEGEL_NO_KNOWN=1) such permissions are not compared.
 +const permUnknown os.FileMode = 0o7777
 +
 +// parentsIntoLayer records that a write below q made the CopyOnWriteFs
-+// create q's base-only ancestors in the layer.
-+func (m *cowModel) parentsIntoLayer(q string) {
++// create q's base-only ancestors in the layer, and reports whether it did
++// (the shape of afero/34: the copies carry another mode).
++func (m *cowModel) parentsIntoLayer(q string) (recreated bool) {
 +	for d := path.Dir(q); d != "/"; d = path.Dir(d) {
 +		if m.layer[d] == nil && m.base[d] != nil {
 +			ne := *m.base[d]
-+			if Known.CowParentModeChanges {
++			if noKnown {
 +				ne.perm = permUnknown
 +			}
 +			m.layer[d] = &ne
++			recreated = true
 +		}
 +	}
++	return recreated
 +}
 +
 +func (m *cowModel) layerHasChildren(p string) bool {
@@ -2239,11 +2900,41 @@ index 0000000..01913e7
 +	}
 +}
 +
++// moveSubtree renames the layer entries at or below q to q2.
++func (m *cowModel) moveSubtree(q, q2 string) {
++	moved := map[string]*entry{}
++	for p, e := range m.layer {
++		if p == q || strings.HasPrefix(p, q+"/") {
++			np := q2 + strings.TrimPrefix(p, q)
++			ne := *e
++			ne.path = np
++			moved[np] = &ne
++			delete(m.layer, p)
++		}
++	}
++	for p, e := range moved {
++		m.layer[p] = e
++	}
++}
++
++var cowSteps = weighted(
++	choice[wrapStep]{3, wrapStepOf("Read", nil)},
++	choice[wrapStep]{1, wrapStepOf("WriteFile", withData)},
++	plain("Mkdir"),
++	plain("MkdirAll"),
++	plain("Remove"),
++	plain("RemoveAll"),
++	choice[wrapStep]{1, wrapStepOf("Rename", withDest)},
++	choice[wrapStep]{1, wrapStepOf("Chmod", withModes)},
++)
++
++var cowCases = wrapCases(cowSteps, 1, 10)
++
 +// TestHegelCopyOnWriteFsMatchesItsModel: a CopyOnWriteFs over two OsFs
 +// directories behaves as the documented union: reads see the layer over the
 +// base, writes go to the layer (copying a base file first), the base is never
 +// modified, removing a layer copy exposes the base file again, and base-only
-+// entries cannot be renamed.
++// entries cannot be renamed. The root is only read.
 +func TestHegelCopyOnWriteFsMatchesItsModel(t *testing.T) {
 +	root, err := os.MkdirTemp("", "hegel-afero-")
 +	if err != nil {
@@ -2251,7 +2942,7 @@ index 0000000..01913e7
 +	}
 +	defer os.RemoveAll(root)
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		c := hegel.Draw(ht, cowCases)
 +		dir, err := os.MkdirTemp(root, "case-")
 +		if err != nil {
 +			t.Fatal(err)
@@ -2261,7 +2952,7 @@ index 0000000..01913e7
 +		os.Mkdir(dir+"/layer", 0o755)
 +		base := afero.NewBasePathFs(afero.NewOsFs(), dir+"/base")
 +		layer := afero.NewBasePathFs(afero.NewOsFs(), dir+"/layer")
-+		dirs, files, _ := buildTree(tc, base)
++		dirs, files, _ := c.Tree.build(base)
 +		m := &cowModel{base: map[string]*entry{}, layer: map[string]*entry{}}
 +		bs, _ := snapshot(base)
 +		for i := range bs {
@@ -2270,82 +2961,87 @@ index 0000000..01913e7
 +		m.base["/"] = &entry{path: "/", dir: true, perm: 0o755}
 +		baseBefore := joinEntries(bs)
 +		cow := afero.NewCopyOnWriteFs(base, layer)
-+		for i, k := 0, n(tc, 1, 10); i < k; i++ {
-+			q := canon(anyPath(tc, dirs, files))
++		p := &pair{ht: ht, mem: cow, os: base}
++		defer p.recoverPanics()
++		for _, s := range c.Steps {
++			p.shapes = nil
++			q := canon(s.Path.resolve(dirs, files))
 +			cur := m.view(q)
 +			parent := m.view(path.Dir(q))
 +			parentIsDir := parent != nil && parent.dir
-+			op := n(tc, 0, 9)
-+			if q == "/" && op < 7 {
-+				op = 8 // the root is only read
++			op := s.Op
++			if q == "/" {
++				op = "Read"
 +			}
 +			switch op {
-+			case 0: // WriteFile
-+				if Known.CowCopyLosesMode && cur != nil && !cur.dir && m.layer[q] == nil && cur.perm != 0o666 {
-+					count(ht, "skip: write to a base-only file with a mode other than 0666 (afero/33)")
++			case "WriteFile":
++				if !p.gate(shapeIf(cur != nil && !cur.dir && m.layer[q] == nil && cur.perm != 0o666, "afero/33")) {
 +					continue
 +				}
-+				data := genData(tc)
-+				err := afero.WriteFile(cow, q, data, 0o600)
-+				note(ht, "WriteFile(%s, %q) = %v", q, data, err)
++				err := afero.WriteFile(cow, q, s.Data, 0o600)
++				note(ht, "WriteFile(%s, %q) = %v", q, s.Data, err)
 +				switch {
 +				case !parentIsDir || (cur != nil && cur.dir):
 +					if err == nil {
-+						fail(ht, "WriteFile(%s) succeeded (parent dir %v, existing dir %v)", q, parentIsDir, cur != nil && cur.dir)
++						p.fail("WriteFile(%s) succeeded (parent dir %v, existing dir %v)", q, parentIsDir, cur != nil && cur.dir)
 +						return
 +					}
 +					if cur != nil && cur.dir && m.layer[q] == nil {
 +						// The failed copy of the base directory already
 +						// recreated its parents in the layer (afero/34).
-+						m.parentsIntoLayer(q)
++						if m.parentsIntoLayer(q) {
++							p.accept("afero/34")
++						}
 +					}
 +				default:
 +					if err != nil {
-+						fail(ht, "WriteFile(%s): %v", q, err)
++						p.fail("WriteFile(%s): %v", q, err)
 +						return
 +					}
 +					perm := os.FileMode(0o600)
 +					if cur != nil {
 +						perm = cur.perm
 +					}
-+					m.layer[q] = &entry{path: q, perm: perm, size: int64(len(data)), content: string(data)}
-+					m.parentsIntoLayer(q)
++					m.layer[q] = &entry{path: q, perm: perm, size: int64(len(s.Data)), content: string(s.Data)}
++					if m.parentsIntoLayer(q) {
++						p.accept("afero/34")
++					}
 +				}
-+			case 1: // Mkdir
-+				if Known.CowMkdirExisting && (!parentIsDir || (cur != nil && m.base[q] != nil && !m.base[q].dir) || (cur != nil && m.layer[q] != nil)) {
-+					count(ht, "skip: Mkdir over a layer entry, a base file or without parent (afero/22)")
++			case "Mkdir":
++				if !p.gate(shapeIf(!parentIsDir || (cur != nil && m.base[q] != nil && !m.base[q].dir) || (cur != nil && m.layer[q] != nil), "afero/22")) {
 +					continue
 +				}
 +				err := cow.Mkdir(q, 0o700)
 +				note(ht, "Mkdir(%s) = %v", q, err)
 +				if cur != nil {
 +					if err == nil {
-+						fail(ht, "Mkdir(%s) over an existing entry succeeded", q)
++						p.fail("Mkdir(%s) over an existing entry succeeded", q)
 +						return
 +					}
 +					continue
 +				}
 +				if err != nil {
-+					fail(ht, "Mkdir(%s): %v", q, err)
++					p.fail("Mkdir(%s): %v", q, err)
 +					return
 +				}
 +				m.layer[q] = &entry{path: q, dir: true, perm: 0o700}
-+				m.parentsIntoLayer(q)
-+			case 2: // MkdirAll
++				if m.parentsIntoLayer(q) {
++					p.accept("afero/34")
++				}
++			case "MkdirAll":
 +				fileOnWay := false
 +				for d := q; d != "/"; d = path.Dir(d) {
 +					if e := m.view(d); e != nil && !e.dir {
 +						fileOnWay = true
 +					}
 +				}
-+				if Known.CowMkdirExisting && fileOnWay {
-+					count(ht, "skip: MkdirAll over or through a file (afero/22)")
++				if !p.gate(shapeIf(fileOnWay, "afero/22")) {
 +					continue
 +				}
 +				err := cow.MkdirAll(q, 0o700)
 +				note(ht, "MkdirAll(%s) = %v", q, err)
 +				if err != nil {
-+					fail(ht, "MkdirAll(%s): %v", q, err)
++					p.fail("MkdirAll(%s): %v", q, err)
 +					return
 +				}
 +				if cur == nil {
@@ -2354,11 +3050,12 @@ index 0000000..01913e7
 +							m.layer[d] = &entry{path: d, dir: true, perm: 0o700}
 +						}
 +					}
-+					m.parentsIntoLayer(q)
++					if m.parentsIntoLayer(q) {
++						p.accept("afero/34")
++					}
 +				}
-+			case 3: // Remove
-+				if Known.CowRemoveBaseOnly && cur != nil && m.layer[q] == nil {
-+					count(ht, "skip: Remove of a base-only entry (afero/21)")
++			case "Remove":
++				if !p.gate(shapeIf(cur != nil && m.layer[q] == nil, "afero/21")) {
 +					continue
 +				}
 +				err := cow.Remove(q)
@@ -2366,31 +3063,30 @@ index 0000000..01913e7
 +				switch {
 +				case cur == nil:
 +					if !os.IsNotExist(err) {
-+						fail(ht, "Remove(%s) of a missing path: %v", q, err)
++						p.fail("Remove(%s) of a missing path: %v", q, err)
 +						return
 +					}
 +				case m.layer[q] != nil:
 +					if m.layer[q].dir && m.layerHasChildren(q) {
 +						if err == nil {
-+							fail(ht, "Remove(%s) of a non-empty layer directory succeeded", q)
++							p.fail("Remove(%s) of a non-empty layer directory succeeded", q)
 +							return
 +						}
 +						continue
 +					}
 +					if err != nil {
-+						fail(ht, "Remove(%s) of a layer entry: %v", q, err)
++						p.fail("Remove(%s) of a layer entry: %v", q, err)
 +						return
 +					}
 +					delete(m.layer, q)
 +				default:
 +					if !errors.Is(err, syscall.EPERM) {
-+						fail(ht, "Remove(%s) of a base-only entry = %v, want EPERM", q, err)
++						p.fail("Remove(%s) of a base-only entry = %v, want EPERM", q, err)
 +						return
 +					}
 +				}
-+			case 4: // RemoveAll
-+				if Known.CowRemoveBaseOnly && cur != nil && m.layer[q] == nil {
-+					count(ht, "skip: RemoveAll of a base-only entry (afero/21)")
++			case "RemoveAll":
++				if !p.gate(shapeIf(cur != nil && m.layer[q] == nil, "afero/21")) {
 +					continue
 +				}
 +				err := cow.RemoveAll(q)
@@ -2398,22 +3094,21 @@ index 0000000..01913e7
 +				switch {
 +				case cur == nil || m.layer[q] != nil:
 +					if err != nil {
-+						fail(ht, "RemoveAll(%s): %v", q, err)
++						p.fail("RemoveAll(%s): %v", q, err)
 +						return
 +					}
 +					m.deleteSubtree(m.layer, q)
 +				default:
 +					if !errors.Is(err, syscall.EPERM) {
-+						fail(ht, "RemoveAll(%s) of a base-only entry = %v, want EPERM", q, err)
++						p.fail("RemoveAll(%s) of a base-only entry = %v, want EPERM", q, err)
 +						return
 +					}
 +				}
-+			case 5: // Rename
-+				q2 := canon(anyPath(tc, dirs, files))
++			case "Rename":
++				q2 := canon(s.Path2.resolve(dirs, files))
 +				dst := m.view(q2)
 +				dstParent := m.view(path.Dir(q2))
-+				if Known.CowRenameIntoBaseDir && m.layer[q] != nil && dstParent != nil && dstParent.dir && m.layer[path.Dir(q2)] == nil && path.Dir(q2) != "/" {
-+					count(ht, "skip: Rename into a base-only directory (afero/37)")
++				if !p.gate(shapeIf(m.layer[q] != nil && dstParent != nil && dstParent.dir && m.layer[path.Dir(q2)] == nil && path.Dir(q2) != "/", "afero/37")) {
 +					continue
 +				}
 +				err := cow.Rename(q, q2)
@@ -2421,12 +3116,12 @@ index 0000000..01913e7
 +				switch {
 +				case cur == nil:
 +					if err == nil {
-+						fail(ht, "Rename(%s, %s) of a missing path succeeded", q, q2)
++						p.fail("Rename(%s, %s) of a missing path succeeded", q, q2)
 +						return
 +					}
 +				case m.layer[q] == nil:
 +					if !errors.Is(err, syscall.EPERM) {
-+						fail(ht, "Rename(%s, %s) of a base-only entry = %v, want EPERM", q, q2, err)
++						p.fail("Rename(%s, %s) of a base-only entry = %v, want EPERM", q, q2, err)
 +						return
 +					}
 +				case q == q2 || dst != nil || dstParent == nil || !dstParent.dir || strings.HasPrefix(q2, q+"/"):
@@ -2434,100 +3129,77 @@ index 0000000..01913e7
 +					// (see the MemMapFs property for those); only require that
 +					// a success moved the layer entry.
 +					if err == nil {
-+						moved := map[string]*entry{}
-+						for p, e := range m.layer {
-+							if p == q || strings.HasPrefix(p, q+"/") {
-+								np := q2 + strings.TrimPrefix(p, q)
-+								ne := *e
-+								ne.path = np
-+								moved[np] = &ne
-+								delete(m.layer, p)
-+							}
-+						}
-+						for p, e := range moved {
-+							m.layer[p] = e
-+						}
++						m.moveSubtree(q, q2)
 +					}
 +				default:
 +					if err != nil {
-+						fail(ht, "Rename(%s, %s) of a layer entry into %s: %v", q, q2, path.Dir(q2), err)
++						p.fail("Rename(%s, %s) of a layer entry into %s: %v", q, q2, path.Dir(q2), err)
 +						return
 +					}
-+					for p, e := range m.layer {
-+						if p == q || strings.HasPrefix(p, q+"/") {
-+							np := q2 + strings.TrimPrefix(p, q)
-+							ne := *e
-+							ne.path = np
-+							delete(m.layer, p)
-+							m.layer[np] = &ne
-+						}
-+					}
++					m.moveSubtree(q, q2)
 +				}
-+			case 6: // Chmod
-+				mode := pick(tc, os.FileMode(0o600), 0o644, 0o700)
++			case "Chmod":
++				mode := s.FileMode
 +				if cur != nil && cur.dir {
-+					mode = pick(tc, os.FileMode(0o700), 0o755)
++					mode = s.DirMode
 +				}
-+				if cur != nil && cur.dir && m.layer[q] == nil && Known.CopyToLayerOfDir {
-+					count(ht, "skip: Chmod of a base-only directory (afero/32)")
++				if !p.gate(shapeIf(cur != nil && cur.dir && m.layer[q] == nil, "afero/32")) {
 +					continue
 +				}
 +				err := cow.Chmod(q, mode)
 +				note(ht, "Chmod(%s, %o) = %v", q, mode, err)
 +				if cur == nil {
 +					if err == nil {
-+						fail(ht, "Chmod(%s) of a missing path succeeded", q)
++						p.fail("Chmod(%s) of a missing path succeeded", q)
 +						return
 +					}
 +					continue
 +				}
 +				if err != nil {
-+					fail(ht, "Chmod(%s): %v", q, err)
++					p.fail("Chmod(%s): %v", q, err)
 +					return
 +				}
 +				ne := *cur
 +				ne.perm = mode
 +				m.layer[q] = &ne
-+				m.parentsIntoLayer(q)
++				if m.parentsIntoLayer(q) {
++					p.accept("afero/34")
++				}
 +			default: // reads: Stat, ReadFile, Readdirnames, Exists
 +				fi, err := cow.Stat(q)
 +				ex, _ := afero.Exists(cow, q)
 +				if cur == nil {
 +					if err == nil || ex {
-+						fail(ht, "Stat(%s) of a missing path: %v (Exists %v)", q, err, ex)
++						p.fail("Stat(%s) of a missing path: %v (Exists %v)", q, err, ex)
 +						return
 +					}
 +					continue
 +				}
 +				if err != nil || fi.IsDir() != cur.dir || (!cur.dir && fi.Size() != cur.size) || (cur.perm != permUnknown && fi.Mode().Perm() != cur.perm) || !ex {
-+					fail(ht, "Stat(%s) = %s, want dir=%v perm=%o size=%d", q, statSummary(fi, err, false), cur.dir, cur.perm, cur.size)
++					p.fail("Stat(%s) = %s, want dir=%v perm=%o size=%d", q, statSummary(fi, err, false), cur.dir, cur.perm, cur.size)
 +					return
 +				}
 +				if cur.dir {
 +					f, err := cow.Open(q)
 +					if err != nil {
-+						fail(ht, "Open(%s) of a directory: %v", q, err)
++						p.fail("Open(%s) of a directory: %v", q, err)
 +						return
 +					}
 +					names, err := f.Readdirnames(-1)
 +					sort.Strings(names)
 +					cerr := f.Close()
 +					if err != nil || fmt.Sprint(names) != fmt.Sprint(m.children(q)) {
-+						fail(ht, "Readdirnames(%s) = %v, %v; want %v", q, names, err, m.children(q))
++						p.fail("Readdirnames(%s) = %v, %v; want %v", q, names, err, m.children(q))
 +						return
 +					}
-+					if cerr != nil {
-+						if Known.UnionCloseBadFD && errors.Is(cerr, afero.BADFD) {
-+							count(ht, "accepted: UnionFile.Close returned BADFD (afero/20)")
-+						} else {
-+							fail(ht, "Close of the directory %s: %v", q, cerr)
-+							return
-+						}
++					if cerr != nil && !(errors.Is(cerr, afero.BADFD) && p.accept("afero/20")) {
++						p.fail("Close of the directory %s: %v", q, cerr)
++						return
 +					}
 +				} else {
 +					data, err := afero.ReadFile(cow, q)
 +					if err != nil || string(data) != cur.content {
-+						fail(ht, "ReadFile(%s) = %q, %v; want %q", q, data, err, cur.content)
++						p.fail("ReadFile(%s) = %q, %v; want %q", q, data, err, cur.content)
 +						return
 +					}
 +				}
@@ -2535,17 +3207,17 @@ index 0000000..01913e7
 +			// The base never changes.
 +			bs, _ := snapshot(base)
 +			if joinEntries(bs) != baseBefore {
-+				fail(ht, "the base changed under the CopyOnWriteFs:\n%s\n->\n%s", baseBefore, joinEntries(bs))
++				p.fail("the base changed under the CopyOnWriteFs:\n%s\n->\n%s", baseBefore, joinEntries(bs))
 +				return
 +			}
 +			// The view of every model path.
 +			for _, e := range m.layer {
-+				if !checkCowEntry(ht, cow, e) {
++				if !checkCowEntry(p, cow, e) {
 +					return
 +				}
 +			}
-+			for p, e := range m.base {
-+				if p != "/" && m.layer[p] == nil && !checkCowEntry(ht, cow, e) {
++			for q, e := range m.base {
++				if q != "/" && m.layer[q] == nil && !checkCowEntry(p, cow, e) {
 +					return
 +				}
 +			}
@@ -2553,26 +3225,42 @@ index 0000000..01913e7
 +	})
 +}
 +
-+func checkCowEntry(ht *hegel.T, cow afero.Fs, e *entry) bool {
++func checkCowEntry(p *pair, cow afero.Fs, e *entry) bool {
 +	fi, err := cow.Stat(e.path)
 +	if err != nil || fi.IsDir() != e.dir || (e.perm != permUnknown && fi.Mode().Perm() != e.perm) {
-+		fail(ht, "view of %s: Stat %s, model %s", e.path, statSummary(fi, err, false), e.String())
++		p.fail("view of %s: Stat %s, model %s", e.path, statSummary(fi, err, false), e.String())
 +		return false
 +	}
 +	if !e.dir {
 +		data, err := afero.ReadFile(cow, e.path)
 +		if err != nil || string(data) != e.content {
-+			fail(ht, "view of %s: content %q, %v; model %s", e.path, data, err, e.String())
++			p.fail("view of %s: content %q, %v; model %s", e.path, data, err, e.String())
 +			return false
 +		}
 +	}
 +	return true
 +}
 +
++// ---------------------------------------------------------------------------
++// CacheOnReadFs.
++
++var cacheSteps = weighted(
++	choice[wrapStep]{1, wrapStepOf("WriteFile", withData)},
++	plain("Mkdir"),
++	plain("MkdirAll"),
++	plain("Remove"),
++	plain("RemoveAll"),
++	choice[wrapStep]{1, wrapStepOf("Rename", withDest)},
++	choice[wrapStep]{1, wrapStepOf("Chmod", withModes)},
++	choice[wrapStep]{2, wrapStepOf("CreateWrite", withData)},
++)
++
++var cacheCases = wrapCases(cacheSteps, 1, 10)
++
 +// TestHegelCacheOnReadFsMirrorsTheBase: with an unlimited cache time, a
 +// CacheOnReadFs over two OsFs directories answers every call like a plain
 +// file system receiving the same calls, and its base holds exactly that
-+// file system's tree.
++// file system's tree. The root is only checked, never operated on.
 +func TestHegelCacheOnReadFsMirrorsTheBase(t *testing.T) {
 +	root, err := os.MkdirTemp("", "hegel-afero-")
 +	if err != nil {
@@ -2580,7 +3268,7 @@ index 0000000..01913e7
 +	}
 +	defer os.RemoveAll(root)
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		c := hegel.Draw(ht, cacheCases)
 +		dir, err := os.MkdirTemp(root, "case-")
 +		if err != nil {
 +			t.Fatal(err)
@@ -2592,98 +3280,95 @@ index 0000000..01913e7
 +		base := afero.NewBasePathFs(afero.NewOsFs(), dir+"/base")
 +		layer := afero.NewBasePathFs(afero.NewOsFs(), dir+"/layer")
 +		ref := afero.NewBasePathFs(afero.NewOsFs(), dir+"/ref")
-+		dirs, files, _ := buildTree(tc, base, ref)
++		dirs, files, _ := c.Tree.build(base, ref)
 +		cache := afero.NewCacheOnReadFs(base, layer, 0)
 +		p := &pair{ht: ht, mem: cache, os: ref}
-+		for i, k := 0, n(tc, 1, 10); i < k; i++ {
-+			q := canon(anyPath(tc, dirs, files))
++		defer p.recoverPanics()
++		for _, s := range c.Steps {
++			p.shapes = nil
++			q := canon(s.Path.resolve(dirs, files))
 +			cached, _ := afero.Exists(layer, q)
 +			kind := kindOf(ref, q)
-+			op := n(tc, 0, 8)
++			op := s.Op
 +			if q == "/" {
-+				op = 8 // the root is only read (below)
-+			}
-+			if Known.CowCopyLosesMode && (op == 0 || op == 7) && kind == kindFile && !cached && permOf(ref, q) != 0o666 {
-+				count(ht, "skip: write to an uncached file with a mode other than 0666 (afero/33)")
-+				continue
-+			}
-+			if Known.CacheWriteOnlyUncached && op == 0 && kind != kindDir && !cached {
-+				count(ht, "skip: WriteFile of a file not in the layer (afero/36)")
-+				continue
++				op = "" // the root is only checked
 +			}
 +			switch op {
-+			case 0:
-+				data := genData(tc)
-+				note(ht, "WriteFile(%s, %q)", q, data)
-+				cerr := afero.WriteFile(cache, q, data, 0o600)
-+				if cerr != nil && Known.UnionCloseBadFD && errors.Is(cerr, afero.BADFD) {
-+					count(ht, "accepted: WriteFile returned UnionFile.Close's BADFD (afero/20)")
++			case "WriteFile":
++				if !p.gate(
++					shapeIf(kind == kindFile && !cached && permOf(ref, q) != 0o666, "afero/33"),
++					shapeIf(kind != kindDir && !cached, "afero/36"),
++				) {
++					continue
++				}
++				note(ht, "WriteFile(%s, %q)", q, s.Data)
++				cerr := afero.WriteFile(cache, q, s.Data, 0o600)
++				if cerr != nil && errors.Is(cerr, afero.BADFD) && p.accept("afero/20") {
 +					cerr = nil
 +				}
-+				if !p.sameErr("WriteFile("+q+")", cerr, afero.WriteFile(ref, q, data, 0o600)) {
++				if !p.sameErr("WriteFile("+q+")", cerr, afero.WriteFile(ref, q, s.Data, 0o600)) {
 +					return
 +				}
-+			case 1:
++			case "Mkdir":
 +				note(ht, "Mkdir(%s)", q)
 +				if !p.sameErr("Mkdir("+q+")", cache.Mkdir(q, 0o700), ref.Mkdir(q, 0o700)) {
 +					return
 +				}
-+			case 2:
++			case "MkdirAll":
 +				note(ht, "MkdirAll(%s)", q)
 +				if !p.sameErr("MkdirAll("+q+")", cache.MkdirAll(q, 0o700), ref.MkdirAll(q, 0o700)) {
 +					return
 +				}
-+			case 3:
-+				if Known.CacheRemoveMiss && kind != kindMissing && !cached {
-+					count(ht, "skip: Remove of an uncached entry (afero/23)")
++			case "Remove":
++				if !p.gate(shapeIf(kind != kindMissing && !cached, "afero/23")) {
 +					continue
 +				}
 +				note(ht, "Remove(%s)", q)
 +				if !p.sameErr("Remove("+q+")", cache.Remove(q), ref.Remove(q)) {
 +					return
 +				}
-+			case 4:
++			case "RemoveAll":
 +				note(ht, "RemoveAll(%s)", q)
 +				if !p.sameErr("RemoveAll("+q+")", cache.RemoveAll(q), ref.RemoveAll(q)) {
 +					return
 +				}
-+			case 5:
-+				q2 := canon(anyPath(tc, dirs, files))
-+				if kind == kindDir && !cached && Known.CopyToLayerOfDir {
-+					count(ht, "skip: Rename of an uncached directory (afero/32)")
-+					continue
-+				}
-+				if parentCached, _ := afero.Exists(layer, path.Dir(q2)); !parentCached && kind != kindMissing && Known.CacheCreateInBaseDir {
-+					count(ht, "skip: Rename into a directory not in the layer (afero/38)")
++			case "Rename":
++				q2 := canon(s.Path2.resolve(dirs, files))
++				parentCached, _ := afero.Exists(layer, path.Dir(q2))
++				if !p.gate(
++					shapeIf(kind == kindDir && !cached, "afero/32"),
++					shapeIf(!parentCached && kind != kindMissing, "afero/38"),
++				) {
 +					continue
 +				}
 +				note(ht, "Rename(%s, %s)", q, q2)
 +				if !p.sameErr("Rename("+q+", "+q2+")", cache.Rename(q, q2), ref.Rename(q, q2)) {
 +					return
 +				}
-+			case 6:
-+				mode := pick(tc, os.FileMode(0o600), 0o644, 0o700)
++			case "Chmod":
++				mode := s.FileMode
 +				if kind == kindDir {
-+					mode = pick(tc, os.FileMode(0o700), 0o755)
++					mode = s.DirMode
 +				}
-+				if kind == kindDir && !cached && Known.CopyToLayerOfDir {
-+					count(ht, "skip: Chmod of an uncached directory (afero/32)")
++				if !p.gate(shapeIf(kind == kindDir && !cached, "afero/32")) {
 +					continue
 +				}
 +				note(ht, "Chmod(%s, %o)", q, mode)
 +				if !p.sameErr("Chmod("+q+")", cache.Chmod(q, mode), ref.Chmod(q, mode)) {
 +					return
 +				}
-+			default: // Create + Write + Close through the union
++			case "CreateWrite": // Create + Write + Close through the union
 +				if kind == kindDir || kindOf(ref, path.Dir(q)) != kindDir {
 +					continue
 +				}
-+				if parentCached, _ := afero.Exists(layer, path.Dir(q)); !parentCached && Known.CacheCreateInBaseDir {
-+					count(ht, "skip: Create in a directory not in the layer (afero/38)")
++				parentCached, _ := afero.Exists(layer, path.Dir(q))
++				if !p.gate(
++					shapeIf(kind == kindFile && !cached && permOf(ref, q) != 0o666, "afero/33"),
++					shapeIf(!parentCached, "afero/38"),
++				) {
 +					continue
 +				}
-+				data := genData(tc)
-+				note(ht, "Create(%s) + Write(%q)", q, data)
++				note(ht, "Create(%s) + Write(%q)", q, s.Data)
 +				cf, cerr := cache.Create(q)
 +				rf, rerr := ref.Create(q)
 +				if !p.sameErr("Create("+q+")", cerr, rerr) {
@@ -2692,14 +3377,13 @@ index 0000000..01913e7
 +				if cerr != nil {
 +					continue
 +				}
-+				_, cerr = cf.Write(data)
-+				_, rerr = rf.Write(data)
++				_, cerr = cf.Write(s.Data)
++				_, rerr = rf.Write(s.Data)
 +				if !p.sameErr("Write", cerr, rerr) {
 +					return
 +				}
 +				cerr, rerr = cf.Close(), rf.Close()
-+				if cerr != nil && Known.UnionCloseBadFD && errors.Is(cerr, afero.BADFD) {
-+					count(ht, "accepted: UnionFile.Close returned BADFD (afero/20)")
++				if cerr != nil && errors.Is(cerr, afero.BADFD) && p.accept("afero/20") {
 +					cerr = nil
 +				}
 +				if !p.sameErr("Close", cerr, rerr) {
@@ -2711,49 +3395,90 @@ index 0000000..01913e7
 +			rs, _ := snapshot(ref)
 +			// Directories recreated in the layer carry another mode
 +			// (afero/34), files copied into it 0666 (afero/33), and Stat
-+			// prefers the layer's FileInfo: those modes are not compared.
++			// prefers the layer's FileInfo: while the bugs are switched off
++			// those modes are not compared; by default a difference of modes
++			// alone names the bug.
 +			hidePerms(bs)
 +			hidePerms(rs)
 +			if joinEntries(bs) != joinEntries(rs) {
-+				fail(ht, "base differs from the reference:\n%s\n->\n%s", joinEntries(bs), joinEntries(rs))
++				p.namePermShapes(bs, rs)
++				p.fail("base differs from the reference:\n%s\n->\n%s", joinEntries(bs), joinEntries(rs))
 +				return
 +			}
 +			for _, e := range rs {
 +				fi, err := cache.Stat(e.path)
-+				if err != nil || fi.IsDir() != e.dir || (e.perm != permUnknown && fi.Mode().Perm() != e.perm) {
-+					fail(ht, "cache.Stat(%s) = %s, reference %s", e.path, statSummary(fi, err, false), e.String())
++				permOK := err != nil || e.perm == permUnknown || fi.Mode().Perm() == e.perm
++				if err == nil && !permOK && fi.IsDir() == e.dir {
++					p.accept(permShape(e.dir))
++				}
++				if err != nil || fi.IsDir() != e.dir || (!e.dir && fi.Size() != e.size) || !permOK {
++					p.fail("cache.Stat(%s) = %s, reference %s", e.path, statSummary(fi, err, false), e.String())
 +					return
 +				}
 +				if !e.dir {
 +					data, err := afero.ReadFile(cache, e.path)
 +					if err != nil || string(data) != e.content {
-+						fail(ht, "cache.ReadFile(%s) = %q, %v; reference %s", e.path, data, err, e.String())
++						p.fail("cache.ReadFile(%s) = %q, %v; reference %s", e.path, data, err, e.String())
 +						return
 +					}
 +				}
 +			}
 +			cs, err := snapshot(cache)
 +			if err != nil {
-+				fail(ht, "walking the cache: %v", err)
++				p.fail("walking the cache: %v", err)
 +				return
 +			}
 +			hidePerms(cs)
 +			if joinEntries(cs) != joinEntries(rs) {
-+				fail(ht, "the cache's tree differs from the reference:\n%s\n->\n%s", joinEntries(cs), joinEntries(rs))
++				p.namePermShapes(cs, rs)
++				p.fail("the cache's tree differs from the reference:\n%s\n->\n%s", joinEntries(cs), joinEntries(rs))
 +				return
 +			}
 +		}
 +	})
 +}
 +
-+// hidePerms marks the modes the known layer bugs change as not compared.
++// hidePerms marks the modes the known layer bugs change as not compared
++// (only while the bugs are switched off).
 +func hidePerms(es []entry) {
++	if !noKnown {
++		return
++	}
 +	for i := range es {
-+		if (es[i].dir && Known.CowParentModeChanges) || (!es[i].dir && Known.CowCopyLosesMode) {
-+			es[i].perm = permUnknown
++		es[i].perm = permUnknown
++	}
++}
++
++// permShape is the bug a wrong mode of a layer copy is the shape of.
++func permShape(dir bool) string {
++	if dir {
++		return "afero/34"
++	}
++	return "afero/33"
++}
++
++// namePermShapes records the shapes of two snapshots that differ in modes
++// alone (the message of the mismatch that follows names them).
++func (p *pair) namePermShapes(got, want []entry) {
++	if len(got) != len(want) {
++		return
++	}
++	for i := range got {
++		g, w := got[i], want[i]
++		g.perm, w.perm = 0, 0
++		if g != w {
++			return
++		}
++	}
++	for i := range got {
++		if got[i].perm != want[i].perm {
++			p.accept(permShape(got[i].dir))
 +		}
 +	}
 +}
++
++// ---------------------------------------------------------------------------
++// RegexpFs.
 +
 +var regexps = []*regexp.Regexp{
 +	regexp.MustCompile(`\.txt$`),
@@ -2762,26 +3487,63 @@ index 0000000..01913e7
 +	regexp.MustCompile(`^c`),
 +}
 +
++// paged: RegexpFile.Readdirnames in pages of two, the shape of afero/26;
++// while the bug is switched off every listing is one call.
++var paged = shaped(chance(50), hegel.Just(false))
++
++var regexpSteps = weighted(
++	plain("Stat"),
++	plain("ReadFile"),
++	plain("Remove"),
++	plain("RemoveAll"),
++	plain("Chmod"),
++	plain("Create"),
++	plain("OpenFile"),
++	choice[wrapStep]{1, wrapStepOf("Rename", withDest)},
++	choice[wrapStep]{2, wrapStepOf("List", func(tc hegel.TestCase, s *wrapStep) { s.Paged = hegel.Draw(tc, paged) })},
++)
++
++// regexpCase is the case of the RegexpFs property: a tree, the regexp's
++// index and a script.
++type regexpCase struct {
++	Tree  treeSpec
++	Re    int
++	Steps []wrapStep
++}
++
++func (c regexpCase) GoString() string {
++	return fmt.Sprintf("regexpCase{%v, %s}", regexps[c.Re], wrapCase{c.Tree, c.Steps}.GoString())
++}
++
++var regexpCases = hegel.Composite(func(tc hegel.TestCase) regexpCase {
++	return regexpCase{
++		Tree:  hegel.Draw(tc, treeSpecs),
++		Re:    hegel.Draw(tc, hegel.Integers(0, len(regexps)-1)),
++		Steps: hegel.Draw(tc, many(regexpSteps, 1, 8)),
++	}
++})
++
 +// TestHegelRegexpFsHidesTheOtherFiles: a RegexpFs shows every directory and
 +// exactly the files whose name matches; an operation on a hidden or
 +// non-matching file name fails with ENOENT and touches nothing; every other
 +// operation acts as on the source.
 +func TestHegelRegexpFsHidesTheOtherFiles(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		c := hegel.Draw(ht, regexpCases)
 +		src := afero.NewMemMapFs()
 +		ref := afero.NewMemMapFs()
-+		dirs, files, _ := buildTree(tc, src, ref)
-+		re := pick(tc, regexps...)
++		dirs, files, _ := c.Tree.build(src, ref)
++		re := regexps[c.Re]
 +		rfs := afero.NewRegexpFs(src, re)
 +		visible := func(q string) bool {
 +			isDir, _ := afero.IsDir(ref, q)
 +			return isDir || re.MatchString(path.Base(q))
 +		}
 +		p := &pair{ht: ht, mem: rfs, os: ref}
-+		note(ht, "regexp %v", re)
-+		for i, k := 0, n(tc, 1, 8); i < k; i++ {
-+			q := canon(anyPath(tc, dirs, files))
++		defer p.recoverPanics()
++		for _, s := range c.Steps {
++			p.shapes = nil
++			q := canon(s.Path.resolve(dirs, files))
 +			kind := kindOf(ref, q)
 +			vis := visible(q)
 +			if q == "/" {
@@ -2791,19 +3553,19 @@ index 0000000..01913e7
 +			check := func(op string, rerr error, refOp func() error) bool {
 +				if !vis {
 +					if !os.IsNotExist(rerr) {
-+						fail(ht, "RegexpFs.%s(%s) on a hidden name (%v): %v, want ENOENT", op, q, re, rerr)
++						p.fail("RegexpFs.%s(%s) on a hidden name (%v): %v, want ENOENT", op, q, re, rerr)
 +						return false
 +					}
 +					return true
 +				}
 +				return p.sameErr("RegexpFs."+op+"("+q+")", rerr, refOp())
 +			}
-+			switch n(tc, 0, 9) {
-+			case 0:
++			switch s.Op {
++			case "Stat":
 +				if !check("Stat", func() error { _, err := rfs.Stat(q); return err }(), func() error { _, err := ref.Stat(q); return err }) {
 +					return
 +				}
-+			case 1:
++			case "ReadFile":
 +				d, err := afero.ReadFile(rfs, q)
 +				if !check("ReadFile", err, func() error {
 +					rd, rerr := afero.ReadFile(ref, q)
@@ -2814,30 +3576,25 @@ index 0000000..01913e7
 +				}) {
 +					return
 +				}
-+			case 2:
-+				if kind == kindDir && Known.RemoveNonEmptyDir && hasChildren(ref, q) {
-+					count(ht, "skip: Remove of a non-empty directory (afero/3)")
++			case "Remove":
++				if !p.gate(shapeIf(kind == kindDir && hasChildren(ref, q), "afero/3")) {
 +					continue
 +				}
 +				if !check("Remove", rfs.Remove(q), func() error { return ref.Remove(q) }) {
 +					return
 +				}
-+			case 3:
-+				if kind == kindDir && Known.RemoveNonEmptyDir && hasChildren(ref, q) {
-+					continue
-+				}
-+				if kind == kindMissing && Known.RegexpRemoveAllMissing {
-+					count(ht, "skip: RemoveAll of a missing path (afero/35)")
++			case "RemoveAll":
++				if !p.gate(shapeIf(kind == kindMissing, "afero/35")) {
 +					continue
 +				}
 +				if !check("RemoveAll", rfs.RemoveAll(q), func() error { return ref.RemoveAll(q) }) {
 +					return
 +				}
-+			case 4:
++			case "Chmod":
 +				if !check("Chmod", rfs.Chmod(q, 0o600), func() error { return ref.Chmod(q, 0o600) }) {
 +					return
 +				}
-+			case 5: // Create of a new or existing name (directories excluded: MemMapFs afero/6)
++			case "Create": // of a new or existing name (directories excluded: MemMapFs afero/6)
 +				if kind == kindDir || kindOf(ref, path.Dir(q)) != kindDir {
 +					continue
 +				}
@@ -2855,12 +3612,11 @@ index 0000000..01913e7
 +				}) {
 +					return
 +				}
-+			case 6: // OpenFile(O_CREATE) of an existing or new matching name
++			case "OpenFile": // OpenFile(O_CREATE) of an existing or new matching name
 +				if kind == kindDir || kindOf(ref, path.Dir(q)) != kindDir {
 +					continue
 +				}
-+				if kind == kindMissing && Known.RegexpOpenFileCreate {
-+					count(ht, "skip: OpenFile(O_CREATE) of a new file (afero/25)")
++				if !p.gate(shapeIf(kind == kindMissing, "afero/25")) {
 +					continue
 +				}
 +				f, err := rfs.OpenFile(q, os.O_RDWR|os.O_CREATE, 0o644)
@@ -2876,15 +3632,12 @@ index 0000000..01913e7
 +				}) {
 +					return
 +				}
-+			case 7: // Rename
-+				q2 := canon(anyPath(tc, dirs, files))
-+				if kind == kindDir {
-+					if Known.RegexpRenameDir {
-+						count(ht, "skip: Rename of a directory (afero/24)")
-+						continue
-+					}
-+				}
++			case "Rename":
++				q2 := canon(s.Path2.resolve(dirs, files))
 +				if kind == kindMissing || kindOf(ref, q2) != kindMissing || kindOf(ref, path.Dir(q2)) != kindDir {
++					continue
++				}
++				if !p.gate(shapeIf(kind == kindDir, "afero/24")) {
 +					continue
 +				}
 +				vis = vis && re.MatchString(path.Base(q2))
@@ -2897,11 +3650,11 @@ index 0000000..01913e7
 +				}
 +				f, err := rfs.Open(q)
 +				if err != nil {
-+					fail(ht, "RegexpFs.Open(%s) of a directory: %v", q, err)
++					p.fail("RegexpFs.Open(%s) of a directory: %v", q, err)
 +					return
 +				}
 +				var names []string
-+				if Known.RegexpReaddirEmptyPage || chance(tc, 50) {
++				if !s.Paged {
 +					names, err = f.Readdirnames(-1)
 +				} else {
 +					for {
@@ -2911,14 +3664,15 @@ index 0000000..01913e7
 +							break
 +						}
 +						if len(page) == 0 {
-+							fail(ht, "RegexpFile.Readdirnames(2) returned an empty page with a nil error")
++							p.accept("afero/26")
++							p.fail("RegexpFile.Readdirnames(2) returned an empty page with a nil error")
 +							return
 +						}
 +					}
 +				}
 +				f.Close()
 +				if err != nil {
-+					fail(ht, "RegexpFile.Readdirnames(%s): %v", q, err)
++					p.fail("RegexpFile.Readdirnames(%s): %v", q, err)
 +					return
 +				}
 +				var want []string
@@ -2930,7 +3684,7 @@ index 0000000..01913e7
 +				}
 +				sort.Strings(names)
 +				if fmt.Sprint(names) != fmt.Sprint(want) {
-+					fail(ht, "RegexpFile.Readdirnames(%s) = %v, want %v", q, names, want)
++					p.fail("RegexpFile.Readdirnames(%s) = %v, want %v", q, names, want)
 +					return
 +				}
 +			}
@@ -2939,7 +3693,7 @@ index 0000000..01913e7
 +			ss, _ := snapshot(src)
 +			rs, _ := snapshot(ref)
 +			if joinEntries(ss) != joinEntries(rs) {
-+				fail(ht, "source differs from the reference:\n%s\n->\n%s", joinEntries(ss), joinEntries(rs))
++				p.fail("source differs from the reference:\n%s\n->\n%s", joinEntries(ss), joinEntries(rs))
 +				return
 +			}
 +			var want []entry
@@ -2950,25 +3704,72 @@ index 0000000..01913e7
 +			}
 +			got, err := snapshot(rfs)
 +			if err != nil || joinEntries(got) != joinEntries(want) {
-+				fail(ht, "walking the RegexpFs (%v): %v\n%s\nwant\n%s", re, err, joinEntries(got), joinEntries(want))
++				p.fail("walking the RegexpFs (%v): %v\n%s\nwant\n%s", re, err, joinEntries(got), joinEntries(want))
 +				return
 +			}
 +		}
 +	})
 +}
 +
++// ---------------------------------------------------------------------------
++// BasePathFs.
++
++// escapeStep probes one path through a BasePathFs: a path of the tree and an
++// escaping fragment placed alone, before or after it.
++type escapeStep struct {
++	Path  pathPick
++	Esc   string
++	Where int // 0 the fragment alone, 1 fragment then path, 2 path then fragment
++}
++
++func (s escapeStep) GoString() string {
++	return fmt.Sprintf("escape{%#v, %q, where %d}", s.Path, s.Esc, s.Where)
++}
++
++var escapeSteps = hegel.Composite(func(tc hegel.TestCase) escapeStep {
++	return escapeStep{
++		Path:  hegel.Draw(tc, pathPicks),
++		Esc:   hegel.Draw(tc, hegel.SampledFrom([]string{"/..", "/../..", "/../x", "/a/../../y", "../z"})),
++		Where: hegel.Draw(tc, hegel.Integers(0, 2)),
++	}
++})
++
++// basePathCase is the case of the BasePathFs property.
++type basePathCase struct {
++	Base  string
++	Tree  treeSpec
++	Steps []escapeStep
++}
++
++func (c basePathCase) GoString() string {
++	var b strings.Builder
++	fmt.Fprintf(&b, "basePathCase{%q\n\t%s", c.Base, c.Tree.GoString())
++	for _, s := range c.Steps {
++		b.WriteString("\n\t" + s.GoString())
++	}
++	b.WriteString("\n}")
++	return b.String()
++}
++
++var basePathCases = hegel.Composite(func(tc hegel.TestCase) basePathCase {
++	return basePathCase{
++		Base:  hegel.Draw(tc, hegel.SampledFrom([]string{"/base", "/base/x", "/b a se/", "/base/./x"})),
++		Tree:  hegel.Draw(tc, treeSpecs),
++		Steps: hegel.Draw(tc, many(escapeSteps, 1, 6)),
++	}
++})
++
 +// TestHegelBasePathFsStaysInsideItsBase: a BasePathFs maps a path to base +
 +// path, reports a path that escapes the base as not existing, trims the base
 +// from File.Name, and FullBaseFsPath composes nested bases.
 +func TestHegelBasePathFsStaysInsideItsBase(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		c := hegel.Draw(ht, basePathCases)
 +		src := afero.NewMemMapFs()
-+		base := pick(tc, "/base", "/base/x", "/b a se/", "/base/./x")
++		base := c.Base
 +		src.MkdirAll(base, 0o755)
 +		bp := afero.NewBasePathFs(src, base)
-+		dirs, files, content := buildTree(tc, bp)
-+		note(ht, "base %q dirs %v files %v", base, dirs, files)
++		dirs, files, content := c.Tree.build(bp)
 +		// Everything landed under the base in the source.
 +		for _, f := range files {
 +			data, err := afero.ReadFile(src, path.Join(base, f))
@@ -2990,10 +3791,9 @@ index 0000000..01913e7
 +				outsideOnly = append(outsideOnly, e)
 +			}
 +		}
-+		for i, k := 0, n(tc, 1, 6); i < k; i++ {
-+			q := anyPath(tc, dirs, files)
-+			esc := pick(tc, "/..", "/../..", "/../x", "/a/../../y", "../z")
-+			ep := pick(tc, esc, esc+q, q+esc)
++		for _, s := range c.Steps {
++			q := s.Path.resolve(dirs, files)
++			ep := [...]string{s.Esc, s.Esc + q, q + s.Esc}[s.Where]
 +			real, err := bp.(*afero.BasePathFs).RealPath(ep)
 +			escapes := !strings.HasPrefix(canon(path.Join(base, ep))+"/", canon(base)+"/")
 +			if escapes != (err != nil) || (err == nil && real != path.Join(base, ep)) {
@@ -3048,16 +3848,19 @@ index 0000000..01913e7
 +	})
 +}
 +
++// ---------------------------------------------------------------------------
++// IOFS.
++
 +// TestHegelIOFSPassesTheStandardChecks: testing/fstest.TestFS accepts the
-+// io/fs adapter of a MemMapFs, bare and behind a BasePathFs, for a random
++// io/fs adapter of a MemMapFs, bare and behind a BasePathFs, for a drawn
 +// tree, and the adapter's ReadFile/ReadDir/Stat agree with the helpers.
 +func TestHegelIOFSPassesTheStandardChecks(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		tc := hegel.TestCase(ht)
++		tree := hegel.Draw(ht, treeSpecs)
 +		mem := afero.NewMemMapFs()
 +		root := afero.NewBasePathFs(mem, "/root")
 +		mem.MkdirAll("/root", 0o755)
-+		dirs, files, content := buildTree(tc, root)
++		dirs, files, content := tree.build(root)
 +		var expected []string
 +		for _, f := range files {
 +			expected = append(expected, strings.TrimPrefix(f, "/"))
@@ -3123,95 +3926,63 @@ index 0000000..01913e7
 +}
 diff --git a/hegel/known.go b/hegel/known.go
 new file mode 100644
-index 0000000..9541e7b
+index 0000000..c9c69ce
 --- /dev/null
 +++ b/hegel/known.go
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,56 @@
 +package hegel
 +
-+// knownBugs lists the bugs recorded in bugs.toml that the properties gate on:
-+// a property that would otherwise reach a recorded bug skips the offending
-+// step (or accepts the recorded outcome) while the switch is true. Each pin in
-+// hegel_pins_test.go asserts the correct behaviour, so the switches can be
-+// turned off one by one as upstream fixes land.
-+type knownBugs struct {
-+	MkdirCreatesParents     bool // afero/1: MemMapFs.Mkdir creates missing parents
-+	CreateCreatesParents    bool // afero/2: Create, OpenFile(O_CREATE) and Rename create missing parents
-+	RemoveNonEmptyDir       bool // afero/3: Remove deletes a non-empty directory, children stay reachable
-+	MkdirAllOverFile        bool // afero/4: MkdirAll on an existing regular file returns nil
-+	FileBecomesDir          bool // afero/5: MkdirAll/Create below a regular file turn it into a directory
-+	CreateOverDir           bool // afero/6: Create over a directory replaces it, children stay reachable
-+	RenameOverwrites        bool // afero/7: Rename of a directory over a file succeeds (and over a non-empty directory)
-+	RenameIntoItself        bool // afero/8: Rename of a directory into its own subtree detaches the tree
-+	NegativeSeek            bool // afero/9: Seek to a negative offset succeeds, the next Read/Write panics
-+	UnexpectedEOF           bool // afero/10: Read/ReadAt past the end return io.ErrUnexpectedEOF
-+	AppendSeeksOnce         bool // afero/11: O_APPEND only seeks to the end at open
-+	AccessModeIgnored       bool // afero/12: O_WRONLY handles read, O_RDONLY|O_CREATE handles write
-+	ReadOnlyOpenNeedsWrite  bool // afero/13: OpenFile(O_RDONLY) needs write permission
-+	DirectoryHandleIsAFile  bool // afero/14: a directory handle acts as a file: Read gives empty content, OpenFile with O_CREATE or write flags succeeds and Write works
-+	CreateReplacesFile      bool // afero/15: Create of an existing file replaces it: mode reset to 0666, open handles detached
-+	RemoveAllEmptyPath      bool // afero/16: RemoveAll("") deletes everything including the root
-+	EmptyNameEntry          bool // afero/17: Mkdir("")/Create("") add an entry with an empty name to the root
-+	SeekBadWhence           bool // afero/18: Seek with an invalid whence returns nil
-+	ContainsBytesPadding    bool // afero/19: FileContainsBytes matches the zero padding of its buffer
-+	UnionCloseBadFD         bool // afero/20: UnionFile.Close returns BADFD (EBADFD) after closing both files, so WriteFile through a union fails after writing
-+	CowRemoveBaseOnly       bool // afero/21: CopyOnWriteFs.Remove/RemoveAll of a base-only file do not return EPERM
-+	CowMkdirExisting        bool // afero/22: CopyOnWriteFs.Mkdir over a layer directory or a base file succeeds
-+	CacheRemoveMiss         bool // afero/23: CacheOnReadFs.Remove of an uncached file removes it but reports not-exist
-+	RegexpRenameDir         bool // afero/24: RegexpFs.Rename of a directory is a silent no-op
-+	RegexpOpenFileCreate    bool // afero/25: RegexpFs.OpenFile(O_CREATE) cannot create a new file
-+	RegexpReaddirEmptyPage  bool // afero/26: RegexpFile.Readdir(n) returns an empty page with a nil error
-+	WalkReturnsSkip         bool // afero/27: Walk returns filepath.SkipDir/SkipAll to its caller
-+	GlobBackslash           bool // afero/28: Glob does not count a backslash escape as a meta character and takes such an element literally
-+	RenameSelfMissing       bool // afero/29: Rename(x, x) of a missing file returns nil
-+	CreateIgnoresPermission bool // afero/30: Create of an existing file without write permission succeeds
-+	EmptyWriteAtGrows       bool // afero/31: WriteAt of an empty slice past the end grows the file with zeros
-+	CopyToLayerOfDir        bool // afero/32: copyToLayer cannot copy a directory: cow Chmod/Chtimes/Chown and cache Chmod/Chtimes/Chown/Rename of a base-only directory fail
-+	CowCopyLosesMode        bool // afero/33: the copy of a base file made in the layer gets mode 0666 instead of the base file's mode
-+	CowParentModeChanges    bool // afero/34: CopyOnWriteFs/CacheOnReadFs recreate a base directory in the layer with the new entry's mode (or 0777) and report that mode
-+	RegexpRemoveAllMissing  bool // afero/35: RegexpFs.RemoveAll of a missing path returns an error instead of nil
-+	CacheWriteOnlyUncached  bool // afero/36: CacheOnReadFs.OpenFile(O_WRONLY...) of a file not in the layer copies through the write-only handle and fails, after O_TRUNC/O_CREATE changed the base
-+	CowRenameIntoBaseDir    bool // afero/37: CopyOnWriteFs.Rename of a layer entry into a directory that exists only in the base fails
-+	CacheCreateInBaseDir    bool // afero/38: CacheOnReadFs.Create and Rename into a directory not yet in the layer fail after changing the base
++import "os"
++
++// noKnown is read once from HEGEL_NO_KNOWN. By default (false) the
++// properties draw the shapes of every recorded bug and fail on them, naming
++// the bug; with HEGEL_NO_KNOWN=1 a step whose shape is a recorded bug is a
++// no-op, a shape the generator can leave out is left out, and a recorded
++// outcome met at comparison time is accepted, so the properties pass. Each
++// pin in hegel_pins_test.go asserts the correct behaviour independently.
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") == "1"
++
++// knownShapes names the shape of every bug recorded in bugs.toml that a
++// property can reach; known(id) is the text a failure message carries.
++var knownShapes = map[string]string{
++	"afero/1":  "MemMapFs.Mkdir creates missing parents",
++	"afero/2":  "Create, OpenFile(O_CREATE) and Rename create missing parents",
++	"afero/3":  "Remove deletes a non-empty directory, children stay reachable",
++	"afero/4":  "MkdirAll on an existing regular file returns nil",
++	"afero/5":  "MkdirAll/Create below a regular file turn it into a directory",
++	"afero/6":  "Create over a directory replaces it, children stay reachable",
++	"afero/7":  "Rename of a directory over a file succeeds",
++	"afero/8":  "Rename of a directory into its own subtree detaches the tree",
++	"afero/9":  "Seek to a negative offset succeeds, the next Read/Write panics",
++	"afero/10": "Read/ReadAt past the end return io.ErrUnexpectedEOF",
++	"afero/11": "O_APPEND only seeks to the end at open",
++	"afero/12": "O_WRONLY handles read, O_RDONLY handles write",
++	"afero/13": "OpenFile(O_RDONLY) needs write permission",
++	"afero/14": "a directory handle acts as a file",
++	"afero/15": "Create of an existing file replaces it: mode reset to 0666, open handles detached",
++	"afero/19": "FileContainsBytes matches the zero padding of its buffer",
++	"afero/20": "UnionFile.Close returns BADFD after closing both files",
++	"afero/21": "CopyOnWriteFs.Remove/RemoveAll of a base-only entry do not return EPERM",
++	"afero/22": "CopyOnWriteFs.Mkdir over a layer directory or a base file succeeds",
++	"afero/23": "CacheOnReadFs.Remove of an uncached file removes it but reports not-exist",
++	"afero/24": "RegexpFs.Rename of a directory is a silent no-op",
++	"afero/25": "RegexpFs.OpenFile(O_CREATE) cannot create a new file",
++	"afero/26": "RegexpFile.Readdir(n) returns an empty page with a nil error",
++	"afero/27": "Walk returns filepath.SkipDir/SkipAll to its caller",
++	"afero/28": "Glob takes a backslash escape literally",
++	"afero/29": "Rename(x, x) of a missing file returns nil",
++	"afero/30": "Create of an existing file without write permission succeeds",
++	"afero/31": "Write/WriteAt of an empty slice past the end grows the file with zeros",
++	"afero/32": "copyToLayer cannot copy a directory (Chmod/Chtimes/Rename of a base-only directory fail)",
++	"afero/33": "the layer copy of a base file gets mode 0666",
++	"afero/34": "a base directory recreated in the layer gets the new entry's mode",
++	"afero/35": "RegexpFs.RemoveAll of a missing path returns an error",
++	"afero/36": "CacheOnReadFs.OpenFile(O_WRONLY) of an uncached file fails after changing the base",
++	"afero/37": "CopyOnWriteFs.Rename of a layer entry into a base-only directory fails",
++	"afero/38": "CacheOnReadFs.Create and Rename into a directory not yet in the layer fail",
 +}
 +
-+var Known = knownBugs{
-+	MkdirCreatesParents:     true,
-+	CreateCreatesParents:    true,
-+	RemoveNonEmptyDir:       true,
-+	MkdirAllOverFile:        true,
-+	FileBecomesDir:          true,
-+	CreateOverDir:           true,
-+	RenameOverwrites:        true,
-+	RenameIntoItself:        true,
-+	NegativeSeek:            true,
-+	UnexpectedEOF:           true,
-+	AppendSeeksOnce:         true,
-+	AccessModeIgnored:       true,
-+	ReadOnlyOpenNeedsWrite:  true,
-+	DirectoryHandleIsAFile:  true,
-+	CreateReplacesFile:      true,
-+	RemoveAllEmptyPath:      true,
-+	EmptyNameEntry:          true,
-+	SeekBadWhence:           true,
-+	ContainsBytesPadding:    true,
-+	UnionCloseBadFD:         true,
-+	CowRemoveBaseOnly:       true,
-+	CowMkdirExisting:        true,
-+	CacheRemoveMiss:         true,
-+	RegexpRenameDir:         true,
-+	RegexpOpenFileCreate:    true,
-+	RegexpReaddirEmptyPage:  true,
-+	WalkReturnsSkip:         true,
-+	GlobBackslash:           true,
-+	RenameSelfMissing:       true,
-+	CreateIgnoresPermission: true,
-+	EmptyWriteAtGrows:       true,
-+	CopyToLayerOfDir:        true,
-+	CowCopyLosesMode:        true,
-+	CowParentModeChanges:    true,
-+	RegexpRemoveAllMissing:  true,
-+	CacheWriteOnlyUncached:  true,
-+	CowRenameIntoBaseDir:    true,
-+	CacheCreateInBaseDir:    true,
++// known names a recorded bug's shape for a failure message.
++func known(id string) string {
++	return id + ": " + knownShapes[id]
 +}
