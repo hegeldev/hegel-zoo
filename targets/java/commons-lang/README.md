@@ -18,6 +18,17 @@ See HACKING.md for the Java mechanics.
 
 Every model is written from the Javadoc's rules and example tables, with `java.lang.String`,
 `java.util.List`, `BigInteger`/`BigDecimal`, `java.time` and `SimpleDateFormat` as the oracles.
+The generators are values built over `Gen.java` (weighted choice, `chance`, `maybe`, `pick`,
+`ints`, `many`, `word`, index tapes): each property draws one case record (`SubstrCase`,
+`SearchCase`, `ArrayCase`, the sealed `NumText`, `FracCase`, `ConvCase`, `CharSetCase`,
+`TablesCase`, `RangeCase`, `DurCase`, `DateCase`, `BuildCase` with its list of mutable-object
+operations) rendered by pure methods, and the shapes of the recorded bugs are drawn by default,
+so the wide properties fail on them and are listed in `target.toml` mapped to the bug they shrink
+to (the substrings property and `createNumber` meet theirs in a few percent of cases and are
+intermittent). `CommonsLangShapesTest` holds one narrow property per bug over the bug's shape
+region with random contents, the deterministic expected failure; `HEGEL_NO_KNOWN=1` (read once,
+`Zoo.NO_KNOWN`) switches the shapes off in the generators and skips the six checks whose shape
+is only known after the draw, and every property then passes.
 
 `CommonsLangTest`:
 
@@ -27,10 +38,10 @@ Every model is written from the Javadoc's rules and example tables, with `java.l
   with pairs a well-formed piece at most one unit shorter, since the code never splits a pair),
   `abbreviate` in all its forms against the example table (tail, head and recursive branches, the
   `IllegalArgumentException` widths) plus the documented promises "never longer than maxWidth" and
-  "the left edge appears in the result" on strings of distinct letters (bug /1 skipped),
+  "the left edge appears in the result" on strings of distinct letters (bug /1),
   `abbreviateMiddle`, `leftPad`/`rightPad`/`center` with cyclic pad strings, chars, null/empty pads
   and the 8192 pad limit, `repeat`, `reverse`, `rotate` (and back), `overlay`, `chomp`, `chop`,
-  `strip*`/`trim*`/`*ToNull`, `normalizeSpace` (with idempotence; strings with U+00A0 are bug /9),
+  `strip*`/`trim*`/`*ToNull`, `normalizeSpace` (with idempotence and the Javadoc's whitespace, which U+00A0 is not - bug /9),
   `deleteWhitespace`, `swapCase`/`capitalize`/`uncapitalize`/`toRoot*Case`/`getDigits`/`toCodePoints`,
   `wrap`/`unwrap`/`wrapIfMissing`, `removeStart/End`, `appendIfMissing`/`prependIfMissing`,
   `substringBefore/After(Last)`, `substringBetween`, `substringsBetween`.
@@ -42,14 +53,14 @@ Every model is written from the Javadoc's rules and example tables, with `java.l
   `getCommonPrefix`/`difference`; the `split` family (`split`, with max, on whitespace, on a char
   set, `splitPreserveAllTokens`, `splitByWholeSeparator[PreserveAllTokens]`,
   `splitByCharacterType[CamelCase]`) against models of the documented merging rules, `join` of
-  arrays/lists/iterators/ranges (`join(Object[], String, start, end)` on valid ranges — bug /3),
+  arrays/lists/iterators/ranges (`join(Object[], String, start, end)` on valid and invalid ranges — bug /3),
   `joinWith`, `splitPreserveAllTokens` then `join` as the identity; `replace`/`replaceOnce`/
   `replaceIgnoreCase`/`replace(max)`/`remove*`, `replaceChars`, `replaceEach` (earliest match,
   ties to the first entry); the `is*` predicates against `Character`, `compare[IgnoreCase]`,
   `defaultIfBlank`, `firstNonBlank`, `reverseDelimited`.
 - **arrayUtilsFollowsItsClampingRules** — `int[]` against an `ArrayList` model: `indexOf`/
   `lastIndexOf` (with start), `contains`, `isSorted`, `toObject`/`toPrimitive`, `toString`, `add`/
-  `addFirst`/`addAll`/`insert` (out-of-range index throws — with values; bug /5), `remove(index)`,
+  `addFirst`/`addAll`/`insert` (out-of-range index throws, with and without values — bug /5), `remove(index)`,
   `get` with default, `removeElement`/`removeAllOccurrences`/`removeElements`/`removeAll(indices)`,
   `subarray` clamping, `reverse`/`shift`/`swap` on ranges (clamping, never throwing, involution and
   rotation laws), `shuffle` as a permutation, `nullToEmpty`, `isSameLength`.
@@ -63,11 +74,11 @@ Every model is written from the Javadoc's rules and example tables, with `java.l
   rule), octal (a leading zero; `8`/`9` invalid) and junk; `isCreatable` ⇔ no exception,
   `isParsable`, `toInt`/`toLong`/`toDouble` defaults, `createBigInteger`/`createDouble`; `min`/
   `max` over arrays with `NumberUtils` propagating NaN and `IEEE754rUtils` ignoring it. A plus sign
-  with the `L` suffix is bug /11 and skipped.
+  with the `L` suffix is bug /11.
 - **fractionArithmeticMatchesBigIntegerRationals** — `getFraction(n, d)` (sign normalisation, no
   reduction, zero denominator), `getReducedFraction`/`reduce`, component-wise `equals`, `compareTo`
   by cross-multiplication, `add`/`subtract`/`multiplyBy`/`divideBy`/`invert`/`negate`/`abs`/`pow`
-  against reduced `BigInteger` rationals (|power| = 1 checks the value only — bug /8), `toString`
+  against reduced `BigInteger` rationals (|power| = 1 reduced too — bug /8), `toString`
   and `toProperString` parsing back, the proper parts, and `getFraction(double)` recovering
   denominators up to 60 exactly.
 - **conversionRoundTripsAndMatchesTheBitOrder** — `intToHex`/`longToHex`/`shortToHex`/`byteToHex`
@@ -89,7 +100,7 @@ Every model is written from the Javadoc's rules and example tables, with `java.l
   `LocaleUtils.toLocale` on generated `language_COUNTRY_variant` strings with `_` or `-` (ISO
   country codes as bare strings, the leading-separator forms, the variant taking the rest) against
   the documented grammar; `ClassUtils.getShortClassName`/`getPackageName` on generated
-  package/inner/array names (an array of a default-package class `C` is bug /10 and skipped),
+  package/inner/array names (an array of a default-package class named by a descriptor letter is bug /10),
   `getAbbreviatedName`'s examples, boxing/widening `isAssignable`.
 - **rangeAlgebraMatchesIntervals** — `Range.of` with swapped bounds, `contains`, `isAfter`/
   `isBefore`/`isStartedBy`/`isEndedBy`, `elementCompareTo`, `fit`, `containsRange`,
@@ -132,7 +143,8 @@ directly.
 
 ## Bugs
 
-Eleven, all pinned (`pin…` tests) and recorded in `bugs.toml`: `abbreviate` with an offset drops
+Eleven, each found by a wide property, held by a narrow one and pinned (`pin…` tests), recorded
+in `bugs.toml`: `abbreviate` with an offset drops
 the left edge it promises to keep (/1); `EnumUtils.generateBitVector(Class, Iterable)` throws NPE
 where IAE is documented (/2); `join(Object[], String, start, end)` throws the wrong exception for a
 negative start and none for an out-of-range end (/3); `replaceEachRepeatedly` rejects a convergent
@@ -156,3 +168,6 @@ tries `_` before `-`, so `"en-GB-a_b"` is invalid while `"en_GB_a_b"` has the va
 - 2026-09-16: created at 01a66dd2 (3.21.0-SNAPSHOT), 12 properties, 11 bugs.
 - 2026-09-18: base bumped 01a66dd238cb → d235f1e99752 (2026-09-18, "LANG-1834 Fix Fraction reduction for Integer.MIN_VALUE (#1794)."; 3.21.0-SNAPSHOT); 11 bug(s) still reproduce. 12 tests pass.
 - 2026-09-20: base bumped d235f1e99752 → 9c94f38ff471 (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 3.21.0-SNAPSHOT); 11 bug(s) still reproduce. 12 tests pass.
+- 2026-09-26: generators rewritten in combinator style over `Gen.java`; the recorded shapes are
+  drawn by default and the wide properties are the expected failures; `CommonsLangShapesTest`
+  with one narrow property per bug; `HEGEL_NO_KNOWN=1` switches the shapes off.
