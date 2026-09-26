@@ -15,8 +15,8 @@ has no CONTRIBUTING file and no AI policy; the zoo only records bugs.
 `hegel_test.go` (value model, generators, the `Known` gates), `hegel_expr_test.go` (the expression
 model and evaluator, rendering, the expression properties), `hegel_config_test.go` (bodies, the
 native and JSON spellings, the structure properties), `hegel_more_test.go` (static analysis,
-PartialContent/MergeFiles, edits, positions) and `hegel_pins_test.go` (one plain test per bug),
-and requires `hegel.dev/go/hegel v0.6.33` in go.mod. `HEGEL_TEST_CASES` sets the case count
+PartialContent/MergeFiles, edits, positions), `hegel_shapes_test.go` (one narrow property per bug)
+and `hegel_pins_test.go` (one plain test per bug), and requires `hegel.dev/go/hegel v0.6.33` in go.mod. `HEGEL_TEST_CASES` sets the case count
 (default 100; the properties run clean at 1000 in about 40 s).
 
 ## Oracles
@@ -63,7 +63,20 @@ and requires `hegel.dev/go/hegel v0.6.33` in go.mod. `HEGEL_TEST_CASES` sets the
 - **Broken inputs never panic**: mutated files (deleted, duplicated, swapped and injected pieces)
   give diagnostics or parse, in `hclsyntax`, `json` and `hclwrite`.
 
-## Bugs (5; details in bugs.toml)
+## Generator
+
+The generators are combinator values (`hegel_test.go` holds the idioms: `weighted`, `chance`,
+`maybe`, `pairs`, `many`, `deferred`, `positions`, `shaped`/`known`): values from a memoised
+grammar per depth (`valuesOf`), expressions from a typed grammar built per drawn scope
+(`grammar.expr(want, depth)`, constructions as weighted choices with the atom first, collections
+and splats scanned with positions taken modulo the live size, a divisor fixed up rather than
+retried), heredocs as a record of marker, indentation and lines rendered by a pure function,
+bodies as lists of items assembled by a pure function, the native spelling read off a drawn tape of
+whitespace, comments and filler (an empty tape is the tidy form), hclwrite builds and edits as
+records applied by pure functions with positions modulo the live size, mutations likewise. Every
+case type has a `GoString` for the draw report.
+
+## Bugs (7; details in bugs.toml)
 
 | id | summary | severity |
 |----|---------|----------|
@@ -72,12 +85,16 @@ and requires `hegel.dev/go/hegel v0.6.33` in go.mod. `HEGEL_TEST_CASES` sets the
 | hcl/3 | hclwrite drops a comment between a block's type and its first label (`resource /* c */ "a" {}`) | low |
 | hcl/4 | `JustAttributes` on the body `PartialContent` leaves reports the extracted blocks as "Unexpected block" (`Content` on the same body does not) | low |
 | hcl/5 | hclwrite edits inside a one-line block write invalid HCL (`resource {}` + `SetAttributeValue` → `resource { b = true\n}`); upstream #687 | medium |
+| hcl/6 | a bare template (a JSON string value, `ParseTemplate`) keeps `$$${` and `%%%{` verbatim after a lone carriage return (`"\r$$${"` reads `\r$$${`, `"\n$$${"` reads `\n$${`) | low |
+| hcl/7 | `hclwrite.Format` spaces a unary minus after an inline comment as a subtraction (`a = /* c */ -1` becomes `a = /* c */ - 1`), so a negative number the writer sets after such a comment is not in Format's form | low |
 
 How they were found: hcl/1 by the native/JSON property (the model's dedent disagreed on a heredoc
 with a whitespace-only line), hcl/2 and hcl/3 by the writer property (`Labels()` against the
 parsed labels; `Bytes()` against `Format`), hcl/4 by the PartialContent property and hcl/5 by the
 edits property on the first one-line block it met; all at 300 to 1000 cases, each reduced to a
-one-line probe. hcl/5 is upstream issue #687 (2024-07-25, `AppendNewBlock` on `atlas {}`; a fix in
+one-line probe. hcl/6 and hcl/7 came with the rewrite of 2026-09-26, once the known shapes were
+drawn by default: the native/JSON property on a string value with a carriage return, and the
+edits property setting a negative number after an inline comment. hcl/5 is upstream issue #687 (2024-07-25, `AppendNewBlock` on `atlas {}`; a fix in
 pull request #828 is open); the attribute case is new there.
 
 Not bugs, noted: `hclwrite.File.Bytes()` formats its output ("a simple formatting pass") so the
@@ -94,12 +111,30 @@ tuple and `keys()` a tuple, `concat` gives a list only when all arguments are li
 in cty; a `~` strip marker that removes the only literal beside an interpolation leaves a single
 interpolation, which unwraps; a literal `$` right before `${` spells the escape `$${`.
 
-Gates while the bugs are open (`Known` in hegel_test.go): heredocs have no whitespace-only lines
-(/1); quoted labels containing `$` or `%` are not generated for the writer property (/2); no
-comment between a block's type and its first label (/3); `JustAttributes` is asked of a native
-remainder only when no block was extracted (/4); the edits property spells every block multi-line
-(/5). The properties run clean at 1000 cases.
+## Known shapes
+
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): heredocs with
+whitespace-only lines, quoted labels holding `$` or `%`, comments between a block's type and its
+first label, `JustAttributes` on a remainder with extracted blocks, edits inside one-line blocks,
+string values with a carriage return before an escape, negative numbers set after an inline
+comment. A mismatch names the bug whose shape it has (`mismatch`; the `Known` switches keep the
+shapes' names) and the property fails: the six wide properties every run (the shapes are 9% to 30%
+of their cases; a property reaching several bugs is mapped to the bug of its majority basin),
+`TestHegelBrokenInputsNeverPanic` in some runs (a mutation lands on hcl/3's shape in about one case
+in a thousand), and each narrow property in `hegel_shapes_test.go` on its own bug. `HEGEL_NO_KNOWN=1`,
+read once, switches the known shapes off: the narrow properties draw the neighbouring region
+(a line feed for the carriage return, a comment after the labels, a non-negative number), the
+wide ones leave the shapes out of their generators (`shaped`) and skip a mismatch that still has a
+known shape (a fraction of a percent of cases), so the test passes and shows what the library gets
+right beside the recorded bugs.
 
 ## History
 
 - 2026-09-17: created at `4932c14` with 5 bugs.
+- 2026-09-26: generators rewritten in combinator style; the known shapes are drawn by default and
+  seven narrow properties, one per bug, are the expected failures beside the pins; hcl/6 and hcl/7
+  recorded (both found once the shapes were drawn). Three model bugs of the old test fixed: the
+  dedent counted a whitespace-only line's newline as indentation, JSON object keys were spelled
+  raw (`"${"` opened an interpolation), and a `length`/`strlen`/`range` result divided by a
+  non-integer was modelled at 512-bit precision where cty rounds at 64 bits (the generator now
+  uses an integer divisor there).
