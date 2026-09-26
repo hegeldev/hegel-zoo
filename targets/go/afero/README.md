@@ -38,8 +38,9 @@ umask is cleared so that both sides keep the modes they are given.
   filtered. `BasePathFs`: escaping paths (`..`) are not-exist for every call and nothing outside the base is
   touched, `RealPath`, `File.Name`, `FullBaseFsPath`. `IOFS`: `fstest.TestFS` on a random tree, bare and
   behind a `BasePathFs`, plus `ReadFile`/`ReadDir` and the leading-slash check.
+- `hegel_shapes_test.go` - one narrow property per recorded bug (see below).
 
-## Known bugs (39, see bugs.toml)
+## Known bugs (40, see bugs.toml)
 
 `MemMapFs` (1-18, 29-31): `Mkdir` creates parents (1) and so do `Create`, `OpenFile(O_CREATE)` and `Rename`
 (2); `Remove` deletes a non-empty directory, its children stay reachable and removing one of them panics
@@ -53,7 +54,8 @@ read-only mode (30); `RemoveAll("")` wipes the file system (16), `Mkdir("")` add
 `Seek` accepts any whence (18); `Rename(x, x)` of a missing file is nil (29); an empty `WriteAt` past the
 end grows the file (31); `Rename` of an entry to a path below itself whose parent is missing aborts the
 whole process (39). Helpers: `FileContainsBytes` matches its buffer's zero padding (19), `Walk` returns
-`SkipDir`/`SkipAll` (27), `Glob` ignores backslash escapes (28). Unions: `UnionFile.Close` returns `BADFD`
+`SkipDir`/`SkipAll` (27), `Glob` ignores backslash escapes (28) and reports no error for a malformed
+pattern over an empty directory (40). Unions: `UnionFile.Close` returns `BADFD`
 so `WriteFile` through a `CacheOnReadFs` fails after writing (20); `CopyOnWriteFs` `Remove`/`RemoveAll` of
 a base-only file are not `EPERM` (21), `Mkdir`/`MkdirAll` only check the base (22), `Rename` into a
 base-only directory fails (37); `CacheOnReadFs.Remove` of an uncached file removes it but reports not-exist
@@ -68,7 +70,14 @@ The generators draw the shape of every recorded bug by default (STYLE.md rule 11
 the properties fail on the first shape they meet, the failure message ends in the shape's name, and the
 wide properties are listed in `[expected_failures]` mapped to the basin the shrinker lands in most
 (`MemMapFs` on 1, sometimes 29; the helpers on 14; `CopyOnWriteFs` on 20; `CacheOnReadFs` on 34, 33 or
-36; `RegexpFs` on 35), the pins beside them as the regression examples. Shapes that depend on the live
+36; `RegexpFs` on 35), the pins beside them as the regression examples. Beside the wide properties,
+`hegel_shapes_test.go` holds one narrow property per recorded bug: each draws the bug's shape region with
+random surroundings (a drawn tree, the construct under a drawn directory with drawn names, decorations,
+modes and data) and checks it with the same helpers as the wide property that meets the bug, so it fails on
+every run while the bug exists and shrinks to the bug's minimal shape; each is the expected failure mapped
+to its bug. Under `HEGEL_NO_KNOWN=1` these properties are skipped, since their region is the recorded bug
+itself; the one for 39 runs the `MemMapFs` call in a memory-capped child process because it aborts the
+process. Shapes that depend on the live
 tree (a parent missing, a base-only entry) are recognised when the step is applied: by default the step
 runs and the mismatch names the bug, under `HEGEL_NO_KNOWN=1` the step is a counted no-op instead, so no
 case is rejected and every property passes at 3000 cases. Comparison-time differences (9, 10, 18, 19, 20,
@@ -98,3 +107,7 @@ umask.
   positions modulo the live tree, handle scripts as data, weighted choices, `chance`, `shaped`) and the
   known-bug steering turned off by default; afero/39 recorded (a process-killing `Rename`), found by the
   freed shapes and reproduced standalone.
+- 2026-09-26 (later): one narrow property per bug in `hegel_shapes_test.go`, the wide properties' steps
+  extracted into shared helpers (generators unchanged); afero/40 recorded (`Glob` skips the pattern check
+  over an empty directory), found by the helpers property under `HEGEL_NO_KNOWN=1` and reproduced
+  standalone.
