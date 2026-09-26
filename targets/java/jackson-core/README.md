@@ -20,10 +20,22 @@ extended with jackson-core's escaping table (`"` `\` and the control characters;
 (several root values, whitespace required after a number, a literal not followed by an identifier
 character). Generators produce random trees (strings over quotes, backslashes, control characters,
 U+2028/2029, HTML characters, surrogate pairs and lone surrogates; numbers from a boundary pool and
-random lexemes), valid texts with random whitespace and escape spellings, and mutations. Every
-property runs its text through the parser kinds — `Src`: String, char[], Reader, throttled Reader,
-byte[], InputStream, throttled InputStream, DataInput, and the non-blocking parser fed in random
-chunks (`Tokens` hides NOT_AVAILABLE).
+random lexemes), valid texts with random whitespace and escape spellings, and mutations. The
+generators are values built from the binding's combinators over a small `Gen.java` (weighted
+choice, `chance`, `maybe`, `pick`, `ints`, `many`, `word`): each property draws one record for its
+case — the value tree, a `Spelling` (two tapes of whitespace gaps and escape choices, empty for the
+compact text), a list of `Edit`s applied at positions taken modulo the live length, the parser kind,
+the generator configuration, the write methods and number classes as tapes applied per event, and a
+`Feed` (a chunk size and cut positions taken modulo what is left) for the non-blocking parser — and
+renders it with pure functions. Each case runs its text through one drawn parser kind — `Src`:
+String, char[], Reader, throttled Reader, byte[], InputStream, throttled InputStream, DataInput, or
+the non-blocking parser fed at the drawn cuts (`Tokens` hides NOT_AVAILABLE and treats a
+NOT_AVAILABLE with `needMoreInput()` false as a stall). The shapes of the recorded bugs are drawn by
+default, so the wide properties fail on them and are mapped to the bug each shrinks to
+(`intermittent` where the shape is a few percent of cases); `HEGEL_NO_KNOWN=1` (read once) switches
+the shapes off, and a shape known only after the draw is counted and skipped for that check;
+`zoo.JacksonCoreShapesTest` holds one narrow property per bug over its shape region, which draws
+the neighbouring region under `HEGEL_NO_KNOWN=1`.
 
 - **generatorEventsReadBackThroughEveryParser** — random events written by either generator with
   random `ESCAPE_FORWARD_SLASHES` / `ESCAPE_NON_ASCII` / `WRITE_HEX_UPPER_CASE` /
@@ -33,8 +45,8 @@ chunks (`Tokens` hides NOT_AVAILABLE).
   same tokens, names, strings, number lexemes (`getString()`), `getNumberType()` and, after each
   token, `streamReadContext().pathAsPointer()` per a pointer model.
 - **parsersAgreeWithTheReference** — a valid or mutated text: the parser accepts iff the reference's
-  root-value model accepts, with the same values (lone surrogates and a leading BOM excepted for the
-  byte sources).
+  root-value model accepts, with the same values (lone surrogates, which bytes cannot carry, and a
+  leading BOM, which the byte parsers skip by documentation, excepted for the byte sources).
 - **numbersDecodeExactlyInEveryParser** — a lexeme (pool, int/long boundaries, 998–1002 digits
   around `maxNumberLength`, random doubles' shortest forms, random BigDecimals), with and without the
   fast parsers: token kind, `getString`, `getNumberType`, `getNumberValue` class,
@@ -73,7 +85,8 @@ shortcuts, `JsonPointer.forPath` with `includeRoot`.
 
 ## Bugs
 
-Thirteen, all pinned (`pin…` tests) and recorded in `bugs.toml`: the DataInput parser fails on a root
+Fourteen, recorded in `bugs.toml`, each found by a wide property, held by a narrow property in
+`zoo.JacksonCoreShapesTest` and pinned by a `pin…` regression example: the DataInput parser fails on a root
 number/literal at the end of input and on an empty document (jackson-core/1); `getNumberValueExact()`
 turns lossy after `getNumberType()` (/2); the byte-based parsers reject a lone-surrogate `\u` escape
 in a property name that the UTF-8 generator writes (/3); the non-blocking parser drops the sign of
@@ -86,8 +99,10 @@ under `ALLOW_BACKSLASH_ESCAPING_ANY_CHARACTER` the byte parsers truncate an esca
 surrogate pair in a name split between feeds stalls the non-blocking parser (/11); the non-blocking
 parser accepts an object's trailing comma without the feature when the brace comes in a later feed (/12);
 the DataInput parser skips C0 control characters between tokens (`<0x01> []` reads as `[]`) where
-every other parser throws "Illegal character (CTRL-CHAR)" (/13, found 2026-09-17 by the mutation
-property; the property skips that shape for the DataInput source until it is fixed).
+every other parser throws "Illegal character (CTRL-CHAR)" (/13); the non-blocking parser accepts a
+root integer directly followed by another root value (`1-40`, `1null`) when both arrive in one
+feed, where every blocking parser demands a separating space (/14, found 2026-09-26 by the mutation
+property once the recorded shapes were drawn by default).
 
 Known upstream and skipped, not counted: mangled numbers inside containers such as `[123true]` are
 not reported (core#1557, `tofix` tests in the repository); the mutation property's root-value model
@@ -97,3 +112,4 @@ only applies jackson's separator rule at the root.
 - 2026-09-17: base bumped 917360f2b0a0 → 6c2090cda7a8 (2026-09-16, "Merge branch '3.2' into 3.x"; 3.3.0-SNAPSHOT); 12 bug(s) still reproduce. 8 tests pass.
 - 2026-09-18: base bumped 6c2090cda7a8 → fa07beee3b21 (2026-09-17, "Merge branch '3.2' into 3.x"; 3.3.0-SNAPSHOT); 13 bug(s) still reproduce. 8 tests pass.
 - 2026-09-20: base bumped fa07beee3b21 → d37d7e25139f (2026-09-18, "Merge branch '3.2' into 3.x"; 3.3.0-SNAPSHOT); 13 bug(s) still reproduce. 8 tests pass.
+- 2026-09-26: generators rewritten in combinator style over `Gen.java` (one record per property, `Spelling`/`Edit`/`Feed` values); the thirteen inline sidesteps of the recorded bugs removed, so the wide properties draw the shapes by default and are mapped to the bug they shrink to, `HEGEL_NO_KNOWN=1` switching them off; `zoo.JacksonCoreShapesTest` added with one narrow property per bug; jackson-core/14 found and recorded.
