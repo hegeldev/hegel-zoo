@@ -49,7 +49,7 @@ missing shell skips its checks. Upstream's own tests confirm against bash 5.3, d
 - **Broken inputs never panic**: mutated programs give `ParseError`/`LangError` (or parse, and then
   round-trip); `RecoverErrors` trees print and reparse.
 
-## Bugs (26; details in bugs.toml)
+## Bugs (28; details in bugs.toml)
 
 | id | summary | severity |
 |----|---------|----------|
@@ -102,23 +102,36 @@ where bash rejects it (bash does not treat `time` as a keyword after a pipe), an
 more than sixteen heredocs on a line are rejected by bash alone — the generator avoids those
 shapes; `Parser.Incomplete` is meaningful only while a read is blocked.
 
-Gates while the bugs are open: the generator puts no trailing comment after `let` or on heredoc
-lines with `|`/`&`/`;` (/1, /7), no `|&` after `let` and no Minify for programs with `let` (/1), no
-`!` directly inside `time` (/2), no `(`, backquote or `[[` after a heredoc redirect on a line (/5,
-/8), no comment ending in a backslash (/6), process substitutions only as whole words (/9), `echo a`
-instead of a coproc command with assignment words (/10), no empty last case item under Minify
-(/11), no empty `${x/}` (/12), no `function f ( )` (/14), no backquotes right after `$` (/15), no
-double-quoted words inside expansions within double quotes for Simplify (/16), no case statements
-with trailing redirects and no `esac` inside if/while conditions (/22), parenthesised operands after
-a unary sign of the same kind (/20), and retries lines with a leading redirect whose target ends in
-`; return` (/23) or a substitution starting with a subshell (/26); the position property skips case
-items without an end (/13), negated pipelines' first statements (/4) and coproc statements (/10);
-the broken-inputs property parses assignments holding `$((` without `RecoverErrors` (/24); the
-printer options leave KeepPadding off for leading redirects, negations and, with spaces, multi-line
-subshells (/3), SingleLine off for programs with `esac`, a body ending in `&`, or a comment after a
-closing word (/18, /19, /21), Minify off when `|` is followed by `&>` (/25), and Minify/SingleLine
-off for /17's shape (`done <x; then`). The properties run clean at 1000 cases.
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11): trailing
+comments after `let` and on heredoc lines, `|&` after `let`, `!` inside `time`, `(`, backquotes and
+`[[` after a heredoc redirect, comments ending in a backslash, glued process substitutions, coproc
+commands with assignment words, empty case items and `${x/}`, `function f ( )`, backquotes after `$`,
+case statements with trailing redirects, `esac` in conditions, parenthesised operands after a unary
+sign, leading redirects ending in `; return`, substitutions starting with a subshell, heredoc bodies
+after a `(` and near the parser's read boundary, and every printer option on every program. The five
+wide properties each find several bugs; they fail on the first shape they meet and are listed in
+`[expected_failures]` mapped to the basin the shrinker lands in most often (formatting on /3,
+Simplify on /9, positions on /4, the broken inputs on /5, the streaming parsers on /20 and marked
+intermittent, since their shapes are a few percent of cases at the default count), the pins beside
+them as the regression examples. `HEGEL_NO_KNOWN=1`, read once into the `Known` switches, turns
+the shapes off: the grammar stops drawing them (heredocs then sit only at line end, the region of
+/5, /7 and /8), lines with a printer-mangled shape are filtered (below one percent), and every
+property passes at 3000 cases.
+
+Two found by the rewritten generators (2026-09-26): a heredoc body placed right after the `(` that
+opens a subshell, a `$(` or a function's subshell body is rejected as an unclosed here-document,
+where bash and dash accept it and the same body after `{` parses (/27, medium); `InteractiveSeq`
+yields the statements before a heredoc twice when the heredoc sits at the parser's 1024-byte read
+boundary (/28, medium).
 
 ## History
 
 - 2026-09-17: created at `c6351e9` with 26 bugs.
+- 2026-09-26: generators rewritten in combinator style (a program grammar built once per dialect
+  from weighted choices, rendered by a pure writer that places heredoc bodies after the next
+  newline; cases as records, mutations as a drawn list) and the known-bug gates turned off by
+  default; latent model bugs of the old test fixed (the heredoc shape matched `<<<`, `<<=` and
+  arithmetic `<<`; the done-redirect and substitution-subshell gates fired far too widely; the
+  broken-inputs skip fired on 45% of cases). sh/27 and sh/28 recorded, found by the freed shapes
+  and reproduced standalone. Oracle tolerance: bash 5.2.21 rejects a leading redirect followed by
+  `&>>` with an assignment-like target, so the generator writes `&>` there.
