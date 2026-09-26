@@ -12,10 +12,10 @@ shifts, resize, clone, draw), `Style.String`/`StyleDiff` and `Line.Render`, and
 scroll, hard-tab, backspace, ECH/REP/ICH/DCH optimisations) against the charmbracelet/x/vt
 terminal emulator. Pinned at 6c9e17d (2026-09-10, untagged main). MIT; no
 CONTRIBUTING/AGENTS/AI policy (checked 2026-09-15). The tests live in package `uv`
-(`hegel_test.go`, `hegel_buffer_test.go`) to reach `eventScanner`, `buildKeysTable`, the legacy
-flag constants and the renderer's current buffer; the renderer differential is in package
-`uv_test` (`hegel_render_test.go`) because x/vt imports ultraviolet, and reaches the harness
-through exported `…T` bridges. **Layout**: the `layout` subpackage (a translation of
+(`hegel_test.go`, `hegel_buffer_test.go`, `hegel_shapes_test.go`) to reach `eventScanner`,
+`buildKeysTable`, the legacy flag constants and the renderer's current buffer; the renderer
+differential is in package `uv_test` (`hegel_render_test.go`, `hegel_render_shapes_test.go`)
+because x/vt imports ultraviolet, and reaches the harness through exported `…T` bridges. **Layout**: the `layout` subpackage (a translation of
 ratatui's Cassowary-based `Layout`: `Len`/`Percent`/`Ratio`/`Min`/`Max`/`Fill` constraints,
 seven `Flex` modes, spacing, padding, the split cache) in `layout/hegel_test.go` (package
 `layout_test`), checked against the documented invariants and against ratatui itself.
@@ -96,10 +96,21 @@ of the interval, `Set`/`Reset`/`Clear`/`Resize`, `Next`/`Prev`/`Find` walking it
 
 ## Properties
 
-| Test | What it checks | Gates |
+The generators are combinator values (`hegel_test.go` holds the idioms: `choice`/`weighted` as a
+`FlatMap` over a small integer, `chance(pct)` shrinking to false, `maybe`, `many`, `positions` with
+`at` taking a position modulo the live size, `shaped`/`known`): encoded events as records of kind,
+bytes and expected events built by `Map`/`OneOf` per protocol, streams as lists of them with the
+read boundaries drawn as positions, buffer, frame and screen operations as one `Composite` per kind
+combined by `weighted` (a 25-operation case stays inside Hegel's choice budget), layouts as records
+of constraints, flex, spacing and padding. Every case type has a `GoString` for the draw report.
+The third column names the recorded bugs whose shapes each property draws (by default; the
+property fails on the bug of its majority basin, every run or intermittently when the shape is a
+few percent of cases) and the protocol ambiguities it leaves out.
+
+| Test | What it checks | Shapes drawn (and protocol exclusions) |
 | --- | --- | --- |
 | `SequencesDecodeToTheirEvents` | every encoded event decodes to itself, consuming exactly its bytes, leaving the buffer untouched, with a non-empty `String()` | alternate keys with a base key (/1) |
-| `StreamsSplitIntoTheirEvents` | 1–6 events back to back parse (via `Decode` and via the scanner) into the concatenated event lists | lone ESC / `ESC ESC` only last; `CSI 1;mod R` alone skips the scanner (whole-read table lookup gives F3 only, by design); URxvt `CSI n $` not in streams (see below) |
+| `StreamsSplitIntoTheirEvents` | 1–6 events back to back parse (via `Decode` and via the scanner) into the concatenated event lists | alternate keys (/1), ASCII-led clusters (/9), alt+O/P/X (/13), CSIs of 33–40 parameters (/10 through `Decode`, /35 through the scanner); lone ESC / `ESC ESC` only last; `CSI 1;mod R` alone skips the scanner (whole-read table lookup gives F3 only, by design); URxvt `CSI n $` not in streams (see below) |
 | `StreamsSurviveArbitraryReads` | the same stream cut into 2–4 reads gives the same events | cuts inside a cluster (two keys: the decoder cannot know), inside `CSI n $ y` (URxvt prefix), inside an X10 report (/3), between ESC and `\` of ST (/16); `CSI 1;mod R` not in cut streams (a remainder that is exactly a table key is F3 only) |
 | `KittyAndModifyOtherKeysAgree` | `CSI code;mod u` and `CSI 27;mod;code ~` give the same code, modifiers and (without shift) text | — |
 | `KeyTableAgreesWithTheDecoder` | every table entry for random legacy flags, terminals and terminfo use decodes to the same key | terminfo-sourced entries (/12), `ESC`/`ESC ESC` with CtrlOpenBracket (/11) |
@@ -112,7 +123,18 @@ of the interval, `Set`/`Reset`/`Clear`/`Resize`, `Next`/`Prev`/`Find` walking it
 | `RendererDrawsWhatTheEmulatorShows` | 1–6 frames on a 2–16 × 1–6 screen (see Oracles) leave the emulator's screen, the renderer's current buffer and its cursor equal to the frame | frames with an orphan placeholder (/22), a linked cell whose link the emulator lacks after the renderer reset the hyperlink (/24), a mismatch after a scroll sequence when some row was untouched (/25), IRM emitted (the emulator has no insert mode) |
 | `Examples` | fixed examples from the protocols, and the x-input bugs fixed here (/2 event types, /3 num lock, /4 buffer mutation, alt+`[`) | — |
 
-Each `TestHegelPin…` reproduces one bug and is an expected failure. `UV_COLLECT=1` turns
+Each `TestHegelPin…` reproduces one bug and is an expected failure; beside it, one narrow
+property per bug (`hegel_shapes_test.go` for the input and buffer slices,
+`hegel_render_shapes_test.go` for the renderer and screen, `layout/hegel_shapes_test.go` for the
+layout: `TestHegelPlusKeysMatchTheirKeystroke`, `TestHegelCellShiftsMoveWideCellsWhole`,
+`TestHegelResetShowsTheCursor`, ...) draws the bug's shape region with random contents, is judged
+by the same oracle and is the deterministic expected failure of the bug. `HEGEL_NO_KNOWN=1`, read
+once, switches the known shapes off: the narrow properties draw the neighbouring region, the wide
+ones leave the shapes out of their generators (`shaped`), count and skip a step or check a known
+shape would falsify (`known`; the emulator's cursor check while a move is queued for /27, the
+alt-screen `InsertAbove` step for /30 at 5%, the still-in-alt Reset for /34 at 1.5%, `+` and
+keypad keystroke checks at 2–3%, the rest under 1%) and skip a mismatch that still has a known
+shape, so the test passes and shows what the library gets right beside the recorded bugs. `UV_COLLECT=1` turns
 failures into a tally per property (`UV_STACK=1` adds stacks to panics). Pin /12 needs the
 `tmux`, `screen` and `xterm` terminfo entries (ncurses-base); it fails either way. Bold, faint,
 italic, blink and the foreground colour are not compared on blank cells: the renderer erases
@@ -161,6 +183,7 @@ runs of such blanks with EL and terminals keep only the background of erased cel
 | ultraviolet/32 | low | `TabStops` hard-codes an interval of 8: a larger interval panics in `NewTabStops`, a smaller one aliases columns |
 | ultraviolet/33 | low | `NewKeyboardEnhancements` decodes two of the five Kitty flags; `NewKeyboardEnhancements(f).Flags() != f` for 24 of 32 values |
 | ultraviolet/34 | medium | `Restore` after `Reset` re-enters the alt screen without redrawing the frame: Stop then Start comes back to a blank screen |
+| ultraviolet/35 | medium | `TerminalReader` panics on a CSI with 33 or more parameters: the scanner runs every read through x/ansi's `DecodeSequence`, which indexes past its 32 parameters (`Decode` on the same bytes returns, /10) |
 
 Fixed here relative to charmbracelet/x/input (held as examples): x-input/2 (event types on
 `CSI n;mod:ev ~`), x-input/3 (num lock text), x-input/4 (URxvt `$` rewrote the caller's
@@ -222,3 +245,12 @@ cellbuf/17 (multi-line scroll without SU), cellbuf/18 (IRM without the cells).
   `SetMouseMode(None)` reset all four.
 - Win32 input mode (`CSI vk;sc;uc;kd;cs;rc _`) and the Windows console path are not covered
   (no encoder written; open slice).
+
+## History
+
+- 2026-09-15: created at 6c9e17d with 34 bugs.
+- 2026-09-26: generators rewritten in combinator style; the known shapes are drawn by default and
+  thirty-five narrow properties, one per bug, are the expected failures beside the pins;
+  ultraviolet/35 recorded (found by the stream property once the scanner's CSIs drew more than 32
+  parameters, reproduced through `TerminalReader.StreamEvents`). The layout property against
+  ratatui gives Legacy a `Fill` so its surplus has one home (no skips left there).
