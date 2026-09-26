@@ -269,7 +269,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go. Rewritten and unsteered together (turn 551) go/hcl and go/ultraviolet. Narrow follow-ups (turn 552) go/gofumpt and go/sh; unsteered (turn 552) java/jts.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go. Rewritten and unsteered together (turn 551) go/hcl and go/ultraviolet. Narrow follow-ups (turn 552) go/gofumpt and go/sh; unsteered (turn 552) java/jts. Narrow follow-ups (turn 554) go/afero and go/tablewriter.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -1084,6 +1084,29 @@ failures, which a region that is all one bug has none of. The turn was cut short
 restart with the sh subagent mid-verification; its work was on disk and its transcript showed
 how far the runs had got, so the verification was taken over rather than the subagent
 relaunched.
+
+The forty-seventh batch (go/afero and go/tablewriter narrow follow-ups, the last two of the
+list) closed the narrow-property work for the Go targets. Its lesson is about what a
+`HEGEL_NO_KNOWN=1` run is for: the mode is not only the proof that the properties pass without
+the recorded shapes, it is a run of the wide properties over a region the default run never
+reaches at length, and a failure there is a candidate like any other. afero's helpers property
+failed once in about twenty 1000-case runs under the switch on a class decoration that split a
+multi-byte name, a malformed pattern; `afero.Glob` skips the up-front `Match(pattern, "")`
+check `filepath.Glob` does, so over an empty directory the malformed pattern returns `[], nil`
+(afero/40). The subagent reported it and left the wide property alone, which is right; the
+integrator then records it and folds it in: the glob decorations draw an unclosed class by
+default, the malformed-pattern shape is named in the failure and left out under the switch,
+and the narrow property adds the malformed element below a fresh empty directory (a `Sub`
+field of the step the wide generator never sets, since the pattern has to end in the bad
+element and list an empty directory). Two idioms from tablewriter: a wide record can carry a
+field only a narrow property draws (`columnMax`, modelled as the documented per-column
+maximum) without touching the wide generator, and a bug no wide property reaches (a setter
+overwritten by a later detection, an AutoFormat rewriting escapes, a table bound that is not
+enforced) gets a narrow property against the documented behaviour spelled out in the property,
+since there is no wide helper to share. Reviewing a large extraction, the lines the wide
+files truly lost are read by diffing the old and new file's line sets: an extraction leaves
+only `continue` turned `return` and setup rewritten as record construction, anything else is
+a change to look at.
 
 The lz4 subagent also observed that hegel-go's case sequence is reproducible per test binary,
 so a wide property with two basins (WriterFramesFollowTheSpec, lz4/2 or lz4/8) lands in one of
