@@ -11,7 +11,7 @@ ExtraRules, Extra.GroupParams, ClotheReturns and BalanceCalls), on generated Go 
 ## Build
 
 The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of six
-`hegel_zoo_*_test.go` files that drive the public API: `go test -count=1 -run TestHegel -v ./hegel`.
+`hegel_zoo_*_test.go` files and `hegel_shapes_test.go` that drive the public API: `go test -count=1 -run TestHegel -v ./hegel`.
 Nothing else is needed.
 
 ## Oracles
@@ -94,12 +94,17 @@ up, comments in empty types in parameter lists, multi-line declarations with a t
 case lists spanning lines with an expression over lines. The properties fail on them every run:
 `TestHegelConstValues` shrinks to two lone `iota` constants (gofumpt/1), `TestHegelGofmtStable`
 to a doc comment with an indented line that gofmt reflows (gofumpt/5, and gofumpt/3 in a quarter
-of its hits), `TestHegelIdempotent` to gofumpt/5 most often and to gofumpt/11, /14 or /4 in
-other runs (it meets a mismatch in about 14% of cases); `TestHegelSyntax` passes. So that the
-two formatting properties fail reliably at 100 cases, top-level declarations are documented
-60% of the time and a var statement's value continuation is drawn as an explicit kind (space,
-newline or comment): a distortion of the corpus confined to those two generators, to be replaced
-by one narrow property per bug (as go/kin-openapi and go/testify have) in a follow-up.
+of its hits), `TestHegelIdempotent` to gofumpt/5, /11, /8 or /14 depending on the run (a wide property over
+several bugs at comparable rates has no stable basin; it is mapped to gofumpt/5, the one seen most
+often over nine runs); `TestHegelSyntax` passes. Top-level declarations
+are documented 30% of the time and a var statement's value continues on the same line in 90% of
+cases, as in a real file; at these natural rates `TestHegelConstValues` and `TestHegelIdempotent`
+still fail at 100 cases in every run seen, while `TestHegelGofmtStable` passes some runs and is
+mapped as intermittent. Each recorded bug also has a narrow property in
+`hegel_shapes_test.go` that draws only its shape region with random contents and surroundings
+and applies the same check as the wide property that met it (`hzCheckConstValues`,
+`hzCheckIdempotent`, `hzCheckGofmtStable`); it fails on every run and shrinks to the bug's
+minimal shape, and under `HEGEL_NO_KNOWN=1` it is skipped.
 `HEGEL_NO_KNOWN=1`, read once, switches the `HZKnown` gates on: the renderer and the fixup pass
 then keep the shapes out of the file (they depend on the rendered text, comment placement and
 line spans, so the avoidance lives there rather than in the generators) and every property
@@ -130,3 +135,5 @@ comments are checked).
   are the expected failures beside the pins. Two latent model bugs fixed (a conversion to a type
   spelled with `func` rendered without parentheses; an avoidance hole for a block comment inside
   an empty struct in a parameter list).
+- 2026-09-26 (later): one narrow property per bug in `hegel_shapes_test.go`; the raised
+  doc-comment and var-continuation rates of the wide generators put back to natural ones.
