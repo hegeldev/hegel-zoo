@@ -7,21 +7,30 @@ formatter and phone number search, driven by Google's `PhoneNumberMetadata.xml`.
 54c0209 (2026-06-19, the GitHub mirror's head; the primary repository is on GitLab), MIT.
 
 The library is plain ESM run straight from `source/` with no build. Hegel and the oracle go under
-`.hegel/`. Tests: `hegel/hegel.test.mjs`, run with `node --test`. `ZOO_FULL=1` widens the
-generators to the shapes that hit known bugs and drops the gates around them; `ZOO_COLLECT=1`
-prints mismatch statistics.
+`.hegel/`. Tests: `hegel/hegel.test.mjs`, generators in `hegel/gen.mjs`, run with `node --test`.
+The generators are values built from Hegel's combinators - a phone number record (country, type,
+national number built from Google's example by drawn edits), a notation record rendered by a pure
+function, one record per as-you-type case - and they draw the shapes of the recorded bugs by
+default, so the properties that found the bugs fail on them and are listed in `target.toml`
+mapped to the bug they shrink to; one narrow property per bug (below) draws random contents over
+the bug's shape region and is the deterministic expected failure. `HEGEL_NO_KNOWN=1` (read once)
+draws beside the known shapes and skips the checks they falsify, and every property then passes.
+`ZOO_FULL=1` compares the as-you-type text with Google's too (a documented difference, see
+below); `ZOO_COLLECT=1` prints mismatch statistics.
 
 ## Oracle and metadata
 
 The oracle is google-libphonenumber 3.2.46, the Closure-compiled port of Google's own library,
-built with libphonenumber 9.0.28. Both libraries are only as good as their metadata, and the
+built with libphonenumber 9.0.35 (its 3.2.45 carried 9.0.28). Both libraries are only as good as their metadata, and the
 library's `metadata.max.json` is generated (at publish time, by the separate
 libphonenumber-metadata-generator package) from whatever Google XML the author last pulled, so the
-setup downloads the `PhoneNumberMetadata.xml` of the 9.0.28 release and runs the generator on it
+setup downloads the `PhoneNumberMetadata.xml` of the 9.0.35 release and runs the generator on it
 (`hegel/generate-metadata.mjs`): every function is called through the `core` API with that
 metadata, and the two sides agree on the data. A probe confirmed it: Google's example number of
 every region and type (1377 numbers) parses as valid with the same country and type, with the one
-exception recorded as bug 1.
+exception recorded as bug 1. (Until 2026-09-26 the setup took the 9.0.28 XML while the oracle
+carried 9.0.35: 47 territories differed - AC's mobile range for one - at about one drawn number in
+six hundred.)
 
 Known, deliberate differences that the tests normalise or skip rather than record:
 
@@ -56,7 +65,22 @@ Known, deliberate differences that the tests normalise or skip rather than recor
 | `TestHegelPhoneNumberConstructorAgreesWithParse` | `new PhoneNumber(e164)` and the two-argument form equal the parsed number in number, national number, validity, type and formatting; `isEqual` and `setExt`; `getPossibleCountries` lists only countries of the calling code |
 | `TestHegelPinCountriesMatchGoogle` | `getCountries()` is Google's set of supported regions |
 
-Pins (`TestHegelPin*`) reproduce the bugs in `bugs.toml` and are listed as expected failures.
+One narrow property per bug, each over the bug's shape region with random contents:
+`TestHegelFixedLineNumbersOfACountryWithoutMobilesAreFixedLine` (1), `TestHegelStrictParseReadsTelUris`
+(2), `TestHegelStrictParseIgnoresSurroundingWhitespace` (3),
+`TestHegelAsYouTypeFormatsTypedCharactersLikeTheWholeText` (4),
+`TestHegelAsYouTypeNumberTypedInANanpaTerritoryIsTheParsedNumber` (5),
+`TestHegelPhoneNumberBuiltFromE164DerivesItsCountry` (6),
+`TestHegelAsYouTypeKeepsANationalPrefixThatParseKeeps` (7),
+`TestHegelAsYouTypeCharsOfAnIddDialledNumberAreTheTypedOnes` (8),
+`TestHegelExtensionsFormatLikeTheMainCountryOfTheCallingCode` (9),
+`TestHegelAsYouTypeNumberAfterAnIddPrefixWithoutACallingCodeIsTheParsedNumber` (10),
+`TestHegelAsYouTypeKeepsTheDefaultCountrysCallingCodeWhenParseDoes` (11),
+`TestHegelAsYouTypeStripsANationalPrefixAfterTheCallingCodeLikeParse` (12). Of the wide properties,
+the parse and the round trip shrink to bug 2, the constructor to bug 6, the as-you-type property
+to bug 8 (its shapes are a few percent of cases: intermittent) and the metadata accessors to bug 1
+(Tristan da Cunha, one country in two hundred: intermittent). Pins (`TestHegelPin*`) are the
+regression examples of the bugs in `bugs.toml`, beside the narrow properties.
 
 ## Not tested
 
@@ -68,3 +92,8 @@ Pins (`TestHegelPin*`) reproduce the bugs in `bugs.toml` and are listed as expec
 ## History
 
 - 2026-09-20: created (turn 318); 9 bugs recorded.
+- 2026-09-26: generators rewritten in combinator style (`hegel/gen.mjs`); the known shapes are drawn
+  by default and the wide properties are the expected failures; one narrow property per bug; the
+  freed as-you-type property, typing IDD-dialled, own-calling-code and prefixed international
+  numbers digit by digit, found bugs 10-12; the metadata moved to the 9.0.35 release the oracle
+  carries.
