@@ -54,13 +54,29 @@ expressions with one character changed, deleted or inserted, and random token so
   tree, macro calls and offsets (reject messages and positions are counted, not judged).
 - `TestHegelMacros`: the five macros over lists and maps against the specification's folds,
   with the same variants as `TestHegelEval`; map-derived results compared as multisets.
+- Eleven narrow properties in `hegel_zoo_shapes_test.go`, one per recorded bug, each a
+  generator over the bug's shape region with random contents judged by the same oracle
+  (`TestHegelPrattLexesLiteralBeforeIn`, `TestHegelMapLiteralRepeatedKeyIsAnError`,
+  `TestHegelFoldingKeepsLiteralPredicateMacros`, ...): the deterministic expected failure of
+  each bug.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
+
+A case is data: the variables' values, a typed expression tree drawn from a grammar built once
+per depth bound (`weighted` choices with the plainest alternative first, a forward-declared
+table of expression generators, a leaf at the bound), and a tape of spelling choices
+(whitespace, parentheses, literal spellings) recycled modulo its length, the empty tape being
+the plainest text; a pure model evaluates the tree and a pure renderer writes it. Keys,
+needles and substrings are positions resolved modulo the live size; macro cases are templates
+over the loop variable.
 
 ## Bugs
 
-Nine, recorded in `bugs.toml`. The Pratt parser rejects a numeric literal glued to `in`
+Eleven, recorded in `bugs.toml`. The Pratt parser rejects a numeric literal glued to `in`
 (cel-go/1) and records different offsets for negative literals, leading-dot identifiers and
-message literals (2). The checker binds the type variable of an empty literal's element to the
+message literals (2); the ANTLR parser ends a string or bytes literal's range after its byte
+length, so a literal with a non-ASCII character is recorded too long (10); the Pratt parser
+rejects an empty list, map or message literal written with a lone comma, `[,]`, which the
+grammar and the ANTLR parser accept (11). The checker binds the type variable of an empty literal's element to the
 first overload tried, so `-({}['a']) + 1` fails to check (3). Errors dropped: `OptOptimize`
 and constant folding make `e in []` false, folding makes `x in [x, e]` true (4). A map literal
 with a repeated key evaluates to a map instead of an error (5). `OptOptimize` fails Program()
@@ -69,17 +85,22 @@ pruned conditional whose ids collide with later nodes (7), unparses NaN and the 
 as `NaN.0`, `+Inf.0`, `-Inf.0` (8), and gives a stray value for a macro whose literal
 predicate leaves the accumulator unchanged (9).
 
-## Modelled as recorded
+## Known shapes
 
-Every bug has an `HZKnown` switch. While a switch is on the generator keeps away from the
-shape or the checks skip it: a space before `in` after a numeric literal; offsets of
-literals, identifiers and structs not compared; indexes and macro ranges regenerated when
-the aggregate is an empty literal; the rewrite variants skipped when an erroring expression
-contains `in`; repeated map keys not generated; Program() errors under `OptOptimize`
-tolerated when the plain result is not an error; folding errors mentioning "already exists
-for expression" skipped; folded texts containing `NaN.0` or `Inf.0` not recompiled; literal
-`false` predicates for filter/map/exists and `true` for all replaced. The collector counts
-the avoidances; `ZOO_KNOWN_OFF=name,name` turns switches off and the properties then fail.
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): numeric literals
+glued to `in`, negative literals, elements of empty literals as operands, `in` over an erroring
+operand, repeated map keys, erroring constant unaries in untaken branches, pruned conditional
+branches under folding, non-finite folded doubles, literal predicates, non-ASCII text literals
+and lone commas in the parser comparison. A mismatch names the bug whose shape it has (the
+`Known` switches keep the shape tests) and the property fails: the three wide properties in
+most runs (their shapes are a few percent of cases and hegel's size ramp reaches repeated-key
+maps rarely at 100 cases, so they are intermittent; `TestHegelEval` lands on cel-go/5, /8 or
+/3, `TestHegelMacros` on /5, `TestHegelParsers` on /2 or /1), and each narrow property on its
+own bug. `HEGEL_NO_KNOWN=1`, read once, switches the known shapes off: the generators draw the
+neighbouring regions instead (a space before `in`, positive literals, one-entry literals,
+distinct keys, ASCII text, no lone comma), a mismatch with a known shape is skipped or, for one
+check among several, tolerated and counted (under one percent of cases), and every property
+passes.
 
 ## Not judged
 
@@ -102,3 +123,8 @@ compiler, the interpretable decorators and `Program.ContextEval`.
 ## History
 
 - 2026-09-22: new target, three properties, 9 bugs.
+- 2026-09-26: generators rewritten in combinator style (a case is data: tree, tape, values);
+  the known shapes are drawn by default and eleven narrow properties, one per bug, are the
+  expected failures beside the pins. Two more parser discrepancies the freed comparison met,
+  recorded as cel-go/10 (the ANTLR parser's literal ranges end in bytes; it had been tolerated
+  as cel-go/2) and cel-go/11 (the Pratt parser rejects a lone comma).
