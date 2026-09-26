@@ -38,6 +38,10 @@ document, `processingMode` json-ld-1.1, the same base IRI and no document loader
 - `TestHegelRDFRoundTrip`: `Normalize(FromRDF(ToRDF(doc)))` is `Normalize(doc)`; pyld's
   `from_rdf` of json-gold's N-Quads votes when it is not.
 
+**`hegel/hegel_shapes_test.go`**: one narrow property per recorded bug (thirteen; bug 10 is
+a documentation default with nothing to draw), each a generator over that bug's shape region
+with random contents, checked by the same helper as the wide property that meets the bug.
+
 **`hegel/hegel_pins_test.go`**: one deterministic reproducer per recorded bug.
 
 ## Oracles and normalisations
@@ -91,8 +95,16 @@ regression examples. `HEGEL_NO_KNOWN=1`, read once, switches the known shapes of
 generators (`docOpts`/`nqOpts` per property) and every property then passes at 1000 cases;
 the shapes that live in the output of ordinary inputs (bugs 2, 3, 4, 11 and 13: `{}`, an
 empty `@list`, a percent-encoded IRI) are recognised in `hegel/known.go` by comparing the two
-outputs up to the defect. Narrow one-per-bug properties in the style of the other rewritten
-targets are still to come.
+outputs up to the defect. Every recorded bug except 10 also has a narrow property in
+`hegel_shapes_test.go` that draws only its shape region with random contents (a relative IRI
+diverging below a slash-terminated `@base`, a non-ASCII word in a relative reference, nodes
+with only `@id` under a non-empty context, a term set to null, native integers going back to
+RDF, an `"@..."@lang` literal, a keyword as a `@vocab`-typed value, an `rdf:langString`
+without a language, a named graph of bare nodes, an invalid item at a random position in a
+`@set`/`@list`, an empty `@list` under a coerced term, a 20-30 digit `xsd:integer` or a
+double beyond float64) and checks it with the same helper as the wide property; these fail
+deterministically by default and are skipped under `HEGEL_NO_KNOWN=1`, where the shape
+region is the bug itself.
 
 ## Not tested
 
@@ -114,3 +126,8 @@ contexts and document loaders, HTML extraction, `@json` literals, `@direction`/`
   value map emptied by the stripping. The string-under-`xsd:double` check now descends into
   `@list`/`@set`. Bug 8 has a second door: the value `"id"` under a `@vocab`-typed term reaches
   `@id` through the `id` alias.
+- 2026-09-26: narrow one-per-bug properties added (`hegel/hegel_shapes_test.go`); the wide
+  checks became package helpers (`checkExpand`, `checkCompact`, `checkFlatten`, `checkToRDF`,
+  `checkFromRDF`, `checkNQuads`, `checkRDFRoundTrip`) so both kinds of property share them.
+  The empty-list recogniser for bug 13 now sees through pyld's `@none` index entry (an empty
+  `@list` under an `@index` container with a type or language coercion is bug 13's shape).
