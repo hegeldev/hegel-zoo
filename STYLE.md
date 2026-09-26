@@ -269,7 +269,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go. Rewritten and unsteered together (turn 551) go/hcl and go/ultraviolet.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go. Rewritten and unsteered together (turn 551) go/hcl and go/ultraviolet. Narrow follow-ups (turn 552) go/gofumpt and go/sh; unsteered (turn 552) java/jts.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -1056,6 +1056,34 @@ whether the output is in Format's form, as the edits property does. Smaller poin
 event's shape is per path (a 33-parameter CSI is ultraviolet/10 through `Decode` and /35
 through the scanner), so the shape helper takes the path; a whole-read panic is named before the
 per-event shapes, since it happens first.
+
+The forty-sixth batch (go/gofumpt and go/sh narrow follow-ups, java/jts unsteered) added four
+lessons. A wide property mapped intermittent to one bug can absorb a second, unrecorded shape
+in silence: jts's predicatesAgree was mapped to jts/4 (RelateOp counting a line's self-crossing
+on a polygon edge as a line) and a 1000-case run then failed it on a line collinear with a
+segment of a self-crossing line, which the mapping would have passed as /4; the failure text of
+every long run is read, not only its verdict, and the second shape became jts/5 with its own
+recogniser, narrow property and pin. A rate a subagent raises so the wide property meets a
+shape more often (jts's strange ordinates 10% to 25%, gofumpt's doc comments to 60%) is put
+back: the narrow property carries the deterministic failure, and the wide property at its
+natural rate is intermittent when it passes some runs (gofumpt's GofmtStable passed one run in
+four). A Java candidate is reproduced the way a Go one is, standalone against the installed
+artifact: a jshell script on the jts-core jar in `~/.m2`, ending in `/exit`. And a hegel-java
+narrow property avoids a generator's inexact region by redrawing rather than assuming: jts's
+midpoint construction is exact on the integer and eighths grids but not on thousandths, so the
+generator is redrawn while the grid is thousandths, and the crossing lines take their
+directions from a fixed list of pairwise non-parallel vectors instead of filtering random ones.
+On the sh side, the narrow properties are built from the grammar's pieces, exposed as fields of
+the grammar record (lines, and-or lists, simple commands, redirects, heredocs, words) so a
+property composes the bug's construct from the same generators the wide grammar uses; a
+`oneLine` variant of the grammar leaves out the quoted texts holding a newline and flattens
+substitutions to one and-or list, since the line-shaped bugs never need them and they only cost
+the shrinker; and the narrow properties pass `hegel.WithReportMultipleFailures(false)`, because
+hegel-go otherwise keeps running a failing property for a fixed time looking for distinct
+failures, which a region that is all one bug has none of. The turn was cut short by a service
+restart with the sh subagent mid-verification; its work was on disk and its transcript showed
+how far the runs had got, so the verification was taken over rather than the subagent
+relaunched.
 
 The lz4 subagent also observed that hegel-go's case sequence is reproducible per test binary,
 so a wide property with two basins (WriterFramesFollowTheSpec, lz4/2 or lz4/8) lands in one of
