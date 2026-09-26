@@ -146,7 +146,7 @@ after its separator and the bottom border with the last line's merge states.
 
 ## Bugs
 
-Thirty-nine, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
+Forty, in `bugs.toml`. Tab width: a width set before the first `Size()` is overwritten by the
 detection (1, medium); `Width`'s cache is not purged when the tab width changes (2, medium).
 Widths: emoji sequences (VS16, ZWJ, flags, modifiers) are measured rune by rune (3).
 `Truncate`: an ESC inside a sequence restarts the scan, so an `ESC \`-terminated OSC (a
@@ -188,7 +188,17 @@ first column's width, so the header line is narrower than the borders (36, mediu
 footer's horizontal merges are not applied though `Start` promises them (37); an empty row
 appended first suppresses the header separator (38); the `Widths.Global` shrink spreads its
 rounding remainder in map order, so the same table lays out differently from run to run (39,
-medium).
+medium). A streamed `Append` with a horizontal row merge blanks the merged cells in the caller's slice (40, medium).
+
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11): each
+property finds several bugs, fails on the first shape it meets with the shape named in the
+failure message, and is listed in `[expected_failures]` mapped to the basin the shrinker lands
+in most often (`Width` on 3, `Truncate` on 5, `Wrap` on 6 (intermittent at the default case count), `Fn` on 8, `Markdown` and `HTML` on
+11, `Blueprint` and `Constraints` on 18, `Merge` on 13, `Stream` on 36, `Input` on 26), the pins
+beside them as the regression examples. `HEGEL_NO_KNOWN=1`, read once into the `Known`
+switches, turns the shapes off in the generators (a tab width of 0, a visible column, a value
+the input accepts; the all-hidden and random-remainder tables are filtered at a few percent)
+and every property passes at 3000 cases.
 
 ## Modelled as recorded, not counted
 
@@ -250,5 +260,18 @@ medium).
   `x\n\ny` do not, unlike batch mode); blank visual lines are kept (`TrimLine` is batch
   only); the footer separator's junctions see no footer merge states; a row refused under
   `StrictColumns` leaves the stream as it was; cases where the global shrink leaves a
-  rounding remainder over several columns are skipped (bug 39). `NewCSV` and the Colorized,
+  rounding remainder over several columns are drawn (bug 39) and left out only under
+  `HEGEL_NO_KNOWN=1`. `NewCSV` and the Colorized,
   Ocean and SVG renderers are not yet exercised.
+
+## History
+
+- 2026-09-21: written against 5f0c87a871a3084b2632f3a7775e45a75ea0422d (v1.1.5, 2026-09-15) with
+  hegel v0.6.33; 39 bugs.
+- 2026-09-26: generators rewritten in combinator style (case records per property, weighted
+  choices, `chance`/`mostly`/`maybe`, embedded fields inserted modulo the live size) and the
+  known-bug steering turned off by default; four latent model bugs fixed (blank cells still
+  count as columns one wide, a row or header wrapping to no line does not move the stream's
+  last position, the stream wraps after the horizontal merge); tablewriter/40 recorded (a
+  streamed merge writes into the caller's slice), found by the stream property comparing its
+  inputs before and after, reproduced standalone.
