@@ -25,6 +25,23 @@
 - `prop_compile_never_panics`: Template compilation / rendering must never panic on arbitrary Handlebars-shaped token soup: `render_template` returns `Ok` or `Err`, never aborts. Oracle-independent (a panic is self-evidently a bug).
 - `prop_render_deterministic`: Rendering is deterministic: the same template + data + registry render to the same result (both the success value and the ok/err status), every time.
 
+**`tests/hegel_shapes.rs`**
+- `deeply_nested_templates_abort_the_process`: templates nested 400 to 2000 levels deep (`{{#if}}`
+  blocks, `(not ...)` subexpressions; unclosed `{{#if}}` opens from 1300) with random names and
+  filler, rendered in a child process: the process must not die of a signal - handlebars/1's
+  region, where it overflows the stack; under `HEGEL_NO_KNOWN=1` depths below the measured
+  thresholds (200; 1000 for the opens).
+
+The generators are values built from hegeltest's combinators, one `tc.draw` per property: JSON
+values as a `one_of!` with `null` first, HTML strings as vectors of drawn characters (the specials
+first), token soup as a vector of fragments, and `prop_compile_never_panics` draws either soup
+(rendered in process, a panic failing it) or a `Nesting` recipe (shape, depth 1-2000, name, filler)
+rendered by a pure function and compiled and rendered in a child process (`tests/util/nesting.rs`:
+the test binary re-executed with `--exact`, the case in an environment variable, `ulimit -v`, a
+deadline, verdicts cached), so the recorded abort is drawn by default and the property is the
+expected failure mapped to handlebars/1 (intermittent: the deep cases past the threshold are about
+3% of cases). The three `#[ignore]`d reproducers stay as the pins.
+
 ## Oracles
 
 ## Not tested
@@ -35,3 +52,6 @@
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/handlebars.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
 - 2026-09-13: base bumped 2802ada08ad8 → 567b48015464 (2026-09-12, "Add the Auric SPA MVC framework to the related projects section (#787)"; 6.4.4); 0 bug(s) still reproduce; 1 ignored reproducer(s) not run. 241 tests pass.
+- 2026-09-26: generators rewritten in combinator style; handlebars/1's shape is drawn by default
+  and rendered in a child process, with a narrow property in `tests/hegel_shapes.rs`; the abort
+  thresholds re-measured (~300 for blocks and subexpressions, ~1150 for unclosed opens).
