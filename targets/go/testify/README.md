@@ -19,7 +19,8 @@ own patch and files nothing upstream.
 switches, a recording `TestingT` and the `check`/`expect` helpers), `hegel_equal_test.go`
 (equality, `EqualValues`, `EqualExportedValues`), `hegel_compare_test.go` (ordering, time
 windows, deltas), `hegel_collections_test.go`, `hegel_contract_test.go` (the shared contract
-and `JSONEq`/`YAMLEq`) and `hegel_pins_test.go` (one plain test per bug), and requires
+and `JSONEq`/`YAMLEq`), `hegel_shapes_test.go` (one narrow property per bug) and
+`hegel_pins_test.go` (one plain test per bug), and requires
 `hegel.dev/go/hegel v0.6.33` in go.mod, which raises the `go` directive from 1.17 to 1.26.
 `-vet=off` because with that directive `go test`'s vet pass rejects two non-constant format
 strings in upstream's own `assertion_compare_test.go`.
@@ -65,15 +66,26 @@ strings in upstream's own `assertion_compare_test.go`.
 | AssertionsKeepTheContract | some 50 assertions on generated arguments with a random message: result vs report, one report, no panic, the message verbatim once |
 | JSONEqFollowsTheModel | `JSONEq` (both orders) and `YAMLEq` on two serialisations of one document, a mutated document, and invalid text on either side |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (no negative signed against unsigned, integral floats below 2^24 against integers, no
-int/string pairs, equal slice/array lengths, strings searched for strings only, no untyped nil
-to the collection and sign assertions, lists only for `ElementsMatch`, comparable panic values,
-finite deltas, equal `InDeltaSlice` lengths, one type per comparison, no nil interfaces in the
-exported-fields structures, integers below 2^53 in documents, `NotSame` on pointers only,
-`NotElementsMatch` left out of the message check, numbers only for `Positive`, no zero-valued array against a list of another length); the pins assert
-the correct behaviour and fail while the bug exists. `ZOO_COLLECT=1` records mismatches instead
-of failing and prints the class counts.
+The generators are combinator values (`hegel_test.go` holds the idioms: `weighted`, `chance`,
+`maybe`, `pairs`, `many`, `tape`, `shuffled`, `shaped`): each property draws one case record
+(the two values and the model's verdict, the document and its serialisations, the assertion
+and its arguments) rendered by pure methods.
+
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): negative signed
+against unsigned, fractional floats against integers, int/string pairs, slices against arrays of
+every length, nil to the collection assertions, NaN deltas, big integers in documents, `NotSame`
+on non-pointers, and so on. A mismatch names the bug whose shape it has (the `Known` switches
+keep the shape tests) and the property fails: the six other wide properties fail every run on
+the shape they reach most often (`EqualValues` on 65 against "A", `Positive("a")`, ...),
+`CollectionsFollowTheModel`, `MapAndStringCollectionsFollowTheModel` and
+`AssertionsKeepTheContract` in most runs (their shapes are a few percent of cases), and the nineteen narrow properties of `hegel_shapes_test.go`
+(`TestHegelEqualValuesKeepsSignedAndUnsignedApart`, `TestHegelInDeltaRejectsANaNDelta`, ...) each
+on its own bug: they are the deterministic expected failures beside the pins. `HEGEL_NO_KNOWN=1`,
+read once, switches the known shapes off: the generators draw the neighbouring regions instead
+(the narrow properties then check the library where it is right, next to the bug), a
+mismatching case with a known shape is skipped (measured at under one percent of cases), and
+the test passes. `ZOO_COLLECT=1` records mismatches instead of failing and prints the class
+counts.
 
 ## Accepted differences
 
@@ -96,9 +108,11 @@ of failing and prints the class counts.
 
 ## Bugs found
 
-Eighteen, in bugs.toml: `EqualValues` equates a negative integer with the unsigned one it
+Nineteen, in bugs.toml: `EqualValues` equates a negative integer with the unsigned one it
 wraps to, truncates floats to integers (1 equals 1.5), is not symmetric on rounding, converts
-65 to "A", and panics on a slice against a longer array; `Contains` on a string looks for
+65 to "A", panics on a slice against a longer array and passes a slice against a shorter array
+holding its first elements (`[]int{1, 2, 3}` against `[2]int{1, 2}`, bug 19, found once every
+slice/array length was drawn); `Contains` on a string looks for
 "<int Value>"; `Subset`, `ElementsMatch`, `IsIncreasing`, `Positive` panic on nil;
 `ElementsMatch` passes two empty non-lists; `PanicsWithValue` panics on an uncomparable value;
 `InDelta` accepts a NaN delta; `InDeltaSlice` ignores the lengths; `Greater` panics on two
@@ -110,3 +124,7 @@ returns true after failing; `NotElementsMatch` mangles the message and reports t
 ## History
 
 - 2026-09-21 (turn 335): target added at 435c07b (v1.12.1+12) with ten properties, 18 pins.
+- 2026-09-26: generators rewritten in combinator style; the known shapes are drawn by default and
+  nineteen narrow properties, one per bug, are the expected failures beside the pins; testify/19
+  found by the freed slice/array pairs. Two latent model bugs fixed (2^63-1 and 2^64-1 rounded to
+  powers of two by a 53-bit `big.Float`; the big-integer test off by one).
