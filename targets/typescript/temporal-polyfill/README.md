@@ -58,10 +58,26 @@ are the reference's are listed below as *oracle limits* and skipped.
   islamic-umalqura, japanese, persian, buddhist, indian, coptic, ethiopic and roc, the date
   fields of `withCalendar`, the round trip through `{year, month, day}`, `monthCode` and era
   bags, `toPlainYearMonth`/`toPlainMonthDay`, `add` with every date unit and `overflow`, `until`
-  and `with` (including out-of-range days, months and leap month codes).
+  and `with` (including out-of-range days, months and leap month codes). Found bug 9 (at 3000
+  cases: the shape is about one case in eight thousand, so the property is intermittent).
 
-Each known bug has a `Known` switch: the properties skip its shape while the pin below asserts
-the specification's behaviour and fails until it is fixed.
+The generators draw the shapes of the recorded bugs by default (`gen.mjs` builds every case as a
+record from `@hegeldev/hegel`'s combinators and renders it with pure functions), so the wide
+properties fail on them and are listed in `target.toml` mapped to the bug they shrink to; the
+parsing property reaches five of the nine and is mapped to the one it shrinks to, and a wide
+property whose shape is under two percent of its cases (`Instant`, `Duration`, `Calendars`) is
+marked intermittent. Beside them, one narrow property per bug (`TestHegelPreEpochInstantsRoundTowardThePast`,
+`TestHegelPlainTimeRejectsInvalidDateParts`, `TestHegelPlainTimeIgnoresCalendarAnnotations`,
+`TestHegelYearMonthArithmeticRejectsUnitsBelowMonths`, `TestHegelBracketedOffsetsWithSecondsAreRejected`,
+`TestHegelOffsetsBeyondTheGrammarAreRejected`, `TestHegelDurationsThatRoundToZeroPrintWithoutASign`,
+`TestHegelTimeZoneAnnotationsComeBeforeOtherAnnotations`, `TestHegelYearsUntilAnEarlierShevatFromAdarIAreWhole`)
+draws random contents over the bug's
+shape region and is the deterministic expected failure; where the reference is wrong too (bug 4's
+sub-month units, mixed-separator offsets) the polyfill is judged by the specification, as the pins
+are. `HEGEL_NO_KNOWN=1` (read once) swaps each known shape for its neighbouring region, and every
+property must then pass; the recorded shapes and the oracle limits met in a run are counted
+(`ZOO_COLLECT`). The pins beside the narrow properties are the regression examples and assert the
+specification's behaviour until the bug is fixed.
 
 ## Bugs
 
@@ -75,6 +91,7 @@ the specification's behaviour and fails until it is fixed.
 | temporal-polyfill/6 | A UTC offset with an hour of 24 or more, or a minute of 60, is accepted by the Plain types | contract | low |
 | temporal-polyfill/7 | A negative duration that rounds to zero in toString keeps its minus sign: -PT0.000S | wrong-result | low |
 | temporal-polyfill/8 | A time zone annotation placed after another annotation ([u-ca=iso8601][UTC]) is accepted by every parser | contract | low |
+| temporal-polyfill/9 | PlainDate.until/since with largestUnit year from Adar I of a Hebrew leap year to a later day of Shevat of an earlier common year counts one year fewer and twelve months | wrong-result | low |
 
 ## Oracle limits (the reference's divergences, skipped and not counted)
 
@@ -110,3 +127,8 @@ arithmetic with `relativeTo` (`add`/`subtract` lost `relativeTo` in the specific
 ## History
 
 - 2026-09-17: created against b28e5a85 (1.0.5); 6 properties, 8 bugs.
+- 2026-09-26: generators rewritten in combinator style (`gen.mjs`); the known shapes are drawn by
+  default and the wide properties are the expected failures; one narrow property per bug added;
+  `HEGEL_NO_KNOWN=1` switches the shapes off; the notes of bugs 1, 3, 5 and 6 corrected after
+  re-checking their examples. The 3000-case run of the rewritten calendar property found bug 9
+  (Hebrew `until` from Adar I).
