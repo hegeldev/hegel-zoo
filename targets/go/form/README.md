@@ -66,7 +66,17 @@ one plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in go.mod (the
 ## Properties
 
 `TestHegelRoundTrip`, `TestHegelEncodeModel`, `TestHegelScalars`, `TestHegelIndexed`,
-`TestHegelDecodeModel`, `TestHegelCustomTypes`; the pins `TestHegelPin*`.
+`TestHegelDecodeModel`, `TestHegelCustomTypes`; seven narrow properties in
+`hegel_shapes_test.go`, one per recorded bug, each a generator over the bug's shape region with
+random contents judged by the same oracle (`TestHegelStrayBracketKeysAreIgnored`,
+`TestHegelNilInterfaceElementsKeepTheirPositions`, `TestHegelBracketMapKeysRoundTrip`, ...);
+the pins `TestHegelPin*`.
+
+The generators are combinator values (`hegel_test.go` holds the idioms: `absentOr` with nil
+first, `many`, `pairs`, `weighted`, `chance`, `maybe`, `shaped`): values of the type universe
+come from a memoised, reflection-driven `valuesOf(type, depth)`, the options are a record, the
+indexed keys a choice of entry generators per key form, and edits are drawn lists applied at
+positions taken modulo the live size. The universe gained `Anys`, a struct of interface slices.
 
 ## Bugs
 
@@ -77,16 +87,21 @@ written unescaped so that they cannot be read back, and two panics on custom typ
 used for map keys (an encoder function returning no values, a decoder function returning
 nil).
 
-## Modelled as recorded
+## Known shapes
 
-- The round trip skips values with a map key containing `[` or `]` (bug 5) and expects nil
-  elements of a slice of interfaces to be dropped (bug 3); the encoder model writes such
-  slices as the encoder does (bug 3).
-- The scalar model zeroes a time field on a parse error (bug 4) and does not pre-fill the
-  `interface{}` field (bug 2).
-- The key model skips cases with a key the decoder panics on (bug 1); the decoder model
-  clears the pre-filled interface fields (bug 2) and skips map keys with brackets (bug 5).
-- Bugs 6 and 7 have pins only: the custom functions of the property always return a value.
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): keys the decoder
+panics on, pre-filled `interface{}` fields, nil elements before values in a slice of
+interfaces, unparsable times, map keys with brackets, custom functions returning no values or
+nil for a map key. The models say what should happen (the stray key ignored, the held value
+replaced, the positions kept, the field left alone, the key read back, the entry skipped, an
+error), a mismatch names the bug whose shape it has (the `Known` switches keep the shape
+tests) and the property fails: `TestHegelScalars` (bug 4, bug 2 in a fifth of its hits),
+`TestHegelEncodeModel` (3), `TestHegelDecodeModel`, `TestHegelRoundTrip` and
+`TestHegelCustomTypes` (5, or 2, 3 and 4 in some runs) every run, `TestHegelIndexed` (1) in
+most runs, its panic keys being a fifth of the junk keys of 40% of cases; and each narrow
+property on its own bug. `HEGEL_NO_KNOWN=1`, read once, switches the known shapes off: the
+generators draw the neighbouring regions instead (a junk key for a panic key, a value after a
+nil, a value-returning custom function), nothing is skipped, and every property passes.
 
 ## Not tested
 
@@ -105,3 +120,7 @@ repeated values receives the values from its element to the end, not just its ow
 - 2026-09-21: new target at v4.5.0; four properties, five bugs.
 - 2026-09-21: the decoder model on pre-filled destinations, custom type functions and
   `RegisterTagNameFunc`; two more bugs (6, 7).
+- 2026-09-26: generators rewritten in combinator style; the known shapes are drawn by default
+  and seven narrow properties, one per bug, are the expected failures beside the pins. A latent
+  model bug fixed (the decode model descended into a held interface and set its unaddressable
+  element; it now replaces the held value).
