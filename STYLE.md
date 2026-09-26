@@ -269,7 +269,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold (json-gold without narrow properties yet).
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -944,8 +944,28 @@ json-gold shows the other half of rule 11: generator factories over an options s
 off under HEGEL_NO_KNOWN, which is fine - the rule forbids helpers over the test case, not
 over options; and bugs that show only in the output of ordinary inputs (`{}` compacting
 differently, an empty `@list`) cannot be switched off in the generator and stay as
-count-and-agree recognisers under the switch. json-gold's narrow one-per-bug properties are
-still to be written.
+count-and-agree recognisers under the switch. json-gold's narrow one-per-bug properties
+followed in the forty-first batch (turn 547): thirteen of them, the wide checks extracted into
+package helpers (`checkExpand`, `checkCompact`, ...) so that both kinds of property share one
+judge, and the documentation-default bug left to its pin, since a property over it would test
+nothing.
+
+The forty-first batch (turn 547: json-iterator and go-json, rewritten and unsteered) shows
+the second way a narrow property can behave under `HEGEL_NO_KNOWN=1`: instead of skipping,
+it draws the neighbouring region the bug does not touch (spaces for the odd indent, a member
+for the empty map, a two-digit exponent, a letter for the stray closer) through the same
+`shaped(known, past)` swap the wide generators use, and passes. Both ways are fine; skipping
+is right when the whole domain is the bug (a `null` term, a lang-string without a language),
+the neighbouring region when the property's check is worth running on the bug's border. Both
+targets found more once the shapes were free: go-json's three-digit exponents (drawn for the
+Valid bug) met a new bug in the Number decoder (go-json/26), and json-iterator's bare
+top-level numbers showed that no unsigned integer passes `Valid` either, correcting a bug's
+notes. Two cautions from the batch: a Go 1.27.1 `encoding/json.Indent` defect (a hang with a
+non-blank prefix and trailing whitespace) posed as a test hang until it was reproduced
+standalone, so an oracle that is a standard library is still an oracle to doubt; and a new
+shape a subagent gates behind a `candidate/` name is steering until the bug is recorded, so
+the gate is folded into the `Known` struct (off by default) and the shape given its own
+narrow property in the same commit as the bugs.toml entry.
 The lz4 subagent also observed that hegel-go's case sequence is reproducible per test binary,
 so a wide property with two basins (WriterFramesFollowTheSpec, lz4/2 or lz4/8) lands in one of
 them for as long as the binary is unchanged and moves when it changes: "run it six times" proves
