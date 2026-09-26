@@ -36,14 +36,26 @@ range with a bias to the 1000ⁿ/1024ⁿ boundaries, to rounding ties and near-c
   the yotta entry and the mantissa is the f64 quotient.
 - `float_inputs_render_without_panicking_and_group_alike`: finite `f64` inputs (fractions of a
   byte, ±1e300) — unit choice and mantissa against the f64 quotient.
-- Pinned (each its own domain, see Bugs): `grouped_renderings_are_the_plain_rendering_with_separators`
-  (humansize/1), `grouped_negative_renderings_keep_their_decimals` (humansize/2),
+- One narrow property per bug, over the bug's shape region with random contents:
+  `grouped_renderings_are_the_plain_rendering_with_separators` (humansize/1),
+  `grouped_negative_renderings_keep_their_decimals` (humansize/2),
   `grouped_integer_parts_beyond_2_53_are_the_f64_digits` (humansize/3),
   `non_ascii_separators_are_inserted_as_characters` (humansize/4),
   `non_finite_inputs_render_their_float_spelling` (humansize/5),
   `pluralisation_follows_the_printed_value` (humansize/6),
-  `long_binary_bit_table_is_capitalised` (humansize/7). The thousands-separator path's oracle is
-  the plain rendering with separators inserted into its integer part.
+  `long_binary_bit_table_is_capitalised` (humansize/7),
+  `grouped_huge_floats_render_without_panicking` (humansize/8). The thousands-separator path's
+  oracle is the plain rendering with separators inserted into its integer part.
+
+The generators are values built from hegeltest's combinators: an option set is a record drawn
+field by field (`Fields`, ten generators mapped into `Opts`) or one of the three presets, a
+magnitude is a `one_of!` over the small counts, the edges, the unit neighbours, the rounding ties
+and the wide ranges, and the shapes of the recorded bugs are drawn by default (separators on
+negative and non-finite values, non-ASCII separators, `bits` in the long binary table, hundred-digit
+floats), so the four wide properties fail on them and are listed in `target.toml` mapped to the
+bug they shrink to. `HEGEL_NO_KNOWN=1` (read once) switches the shapes off: the wide generators
+then keep clear of the recorded regions and every property must pass. A rendering that may hang
+(a non-finite value with a separator, humansize/5) runs in a child process with a deadline.
 
 ## Oracles
 
@@ -60,8 +72,9 @@ direction of ties (the mantissa is checked to half a last digit, not re-implemen
 
 ## Bugs
 
-All seven found on the first 100-case run or by reading the 160-line formatter first; six are
-in the `thousands_separator` branch, which re-implements number formatting on a byte buffer.
+The first seven found on the first 100-case run or by reading the 160-line formatter first, the
+eighth by the rewritten float property; seven are in the `thousands_separator` branch, which
+re-implements number formatting on a byte buffer.
 - **humansize/1** (medium): a fraction that rounds up loses its carry — 1999 bytes is `1.00 kB`
   where the plain path prints `2.00 kB`; 12 029 of the 1 999 001 counts in 1000..=2 000 000
   differ from the plain rendering.
@@ -78,6 +91,9 @@ in the `thousands_separator` branch, which re-implements number formatting on a 
   `2.00 Kilobyte` for 1999 bytes, and negatives are never singular (`-1 Bytes`).
 - **humansize/7** (low): the long binary bit scale spells `bits` where the decimal one spells
   `Bits`.
+- **humansize/8** (low): a finite value of about 75 integer digits or more with a separator panics
+  (`attempt to subtract with overflow`) - the 100-byte buffer overflows; `1e100` with `DECIMAL`
+  and a `','` for one, where the plain path prints all 77 digits.
 
 ## History
 
@@ -89,3 +105,7 @@ in the `thousands_separator` branch, which re-implements number formatting on a 
   + 10 000 cases. Test defects on the way: the tables spelled `Bits` where the crate says `bits`
   (fixed to the crate's spelling, pinned separately); a sign-symmetry check on the separator path
   duplicated humansize/2.
+- 2026-09-26: generators rewritten in combinator style (`Fields`/`Opts` records, `one_of!`
+  magnitudes, `either`/`optional` choices with the plain alternative first); the recorded shapes
+  are drawn by default and the wide properties are expected failures; `HEGEL_NO_KNOWN=1`
+  switches them off; humansize/8 found by the float property and given its own narrow property.
