@@ -269,7 +269,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -1013,6 +1013,27 @@ a method the item has) by a pure map applied only under the flag. Where the shap
 the rendered text (gofumpt's comment placement and line spans) the avoidance under the flag
 lives in the renderer and the fixup pass rather than in the generators, and that is fine as
 long as by default nothing is kept out.
+
+The forty-fourth batch (turn 550: form, echo and cel-go, rewritten and unsteered, the rewrite
+prompt now asking for the narrow properties itself and forbidding raised shape rates) cleared
+the Go part of the worklist but for hcl, ultraviolet and the waiting go-runewidth. Three things
+it settled. The CI machine is another test binary: two of testify's wide properties that had
+failed in every local run passed there (hegel-go's case sequence is per binary, the lz4
+lesson), so a wide property whose shape is a few percent of cases is intermittent whatever the
+local runs say, and the batch's mappings were written that way from the start. A gate the
+subagent leaves on in every mode is steering however it is spelled: cel-go's came as two
+`const hzSkip... = true` with careful comments explaining the discrepancies they hid; both
+were library bugs (the ANTLR parser's literal ranges end in bytes, cel-go/10, which the old
+test had tolerated as cel-go/2; the Pratt parser rejects `[,]`, cel-go/11), reproduced
+standalone, folded into the switches and given their narrow property and pin. And a model that
+follows the code is steering too: echo's model had stopped at a `RouteNotFound` node and
+dropped text after `*` as the router does, so echo/3 and echo/5 could never fail by default;
+the model now says what the documentation promises, and the shapes fail. Smaller points: a
+subagent raising a shape's drawn rate for reliability (form's panic keys, 20% to 50%) is put
+back and the property mapped intermittent; narrow properties named `TestHegelShapeX` are
+renamed to read as properties (`TestHegelWildcardBelowParam`); a mismatch met one time in ten
+by Go's map order (echo/10) is bound two hundred times in the property so its verdict is
+stable, since hegel-go reports a nondeterministic replay as a bare failure with no message.
 
 The lz4 subagent also observed that hegel-go's case sequence is reproducible per test binary,
 so a wide property with two basins (WriterFramesFollowTheSpec, lz4/2 or lz4/8) lands in one of
