@@ -17,7 +17,8 @@ combinations, `Merging.ByColumnIndex`); and the streaming API (`WithStreaming`, 
 
 ## Build
 
-The patch adds a `hegel/` package; `go test -count=1 -run TestHegel -v ./hegel` needs nothing
+The patch adds a `hegel/` package (the wide properties, `hegel_shapes_test.go` with one narrow
+property per bug, `hegel_pins_test.go`); `go test -count=1 -run TestHegel -v ./hegel` needs nothing
 beyond the module. The tests fix the tab width at 4 (`SetTabWidth` after a first `TabWidth()`,
 see bug 1) and set the East Asian and narrow-border options per test case.
 
@@ -195,10 +196,20 @@ property finds several bugs, fails on the first shape it meets with the shape na
 failure message, and is listed in `[expected_failures]` mapped to the basin the shrinker lands
 in most often (`Width` on 3, `Truncate` on 5, `Wrap` on 6 (intermittent at the default case count), `Fn` on 8, `Markdown` and `HTML` on
 11, `Blueprint` and `Constraints` on 18, `Merge` on 13, `Stream` on 36, `Input` on 26), the pins
-beside them as the regression examples. `HEGEL_NO_KNOWN=1`, read once into the `Known`
-switches, turns the shapes off in the generators (a tab width of 0, a visible column, a value
-the input accepts; the all-hidden and random-remainder tables are filtered at a few percent)
-and every property passes at 3000 cases.
+beside them as the regression examples. Each recorded bug also has a narrow property in
+`hegel_shapes_test.go`, named after the behaviour it asserts (`TestHegelEmptyRecordsAreNotFramed`,
+`TestHegelStreamedFootersMerge`, ...), that draws only that bug's shape region with random
+surroundings taken from the wide generators and checks it with the wide property's own helper
+(`checkBlueprint`, `checkStream`, `checkInput`, ...); the three bugs no wide property reaches (1, 19,
+24) are checked against the documented behaviour spelled in the property. The narrow properties
+fail on their first case at the default count and shrink to the bug's minimal example; each is
+the expected failure mapped to its bug. `WithColumnMax` is drawn in batch mode by the property of
+bug 12 alone, modelled as the documented per-column maximum; the streamed global-width property
+binds each case forty times, since the package's layout depends on map order. `HEGEL_NO_KNOWN=1`,
+read once into the `Known` switches, turns the shapes off in the generators (a tab width of 0, a
+visible column, a value the input accepts; the all-hidden and random-remainder tables are
+filtered at a few percent), skips the narrow properties (their region is the bug) and every wide
+property passes at 3000 cases.
 
 ## Modelled as recorded, not counted
 
@@ -275,3 +286,7 @@ and every property passes at 3000 cases.
   last position, the stream wraps after the horizontal merge); tablewriter/40 recorded (a
   streamed merge writes into the caller's slice), found by the stream property comparing its
   inputs before and after, reproduced standalone.
+- 2026-09-26 (later): one narrow property per bug in `hegel_shapes_test.go`; the wide properties'
+  checks extracted into `checkWidth`, `checkTruncate`, `checkWrap`, `checkFn`, `checkMarkdown`,
+  `checkHTML`, `checkConstraints`, `checkBlueprint`, `checkMerge`, `checkStream` and `checkInput`,
+  their generators and rates unchanged.
