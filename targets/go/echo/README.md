@@ -86,8 +86,19 @@ TestHegel -v ./hegel`
   `FormValue`/`FormValueOr`/`FormValues`/`FormValuesOr` for nine `T`s with time options.
 - `TestHegelQueryParamFastPath`: `QueryParam(name)` before and after `QueryParams()` on raw
   queries built from tricky atoms (`;`, bad escapes, empty segments) against `url.ParseQuery`.
+- Thirteen narrow properties in `hegel_zoo_shapes_test.go`, one per recorded bug, each a
+  generator over the bug's shape region with random contents judged by the same model
+  (`TestHegelEscapedColonBesideParam`, `TestHegelWildcardBelowParam`, `TestHegelBindCaseFold`,
+  ...): the deterministic expected failure of each bug.
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
+
+The generators are combinator values (`hegel_zoo_test.go` holds the idioms: `hzWeighted`,
+`hzCoin`, `hzMaybe`, `hzMany`, `hzPositions`, `hzShuffled`, `hzShaped`): routes as records of
+weighted segment kinds, requests as a route index and values rendered against the live routes,
+permutations as drawn sort keys, removals as a mask recycled modulo the route count, struct
+specs as a two-level tree, ValueBinder chains as lists of operation records, generic calls drawn
+per source.
 
 ## Bugs
 
@@ -108,19 +119,24 @@ names match (echo/10); `ValueBinder`'s slice methods do not bind after an earlie
 error where their examples say the default (echo/12); `Bind` with a non-pointer destination
 panics when the request has query or path values (echo/13).
 
-## Modelled as recorded
+## Known shapes
 
-The wildcard stop (echo/2), the `RouteNotFound` stop (echo/3), the inverted option (echo/4),
-`Remove`'s walk (its `prefixLen` accounting over the radix nodes as built, `originalPath` per
-node, no re-merging) and its pruning (echo/8, echo/9) are in the model behind `HZKnown`
-switches; the collision (echo/1), the custom-method panic (echo/6) and the slash-less paths
-(echo/7) are skipped by the generators while their switches are on. `ZOO_KNOWN_OFF=name`
-turns a switch off and the property then fails. Text after `*` (echo/5) is modelled as the
-router reads it (dropped); the pin asserts the documented syntax.
-
-Binder switches: `caseFoldRandom` (echo/10: the model skips a lookup with several inexact
-matches), `slicesNeedNoErrors` (echo/11), `orReturnsZero` (echo/12). The non-pointer panic
-(echo/13) is only pinned.
+The shapes of the recorded bugs are drawn by default (STYLE.md rule 11): escaped colons beside
+parameters, wildcards below parameters, `RouteNotFound` routes beside matching routes, the
+escaped-path option, text after `*`, custom-method and slash-less and repeated removals, tags
+differing only in case, slices after an error, `Or` on a parse error, non-pointer `Bind`
+destinations. The model says what the documentation promises (a `RouteNotFound` route is a
+candidate used only when nothing matches; text after `*` is matched; `Remove` finds every
+registered route and prunes nothing else), a mismatch names the bug whose shape it has (the
+`hzSwitches` keep the shape tests) and the property fails: `TestHegelRoute` (echo/4 or echo/5;
+14% of cases meet a shape), `TestHegelRemove` (echo/8; 37%) and `TestHegelParseValue` (echo/12;
+11%) every run, `TestHegelReverse`, `TestHegelValueBinder`, `TestHegelBind`, `TestHegelBindData`
+and `TestHegelRouteOrder` in some runs (their shapes are 0.3-2% of cases), and each narrow
+property on its own bug. `HEGEL_NO_KNOWN=1`, read once, switches the known shapes off: the
+generators draw the neighbouring regions instead (a route set without collisions, tags folded
+to distinct names, a call after no error), nothing is skipped, and every property passes. A
+lookup with several case-insensitive matches (echo/10) is bound 200 times, since Go's map order
+picks the wrong one only about one time in ten.
 
 Design notes the model follows (the package's tests assert them):
 
@@ -155,3 +171,7 @@ in the binder, `BindHeaders` beyond the property's pool, rendering, the static f
 
 - 2026-09-21: new target, four properties, 9 bugs.
 - 2026-09-21: part 2, the binder: five properties, 4 more bugs.
+- 2026-09-26: generators rewritten in combinator style; the known shapes are drawn by default
+  and thirteen narrow properties, one per bug, are the expected failures beside the pins. The
+  model now follows the documentation for `RouteNotFound` candidates and for text after `*`
+  (it had followed the code, so echo/3 and echo/5 never failed by default).
