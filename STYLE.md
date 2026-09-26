@@ -269,7 +269,7 @@ java/snakeyaml-engine (turn 442; pathe/16 from the subagent's candidate); go/go-
 bugs and are the expected failures). Unsteered without a restyle (turn 443): typescript/ini, java/jsqlparser,
 and the sibling go/go-runewidth@14205cc; (turn 444) go/ssh_config, go/go-udiff, go/godotenv (whose
 `HEGEL_NO_KNOWN` used to lift the gates and now switches the shapes off like everywhere else) and
-typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go.
+typescript/rbush; (turn 445) go/compose-go, go/go-re2 and typescript/picomatch. Unsteered (turn 446) go/sonic, typescript/shell-quote and go/now; (turn 449) typescript/liquidjs and go/jsonschema; (turn 450) typescript/node-csv; (turn 486) java/commons-csv, typescript/structured-clone, go/miekg-dns, typescript/jsonrepair and typescript/css-tree. Rewritten and unsteered together (turn 487) go/mapstructure and go/termenv; unsteered (turn 487) java/jackson-yaml, java/semver4j and java/sbe. Rewritten and unsteered together (turn 488) go/gofrs-uuid, go/bitset, go/go-version and go/uuid; unsteered (turn 488) java/javaparser. Rewritten and unsteered together (turn 489) go/uniseg, go/xstrings, go/properties, go/x-input and go/go-git. Rewritten and unsteered together (turn 490) go/cast, go/masterminds-semver, go/koanf, go/brotli and go/compress. Rewritten and unsteered together (turn 491) go/go-ldap, go/pflag, go/enmime, go/terminfo and go/tcell. Rewritten and unsteered together (turns 492-496) go/fasthttp, go/golang-ical and go/lz4. Rewritten and unsteered together (turn 497) go/go-geom and go/hujson. Rewritten and unsteered together (turn 498) go/gofeed. Rewritten and unsteered together (turn 503) go/prometheus-common and go/json-gold; json-gold's narrow properties followed (turn 547). Rewritten and unsteered together (turn 547) go/json-iterator and go/go-json. Rewritten and unsteered together (turn 548) go/afero, go/tablewriter and go/sh. Rewritten and unsteered together (turn 549) go/kin-openapi, go/testify and go/gofumpt. Rewritten and unsteered together (turn 550) go/form, go/echo and go/cel-go. Rewritten and unsteered together (turn 551) go/hcl and go/ultraviolet.
 Stateful-looking tests (rbush, java-diff-utils, re2j's junk edits, configparser's map edits,
 semver4j's version nudges) draw the whole operation or edit list as data, with positions taken
 modulo the live size when applied, so the shrinker can delete steps. The order of the rest,
@@ -1034,6 +1034,28 @@ back and the property mapped intermittent; narrow properties named `TestHegelSha
 renamed to read as properties (`TestHegelWildcardBelowParam`); a mismatch met one time in ten
 by Go's map order (echo/10) is bound two hundred times in the property so its verdict is
 stable, since hegel-go reports a nondeterministic replay as a bare failure with no message.
+
+The forty-fifth batch (go/hcl, go/ultraviolet) settled three things. A gate a subagent leaves
+behind because it thinks the finding is not the library's bug is still a gate: ultraviolet's
+scanner passes every read to x/ansi's `DecodeSequence`, which panics on a CSI with 33
+parameters, and the subagent capped the scanner's CSIs at 32 as "GATE, not a recorded bug";
+the panic reaches every program reading a terminal through `TerminalReader`, so it is
+ultraviolet's crash (ultraviolet/35), the cap became `shaped(1..40, 1..32)`, the scanner calls
+run under a recovering wrapper that names the shape, and the shape got its narrow property and
+pin. Likewise hcl's two "candidates" (a bare template keeps `$$${` verbatim after a lone
+carriage return; `Format` spaces a unary minus after an inline comment), both reproduced
+standalone and recorded; a candidate is recorded or refuted before the commit, never carried.
+Second, the bug a wide property is mapped to is read off the runs, not the subagent's guess:
+hcl's edits property lands on hcl/1 in every run though the subagent proposed hcl/5, and its
+Format property on hcl/3 in four runs of five; the shape names in the failure output (`awk` over
+"the shape of" lines, which in `go test -v` precede the `--- FAIL` line of their test) give the
+majority basin. Third, a narrow property's oracle is the wide property's, spelled for the
+region: hcl/7 is visible only in what the writer emits (`Bytes` of a parsed file formats the
+minus too), so the narrow property parses `a = /* c */ 1`, sets a negative number and asks
+whether the output is in Format's form, as the edits property does. Smaller points: a stream
+event's shape is per path (a 33-parameter CSI is ultraviolet/10 through `Decode` and /35
+through the scanner), so the shape helper takes the path; a whole-read panic is named before the
+per-event shapes, since it happens first.
 
 The lz4 subagent also observed that hegel-go's case sequence is reproducible per test binary,
 so a wide property with two basins (WriterFramesFollowTheSpec, lz4/2 or lz4/8) lands in one of
