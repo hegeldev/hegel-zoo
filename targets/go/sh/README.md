@@ -12,8 +12,9 @@ patches are not helpful and ask for detailed issues instead; the zoo only record
 ## Build
 
 `go test -count=1 -run TestHegel -v ./syntax` in the module root. The patch adds
-`syntax/hegel_test.go` (the generator, the oracles and six properties) and
-`syntax/hegel_pins_test.go` (one plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in
+`syntax/hegel_test.go` (the generator, the oracles and six properties),
+`syntax/hegel_shapes_test.go` (one narrow property per bug) and `syntax/hegel_pins_test.go` (one
+plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in
 go.mod (`go get` also moved `x/mod`, `x/sync` and `x/tools` forward; go 1.26 stays). `bash`
 (5.2 here) and `dash` are the oracles for the bash and POSIX dialects, run with `-n` on stdin; a
 missing shell skips its checks. Upstream's own tests confirm against bash 5.3, dash, mksh and zsh.
@@ -112,11 +113,16 @@ after a `(` and near the parser's read boundary, and every printer option on eve
 wide properties each find several bugs; they fail on the first shape they meet and are listed in
 `[expected_failures]` mapped to the basin the shrinker lands in most often (formatting on /3,
 Simplify on /9, positions on /4, the broken inputs on /5, the streaming parsers on /20 and marked
-intermittent, since their shapes are a few percent of cases at the default count), the pins beside
-them as the regression examples. `HEGEL_NO_KNOWN=1`, read once into the `Known` switches, turns
-the shapes off: the grammar stops drawing them (heredocs then sit only at line end, the region of
-/5, /7 and /8), lines with a printer-mangled shape are filtered (below one percent), and every
-property passes at 3000 cases.
+intermittent, since their shapes are a few percent of cases at the default count). Beside them
+`syntax/hegel_shapes_test.go` has one narrow property per bug: it draws the bug's shape region
+with random contents (the construct of the bug built from the grammar's pieces, among random
+surrounding lines, under random printer options where the bug depends on them) and runs the same
+check as the wide property that meets the bug, so it fails on its first case and shrinks to the
+bug's minimal shape; each is the expected failure mapped to its bug, and the pins are the
+regression examples. `HEGEL_NO_KNOWN=1`, read once into the `Known` switches, turns the shapes
+off: the grammar stops drawing them (heredocs then sit only at line end, the region of /5, /7 and
+/8), lines with a printer-mangled shape are filtered (below one percent), the narrow properties
+are skipped (their region is the bug), and every wide property passes at 3000 cases.
 
 Two found by the rewritten generators (2026-09-26): a heredoc body placed right after the `(` that
 opens a subshell, a `$(` or a function's subshell body is rejected as an unclosed here-document,
@@ -135,3 +141,8 @@ boundary (/28, medium).
   broken-inputs skip fired on 45% of cases). sh/27 and sh/28 recorded, found by the freed shapes
   and reproduced standalone. Oracle tolerance: bash 5.2.21 rejects a leading redirect followed by
   `&>>` with an assignment-like target, so the generator writes `&>` there.
+- 2026-09-26 (later): one narrow property per bug in `syntax/hegel_shapes_test.go`, built from
+  the grammar's pieces (exposed on the `grammar` record; a `oneLine` grammar variant without
+  newline-holding quotes for the line-shaped bugs); the wide properties' checks extracted into
+  `checkFormatting`, `checkSimplify`, `checkPositions`, `checkStreams` and `checkBroken`, their
+  generators and rates unchanged.
