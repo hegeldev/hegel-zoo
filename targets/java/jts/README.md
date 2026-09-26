@@ -86,12 +86,36 @@ nest in every way.
   against the iterated binary union; normal form (shell CW, holes CCW, idempotent, reverse-invariant);
   `isRectangle`.
 
-`HEGEL_TEST_CASES=2000` × 9 properties runs in about 20 s.
+## Known shapes (`JtsShapesTest`)
 
-## What the generator avoids
+The generators draw the shape of every recorded bug by default (STYLE.md rule 11): `GeoGen.line` repeats an
+interior vertex in one line in ten (half the time next to the original), one point set in ten has all its points
+coincide, and the strange-ordinate pool mixed into a tenth of the points and lines holds 1/7, 1/3000, 1e-17 and
+5e-324 beside the extremes; `predicatesAgree` judges every pair, including lines whose segments cross each other on a
+polygon's boundary or along another line. The wide properties fail on those shapes when they draw them - a few percent of cases each, so
+they pass some runs at the default count and are mapped as intermittent (`readersInvertWriters` to jts/1,
+`measuresAreExact` to jts/3, which it shrinks to in every run, `predicatesAgree` to jts/4, the first of the two
+relate shapes it meets - jts/5 is the other). Beside them
+`JtsShapesTest` has one narrow property per bug, drawing only the bug's shape region with random contents and judged
+by the same check as the wide property (`checkWktRoundTrip`, `checkRingSimple`/`checkLineSimple`,
+`checkBoundingCircle`, `checkRelateAgree`): ordinates below one through WKT, a repeated interior vertex in a simple
+line or ring, 2..8 coincident points under `MinimumBoundingCircle`, a line crossing itself at the midpoint of a
+polygon's edge, and a self-crossing line with a line along its last segment, under `RelateOp` and `RelateNG`. They fail every run; `JtsPinsTest` keeps the regression examples.
+`HEGEL_NO_KNOWN=1`, read once into `Zoo.NO_KNOWN`, switches the shapes off: the generators stop planting them, the
+narrow properties draw the neighbouring region (short decimals, a repeated end point, a second distinct point, a
+crossing off the boundary, the middle segment) and every property passes; the skips this adds are 0.9 % of `readersInvertWriters`
+(hole vertices on the thousandths grid that need 17 digits), 2.2 % of `measuresAreExact` and below 0.1 % elsewhere.
+
+`HEGEL_TEST_CASES=2000` × 14 properties runs in about 25 s.
+
+## What the properties allow for
 
 Zero-length lines (all points equal) are invalid in JTS (`isValid` false) and relate inconsistently, so predicates
-skip them. The quirks the properties allow for, all documented or inherent: `Area.ofRingSigned` and
+leave them out (`assume`), and the simplifiers, densifier and precision reducer are checked on valid lines only.
+`GeometryNoder` drops a line whose vertices all snap to one grid point, `DouglasPeucker` and `VW` may collapse a
+closed line to a zero-length one (validity is promised for polygonal results only), and `OffsetCurve.rawOffset`
+gives a single point when the inside offset distance is at least every segment's length (`LINESTRING (3 0, 2 0,
+2 1)` at -1) - tolerated for those cases only. The quirks the properties allow for, all documented or inherent: `Area.ofRingSigned` and
 `Triangle.signedArea` are positive for *clockwise* rings; `IntersectionMatrix.transpose()` mutates in place;
 `GeometryCollection.getBoundary` throws; `RobustLineIntersector` reports a two-point collinear intersection when a
 zero-length segment lies on the other; the `Quadtree` may return a superset; `STRtree.nearestNeighbour(ItemDistance)`
@@ -111,16 +135,24 @@ and `tests` modules, `SnapIfNeededOverlayOp` and other legacy overlay entry poin
 
 ## Bugs found
 
-See `bugs.toml` (3, all open at the pinned commit, all pinned in `JtsPinsTest`): `WKTWriter` prints at most 16
+See `bugs.toml` (5, all open at the pinned commit, each with a narrow property in `JtsShapesTest` and a pin in
+`JtsPinsTest`): `WKTWriter` prints at most 16
 fraction digits under the floating precision model, so ordinates below 1 needing 17 significant digits (1/7, 1/3000)
 and anything below 1e-16 do not round-trip (1); `IsSimpleOp` reports a line or ring with a repeated interior vertex
 as non-simple while trimming repeated end points (2); `MinimumBoundingCircle` of two or more coincident points has a
-null centre — the convex hull is a single point and the "duplicate final point" strip removes it (3).
+null centre — the convex hull is a single point and the "duplicate final point" strip removes it (3); `RelateOp`
+reports the boundary of a polygon meeting the interior of a line in a one-dimensional set when two segments of the
+line cross each other at a point inside one of the polygon's edges (`1021F1102` where `RelateNG` and the boundary's
+intersection, two points, say `1020F1102`) (4); `RelateOp` relates a line collinear with a segment of a self-crossing
+line as mostly outside it when the crossing point is not exactly representable (`001F001F2` for
+`LINESTRING (0 0, 1 -1, 0 -1, 1 1)` and its own segment `LINESTRING (0 -1, 1 1)`, `RelateNG` `101F00FF2`, so
+`covers` is false) (5). Both found on 2026-09-26 by `predicatesAgree` once the shapes were drawn.
 
 ## Observed, not recorded
 
 - `Geometry.relate` and `Geometry.intersection` use the original `RelateOp`/`OverlayOp` unless the system properties
-  `jts.relate=ng`/`jts.overlay=ng` are set; both pairs agreed on every case (2000 per run).
+  `jts.relate=ng`/`jts.overlay=ng` are set; the overlay pair agreed on every case (2000 per run), the relate pair
+  except for bugs 4 and 5.
 - `OverlayNG` intersection may return a mixed-dimension collection (polygon plus the touching line/point), which it
   then refuses as input ("Overlay input is mixed-dimension").
 - `GeometryPrecisionReducer(1)` changes an on-grid polygon whose hole vertex lies within half a cell of the shell
@@ -129,3 +161,6 @@ null centre — the convex hull is a single point and the "duplicate final point
 ## History
 
 - 2026-09-16: created (turn 176) at 9c995e538329 (1.21.0-SNAPSHOT); 3 bugs.
+- 2026-09-26: the known shapes drawn by default, one narrow property per bug in `JtsShapesTest`, `Zoo.NO_KNOWN`;
+  bugs 4 and 5 found by the freed `predicatesAgree`; `Zoo.chance` now shrinks to false; four tolerances for zero-length
+  and closed lines from `GeoGen.line` (above).
