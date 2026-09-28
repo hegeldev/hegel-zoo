@@ -45,10 +45,19 @@ is compared byte for byte after normalizing the two spellings the format allows 
 Three, see `bugs.toml`: a reversed GIT binary patch keeps its sections in forward order (1);
 a `---`/`+++` pair of body lines before the next hunk header is taken for a file header even
 though the hunk header's counts say otherwise (2); a file name ending in a space loses it (3,
-pin only).
+pin only); a `--binary` diff of a renamed or mode-changed binary file whose content changed
+is dropped by `ParseMultiFileDiff` and rejected by `ParseFileDiff` (4). `TestHegelMultiFile`
+draws the shape of 4 by default and is its intermittent expected failure (how often git pairs
+two generated binary files as a rename depends on the git version);
+`TestHegelBinaryRenamePatchParses` draws the region every run; `HEGEL_NO_KNOWN=1` skips it.
 
 ## Modelled as recorded, not counted
 
+- `TestHegelMultiFile` parses with `KeepCR` (its trees are compared byte for byte after
+  `git apply`; the documented CR loss without it is still checked by `TestHegelParseUnified`),
+  and when a reprinted diff applies to a different tree it applies git's own diff first: git
+  misreads its own `-U0` diff of a file without a final newline, and such cases are counted,
+  not failed.
 - `PrintFileDiff` writes names unquoted (a `TODO` in the source): names with tabs, quotes,
   backslashes or non-ASCII parsed from git's quoted headers print as different diffs. The
   generators use names without such characters.
