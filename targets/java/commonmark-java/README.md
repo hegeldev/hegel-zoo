@@ -69,6 +69,15 @@ cells, backslashes in table cells; for the differential also HTML blocks inside 
 before its parent with only whitespace or `>` between and the paragraph after a definition; for purity documents with
 image attributes); the pins carry them.
 
+Bugs 60 and 61, found by the weekly 1000-case run of 2026-09-28, are drawn by default: `htmlMatchesCommonmarkJs` fails
+at their natural rate and is listed in `target.toml` as an intermittent expected failure (mapped to 60), and `Known`
+skips their shapes only under `HEGEL_NO_KNOWN=1` (`Zoo.NO_KNOWN`, read once). `sourceSpansPointIntoTheInput` reaches
+bug 48 through a setext heading and `markdownRendererRoundTripsWithExtensions` bugs 49 and 29 together, both mapped
+intermittent. Narrow properties fail deterministically beside the pins: `failedDefinitionTitleKeepsItsSpans` (48),
+`listStaysTightAcrossBlankLinesInsideAnOpenFence` (60), `unclosedDefinitionTitleIsNoTitle` (61) and
+`unterminatedFrontMatterIsOrdinaryMarkdown` (29). The older gates of `Known.java` are still always on, which is
+steering; unsteering them is on the worklist.
+
 ## Not tested
 
 The `TextContentRenderer`'s output beyond purity (its line-break modes and separators), `HtmlRenderer` options
@@ -77,7 +86,7 @@ autolink rules (it wraps `org.nibor.autolink` and claims no spec), the heading-a
 beyond the round trip, `enabledBlockTypes`, custom block/inline parsers, the `parser.beta` API, the `DingusApp`,
 Android module. The YAML property writes only closed front matter (bug 29) at the document start (bug 41).
 
-## Bugs (59 open; each has a pin in `CommonmarkPinsTest`)
+## Bugs (61 open; each has a pin in `CommonmarkPinsTest`)
 
 | id | severity | what |
 |---|---|---|
@@ -140,6 +149,8 @@ Android module. The YAML property writes only closed front matter (bug 29) at th
 | commonmark-java/57 | medium | a footnote definition inside a container reads its later blocks against the absolute column 4, so a paragraph becomes indented code (and the Markdown rendering grows by four columns each time) |
 | commonmark-java/58 | medium | a list item that may not interrupt a paragraph (`2.`, an empty item) does so right after a link reference definition |
 | commonmark-java/59 | low | MarkdownRenderer: a footnote reference at a line start followed by `:` re-parses as a footnote definition (found by this turn's 1000-case run) |
+| commonmark-java/60 | medium | a blank line inside an open fenced code block or HTML block that ends a list item makes the list loose |
+| commonmark-java/61 | low | a definition whose title is still open when its paragraph ends keeps the partial title |
 
 Observed and left unrecorded (arguable or cosmetic): the renderer's text escaping is not a fixed point (`[^a]:**.**Æ`
 renders unescaped once and escaped the second time, with equal HTML); the Markdown renderer discards `TableCell.getWidth()` and
@@ -157,3 +168,6 @@ commonmark.js.
   jars, commonmark.js and cmark-gfm; 59 from the 1000-case round-trip run that verified them); two more of the
   rewrite's findings extend bugs 2 (a thematic break's literal keeps the partial tab) and 46 (the blank line at the
   document end, and the mechanism is the HTML writer's, not the parser's).
+- 2026-09-28: the weekly 1000-case run failed the spans property on bug 48 by a new route; 60 and 61 recorded
+  (reproduced standalone against the built jar, cmark-gfm and markdown-it), drawn by default; narrow properties for
+  29, 48, 60 and 61.
