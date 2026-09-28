@@ -53,15 +53,25 @@ twins (antisymmetry, transitivity, prefixes sort first); `wrappingReportsTheAdju
 (append/consume/forEach/reset).
 
 `AgronaPinsTest` holds one pin per recorded bug; each asserts the correct behaviour on a minimal input and is listed
-in `[expected_failures]`.
+in `[expected_failures]`. `AgronaShapesTest` holds one narrow property per open bug beside the pins, a generator
+over the bug's shape region with random contents judged by the same oracles: `naturalIntFromEndWritesEveryValue`
+(agrona/1), `leadingZerosParseToTheirValue` (agrona/2), `selfCopiesCheckTheSourceRange` (agrona/4).
 
-## What the generators avoid
+## Known bugs (drawn by default)
 
-- `putNaturalIntAsciiFromEnd` is not exercised with 0 (agrona/1).
-- Well-formed decimal strings longer than 10 characters (int) or 19 (long) are not expected to parse (agrona/2).
-- An `ExpandableRingBuffer.append` whose record fits in total but neither before the end nor at the front while the
-  ring cannot grow is skipped (agrona/3; the shape is computed from `head()`, `tail()`, `capacity()`, `maxCapacity()`).
-- Self copies on an expandable buffer whose source range lies beyond the capacity are skipped (agrona/4).
+The generators draw the recorded bugs' shapes: `intAndLongAsciiRoundTrip` draws 0 for `putNaturalIntAsciiFromEnd`
+(agrona/1) and padded widths above 10 whose parse-back it checks (agrona/2); `asciiParsersMatchTheJdk` draws
+well-formed decimals longer than the 10/19-digit budget (agrona/2); `buffersMatchAByteArrayModel` draws expandable
+self copies whose growth covers a source beyond the capacity (agrona/4). They are the expected failures mapped to
+those bugs (`buffersMatchAByteArrayModel` intermittently: the shape is 8.5% of cases and a 100-case run misses it
+about half the time); the three narrow properties fail on every run. Only under `HEGEL_NO_KNOWN=1` (read once,
+`Zoo.NO_KNOWN`) do the generators stay off those shapes: value 0 is skipped for the from-end writer, excess leading
+zeros are cut to the budget, and a growing self copy draws its source within the capacity. The append shape of
+agrona/3 (a record that fits in total but in neither part of a split ring that cannot grow) is drawn in 11-15% of
+`expandableRingBufferIsAFifo`'s cases and passes since the fix.
+
+## Documented preconditions the generators respect
+
 - `values().remove(v)` is only used when `v` occurs once (which of several equal values goes is the iteration
   order's choice); `IntHashSet.copy` is only called with a set of equal capacity (an undocumented precondition);
   `IntArrayQueue` is created with at least `MIN_CAPACITY`; stale claim indices are only re-committed while the
@@ -107,3 +117,4 @@ anything multi-threaded (`unblock`, broadcast buffers, concurrent array queues, 
 - 2026-09-17: base bumped 6a57dd3df11c → b4858542512f (2026-09-17, "ExpandableRingBuffer align bug (#370)"; 2.7.0-SNAPSHOT); 3 bug(s) still reproduce; fixed upstream: agrona/3. 15 tests pass.
 - 2026-09-17: base bumped b4858542512f → 093748e1cfa6 (2026-09-17, "post release bump"; 2.7.0-SNAPSHOT); 3 bug(s) still reproduce. 16 tests pass.
 - 2026-09-18: base bumped 093748e1cfa6 → 1c1079dc40fb (2026-09-18, "[Java] Remove unused variable in test"; 2.7.0-SNAPSHOT); 3 bug(s) still reproduce. 16 tests pass.
+- 2026-09-28: unsteered: the properties draw the known shapes by default and are the expected failures mapped to them; `AgronaShapesTest` adds one narrow property per open bug; `HEGEL_NO_KNOWN=1` switches the shapes off. 19 tests.
