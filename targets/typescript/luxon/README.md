@@ -2,7 +2,7 @@
 
 Luxon is "a powerful, modern, and friendly wrapper for JavaScript dates and times": immutable
 `DateTime`s in IANA zones whose offsets come from `Intl`, `Duration`s with casual or long-term
-unit conversion, and half-open `Interval`s. The patch checks it three ways and pins 10 bugs.
+unit conversion, and half-open `Interval`s. The patch checks it three ways and pins 14 bugs.
 
 The in-repo `docs/` (math, zones, parsing, formatting, validity) is the reference; the method
 docstrings in `src/` were read for `set`, `shiftTo`, `splitAt`, `toISOTime` and `fixOffset`.
@@ -37,12 +37,19 @@ because the zones guide documents Luxon's choice there as undefined.
 | `TestHegelInfoAndZones` | `Info.isValidIANAZone`, `normalizeZone` of names and junk, `hasDST` (December vs June offsets this year), `FixedOffsetZone` names and `UTC±H:MM` specifiers, `Info.months/weekdays/meridiems` |
 
 `ZOO_COLLECT=1` turns mismatches into `# COLLECT` counts instead of failures; `HEGEL_TEST_CASES`
-(default 100) widens the sweep. Known bugs are skipped through the `Known` switches at the top
-of the file, accepted differences through `Accepted`; each skip is counted.
+(default 100) widens the sweep. Bugs 1 to 10 are skipped through the `Known` switches at the top
+of the file (still on by default, which is steering; unsteering them is on the worklist), accepted
+differences through `Accepted`; each skip is counted. Bugs 11 to 14, and bug 1 and 7 by the routes
+the weekly 1000-case run of 2026-09-28 found, are drawn by default: `TestHegelArithmeticLikeTemporal`
+and `TestHegelIntervalAlgebra` fail at their natural rate on 11 (and 12), `TestHegelFieldsLikeTemporal`
+on 13, `TestHegelParseTechnicalFormats` on 1 and `TestHegelDurationLaws` on 7, each listed in
+`target.toml` as an intermittent expected failure; `HEGEL_NO_KNOWN=1` (read once) switches those
+shapes off. Narrow properties over the shape regions of 1, 7 and 11 to 14 fail deterministically
+beside the pins.
 
 ## Bugs
 
-10 open, all pinned (see `bugs.toml`). By area:
+14 open, all pinned (see `bugs.toml`). By area:
 
 - Zones and offsets: `fromISO` discards the offset when a `[zone]` annotation follows (3); a wall
   time within a day after a transition is taken for a gap when the zone's current offset is far
@@ -54,7 +61,12 @@ of the file, accepted differences through `Accepted`; each skip is counted.
   `toISOWeekDate` does not expand years outside 0000–9999 (1).
 - Durations: `shiftTo`/`normalize` leave a fractional opposite-signed unit below one (7), and
   fractional intermediate units under long-term accuracy (10).
-- Intervals: `splitAt` with a cut at the start or a repeated cut yields empty intervals (5).
+- Intervals: `splitAt` with a cut at the start or a repeated cut yields empty intervals (5);
+  `count("days")` is one short when the start day's midnight falls in a DST gap (12).
+- Transitions: `startOf`/`endOf` of an hour around a half-hour or 45-minute transition leave the
+  hour, and `endOf("day")` before a fall-back that lands on midnight ends in the next day (11).
+- Formatting and year 0: the `x` token prints float noise far from the epoch (13); the weekday of
+  0000-02-29 is a Wednesday, and week dates and weekday tokens follow (14).
 
 ## Accepted differences (skipped, not counted as bugs)
 
@@ -90,3 +102,6 @@ subclasses, `Info.features`.
 ## History
 
 - 2026-09-17: created at f427515 (3.7.2 dev head), 7 properties, 10 bugs.
+- 2026-09-28: the weekly 1000-case run reached bug 1 through week dates of year -1 and two test
+  flaws (`kk` of a negative week-year, a casual-matrix rescale); 11 to 14 recorded, drawn by default
+  with narrow properties; 14 bugs.
