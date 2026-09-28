@@ -63,13 +63,15 @@ interfaces, a `Leaf` or a pointer to one (typed nil included). Empty values are 
 
 ## Bugs
 
-Nineteen, recorded in `bugs.toml`: eleven crashes (a typed nil pointer source; an unexported
+Twenty, recorded in `bugs.toml`: twelve crashes (a typed nil pointer source; an unexported
 map field under `WithOverwriteWithEmptyValue`; `Map` values of the field's kind but another
 type, in particular a nested `map[string]interface{}` for a typed map field; a nil map
 destination; a typed nil pointer value; a map destination or source of another map type; a
 promoted field through a nil embedded pointer; `WithSliceDeepCopy` over `[]interface{}`
-elements of different kinds; interface entries holding maps of different types;
-`WithoutDereference` with `WithOverride` on pointer entries of maps) and eight wrong results
+elements of different kinds, and over a map-of-interfaces entry that holds a slice in the
+source and a scalar, struct, pointer or non-empty map in the destination; interface entries
+holding maps of different types; `WithoutDereference` with `WithOverride` on pointer entries
+of maps) and eight wrong results
 (`WithSliceDeepCopy` merges only pointer and map elements; arrays are never empty;
 `WithoutDereference` with `WithOverride` leaves struct pointers alone; `Map` into a non-empty
 interface field of another dynamic type errors; `Map` removes map entries and pointers the
@@ -84,7 +86,10 @@ The model reproduces the recorded behaviour while a `Known` switch is on (bugs 6
 disagrees (never set in the zoo's runs). The other bugs are pin-only: the generators keep
 away from them (no nil sources, unexported fields zero, exactly typed `Map` values, non-nil
 map destinations, untyped nil for nil pointers in `Map` values, `map[string]interface{}`
-sources and destinations, embedded structs by value under `Map`).
+sources and destinations, embedded structs by value under `Map`). Bug 20 is drawn by default
+(STYLE.md rule 11): `TestHegelMergeLaws`, `TestHegelMergeModel` and `TestHegelMapModel` reach
+it now and then and are its intermittent expected failures, `TestHegelSliceDeepCopyMapEntries`
+draws the region every run, and `HEGEL_NO_KNOWN=1` (read once) skips the shape.
 
 Design facts mirrored, not recorded: a struct is never empty (only its fields are), so a
 struct without exported fields moves only with `WithOverride`, and a pointer to a zero struct
