@@ -21,7 +21,13 @@ syntaxes are exact rational arithmetic with `fractions`. For exp, ln, log2, log1
 and pow the oracle computes at 30 guard digits (correctly rounded by libmpdec), rounds to the
 target precision and refuses to decide (the case is skipped, about 1% of them) when the guard
 digits sit on a rounding boundary while the result is inexact; exact results (`log2(256)`,
-`pow(2, -1)`) are recognised by the Inexact flag staying clear. The oracle runs as one Python
+`pow(2, -1)`) are recognised by the Inexact flag staying clear. decimal.js documents `pow`, and
+`log` to a base other than 2 or 10, as "almost always" correctly rounded (15 guard digits; a
+result whose first fifteen rounding digits are all nines or all zeros, or a 4 or 5 before them,
+may be one ulp off), so such a miss — one ulp from the oracle's value, the exact value's fifteen
+rounding digits on a boundary — is counted, not failed. `hypot` follows `Math.hypot`'s specials
+(an infinite argument wins over NaN) and a zero's `toFraction` numerator keeps its sign, as in
+JavaScript. The oracle runs as one Python
 child process over two FIFOs, one JSON line per request. Formatting (`toString`, `toFixed`,
 `toExponential`, `toPrecision`, radix notation) is checked against models of the documented
 rules written in the test.
@@ -63,7 +69,7 @@ the oracle's ranges.
 
 ## Bugs
 
-Six, all recorded in `bugs.toml` with a pin each:
+Eight, all recorded in `bugs.toml` with a pin each:
 
 - **decimaljs/1** (low) — `toNearest` with a negative n rounds the quotient, so ROUND_FLOOR
   rounds up (`9.499.toNearest(-0.5, ROUND_FLOOR)` is 9.5), and CEIL/HALF_CEIL/HALF_FLOOR flip too.
@@ -79,3 +85,13 @@ Six, all recorded in `bugs.toml` with a pin each:
 - **decimaljs/6** (medium) — radix strings with a binary exponent are parsed inexactly
   (`new Decimal('0o1p+104')` has 20 digits, 2^-27 loses its last digits), whatever the
   precision, so `toBinary(sd)`/`toOctal(sd)`/`toHex(sd)` output does not read back.
+- **decimaljs/7** (low) — `log` of 0 or Infinity to a base between 0 and 1 has the wrong sign
+  (`Infinity.log(0.5)` is Infinity, `0.log(0.5)` is -Infinity): the special is returned before
+  the base's sign is looked at.
+- **decimaljs/8** (low) — `pow` of 0, Infinity or NaN to an exponent below the double range is 1:
+  the special case goes through `Math.pow(+x, +y)` and `+y` is 0.
+
+Bugs 7 and 8 are drawn by default (STYLE.md rule 11): `TestHegelTranscendentalsAreCorrectlyRounded`
+reaches them rarely and is the intermittent expected failure for 7, and two narrow properties
+draw each region every run; `HEGEL_NO_KNOWN=1` (read once) skips the shapes. The gates for bugs
+1-6 are still the older count-and-return kind.
