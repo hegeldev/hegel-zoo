@@ -81,7 +81,7 @@ writer rejects an out-of-range date, error 10).
 
 ## Bugs
 
-Thirteen, fflate/1–13 in `bugs.toml`. The one-shot `gunzipSync` reads one member and sizes its
+Fifteen, fflate/1–15 in `bugs.toml`. The one-shot `gunzipSync` reads one member and sizes its
 output from the last four bytes of the input, so zero padding gives empty output and a second
 member truncates or throws (/1); no checksum or length trailer is ever verified, so corrupted
 input decodes to silent garbage (/2); a gzip `filename` with a character outside Latin-1 or a
@@ -98,12 +98,29 @@ to 32 bytes with incompressible input gives a stream zlib rejects and fflate mis
 streaming `Gunzip` ends a truncated stream with partial output and no error where the one-shot
 raises "unexpected EOF" (/11); the raw `Inflate` stream with a dictionary loses the dictionary
 on an empty first push and decodes the rest to wrong bytes (/12); at level 0 an input of
-exactly k × 65535 bytes gets a second final block and the zlib/gzip output is unreadable (/13).
+exactly k × 65535 bytes gets a second final block and the zlib/gzip output is unreadable (/13);
+the streaming `Unzlib` pushed in pieces accepts a stream cut inside its Adler-32 (/14); the
+streaming `Deflate`/`Zlib`/`Gzip` emit a back-reference before the start of the data when the
+input begins with zeros (/15).
 /1, /2, /6, /8, /11, /12 came out of reading Node's streams, /3, /9, /10, /13 out of Node
 reading fflate's, /4 out of the UTF-8 property, /5 and /7 out of the ZIP differential; /12 and
 /13 were found by fresh-seed clean runs of the finished suite (shapes the collect runs had not
 hit — the generator now lands on the 65535 boundary on purpose).
 
+The weekly 1000-case run of 2026-09-28 reached /11 through a bit flip that runs the DEFLATE data into
+the gzip trailer, and the triage found /14 and /15. Since then the two differentials draw the
+recorded shapes by default and fail at their natural rates (the reader on /1, /8, /11, /12 and /14,
+the writer on /13 and /15; each failure names the shape), and are listed in `target.toml` as
+intermittent expected failures mapped to /11 and /13; `HEGEL_NO_KNOWN=1` (read once) switches the
+shapes off. Six narrow properties over the shape regions of /8, /11, /12, /13, /14 and /15 fail
+deterministically beside the pins. One guard is on by default: when the four bytes `gunzipSync`
+sizes its output from read past 64 MiB the one-shot is not called (it would allocate up to 4 GiB
+for a 40-byte input, /1) and the stream is judged against zlib alone. The older gates of the two
+properties are still on by default, which is steering; unsteering them is on the worklist.
+
 ## History
 
 - 2026-09-15: created at dcb3714a (0.8.3); 13 bugs.
+- 2026-09-28: the weekly 1000-case run reached /11 through the reader differential; /14 and /15
+  recorded, the differentials draw the known shapes by default, six narrow properties, the
+  `gunzipSync` allocation guard.
