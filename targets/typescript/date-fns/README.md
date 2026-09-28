@@ -53,7 +53,10 @@ day compared by wall clock (as documented; a 24-hour DST day is one day); the `b
 to either occurrence; a midnight that occurs twice (St. John's 00:01 fall-backs) makes
 `eachDayOfInterval` count the next day when the interval ends in the repeated minutes; a BC year
 formatted without an era or signed-year token cannot round-trip; offsets with seconds (local
-mean time before standard time) cannot round-trip through `hh:mm` offsets.
+mean time before standard time) cannot round-trip through `hh:mm` offsets. A date followed by
+`Z` (`2021-06Z`, `0000001Z`) is accepted by the model as `parseISO` and V8's `Date` accept it
+(upstream tests it on purpose). A year or month boundary that falls in a repeated wall-clock hour
+(`differenceInYears`/`differenceInMonths` across a fall-back) may be counted either way.
 
 ## Bugs
 
@@ -77,8 +80,18 @@ of day on a month's last day (6); `isExists` is false for years 0-99 (7);
 `differenceInBusinessDays` is not antisymmetric at weekends (8); `formatRFC3339`/`formatRFC7231`
 write years below 1000 unpadded (9); `lastDayOfWeek`, `eachMonthOfInterval` and
 `eachYearOfInterval` return 01:00 when the input day starts at 01:00 (10); `parseJSON` maps years
-0-99 to the 1900s (14); `parseISO("...01.023Z")` is .022 (16).
+0-99 to the 1900s (14); `parseISO("...01.023Z")` is .022 (16); `setYear` rolls 29 February over to
+1 March where every other setter clamps (17); `differenceInMonths(31 Oct, 30 Nov)` is 0 while the
+reverse is 1 (18).
+
+Bugs 16, 17 and 18 are drawn by default: `TestHegelIsoFormatsMatchTheModel`,
+`TestHegelAddSubSetGetMatchTheModel` and `TestHegelDifferencesMatchTheModel` reach them at their
+natural rates (a few cases in 5000) and are listed in `target.toml` as intermittent expected failures;
+each also has a narrow property over its shape region that fails deterministically beside the pin.
+`HEGEL_NO_KNOWN=1` switches the known shapes off, and then every property passes.
 
 ## History
 
 - 2026-09-20: created against 18cbd43 (4.4.0); 16 bugs.
+- 2026-09-28: the weekly 1000-case run failed `TestHegelParseIsoFollowsIso8601` on a date followed by
+  `Z` (model widened); bugs 17 and 18 recorded, known shapes drawn by default; 18 bugs.
