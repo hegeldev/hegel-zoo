@@ -86,9 +86,9 @@ coordinate has other Z/M (the format omits it) and of a snap that merges vertice
 generated: lower-case WKT keywords and a MultiPoint mixing parenthesised and bare points (GEOS
 and simplefeatures differ in leniency).
 
-## Known bugs (gated)
+## Known bugs (drawn by default)
 
-Eight bugs (`bugs.toml`): `Simplify` is not Ramer-Douglas-Peucker and drops vertices farther
+Twelve bugs (`bugs.toml`): `Simplify` is not Ramer-Douglas-Peucker and drops vertices farther
 than the threshold from its result; TWKB of an empty geometry carries size and bounding box bytes
 its header does not declare; a GeometryCollection's TWKB bounding box is all zeros; an empty
 Point in a MultiPoint reads back from TWKB as `POINT (0 0)`; a MultiPolygon or collection with
@@ -97,9 +97,28 @@ with a recovered panic on a puntal geometry holding an empty point or a nested M
 prepared predicates misjudge a collection whose members overlap (a point inside a polygon member
 and at a line member's end touches rather than lies within; two overlapping areal members give a
 recovered `side location conflict` panic); point-point overlays compare Z and M (the intersection
-of `POINT (1 1)` and `POINT Z (1 1 5)` is empty, their union two equal points). `hegel/known.go`
-gates them by generated shape or by the shape of the one disagreement; `HEGEL_NO_KNOWN=1` lifts
-the gates.
+of `POINT (1 1)` and `POINT Z (1 1 5)` is empty, their union two equal points); line overlays
+lose a vertex shared with an operand that carries Z (9); a point on the boundary of a
+MultiPolygon nested in a collection is prepared-within rather than touching (10); an empty areal
+member raises a collection's prepared dimension so `Within`/`CoveredBy`/`Contains` against a
+point go false (11); prepared `Overlaps` is false for two lines sharing a segment that one of
+them crosses at a non-representable point (12). Bugs 10 to 12 are in JTS 1.20 too, inherited
+through the port.
+
+The wide properties draw these shapes by default and fail at their natural rates
+(`TestHegelSimplifyStaysClose` and `TestHegelDensifySimplifyMatchesGEOS` on 1,
+`TestHegelTWKBRoundTrip` on 2, `TestHegelPreparedAgrees` on 6, 7, 10, 11 and 12,
+`TestHegelOverlaysMatchGEOS` and `TestHegelUnionManyMatchesGEOS` on 8 and 9); `target.toml` maps
+each to the bug it meets most often. Each bug also has a narrow property over its shape region in
+`hegel/hegel_shapes_test.go` that fails deterministically beside its pin. `HEGEL_NO_KNOWN=1`
+switches the shapes off (`hegel/known.go` gates them by generated shape or by the shape of the one
+disagreement), and then every property passes.
+
+Accepted differences with GEOS 3.13.1, not bugs: buffer offsets at turns shallower than three
+degrees, where GEOS places the segments differently from JTS 1.20 (which simplefeatures matches
+to the last digit); GEOS collapsing a ring whose start vertex lies within the tolerance of the
+simplifying chord; overlays of near-degenerate inputs (coordinates within 1e-9 of coincidence);
+a union whose lineal result differs only by noding; and WKT coordinates differing by 1e-16.
 
 ## Not tested
 
@@ -112,3 +131,5 @@ methods, `ExactEquals` options, TWKB ID lists and per-dimension precisions, the 
 
 - 2026-09-20: written against 896784c3b5d5bee03a3a71f76bfa27028ebd1af1 (2026-08-21, v0.59.0+17)
   with hegel.dev/go/hegel v0.6.33; 8 bugs.
+- 2026-09-28: the weekly 1000-case run failed the overlay and prepared properties; bugs 9-12 recorded, the
+  known shapes drawn by default with narrow properties, four oracle tolerances added; 12 bugs.
