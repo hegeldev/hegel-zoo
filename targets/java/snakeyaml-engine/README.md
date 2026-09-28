@@ -80,7 +80,7 @@ label/anchor generators), custom constructors and representers, `Representer` fo
 directives and custom tags, timestamps and other tags outside the three schemas, the `%YAML 1.1`
 directive, marks and error positions, thread-safety.
 
-## Bugs (10)
+## Bugs (12)
 
 All at 93ecc0a (3.2-SNAPSHOT, 2026-08-10), all open, none reported upstream (the zoo only records).
 
@@ -115,6 +115,23 @@ All at 93ecc0a (3.2-SNAPSHOT, 2026-08-10), all open, none reported upstream (the
   scalar it does not fit (`!!int abc`, `!!float ''`, `!!binary '***'`) leaks a `NumberFormatException`,
   `StringIndexOutOfBoundsException` or `IllegalArgumentException` inside the `YamlEngineException`,
   and `!!bool maybe` is silently `null`. Siblings of snakeyaml/10 and /11.
+- **snakeyaml-engine/11** (roundtrip, medium; `pin11`): `Emitter.writeFolded` splits a folded scalar at a
+  single space once past the width without the guard `writeDoubleQuoted` has, so `[[[" a"]]]` at indent 2
+  and width 5 comes back as `[[["a"]]]`, `"a\n b"` as `"a b"`, and `" a b c"` gains a line break.
+  Sibling of snakeyaml/21.
+- **snakeyaml-engine/12** (roundtrip, low; `pin12`): a string starting with U+FEFF is written plain, and
+  first in the stream the scanner strips it as the byte order mark: `dump("\ufeff")` loads as no
+  document, `"\ufeffa"` as `"a"`. Sibling of snakeyaml/17 and jackson-yaml/13.
+
+Bugs 1, 11 and 12 are drawn by default, as of 2026-09-28: `mutatedDocumentsFailCleanly` reaches `+.inf`
+under the core schema by an edit (about one case in a thousand) and `dumpedValuesLoadBack` the folded and
+byte-order-mark shapes (a few in ten thousand); both are listed in `target.toml` as intermittent expected
+failures, and their shapes are skipped only under `HEGEL_NO_KNOWN=1` (`Zoo.NO_KNOWN`, read once). Narrow
+properties fail deterministically beside the pins: `plusInfinityLoadsUnderTheCoreSchema` (1),
+`foldedScalarsWithALeadingSpaceSurviveADumpPastTheWidth` (11), `stringsStartingWithAByteOrderMarkSurviveADump`
+(12). The older gates (the `+.inf` assume of `scalarsTypeLikeTheSpec`, `knownShape` for 1 and 2, `knownLoss`
+for 4, the accepts for 6, 8 and 10, the writer never spelling `+.inf`, `\L` or `\P`) are still on by
+default, which is steering; unsteering them is on the worklist.
 
 ## Observed and not recorded
 
@@ -137,3 +154,5 @@ All at 93ecc0a (3.2-SNAPSHOT, 2026-08-10), all open, none reported upstream (the
   the zoo's jackson-yaml target the day before and reproduced here with the engine alone, 4 new
   (the failsafe schema's empty scalars, ClassCastException on mismatched tags, the ignored indent 1/10,
   raw exceptions from explicit tags on unfit scalars).
+- 2026-09-28: the weekly 1000-case run reached bug 1 through the mutation property; 11 and 12 recorded
+  (found while verifying, reproduced standalone against the built jar), drawn by default with narrow properties.
