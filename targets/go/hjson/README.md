@@ -73,11 +73,12 @@ plain test per bug), requires `hegel.dev/go/hegel v0.6.33` in go.mod and raises 
 
 `TestHegelJSON`, `TestHegelParse`, `TestHegelRoundTrip`, `TestHegelTypedRoundTrip`,
 `TestHegelNodeFixedPoint`, `TestHegelOrderedMap`, `TestHegelNodeAPI`, `TestHegelTypedHints`,
-`TestHegelMarshalers`, `TestHegelCommentRoundTrip`.
+`TestHegelMarshalers`, `TestHegelCommentRoundTrip`; and two narrow ones over a recorded
+bug's region, `TestHegelArrayMultilineLayout` (10) and `TestHegelEmptyLastValue` (20).
 
 ## Bugs
 
-Nineteen, in `bugs.toml`. The parser combines no `\u` surrogate pairs (1); `Node.Insert` shadows
+Twenty, in `bugs.toml`. The parser combines no `\u` surrogate pairs (1); `Node.Insert` shadows
 its return values (2); the encoder's single-line `'''` form loses leading whitespace (4) and
 breaks the document for strings ending in a quote (5); quoteless strings are trimmed of Unicode
 spaces the encoder does not quote (6); multi-line `comment` tags are split on `Eol`, so CRLF
@@ -93,7 +94,8 @@ a field but `strings.ToLower` does not (16). Reading comments into a `Node` and 
 back doubles a comment after a root scalar (17) and turns a multiline string after a key comment
 ending in a line feed into a differently indented one that reads back changed (18). A string
 spelling a number beyond float64 is written quoteless, and the text then fails to read into
-`interface{}` (19).
+`interface{}` (19). A braceless root object whose last member has no value at the end of the
+input, `a:`, reads as `{"a": "\x00"}` (20).
 
 ## Modelled as recorded
 
@@ -115,6 +117,12 @@ spelling a number beyond float64 is written quoteless, and the text then fails t
 - The grammar model generates no `1.`-style numbers, no exponents beyond float64 and no root
   quoteless strings with a colon; surrogate pairs decode as two U+FFFD (1) in both decoding
   properties.
+- Drawn by default and expected to fail (STYLE.md rule 11): a root `key :` with nothing after
+  the colon but blanks and comments (20), which `TestHegelRoundTrip`, `TestHegelNodeFixedPoint`
+  and `TestHegelCommentRoundTrip` reach in about one case in a hundred, and a quoted string with
+  an escaped line feed in an array, which the comment round trip's `'''` skip (it looks at the
+  input text only) lets through to bug 10 now and then. `HEGEL_NO_KNOWN=1` skips the first and
+  the narrow properties.
 
 ## Not tested
 
