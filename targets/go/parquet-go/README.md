@@ -47,7 +47,7 @@ the case count):
   FIXED_LEN_BYTE_ARRAY of parquet-cpp's length for the precision, or INT32/INT64 with
   `store_decimal_as_integer`), turns ENUM into a string and bare repeated fields into LISTs.
 
-Fourteen bugs, found 2026-09-20 at v0.32.0+. Writing: `Schema.Deconstruct` (and so the deprecated `Writer`)
+Twenty bugs, fourteen found 2026-09-20 at v0.32.0+ and six by the weekly 1000-case run of 2026-09-28. Writing: `Schema.Deconstruct` (and so the deprecated `Writer`)
 panics on `[]*T` list elements and writes `[]string` elements tagged optional as nulls (1,
 medium); a `[N]byte` decimal whose precision needs more than N bytes passes `SchemaOf` and
 panics on write (2, low); a decimal tag on `[]int32` yields a bogus fixed-length column whose
@@ -69,9 +69,25 @@ of zero values dereferences nil (13, medium); LZ4_RAW pages that compress by les
 decoded from a stale pooled buffer, giving zeros, garbage or decoding errors, with parquet-go's
 own files too (14, high). Everything else parquet-go read right: every type and nesting, every
 other codec and encoding, statistics and page index bounds, row groups and metadata.
+The weekly run added: when the first column chunk has no column index (parquet-cpp writes none
+for a float chunk with an all-NaN page) `ReadPageIndex` stores an empty index for every other
+chunk (15, medium); and four ways a damaged file takes the process down instead of returning an
+error — a damaged byte-array page makes the reflection readers panic in `unsafe.Slice` (16,
+medium), `OpenFile` allocates the footer length the trailer claims, up to 4 GB, before checking
+it (17, medium), the LZ4 codec doubles its buffer on every decode error until the runtime aborts
+(18, medium), a leaf annotated MAP or LIST makes `OpenFile` panic in `Kind` (19, medium), and a
+v2 page header counting more nulls than values panics in `makeNumValues` (20, medium).
 
 Gates (`hegel/known.go` and the statistics check) cover the shapes of bugs 1, 4, 5, 6, 7, 8, 9,
-11, 12, 13 and 14 (bug 10 does not arise in the properties, whose Go types match the files);
+11, 12 and 13 by default (bug 10 does not arise in the properties, whose Go types match the
+files); those are still steering and unsteering them is on the worklist. Bugs 14 to 20 are drawn
+by default: `TestHegelReadsBackWhatItWrites` fails at its natural rate on 14, `TestHegelReadsWhatPyarrowWrites`
+on 15 and `TestHegelDamagedFilesNeverPanic` on 16 to 20 (it opens and reads every damaged file in
+a 2.5 GB-capped child so that a death is attributable to its stage), each listed in `target.toml` as
+an intermittent expected failure mapped to one of them; `HEGEL_NO_KNOWN=1` (read once) switches
+those shapes off, and narrow properties over the shape regions of 15, 17, 18, 19 and 20 fail
+deterministically beside the pins. parquet-cpp's missing column index under an all-NaN page is
+tolerated, not a bug;
 dictionary-encoded booleans, which the format allows for every physical type but parquet-cpp
 refuses to read ("Dictionary encoding not implemented for boolean type"), are counted, not
 compared. The generator keeps to the tag placements parquet-go accepts (logical types on LIST
