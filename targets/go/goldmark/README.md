@@ -29,7 +29,8 @@ is on the Go job's path in CI (`actions/setup-node`). The child process honours 
   task lists, autolink literals) the oracle for the GFM extensions.
 - **goldmark v1.8.6** — the last v1 release, for the rewrite: every CommonMark and GFM document
   is rendered by both major versions; a difference is a regression or a fix, and the v2 bugs
-  below say which are regressions (4, 8, 11, 29).
+  below say which are regressions (4, 8, 11, 29, 33). A v1/v2 difference where v2 agrees with
+  the reference implementation for that configuration counts as a v1 bug, not a regression.
 
 ## Method
 
@@ -47,6 +48,7 @@ NUL bytes.
 | CommonMarkAgreesWithCommonmarkJs | exact HTML agreement (XHTML, unsafe) with commonmark.js; micromark's verdict on every mismatch |
 | GfmAgreesWithMicromark | tables + strikethrough + task lists against micromark + gfm, on documents whose CommonMark core the two reference implementations agree on |
 | RewriteAgreesWithVersion1 | v2 against v1.8.6, CommonMark then GFM, minus the documented v2 changes |
+| ...AgreesWithCommonmarkJs, ...AgreesWithMicromark (ten) | narrow properties over the shape regions of bugs 9, 10, 16, 25, 28 and 30–34, judged by the same oracles; each fails deterministically |
 | LinkifyAgreesWithGfmAutolinkLiterals | the Linkify extension against `micromark-extension-gfm-autolink-literal` on runs of URLs, emails and words separated by the GFM start characters |
 | SafeOutputIsWellFormedHtml | every extension on, raw HTML off: balanced tags, quoted attributes, every `&` an escape, no `javascript:`/`vbscript:`/`file:`/`data:` (except images) href or src |
 | AstIsWellFormed | parent/sibling links, `ChildCount`, `OwnerDocument`, `Source()` segments inside the source and in order, `Dump` runs, rendering the same tree twice and from a string source gives the same HTML |
@@ -59,8 +61,8 @@ NUL bytes.
 
 Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
 shape (regexes and two small scanners for table cell counts), and accepted differences are
-normalised on both sides. With everything gated the four differential properties run clean at
-500–800 cases; `ZOO_COLLECT=1 go test -run TestHegel... -v .` prints the class counts and the
+normalised on both sides. With the switches of bugs 1–29 gated the four differential properties fail only on
+bugs 30–34 (below); `ZOO_COLLECT=1 go test -run TestHegel... -v .` prints the class counts and the
 first 25 mismatches instead of failing.
 
 ## Accepted differences (not bugs)
@@ -97,14 +99,24 @@ first 25 mismatches instead of failing.
 
 ## Bugs
 
-Twenty-nine, all with commonmark.js and micromark (and where they apply, cmark or the GFM text)
-agreeing on the correct answer; see `bugs.toml`. By theme: line endings (2, 3, 14; a leading
+Thirty-four, all with commonmark.js and micromark (and where they apply, cmark or the GFM text)
+agreeing on the correct answer, except bug 33, where micromark alone sides with goldmark against
+commonmark.js, cmark and markdown-it; see `bugs.toml`. By theme: line endings (2, 3, 14; a leading
 BOM, 1), tabs inside containers (9, 16, 28), image alt text (4, 5, 6), link destinations and
 titles (25, 26), HTML block starts (11, 17), fences (10, 13, 21), NUL handling (7), emphasis after
-a bare quote marker (12), list tightness (15), tables (8, 23, 29), and seven in the Linkify
-extension (18, 19, 20, 22, 24, 27). Bug 29 is the most visible: a paragraph line followed by a
-tab-indented `---` becomes a one-column table. Four are v2 regressions (4, 8, 11, 29); the rest are shared
-with v1.8.6.
+a bare quote marker (12) and the rule of three (33), lists (15, 30, 34), tables (8, 23, 29, 32),
+strikethrough (31), and seven in the Linkify extension (18, 19, 20, 22, 24, 27). Bug 29 is the most
+visible: a paragraph line followed by a tab-indented `---` becomes a one-column table. Five are v2
+regressions (4, 8, 11, 29, 33); the rest are shared with v1.8.6.
+
+Bugs 30–34 came out of the weekly 1000-case run of 2026-09-28 and are drawn by default: their
+`Known` switches are off unless `HEGEL_NO_KNOWN=1` is set, so the CommonMark differential fails
+at its natural rate on 30 (and 33, 34), the GFM differential on 32 (and 31), the rewrite property
+on 33, and each is listed in `target.toml` as an intermittent expected failure mapped to one of
+them. Each of the five, and bugs 9, 10, 16, 25 and 28, also has a narrow property over its shape
+region (`...AgreesWithCommonmarkJs` / `...AgreesWithMicromark`) that fails deterministically
+beside the pin. The `Known` switches of bugs 1–29 are still on by default, which is steering;
+unsteering them is on the worklist.
 
 ## Not tested
 
