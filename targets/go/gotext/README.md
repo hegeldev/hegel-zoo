@@ -87,8 +87,12 @@ Gates while the bugs are open (`Known` in hegel_test.go): no entry is fuzzy (/1)
 untranslated plural lookup accepts either msgid when the oracle and gotext both answered a msgid
 (/2); plural lookups of singular entries that answered `""` are skipped (/3); `IsTranslated` of
 singular entries is not checked when plural(1) != 0 (/4); no bare tests are generated (/5); the
-MarshalText property maps non-ASCII runes to ASCII (/6) and removes backslashes before quotes
-(/7). The properties run clean at 1000 cases.
+MarshalText property maps non-ASCII runes to ASCII (/6). The backslash-before-quote shape
+(/7) is drawn by default: `TestHegelMarshalTextRoundTrips` is the expected failure for gotext/7
+(intermittent: the shape is a few percent of catalogs) and the narrow
+`TestHegelMarshalTextRoundTripsBackslashBeforeQuote` splices a run of backslashes and a quote
+into a drawn string and fails every run; `HEGEL_NO_KNOWN=1` removes the backslashes instead.
+The other properties run clean at 1000 cases.
 
 ## History
 
