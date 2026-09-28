@@ -39,7 +39,12 @@ deny; allow and no deny; first determinate rule in priority order).
   DeleteRole, DeletePermission(sForUser), DeleteAllUsersByDomain, DeleteDomains, ClearPolicy
   returns what the documentation says, leaves the rules the model has (no duplicates), and
   afterwards Enforce, the implicit roles and the domains agree with the model (incremental role
-  links).
+  links). It is the expected failure for casbin/4 (intermittent: a batch removal naming a rule
+  in a domain that never had a link, under one per cent of cases); `HEGEL_NO_KNOWN=1` skips
+  that shape.
+- `TestHegelDomainsFollowRoleLinks`: the narrow property for casbin/4 - a few links in two
+  domains, one removed by a drawn route (single, filtered, batch, by user, or naming a rule
+  that was never added); `GetAllDomains` must list the domains of the remaining grouping rules.
 - `TestHegelKeyMatchPatterns`, `TestHegelKeyMatchPrefix`: keyMatch..keyMatch5, keyGet,
   keyGet2, keyGet3 against the documented pattern languages (`*`, `/*`, `:name`, `{name}`,
   repeated names, query strings) with a backtracking matcher written from the documentation.
