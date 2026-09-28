@@ -6,9 +6,13 @@ target list (shard) and the exit code (rc) as an artifact named zoo-<lang>-<job 
 script, run by the last job, reads them all and prints, for every shard that failed or left
 no artifact, the BAD verdict lines with their FAIL/PASS?/MISSING/NOTRUN lines and the failure
 excerpts, and for a shard that failed without a verdict for some target (a setup or build
-failure) the tail of its output. The whole digest stays under DIGEST_CAP characters, so that a
-reader keeping only the tail of the run's failed-steps log (Andon keeps 200,000 characters)
-gets all of it. Exit status 1 when any shard failed.
+failure) the tail of its output, and ends with a summary (the verdict and FAIL lines of every
+BAD target) so that even a cut digest's tail names them all. Sizes are measured as the run log
+stores them: every line carries a ~66-character prefix (job name, step name, timestamp) there,
+so a line costs LINE_COST on top of its characters, and the whole digest stays under DIGEST_CAP
+so measured, which keeps it inside the 200,000 characters of the run's failed-steps log that
+its reader keeps (the 2026-09-28 run lost its first 50k this way: 1,643 short lines). Exit
+status 1 when any shard failed.
 
 Usage: digest.py <artifacts dir>   with SHARDS_<LANG> env vars holding the JSON shard lists.
 """
@@ -20,20 +24,48 @@ import sys
 from pathlib import Path
 
 LANGS = ["rust", "go", "typescript", "java"]
-DIGEST_CAP = 150_000
-BLOCK_CAP = 16_000
-TAIL_CAP = 6_000
+LINE_COST = 70
+DIGEST_CAP = 170_000  # as measured by cost()
+BLOCK_CAP = 12_000
+TAIL_CAP = 5_000
 
 VERDICT = re.compile(r"^(OK |BAD) (\S+): ")
 
 
+def cost(text: str) -> int:
+    """The text's size in the run log: its characters plus a prefix per line."""
+    return len(text) + LINE_COST * (text.count("\n") + 1)
+
+
 def cut(text: str, cap: int, where: str = "middle") -> str:
-    if len(text) <= cap:
+    """Cut text so that cost(result) <= cap, keeping the head and tail (or the tail alone),
+    on line boundaries."""
+    if cost(text) <= cap:
         return text
+    lines = text.splitlines()
+    total = len(lines)
     if where == "tail":
-        return "[… " + str(len(text) - cap) + " characters cut]\n" + text[-cap:]
-    half = cap // 2
-    return text[:half] + "\n[… " + str(len(text) - cap) + " characters cut]\n" + text[-half:]
+        kept, size = [], 200
+        for l in reversed(lines):
+            if size + cost(l) > cap:
+                break
+            kept.append(l)
+            size += cost(l)
+        kept.reverse()
+        return "[… " + str(total - len(kept)) + " lines cut]\n" + "\n".join(kept)
+    head, tail, size = [], [], 200
+    i, j = 0, total - 1
+    while i <= j:
+        if len(head) <= len(tail):
+            if size + cost(lines[i]) > cap:
+                break
+            head.append(lines[i]); size += cost(lines[i]); i += 1
+        else:
+            if size + cost(lines[j]) > cap:
+                break
+            tail.append(lines[j]); size += cost(lines[j]); j -= 1
+    tail.reverse()
+    return "\n".join(head) + "\n[… " + str(j - i + 1) + " lines cut]\n" + "\n".join(tail)
 
 
 def blocks(out: str) -> tuple[str, list[tuple[str, str, str]], str]:
@@ -83,6 +115,7 @@ def main() -> int:
     failed = []  # (title, text)
     ok_shards = 0
     bad_targets = []
+    summary = []  # every BAD verdict line with its FAIL/PASS?/MISSING/NOTRUN lines, for the trailer
     for lang in LANGS:
         for idx, shard in enumerate(shards[lang]):
             d = root / f"zoo-{lang}-{idx}"
@@ -104,6 +137,8 @@ def main() -> int:
                 if flag == "BAD":
                     bad_targets.append(target)
                     parts.append(cut(text, BLOCK_CAP))
+                    summary.extend(l for l in text.splitlines()
+                                   if VERDICT.match(l) or re.match(r"^\s+(FAIL|PASS\?|MISSING|NOTRUN)\s", l))
             missing = [t for t in shard.split() if t not in seen]
             if missing:
                 parts.append("no verdict for: " + " ".join(missing) + " (setup or build failure, or the run stopped)")
@@ -123,15 +158,16 @@ def main() -> int:
     if not failed:
         print("\n".join(head))
         return 0
+    trailer = "\n==== summary ====\n" + "\n".join(head) + "\n" + "\n".join(summary)
     body = []
-    budget = DIGEST_CAP - len("\n".join(head)) - 200
+    budget = DIGEST_CAP - cost("\n".join(head)) - cost(trailer) - 200
     per = max(2000, budget // len(failed))
     for title, text in failed:
         body.append(f"\n==== {title} ====\n{cut(text, per)}")
     digest = "\n".join(head) + "\n" + "\n".join(body)
-    if len(digest) > DIGEST_CAP:
-        digest = cut(digest, DIGEST_CAP, "tail")
-    print(digest)
+    if cost(digest) > DIGEST_CAP - cost(trailer):
+        digest = cut(digest, DIGEST_CAP - cost(trailer), "tail")
+    print(digest + "\n" + trailer)
     return 1
 
 
