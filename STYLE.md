@@ -1173,6 +1173,20 @@ cases), so a table drawn by `pick` is not uniform and a shape's rate is measured
 the table; and where a bug's neighbouring region is defined by the grammar (a fraction after the
 integer takes the number off the fast path), the `NO_KNOWN` switch is a generator field, not a skip.
 
+The fifty-first batch (java/agrona; turn 801) closed the unsteering worklist but for go/go-runewidth,
+which waits on a bump of its base. agrona had been put off for the size of its patch, and the
+lesson is that the size of a patch says nothing about the size of its steering: six lines gated
+the three open bugs (a `value != 0`, a `length <= INT_MAX_DIGITS`, an early return and two
+`break`s), and the skip the README described for the fixed agrona/3 no longer existed in the
+test at all; the shape it named is drawn in one case of eight and passes. Under the flag the
+gates became generator fields rather than skips (excess leading zeros cut to the digit budget,
+a growing self copy drawing its source within the capacity), so nothing is rejected and the
+region's neighbours stay tested. A property whose failing shape is 8.5% of cases still passed
+two hundred-case runs of eight, hegel-java's draw bias again, and is mapped intermittent. One
+harness point: a check that lets the library's exception escape reports the bug as an error
+rather than a failure message; routing the parse through the existing `attempt` helper makes
+the shrunk output name the value, without weakening the check.
+
 The lz4 subagent also observed that hegel-go's case sequence is reproducible per test binary,
 so a wide property with two basins (WriterFramesFollowTheSpec, lz4/2 or lz4/8) lands in one of
 them for as long as the binary is unchanged and moves when it changes: "run it six times" proves
