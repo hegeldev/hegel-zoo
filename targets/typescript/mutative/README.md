@@ -67,8 +67,7 @@ become strings, so a Map with number or
 boolean keys does not round-trip through string patches; `enableAutoFreeze` leaves `Object.isFrozen`
 false on Maps and Sets (their mutators throw); in strict mode a Set holding a Date cannot be iterated at
 all; assigning the base's own object at another key and mutating it there mutates the base (immer
-likewise). Known bugs are gated on a mismatch whose shape matches (`known mutative/N` counts), never
-avoided up front.
+likewise).
 
 Not covered: `mark` returning a custom shallow-copy function or `"mutable"`, subclasses of Map/Set,
 getters/setters and non-enumerable or symbol properties, `castDraft`/`castImmutable` (types only), the
@@ -77,7 +76,7 @@ auto-freeze in development).
 
 ## Bugs
 
-Twelve, all pinned (`TestHegelPin...`) and recorded in `bugs.toml`: a Set draft moved to another key
+Fourteen, all pinned (`TestHegelPin...`) and recorded in `bugs.toml`: a Set draft moved to another key
 (`reverse`, `unshift`, `sort`, `d.b = d.a; delete d.a`, or wrapped into a new array that replaces it)
 finalizes to its unmodified value (mutative/1, high); a Set draft iterates the -0 it was given where a
 Set holds +0 (/2); assigning the base's own child back after modifying its draft emits a `remove` patch
@@ -93,16 +92,41 @@ by its parent's `unshift` and modified again, emits its element patches under it
 inverse does not apply (/10); array patches do not tell 0 from -0, so `d[0] = -0` over a 0 (or a
 `reverse` swapping them) emits no patch and a replay misses the change (/11); an element draft that
 was only read into and then moved by its parent (`d[0][0]; d.reverse()`) finalizes to a shallow copy
-instead of the base object (/12, found 2026-10-06 with /11).
-Drawn by default (STYLE.md rule 11): `TestHegelCreateMatchesTheModelAndImmer` and
-`TestHegelPatchesReplayAndInvert` keep drawing the shapes of mutative/12 and /11 and fail at their
-natural rates (a few cases in ten thousand), so they are expected failures marked intermittent beside
-the narrow properties `TestHegelMovedUntouchedDraftsFinalizeToTheBaseObject` and
-`TestHegelArrayPatchesTellZeroFromNegativeZero`, which fail every run. `HEGEL_NO_KNOWN=1` (read once)
-switches those two shapes off; the older gates (`known mutative/N` counts) stay on by default and are
-not yet under the switch.
+instead of the base object (/12, found 2026-10-06 with /11); under `enableAutoFreeze` the development build
+throws `Forbids circular reference` for a state without a cycle that holds a modified copy of a base node
+beside the node itself - its draft aliased into a sibling, the base's node assigned back, the new draft
+changed to hold the sibling - because `deepFreeze` canonicalizes every finalized copy to its original
+(/13, found 2026-10-06 by the unsteered Frozen property); a draft assigned into an object, array, Map or Set that
+the same draft function then replaces by a primitive still emits its patch at the vanished path, ahead of the
+container's replace, so `apply(state, inverse)` throws (/14, found 2026-10-06 by the Patches property under
+`HEGEL_NO_KNOWN=1`, one case in a few thousand).
+Drawn by default (STYLE.md rule 11, the whole target since 2026-10-06): the generators draw the shapes
+of all fourteen recorded bugs, and a mismatch whose scenario has a recorded shape fails with
+`(shape of mutative/N)` on its first line, so the wide properties fail at their natural rates and are
+expected failures mapped to the bug they most often shrink to: `TestHegelPatchesReplayAndInvert` fails
+every run (the /1, /3, /4, /5 and /9 shapes are 5% of its cases together; it shrinks to /4 most often,
+also to /3, /9, /1, /5, and to /11 and /14 at a few cases in ten thousand), and the other seven fail in about
+half the 100-case runs and every 1000-case run, mapped intermittent: Create → /5 (also /4, /1, /12),
+Current → /5 (also /1, /4, /8), Reads → /2 (also /5), Frozen → /5 (also /4, /1, /13), ReturnValues → /6
+(its /7 and /5 cases shrink to /6's smaller one), Mark → /3 (also /9, /1), Strict → /5 (also /1). Beside
+them one narrow property per bug (`TestHegelMovedSetDraftsKeepTheirChanges`,
+`TestHegelSetDraftsIterateZeroForNegativeZero`, `TestHegelAssigningTheOriginalChildBackEmitsNoPatch`,
+`TestHegelUndefinedAssignedToAVacatedKeyIsKept`, `TestHegelSetDraftsYieldTheirArrayElementOnEveryIteration`,
+`TestHegelApplyReplaysARootReplaceToADate`, `TestHegelReturningAnUntouchedChildDraftAfterAMutationThrows`,
+`TestHegelCurrentWorksWithAFreshSetHoldingDraftsOrNaN`, `TestHegelSetElementChangePatchesInvertBesideAnAddOrRemoval`,
+`TestHegelMovedArrayPatchesUseTheirNewIndex`, `TestHegelArrayPatchesTellZeroFromNegativeZero`,
+`TestHegelMovedUntouchedDraftsFinalizeToTheBaseObject`, `TestHegelAutoFreezeAcceptsARestoredNodeBesideItsModifiedCopy`,
+`TestHegelPatchesOfAContainerReplacedAfterHoldingADraftInvert`),
+each over the bug's shape region with random contents and the same oracle, failing every run; and the
+pins. `HEGEL_NO_KNOWN=1` (read once) counts such mismatches as `known mutative/N` and rejects the case
+(assume) or leaves the check out, and skips the narrow properties whole; the skips are 5% of Patches'
+cases, 3.5% of Strict's and under 2% elsewhere. The documented conventions above are tolerated in both
+modes. Open: under the switch the Patches property failed once in some eleven thousand cases on a shape
+not recorded (2026-10-06, not caught again in 8000 more), so a rare unclassified shape remains in it. `ZOO_COLLECT=1` prints the counts at the end of each property.
 
 ## History
 
 - 2026-09-19: created at 63774685 (1.3.0, 2026-08-14) with 9 properties and 10 bugs.
+- 2026-10-06: unsteered (STYLE.md rule 11): the ten older gates became failures naming their shape, one narrow property per
+  bug, `HEGEL_NO_KNOWN=1` the only way past them; the Frozen property then found mutative/13 and the Patches property, under the switch, mutative/14.
 - 2026-10-06: weekly 1000-case run 37296133806 failed the Create and Patches properties; triage found mutative/11 (array patches blind to the sign of zero) and /12 (moved untouched draft finalizes to a copy), narrow properties and pins for both, the wide properties mapped intermittent; test flaws fixed on the way (untouched-path tracking follows moved nodes, `restore` drawn only into the base's own containers, immer's incomplete alias patches and 0/-0 replay counted as oracle defects, /4 and /10 gates widened to new routes).
