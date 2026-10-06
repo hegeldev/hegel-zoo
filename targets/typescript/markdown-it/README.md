@@ -68,7 +68,7 @@ GFM autolink literals, single-tilde strikethrough, a pipeless header row, `~~` t
 Each shape was shrunk by hand (line-drop, character-drop, character-replace) with the gates of the
 test file applied, so the pins are minimal.
 
-## Bugs (16)
+## Bugs (18)
 
 All wrong-result, all still open at the pin. The parser is spec-exact on the ordinary paths — the
 spec fixtures pass and random documents agree with commonmark.js — and the bugs sit where two
@@ -78,7 +78,22 @@ before the container rules (9), unclosed fences at boundaries (3, 8), the URL no
 renderer rules that bypass `renderToken` (7), inline parsing on stripped-but-not-quite content
 (5, 15), the two decoding paths for entities (2), and the GFM strikethrough rule cutting a run of
 three or more tildes into `~~` pairs where GFM has text (16, found by the micromark differential
-on CI). Medium: 4, 8, 9, 10, 12, 15.
+on CI), the link destination scanner skipping the character after a backslash even when it is a
+line ending (17), and the label scan treating an image as one token, so a link forms around an
+image whose alt holds a link (18; both found while steering the commonmark.js differential at the
+weekly budget). Medium: 4, 8, 9, 10, 12, 15.
+
+Drawn by default (STYLE.md rule 11): `TestHegelCommonMarkPresetAgreesWithCommonmarkJs` keeps
+drawing the container shapes of 10 (lines that cannot interrupt a paragraph after a definition,
+found by the weekly 1000-case run of 2026-10-05), 12 and 8 and the shapes of 17 and 18, and is
+mapped to markdown-it/10 as intermittent (about one case in two hundred); the narrow properties
+`TestHegelLinesAfterADefinitionStayInItsParagraph` (10),
+`TestHegelBlocksAfterATightItemParagraphStartOnTheirOwnLine` (7),
+`TestHegelIndentedLineShortOfTheItemOffsetContinuesTheItem` (12),
+`TestHegelBackslashBeforeALineEndingEndsTheDestination` (17) and
+`TestHegelLinkTextWithALinkInsideAnImageIsNotALink` (18) draw only their regions and fail every
+run beside the pins; `HEGEL_NO_KNOWN=1` (read once) switches those shapes off. The other gates
+(`SHAPES`, the regex gates of the older bugs) are still on by default, as before.
 
 ## Not tested
 
@@ -91,3 +106,9 @@ long as the rule), the CLI, source maps, the browser bundles.
 - 2026-09-17: created at 15.0.2 (`3c51991`); 15 bugs.
 - 2026-09-18: markdown-it/16 (tilde runs of three or more), found by the CI run of the micromark
   differential; gate `known-long-tilde-run`.
+- 2026-10-06: markdown-it/17 (backslash before a line ending in a destination) and /18 (link around
+  an image around a link), found while steering the commonmark.js differential at the weekly budget;
+  the differential now draws the container shapes of 10/12/8 by default (mapped intermittent), narrow
+  properties for 7, 10, 12, 17, 18; the micromark differential's tilde gate widened to `*~`/`~*`
+  (micromark's strikethrough registers a single tilde as an attention marker) and a GFM
+  autolink-literal tolerance added.
