@@ -14,6 +14,8 @@
 **`src/packet.rs`**
 - `pn_wire_roundtrip`: Any encoded packet number of any width survives a wire roundtrip, its encoding is exactly `len()` bytes, and the wire tag agrees with `len()` via `decode_len`. Generalizes `roundtrip_packet_numbers` above.
 - `pn_new_expand_recovers_original`: RFC 9000 Appendix A: a packet number truncated relative to `largest_acked` is recovered exactly by `expand(expected)` for any decoder reference point `expected` between `largest_acked` and the packet number itself. Generalizes the exhaustive small-range `pn_expand_roundtrip` above to the full packet number space (packet numbers are < 2^62, RFC 9000 §12.3).
+- `pn_new_expand_across_u24_block_boundary`: the region of quinn/2 with random contents, judged by the same oracle: a 3-byte truncation of a packet number just past a 2^24 boundary (block index ending in two set bits) is recovered from any reference point in the block before. Fails every run; under `HEGEL_NO_KNOWN=1` it draws the neighbouring block indexes, where nothing leaks, and passes.
+- `pn_new_u24_keeps_bits_above_24`: pin of quinn/2: `PacketNumber::new(2^26, 58720257)` is `U24(0)`, as `decode` would give for the same three bytes, and expands against 59790379 to 2^26 (it gives `U24(67108864)` and 100663296).
 - `partial_decode_accounts_for_every_byte`: Port of `fuzz/fuzz_targets/packet.rs`: `PartialDecode::new` never panics on arbitrary input, and on success every input byte is accounted for exactly once between the decoded packet and the returned trailing datagram bytes.
 
 **`src/range_set/btree_range_set.rs`**
@@ -38,6 +40,10 @@
 
 ## Not tested
 
+## Known bugs (drawn by default)
+
+quinn/2: `PacketNumber::new` stores a 3-byte truncation as `n as u32` without masking it to 24 bits, so `expand` ORs bits 24..31 of `n` into the reference point's block. The wide property `pn_new_expand_recovers_original` keeps drawing that shape and is mapped to quinn/2 as intermittent (the leak needs a block index ending in two or more set bits and a reference point in the block before: well under 1% of its cases, found by the weekly 1000-case run); `pn_new_expand_across_u24_block_boundary` draws only that region and fails every run; `HEGEL_NO_KNOWN=1` (read once) switches the shape off in both, and the pin stays.
+
 ## History
 
 - 2026-07-20: predecessor base commit `fec2f8960df4` (build(deps): bump rustls from 0.23.41 to 0.23.42).
@@ -49,3 +55,4 @@
 - 2026-09-16: base bumped 769ef759a35d → 5358e3463ab5 (2026-09-16, "fix: cleanup state if transmit failed"; 0.12.0); 0 bug(s) still reproduce; fixed upstream: quinn/1. 335 tests pass.
 - 2026-09-16: base bumped 5358e3463ab5 → d4083432f683 (2026-09-16, "ci: fix workflow formatting"; 0.12.0); 0 bug(s) still reproduce. 336 tests pass.
 - 2026-09-17: base bumped d4083432f683 → db60822629ee (2026-09-17, "proto: bound sent-packet storage by live entries"; 0.12.0); 0 bug(s) still reproduce. 337 tests pass.
+- 2026-10-06: quinn/2 found by the weekly run's 1000-case budget on `pn_new_expand_recovers_original` (unmasked 3-byte truncation in `PacketNumber::new`); mapped intermittent, narrow property `pn_new_expand_across_u24_block_boundary` and pin `pn_new_u24_keeps_bits_above_24` added, `HEGEL_NO_KNOWN=1` gate.
