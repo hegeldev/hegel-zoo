@@ -65,7 +65,7 @@ inside an integration point): the parser is conformant but for that, and the oth
 - `TestHegelPlainTextBecomesAPreElement`: `PlainTextConversionStream` builds
   `html/head/body/pre` with the text as the spec's "load a text document" describes.
 
-## Known bugs (15, see bugs.toml)
+## Known bugs (18, see bugs.toml)
 
 The serializer leaves `<` and `>` unescaped in attribute values (the 2025 spec change, 1). Source
 locations: a newline right after `&` is counted twice (2), an unterminated comment or doctype ends
@@ -82,6 +82,19 @@ content after a self-closing `<svg/>` or `<math/>` (11) and switches to raw text
 serializes integer-named attributes first (13). `parseFragment` in a `noscript` context reads the
 input as raw text even with `scriptingEnabled: false` (14). A CDATA section inside an SVG `title`,
 `desc` or `foreignObject` or a MathML text element is read as a bogus comment (15).
+The SAX parser drops the newline after a tag that follows `<pre>`, `<textarea>` or `<listing>`
+(the simulator never clears its skip flag on tags, 16). `emitText` leaves text unescaped before a
+raw-text start tag and after a raw-text element until the next start tag (17). The htmlparser2
+adapter keeps one attribute per local name, `href` beside `xlink:href` losing the earlier one (18).
+
+Drawn by default (STYLE.md rule 11): the shapes of 16, 17 and 18, and the routes to 4 (astral
+characters in attribute names, bogus comments and end tags) and 11 (CDATA and NUL after a
+self-closing foreign root) that the weekly 1000-case run of 2026-10-05 found; the wide properties
+that reach them (`TestHegelSaxTokensMatchTheParser`, `TestHegelReemittedTokensParseAlike`,
+`TestHegelLocationsPointIntoTheSource`, `TestHegelRewritingStreamPassesTheSourceThrough`,
+`TestHegelTreeAdaptersAgree`) are mapped intermittent, one narrow property per bug fails every run
+beside the pin, and `HEGEL_NO_KNOWN=1` (read once, `noKnown` in `known.mjs`) switches those shapes
+off. The older routes to 1-15 are still gated by default in `known.mjs`, as before.
 
 ## Conventions followed, not recorded
 
