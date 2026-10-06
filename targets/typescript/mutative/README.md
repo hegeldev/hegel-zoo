@@ -77,7 +77,7 @@ auto-freeze in development).
 
 ## Bugs
 
-Ten, all pinned (`TestHegelPin...`) and recorded in `bugs.toml`: a Set draft moved to another key
+Twelve, all pinned (`TestHegelPin...`) and recorded in `bugs.toml`: a Set draft moved to another key
 (`reverse`, `unshift`, `sort`, `d.b = d.a; delete d.a`, or wrapped into a new array that replaces it)
 finalizes to its unmodified value (mutative/1, high); a Set draft iterates the -0 it was given where a
 Set holds +0 (/2); assigning the base's own child back after modifying its draft emits a `remove` patch
@@ -90,8 +90,19 @@ a Date (/6); returning an untouched child draft after mutating the root silently
 element was modified and another element added or removed describe the element twice, so the inverse
 fails and a replay on a copy duplicates the element (/9); an array with a modified element draft, moved
 by its parent's `unshift` and modified again, emits its element patches under its old index, so the
-inverse does not apply (/10).
+inverse does not apply (/10); array patches do not tell 0 from -0, so `d[0] = -0` over a 0 (or a
+`reverse` swapping them) emits no patch and a replay misses the change (/11); an element draft that
+was only read into and then moved by its parent (`d[0][0]; d.reverse()`) finalizes to a shallow copy
+instead of the base object (/12, found 2026-10-06 with /11).
+Drawn by default (STYLE.md rule 11): `TestHegelCreateMatchesTheModelAndImmer` and
+`TestHegelPatchesReplayAndInvert` keep drawing the shapes of mutative/12 and /11 and fail at their
+natural rates (a few cases in ten thousand), so they are expected failures marked intermittent beside
+the narrow properties `TestHegelMovedUntouchedDraftsFinalizeToTheBaseObject` and
+`TestHegelArrayPatchesTellZeroFromNegativeZero`, which fail every run. `HEGEL_NO_KNOWN=1` (read once)
+switches those two shapes off; the older gates (`known mutative/N` counts) stay on by default and are
+not yet under the switch.
 
 ## History
 
 - 2026-09-19: created at 63774685 (1.3.0, 2026-08-14) with 9 properties and 10 bugs.
+- 2026-10-06: weekly 1000-case run 37296133806 failed the Create and Patches properties; triage found mutative/11 (array patches blind to the sign of zero) and /12 (moved untouched draft finalizes to a copy), narrow properties and pins for both, the wide properties mapped intermittent; test flaws fixed on the way (untouched-path tracking follows moved nodes, `restore` drawn only into the base's own containers, immer's incomplete alias patches and 0/-0 replay counted as oracle defects, /4 and /10 gates widened to new routes).
