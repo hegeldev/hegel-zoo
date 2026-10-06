@@ -20,10 +20,10 @@ index 33e0f92..32569ba 100644
 +)
 diff --git a/hegel_test.go b/hegel_test.go
 new file mode 100644
-index 0000000..e5e2202
+index 0000000..86308b0
 --- /dev/null
 +++ b/hegel_test.go
-@@ -0,0 +1,1911 @@
+@@ -0,0 +1,2075 @@
 +// Hegel property tests for apd (the Hegel zoo, https://github.com/hegeldev/hegel-zoo).
 +//
 +// Oracles: math/big for BigInt (apd's own testing/quick suite ported and widened to aliased
@@ -39,6 +39,7 @@ index 0000000..e5e2202
 +import (
 +	"bufio"
 +	"bytes"
++	"context"
 +	"encoding/gob"
 +	"encoding/json"
 +	"fmt"
@@ -51,6 +52,7 @@ index 0000000..e5e2202
 +	"strings"
 +	"sync"
 +	"testing"
++	"time"
 +
 +	. "github.com/cockroachdb/apd/v3"
 +	"hegel.dev/go/hegel"
@@ -68,10 +70,15 @@ index 0000000..e5e2202
 +	return nil
 +}
 +
++// noKnown switches the known-bug shapes off (HEGEL_NO_KNOWN=1, read once): the wide
++// properties then leave out the shapes recorded in bugs.toml instead of failing on them.
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") == "1"
++
 +// property runs fn as a Hegel property, turning a panic in the code under test into a
 +// failure of the current test case (hegel-go re-raises panics after shrinking, which would
 +// abort the test binary and hide every later test).  Hegel's own control-flow panics pass.
-+func property(t *testing.T, fn func(ht *hegel.T)) {
++// Options given here come after the harness's own.
++func property(t *testing.T, fn func(ht *hegel.T), opts ...hegel.Option) {
 +	t.Helper()
 +	hegel.Test(t, func(ht *hegel.T) {
 +		defer func() {
@@ -86,7 +93,7 @@ index 0000000..e5e2202
 +			ht.Fatalf("panic in the code under test: %v", r)
 +		}()
 +		fn(ht)
-+	}, hegelOpts()...)
++	}, append(hegelOpts(), opts...)...)
 +}
 +
 +func n(tc hegel.TestCase, lo, hi int) int {
@@ -1460,6 +1467,15 @@ index 0000000..e5e2202
 +				cond, err = c.Sqrt(&want, x)
 +				e.Sqrt(&got, x)
 +			case "Ln":
++				if lnSeriesShape(c, x) {
++					if noKnown {
++						continue // apd/18: Ln may never return; the step is left out
++					}
++					if p := lnInChild(c, x); p.timedOut {
++						ht.Fatalf("step %d Ln(%s) [prec %d Emin %d traps %s] did not return within %s (apd/18)",
++							i, xs, prec, c.MinExponent, c.Traps, lnProbeDeadline)
++					}
++				}
 +				cond, err = c.Ln(&want, x)
 +				e.Ln(&got, x)
 +			case "Exp":
@@ -1528,6 +1544,109 @@ index 0000000..e5e2202
 +			ht.Fatalf("json round trip of %s: %s (%v)", xs, &jb, err)
 +		}
 +	})
++}
++
++// ---------------------------------------------------------------------------------------
++// Ln in a child process (apd/18).
++//
++// apd's Ln computes an operand within 0.1 of 1 (or with leading digit 9, so that the
++// range-reduced operand is) with a power series whose every step goes through an ErrDecimal
++// over a copy of the caller's context.  Once a trap fires, ErrDecimal makes every later step
++// a no-op, but the loop's exit test reads a value those steps no longer update, so a trapped
++// Inexact, or a trapped Subnormal/Underflow once a term drops below 10^MinExponent (which
++// happens whenever MinExponent is above about -(Precision+2)), spins forever; when the trap
++// lands on the step that writes the exit value the call returns a spurious underflow error
++// instead.  A call that may never return runs in a fresh copy of the test binary with a
++// capped address space and a deadline (STYLE.md rule 11); TestHegelLnProbeChild is the
++// child side.
++
++const (
++	lnProbeEnv      = "APD_HEGEL_LN_PROBE"
++	lnProbeDeadline = time.Second // a returning Ln takes microseconds; the child starts in a few ms
++)
++
++// lnSeriesShape reports whether Ln(x) under c takes the power-series branch with a trap that
++// can fire inside it: the region of apd/18 (a superset of it: whether a term trips the trap
++// depends on MinExponent and on how close x is to 1).
++func lnSeriesShape(c *Context, x *Decimal) bool {
++	if c.Traps&(Inexact|Subnormal|Underflow) == 0 || x.Form != Finite || x.Sign() <= 0 {
++		return false
++	}
++	var diff Decimal
++	exact := &Context{Precision: 0, MaxExponent: MaxExponent, MinExponent: MinExponent}
++	exact.Sub(&diff, x, New(1, 0))
++	if diff.Sign() == 0 {
++		return false // ln 1 = 0 is special-cased
++	}
++	if diff.Abs(&diff).Cmp(New(1, -1)) <= 0 {
++		return true
++	}
++	return strings.HasPrefix(x.Coeff.String(), "9")
++}
++
++// lnProbe is what a child's Ln came to.
++type lnProbe struct {
++	timedOut bool
++	result   string // the Decimal as the child printed it
++	err      string // the error's text, "" if none
++}
++
++var (
++	lnProbeMu   sync.Mutex
++	lnProbeSeen = map[string]lnProbe{} // verdicts per case: the shrinker re-runs cases
++)
++
++// lnInChild runs c.Ln(x) in a fresh copy of the test binary, its address space capped by
++// sh's ulimit, and reports what it returned, or that it did not return within the deadline.
++func lnInChild(c *Context, x *Decimal) lnProbe {
++	key := strings.Join([]string{strconv.Itoa(int(c.Precision)), strconv.Itoa(int(c.MaxExponent)),
++		strconv.Itoa(int(c.MinExponent)), strconv.Itoa(int(c.Traps)), string(c.Rounding), x.String()}, "|")
++	lnProbeMu.Lock()
++	p, seen := lnProbeSeen[key]
++	lnProbeMu.Unlock()
++	if seen {
++		return p
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), lnProbeDeadline)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `ulimit -v 4000000 && exec "$0" "$@"`,
++		os.Args[0], "-test.run=^TestHegelLnProbeChild$", "-test.count=1")
++	cmd.Env = append(os.Environ(), lnProbeEnv+"="+key)
++	out, err := cmd.Output()
++	if ctx.Err() != nil {
++		p = lnProbe{timedOut: true}
++	} else if _, verdict, ok := strings.Cut(string(out), "LNPROBE "); ok {
++		verdict, _, _ = strings.Cut(verdict, "\n")
++		p.result, p.err, _ = strings.Cut(verdict, " ")
++	} else {
++		p = lnProbe{err: fmt.Sprintf("no verdict from the child (%v): %q", err, out)}
++	}
++	lnProbeMu.Lock()
++	lnProbeSeen[key] = p
++	lnProbeMu.Unlock()
++	return p
++}
++
++// TestHegelLnProbeChild is the child side of lnInChild: it runs the Ln the environment
++// describes and prints the outcome.  In a normal run it is skipped.
++func TestHegelLnProbeChild(t *testing.T) {
++	spec := os.Getenv(lnProbeEnv)
++	if spec == "" {
++		t.Skip("the child side of lnInChild")
++	}
++	f := strings.Split(spec, "|")
++	prec, _ := strconv.Atoi(f[0])
++	emax, _ := strconv.Atoi(f[1])
++	emin, _ := strconv.Atoi(f[2])
++	traps, _ := strconv.Atoi(f[3])
++	c := &Context{Precision: uint32(prec), MaxExponent: int32(emax), MinExponent: int32(emin), Traps: Condition(traps), Rounding: Rounder(f[4])}
++	var d Decimal
++	_, err := c.Ln(&d, parse(f[5]))
++	errText := ""
++	if err != nil {
++		errText = err.Error()
++	}
++	fmt.Printf("LNPROBE %s %s\n", &d, errText)
 +}
 +
 +// ---------------------------------------------------------------------------------------
@@ -1932,6 +2051,51 @@ index 0000000..e5e2202
 +			ht.Fatalf("SetFloat64(%v) = %s, exact value %s", f, d.Text('e'), exact.FloatString(30))
 +		}
 +	})
++}
++
++// apd/18: Ln never returns when a trap fires inside its power series.  Under DefaultTraps
++// (Subnormal and Underflow trapped) with MinExponent above -(Precision+2), a term of the
++// series for an operand within 0.1 of 1, or with leading digit 9, falls below 10^MinExponent
++// before the series converges, and the call spins forever (at the edge of the region it
++// returns a spurious underflow error instead).  The result itself is nowhere near the
++// exponent range, as Python's ln shows; it is compared to within one ulp like the other
++// transcendental functions.  No shrink phase: every case of the region costs the deadline.
++func TestHegelLnReturnsWhenATermOfItsSeriesIsSubnormal(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		prec := n(ht, 2, 20)
++		emin := -n(ht, 3, prec+1)
++		digits := genDigits(ht, 6)
++		ht.Assume(digits != "0")
++		e := n(ht, -9, 9)
++		// 0.9d… and 1.0d… take the series directly; 9d…E<e> after the range reduction to 0.9d….
++		xs := pick(ht, []string{"0.9" + digits, "1.0" + digits, "9" + digits + "E" + strconv.Itoa(e)})
++		c := &Context{Precision: uint32(prec), MaxExponent: 999, MinExponent: int32(emin), Traps: DefaultTraps, Rounding: RoundHalfEven}
++		want := ask(ht, pyReq{Prec: prec, Rounding: "ROUND_HALF_EVEN", Emin: emin, Emax: 999, Op: "ln", Args: []string{xs}})
++		ht.Assume(!strings.Contains(strings.Join(want.Flags, ","), "Subnormal")) // a result below 10^Emin is rightly trapped
++		where := fmt.Sprintf("Ln(%s) [prec %d Emin %d DefaultTraps]", xs, prec, emin)
++		p := lnInChild(c, parse(xs))
++		switch {
++		case p.timedOut:
++			ht.Fatalf("%s did not return within %s, want %s", where, lnProbeDeadline, *want.Result)
++		case p.err != "":
++			ht.Fatalf("%s returned the error %q, want %s", where, p.err, *want.Result)
++		case !sameValue(parse(p.result), *want.Result) && !ulpApart(parse(p.result), parse(*want.Result)):
++			ht.Fatalf("%s = %s, want %s", where, p.result, *want.Result)
++		}
++	}, hegel.WithPhases(hegel.PhaseGenerate))
++}
++
++// apd/18, the example: Ln(0.95) at precision 10 with MinExponent -5 under DefaultTraps
++// never returns (Python: -0.05129329439).
++func TestHegelPinLnSpinsWhenASeriesTermIsSubnormal(t *testing.T) {
++	c := &Context{Precision: 10, MaxExponent: 999, MinExponent: -5, Traps: DefaultTraps, Rounding: RoundHalfEven}
++	p := lnInChild(c, parse("0.95"))
++	switch {
++	case p.timedOut:
++		t.Fatalf("Ln(0.95) [prec 10 Emin -5 DefaultTraps] did not return within %s, want -0.05129329439", lnProbeDeadline)
++	case p.err != "" || p.result != "-0.05129329439":
++		t.Fatalf("Ln(0.95) [prec 10 Emin -5 DefaultTraps] = %s (error %q), want -0.05129329439", p.result, p.err)
++	}
 +}
 +
 +func note(ht *hegel.T, format string, args ...interface{}) { ht.Note(fmt.Sprintf(format, args...)) }

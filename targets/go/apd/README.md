@@ -43,14 +43,19 @@ Abs, Neg, Cmp, Round, Reduce, RoundToIntegral*, Floor, Ceil), `TestHegelDivision
 `TestHegelCmpTotalAgreesWithPythonDecimal`, `TestHegelTextFormatsAgreeWithTheModel`,
 `TestHegelConversionsAgreeWithStrconv`, `TestHegelSetFloat64RoundTrips`,
 `TestHegelDecimalHelpersAgreeWithTheModel`, `TestHegelErrDecimalMatchesContext`,
-`TestHegelBigIntEncodingRoundTrips`; 17 pinned expected failures below. All general properties
-pass at 1000 cases × 3.
+`TestHegelBigIntEncodingRoundTrips`; 17 pinned expected failures below, plus apd/18, which is drawn by
+default (STYLE.md rule 11): `TestHegelErrDecimalMatchesContext` probes the `Ln` step in a child process
+with a one-second deadline when the context and operand are in the shape and is mapped to apd/18 as
+intermittent (about one case in ten thousand; found by the weekly 1000-case run of 2026-10-05, where
+the hang ran into `go test`'s ten-minute timeout), `TestHegelLnReturnsWhenATermOfItsSeriesIsSubnormal`
+draws only that shape and fails every run beside the pin, and `HEGEL_NO_KNOWN=1` (read once) leaves
+the step out. The other general properties pass at 1000 cases × 3.
 
 `[run] setup` checks `python3 -c 'import decimal'`; the test file passes `HEGEL_TEST_CASES`
 through `hegel.WithTestCases` and wraps each property in a `recover` (the zoo's Go conventions,
 see `HACKING.md`).
 
-## Bugs (17)
+## Bugs (18)
 
 - **apd/1** (wrong-result, high): `Quantize`/`RoundToIntegral*` of a value below one unit give
   `0` under every rounding mode — `Quantize(0.001, -2)` with `RoundUp` is `0.00`, not `0.01`.
@@ -85,6 +90,12 @@ see `HACKING.md`).
   -3)` with `MaxExponent` 2 is `NaN`, not `1.235`): the intermediate rounding runs at exponent
   0 and trips the exponent check.
 
+- **apd/18** (abort, high): `Context.Ln` never returns when a trap fires inside its power-series
+  branch (|x-1| <= 0.1, or a range-reduced operand with leading digit 9): `Ln(0.95)` at precision
+  10 with `MinExponent` -5 and `DefaultTraps` spins for ever (Python: -0.05129329439). The
+  `ErrDecimal` makes the later steps no-ops once Subnormal/Underflow/Inexact fires, but the exit
+  test keeps reading a term that is never divided again.
+
 ## Not bugs (and what the general generators avoid)
 
 - Zeros with negative exponents print as `0.000…` (PostgreSQL compatibility, documented in
@@ -107,3 +118,4 @@ see `HACKING.md`).
 ## History
 
 - 2026-09-14: written at 6d9c587326e7 (v3.2.3, 2026-03-23), hegel.dev/go/hegel v0.6.33.
+- 2026-10-06: apd/18 (`Ln` spinning when a trap fires in its series) found by the weekly run's 1000-case budget; the wide property probes `Ln` in a child process and is mapped intermittent, narrow property and pin added, `HEGEL_NO_KNOWN=1` gate.
