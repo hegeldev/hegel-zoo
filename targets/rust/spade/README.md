@@ -14,6 +14,8 @@
 **`src/delaunay_core/triangulation_ext.rs`**
 - `hegel_delaunay_empty_circumcircle`: The defining global Delaunay property: no vertex lies strictly inside the circumcircle of any inner face. Checked with the exact predicates of the `robust` crate as an oracle. `robust::incircle(a, b, c, q)` is positive exactly if `q` lies strictly inside the circle through the counterclockwise-ordered points `a`, `b`, `c`. Spade stores all inner faces in counterclockwise order.
 - `hegel_insertion_order_invariance`: The triangulation of a point set does not depend on how it is built: `bulk_load` and incremental insertion in an arbitrary drawn order must produce the same vertex set, the same convex hull and the same number of edges and faces. (Edge *sets* can legitimately differ for cocircular point sets, but the counts are uniquely determined by the number of vertices and the convex hull.)
+- `hegel_bulk_load_with_far_points_on_a_hull_ray_matches_insertion`: the family of spade/3 with random contents, judged by the same oracle as `hegel_insertion_order_invariance`: near points that tie in distance from the mean plus two far points on one pseudo-angle ray from the seed triangle (far scale 2^142..2^199, a >= c), built by `bulk_load` and by insertion. Fails every run; under `HEGEL_NO_KNOWN=1` it draws a < c, where the sweep finds the right hull edge, and passes.
+- `known_bug_bulk_load_overlapping_triangles_for_far_points_on_a_hull_ray`: pin of spade/3: the ten-point set the weekly run found; `bulk_load`'s outer face is not convex and a hull vertex lies inside a face, while insertion gives the right hull.
 - `hegel_euler_formula_after_insertions_and_removals`: Euler's formula `V - E + F = 2` (`F` including the outer face) holds after any sequence of insertions and removals, as long as not all vertices lie on a single line. For fully degenerate (collinear) triangulations the documented invariants are `F = 1` and `E = V - 1` (or 0 for empty triangulations).
 - `hegel_locate_agrees_with_exact_predicates`: `locate` returns a position description that is consistent with exact geometric predicates: `OnVertex` queries match the vertex position exactly, `OnEdge` queries lie exactly on the edge's segment, `OnFace` queries lie strictly inside the face and `OutsideOfConvexHull` queries are contained in no face at all.
 - `hegel_delaunay_matches_point_set_model`: (no doc comment)
@@ -28,8 +30,13 @@
 
 ## Not tested
 
+## Known bugs (drawn by default)
+
+spade/3: `bulk_load` builds a self-overlapping triangulation when far points share a pseudo-angle ray from the seed triangle (the circle sweep's `Hull::get` returns the neighbouring edge for a hull edge that spans no angle). The wide property `hegel_insertion_order_invariance` keeps drawing the full plane, including that shape, and is mapped to spade/3 as intermittent (about one case in several thousand; found by the weekly 1000-case run); `hegel_bulk_load_with_far_points_on_a_hull_ray_matches_insertion` draws only that family and fails every run; `HEGEL_NO_KNOWN=1` (read once) switches the shape off in both - in the wide property by assuming a convex outer face, since the shape has no external description beyond the sweep's rounding - and the pin stays. spade/1 and spade/2 (flood-fill queries) keep their pins and narrow properties as before.
+
 ## History
 
 - 2026-03-24: predecessor base commit `c8befc96bbbc` (chore: Release).
 - 2026-07: tests written with hegeltest 0.28.2 in DRMacIver/hegel-rust-oss-bug-finding (`patches/spade.patch`).
 - 2026-09-12: imported into the zoo; ported to hegeltest 0.44.1.
+- 2026-10-06: spade/3 found by the weekly run's 1000-case budget on `hegel_insertion_order_invariance` (`bulk_load` self-overlap for far points on one pseudo-angle ray); mapped intermittent, narrow property `hegel_bulk_load_with_far_points_on_a_hull_ray_matches_insertion` and pin `known_bug_bulk_load_overlapping_triangles_for_far_points_on_a_hull_ray` added, `HEGEL_NO_KNOWN=1` gate.
