@@ -51,14 +51,30 @@ accuracy (1e-8), which is checked as written. Observed accuracy is far better th
   `from(value, ε, n)` ignores an ε below ulp(value) (17), `ArithmeticUtils.pow(-2, 31)`/`pow(-2L, 63)` throw for
   `MIN_VALUE` (18), `DD.multiply(DD)` promises 4 eps and reaches Dekker's 5 (20).
 
-Drawn by default (STYLE.md rule 11): the shapes of 18–21 and the subnormal-step shape of 11 are drawn by the wide
-properties (`arithmeticUtilsAgreeWithBigInteger`, `incompleteGammaAndBetaAgreeWithMpmath`, `anglesReduceIntoTheirIntervals`,
-`doubleDoubleArithmeticStaysWithinItsBounds`, `elementaryFunctionsAgreeWithMpmath`), mapped as intermittent expected
-failures at their natural rates, beside one narrow property per bug (`powOfMinusTwoReachesTheMinimumValue`,
-`arcsineBetaComplementAgreesWithMpmathForSmallX`, `normalizersStayAboveTheLowerBoundForASubnormalStepBelowIt`,
-`multiplyOfMaximalLowPartsStaysWithinFourEps`, `logWithASubnormalImaginaryPartAgreesWithMpmath`) and a pin; `HEGEL_NO_KNOWN=1`
-(`Zoo.NO_KNOWN`, read once into `Known`) switches those shapes off and every property passes under it. The older shapes
-(1–17) are still steered off unconditionally in `Known` and wait for the target-wide rewrite.
+Drawn by default (STYLE.md rule 11, the whole target since 2026-10-06): every switch in `Known` is off by default, so the
+wide properties draw the shapes of all 21 bugs and are expected failures mapped to the bug they shrink to —
+`fractionsAgreeWithBigIntegerRationals` (1), `fractionsFromDoublesMeetTheirBounds` (16), `combinatoricsAgreeWithBigInteger`
+(9) and `gammaAndErrorFunctionsAgreeWithMpmath` (6) every run; `textPolarRootsAndPowersAreConsistent` (4),
+`combinationsAreEnumeratedInOrder` (8), `anglesReduceIntoTheirIntervals` (10), `sumsAndNormsAreAccurate` (13),
+`precisionComparisonsFollowTheirDefinitions` (14), `arithmeticUtilsAgreeWithBigInteger` (18),
+`incompleteGammaAndBetaAgreeWithMpmath` (19), `doubleDoubleArithmeticStaysWithinItsBounds` (20) and
+`elementaryFunctionsAgreeWithMpmath` (21) at their natural rates, mapped intermittent. Bugs 2, 3, 5, 7, 11, 12, 15 and 17
+live in regions the wide generators reach rarely or never (a huge real beside a subnormal imaginary, `MIN_VALUE` parts,
+the reflected digamma band, 2^30 periods out), so one narrow property per bug carries the deterministic failure beside
+each wide one (`intValueAndLongValueOfANegativeFractionAreTheFloor`, `logAndSqrtWithAHugeAndASubnormalPartAgreeWithMpmath`,
+`expOfARealPartPastTheOverflowKeepsItsFiniteImaginaryPart`, `nthRootRejectsIntegerMinValueForAnyBase`,
+`fractionArithmeticWithMinValuePartsStaysRepresentable`, `digammaHasNoFiniteValueAtTheNegativeIntegers`,
+`digammaAndTrigammaReflectionKeepsTheDocumentedAccuracy`, `comparatorOfALargeUniverseOrdersSubsets`,
+`logFactorialWithACacheAgreesWithTheUncachedValue`, `reduceOfAHairBelowTheOffsetStaysBelowThePeriod`,
+`normalizersStayAboveTheLowerBoundForLargeArguments`, `cosAngleOfTinyOrHugeVectorsIsTheirCosine`,
+`sumOfNegativeZerosIsNegativeZero`, `roundWithAnExtremeScaleGivesTheDecimalRounding`,
+`bigFractionApproximationsOfValuesBeyondTheIntRangeAreConvergents`, `fromWithANonPositiveEpsilonIsRejectedNamingTheEpsilon`,
+`fromWithAnEpsilonBelowTheUlpOfTheValueStaysWithinIt`, and for 18–21 and the second shape of 11 the five of 2026-10-06), with
+the pins in `CommonsNumbersPinsTest` as regression examples. `HEGEL_NO_KNOWN=1` (`Zoo.NO_KNOWN`, read once into `Known`)
+turns the switches on: the wide properties then check beside the shapes instead of skipping cases (the floor on the
+negated fraction, digamma's accuracy at 1/2 − x and −x, a value folded into the int range, a period exponent capped at
+2^29), the narrow properties draw the neighbouring region, and every property passes. The `DOUBLE_EQUIVALENCE_NAN_ORDER`
+switch is not a bug gate and stays on.
 
 ## Design choices respected (not recorded)
 
@@ -91,3 +107,4 @@ failures at their natural rates, beside one narrow property per bug (`powOfMinus
 - 2026-09-20: base bumped 21fa3accb0e4 → 811a3b1c34fa (2026-09-19, "Bump github/codeql-action/* from 4.37.9 to 4.38.1"; 1.4-SNAPSHOT); 17 bug(s) still reproduce. 17 tests pass. Three harness corrections found by the bump runs: near() rounds an exact value between MAX_VALUE and MAX_VALUE + ulp/2 to MAX_VALUE rather than demanding infinity; a fraction representable only as -n / MIN_VALUE (denominator 2^31) may overflow or come out right; the mpmath oracle gives the x = 0 limits of the P and I_x derivatives instead of nan.
 - 2026-09-20: base bumped 811a3b1c34fa → 30078a2322ce (2026-09-20, "Correct private javadoc errors"; 1.4-SNAPSHOT); 17 bug(s) still reproduce. 17 tests pass.
 - 2026-10-06: the weekly 1000-case run (37296133806) failed five wide properties at 30078a2322ce: four new bugs (18–21) and a second shape of 11, each given a narrow property and a pin and drawn by default; two harness corrections (`Beta`'s tolerance grows with a + b, as its Lanczos product does — 825 ulps at a + b = 583; `G.in` clamps a value that rounds past its bound, which had sent `BrentSolver` an initial outside the bracket at 3000 cases) and an `ExactTest` oracle fix (`of(1, MIN_VALUE).negate()` is representable as -1 / MIN_VALUE, so the model no longer demands an overflow).
+- 2026-10-06: unsteered (STYLE.md rule 11) for bugs 1–17: the 17 `Known` switches are off by default, each bug has a narrow property, the wide properties are mapped to the bugs they shrink to (see above); `anglesReduceIntoTheirIntervals` moves from 11 to 10, which is what it shrinks to. Harness corrections: the oracle's `polygamma(1, x)` is reflected for negative x (mpmath's series is linear in |x| there, 28 s at −1e7 and unbounded at −1e14 — the bug-7 gate had hidden it); the exact `binom(n, k)` model takes `min(k, n − k)` and, above 1100, checks overflow and the log against mpmath instead of multiplying 2^31 times (one likely cause of the earlier runs past ten minutes); `Fraction.pow(Integer.MIN_VALUE)` (bug 18 through `Fraction`) is a check failure instead of a test error; `BigDecimal.setScale` takes minutes for scales in about 5.4e8–7.16e8, so the round property draws from 7.2e8.
