@@ -81,11 +81,19 @@ name giving `@@ -0,N` for any single-delta patch, whose parse then loses the pos
 `Chunk.verifyChunk` reading one line past the target, so `applyTo` and `applyFuzzy` throw
 `IndexOutOfBoundsException` (/3); `reportLinesUnchanged` ignored by inline diffs (/4);
 `columnWidth` wrapping tearing inline tags (/5); word-level inline diffs leaving tags open across
-rows (/6); `applyFuzzy` keeping stale positions after a size-changing hunk (/7); word-level inline
-diffs putting tags inside `&lt;`/`&gt;` (/8); `wrapText` emitting a leading or doubled `<br/>` at a
+rows (/6); `applyFuzzy` keeping stale positions after a size-changing hunk (/7); inline diffs, by
+word and (found 2026-10-06) by character, putting tags inside `&lt;`/`&gt;` (/8); `wrapText` emitting a leading or doubled `<br/>` at a
 surrogate pair (/9); the merge-conflict output throwing when the chunk runs past the target (/10);
 `UnifiedDiffReader` throwing `ArrayIndexOutOfBoundsException` on a short `diff` line (/11). All
 still reproduce.
+
+Drawn by default (STYLE.md rule 11): `diffRowsReconstructBothTexts` keeps drawing the character-split
+route to /8 (an HTML-normalised `<` against `&`, about one case in 20000-100000) and is an expected
+failure marked intermittent; the narrow property `inlineDiffsKeepHtmlEntitiesWhole` (`&lt;` → `&gt;`
+or `&amp;` in random context, either splitter) fails every run beside the pin
+`pinCharacterInlineDiffsKeepHtmlEntitiesWhole`. `HEGEL_NO_KNOWN=1` (read once, `Zoo.NO_KNOWN`)
+switches that shape off; the older shapes (/4, /5, /6, /9 and /8 by word) are still steered off
+unconditionally in the wide property.
 
 ## Observed and not recorded
 
@@ -109,3 +117,4 @@ still reproduce.
 
 - 2026-09-16: created at 5e2e5b98 (4.18-SNAPSHOT); bugs /1–/11.
 - 2026-09-18: base bumped 5e2e5b981533 → 06438525cfb1 (2026-09-19, "upgraded release plugin"; 4.18-SNAPSHOT); 10 bug(s) still reproduce; fixed upstream: java-diff-utils/3. 6 tests pass.
+- 2026-10-06: weekly 1000-case run 37296133806 failed `diffRowsReconstructBothTexts`; triage: an oracle flaw (a multi-line CHANGE whose only difference is a moved line break has no tag to show - the no-tag check now excludes multi-line changes like the remainder check) and /8 reached through the character splitter, now in the record; narrow property, pin, first `HEGEL_NO_KNOWN` gate of this target.
