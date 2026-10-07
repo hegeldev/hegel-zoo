@@ -46,14 +46,14 @@ in go.mod.
 |---|---|
 | RoundTrip | random documents (depth ≤ 3, keys including `""`, `-`, `~`, `a/b`, `"q"`, `\`, numbers as strings) and a mutation of them (replace, delete, add, copy, move, permute, reverse, tweak) or an unrelated document, under random option sets: the patch is well formed for the options, applies to the source with the model and with evanphx to give the target (up to array order under Equivalent), Rationalize never enlarges it |
 | Invert | the same pairs: a patch that has the invertible shape inverts, one that has not is rejected, and the inverse applied to the target gives the source (model and evanphx) |
-| Ignores | a pair and a random set of object-key paths whose ancestors are objects in both documents, under random Factorize/Equivalent/LCS/Invertible: no operation touches an ignored path or a descendant (a `move`'s `from` included), and the patch applied to the source gives the target with the ignored subtrees as in the source |
+| Ignores | a pair and a random set of object-key paths whose ancestors are objects in both documents, under random Factorize/Rationalize/Equivalent/LCS/Invertible: no operation touches an ignored path or a descendant (a `move`'s `from` included), and the patch applied to the source gives the target with the ignored subtrees as in the source |
 | EntryPoints | Compare, CompareWithoutMarshal, Compare with MarshalFunc/UnmarshalFunc, a reused Differ (Reset between uses) and CompareJSON agree; the reverse pair's patch applies to the target and gives the source |
 | MergePatch | MergePatchJSON and MergePatch: valid JSON, equal to the RFC 7386 model's patch, applied by the model (and by evanphx) gives the target |
 
-The generators draw the shapes of all thirteen recorded bugs by default (STYLE.md rule 11,
-since 2026-10-06): Rationalize with keys that need escaping and with Equivalent, root kinds
-that differ, appends, values whose hashes collide, arrays reordered under Equivalent and
-arrays with repeated elements, null merge targets, Factorize+LCS moves, adds under
+The generators draw the shapes of all fourteen recorded bugs by default (STYLE.md rule 11,
+since 2026-10-06): Rationalize with keys that need escaping, with Equivalent and with Ignores,
+root kinds that differ, appends, values whose hashes collide, arrays reordered under Equivalent
+and arrays with repeated elements, null merge targets, Factorize+LCS moves, adds under
 Rationalize+Factorize. The wide properties fail on them and name the bug on the failure's
 first line; each is listed in `target.toml` under the bug it shrinks to (`Invert` to
 jsondiff/7 every run; `RoundTrip`, `Ignores` and `EntryPoints` to jsondiff/2 and `MergePatch`
@@ -65,8 +65,8 @@ fails deterministically beside the pin: `FactorizeCopiesOnlyEqualValues` (1),
 `RationalizeCountsTheTestOperation` (6), `InvertibleAcrossRootKinds` (7), `InvertOfAnAppend`
 (8), `FactorizeTestsBeforeMoving` (9), `FactorizeMovesTheRightElement` (10),
 `RationalizeWithEquivalentDoesNotPanic` (11), `RationalizeKeepsTheSmallerFactorizedPatch`
-(12), `EquivalentTellsMultiplicitiesApart` (13). `HEGEL_NO_KNOWN=1` (read once) leaves the
-shapes out instead: Rationalize draws keys without escapes and never Equivalent, Invert
+(12), `EquivalentTellsMultiplicitiesApart` (13), `RationalizeLeavesIgnoredValuesAlone` (14). `HEGEL_NO_KNOWN=1` (read once) leaves the
+shapes out instead: Rationalize draws keys without escapes and never Equivalent or Ignores, Invert
 draws the target in the source's kind and re-diffs an appending pair with LCS, the null
 merge target becomes `false`, the narrow properties draw the region's neighbourhood; what
 is left is skipped at the mismatch (at most 3% of cases, EntryPoints), and every property
@@ -94,6 +94,7 @@ engine's log).
 | jsondiff/11 | Rationalize+Equivalent panics in `findIndex` on about a third of calls (arrays reordered in place before the text is searched by index) | high |
 | jsondiff/12 | Rationalize+Factorize weighs an add as the whole container's text and replaces a whole array or object where the operations were smaller (with LCS, and since 2026-10-06 any add: `{}`→`{"name":{}}`) | low |
 | jsondiff/13 | Equivalent gives an empty patch for arrays holding the same elements with different multiplicities (`[1,1,2]`/`[1,2,2]`): the comparison is a set of digests and a length | medium |
+| jsondiff/14 | Rationalize replaces a whole value with the target's text, ignored members included: `{"i":1,"j":1,"l":1}`→`{"i":2,"j":2,"l":2}` with `Ignores("/i")` is a root replace that sets `/i` to 2 | medium |
 
 How they were found: jsondiff/1 by the round-trip property on the first collect round (a
 `copy` from `/x` to `/z` giving `[]` for `[[]]`), then the hasher read and the other
@@ -108,8 +109,10 @@ wrong result of 10 came out as `[[],[-1.25,"foo","foo!"]]` for `[[],[-1.25,"foo"
 jsondiff/11 as a panic under Hegel at 1000 cases, jsondiff/12 by the size check; jsondiff/13 and
 the wider shape of 12 by the round-trip property on 2026-10-06, once the generators drew every
 recorded shape (a mismatch under Equivalent that neither a collision nor the in-place sort
-explained; a 48-byte replace for a 40-byte add under Rationalize+Factorize). Everything else agrees with the appliers and the models: LCS diffs without Factorize,
-moves between object members, Ignores, the merge patch on ordinary documents, the marshal hooks, `Differ` reuse.
+explained; a 48-byte replace for a 40-byte add under Rationalize+Factorize); jsondiff/14 by the
+Ignores property on 2026-10-07, once it drew Rationalize (kept off until then as "not described
+by the model"). Everything else agrees with the appliers and the models: LCS diffs without Factorize,
+moves between object members, Ignores without Rationalize, the merge patch on ordinary documents, the marshal hooks, `Differ` reuse.
 
 ## Accepted differences (not bugs)
 
