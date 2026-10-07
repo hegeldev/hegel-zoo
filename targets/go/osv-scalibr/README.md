@@ -45,5 +45,28 @@ separator stripping and tilde rule (9); and an Alpine `Compare` that is not an o
 apk would reject are involved (6) or when a missing component meets one with a leading zero (10).
 PyPI, Debian, npm and Go agreed with their oracles over some 10,000 accepted pairs each.
 
-Gates (`known.go`) match the shapes of the known bugs so the properties stay green; nothing is
-otherwise excluded.
+Every one of the ten bugs is drawn by default and found by the properties (DESIGN.md decision 3):
+the wide properties reach the shapes at their natural rates - a disagreement on a recorded shape in
+`TestHegelComparesLikeTheEcosystem` in about half a percent of cases, a broken order in
+`TestHegelCompareIsAnOrder` in about a quarter of a percent - and fail naming the bug (both are
+intermittent expected failures, mapped to the basin the shrinker usually lands in: the Red Hat
+release split (5) and the Alpine order (6)). The narrow properties of `hegel_shapes_test.go` draw
+each shape region deterministically, one per bug, judged by the same oracles:
+`TestHegelRubyGemsStripsSurroundingWhitespace` (1), `TestHegelRubyGemsHyphenReadsAsPre` (2),
+`TestHegelMavenDotQualifierBeforeDigitOrEndIsHyphen` (3), `TestHegelMavenNullItemBeforeSublistNests`
+(4), `TestHegelRedHatReleaseSplitsAtLastHyphen` (5), `TestHegelAlpineOrderHoldsWithInvalidVersions`
+(6), `TestHegelRubyGemsZeroPaddedSegmentIsZero` (7), `TestHegelMavenZeroVersionSortsBelowUnknownQualifier`
+(8), `TestHegelRedHatEmptyComponentsCompareByRpmvercmp` (9) and
+`TestHegelAlpineMissingComponentOrderIsTransitive` (10). `HEGEL_NO_KNOWN=1` switches the shapes
+off: the wide properties then consult the shape classifiers of `known.go` and assume a recorded
+shape away (about 0.2% of cases), the narrow ones draw the neighbouring region, and every property
+passes. Nothing else is excluded; shapes an oracle cannot judge are counted.
+
+History: 2026-09-19 written at 6aec485 (v0.5.2+), hegel.dev/go/hegel v0.6.33; 2026-10-07 generators
+rewritten in combinator style (STYLE.md): package-level generator values (`number`/`word`/`piece`/
+`soup`, one shaped generator per ecosystem family as `cat` of `maybe` parts with the plain
+alternative first, edits as data applied by a pure function with positions modulo the live
+length, a pair as a version and a relation to it, one case record per property with a `GoString`),
+the known shapes drawn by default with the ten narrow properties beside the pins, and the Maven
+driver no longer trims its input line (an empty version is an empty base64 token, which the trim
+turned into a crash of the driver).
