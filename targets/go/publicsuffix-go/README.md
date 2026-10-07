@@ -10,7 +10,7 @@ through every lookup API, and cookie jars built on `CookieJarList`.
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of five
 `hegel_zoo_*_test.go` files that drive the public API. `go test -count=1 -run TestHegel -v ./hegel`
 
 ## Oracles
@@ -38,7 +38,7 @@ The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
   `ParserOption` drawn, loaded with `LoadString` (error, rules returned, `Size`); then 1-4
   names built from the rule values (extra labels, a suffix of a suffix, upper case, leading
   or trailing dot, an empty label, the empty string) with `FindOptions` drawn (nil,
-  `IgnorePrivate`, a nil or own `*` `DefaultRule`): `Find`, `Decompose` of the rule found,
+  `IgnorePrivate`, a nil, own `*` or own normal `DefaultRule`): `Find`, `Decompose` of the rule found,
   `ParseFromListWithOptions` (error class or every field), `DomainName.String`,
   `DomainFromListWithOptions`, against the model.
 - `TestHegelDefaultList`: names around a rule of the packaged list (the 296 wildcard and
@@ -47,6 +47,14 @@ The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
 - `TestHegelCookieJar`: a host of 1-3 labels above a public suffix of the packaged list, 1-3
   cookies whose `Domain` is a suffix of the host at a label boundary (with or without a leading
   dot) or absent, set on two jars; `Cookies` for the host, a child and every parent must agree.
+- `TestHegelCookieJarRejectsCookiesOnAPublicSuffix`, `TestHegelAdapterPublicSuffixOfASuffix`,
+  `TestHegelRuleLineReadUpToWhitespace`, `TestHegelSameValueRulesAreBothKept`,
+  `TestHegelExceptionPrevailsOverLongerRule`, `TestHegelOwnStarDefaultRuleDecomposes`,
+  `TestHegelNewRuleRejectsMalformedContent`, `TestHegelStarRuleLengthIsOne`,
+  `TestHegelUnicodeExceptionStaysAnException`, `TestHegelEmptyLabelNamesAreRejected`: one
+  narrow property per recorded bug over the bug's shape region, judged by the same model (the
+  own-default-rule one compares the decomposition and the fields, not the rule's `Length`,
+  which is bug 8's).
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
 
@@ -61,13 +69,23 @@ rule beats an exception rule (5); a `DefaultRule` other than the package's decom
 `NewRuleUnicode` reads an exception with a Unicode first label as a normal rule (9); a name
 with an empty label is accepted and its `String` drops the TRD (10).
 
-## Modelled as recorded
+## Known shapes drawn by default
 
-All ten are in the model behind `HZKnown` switches (`suffixPublicSuffixEmpty` for 1 and 2,
-`wholeLineIsRule`, `sameValueOverwrites`, `longestBeatsException`, `foreignStarMisdecomposes`,
-`starTakesTwoBytes`, `emptyValueHasOneLabel`, `unicodeExceptionPrefixEncoded`,
-`emptySLDDropsTRD`); `ZOO_KNOWN_OFF=name` turns a switch off and the property then fails. The
-panic of 7, the normal default rule of 6 and the acceptance of 10 are pinned only.
+The ten bugs are in the model behind `HZKnown` switches (`suffixPublicSuffixEmpty` for 1 and
+2, `wholeLineIsRule`, `sameValueOverwrites`, `longestBeatsException`,
+`foreignStarMisdecomposes` for both faces of 6, `starTakesTwoBytes`, `emptyValueHasOneLabel`,
+`unicodeExceptionPrefixEncoded`, `emptySLDDropsTRD` for both faces of 10), all off by default:
+the model states the documented behaviour, the wide properties draw every shape and fail on
+the recorded bugs (`TestHegelList` and `TestHegelDefaultList` shrink to `DefaultRule.Length`,
+bug 8, which most names reach and which masks the other shapes the list property meets - the
+same value 31% of cases, a junk line 16%, an own default rule 18%, an empty label 4%, an
+exception beside a longer rule 1%; `TestHegelCookieJar` shrinks to a `Domain=<suffix>` cookie
+accepted, bug 1), and each is listed in `target.toml` mapped to its bug. `HEGEL_NO_KNOWN=1`,
+read once, turns every switch on, so the model reproduces the bugs and every property passes
+(no case is skipped). The narrow properties of `hegel_zoo_shapes_test.go` draw one bug's shape
+region each with random contents, judged by the same model, and fail every run; under
+`HEGEL_NO_KNOWN=1` they draw the neighbouring region and pass. The panic of 7 is reached by
+the narrow property only.
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -90,3 +108,8 @@ package's `TestPsl` does that).
 ## History
 
 - 2026-09-21: new target, three properties, 10 bugs.
+- 2026-10-07: generators rewritten in combinator style (lists as records of line records
+  rendered by a pure function, names as recipes resolved against the drawn list, find options
+  and cookie-jar cases as records); the `HZKnown` switches off by default (`ZOO_KNOWN_OFF`
+  dropped), so the wide properties find the recorded bugs; ten narrow properties; an own
+  normal `DefaultRule` drawn as well.
