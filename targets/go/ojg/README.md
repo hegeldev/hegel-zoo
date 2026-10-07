@@ -58,6 +58,18 @@ spaces, quotes, dots and non-ASCII). A canonical string form with type tags comp
   `OmitNil`; `Dup` is independent of the original; `Diff`/`Compare` empty exactly for equal
   values (nil members as absent); `Match` on the value and on key subsets; `Checksum` equal
   for equal values.
+- Eighteen narrow properties in `hegel_shapes_test.go`, one per bug, each over the bug's shape
+  region with random contents and judged by the same model: `IntegersNearInt64LimitsParse`
+  (1), `ValidateRejectsUnclosedContainers` (2), `SetAtOrAfterArrayEndAppends` (3),
+  `DelOutOfRangeIsNoOp` (4), `SENQuotesDashStrings` (5), `SENQuotesLiteralWords` (6),
+  `DescentBeforeBracketFragmentStringParses` (7), `DescentBracketStringParses` (8),
+  `BareDecimalPointRejected` (9), `RemoveUnionResolvesNegativeIndices` (10),
+  `NegativeStepSliceOnEmptyArray` (11), `NegativeStepSliceOutOfRangeBounds` (12),
+  `SurrogatePairEscapesDecode` (13), `UnionKeysWithQuotesEscape` (14), `LocateMaxOverSlices`
+  (15), `MatchDescentIntoNestedArrays` (16), `MatchFilterSeveralElements` (17),
+  `TruncatedLiteralBeforeCommaRejected` (18). Each fails on its bug; under `HEGEL_NO_KNOWN=1`
+  it draws the neighbouring region and passes.
+
 
 ## Bugs
 
@@ -75,6 +87,45 @@ not searching inside an element a descent matched, so `$..*` yields only top-lev
 several elements, with the wrong path (17); a truncated literal before a comma (`[nul,1]`)
 accepted by `Parse` and `Validate` with the value dropped (18).
 
+## Known shapes drawn by default
+
+The eighteen `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them
+on): the generators draw every recorded shape (integers at the int64 limits, `1.` and
+`[nul,1]` and unclosed containers among the mutations, negative-step slices over empty arrays
+and with out-of-range bounds, descents before bracket fragments, union keys with quotes,
+filters matching several elements, negative union indices under `Remove`, out-of-range `Set`
+and `Del` indices, SEN strings starting with `-` or spelling `null`/`true`/`false`,
+surrogate-pair escapes), the model says what the documentation says (`pySlice` without the
+clamp), and a mismatch names the shapes the case has (`mismatch(ht, shapes, ...)`). The first
+hundred cases hegel-go draws are strongly clustered on small values, so a shape drawn at a few
+percent passed a default-count run three or four times in twenty: the Parse, Write and SEN
+properties draw a limit integer or a bare string into a host two cases in five by default
+(`parseValues`, `senShapeValues`; the plain value tree under `HEGEL_NO_KNOWN=1`), and the
+shape mutations of the Invalid property are drawn one to one with the byte edits. Over
+eleven default rounds Parse, Write and SEN shrank to ojg/1 every time, Invalid to ojg/2 (ojg/9
+once), Path to ojg/8 and PathEdit to ojg/3 every time (ojg/4 is the more frequent shape there,
+226 against 129 per 3000 cases, but the shrinker lands on `Set $[0]` of an empty array); all
+six are mapped plain; Alt passes. Under `HEGEL_NO_KNOWN=1` the switches skip and excuse as
+before and every property passes (3000 cases); the excused rates are ojg/8 and /16 at 2.4%,
+/7 1.4%, /15 0.4% of the Path cases and the rest under a percent.
+
+The generators are package-level values in combinator style (`hegel_model_test.go`): keys and
+strings as joined atom lists, the value tree as a depth-indexed memoised `valueAt(depth)`, the
+JSON text as the value plus a spelling tape (whitespace, escape and float-spelling choices)
+read by a pure `emitJSON`, mutations as records applied modulo the live length, path
+fragments as records drawn from the data's keys (`fragsFor(keys)`, `pathCasesOver(data)`) and
+rewritten by `pastFilterSeveral` for the neighbouring region, edits as records.
+
+Five candidates are counted and assumed away pending reproduction: `{"a":}` accepted by
+`Parse` and `Validate` with the member dropped (`candidate/go/ojg-1`); `{"k":nul,"a":1}`
+panicking in `Parse`, `Parser.Parse` and `Unmarshal` with "assignment to entry in nil map"
+(`oj/parser.go`; `Validate` accepts) (2); a filter `!=` on a float64 member compared with a
+string (`$[?(@.a != 'zzz')]` on `[{"a":0.5}]`) false where the model says true
+(`jp/script.go` around line 537, a missing `ok` guard) (3); `sen.String` leaving a string that
+starts with a BOM bare, which `sen.Parse` then reads as the value after the BOM (4); `0e5`,
+`0e+100` and `-0E1` rejected as invalid numbers by `oj.Parse`, `oj.Validate` and `sen.Parse`
+though valid JSON (5; `1e+400` parses to +Inf without error).
+
 ## Modelled as recorded, not counted
 
 - `Unmarshal` into an interface returns float64 for every number (`ForceFloat`, as
@@ -91,3 +142,7 @@ accepted by `Parse` and `Validate` with the value dropped (18).
   `Remove` accepts slices.
 - `jp.Walk` with `justLeaves` does not visit empty containers.
 - SEN reads `.5` as the string ".5" (a token may start with '.').
+
+## History
+
+- 2026-10-07: generators rewritten in combinator style; the eighteen known shapes drawn by default (six wide properties plain); eighteen narrow properties added; five candidates counted.
