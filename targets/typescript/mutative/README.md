@@ -121,8 +121,16 @@ each over the bug's shape region with random contents and the same oracle, faili
 pins. `HEGEL_NO_KNOWN=1` (read once) counts such mismatches as `known mutative/N` and rejects the case
 (assume) or leaves the check out, and skips the narrow properties whole; the skips are 5% of Patches'
 cases, 3.5% of Strict's and under 2% elsewhere. The documented conventions above are tolerated in both
-modes. Open: under the switch the Patches property failed once in some eleven thousand cases on a shape
-not recorded (2026-10-06, not caught again in 8000 more), so a rare unclassified shape remains in it. `ZOO_COLLECT=1` prints the counts at the end of each property.
+modes. The rare Patches failure seen under the switch on 2026-10-06 (one in some ten thousand cases)
+was two shapes, found and classified in 650 000 cases on 2026-10-07: the mutative/4 set trap reached
+through `apply` (a composed inverse removes a key the base held `undefined` and a later patch adds it
+back without a value: the assignment of undefined after the delete in one draft is dropped), named
+mutative/4; and an immer patch whose value carries one of immer's own drafts (a Map draft aliased into
+a new object and changed through the alias), which immer's applyPatches still replays but mutative's
+apply copies as an object, counted as `immer patches carry a draft` beside `immer patches incomplete`.
+With both named, 750 000 more cases under the switch had two mismatches, in one 5000-case run whose
+messages were not kept, so a shape rarer than one in 300 000 may remain; the property runs 5000
+cases a second, so a hunt is cheap. `ZOO_COLLECT=1` prints the counts at the end of each property.
 
 ## History
 
