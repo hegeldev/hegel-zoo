@@ -83,17 +83,23 @@ line ending (17), and the label scan treating an image as one token, so a link f
 image whose alt holds a link (18; both found while steering the commonmark.js differential at the
 weekly budget). Medium: 4, 8, 9, 10, 12, 15.
 
-Drawn by default (STYLE.md rule 11): `TestHegelCommonMarkPresetAgreesWithCommonmarkJs` keeps
-drawing the container shapes of 10 (lines that cannot interrupt a paragraph after a definition,
-found by the weekly 1000-case run of 2026-10-05), 12 and 8 and the shapes of 17 and 18, and is
-mapped to markdown-it/10 as intermittent (about one case in two hundred); the narrow properties
-`TestHegelLinesAfterADefinitionStayInItsParagraph` (10),
-`TestHegelBlocksAfterATightItemParagraphStartOnTheirOwnLine` (7),
-`TestHegelIndentedLineShortOfTheItemOffsetContinuesTheItem` (12),
-`TestHegelBackslashBeforeALineEndingEndsTheDestination` (17) and
-`TestHegelLinkTextWithALinkInsideAnImageIsNotALink` (18) draw only their regions and fail every
-run beside the pins; `HEGEL_NO_KNOWN=1` (read once) switches those shapes off. The other gates
-(`SHAPES`, the regex gates of the older bugs) are still on by default, as before.
+Drawn by default (STYLE.md rule 11, the whole target since 2026-10-07): the generators draw the
+shape of every recorded bug (a byte order mark, invalid character references, trailing whitespace
+in bracketed destinations, delimiter runs ending link text, tabs after quote markers, indented `>`
+markers, unclosed fences at the end and in items, table headers over other blocks, long tilde runs,
+the container shapes of 10, 12 and 8), and a mismatch that a bug's gate or output normaliser
+explains fails naming it (`(shape of markdown-it/N: ...)`). `TestHegelCommonMarkPresetAgreesWithCommonmarkJs`
+meets a recorded shape in 29% of its cases and shrinks to the byte order mark (1),
+`TestHegelUtilsMatchTheirModels` to `unescapeAll("&#0;")` (2), both every run and mapped plain;
+`TestHegelDefaultPresetAgreesWithMicromarkGfm` reaches 9 about once in two hundred cases
+(intermittent). One narrow property per bug (`TestHegelALeadingByteOrderMarkIsNotText` for 1,
+`TestHegelInvalidCharacterReferencesOutsideTextDecodeToTheReplacementCharacter` for 2, and so on:
+eighteen, named in target.toml) draws its region alone and fails every run beside the pin.
+`HEGEL_NO_KNOWN=1` (read once) is the run that looks past the bugs: the narrow properties are
+skipped, known input shapes are counted and skipped (under 5% of cases per differential) or not
+drawn (entities, the mark, bracketed whitespace, link-text runs, item padding at the content
+offset, a blank line after a definition), and the known output normalisers explain the mismatches,
+so every property passes.
 
 ## Not tested
 
@@ -112,3 +118,9 @@ long as the rule), the CLI, source maps, the browser bundles.
   properties for 7, 10, 12, 17, 18; the micromark differential's tilde gate widened to `*~`/`~*`
   (micromark's strikethrough registers a single tilde as an attention marker) and a GFM
   autolink-literal tolerance added.
+- 2026-10-07: unsteered (rule 11): the sixteen older gates fail by default naming their shape,
+  thirteen narrow properties added, the commonmark.js differential mapped to 1 and the utils
+  property to 2; the version-14 differential's `lookaheadHidCodeSpan` now also covers a code span
+  closing after the `]`; micromark tolerances added for a nested-quote table's `</thead><tbody>`
+  without a newline, a one-column pipe header over a pipeless delimiter row, and an HTML block
+  whose last line is text.
