@@ -138,6 +138,15 @@ did, until 2026-10-07, hiding four bugs behind it), and a value that should spre
 interval is `doubles().min(lo).max(hi).allowNan(false).allowInfinity(false)` (deciles 9–13 %
 each, a quarter of the draws within 1e-6 of zero when the interval spans it); the integer draws
 are for counts, indices and decimals built from small parts, where small values are the point.
+The same law holds in hegel-go and hegel-rust, with two consequences for floats. A "random
+bits" arm (`Float64frombits` / `f64::from_bits` / `longBitsToDouble` of a full-range integer
+draw, which some twenty-five harnesses have) is in truth a subnormal-or-NaN arm: 95 % subnormals
+from an unsigned draw, 48 % subnormals and 48 % NaNs from a signed one, under 0.5 % of ordinary
+magnitude in all three bindings — fine as the odd-pattern arm it usually is, not as a source of
+random doubles. And the unbounded float draw (`Floats[float64]()`, `floats::<f64>()`,
+`doubles()`) spreads by magnitude, not by value: about 2 % of its draws lie between 1e-3 and
+1e3, 45–58 % between 1e3 and 1e100 and 17–24 % beyond 1e100 or infinite; a property about
+ordinary values bounds the draw or composes a mantissa in [1, 10) with a drawn exponent.
 
 ## What the survey found (turn 413, four language surveys over the committed patches)
 
