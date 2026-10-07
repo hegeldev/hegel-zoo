@@ -37,6 +37,17 @@ decided.
   candidates, all four leniencies and `maxTries` limits: the same matches (offsets in code points,
   raw strings, numbers).
 - `TestHegelPin...` - one plain test per recorded bug.
+- `TestHegelAreaLookupsFallBackToEnglish`, `TestHegelCarrierLookupsFallBackToEnglish` and
+  `TestHegelOutOfCountryAlphaFormattingDropsPlusAndStar` (`hegel_shapes_test.go`) - one narrow
+  property per recorded bug, drawing its shape region with random contents.
+
+Both bugs are drawn by default and found by the properties (DESIGN.md decision 3): the number
+queries draw their language for the area and carrier lookups from the full list (German, empty
+and unknown codes included), so `TestHegelNumberQueriesAgreeWithLibphonenumber` meets bug 1 in
+about 30% of its cases and fails every run (it also meets bug 2, a raw input with `+` or `*`, in
+about 3%); the narrow properties draw each shape deterministically. `HEGEL_NO_KNOWN=1` switches
+the shapes off (English lookups only; the alpha-keeping check skipped for raw inputs with `+` or
+`*`; the narrow properties draw the neighbouring region) and every property passes.
 
 ## Bugs
 
@@ -54,6 +65,14 @@ returning the country name or nothing where libphonenumber returns "New Jersey" 
   a description equal to Python's country name is not compared; and it still ships prefix data
   libphonenumber 9.0.38 has dropped (English geocoding for France, Malaysia, Latvia and Estonia,
   South Korea in other languages, carrier names under 549), gated by calling code.
-- Carrier and area comparisons are made in English only because of bug 1; the pin covers the
-  fallback with German, empty and unknown language codes.
+- Three more oracle patches to Java's reading (libphonenumber 9.0.39 arbitrated, 2026-10-07):
+  Python's matcher re-searches overlapping inner groups and runs out of `max_tries` sooner than
+  Java's `Matcher.find()` loop; Python writes every leading zero of a number where Java and the
+  port cap them at ten in `getNationalSignificantNumber` (`"000000000000"` in US); and Python's
+  `is_alpha_number` has no 250-character cap where Java's and the port's return false.
 - 2026-09-20: base bumped 0a7e43b1fc85 → 7e3ecf02576b (2026-09-14, "Updated metadata to v9.0.39"; v2.0.12+); 2 bug(s) still reproduce. 262 tests pass.
+- 2026-10-07: generators rewritten in combinator style (STYLE.md): package-level generator values
+  (`candidate` as a record of region, seed or digits, edits, prefix, gaps and a `decoration`
+  record rendered by a pure `text()`; `queryCase`, `helperCase`, `aytfCase` and `matcherCase`
+  around it, each with a `GoString`), the known shapes drawn by default with the narrow
+  properties of `hegel_shapes_test.go` beside the pins.
