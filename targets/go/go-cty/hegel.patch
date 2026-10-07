@@ -27,14 +27,15 @@ index f4313fd..50dedb8 100644
 +go 1.26.0
 diff --git a/hegel/hegel_codec_test.go b/hegel/hegel_codec_test.go
 new file mode 100644
-index 0000000..bc553b8
+index 0000000..cb958ec
 --- /dev/null
 +++ b/hegel/hegel_codec_test.go
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,504 @@
 +package hegel
 +
 +import (
 +	"encoding/json"
++	"fmt"
 +	"testing"
 +
 +	"github.com/zclconf/go-cty/cty"
@@ -44,28 +45,102 @@ index 0000000..bc553b8
 +	"hegel.dev/go/hegel"
 +)
 +
++// --------------------------------------------------------------------------- round trips
++
++var (
++	// jsonCases: a type with placeholders up to three deep and a value of it with nulls at a
++	// tenth of the positions.
++	jsonCases = typedValuesOf(dynamicTypes, valueOpts{nullPct: 10})
++	// msgpackCases: the same, half the time with unknowns at a tenth of the positions too.
++	msgpackCases = hegel.FlatMap(hegel.SampledFrom([]int{0, 10}), func(unknownPct int) hegel.Generator[typed] {
++		return typedValuesOf(dynamicTypes, valueOpts{nullPct: 10, unknownPct: unknownPct})
++	})
++)
++
++// isEmptyCollection reports a known list, set or map without elements.
++func isEmptyCollection(v cty.Value) bool {
++	return v.IsKnown() && !v.IsNull() && (v.Type().IsListType() || v.Type().IsSetType() || v.Type().IsMapType()) && v.LengthInt() == 0
++}
++
++// losesElementType reports the shape of go-cty/1: somewhere in v, marshalled as ty, a null,
++// unknown or empty collection sits at a position whose declared type is not its own (the
++// declared one holds a placeholder, the value's is concrete: the position is inside an element
++// of a list, set or map whose element type holds the placeholder), so the codecs write nothing
++// the reader could take the value's type from and it comes back with the declared type. A
++// position typed exactly DynamicPseudoType is written with the value's own type and loses
++// nothing.
++func losesElementType(ty cty.Type, v cty.Value) bool {
++	if ty == cty.DynamicPseudoType {
++		return false
++	}
++	if v.IsNull() || !v.IsKnown() || isEmptyCollection(v) {
++		return !v.Type().Equals(ty)
++	}
++	switch {
++	case ty.IsListType(), ty.IsSetType(), ty.IsMapType():
++		for it := v.ElementIterator(); it.Next(); {
++			_, e := it.Element()
++			if losesElementType(ty.ElementType(), e) {
++				return true
++			}
++		}
++	case ty.IsObjectType():
++		for name, aty := range ty.AttributeTypes() {
++			if losesElementType(aty, v.GetAttr(name)) {
++				return true
++			}
++		}
++	case ty.IsTupleType():
++		for i, ety := range ty.TupleElementTypes() {
++			if losesElementType(ety, v.Index(cty.NumberIntVal(int64(i)))) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// recovering runs unmarshal and returns what it panicked with, if it did (the go-cty/1 shape
++// panics inside cty.ListVal; the run must go on).
++func recovering(unmarshal func() (cty.Value, error)) (got cty.Value, err error, panicked any) {
++	defer func() {
++		if r := recover(); r != nil {
++			panicked = r
++		}
++	}()
++	got, err = unmarshal()
++	return
++}
++
 +// TestHegelJSONRoundTrip: a value marshalled with its type unmarshals, with the same type, to an
 +// equal value ("it is guaranteed that values will round-trip through JSON serialization to
 +// produce a value of the same type"); the type itself round-trips through MarshalType; the
 +// implied type of the buffer reads it to a value that converts back to the original; and
-+// SimpleJSONValue reads any buffer the type-preserving marshaller wrote.
++// SimpleJSONValue reads any buffer the type-preserving marshaller wrote. A null or empty
++// element under a placeholder-bearing element type comes back with the declared type, and
++// panics the unmarshal beside a known element (go-cty/1).
 +func TestHegelJSONRoundTrip(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		ty := genType(ht, typeOpts{dynamic: true, depth: 3})
-+		v := genValue(ht, ty, valueOpts{nullPct: 10})
++		tv := hegel.Draw(ht, jsonCases)
++		ty, v := tv.ty, tv.v
++		shape := shapeIf(losesElementType(ty, v), "go-cty/1")
 +		buf, err := ctyjson.Marshal(v, ty)
 +		if err != nil {
 +			c.failClass(ht, "marshal", "Marshal(%s, %s): %v", v.GoString(), tyString(ty), err)
 +			return
 +		}
-+		got, err := ctyjson.Unmarshal(buf, ty)
++		got, err, panicked := recovering(func() (cty.Value, error) { return ctyjson.Unmarshal(buf, ty) })
++		if panicked != nil {
++			c.mismatch(ht, "unmarshal panic", shape, "Unmarshal(%s, %s) panics: %v (value %s)", buf, tyString(ty), panicked, v.GoString())
++			return
++		}
 +		if err != nil {
-+			c.failClass(ht, "unmarshal", "Unmarshal(%s, %s): %v (value %s)", buf, tyString(ty), err, v.GoString())
++			c.mismatch(ht, "unmarshal", shape, "Unmarshal(%s, %s): %v (value %s)", buf, tyString(ty), err, v.GoString())
 +			return
 +		}
 +		if !got.RawEquals(v) {
-+			c.failClass(ht, "value", "round trip of %s as %s gives %s (JSON %s)", v.GoString(), tyString(ty), got.GoString(), buf)
++			c.mismatch(ht, "value", shape, "round trip of %s as %s gives %s (JSON %s)", v.GoString(), tyString(ty), got.GoString(), buf)
 +			return
 +		}
 +		// the type
@@ -129,28 +204,31 @@ index 0000000..bc553b8
 +}
 +
 +// TestHegelMsgpackRoundTrip: the msgpack serialization round-trips values with their type,
-+// unknown values included, and the implied type reads a buffer without unknowns back.
++// unknown values included, and the implied type reads a buffer without unknowns back. A null,
++// unknown or empty element under a placeholder-bearing element type comes back with the
++// declared type, and panics the unmarshal beside a known element (go-cty/1).
 +func TestHegelMsgpackRoundTrip(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		ty := genType(ht, typeOpts{dynamic: true, depth: 3})
-+		unknownPct := 0
-+		if chance(ht, 50) {
-+			unknownPct = 10
-+		}
-+		v := genValue(ht, ty, valueOpts{nullPct: 10, unknownPct: unknownPct})
++		tv := hegel.Draw(ht, msgpackCases)
++		ty, v := tv.ty, tv.v
++		shape := shapeIf(losesElementType(ty, v), "go-cty/1")
 +		buf, err := ctymsgpack.Marshal(v, ty)
 +		if err != nil {
 +			c.failClass(ht, "marshal", "Marshal(%s, %s): %v", v.GoString(), tyString(ty), err)
 +			return
 +		}
-+		got, err := ctymsgpack.Unmarshal(buf, ty)
++		got, err, panicked := recovering(func() (cty.Value, error) { return ctymsgpack.Unmarshal(buf, ty) })
++		if panicked != nil {
++			c.mismatch(ht, "unmarshal panic", shape, "Unmarshal(%x, %s) panics: %v (value %s)", buf, tyString(ty), panicked, v.GoString())
++			return
++		}
 +		if err != nil {
-+			c.failClass(ht, "unmarshal", "Unmarshal(%x, %s): %v (value %s)", buf, tyString(ty), err, v.GoString())
++			c.mismatch(ht, "unmarshal", shape, "Unmarshal(%x, %s): %v (value %s)", buf, tyString(ty), err, v.GoString())
 +			return
 +		}
 +		if !got.RawEquals(v) {
-+			c.failClass(ht, "value", "round trip of %s as %s gives %s", v.GoString(), tyString(ty), got.GoString())
++			c.mismatch(ht, "value", shape, "round trip of %s as %s gives %s", v.GoString(), tyString(ty), got.GoString())
 +			return
 +		}
 +		if !hasDynamic(ty) && v.IsWhollyKnown() {
@@ -177,117 +255,139 @@ index 0000000..bc553b8
 +	})
 +}
 +
-+// genRelatedType draws a target type for a conversion from ty: a structural cousin (list, set
-+// or tuple of the same elements; map or object of the same attributes), a type with one
-+// primitive swapped, or an unrelated type.
-+func genRelatedType(tc hegel.TestCase, ty cty.Type) cty.Type {
-+	switch drawInt(tc, 1, 4) {
-+	case 1:
-+		return genType(tc, typeOpts{dynamic: chance(tc, 30), depth: 2})
-+	case 2:
-+		return swapPrimitive(tc, ty)
-+	default:
-+		return cousin(tc, ty)
-+	}
++// --------------------------------------------------------------------------- related types
++
++// freshTypes: a type unrelated to the source, with placeholders three times in ten.
++var freshTypes = weighted(choice[cty.Type]{70, plainTypes2}, choice[cty.Type]{30, dynamicTypes2})
++
++// relatedTypesOf is the generator of target types for a conversion from ty: an unrelated type,
++// the type with one primitive swapped, or (half the time) a structural cousin.
++func relatedTypesOf(ty cty.Type) hegel.Generator[cty.Type] {
++	return weighted(
++		choice[cty.Type]{25, freshTypes},
++		choice[cty.Type]{25, swappedOf(ty)},
++		choice[cty.Type]{50, cousinsOf(ty)},
++	)
 +}
 +
-+// swapPrimitive replaces one primitive somewhere in the type by another primitive.
-+func swapPrimitive(tc hegel.TestCase, ty cty.Type) cty.Type {
++// swappedOf is ty with one primitive somewhere in it replaced by another primitive.
++func swappedOf(ty cty.Type) hegel.Generator[cty.Type] {
 +	switch {
 +	case ty.IsPrimitiveType():
-+		return genPrimitiveType(tc, false)
++		return plainPrimitives
 +	case ty.IsListType():
-+		return cty.List(swapPrimitive(tc, ty.ElementType()))
++		return hegel.Map(swappedOf(ty.ElementType()), cty.List)
 +	case ty.IsSetType():
-+		return cty.Set(swapPrimitive(tc, ty.ElementType()))
++		return hegel.Map(swappedOf(ty.ElementType()), cty.Set)
 +	case ty.IsMapType():
-+		return cty.Map(swapPrimitive(tc, ty.ElementType()))
++		return hegel.Map(swappedOf(ty.ElementType()), cty.Map)
 +	case ty.IsObjectType():
-+		attrs := map[string]cty.Type{}
-+		for k, a := range ty.AttributeTypes() {
-+			attrs[k] = a
++		attrs := ty.AttributeTypes()
++		if len(attrs) == 0 {
++			return hegel.Just(ty)
 +		}
-+		if len(attrs) > 0 {
-+			k := pick(tc, sortedKeys(attrs))
-+			attrs[k] = swapPrimitive(tc, attrs[k])
-+		}
-+		return cty.Object(attrs)
++		return hegel.FlatMap(hegel.SampledFrom(sortedKeys(attrs)), func(k string) hegel.Generator[cty.Type] {
++			return hegel.Map(swappedOf(attrs[k]), func(swapped cty.Type) cty.Type {
++				out := map[string]cty.Type{}
++				for name, a := range attrs {
++					out[name] = a
++				}
++				out[k] = swapped
++				return cty.Object(out)
++			})
++		})
 +	case ty.IsTupleType():
-+		elems := append([]cty.Type{}, ty.TupleElementTypes()...)
-+		if len(elems) > 0 {
-+			i := drawInt(tc, 0, len(elems)-1)
-+			elems[i] = swapPrimitive(tc, elems[i])
++		etys := ty.TupleElementTypes()
++		if len(etys) == 0 {
++			return hegel.Just(ty)
 +		}
-+		return cty.Tuple(elems)
++		return hegel.FlatMap(hegel.Integers(0, len(etys)-1), func(i int) hegel.Generator[cty.Type] {
++			return hegel.Map(swappedOf(etys[i]), func(swapped cty.Type) cty.Type {
++				out := append([]cty.Type{}, etys...)
++				out[i] = swapped
++				return cty.Tuple(out)
++			})
++		})
 +	}
-+	return ty
++	return hegel.Just(ty)
 +}
 +
-+func sortedKeys(m map[string]cty.Type) []string {
-+	var out []string
-+	for k := range m {
-+		out = append(out, k)
-+	}
-+	sortStrings(out)
-+	return out
-+}
-+
-+// cousin: the same elements in another kind.
-+func cousin(tc hegel.TestCase, ty cty.Type) cty.Type {
++// cousinsOf is the same elements in another kind: a list, set or tuple of a sequence's
++// element type; a list or set of one of a tuple's element types; an object of a map's element
++// type; a map of one of an object's attribute types, or the object with an attribute dropped
++// or added; a primitive for a primitive.
++func cousinsOf(ty cty.Type) hegel.Generator[cty.Type] {
 +	switch {
 +	case ty.IsListType() || ty.IsSetType():
-+		switch drawInt(tc, 1, 3) {
-+		case 1:
-+			return cty.List(ty.ElementType())
-+		case 2:
-+			return cty.Set(ty.ElementType())
-+		default:
-+			n := drawInt(tc, 0, 3)
-+			elems := make([]cty.Type, n)
-+			for i := range elems {
-+				elems[i] = ty.ElementType()
-+			}
-+			return cty.Tuple(elems)
-+		}
++		ety := ty.ElementType()
++		return hegel.OneOf(
++			hegel.Just(cty.List(ety)),
++			hegel.Just(cty.Set(ety)),
++			hegel.Map(hegel.Integers(0, 3), func(n int) cty.Type {
++				elems := make([]cty.Type, n)
++				for i := range elems {
++					elems[i] = ety
++				}
++				return cty.Tuple(elems)
++			}),
++		)
 +	case ty.IsTupleType():
-+		ets := ty.TupleElementTypes()
-+		if len(ets) == 0 {
-+			return pick(tc, []cty.Type{cty.List(cty.String), cty.Set(cty.Number), cty.EmptyTuple})
++		etys := ty.TupleElementTypes()
++		if len(etys) == 0 {
++			return hegel.SampledFrom([]cty.Type{cty.List(cty.String), cty.Set(cty.Number), cty.EmptyTuple})
 +		}
-+		e := pick(tc, ets)
-+		if chance(tc, 50) {
-+			return cty.List(e)
-+		}
-+		return cty.Set(e)
++		return hegel.FlatMap(hegel.SampledFrom(etys), func(e cty.Type) hegel.Generator[cty.Type] {
++			return hegel.OneOf(hegel.Just(cty.List(e)), hegel.Just(cty.Set(e)))
++		})
 +	case ty.IsMapType():
-+		attrs := map[string]cty.Type{}
-+		for i, n := 0, drawInt(tc, 0, 3); i < n; i++ {
-+			attrs[pick(tc, attrNames)] = ty.ElementType()
-+		}
-+		return cty.Object(attrs)
++		return hegel.Map(hegel.Maps(attrKeys, hegel.Just(ty.ElementType())).MaxSize(3), objectOf)
 +	case ty.IsObjectType():
-+		ats := ty.AttributeTypes()
-+		if len(ats) == 0 {
-+			return cty.Map(genPrimitiveType(tc, false))
++		attrs := ty.AttributeTypes()
++		if len(attrs) == 0 {
++			return hegel.Map(plainPrimitives, cty.Map)
 +		}
-+		if chance(tc, 50) {
-+			return cty.Map(ats[pick(tc, sortedKeys(ats))])
-+		}
-+		// the same object with an attribute dropped or added
-+		attrs := map[string]cty.Type{}
-+		for k, a := range ats {
-+			attrs[k] = a
-+		}
-+		if chance(tc, 50) {
-+			delete(attrs, pick(tc, sortedKeys(ats)))
-+		} else {
-+			attrs[pick(tc, attrNames)] = genPrimitiveType(tc, false)
-+		}
-+		return cty.Object(attrs)
-+	default:
-+		return genPrimitiveType(tc, false)
++		names := hegel.SampledFrom(sortedKeys(attrs))
++		return weighted(
++			choice[cty.Type]{50, hegel.Map(names, func(k string) cty.Type { return cty.Map(attrs[k]) })},
++			choice[cty.Type]{25, hegel.Map(names, func(k string) cty.Type {
++				out := map[string]cty.Type{}
++				for name, a := range attrs {
++					out[name] = a
++				}
++				delete(out, k)
++				return cty.Object(out)
++			})},
++			choice[cty.Type]{25, hegel.Composite(func(tc hegel.TestCase) cty.Type {
++				out := map[string]cty.Type{}
++				for name, a := range attrs {
++					out[name] = a
++				}
++				out[hegel.Draw(tc, attrKeys)] = hegel.Draw(tc, plainPrimitives)
++				return cty.Object(out)
++			})},
++		)
 +	}
++	return plainPrimitives
 +}
++
++// --------------------------------------------------------------------------- conversions
++
++// convCase: a value of a type without placeholders and a related type to convert it to.
++type convCase struct {
++	ty   cty.Type
++	v    cty.Value
++	want cty.Type
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c convCase) GoString() string {
++	return fmt.Sprintf("%s as %s -> %s", c.v.GoString(), tyString(c.ty), tyString(c.want))
++}
++
++var convCases = hegel.Composite(func(tc hegel.TestCase) convCase {
++	ty := hegel.Draw(tc, plainTypes)
++	return convCase{ty: ty, v: hegel.Draw(tc, valuesOf(ty, valueOpts{nullPct: 8})), want: hegel.Draw(tc, relatedTypesOf(ty))}
++})
 +
 +// TestHegelConversionRules: a safe conversion never fails and yields the target type; Convert
 +// succeeds exactly when an unsafe conversion exists (or the types are equal) and yields the
@@ -295,9 +395,8 @@ index 0000000..bc553b8
 +func TestHegelConversionRules(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		ty := genType(ht, typeOpts{depth: 3})
-+		v := genValue(ht, ty, valueOpts{nullPct: 8})
-+		want := genRelatedType(ht, ty)
++		cc := hegel.Draw(ht, convCases)
++		ty, v, want := cc.ty, cc.v, cc.want
 +		if want.Equals(ty) {
 +			out, err := convert.Convert(v, want)
 +			if err != nil || !out.RawEquals(v) {
@@ -359,24 +458,42 @@ index 0000000..bc553b8
 +	})
 +}
 +
++// --------------------------------------------------------------------------- unification
++
++// unifyCase: a base type without placeholders, up to two types related to it, and a value of
++// each.
++type unifyCase struct {
++	types []cty.Type
++	vals  []cty.Value
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c unifyCase) GoString() string {
++	s := "unify"
++	for i, ty := range c.types {
++		s += fmt.Sprintf("\n  %s as %s", c.vals[i].GoString(), tyString(ty))
++	}
++	return s
++}
++
++var unifyCases = hegel.Composite(func(tc hegel.TestCase) unifyCase {
++	base := hegel.Draw(tc, plainTypes2)
++	types := append([]cty.Type{base}, hegel.Draw(tc, many(relatedTypesOf(base), 0, 2))...)
++	vals := make([]cty.Value, len(types))
++	for i, ty := range types {
++		vals[i] = hegel.Draw(tc, valuesOf(ty, valueOpts{nullPct: 5}))
++	}
++	return unifyCase{types, vals}
++})
++
 +// TestHegelUnification: the type Unify returns is one every input type converts to, with the
 +// conversions it hands back; UnifyUnsafe the same, the conversions allowed to fail on some
 +// values but never on the type.
 +func TestHegelUnification(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		n := drawInt(ht, 1, 3)
-+		var types []cty.Type
-+		var vals []cty.Value
-+		base := genType(ht, typeOpts{depth: 2})
-+		for i := 0; i < n; i++ {
-+			ty := base
-+			if i > 0 {
-+				ty = genRelatedType(ht, base)
-+			}
-+			types = append(types, ty)
-+			vals = append(vals, genValue(ht, ty, valueOpts{nullPct: 5}))
-+		}
++		uc := hegel.Draw(ht, unifyCases)
++		types, vals := uc.types, uc.vals
 +		for _, unsafe := range []bool{false, true} {
 +			var uty cty.Type
 +			var convs []convert.Conversion
@@ -420,13 +537,17 @@ index 0000000..bc553b8
 +}
 diff --git a/hegel/hegel_gen_test.go b/hegel/hegel_gen_test.go
 new file mode 100644
-index 0000000..a3e4ebf
+index 0000000..91f51db
 --- /dev/null
 +++ b/hegel/hegel_gen_test.go
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,366 @@
 +package hegel
 +
-+// Generators of cty types and values.
++// Generators of cty types and values, as values. A type comes from typesAt, a depth-indexed
++// generator memoised per depth over a weighted choice of kinds with the primitive first; a
++// value of a drawn type comes from valuesOf, a function of the type returning the generator of
++// its values (the properties FlatMap it over the type generator, so that the value follows the
++// type); numbers and strings are weighted choices over small forms and sample tables.
 +
 +import (
 +	"fmt"
@@ -437,53 +558,79 @@ index 0000000..a3e4ebf
 +	"hegel.dev/go/hegel"
 +)
 +
-+// typeOpts steers genType.
-+type typeOpts struct {
-+	dynamic bool // allow cty.DynamicPseudoType placeholders
-+	depth   int  // maximum nesting depth
-+}
-+
-+func genType(tc hegel.TestCase, o typeOpts) cty.Type {
-+	if o.depth <= 0 || chance(tc, 40) {
-+		return genPrimitiveType(tc, o.dynamic)
-+	}
-+	inner := typeOpts{dynamic: o.dynamic, depth: o.depth - 1}
-+	switch drawInt(tc, 1, 6) {
-+	case 1:
-+		return cty.List(genType(tc, inner))
-+	case 2:
-+		return cty.Map(genType(tc, inner))
-+	case 3:
-+		// set elements: no dynamic placeholders (a set of dynamic values is legal but its JSON
-+		// form needs type information the round trip does not keep for elements)
-+		return cty.Set(genType(tc, typeOpts{depth: o.depth - 1}))
-+	case 4:
-+		n := drawInt(tc, 0, 3)
-+		attrs := map[string]cty.Type{}
-+		for i := 0; i < n; i++ {
-+			attrs[pick(tc, attrNames)] = genType(tc, inner)
-+		}
-+		return cty.Object(attrs)
-+	default:
-+		n := drawInt(tc, 0, 3)
-+		var elems []cty.Type
-+		for i := 0; i < n; i++ {
-+			elems = append(elems, genType(tc, inner))
-+		}
-+		return cty.Tuple(elems)
-+	}
-+}
-+
 +var attrNames = []string{"a", "b", "name", "id", "x_y", "Z"}
 +
-+func genPrimitiveType(tc hegel.TestCase, dynamic bool) cty.Type {
-+	if dynamic && chance(tc, 15) {
-+		return cty.DynamicPseudoType
++var (
++	attrKeys        = hegel.SampledFrom(attrNames)
++	plainPrimitives = hegel.SampledFrom([]cty.Type{cty.String, cty.Number, cty.Bool})
++	// dynamicPrimitives: the primitives and, 15% of the time, the DynamicPseudoType placeholder.
++	dynamicPrimitives = weighted(choice[cty.Type]{85, plainPrimitives}, choice[cty.Type]{15, hegel.Just(cty.DynamicPseudoType)})
++)
++
++func primitivesOf(dynamic bool) hegel.Generator[cty.Type] {
++	if dynamic {
++		return dynamicPrimitives
 +	}
-+	return pick(tc, []cty.Type{cty.String, cty.Number, cty.Bool})
++	return plainPrimitives
 +}
 +
-+// valueOpts steers genValue.
++func objectOf(attrs map[string]cty.Type) cty.Type {
++	if attrs == nil {
++		attrs = map[string]cty.Type{}
++	}
++	return cty.Object(attrs)
++}
++
++func tupleOf(elems []cty.Type) cty.Type {
++	if elems == nil {
++		elems = []cty.Type{}
++	}
++	return cty.Tuple(elems)
++}
++
++type typeKey struct {
++	dynamic bool
++	depth   int
++}
++
++var typeMemo = map[typeKey]hegel.Generator[cty.Type]{}
++
++// typesAt is the generator of types nested up to depth, with DynamicPseudoType placeholders
++// when dynamic (never inside a set: a set of dynamic values is legal but its JSON form needs
++// type information the round trip does not keep for elements), memoised per (dynamic, depth):
++// a primitive first, then a list, map or set of a type one level down, an object of up to
++// three attributes or a tuple of up to three elements.
++func typesAt(dynamic bool, depth int) hegel.Generator[cty.Type] {
++	key := typeKey{dynamic, depth}
++	if g, ok := typeMemo[key]; ok {
++		return g
++	}
++	g := primitivesOf(dynamic)
++	if depth > 0 {
++		inner := typesAt(dynamic, depth-1)
++		plain := typesAt(false, depth-1)
++		g = weighted(
++			choice[cty.Type]{40, primitivesOf(dynamic)},
++			choice[cty.Type]{10, hegel.Map(inner, cty.List)},
++			choice[cty.Type]{10, hegel.Map(inner, cty.Map)},
++			choice[cty.Type]{10, hegel.Map(plain, cty.Set)},
++			choice[cty.Type]{10, hegel.Map(hegel.Maps(attrKeys, inner).MaxSize(3), objectOf)},
++			choice[cty.Type]{20, hegel.Map(many(inner, 0, 3), tupleOf)},
++		)
++	}
++	typeMemo[key] = g
++	return g
++}
++
++var (
++	dynamicTypes  = typesAt(true, 3)  // the codec round trips
++	plainTypes    = typesAt(false, 3) // conversions, the stdlib's JSON functions
++	dynamicTypes2 = typesAt(true, 2)
++	plainTypes2   = typesAt(false, 2)
++	shallowTypes  = typesAt(false, 1) // the concrete type standing in for a placeholder
++)
++
++// valueOpts steers valuesOf.
 +type valueOpts struct {
 +	nullPct    int  // chance of a null at any position
 +	unknownPct int  // chance of an unknown at any position
@@ -500,117 +647,143 @@ index 0000000..a3e4ebf
 +
 +var sampleStrings = []string{"", "a", "hello", "Hello World", "héllo", "日本語", "a\nb", `q"uote`, "tab\tx", "  spaced  ", "1", "true", "null", "-0", "1e3", "🙂", "é", "\\back"}
 +
-+// genNumber draws a number: small integers, decimals, big integers, a few specials.
-+func genNumber(tc hegel.TestCase) cty.Value {
-+	switch drawInt(tc, 1, 10) {
-+	case 1, 2, 3, 4:
-+		return cty.NumberIntVal(int64(drawInt(tc, -1000, 1000)))
-+	case 5, 6:
-+		return cty.MustParseNumberVal(fmt.Sprintf("%d.%03d", drawInt(tc, -1000, 1000), drawInt(tc, 0, 999)))
-+	case 7:
-+		return cty.MustParseNumberVal(pick(tc, []string{"123456789012345678901234567890", "-98765432109876543210", "9223372036854775807", "18446744073709551615", "1e30", "0.1", "1e-10", "3.14159265358979323846264338327950288"}))
-+	case 8:
-+		return cty.NumberFloatVal(float64(drawInt(tc, -100000, 100000)) / 7)
-+	default:
-+		return cty.NumberIntVal(int64(drawInt(tc, -3, 3)))
++var specialNumbers = []string{"123456789012345678901234567890", "-98765432109876543210", "9223372036854775807", "18446744073709551615", "1e30", "0.1", "1e-10", "3.14159265358979323846264338327950288"}
++
++func intVal(i int64) cty.Value { return cty.NumberIntVal(i) }
++
++var (
++	samples = hegel.SampledFrom(sampleStrings)
++	// stringValues: a sample string or, a fifth of the time, two concatenated.
++	stringValues = hegel.Map(weighted(choice[string]{80, samples}, choice[string]{20, cat(samples, samples)}), cty.StringVal)
++	// decimals: three decimal places.
++	decimals = hegel.Composite(func(tc hegel.TestCase) cty.Value {
++		return cty.MustParseNumberVal(fmt.Sprintf("%d.%03d", hegel.Draw(tc, hegel.Integers(-1000, 1000)), hegel.Draw(tc, hegel.Integers(0, 999))))
++	})
++	// numbers: a weighted choice of forms, the small integers first: integers within three,
++	// within a thousand, decimals, big and special numbers, sevenths.
++	numbers = weighted(
++		choice[cty.Value]{20, hegel.Map(ints(-3, 3), intVal)},
++		choice[cty.Value]{40, hegel.Map(ints(-1000, 1000), intVal)},
++		choice[cty.Value]{20, decimals},
++		choice[cty.Value]{10, hegel.Map(hegel.SampledFrom(specialNumbers), cty.MustParseNumberVal)},
++		choice[cty.Value]{10, hegel.Map(hegel.Integers(-100000, 100000), func(i int) cty.Value { return cty.NumberFloatVal(float64(i) / 7) })},
++	)
++	bools = hegel.Map(hegel.Booleans(), cty.BoolVal)
++)
++
++// valuesOf is the generator of values of ty: at every position a known value first, then a
++// null (nullPct) or an unknown (unknownPct) of the position's type; a DynamicPseudoType
++// position holds a value of some concrete type one level deep (or the dynamic null or
++// unknown).
++func valuesOf(ty cty.Type, o valueOpts) hegel.Generator[cty.Value] {
++	known := knownValuesOf(ty, o)
++	if o.nullPct == 0 && o.unknownPct == 0 {
++		return known
 +	}
++	return weighted(
++		choice[cty.Value]{100 - o.nullPct - o.unknownPct, known},
++		choice[cty.Value]{o.nullPct, hegel.Just(cty.NullVal(ty))},
++		choice[cty.Value]{o.unknownPct, hegel.Just(cty.UnknownVal(ty))},
++	)
 +}
 +
-+func genString(tc hegel.TestCase) cty.Value {
-+	if chance(tc, 20) {
-+		return cty.StringVal(pick(tc, sampleStrings) + pick(tc, sampleStrings))
-+	}
-+	return cty.StringVal(pick(tc, sampleStrings))
-+}
-+
-+// genValue draws a value of the type; for DynamicPseudoType a value of some concrete type (or
-+// the dynamic unknown / null).
-+func genValue(tc hegel.TestCase, ty cty.Type, o valueOpts) cty.Value {
-+	if o.unknownPct > 0 && chance(tc, o.unknownPct) {
-+		return cty.UnknownVal(ty)
-+	}
-+	if o.nullPct > 0 && chance(tc, o.nullPct) {
-+		return cty.NullVal(ty)
-+	}
++// knownValuesOf is the generator of known values of ty. The elements of one list, set or map
++// share one concrete type (cty.ListVal refuses a mix), drawn once per collection; sets hold
++// no unknowns (their membership would be undefined) and dedupe their elements by GoString;
++// the attributes of an object are drawn in name order.
++func knownValuesOf(ty cty.Type, o valueOpts) hegel.Generator[cty.Value] {
 +	switch {
 +	case ty == cty.DynamicPseudoType:
-+		return genValue(tc, genType(tc, typeOpts{depth: 1}), o)
++		return hegel.FlatMap(shallowTypes, func(conc cty.Type) hegel.Generator[cty.Value] { return valuesOf(conc, o) })
 +	case ty == cty.String:
-+		return genString(tc)
++		return stringValues
 +	case ty == cty.Number:
-+		return genNumber(tc)
++		return numbers
 +	case ty == cty.Bool:
-+		return cty.BoolVal(chance(tc, 50))
++		return bools
 +	case ty.IsListType():
-+		n := drawInt(tc, o.minLen(), 3)
-+		if n == 0 {
-+			return cty.ListValEmpty(ty.ElementType())
-+		}
-+		// the elements of one collection share one concrete type
-+		ety := concretize(tc, ty.ElementType())
-+		eo := elemOpts(ty.ElementType(), ety, o)
-+		var elems []cty.Value
-+		for i := 0; i < n; i++ {
-+			elems = append(elems, genValue(tc, ety, eo))
-+		}
-+		return cty.ListVal(elems)
++		ety := ty.ElementType()
++		return hegel.FlatMap(concreteOf(ety), func(conc cty.Type) hegel.Generator[cty.Value] {
++			return hegel.Map(many(valuesOf(conc, elemOpts(ety, conc, o)), o.minLen(), 3), func(elems []cty.Value) cty.Value {
++				if len(elems) == 0 {
++					return cty.ListValEmpty(ety)
++				}
++				return cty.ListVal(elems)
++			})
++		})
 +	case ty.IsSetType():
-+		n := drawInt(tc, o.minLen(), 3)
-+		// no unknowns inside sets: their membership is undefined
++		ety := ty.ElementType()
 +		inner := valueOpts{nullPct: o.nullPct, noEmpty: o.noEmpty}
-+		ety := concretize(tc, ty.ElementType())
-+		inner = elemOpts(ty.ElementType(), ety, inner)
-+		seen := map[string]bool{}
-+		var elems []cty.Value
-+		for i := 0; i < n; i++ {
-+			v := genValue(tc, ety, inner)
-+			k := v.GoString()
-+			if seen[k] {
-+				continue
-+			}
-+			seen[k] = true
-+			elems = append(elems, v)
-+		}
-+		if len(elems) == 0 {
-+			return cty.SetValEmpty(ty.ElementType())
-+		}
-+		return cty.SetVal(elems)
++		return hegel.FlatMap(concreteOf(ety), func(conc cty.Type) hegel.Generator[cty.Value] {
++			return hegel.Map(many(valuesOf(conc, elemOpts(ety, conc, inner)), o.minLen(), 3), func(elems []cty.Value) cty.Value {
++				elems = distinctValues(elems)
++				if len(elems) == 0 {
++					return cty.SetValEmpty(ety)
++				}
++				return cty.SetVal(elems)
++			})
++		})
 +	case ty.IsMapType():
-+		n := drawInt(tc, o.minLen(), 3)
-+		m := map[string]cty.Value{}
-+		ety := concretize(tc, ty.ElementType())
-+		eo := elemOpts(ty.ElementType(), ety, o)
-+		for i := 0; i < n; i++ {
-+			m[pick(tc, attrNames)] = genValue(tc, ety, eo)
-+		}
-+		for len(m) < n {
-+			m[pick(tc, attrNames)+itoa(len(m))] = genValue(tc, ety, eo)
-+		}
-+		if len(m) == 0 {
-+			return cty.MapValEmpty(ty.ElementType())
-+		}
-+		return cty.MapVal(m)
++		ety := ty.ElementType()
++		return hegel.FlatMap(concreteOf(ety), func(conc cty.Type) hegel.Generator[cty.Value] {
++			return hegel.Map(hegel.Maps(attrKeys, valuesOf(conc, elemOpts(ety, conc, o))).MinSize(o.minLen()).MaxSize(3), func(m map[string]cty.Value) cty.Value {
++				if len(m) == 0 {
++					return cty.MapValEmpty(ety)
++				}
++				return cty.MapVal(m)
++			})
++		})
 +	case ty.IsObjectType():
-+		m := map[string]cty.Value{}
-+		for name, aty := range ty.AttributeTypes() {
-+			m[name] = genValue(tc, aty, o)
++		attrs := ty.AttributeTypes()
++		names := sortedKeys(attrs)
++		gens := make([]hegel.Generator[cty.Value], len(names))
++		for i, name := range names {
++			gens[i] = valuesOf(attrs[name], o)
 +		}
-+		return cty.ObjectVal(m)
++		return hegel.Composite(func(tc hegel.TestCase) cty.Value {
++			m := map[string]cty.Value{}
++			for i, name := range names {
++				m[name] = hegel.Draw(tc, gens[i])
++			}
++			return cty.ObjectVal(m)
++		})
 +	case ty.IsTupleType():
-+		var elems []cty.Value
-+		for _, ety := range ty.TupleElementTypes() {
-+			elems = append(elems, genValue(tc, ety, o))
++		etys := ty.TupleElementTypes()
++		gens := make([]hegel.Generator[cty.Value], len(etys))
++		for i, ety := range etys {
++			gens[i] = valuesOf(ety, o)
 +		}
-+		return cty.TupleVal(elems)
++		return hegel.Composite(func(tc hegel.TestCase) cty.Value {
++			elems := make([]cty.Value, len(gens))
++			for i, g := range gens {
++				elems[i] = hegel.Draw(tc, g)
++			}
++			return cty.TupleVal(elems)
++		})
 +	}
-+	panic("genValue: unhandled type " + ty.FriendlyName())
++	panic("valuesOf: unhandled type " + ty.FriendlyName())
++}
++
++// distinctValues keeps the first of equal values (by GoString), in order.
++func distinctValues(elems []cty.Value) []cty.Value {
++	seen := map[string]bool{}
++	var out []cty.Value
++	for _, v := range elems {
++		k := v.GoString()
++		if !seen[k] {
++			seen[k] = true
++			out = append(out, v)
++		}
++	}
++	return out
 +}
 +
 +// elemOpts: the value options for the elements of a collection whose declared element type is
-+// decl and whose elements are generated as conc. While Known.dynamicElemNullLosesType is on,
-+// a collection whose element type holds a placeholder gets known, non-empty elements only: a
-+// null, unknown or empty-collection element comes back from a codec with the declared type,
-+// and beside a known element that makes the unmarshalled list inconsistent (a panic).
++// decl and whose elements are generated as conc. While Known.dynamicElemNullLosesType is on
++// (HEGEL_NO_KNOWN=1), a collection whose element type holds a placeholder gets known,
++// non-empty elements only: a null, unknown or empty-collection element comes back from a codec
++// with the declared type, and beside a known element that makes the unmarshalled list
++// inconsistent (a panic).
 +func elemOpts(decl, conc cty.Type, o valueOpts) valueOpts {
 +	if Known.dynamicElemNullLosesType && !decl.Equals(conc) {
 +		return valueOpts{noEmpty: true}
@@ -618,31 +791,66 @@ index 0000000..a3e4ebf
 +	return o
 +}
 +
-+// concretize replaces every DynamicPseudoType in the type by a concrete type.
-+func concretize(tc hegel.TestCase, ty cty.Type) cty.Type {
++// concreteOf is the generator of concrete types for a type with placeholders: every
++// DynamicPseudoType replaced by a shallow concrete type (the type itself, without a draw, when
++// it has none).
++func concreteOf(ty cty.Type) hegel.Generator[cty.Type] {
 +	switch {
++	case !ty.HasDynamicTypes():
++		return hegel.Just(ty)
 +	case ty == cty.DynamicPseudoType:
-+		return genType(tc, typeOpts{depth: 1})
++		return shallowTypes
 +	case ty.IsListType():
-+		return cty.List(concretize(tc, ty.ElementType()))
++		return hegel.Map(concreteOf(ty.ElementType()), cty.List)
 +	case ty.IsSetType():
-+		return cty.Set(concretize(tc, ty.ElementType()))
++		return hegel.Map(concreteOf(ty.ElementType()), cty.Set)
 +	case ty.IsMapType():
-+		return cty.Map(concretize(tc, ty.ElementType()))
++		return hegel.Map(concreteOf(ty.ElementType()), cty.Map)
 +	case ty.IsObjectType():
-+		attrs := map[string]cty.Type{}
-+		for k, a := range ty.AttributeTypes() {
-+			attrs[k] = concretize(tc, a)
++		attrs := ty.AttributeTypes()
++		names := sortedKeys(attrs)
++		gens := make([]hegel.Generator[cty.Type], len(names))
++		for i, name := range names {
++			gens[i] = concreteOf(attrs[name])
 +		}
-+		return cty.Object(attrs)
++		return hegel.Composite(func(tc hegel.TestCase) cty.Type {
++			out := map[string]cty.Type{}
++			for i, name := range names {
++				out[name] = hegel.Draw(tc, gens[i])
++			}
++			return cty.Object(out)
++		})
 +	case ty.IsTupleType():
-+		var elems []cty.Type
-+		for _, e := range ty.TupleElementTypes() {
-+			elems = append(elems, concretize(tc, e))
++		etys := ty.TupleElementTypes()
++		gens := make([]hegel.Generator[cty.Type], len(etys))
++		for i, ety := range etys {
++			gens[i] = concreteOf(ety)
 +		}
-+		return cty.Tuple(elems)
++		return hegel.Composite(func(tc hegel.TestCase) cty.Type {
++			out := make([]cty.Type, len(gens))
++			for i, g := range gens {
++				out[i] = hegel.Draw(tc, g)
++			}
++			return cty.Tuple(out)
++		})
 +	}
-+	return ty
++	return hegel.Just(ty)
++}
++
++// typed is a value with the type it is marshalled as.
++type typed struct {
++	ty cty.Type
++	v  cty.Value
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c typed) GoString() string { return fmt.Sprintf("%s as %s", c.v.GoString(), tyString(c.ty)) }
++
++// typedValuesOf draws a type from types and a value of it.
++func typedValuesOf(types hegel.Generator[cty.Type], o valueOpts) hegel.Generator[typed] {
++	return hegel.FlatMap(types, func(ty cty.Type) hegel.Generator[typed] {
++		return hegel.Map(valuesOf(ty, o), func(v cty.Value) typed { return typed{ty, v} })
++	})
 +}
 +
 +// hasDynamic reports a DynamicPseudoType anywhere in the type.
@@ -674,6 +882,15 @@ index 0000000..a3e4ebf
 +// tyString renders a type for messages.
 +func tyString(ty cty.Type) string { return ty.GoString() }
 +
++func sortedKeys(m map[string]cty.Type) []string {
++	var out []string
++	for k := range m {
++		out = append(out, k)
++	}
++	sort.Strings(out)
++	return out
++}
++
 +// keysOf returns the sorted keys of a map value.
 +func keysOf(v cty.Value) []string {
 +	var out []string
@@ -690,8 +907,6 @@ index 0000000..a3e4ebf
 +func numStr(v cty.Value) string { return v.AsBigFloat().Text('f', -1) }
 +
 +func itoa(i int) string { return strconv.Itoa(i) }
-+
-+func sortStrings(xs []string) { sort.Strings(xs) }
 diff --git a/hegel/hegel_pins_test.go b/hegel/hegel_pins_test.go
 new file mode 100644
 index 0000000..5901cf1
@@ -865,15 +1080,439 @@ index 0000000..5901cf1
 +		t.Errorf("stdlib.Modulo(5, 0) = %s, want PositiveInfinity or an error", got.GoString())
 +	}
 +}
+diff --git a/hegel/hegel_shapes_test.go b/hegel/hegel_shapes_test.go
+new file mode 100644
+index 0000000..3d19616
+--- /dev/null
++++ b/hegel/hegel_shapes_test.go
+@@ -0,0 +1,415 @@
++package hegel
++
++// One property per recorded bug (bugs.toml), each over the bug's shape region alone and judged
++// by the documented model the wide properties use; under HEGEL_NO_KNOWN=1 each draws the
++// neighbouring region past the shape instead (known, non-empty elements; a positive length or
++// a non-negative offset; separators other than the underscore; non-zero steps; a positive
++// precision; text after the document; non-zero divisors) and passes.
++
++import (
++	"fmt"
++	"math/big"
++	"strings"
++	"testing"
++
++	"github.com/zclconf/go-cty/cty"
++	"github.com/zclconf/go-cty/cty/function/stdlib"
++	ctyjson "github.com/zclconf/go-cty/cty/json"
++	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- go-cty/1
++
++// lostKind is the form of an element that comes back with the declared element type: a null,
++// an unknown (msgpack only) or an empty collection of its own concrete type.
++type lostKind int
++
++const (
++	lostNull lostKind = iota
++	lostUnknown
++	lostEmpty
++)
++
++// dynamicElemCase: a list or map whose element type holds a placeholder, holding known
++// non-empty elements of one concrete type and (in the shape region) one null, unknown or empty
++// element among them.
++type dynamicElemCase struct {
++	msgpack bool
++	asMap   bool
++	ety     cty.Type // List(D), Map(D) or Object({a: D})
++	conc    cty.Type // the elements' concrete type
++	knowns  []cty.Value
++	lost    *lostKind // nil: no lost element (past the shape)
++	pos     int       // where the lost element goes among the knowns
++	keys    []string  // the map keys, one per element (attrNames)
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c dynamicElemCase) GoString() string {
++	codec := "json"
++	if c.msgpack {
++		codec = "msgpack"
++	}
++	ty, v := c.typed()
++	return fmt.Sprintf("%s: %s as %s", codec, v.GoString(), tyString(ty))
++}
++
++// lostValue is the lost element: a null or unknown of the concrete type, or the empty
++// collection of its element type.
++func (c dynamicElemCase) lostValue() cty.Value {
++	switch *c.lost {
++	case lostUnknown:
++		return cty.UnknownVal(c.conc)
++	case lostEmpty:
++		if c.conc.IsMapType() {
++			return cty.MapValEmpty(c.conc.ElementType())
++		}
++		return cty.ListValEmpty(c.conc.ElementType())
++	}
++	return cty.NullVal(c.conc)
++}
++
++// elems is the elements in order, the lost one at its position.
++func (c dynamicElemCase) elems() []cty.Value {
++	if c.lost == nil {
++		return c.knowns
++	}
++	out := append([]cty.Value(nil), c.knowns[:c.pos]...)
++	out = append(out, c.lostValue())
++	return append(out, c.knowns[c.pos:]...)
++}
++
++// typed renders the case to the type and the value marshalled as it.
++func (c dynamicElemCase) typed() (cty.Type, cty.Value) {
++	elems := c.elems()
++	if c.asMap {
++		m := map[string]cty.Value{}
++		for i, e := range elems {
++			m[c.keys[i]] = e
++		}
++		if len(m) == 0 {
++			return cty.Map(c.ety), cty.MapValEmpty(c.ety)
++		}
++		return cty.Map(c.ety), cty.MapVal(m)
++	}
++	if len(elems) == 0 {
++		return cty.List(c.ety), cty.ListValEmpty(c.ety)
++	}
++	return cty.List(c.ety), cty.ListVal(elems)
++}
++
++var (
++	dynamicElemTypes = hegel.SampledFrom([]cty.Type{
++		cty.List(cty.DynamicPseudoType),
++		cty.Map(cty.DynamicPseudoType),
++		cty.Object(map[string]cty.Type{"a": cty.DynamicPseudoType}),
++	})
++	dynamicElemCases = hegel.Composite(func(tc hegel.TestCase) dynamicElemCase {
++		c := dynamicElemCase{msgpack: hegel.Draw(tc, hegel.Booleans()), asMap: hegel.Draw(tc, hegel.Booleans()), ety: hegel.Draw(tc, dynamicElemTypes)}
++		c.conc = hegel.Draw(tc, concreteOf(c.ety))
++		// the shape: zero to two known elements and one lost; past it: one to three known
++		c.knowns = hegel.Draw(tc, many(valuesOf(c.conc, valueOpts{noEmpty: true}), shaped(0, 1), shaped(2, 3)))
++		if !noKnown {
++			// a null, or (msgpack) an unknown, or (list and map elements) the empty collection
++			kinds := []lostKind{lostNull}
++			if c.msgpack {
++				kinds = append(kinds, lostUnknown)
++			}
++			if !c.conc.IsObjectType() {
++				kinds = append(kinds, lostEmpty)
++			}
++			c.lost = ptrTo(hegel.Draw(tc, hegel.SampledFrom(kinds)))
++			c.pos = hegel.Draw(tc, hegel.Integers(0, len(c.knowns)))
++		}
++		c.keys = attrNames // one key per element, in the table's order
++		return c
++	})
++)
++
++// TestHegelDynamicElementTypesKeepNullElements: a null, unknown or empty-collection element
++// of a list or map whose element type holds a placeholder round-trips through JSON and msgpack
++// with its own type, and beside a known element the unmarshal does not panic (go-cty/1). Under
++// HEGEL_NO_KNOWN=1 the elements are all known and non-empty.
++func TestHegelDynamicElementTypesKeepNullElements(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		dc := hegel.Draw(ht, dynamicElemCases)
++		ty, v := dc.typed()
++		shape := known("go-cty/1")
++		marshal, unmarshal := ctyjson.Marshal, ctyjson.Unmarshal
++		if dc.msgpack {
++			marshal, unmarshal = ctymsgpack.Marshal, ctymsgpack.Unmarshal
++		}
++		buf, err := marshal(v, ty)
++		if err != nil {
++			c.failClass(ht, "marshal", "Marshal(%s, %s): %v", v.GoString(), tyString(ty), err)
++			return
++		}
++		got, err, panicked := recovering(func() (cty.Value, error) { return unmarshal(buf, ty) })
++		switch {
++		case panicked != nil:
++			c.mismatch(ht, "unmarshal panic", shape, "Unmarshal(%q, %s) panics: %v (value %s)", buf, tyString(ty), panicked, v.GoString())
++		case err != nil:
++			c.mismatch(ht, "unmarshal", shape, "Unmarshal(%q, %s): %v (value %s)", buf, tyString(ty), err, v.GoString())
++		case !got.RawEquals(v):
++			c.mismatch(ht, "value", shape, "round trip of %s as %s gives %s (%q)", v.GoString(), tyString(ty), got.GoString(), buf)
++		}
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/2
++
++// substrCase: a non-empty string, an offset and a length.
++type substrCase struct {
++	s           string
++	off, length int
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c substrCase) GoString() string { return fmt.Sprintf("Substr(%q, %d, %d)", c.s, c.off, c.length) }
++
++var (
++	nonEmptyPlain = hegel.Filter(plain, func(s string) bool { return s != "" })
++	substrCases   = hegel.FlatMap(nonEmptyPlain, func(s string) hegel.Generator[substrCase] {
++		n := len([]rune(s))
++		negative := hegel.Integers(-n, -1)
++		// the shape: a negative offset with length 0; past it, a positive length with a negative
++		// offset or a non-negative offset with length 0
++		return shaped(
++			hegel.Map(negative, func(off int) substrCase { return substrCase{s, off, 0} }),
++			weighted(
++				choice[substrCase]{50, hegel.Composite(func(tc hegel.TestCase) substrCase {
++					return substrCase{s, hegel.Draw(tc, negative), hegel.Draw(tc, hegel.Integers(1, n+1))}
++				})},
++				choice[substrCase]{50, hegel.Map(hegel.Integers(0, n), func(off int) substrCase { return substrCase{s, off, 0} })},
++			),
++		)
++	})
++)
++
++// TestHegelSubstrNegativeOffsetsWithZeroLength: Substr with a negative offset and length 0 is
++// the empty string, as with any offset (go-cty/2). Under HEGEL_NO_KNOWN=1 the length is
++// positive or the offset non-negative.
++func TestHegelSubstrNegativeOffsetsWithZeroLength(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		sc := hegel.Draw(ht, substrCases)
++		got, err := stdlib.Substr(cty.StringVal(sc.s), cty.NumberIntVal(int64(sc.off)), cty.NumberIntVal(int64(sc.length)))
++		checkString(c, ht, "Substr", known("go-cty/2"), got, err, substrWant([]rune(sc.s), sc.off, sc.length), sc.GoString())
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/3
++
++var (
++	titleWords = hegel.SampledFrom([]string{"a", "hello", "world", "x", "foo", "bar", "\u00e9t\u00e9", "b2", "zz"})
++	// titleSeparators: the underscore (the shape), or past it the separators strings.Title knows.
++	titleSeparators = shaped(hegel.Just("_"), hegel.SampledFrom([]string{" ", "-", ".", "/", ","}))
++	titleCases      = hegel.Composite(func(tc hegel.TestCase) string {
++		return strings.Join(hegel.Draw(tc, many(titleWords, 2, 4)), hegel.Draw(tc, titleSeparators))
++	})
++)
++
++// TestHegelTitleAfterUnderscores: Title upper-cases the letter after an underscore, a
++// non-letter, non-digit character by its description (go-cty/3). Under HEGEL_NO_KNOWN=1 the
++// words are joined by other separators.
++func TestHegelTitleAfterUnderscores(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		s := hegel.Draw(ht, titleCases)
++		got, err := stdlib.Title(cty.StringVal(s))
++		checkString(c, ht, "Title", known("go-cty/3"), got, err, titleWant(s), fmt.Sprintf("Title(%q)", s))
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/4
++
++// numberPair: two numbers that differ.
++type numberPair struct{ a, b cty.Value }
++
++// GoString is what the draw report prints (it uses %#v).
++func (p numberPair) GoString() string { return fmt.Sprintf("%s, %s", numStr(p.a), numStr(p.b)) }
++
++var numberPairs = hegel.Filter(hegel.Composite(func(tc hegel.TestCase) numberPair {
++	return numberPair{hegel.Draw(tc, numbers), hegel.Draw(tc, numbers)}
++}), func(p numberPair) bool { return p.a.AsBigFloat().Cmp(p.b.AsBigFloat()) != 0 })
++
++// TestHegelComparisonsAgainstDescriptions: LessThan, LessThanOrEqualTo, GreaterThan and
++// GreaterThanOrEqualTo of two numbers that differ, against what their descriptions say of the
++// operands (go-cty/4). Under HEGEL_NO_KNOWN=1 the model is the numeric order of the arguments
++// as given, which the descriptions do not state.
++func TestHegelComparisonsAgainstDescriptions(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		p := hegel.Draw(ht, numberPairs)
++		a, b := p.a, p.b
++		lt, le, gt, ge := comparisonWant(a.AsBigFloat().Cmp(b.AsBigFloat()))
++		check := func(name string, got cty.Value, err error, want bool) {
++			if err != nil {
++				c.mismatch(ht, name, known("go-cty/4"), "%s(%s, %s): %v", name, numStr(a), numStr(b), err)
++			} else if got.True() != want {
++				c.mismatch(ht, name, known("go-cty/4"), "%s(%s, %s) = %v, want %v", name, numStr(a), numStr(b), got.True(), want)
++			}
++		}
++		got, err := stdlib.LessThan(a, b)
++		check("LessThan", got, err, lt)
++		got, err = stdlib.LessThanOrEqualTo(a, b)
++		check("LessThanOrEqualTo", got, err, le)
++		got, err = stdlib.GreaterThan(a, b)
++		check("GreaterThan", got, err, gt)
++		got, err = stdlib.GreaterThanOrEqualTo(a, b)
++		check("GreaterThanOrEqualTo", got, err, ge)
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/5
++
++var (
++	// nonZeroSteps: -3 to 3 without 0.
++	nonZeroSteps  = hegel.Map(hegel.Integers(0, 5), func(i int) int { return []int{1, -1, 2, -2, 3, -3}[i] })
++	zeroStepCases = hegel.Composite(func(tc hegel.TestCase) rangeCase {
++		start := hegel.Draw(tc, rangeEnds)
++		end := start
++		if !hegel.Draw(tc, chance(50)) {
++			end = hegel.Draw(tc, rangeEnds)
++		}
++		return rangeCase{nargs: 3, start: start, end: end, step: hegel.Draw(tc, shaped(hegel.Just(0), nonZeroSteps))}
++	})
++)
++
++// TestHegelRangeRejectsZeroSteps: Range with a step of 0 fails, from any start to any end,
++// the end being the start half the time (go-cty/5: Range(n, n, 0) is the empty list). Under
++// HEGEL_NO_KNOWN=1 the steps are non-zero.
++func TestHegelRangeRejectsZeroSteps(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		rc := hegel.Draw(ht, zeroStepCases)
++		checkRange(c, ht, known("go-cty/5"), rc)
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/6
++
++// candidateFormatAsIsPrecision names the shape gated out of the %s precision property: %v
++// ignores every precision (formatAppendAsIs never reads it), where the documentation has %v
++// format a string as %s and precision limit a string's length. Counted, not judged, until it
++// is recorded (hegel-bindings.md).
++const candidateFormatAsIsPrecision = "candidate/go/go-cty-9"
++
++// precisionCase: a string formatted by %s or %v with a precision.
++type precisionCase struct {
++	verb string
++	prec int
++	s    string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c precisionCase) GoString() string {
++	return fmt.Sprintf("Format(\"%%.%d%s\", %q)", c.prec, c.verb, c.s)
++}
++
++var precisionCases = hegel.Composite(func(tc hegel.TestCase) precisionCase {
++	return precisionCase{
++		// %s nine times in ten, %v the tenth (gated: candidateFormatAsIsPrecision)
++		verb: hegel.Draw(tc, weighted(choice[string]{90, hegel.Just("s")}, choice[string]{10, hegel.Just("v")})),
++		// the shape: precision 0; past it, 1 to 4
++		prec: hegel.Draw(tc, shaped(hegel.Just(0), hegel.Integers(1, 4))),
++		s:    hegel.Draw(tc, plain),
++	}
++})
++
++// TestHegelFormatStringPrecision: Format's %s truncates the string to the precision, 0
++// included (go-cty/6). Under HEGEL_NO_KNOWN=1 the precision is positive. The %v cases are
++// counted and skipped (candidateFormatAsIsPrecision).
++func TestHegelFormatStringPrecision(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		pc := hegel.Draw(ht, precisionCases)
++		if pc.verb == "v" {
++			c.count(candidateFormatAsIsPrecision)
++			ht.Assume(false)
++		}
++		seg := fmtSeg{verb: pc.verb, width: -1, prec: pc.prec, arg: cty.StringVal(pc.s)}
++		checkFormat(c, ht, known("go-cty/6"), formatCase{segs: []fmtSeg{seg}})
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/7
++
++// trailedDoc: a value's JSON document and the text appended to it.
++type trailedDoc struct {
++	v        cty.Value
++	trailing string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (d trailedDoc) GoString() string { return fmt.Sprintf("%s then %q", d.v.GoString(), d.trailing) }
++
++var (
++	// bracketTrailers: closing brackets (the shape), or past it text.
++	bracketTrailers = shaped(hegel.SampledFrom([]string{"]", "}", "]]"}), hegel.SampledFrom([]string{" x", " 1"}))
++	trailedDocs     = hegel.Composite(func(tc hegel.TestCase) trailedDoc {
++		ty := hegel.Draw(tc, plainTypes)
++		return trailedDoc{v: hegel.Draw(tc, valuesOf(ty, valueOpts{nullPct: 10})), trailing: hegel.Draw(tc, bracketTrailers)}
++	})
++)
++
++// TestHegelJSONDecodeRejectsTrailingBrackets: JSONDecode rejects a valid document followed by
++// a stray "]" or "}" (go-cty/7). Under HEGEL_NO_KNOWN=1 the document is followed by text.
++func TestHegelJSONDecodeRejectsTrailingBrackets(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		d := hegel.Draw(ht, trailedDocs)
++		enc, err := stdlib.JSONEncode(d.v)
++		if err != nil {
++			c.failClass(ht, "JSONEncode", "JSONEncode(%s): %v", d.v.GoString(), err)
++			return
++		}
++		checkTrailing(c, ht, known("go-cty/7"), enc.AsString(), d.trailing)
++	})
++}
++
++// --------------------------------------------------------------------------- go-cty/8
++
++// moduloCase: an integer dividend and divisor.
++type moduloCase struct{ a, b int64 }
++
++// GoString is what the draw report prints (it uses %#v).
++func (c moduloCase) GoString() string { return fmt.Sprintf("Modulo(%d, %d)", c.a, c.b) }
++
++var (
++	// nonZeroInts: -1000 to 1000 without 0.
++	nonZeroInts = hegel.Map(hegel.Integers(1, 2000), func(i int) int64 {
++		if i > 1000 {
++			return int64(1000 - i)
++		}
++		return int64(i)
++	})
++	moduloCases = hegel.Composite(func(tc hegel.TestCase) moduloCase {
++		return moduloCase{a: hegel.Draw(tc, ints(-1000, 1000)), b: hegel.Draw(tc, shaped(hegel.Just[int64](0), nonZeroInts))}
++	})
++)
++
++// TestHegelModuloByZero: Modulo of an integer by zero is the infinity of the dividend's sign
++// (Value.Modulo's documentation; go-cty/8). Under HEGEL_NO_KNOWN=1 the divisor is non-zero
++// and the model big.Int's remainder.
++func TestHegelModuloByZero(t *testing.T) {
++	c := newCollector(t)
++	property(t, func(ht *hegel.T) {
++		mc := hegel.Draw(ht, moduloCases)
++		a, b := cty.NumberIntVal(mc.a), cty.NumberIntVal(mc.b)
++		got, err := stdlib.Modulo(a, b)
++		var want cty.Value
++		if mc.b == 0 {
++			want = moduloByZeroWant(a)
++		} else {
++			want = cty.NumberVal(new(big.Float).SetInt(new(big.Int).Rem(big.NewInt(mc.a), big.NewInt(mc.b))))
++		}
++		if err != nil {
++			c.mismatch(ht, "Modulo", known("go-cty/8"), "%s: %v", mc.GoString(), err)
++		} else if got.AsBigFloat().Cmp(want.AsBigFloat()) != 0 {
++			c.mismatch(ht, "Modulo", known("go-cty/8"), "%s = %s, want %s", mc.GoString(), got.GoString(), want.GoString())
++		}
++	})
++}
 diff --git a/hegel/hegel_stdlib_test.go b/hegel/hegel_stdlib_test.go
 new file mode 100644
-index 0000000..c8fef5e
+index 0000000..d67e895
 --- /dev/null
 +++ b/hegel/hegel_stdlib_test.go
-@@ -0,0 +1,1508 @@
+@@ -0,0 +1,2022 @@
 +package hegel
 +
 +// The stdlib functions against models written from their doc comments and Description fields.
++// Each property draws one case record (a Composite where a draw depends on another, Map/Lists
++// over the sample tables otherwise) and judges it; the models are pure functions of the
++// record, shared with the narrow properties of hegel_shapes_test.go.
 +
 +import (
 +	"bytes"
@@ -898,21 +1537,14 @@ index 0000000..c8fef5e
 +// "\r\n"), so the rune-based models agree with the documented character semantics.
 +var plainStrings = []string{"", "a", "hello", "Hello World", "héllo", "日本語", "a\nb", `q"uote`, "tab\tx", "  spaced  ", "1", "true", "-0", "🙂", "é", "\\back", "x_y", "a-b c", "ABC", "MiXeD", "\n\n", "end\n", "<a&b>"}
 +
-+func genPlain(tc hegel.TestCase) string {
-+	if chance(tc, 25) {
-+		return pick(tc, plainStrings) + pick(tc, plainStrings)
-+	}
-+	return pick(tc, plainStrings)
-+}
++var (
++	plainSamples = hegel.SampledFrom(plainStrings)
++	// plain: a sample string or, a quarter of the time, two concatenated.
++	plain = weighted(choice[string]{75, plainSamples}, choice[string]{25, cat(plainSamples, plainSamples)})
++)
 +
-+func genStrings(tc hegel.TestCase, lo, hi int) []string {
-+	n := drawInt(tc, lo, hi)
-+	out := make([]string, n)
-+	for i := range out {
-+		out[i] = genPlain(tc)
-+	}
-+	return out
-+}
++// plains is a list of lo to hi plain strings.
++func plains(lo, hi int) hegel.Generator[[]string] { return many(plain, lo, hi) }
 +
 +func strList(xs []string) cty.Value {
 +	if len(xs) == 0 {
@@ -996,26 +1628,142 @@ index 0000000..c8fef5e
 +
 +// --------------------------------------------------------------------------- strings
 +
++// substrWant is Substr's documented result on the runes: a negative offset counts from the
++// end, length -1 is the rest, length 0 the empty string. While
++// Known.substrNegativeOffsetZeroLength is on, a negative offset with length 0 gives the rest
++// from the offset (go-cty/2).
++func substrWant(runes []rune, off, length int) string {
++	n := len(runes)
++	o := off
++	if o < 0 {
++		o += n
++	}
++	switch {
++	case length == 0 && off < 0 && Known.substrNegativeOffsetZeroLength:
++		return string(runes[o:])
++	case length == 0:
++		return ""
++	case length < 0:
++		return string(runes[o:])
++	}
++	end := o + length
++	if end > n {
++		end = n
++	}
++	return string(runes[o:end])
++}
++
++// titleWant is Title's described result: one letter after each non-letter, non-digit
++// character upper-cased. While Known.titleUnderscore is on it is strings.Title, whose
++// separators exclude the underscore and every non-ASCII, non-space character (go-cty/3).
++func titleWant(s string) string {
++	if Known.titleUnderscore {
++		return strings.Title(s)
++	}
++	var b strings.Builder
++	prevSep := true
++	for _, r := range s {
++		if prevSep {
++			b.WriteRune(unicode.ToTitle(r))
++		} else {
++			b.WriteRune(r)
++		}
++		prevSep = !unicode.IsLetter(r) && !unicode.IsDigit(r)
++	}
++	return b.String()
++}
++
++// titleShape reports the shape of go-cty/3: a letter with a title-case form follows an
++// underscore or a non-ASCII character that is neither a letter, a digit nor a space, which the
++// description counts as a separator and strings.Title does not.
++func titleShape(s string) bool {
++	prev := rune(-1)
++	for _, r := range s {
++		if prev >= 0 && unicode.IsLetter(r) && unicode.ToTitle(r) != r &&
++			(prev == '_' || (prev > 0x7f && !unicode.IsLetter(prev) && !unicode.IsDigit(prev) && !unicode.IsSpace(prev))) {
++			return true
++		}
++		prev = r
++	}
++	return false
++}
++
++// stringCase: the subject string and the arguments of each string function.
++type stringCase struct {
++	s           string
++	off, length int        // Substr: an offset in [-n, n] and a length in [-1, n+1] for n runes
++	tail        string     // Chomp: the line ending appended to s
++	indent      int        // Indent: spaces
++	cut         string     // Trim: the cutset
++	affix       string     // TrimPrefix, TrimSuffix
++	sub, rep    string     // Replace
++	sep         string     // Split, Join
++	lists       [][]string // Join: one to three lists
++	xs          []string   // Sort
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c stringCase) GoString() string {
++	return fmt.Sprintf("s %q off %d len %d tail %q indent %d cut %q affix %q sub %q rep %q sep %q lists %q sort %q",
++		c.s, c.off, c.length, c.tail, c.indent, c.cut, c.affix, c.sub, c.rep, c.sep, c.lists, c.xs)
++}
++
++var (
++	lineEndings = hegel.SampledFrom([]string{"", "\n", "\r\n", "\n\n", "\r\n\r\n", "\n\r"})
++	cutsets     = hegel.SampledFrom([]string{"", " ", "ab", "lo", "\n", "é", "abc123"})
++	affixes     = hegel.SampledFrom([]string{"", "h", "he", "日", "  ", "Hello", "x"})
++	substrings  = hegel.SampledFrom([]string{"l", "ll", "o", " ", "日本", "🙂", "zz", "\n"})
++	replacers   = hegel.SampledFrom([]string{"", "L", "--", "日"})
++	separators  = hegel.SampledFrom([]string{",", " ", "l", "\n", "ab", "日"})
++	stringCases = hegel.Composite(func(tc hegel.TestCase) stringCase {
++		s := hegel.Draw(tc, plain)
++		n := len([]rune(s))
++		return stringCase{
++			s:      s,
++			off:    hegel.Draw(tc, hegel.Integers(-n, n)),
++			length: hegel.Draw(tc, hegel.Integers(-1, n+1)),
++			tail:   hegel.Draw(tc, lineEndings),
++			indent: hegel.Draw(tc, hegel.Integers(0, 4)),
++			cut:    hegel.Draw(tc, cutsets),
++			affix:  hegel.Draw(tc, affixes),
++			sub:    hegel.Draw(tc, substrings),
++			rep:    hegel.Draw(tc, replacers),
++			sep:    hegel.Draw(tc, separators),
++			lists:  hegel.Draw(tc, many(plains(0, 3), 1, 3)),
++			xs:     hegel.Draw(tc, plains(0, 5)),
++		}
++	})
++)
++
++// checkString checks that got is the known string want.
++func checkString(c *collector, ht *hegel.T, name, shape string, got cty.Value, err error, want string, call string) {
++	if err != nil {
++		c.mismatch(ht, name, shape, "%s: %v", call, err)
++		return
++	}
++	if got.Type() != cty.String || !got.IsKnown() || got.IsNull() {
++		c.mismatch(ht, name, shape, "%s: %s is not a known string", call, got.GoString())
++		return
++	}
++	if got.AsString() != want {
++		c.mismatch(ht, name, shape, "%s = %q, want %q", call, got.AsString(), want)
++	}
++}
++
++// TestHegelStringFunctions: the string functions against models by runes. Substr with a
++// negative offset and length 0 returns the rest of the string (go-cty/2); Title leaves the
++// letter after an underscore alone (go-cty/3).
 +func TestHegelStringFunctions(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		s := genPlain(ht)
++		sc := hegel.Draw(ht, stringCases)
++		s := sc.s
 +		sv := cty.StringVal(s)
 +		runes := []rune(s)
 +		n := len(runes)
 +
 +		check := func(name string, got cty.Value, err error, want string) {
-+			if err != nil {
-+				c.failClass(ht, name, "%s(%q): %v", name, s, err)
-+				return
-+			}
-+			if got.Type() != cty.String || !got.IsKnown() || got.IsNull() {
-+				c.failClass(ht, name, "%s(%q): %s is not a known string", name, s, got.GoString())
-+				return
-+			}
-+			if got.AsString() != want {
-+				c.failClass(ht, name, "%s(%q) = %q, want %q", name, s, got.AsString(), want)
-+			}
++			checkString(c, ht, name, "", got, err, want, fmt.Sprintf("%s(%q)", name, s))
 +		}
 +
 +		got, err := stdlib.Upper(sv)
@@ -1035,95 +1783,43 @@ index 0000000..c8fef5e
 +		}
 +
 +		// Substr: offset in characters (a negative one counts from the end), length -1 = the rest
-+		off := drawInt(ht, -n, n)
-+		length := drawInt(ht, -1, n+1)
-+		got, err = stdlib.Substr(sv, cty.NumberIntVal(int64(off)), cty.NumberIntVal(int64(length)))
-+		{
-+			o := off
-+			if o < 0 {
-+				o += n
-+			}
-+			var want string
-+			switch {
-+			case length == 0 && off < 0 && Known.substrNegativeOffsetZeroLength:
-+				want = string(runes[o:])
-+			case length == 0:
-+				want = ""
-+			case length < 0:
-+				want = string(runes[o:])
-+			default:
-+				end := o + length
-+				if end > n {
-+					end = n
-+				}
-+				want = string(runes[o:end])
-+			}
-+			if err != nil {
-+				c.failClass(ht, "Substr", "Substr(%q, %d, %d): %v", s, off, length, err)
-+			} else if got.AsString() != want {
-+				c.failClass(ht, "Substr", "Substr(%q, %d, %d) = %q, want %q", s, off, length, got.AsString(), want)
-+			}
-+		}
++		got, err = stdlib.Substr(sv, cty.NumberIntVal(int64(sc.off)), cty.NumberIntVal(int64(sc.length)))
++		checkString(c, ht, "Substr", shapeIf(sc.off < 0 && sc.length == 0, "go-cty/2"), got, err, substrWant(runes, sc.off, sc.length), fmt.Sprintf("Substr(%q, %d, %d)", s, sc.off, sc.length))
 +
 +		// Chomp: newline characters at the end
 +		{
-+			cs := s + pick(ht, []string{"", "\n", "\r\n", "\n\n", "\r\n\r\n", "\n\r"})
++			cs := s + sc.tail
 +			want := cs
 +			for strings.HasSuffix(want, "\n") || strings.HasSuffix(want, "\r") {
 +				want = strings.TrimRight(want, "\n")
 +				want = strings.TrimRight(want, "\r")
 +			}
 +			got, err := stdlib.Chomp(cty.StringVal(cs))
-+			if err != nil {
-+				c.failClass(ht, "Chomp", "Chomp(%q): %v", cs, err)
-+			} else if got.AsString() != want {
-+				c.failClass(ht, "Chomp", "Chomp(%q) = %q, want %q", cs, got.AsString(), want)
-+			}
++			checkString(c, ht, "Chomp", "", got, err, want, fmt.Sprintf("Chomp(%q)", cs))
 +		}
 +
 +		// Indent: spaces after each newline
-+		sp := drawInt(ht, 0, 4)
-+		got, err = stdlib.Indent(cty.NumberIntVal(int64(sp)), sv)
-+		check("Indent", got, err, strings.ReplaceAll(s, "\n", "\n"+strings.Repeat(" ", sp)))
++		got, err = stdlib.Indent(cty.NumberIntVal(int64(sc.indent)), sv)
++		check("Indent", got, err, strings.ReplaceAll(s, "\n", "\n"+strings.Repeat(" ", sc.indent)))
 +
 +		// Title: one letter after each non-letter, non-digit character upper-cased
 +		got, err = stdlib.Title(sv)
-+		{
-+			var b strings.Builder
-+			prevSep := true
-+			for _, r := range s {
-+				if prevSep {
-+					b.WriteRune(unicode.ToTitle(r))
-+				} else {
-+					b.WriteRune(r)
-+				}
-+				prevSep = !unicode.IsLetter(r) && !unicode.IsDigit(r)
-+			}
-+			if Known.titleUnderscore {
-+				b.Reset()
-+				b.WriteString(strings.Title(s))
-+			}
-+			check("Title", got, err, b.String())
-+		}
++		checkString(c, ht, "Title", shapeIf(titleShape(s), "go-cty/3"), got, err, titleWant(s), fmt.Sprintf("Title(%q)", s))
 +
 +		// Trim family
-+		cut := pick(ht, []string{"", " ", "ab", "lo", "\n", "é", "abc123"})
-+		got, err = stdlib.Trim(sv, cty.StringVal(cut))
-+		check("Trim", got, err, strings.Trim(s, cut))
-+		pre := pick(ht, []string{"", "h", "he", "日", "  ", "Hello", "x"})
-+		got, err = stdlib.TrimPrefix(sv, cty.StringVal(pre))
-+		check("TrimPrefix", got, err, strings.TrimPrefix(s, pre))
-+		got, err = stdlib.TrimSuffix(sv, cty.StringVal(pre))
-+		check("TrimSuffix", got, err, strings.TrimSuffix(s, pre))
++		got, err = stdlib.Trim(sv, cty.StringVal(sc.cut))
++		check("Trim", got, err, strings.Trim(s, sc.cut))
++		got, err = stdlib.TrimPrefix(sv, cty.StringVal(sc.affix))
++		check("TrimPrefix", got, err, strings.TrimPrefix(s, sc.affix))
++		got, err = stdlib.TrimSuffix(sv, cty.StringVal(sc.affix))
++		check("TrimSuffix", got, err, strings.TrimSuffix(s, sc.affix))
 +
 +		// Replace: all instances
-+		sub := pick(ht, []string{"l", "ll", "o", " ", "日本", "🙂", "zz", "\n"})
-+		rep := pick(ht, []string{"", "L", "--", "日"})
-+		got, err = stdlib.Replace(sv, cty.StringVal(sub), cty.StringVal(rep))
-+		check("Replace", got, err, strings.ReplaceAll(s, sub, rep))
++		got, err = stdlib.Replace(sv, cty.StringVal(sc.sub), cty.StringVal(sc.rep))
++		check("Replace", got, err, strings.ReplaceAll(s, sc.sub, sc.rep))
 +
 +		// Split / Join
-+		sep := pick(ht, []string{",", " ", "l", "\n", "ab", "日"})
++		sep := sc.sep
 +		got, err = stdlib.Split(cty.StringVal(sep), sv)
 +		if err != nil {
 +			c.failClass(ht, "Split", "Split(%q, %q): %v", sep, s, err)
@@ -1134,11 +1830,9 @@ index 0000000..c8fef5e
 +			back, err := stdlib.Join(cty.StringVal(sep), got)
 +			check("Join", back, err, s)
 +		}
-+		lists := drawInt(ht, 1, 3)
 +		var all []string
 +		var args []cty.Value
-+		for i := 0; i < lists; i++ {
-+			xs := genStrings(ht, 0, 3)
++		for _, xs := range sc.lists {
 +			all = append(all, xs...)
 +			args = append(args, strList(xs))
 +		}
@@ -1146,7 +1840,7 @@ index 0000000..c8fef5e
 +		check("Join", got, err, strings.Join(all, sep))
 +
 +		// Sort: lexicographic
-+		xs := genStrings(ht, 0, 5)
++		xs := sc.xs
 +		got, err = stdlib.Sort(strList(xs))
 +		if err != nil {
 +			c.failClass(ht, "Sort", "Sort(%q): %v", xs, err)
@@ -1170,13 +1864,102 @@ index 0000000..c8fef5e
 +
 +// --------------------------------------------------------------------------- collections
 +
++// flatPart is one element of Flatten's argument: a list, a tuple, or a tuple holding a list
++// (one level deeper).
++type flatPart struct {
++	zs   []string
++	kind int // 0 list, 1 tuple, 2 nested
++}
++
++func (p flatPart) value() cty.Value {
++	switch p.kind {
++	case 1:
++		return strTuple(p.zs)
++	case 2:
++		return cty.TupleVal([]cty.Value{strList(p.zs)})
++	}
++	return strList(p.zs)
++}
++
++// collectionCase: a sequence of strings and the arguments of each collection function.
++type collectionCase struct {
++	xs         []string
++	tuple      bool // the sequence as a tuple rather than a list
++	idx        int  // Element: 0 to 2n+1
++	at         int  // HasIndex, Index: -1 to n
++	needle     string
++	start, end int // Slice: 0 <= start <= end <= n
++	size       int // Chunklist: 1 to n+1
++	ys         []string
++	parts      []flatPart // Flatten
++	extra      *string    // Flatten: a string among the sequences (when the result stays short)
++	coalesce   []*string  // Coalesce: nil is a null
++	lists      [][]string // CoalesceList: nil is an empty list
++	m, m2      map[string]string
++	key, def   string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c collectionCase) GoString() string {
++	var co []string
++	for _, p := range c.coalesce {
++		if p == nil {
++			co = append(co, "null")
++		} else {
++			co = append(co, fmt.Sprintf("%q", *p))
++		}
++	}
++	extra := "none"
++	if c.extra != nil {
++		extra = fmt.Sprintf("%q", *c.extra)
++	}
++	return fmt.Sprintf("xs %q tuple %v idx %d at %d needle %q slice %d:%d size %d ys %q parts %v extra %s coalesce %v lists %q m %v m2 %v key %q def %q",
++		c.xs, c.tuple, c.idx, c.at, c.needle, c.start, c.end, c.size, c.ys, c.parts, extra, co, c.lists, c.m, c.m2, c.key, c.def)
++}
++
++var (
++	flatParts = hegel.Composite(func(tc hegel.TestCase) flatPart {
++		return flatPart{zs: hegel.Draw(tc, plains(0, 3)), kind: hegel.Draw(tc, hegel.Integers(0, 2))}
++	})
++	// shortLists: an empty list four times in ten, else up to two strings.
++	shortLists      = weighted(choice[[]string]{40, hegel.Just[[]string](nil)}, choice[[]string]{60, plains(0, 2)})
++	stringMaps      = hegel.Maps(attrKeys, plain)
++	collectionCases = hegel.Composite(func(tc hegel.TestCase) collectionCase {
++		xs := hegel.Draw(tc, plains(0, 5))
++		n := len(xs)
++		start := hegel.Draw(tc, hegel.Integers(0, n))
++		return collectionCase{
++			xs:       xs,
++			tuple:    hegel.Draw(tc, chance(30)),
++			idx:      hegel.Draw(tc, hegel.Integers(0, 2*n+1)),
++			at:       hegel.Draw(tc, hegel.Integers(-1, n)),
++			needle:   hegel.Draw(tc, plain),
++			start:    start,
++			end:      hegel.Draw(tc, hegel.Integers(start, n)),
++			size:     hegel.Draw(tc, hegel.Integers(1, n+1)),
++			ys:       hegel.Draw(tc, plains(0, 3)),
++			parts:    hegel.Draw(tc, many(flatParts, 0, 3)),
++			extra:    hegel.Draw(tc, optional(30, plain)),
++			coalesce: hegel.Draw(tc, many(optional(60, plain), 1, 4)),
++			lists:    hegel.Draw(tc, many(shortLists, 1, 4)),
++			m:        hegel.Draw(tc, stringMaps.MaxSize(4)),
++			m2:       hegel.Draw(tc, stringMaps.MaxSize(3)),
++			key:      hegel.Draw(tc, attrKeys),
++			def:      hegel.Draw(tc, plain),
++		}
++	})
++)
++
++// TestHegelCollectionFunctions: the collection functions against models over a sequence of
++// strings and maps of strings.
 +func TestHegelCollectionFunctions(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		xs := genStrings(ht, 0, 5)
++		cc := hegel.Draw(ht, collectionCases)
++		xs := cc.xs
 +		n := len(xs)
 +		lv := strList(xs)
-+		if chance(ht, 30) {
++		if cc.tuple {
 +			lv = strTuple(xs)
 +		}
 +
@@ -1187,7 +1970,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// Element: index modulo the length; error on an empty sequence
-+		idx := drawInt(ht, 0, 2*n+1)
++		idx := cc.idx
 +		got, err := stdlib.Element(lv, cty.NumberIntVal(int64(idx)))
 +		switch {
 +		case n == 0:
@@ -1201,7 +1984,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// HasIndex / Index
-+		i2 := drawInt(ht, -1, n)
++		i2 := cc.at
 +		hi, err := stdlib.HasIndex(lv, cty.NumberIntVal(int64(i2)))
 +		if err != nil {
 +			c.failClass(ht, "HasIndex", "HasIndex(%q, %d): %v", xs, i2, err)
@@ -1220,7 +2003,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// Contains
-+		needle := genPlain(ht)
++		needle := cc.needle
 +		if got, err := stdlib.Contains(lv, cty.StringVal(needle)); err != nil {
 +			c.failClass(ht, "Contains", "Contains(%q, %q): %v", xs, needle, err)
 +		} else {
@@ -1281,8 +2064,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// Slice: 0 <= start <= end <= n
-+		start := drawInt(ht, 0, n)
-+		end := drawInt(ht, start, n)
++		start, end := cc.start, cc.end
 +		if got, err := stdlib.Slice(lv, cty.NumberIntVal(int64(start)), cty.NumberIntVal(int64(end))); err != nil {
 +			c.failClass(ht, "Slice", "Slice(%q, %d, %d): %v", xs, start, end, err)
 +		} else if !sameStrings(stringsOf(got), xs[start:end]) {
@@ -1293,7 +2075,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// Chunklist: chunks of at most size elements, all but the last exactly size
-+		size := drawInt(ht, 1, n+1)
++		size := cc.size
 +		if got, err := stdlib.Chunklist(strList(xs), cty.NumberIntVal(int64(size))); err != nil {
 +			c.failClass(ht, "Chunklist", "Chunklist(%q, %d): %v", xs, size, err)
 +		} else {
@@ -1321,7 +2103,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// Concat: the sequences in order
-+		ys := genStrings(ht, 0, 3)
++		ys := cc.ys
 +		if got, err := stdlib.Concat(lv, strList(ys)); err != nil {
 +			c.failClass(ht, "Concat", "Concat(%q, %q): %v", xs, ys, err)
 +		} else if want := append(append([]string(nil), xs...), ys...); !sameStrings(stringsOf(got), want) {
@@ -1332,23 +2114,13 @@ index 0000000..c8fef5e
 +		{
 +			var want []string
 +			var parts []cty.Value
-+			for i := 0; i < drawInt(ht, 0, 3); i++ {
-+				zs := genStrings(ht, 0, 3)
-+				want = append(want, zs...)
-+				switch drawInt(ht, 1, 3) {
-+				case 1:
-+					parts = append(parts, strList(zs))
-+				case 2:
-+					parts = append(parts, strTuple(zs))
-+				default:
-+					// one level deeper
-+					parts = append(parts, cty.TupleVal([]cty.Value{strList(zs)}))
-+				}
++			for _, p := range cc.parts {
++				want = append(want, p.zs...)
++				parts = append(parts, p.value())
 +			}
-+			if chance(ht, 30) && len(want) < 6 {
-+				s := genPlain(ht)
-+				parts = append(parts, cty.StringVal(s))
-+				want = append(want, s)
++			if cc.extra != nil && len(want) < 6 {
++				parts = append(parts, cty.StringVal(*cc.extra))
++				want = append(want, *cc.extra)
 +			}
 +			if got, err := stdlib.Flatten(cty.TupleVal(parts)); err != nil {
 +				c.failClass(ht, "Flatten", "Flatten(%s): %v", cty.TupleVal(parts).GoString(), err)
@@ -1361,20 +2133,18 @@ index 0000000..c8fef5e
 +
 +		// Coalesce / CoalesceList
 +		{
-+			k := drawInt(ht, 1, 4)
 +			var args []cty.Value
 +			want := ""
 +			found := false
-+			for i := 0; i < k; i++ {
-+				if chance(ht, 40) {
++			for _, p := range cc.coalesce {
++				if p == nil {
 +					args = append(args, cty.NullVal(cty.String))
-+				} else {
-+					s := genPlain(ht)
-+					if !found {
-+						want, found = s, true
-+					}
-+					args = append(args, cty.StringVal(s))
++					continue
 +				}
++				if !found {
++					want, found = *p, true
++				}
++				args = append(args, cty.StringVal(*p))
 +			}
 +			got, err := stdlib.Coalesce(args...)
 +			switch {
@@ -1388,11 +2158,7 @@ index 0000000..c8fef5e
 +			var lists []cty.Value
 +			var wantL []string
 +			foundL := false
-+			for i := 0; i < k; i++ {
-+				zs := genStrings(ht, 0, 2)
-+				if chance(ht, 40) {
-+					zs = nil
-+				}
++			for _, zs := range cc.lists {
 +				if len(zs) > 0 && !foundL {
 +					wantL, foundL = zs, true
 +				}
@@ -1410,10 +2176,7 @@ index 0000000..c8fef5e
 +		}
 +
 +		// maps: Keys, Values, Lookup, Merge, Zipmap
-+		m := map[string]string{}
-+		for i := 0; i < drawInt(ht, 0, 4); i++ {
-+			m[pick(ht, attrNames)] = genPlain(ht)
-+		}
++		m := cc.m
 +		mv := strMap(m)
 +		keys := make([]string, 0, len(m))
 +		for k := range m {
@@ -1434,8 +2197,7 @@ index 0000000..c8fef5e
 +		} else if !sameStrings(stringsOf(got), vals) {
 +			c.failClass(ht, "Values", "Values(%v) = %q, want %q", m, stringsOf(got), vals)
 +		}
-+		key := pick(ht, attrNames)
-+		def := genPlain(ht)
++		key, def := cc.key, cc.def
 +		if got, err := stdlib.Lookup(mv, cty.StringVal(key), cty.StringVal(def)); err != nil {
 +			c.failClass(ht, "Lookup", "Lookup(%v, %q): %v", m, key, err)
 +		} else {
@@ -1447,10 +2209,7 @@ index 0000000..c8fef5e
 +				c.failClass(ht, "Lookup", "Lookup(%v, %q, %q) = %q, want %q", m, key, def, got.AsString(), want)
 +			}
 +		}
-+		m2 := map[string]string{}
-+		for i := 0; i < drawInt(ht, 0, 3); i++ {
-+			m2[pick(ht, attrNames)] = genPlain(ht)
-+		}
++		m2 := cc.m2
 +		if got, err := stdlib.Merge(mv, strMap(m2)); err != nil {
 +			c.failClass(ht, "Merge", "Merge(%v, %v): %v", m, m2, err)
 +		} else {
@@ -1498,10 +2257,10 @@ index 0000000..c8fef5e
 +	return cty.SetVal(vals)
 +}
 +
-+func genIntSet(tc hegel.TestCase) map[int]bool {
++func setOf(xs []int) map[int]bool {
 +	m := map[int]bool{}
-+	for i := 0; i < drawInt(tc, 0, 4); i++ {
-+		m[drawInt(tc, -3, 5)] = true
++	for _, x := range xs {
++		m[x] = true
 +	}
 +	return m
 +}
@@ -1538,13 +2297,33 @@ index 0000000..c8fef5e
 +	return true
 +}
 +
++// setCase: two sets of small integers and a probe.
++type setCase struct {
++	a, b map[int]bool
++	x    int
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c setCase) GoString() string {
++	return fmt.Sprintf("a %v b %v x %d", setKeys(c.a), setKeys(c.b), c.x)
++}
++
++var (
++	smallInts = hegel.Integers(-3, 5)
++	intSets   = hegel.Map(many(smallInts, 0, 4), setOf)
++	setCases  = hegel.Composite(func(tc hegel.TestCase) setCase {
++		return setCase{a: hegel.Draw(tc, intSets), b: hegel.Draw(tc, intSets), x: hegel.Draw(tc, smallInts)}
++	})
++)
++
++// TestHegelSetFunctions: the set functions against set algebra over small integers.
 +func TestHegelSetFunctions(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		a, b := genIntSet(ht), genIntSet(ht)
++		sc := hegel.Draw(ht, setCases)
++		a, b, x := sc.a, sc.b, sc.x
 +		av, bv := intSet(setKeys(a)), intSet(setKeys(b))
 +
-+		x := drawInt(ht, -3, 5)
 +		if got, err := stdlib.SetHasElement(av, cty.NumberIntVal(int64(x))); err != nil {
 +			c.failClass(ht, "SetHasElement", "SetHasElement(%v, %d): %v", setKeys(a), x, err)
 +		} else if got.True() != a[x] {
@@ -1656,10 +2435,78 @@ index 0000000..c8fef5e
 +	return i
 +}
 +
++// comparisonWant is what the descriptions of LessThan, LessThanOrEqualTo, GreaterThan and
++// GreaterThanOrEqualTo say of two numbers comparing as cmp: GreaterThan "returns true if and
++// only if the second number is greater than the first", and so on. While
++// Known.comparisonDescriptionsReversed is on, the functions compare the first number with the
++// second (go-cty/4).
++func comparisonWant(cmp int) (lt, le, gt, ge bool) {
++	if Known.comparisonDescriptionsReversed {
++		return cmp < 0, cmp <= 0, cmp > 0, cmp >= 0
++	}
++	return cmp > 0, cmp >= 0, cmp < 0, cmp <= 0
++}
++
++// moduloByZeroWant is Value.Modulo's documented result for a zero divisor: an infinity of the
++// dividend's sign. While Known.moduloByZeroIsDividend is on it is the dividend (go-cty/8).
++func moduloByZeroWant(a cty.Value) cty.Value {
++	if Known.moduloByZeroIsDividend {
++		return a
++	}
++	if a.AsBigFloat().Sign() < 0 {
++		return cty.NegativeInfinity
++	}
++	return cty.PositiveInfinity
++}
++
++// numberCase: two numbers and the arguments of Pow and ParseInt.
++type numberCase struct {
++	a, b   cty.Value
++	exp    int      // Pow: 0 to 6
++	base   int      // ParseInt: 2 to 36
++	parsed *big.Int // ParseInt: the integer written in the base
++	upper  bool     // ParseInt: the digits upper-cased
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c numberCase) GoString() string {
++	return fmt.Sprintf("a %s b %s exp %d base %d parsed %s upper %v", numStr(c.a), numStr(c.b), c.exp, c.base, c.parsed, c.upper)
++}
++
++var (
++	// parsedInts: an integer within a hundred thousand or, a fifth of the time, a thirty-digit one.
++	parsedInts = weighted(
++		choice[*big.Int]{80, hegel.Map(ints(-100000, 100000), big.NewInt)},
++		choice[*big.Int]{20, hegel.Just(mustBig("123456789012345678901234567890"))},
++	)
++	numberCases = hegel.Composite(func(tc hegel.TestCase) numberCase {
++		return numberCase{
++			a:      hegel.Draw(tc, numbers),
++			b:      hegel.Draw(tc, numbers),
++			exp:    hegel.Draw(tc, hegel.Integers(0, 6)),
++			base:   hegel.Draw(tc, hegel.Integers(2, 36)),
++			parsed: hegel.Draw(tc, parsedInts),
++			upper:  hegel.Draw(tc, chance(30)),
++		}
++	})
++)
++
++func mustBig(s string) *big.Int {
++	i, ok := new(big.Int).SetString(s, 10)
++	if !ok {
++		panic(s)
++	}
++	return i
++}
++
++// TestHegelNumberFunctions: the number functions against big.Float and big.Int. The
++// comparison functions' descriptions name the operands backwards (go-cty/4); Modulo by zero
++// returns the dividend (go-cty/8).
 +func TestHegelNumberFunctions(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		a, b := genNumber(ht), genNumber(ht)
++		nc := hegel.Draw(ht, numberCases)
++		a, b := nc.a, nc.b
 +		ab, bb := bigOf(a), bigOf(b)
 +
 +		checkNum := func(name string, got cty.Value, err error, want *big.Float) {
@@ -1675,17 +2522,17 @@ index 0000000..c8fef5e
 +				c.failClass(ht, name, "%s(%s, %s) = %s, want %s", name, numStr(a), numStr(b), numStr(got), want.Text('g', 30))
 +			}
 +		}
-+		checkBool := func(name string, got cty.Value, err error, want bool) {
++		checkBool := func(name, shape string, got cty.Value, err error, want bool) {
 +			if err != nil {
-+				c.failClass(ht, name, "%s(%s, %s): %v", name, numStr(a), numStr(b), err)
++				c.mismatch(ht, name, shape, "%s(%s, %s): %v", name, numStr(a), numStr(b), err)
 +				return
 +			}
 +			if got.Type() != cty.Bool || !got.IsKnown() || got.IsNull() {
-+				c.failClass(ht, name, "%s(%s, %s) = %s, want a known bool", name, numStr(a), numStr(b), got.GoString())
++				c.mismatch(ht, name, shape, "%s(%s, %s) = %s, want a known bool", name, numStr(a), numStr(b), got.GoString())
 +				return
 +			}
 +			if got.True() != want {
-+				c.failClass(ht, name, "%s(%s, %s) = %v, want %v", name, numStr(a), numStr(b), got.True(), want)
++				c.mismatch(ht, name, shape, "%s(%s, %s) = %v, want %v", name, numStr(a), numStr(b), got.True(), want)
 +			}
 +		}
 +
@@ -1708,23 +2555,20 @@ index 0000000..c8fef5e
 +		cmp := ab.Cmp(bb)
 +		// the descriptions of the comparison functions: GreaterThan "returns true if and only if
 +		// the second number is greater than the first", and so on
-+		lt, le, gt, ge := cmp > 0, cmp >= 0, cmp < 0, cmp <= 0
-+		if Known.comparisonDescriptionsReversed {
-+			// the functions compare the first number with the second
-+			lt, le, gt, ge = cmp < 0, cmp <= 0, cmp > 0, cmp >= 0
-+		}
++		lt, le, gt, ge := comparisonWant(cmp)
++		shape := shapeIf(cmp != 0, "go-cty/4")
 +		got, err = stdlib.LessThan(a, b)
-+		checkBool("LessThan", got, err, lt)
++		checkBool("LessThan", shape, got, err, lt)
 +		got, err = stdlib.LessThanOrEqualTo(a, b)
-+		checkBool("LessThanOrEqualTo", got, err, le)
++		checkBool("LessThanOrEqualTo", shape, got, err, le)
 +		got, err = stdlib.GreaterThan(a, b)
-+		checkBool("GreaterThan", got, err, gt)
++		checkBool("GreaterThan", shape, got, err, gt)
 +		got, err = stdlib.GreaterThanOrEqualTo(a, b)
-+		checkBool("GreaterThanOrEqualTo", got, err, ge)
++		checkBool("GreaterThanOrEqualTo", shape, got, err, ge)
 +		got, err = stdlib.Equal(a, b)
-+		checkBool("Equal", got, err, cmp == 0)
++		checkBool("Equal", "", got, err, cmp == 0)
 +		got, err = stdlib.NotEqual(a, b)
-+		checkBool("NotEqual", got, err, cmp != 0)
++		checkBool("NotEqual", "", got, err, cmp != 0)
 +
 +		minB, maxB := ab, bb
 +		if cmp > 0 {
@@ -1781,22 +2625,16 @@ index 0000000..c8fef5e
 +			} else {
 +				// Value.Modulo documents an infinity of the dividend's sign for a zero divisor
 +				got, err := stdlib.Modulo(a, b)
-+				want := cty.PositiveInfinity
-+				if ai.Sign() < 0 {
-+					want = cty.NegativeInfinity
-+				}
-+				if Known.moduloByZeroIsDividend {
-+					want = a
-+				}
++				want := moduloByZeroWant(a)
 +				if err != nil {
-+					c.failClass(ht, "Modulo", "Modulo(%s, 0): %v", numStr(a), err)
++					c.mismatch(ht, "Modulo", "go-cty/8", "Modulo(%s, 0): %v", numStr(a), err)
 +				} else if !got.RawEquals(want) {
-+					c.failClass(ht, "Modulo", "Modulo(%s, 0) = %s, want %s", numStr(a), got.GoString(), want.GoString())
++					c.mismatch(ht, "Modulo", "go-cty/8", "Modulo(%s, 0) = %s, want %s", numStr(a), got.GoString(), want.GoString())
 +				}
 +			}
 +			// Pow with a small non-negative exponent
 +			if ai.IsInt64() && ai.Int64() >= -20 && ai.Int64() <= 20 {
-+				e := drawInt(ht, 0, 6)
++				e := nc.exp
 +				got, err = stdlib.Pow(a, cty.NumberIntVal(int64(e)))
 +				checkNum("Pow", got, err, new(big.Float).SetInt(new(big.Int).Exp(ai, big.NewInt(int64(e)), nil)))
 +			}
@@ -1804,13 +2642,10 @@ index 0000000..c8fef5e
 +
 +		// ParseInt against big.Int
 +		{
-+			base := drawInt(ht, 2, 36)
-+			ai := big.NewInt(int64(drawInt(ht, -100000, 100000)))
-+			if chance(ht, 20) {
-+				ai.SetString("123456789012345678901234567890", 10)
-+			}
++			base := nc.base
++			ai := nc.parsed
 +			str := ai.Text(base)
-+			if chance(ht, 30) {
++			if nc.upper {
 +				str = strings.ToUpper(str)
 +			}
 +			got, err := stdlib.ParseInt(cty.StringVal(str), cty.NumberIntVal(int64(base)))
@@ -1837,219 +2672,381 @@ index 0000000..c8fef5e
 +	})
 +}
 +
-+// Range: the documented series
++// --------------------------------------------------------------------------- range
++
++// rangeCase: Range's one, two or three arguments.
++type rangeCase struct {
++	nargs            int
++	start, end, step int
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c rangeCase) GoString() string { return fmt.Sprintf("Range%v", c.ints()) }
++
++// ints is the arguments: the end alone, start and end, or start, end and step.
++func (c rangeCase) ints() []int {
++	switch c.nargs {
++	case 1:
++		return []int{c.end}
++	case 2:
++		return []int{c.start, c.end}
++	}
++	return []int{c.start, c.end, c.step}
++}
++
++func (c rangeCase) args() []cty.Value {
++	var args []cty.Value
++	for _, i := range c.ints() {
++		args = append(args, cty.NumberIntVal(int64(i)))
++	}
++	return args
++}
++
++// series is the documented series and step: with one argument from zero to the end, with two
++// from the start to the end, stepping by -1 when the end is below the start (as the
++// implementation does; the doc comment says the step defaults to 1), else by the step.
++func (c rangeCase) series() (start, end, step int) {
++	switch c.nargs {
++	case 1:
++		start, end, step = 0, c.end, 1
++	case 2:
++		start, end, step = c.start, c.end, 1
++	default:
++		return c.start, c.end, c.step
++	}
++	if end < start {
++		step = -1
++	}
++	return start, end, step
++}
++
++// rangeWant is Range's documented result on the series: an error for a zero step or a step
++// pointing away from the end, else the numbers from the start up to (not including) the end.
++// While Known.rangeZeroStepCheck is on, a zero step from the caller passes the check: the
++// empty series when the start is the end (go-cty/5), and the error of the 1024-value cap
++// otherwise.
++func rangeWant(start, end, step int) (want []int, wantErr bool) {
++	if step == 0 {
++		return nil, !(Known.rangeZeroStepCheck && start == end)
++	}
++	if (step > 0 && end < start) || (step < 0 && end > start) {
++		return nil, true
++	}
++	for x := start; (step > 0 && x < end) || (step < 0 && x > end); x += step {
++		want = append(want, x)
++	}
++	return want, false
++}
++
++var (
++	rangeEnds  = hegel.Integers(-6, 6)
++	rangeCases = hegel.Composite(func(tc hegel.TestCase) rangeCase {
++		return rangeCase{
++			nargs: hegel.Draw(tc, hegel.Integers(1, 3)),
++			start: hegel.Draw(tc, rangeEnds),
++			end:   hegel.Draw(tc, rangeEnds),
++			step:  hegel.Draw(tc, hegel.Integers(-3, 3)),
++		}
++	})
++)
++
++// checkRange checks Range's result against the documented series.
++func checkRange(c *collector, ht *hegel.T, shape string, rc rangeCase) {
++	args := rc.args()
++	start, end, step := rc.series()
++	got, err := stdlib.Range(args...)
++	want, wantErr := rangeWant(start, end, step)
++	if wantErr {
++		if err == nil {
++			c.mismatch(ht, "Range", shape, "Range(%d, %d, %d) = %s, want an error", start, end, step, got.GoString())
++		}
++		return
++	}
++	if err != nil {
++		c.mismatch(ht, "Range", shape, "Range(%d, %d, %d): %v", start, end, step, err)
++	} else if !got.Type().IsListType() || got.Type().ElementType() != cty.Number {
++		c.mismatch(ht, "Range", shape, "Range gives a %s", tyString(got.Type()))
++	} else {
++		var gotInts []int
++		for _, e := range elemsOf(got) {
++			i, _ := e.AsBigFloat().Int64()
++			gotInts = append(gotInts, int(i))
++		}
++		if !sameInts(gotInts, want) {
++			c.mismatch(ht, "Range", shape, "Range(%v) = %v, want %v", rc.ints(), gotInts, want)
++		}
++	}
++}
++
++// TestHegelRange: Range gives the documented series. A zero step from the caller is not
++// rejected: Range(n, n, 0) is the empty list (go-cty/5).
 +func TestHegelRange(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		var args []cty.Value
-+		var start, end, step int
-+		switch drawInt(ht, 1, 3) {
-+		case 1:
-+			end = drawInt(ht, -6, 6)
-+			args = []cty.Value{cty.NumberIntVal(int64(end))}
-+			step = 1
-+			if end < 0 {
-+				step = -1
-+			}
-+		case 2:
-+			start, end = drawInt(ht, -6, 6), drawInt(ht, -6, 6)
-+			args = []cty.Value{cty.NumberIntVal(int64(start)), cty.NumberIntVal(int64(end))}
-+			step = 1
-+			if end < start {
-+				step = -1
-+			}
-+		default:
-+			start, end, step = drawInt(ht, -6, 6), drawInt(ht, -6, 6), drawInt(ht, -3, 3)
-+			args = []cty.Value{cty.NumberIntVal(int64(start)), cty.NumberIntVal(int64(end)), cty.NumberIntVal(int64(step))}
-+		}
-+		got, err := stdlib.Range(args...)
-+		if step == 0 && start == end && Known.rangeZeroStepCheck {
-+			// the zero-step check never fires for a zero from the caller: the empty series
-+			if err != nil || got.LengthInt() != 0 {
-+				c.failClass(ht, "Range", "Range(%d, %d, 0) = %s, %v", start, end, got.GoString(), err)
-+			}
-+			return
-+		}
-+		if step == 0 || (step > 0 && end < start) || (step < 0 && end > start) {
-+			if err == nil {
-+				c.failClass(ht, "Range", "Range(%d, %d, %d) = %s, want an error", start, end, step, got.GoString())
-+			}
-+			return
-+		}
-+		var want []int
-+		for x := start; (step > 0 && x < end) || (step < 0 && x > end); x += step {
-+			want = append(want, x)
-+		}
-+		if err != nil {
-+			c.failClass(ht, "Range", "Range(%d, %d, %d): %v", start, end, step, err)
-+		} else if !got.Type().IsListType() || got.Type().ElementType() != cty.Number {
-+			c.failClass(ht, "Range", "Range gives a %s", tyString(got.Type()))
-+		} else {
-+			var gotInts []int
-+			for _, e := range elemsOf(got) {
-+				i, _ := e.AsBigFloat().Int64()
-+				gotInts = append(gotInts, int(i))
-+			}
-+			if !sameInts(gotInts, want) {
-+				c.failClass(ht, "Range", "Range(%v) = %v, want %v", args, gotInts, want)
-+			}
-+		}
++		rc := hegel.Draw(ht, rangeCases)
++		start, end, step := rc.series()
++		checkRange(c, ht, shapeIf(rc.nargs == 3 && step == 0 && start == end, "go-cty/5"), rc)
 +	})
 +}
 +
 +// --------------------------------------------------------------------------- format
 +
++// fmtSeg is one segment of a format string: a literal, then a verb with its flags, width and
++// precision, and the argument it consumes.
 +type fmtSeg struct {
-+	lit  string
-+	verb string // "s", "d", "v", "t", "q", "f", "x", "o", "b"
-+	raw  string // the full verb text
-+	arg  cty.Value
-+	want string
++	lit   string // literal text before the verb ("" none; "%%" an escaped percent sign)
++	verb  string // s d v t q f x o b X
++	pad   string // "", "-" or "0"
++	plus  bool
++	width int // -1 none
++	prec  int // -1 none
++	arg   cty.Value
 +}
 +
++// raw is the verb's text in the format string.
++func (s fmtSeg) raw() string {
++	r := "%" + s.pad
++	if s.plus {
++		r += "+"
++	}
++	if s.width >= 0 {
++		r += itoa(s.width)
++	}
++	if s.prec >= 0 {
++		r += "." + itoa(s.prec)
++	}
++	return r + s.verb
++}
++
++// argString is the string a %s argument converts to.
++func argString(arg cty.Value) string {
++	switch arg.Type() {
++	case cty.Number:
++		return numStr(arg)
++	case cty.Bool:
++		return fmt.Sprint(arg.True())
++	}
++	return arg.AsString()
++}
++
++// want is the documented formatting of the argument by the verb: %s converts to a string,
++// truncated to the precision in characters and padded to the width (while
++// Known.formatZeroPrecision is on, a precision of 0 is ignored: go-cty/6); the integer verbs
++// and %f as Go formats a big.Int or big.Float; %t a bool; %q the JSON string; %v a string as
++// is, a number by its shortest form, a bool as %t.
++func (s fmtSeg) want() string {
++	switch s.verb {
++	case "s":
++		r := []rune(argString(s.arg))
++		prec := s.prec
++		if prec == 0 && Known.formatZeroPrecision {
++			prec = -1 // precision 0 is ignored
++		}
++		if prec >= 0 && prec < len(r) {
++			r = r[:prec]
++		}
++		w := string(r)
++		if s.width > len(r) {
++			pad := strings.Repeat(" ", s.width-len(r))
++			if s.pad == "-" {
++				w = w + pad
++			} else {
++				w = pad + w
++			}
++		}
++		return w
++	case "d", "x", "o", "b", "X":
++		i, _ := s.arg.AsBigFloat().Int(nil)
++		return fmt.Sprintf(s.raw(), i)
++	case "f":
++		return fmt.Sprintf(s.raw(), s.arg.AsBigFloat())
++	case "t":
++		return fmt.Sprint(s.arg.True())
++	case "q":
++		jb, _ := json.Marshal(s.arg.AsString())
++		return string(jb)
++	case "v":
++		switch s.arg.Type() {
++		case cty.Number:
++			return s.arg.AsBigFloat().Text('g', -1)
++		case cty.Bool:
++			return fmt.Sprint(s.arg.True())
++		}
++		return s.arg.AsString()
++	}
++	panic("fmtSeg.want: verb " + s.verb)
++}
++
++// formatCase: the segments of a format string and a trailing literal.
++type formatCase struct {
++	segs []fmtSeg
++	tail string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c formatCase) GoString() string {
++	s := fmt.Sprintf("format %q, args", c.format())
++	for _, seg := range c.segs {
++		s += " " + seg.arg.GoString()
++	}
++	return s
++}
++
++func (c formatCase) format() string {
++	var b strings.Builder
++	for _, seg := range c.segs {
++		b.WriteString(seg.lit)
++		b.WriteString(seg.raw())
++	}
++	b.WriteString(c.tail)
++	return b.String()
++}
++
++func (c formatCase) args() []cty.Value {
++	var args []cty.Value
++	for _, seg := range c.segs {
++		args = append(args, seg.arg)
++	}
++	return args
++}
++
++// want is the documented output: the literals with %% unescaped, each verb's formatting.
++func (c formatCase) want() string {
++	var b strings.Builder
++	for _, seg := range c.segs {
++		b.WriteString(strings.ReplaceAll(seg.lit, "%%", "%"))
++		b.WriteString(seg.want())
++	}
++	b.WriteString(strings.ReplaceAll(c.tail, "%%", "%"))
++	return b.String()
++}
++
++// shape names go-cty/6 when a %s has a precision of 0 and a string to truncate.
++func (c formatCase) shape() string {
++	for _, seg := range c.segs {
++		if seg.verb == "s" && seg.prec == 0 && argString(seg.arg) != "" {
++			return "go-cty/6"
++		}
++	}
++	return ""
++}
++
++// widthSpec is a width with its flags.
++type widthSpec struct {
++	pad   string
++	plus  bool
++	width int
++}
++
++var (
++	fmtVerbs    = hegel.SampledFrom([]string{"s", "s", "d", "v", "t", "q", "f", "x", "o", "b", "X"})
++	fmtLiterals = maybe(50, hegel.SampledFrom([]string{"x", " ", "a-b", "%%", "日", "=", "\n"}))
++	fmtTails    = maybe(50, hegel.SampledFrom([]string{"!", " end", "%%", "日"}))
++	fmtStrings  = hegel.SampledFrom([]string{"", "a", "hello", "Hello World", "日本語", "🙂", "ab cd", "x_y"})
++	// stringArgs: a %s argument: a string, a number or a bool (converted).
++	stringArgs = weighted(
++		choice[cty.Value]{72, hegel.Map(fmtStrings, cty.StringVal)},
++		choice[cty.Value]{20, hegel.Map(ints(-50, 50), intVal)},
++		choice[cty.Value]{8, bools},
++	)
++	// integerArgs: an integer within three hundred or, now and then, 2^40.
++	integerArgs = weighted(choice[cty.Value]{85, hegel.Map(ints(-300, 300), intVal)}, choice[cty.Value]{15, hegel.Just(cty.NumberIntVal(1 << 40))})
++	quotedArgs  = hegel.Map(plainSamples, cty.StringVal)
++	// asIsArgs: a %v argument: a string, a number or a bool.
++	asIsArgs = weighted(choice[cty.Value]{34, quotedArgs}, choice[cty.Value]{33, numbers}, choice[cty.Value]{33, bools})
++	// fmtPrecisions: none, or 0 to 4 three times in ten.
++	fmtPrecisions = weighted(choice[int]{70, hegel.Just(-1)}, choice[int]{30, hegel.Integers(0, 4)})
++	noPrecision   = hegel.Just(-1)
++	// segmentsOf: the segment generator per verb: a literal half the time; for the verbs with
++	// a width (not v, t, q) a width three times in ten with its flags ("-" four times in ten,
++	// else "0" three times in ten and "+" three times in ten, neither on %s); a precision on
++	// %s and %f; the argument of the verb's kind.
++	segmentsOf = map[string]hegel.Generator[fmtSeg]{
++		"s": segments("s", widths(weighted(choice[string]{60, hegel.Just("")}, choice[string]{40, hegel.Just("-")}), hegel.Just(false)), fmtPrecisions, stringArgs),
++		"d": segments("d", numberWidths, noPrecision, integerArgs),
++		"x": segments("x", numberWidths, noPrecision, integerArgs),
++		"o": segments("o", numberWidths, noPrecision, integerArgs),
++		"b": segments("b", numberWidths, noPrecision, integerArgs),
++		"X": segments("X", numberWidths, noPrecision, integerArgs),
++		"f": segments("f", numberWidths, fmtPrecisions, numbers),
++		"v": segments("v", noWidth, noPrecision, asIsArgs),
++		"t": segments("t", noWidth, noPrecision, bools),
++		"q": segments("q", noWidth, noPrecision, quotedArgs),
++	}
++	fmtSegments = hegel.FlatMap(fmtVerbs, func(verb string) hegel.Generator[fmtSeg] { return segmentsOf[verb] })
++	formatCases = hegel.Composite(func(tc hegel.TestCase) formatCase {
++		return formatCase{segs: hegel.Draw(tc, many(fmtSegments, 0, 4)), tail: hegel.Draw(tc, fmtTails)}
++	})
++	noWidth      = hegel.Just[*widthSpec](nil)
++	numberWidths = widths(weighted(choice[string]{42, hegel.Just("")}, choice[string]{40, hegel.Just("-")}, choice[string]{18, hegel.Just("0")}), chance(30))
++)
++
++// widths is a width of 0 to 8 with its flags three times in ten, else none.
++func widths(pads hegel.Generator[string], plus hegel.Generator[bool]) hegel.Generator[*widthSpec] {
++	return optional(30, hegel.Composite(func(tc hegel.TestCase) widthSpec {
++		return widthSpec{pad: hegel.Draw(tc, pads), plus: hegel.Draw(tc, plus), width: hegel.Draw(tc, hegel.Integers(0, 8))}
++	}))
++}
++
++// segments is the segment generator of one verb.
++func segments(verb string, widths hegel.Generator[*widthSpec], precs hegel.Generator[int], args hegel.Generator[cty.Value]) hegel.Generator[fmtSeg] {
++	return hegel.Composite(func(tc hegel.TestCase) fmtSeg {
++		seg := fmtSeg{lit: hegel.Draw(tc, fmtLiterals), verb: verb, width: -1, prec: hegel.Draw(tc, precs), arg: hegel.Draw(tc, args)}
++		if w := hegel.Draw(tc, widths); w != nil {
++			seg.pad, seg.plus, seg.width = w.pad, w.plus, w.width
++		}
++		return seg
++	})
++}
++
++// checkFormat checks Format of the case against its documented output.
++func checkFormat(c *collector, ht *hegel.T, shape string, fc formatCase) {
++	format, args, want := fc.format(), fc.args(), fc.want()
++	var argDesc []string
++	for _, a := range args {
++		argDesc = append(argDesc, a.GoString())
++	}
++	got, err := stdlib.Format(cty.StringVal(format), args...)
++	if err != nil {
++		c.mismatch(ht, "Format", shape, "Format(%q, %s): %v", format, argDesc, err)
++	} else if !got.IsKnown() || got.Type() != cty.String {
++		c.mismatch(ht, "Format", shape, "Format(%q, %s) = %s", format, argDesc, got.GoString())
++	} else if got.AsString() != want {
++		c.mismatch(ht, "Format", shape, "Format(%q, %s) = %q, want %q", format, argDesc, got.AsString(), want)
++	}
++}
++
++// TestHegelFormat: Format against the documented verbs, flags, widths and precisions; too few
++// arguments fail; a null argument fails except for %v, which prints "null"; an unknown
++// argument gives an unknown. %s ignores a precision of 0 (go-cty/6).
 +func TestHegelFormat(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		var format strings.Builder
-+		var want strings.Builder
-+		var args []cty.Value
-+		var argDesc []string
-+		var verbs []string
-+		n := drawInt(ht, 0, 4)
-+		for i := 0; i < n; i++ {
-+			if chance(ht, 50) {
-+				lit := pick(ht, []string{"x", " ", "a-b", "%%", "日", "=", "\n"})
-+				format.WriteString(lit)
-+				want.WriteString(strings.ReplaceAll(lit, "%%", "%"))
-+			}
-+			verb := pick(ht, []string{"s", "s", "d", "v", "t", "q", "f", "x", "o", "b", "X"})
-+			flags := ""
-+			width := -1
-+			prec := -1
-+			if chance(ht, 30) && verb != "v" && verb != "t" && verb != "q" {
-+				if chance(ht, 40) {
-+					flags += "-"
-+				} else if chance(ht, 30) && verb != "s" {
-+					flags += "0"
-+				}
-+				if chance(ht, 30) && verb != "s" {
-+					flags += "+"
-+				}
-+				width = drawInt(ht, 0, 8)
-+			}
-+			if chance(ht, 30) && (verb == "s" || verb == "f") {
-+				prec = drawInt(ht, 0, 4)
-+			}
-+			raw := "%" + flags
-+			if width >= 0 {
-+				raw += itoa(width)
-+			}
-+			if prec >= 0 {
-+				raw += "." + itoa(prec)
-+			}
-+			raw += verb
-+			format.WriteString(raw)
-+			verbs = append(verbs, verb)
-+
-+			var arg cty.Value
-+			var w string
-+			switch verb {
-+			case "s":
-+				s := pick(ht, []string{"", "a", "hello", "Hello World", "日本語", "🙂", "ab cd", "x_y"})
-+				arg = cty.StringVal(s)
-+				if chance(ht, 20) {
-+					arg = cty.NumberIntVal(int64(drawInt(ht, -50, 50)))
-+					s = numStr(arg)
-+				} else if chance(ht, 10) {
-+					arg = cty.BoolVal(chance(ht, 50))
-+					s = fmt.Sprint(arg.True())
-+				}
-+				r := []rune(s)
-+				if prec == 0 && Known.formatZeroPrecision {
-+					prec = -1 // precision 0 is ignored
-+				}
-+				if prec >= 0 && prec < len(r) {
-+					r = r[:prec]
-+				}
-+				w = string(r)
-+				if width > len(r) {
-+					pad := strings.Repeat(" ", width-len(r))
-+					if strings.Contains(flags, "-") {
-+						w = w + pad
-+					} else {
-+						w = pad + w
-+					}
-+				}
-+			case "d", "x", "o", "b", "X":
-+				i := int64(drawInt(ht, -300, 300))
-+				if chance(ht, 15) {
-+					i = 1 << 40
-+				}
-+				arg = cty.NumberIntVal(i)
-+				w = fmt.Sprintf(raw, big.NewInt(i))
-+			case "f":
-+				arg = genNumber(ht)
-+				w = fmt.Sprintf(raw, arg.AsBigFloat())
-+			case "t":
-+				arg = cty.BoolVal(chance(ht, 50))
-+				w = fmt.Sprint(arg.True())
-+			case "q":
-+				s := pick(ht, plainStrings)
-+				arg = cty.StringVal(s)
-+				jb, _ := json.Marshal(s)
-+				w = string(jb)
-+			case "v":
-+				switch drawInt(ht, 1, 3) {
-+				case 1:
-+					s := pick(ht, plainStrings)
-+					arg = cty.StringVal(s)
-+					w = s
-+				case 2:
-+					arg = genNumber(ht)
-+					w = arg.AsBigFloat().Text('g', -1)
-+				default:
-+					arg = cty.BoolVal(chance(ht, 50))
-+					w = fmt.Sprint(arg.True())
-+				}
-+			}
-+			args = append(args, arg)
-+			argDesc = append(argDesc, arg.GoString())
-+			want.WriteString(w)
-+		}
-+		if chance(ht, 50) {
-+			lit := pick(ht, []string{"!", " end", "%%", "日"})
-+			format.WriteString(lit)
-+			want.WriteString(strings.ReplaceAll(lit, "%%", "%"))
-+		}
-+		got, err := stdlib.Format(cty.StringVal(format.String()), args...)
-+		if err != nil {
-+			c.failClass(ht, "Format", "Format(%q, %s): %v", format.String(), argDesc, err)
-+		} else if !got.IsKnown() || got.Type() != cty.String {
-+			c.failClass(ht, "Format", "Format(%q, %s) = %s", format.String(), argDesc, got.GoString())
-+		} else if got.AsString() != want.String() {
-+			c.failClass(ht, "Format", "Format(%q, %s) = %q, want %q", format.String(), argDesc, got.AsString(), want.String())
-+		}
++		fc := hegel.Draw(ht, formatCases)
++		checkFormat(c, ht, fc.shape(), fc)
 +
 +		// too few arguments fail; a null argument fails; an unknown one gives an unknown
++		format, args := fc.format(), fc.args()
++		n := len(args)
 +		if n > 0 {
-+			if got, err := stdlib.Format(cty.StringVal(format.String()), args[:n-1]...); err == nil {
-+				c.failClass(ht, "Format args", "Format(%q) with %d of %d arguments = %s, want an error", format.String(), n-1, n, got.GoString())
++			if got, err := stdlib.Format(cty.StringVal(format), args[:n-1]...); err == nil {
++				c.failClass(ht, "Format args", "Format(%q) with %d of %d arguments = %s, want an error", format, n-1, n, got.GoString())
 +			}
 +			// a null argument: "null" for %v, an error otherwise
 +			nulled := append([]cty.Value(nil), args...)
 +			nulled[0] = cty.NullVal(args[0].Type())
-+			got, err := stdlib.Format(cty.StringVal(format.String()), nulled...)
-+			if verbs[0] == "v" {
++			got, err := stdlib.Format(cty.StringVal(format), nulled...)
++			if fc.segs[0].verb == "v" {
 +				if err != nil || !strings.Contains(got.AsString(), "null") {
-+					c.failClass(ht, "Format null", "Format(%q) with a null argument for %%v = %s, %v; want \"null\"", format.String(), got.GoString(), err)
++					c.failClass(ht, "Format null", "Format(%q) with a null argument for %%v = %s, %v; want \"null\"", format, got.GoString(), err)
 +				}
 +			} else if err == nil {
-+				c.failClass(ht, "Format null", "Format(%q) with a null argument = %s, want an error", format.String(), got.GoString())
++				c.failClass(ht, "Format null", "Format(%q) with a null argument = %s, want an error", format, got.GoString())
 +			}
 +			unk := append([]cty.Value(nil), args...)
 +			unk[0] = cty.UnknownVal(args[0].Type())
-+			if got, err := stdlib.Format(cty.StringVal(format.String()), unk...); err != nil || got.IsKnown() {
-+				c.failClass(ht, "Format unknown", "Format(%q) with an unknown argument = %s, %v; want an unknown string", format.String(), got.GoString(), err)
++			if got, err := stdlib.Format(cty.StringVal(format), unk...); err != nil || got.IsKnown() {
++				c.failClass(ht, "Format unknown", "Format(%q) with an unknown argument = %s, %v; want an unknown string", format, got.GoString(), err)
 +			}
 +		}
 +	})
@@ -2057,11 +3054,13 @@ index 0000000..c8fef5e
 +
 +// --------------------------------------------------------------------------- regex
 +
-+var regexPatterns = []struct {
++type regexPattern struct {
 +	pat   string
 +	named bool // has named groups
 +	n     int  // number of groups
-+}{
++}
++
++var regexPatterns = []regexPattern{
 +	{`a`, false, 0},
 +	{`[0-9]+`, false, 0},
 +	{`([0-9]+)`, false, 1},
@@ -2076,11 +3075,33 @@ index 0000000..c8fef5e
 +
 +var regexSubjects = []string{"", "a", "abc", "ab", "123", "x=12,y=3", "hello", "aac", "héllo 42", "k=", "helelo"}
 +
++// regexCase: a pattern, a subject and a replacement.
++type regexCase struct {
++	p   regexPattern
++	s   string
++	rep string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c regexCase) GoString() string {
++	return fmt.Sprintf("pattern %q subject %q replacement %q", c.p.pat, c.s, c.rep)
++}
++
++var regexCases = hegel.Composite(func(tc hegel.TestCase) regexCase {
++	return regexCase{
++		p:   hegel.Draw(tc, hegel.SampledFrom(regexPatterns)),
++		s:   hegel.Draw(tc, hegel.SampledFrom(regexSubjects)),
++		rep: hegel.Draw(tc, hegel.SampledFrom([]string{"", "_", "[$0]", "$1", "${x}"})),
++	}
++})
++
++// TestHegelRegex: Regex, RegexAll and RegexReplace against Go's regexp with the documented
++// result shapes.
 +func TestHegelRegex(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		p := pick(ht, regexPatterns)
-+		s := pick(ht, regexSubjects)
++		rc := hegel.Draw(ht, regexCases)
++		p, s := rc.p, rc.s
 +		re := regexp.MustCompile(p.pat)
 +
 +		// the model of one match from its submatch indexes
@@ -2145,8 +3166,9 @@ index 0000000..c8fef5e
 +			}
 +		}
 +
-+		// RegexReplace against Go's ReplaceAllString
-+		rep := pick(ht, []string{"", "_", "[$0]", "$1", "${x}"})
++		// RegexReplace against Go's ReplaceAllString (a replacement naming a group the
++		// pattern lacks is "_")
++		rep := rc.rep
 +		if strings.Contains(rep, "$1") && p.n == 0 {
 +			rep = "_"
 +		}
@@ -2169,11 +3191,40 @@ index 0000000..c8fef5e
 +
 +// --------------------------------------------------------------------------- JSON, CSV
 +
++// jsonCase: a value of a type without placeholders and the text appended to its encoding.
++type jsonCase struct {
++	ty       cty.Type
++	v        cty.Value
++	trailing string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c jsonCase) GoString() string {
++	return fmt.Sprintf("%s as %s, trailing %q", c.v.GoString(), tyString(c.ty), c.trailing)
++}
++
++var (
++	// trailers: the text after a JSON document that makes it invalid: a stray bracket (the
++	// shape of go-cty/7), or text; under HEGEL_NO_KNOWN=1 text only, since a trailing bracket
++	// is not noticed.
++	trailers    = shaped(hegel.SampledFrom([]string{"]", "}", " x", " 1", "]]"}), hegel.SampledFrom([]string{" x", " 1"}))
++	jsonFnCases = hegel.Composite(func(tc hegel.TestCase) jsonCase {
++		ty := hegel.Draw(tc, plainTypes)
++		return jsonCase{ty: ty, v: hegel.Draw(tc, valuesOf(ty, valueOpts{nullPct: 10})), trailing: hegel.Draw(tc, trailers)}
++	})
++)
++
++// bareBrackets reports a trailer of closing brackets only, the shape of go-cty/7.
++func bareBrackets(trailing string) bool { return strings.Trim(trailing, "]}") == "" }
++
++// TestHegelJSONFunctions: JSONEncode writes JSON that JSONDecode reads back to a value
++// converting to the original; an unknown encodes to an unknown; a document with data after
++// the value is rejected (a stray "]" or "}" is accepted: go-cty/7).
 +func TestHegelJSONFunctions(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		ty := genType(ht, typeOpts{depth: 3})
-+		v := genValue(ht, ty, valueOpts{nullPct: 10})
++		jc := hegel.Draw(ht, jsonFnCases)
++		ty, v := jc.ty, jc.v
 +		enc, err := stdlib.JSONEncode(v)
 +		if err != nil {
 +			c.failClass(ht, "JSONEncode", "JSONEncode(%s): %v", v.GoString(), err)
@@ -2192,70 +3243,109 @@ index 0000000..c8fef5e
 +			c.failClass(ht, "JSONDecode", "JSONDecode(%q): %v", enc.AsString(), err)
 +			return
 +		}
-+		if hasSet(ty) {
++		if !hasSet(ty) {
 +			// sets come back as tuples; their order is not part of the value
-+			return
-+		}
-+		back, err := convert.Convert(dec, ty)
-+		if err != nil {
-+			c.failClass(ht, "convert back", "JSONDecode(%q) = %s does not convert to %s: %v", enc.AsString(), dec.GoString(), tyString(ty), err)
-+			return
-+		}
-+		if !back.RawEquals(v) {
-+			c.failClass(ht, "round trip", "JSONEncode/JSONDecode of %s (%s) gives %s (JSON %s)", v.GoString(), tyString(ty), back.GoString(), enc.AsString())
++			back, err := convert.Convert(dec, ty)
++			if err != nil {
++				c.failClass(ht, "convert back", "JSONDecode(%q) = %s does not convert to %s: %v", enc.AsString(), dec.GoString(), tyString(ty), err)
++				return
++			}
++			if !back.RawEquals(v) {
++				c.failClass(ht, "round trip", "JSONEncode/JSONDecode of %s (%s) gives %s (JSON %s)", v.GoString(), tyString(ty), back.GoString(), enc.AsString())
++				return
++			}
 +		}
 +		// an unknown encodes to an unknown string, invalid JSON fails to decode
 +		if u, err := stdlib.JSONEncode(cty.UnknownVal(ty)); err != nil || u.IsKnown() {
 +			c.failClass(ht, "unknown", "JSONEncode(unknown %s) = %s, %v", tyString(ty), u.GoString(), err)
 +		}
-+		trailing := pick(ht, []string{"]", "}", " x", " 1", "]]"})
-+		if Known.jsonDecodeTrailingBrackets && strings.Trim(trailing, "]}") == "" {
-+			trailing = " x" // a trailing bracket is not noticed
-+		}
-+		if got, err := stdlib.JSONDecode(cty.StringVal(enc.AsString() + trailing)); err == nil {
-+			c.failClass(ht, "invalid", "JSONDecode(%q) = %s, want an error", enc.AsString()+trailing, got.GoString())
-+		}
++		checkTrailing(c, ht, shapeIf(bareBrackets(jc.trailing), "go-cty/7"), enc.AsString(), jc.trailing)
 +	})
 +}
 +
-+var csvCells = []string{"", "a", "hello world", "1", "with,comma", `with "quote"`, "multi\nline", " padded ", "日本語", "-0"}
++// checkTrailing checks that JSONDecode rejects the document with the trailing text.
++func checkTrailing(c *collector, ht *hegel.T, shape, doc, trailing string) {
++	if got, err := stdlib.JSONDecode(cty.StringVal(doc + trailing)); err == nil {
++		c.mismatch(ht, "invalid", shape, "JSONDecode(%q) = %s, want an error", doc+trailing, got.GoString())
++	}
++}
 +
++var (
++	csvCells   = []string{"", "a", "hello world", "1", "with,comma", `with "quote"`, "multi\nline", " padded ", "日本語", "-0"}
++	csvHeaders = []string{"a", "b", "name", "id", "x y", "Z", "with,comma", `q"uote`}
++)
++
++// csvCase: distinct header names, rows of cells, and the line ending.
++type csvCase struct {
++	header []string
++	rows   [][]string
++	crlf   bool
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c csvCase) GoString() string {
++	return fmt.Sprintf("header %q rows %q crlf %v", c.header, c.rows, c.crlf)
++}
++
++// records is the table written: the header, then the rows, an empty cell of a one-column
++// table written as "x" (an empty line is not a record).
++func (c csvCase) records() [][]string {
++	records := [][]string{c.header}
++	for _, row := range c.rows {
++		row = append([]string(nil), row...)
++		for j := range row {
++			if len(c.header) == 1 && row[j] == "" {
++				row[j] = "x"
++			}
++		}
++		records = append(records, row)
++	}
++	return records
++}
++
++// text is the table as encoding/csv writes it.
++func (c csvCase) text() string {
++	var buf bytes.Buffer
++	w := csv.NewWriter(&buf)
++	w.UseCRLF = c.crlf
++	if err := w.WriteAll(c.records()); err != nil {
++		panic(err)
++	}
++	return buf.String()
++}
++
++// distinctStrings keeps the first of equal strings, in order.
++func distinctStrings(xs []string) []string {
++	seen := map[string]bool{}
++	var out []string
++	for _, x := range xs {
++		if !seen[x] {
++			seen[x] = true
++			out = append(out, x)
++		}
++	}
++	return out
++}
++
++var (
++	headers  = hegel.Map(many(hegel.SampledFrom(csvHeaders), 1, 4), distinctStrings)
++	csvCases = hegel.FlatMap(headers, func(header []string) hegel.Generator[csvCase] {
++		cols := len(header)
++		return hegel.Composite(func(tc hegel.TestCase) csvCase {
++			return csvCase{header: header, rows: hegel.Draw(tc, many(many(hegel.SampledFrom(csvCells), cols, cols), 0, 4)), crlf: hegel.Draw(tc, chance(30))}
++		})
++	})
++)
++
++// TestHegelCSVDecode: CSVDecode reads a table encoding/csv wrote into a list of objects keyed
++// by the header; a ragged table fails.
 +func TestHegelCSVDecode(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		// distinct header names, rows of cells
-+		cols := drawInt(ht, 1, 4)
-+		var header []string
-+		seen := map[string]bool{}
-+		for len(header) < cols {
-+			h := pick(ht, []string{"a", "b", "name", "id", "x y", "Z", "with,comma", `q"uote`})
-+			if !seen[h] {
-+				seen[h] = true
-+				header = append(header, h)
-+			}
-+		}
-+		rows := drawInt(ht, 0, 4)
-+		var records [][]string
-+		records = append(records, header)
-+		for i := 0; i < rows; i++ {
-+			row := make([]string, cols)
-+			for j := range row {
-+				row[j] = pick(ht, csvCells)
-+				if cols == 1 && row[j] == "" {
-+					row[j] = "x" // an empty line is not a record
-+				}
-+			}
-+			records = append(records, row)
-+		}
-+		var buf bytes.Buffer
-+		w := csv.NewWriter(&buf)
-+		if chance(ht, 30) {
-+			w.UseCRLF = true
-+		}
-+		if err := w.WriteAll(records); err != nil {
-+			ht.Fatalf("csv writer: %v", err)
-+		}
-+		text := buf.String()
++		cc := hegel.Draw(ht, csvCases)
++		header, records := cc.header, cc.records()
++		cols, rows := len(header), len(cc.rows)
++		text := cc.text()
 +		got, err := stdlib.CSVDecode(cty.StringVal(text))
 +		if err != nil {
 +			c.failClass(ht, "CSVDecode", "CSVDecode(%q): %v", text, err)
@@ -2299,7 +3389,9 @@ index 0000000..c8fef5e
 +
 +// --------------------------------------------------------------------------- dates
 +
-+var dateTokens = []struct{ tok, layout string }{
++type dateToken struct{ tok, layout string }
++
++var dateTokens = []dateToken{
 +	{"YY", "06"}, {"YYYY", "2006"}, {"M", "1"}, {"MM", "01"}, {"MMM", "Jan"}, {"MMMM", "January"},
 +	{"D", "2"}, {"DD", "02"}, {"EEE", "Mon"}, {"EEEE", "Monday"},
 +	{"h", "H24"}, {"hh", "15"}, {"H", "3"}, {"HH", "03"}, {"AA", "PM"}, {"aa", "pm"},
@@ -2307,66 +3399,124 @@ index 0000000..c8fef5e
 +	{"ZZZZ", "-0700"}, {"ZZZZZ", "-07:00"}, {"Z", "Z07:00"}, {"ZZZ", "UTC"},
 +}
 +
-+func genTime(tc hegel.TestCase) time.Time {
-+	secs := int64(drawInt(tc, -1500000000, 2500000000))
-+	off := 0
-+	if chance(tc, 50) {
-+		off = drawInt(tc, -14, 14)*3600 + pick(tc, []int{0, 0, 30 * 60, 45 * 60})
-+	}
-+	loc := time.UTC
-+	if off != 0 {
-+		loc = time.FixedZone("", off)
-+	}
-+	return time.Unix(secs, 0).In(loc)
++// timeSpec is an instant and a zone offset (seconds east of UTC; 0 is UTC).
++type timeSpec struct {
++	secs int64
++	off  int
 +}
 +
++func (t timeSpec) time() time.Time {
++	loc := time.UTC
++	if t.off != 0 {
++		loc = time.FixedZone("", t.off)
++	}
++	return time.Unix(t.secs, 0).In(loc)
++}
++
++// dateCase: a time, the tokens of a format with the separator after each (the last one's
++// written three times in ten), and a duration for TimeAdd.
++type dateCase struct {
++	t       timeSpec
++	toks    []dateToken
++	seps    []string
++	lastSep bool
++	dur     string
++}
++
++// GoString is what the draw report prints (it uses %#v).
++func (c dateCase) GoString() string {
++	return fmt.Sprintf("time %s format %q dur %q", c.t.time().Format(time.RFC3339), c.format(), c.dur)
++}
++
++// format is the format string.
++func (c dateCase) format() string {
++	var b strings.Builder
++	for i, tk := range c.toks {
++		b.WriteString(tk.tok)
++		if i < len(c.toks)-1 || c.lastSep {
++			b.WriteString(c.seps[i])
++		}
++	}
++	return b.String()
++}
++
++// want is the formatted time: each token by its Go layout (the 24-hour "h" and the "ZZZ" zone
++// name by hand), each separator with its quotes removed (two apostrophes are one).
++func (c dateCase) want() string {
++	tm := c.t.time()
++	var b strings.Builder
++	for i, tk := range c.toks {
++		switch tk.layout {
++		case "H24":
++			b.WriteString(itoa(tm.Hour()))
++		case "UTC":
++			s := tm.Format("-0700")
++			if s == "+0000" {
++				s = "UTC"
++			}
++			b.WriteString(s)
++		default:
++			b.WriteString(tm.Format(tk.layout))
++		}
++		if i < len(c.toks)-1 || c.lastSep {
++			sep := c.seps[i]
++			if strings.HasPrefix(sep, "'") {
++				sep = strings.Trim(sep, "'")
++				if sep == "" {
++					sep = "'"
++				}
++			}
++			b.WriteString(sep)
++		}
++	}
++	return b.String()
++}
++
++var (
++	// zoneOffsets: UTC half the time, else whole hours within fourteen and a half or three
++	// quarters now and then.
++	zoneOffsets = maybe(50, hegel.Composite(func(tc hegel.TestCase) int {
++		return hegel.Draw(tc, hegel.Integers(-14, 14))*3600 + hegel.Draw(tc, hegel.SampledFrom([]int{0, 0, 30 * 60, 45 * 60}))
++	}))
++	timeSpecs = hegel.Composite(func(tc hegel.TestCase) timeSpec {
++		return timeSpec{secs: hegel.Draw(tc, hegel.Integers[int64](-1500000000, 2500000000)), off: hegel.Draw(tc, zoneOffsets)}
++	})
++	dateSeps  = hegel.SampledFrom([]string{"-", ":", " ", "/", ".", "'at'", "'T'", "''", "_", ","})
++	durations = hegel.SampledFrom([]string{"1h", "-2h5m", "1.5h", "30s", "1000ms", "0s", "24h", "-1h30m10s", "1h1m1s"})
++	dateCases = hegel.Composite(func(tc hegel.TestCase) dateCase {
++		toks := hegel.Draw(tc, many(hegel.SampledFrom(dateTokens), 1, 5))
++		return dateCase{
++			t:       hegel.Draw(tc, timeSpecs),
++			toks:    toks,
++			seps:    hegel.Draw(tc, many(dateSeps, len(toks), len(toks))),
++			lastSep: hegel.Draw(tc, chance(30)),
++			dur:     hegel.Draw(tc, durations),
++		}
++	})
++)
++
++// TestHegelFormatDate: FormatDate against Go's time layouts and TimeAdd against
++// time.Duration; an invalid timestamp and an invalid duration fail.
 +func TestHegelFormatDate(t *testing.T) {
 +	c := newCollector(t)
 +	property(t, func(ht *hegel.T) {
-+		tm := genTime(ht)
++		dc := hegel.Draw(ht, dateCases)
++		tm := dc.t.time()
 +		ts := tm.Format(time.RFC3339)
-+		var format, want strings.Builder
-+		n := drawInt(ht, 1, 5)
-+		for i := 0; i < n; i++ {
-+			tk := pick(ht, dateTokens)
-+			format.WriteString(tk.tok)
-+			switch tk.layout {
-+			case "H24":
-+				want.WriteString(itoa(tm.Hour()))
-+			case "UTC":
-+				s := tm.Format("-0700")
-+				if s == "+0000" {
-+					s = "UTC"
-+				}
-+				want.WriteString(s)
-+			default:
-+				want.WriteString(tm.Format(tk.layout))
-+			}
-+			if i < n-1 || chance(ht, 30) {
-+				sep := pick(ht, []string{"-", ":", " ", "/", ".", "'at'", "'T'", "''", "_", ","})
-+				format.WriteString(sep)
-+				if strings.HasPrefix(sep, "'") {
-+					sep = strings.Trim(sep, "'")
-+					if sep == "" {
-+						sep = "'"
-+					}
-+				}
-+				want.WriteString(sep)
-+			}
-+		}
-+		got, err := stdlib.FormatDate(cty.StringVal(format.String()), cty.StringVal(ts))
++		format, want := dc.format(), dc.want()
++		got, err := stdlib.FormatDate(cty.StringVal(format), cty.StringVal(ts))
 +		if err != nil {
-+			c.failClass(ht, "FormatDate", "FormatDate(%q, %q): %v", format.String(), ts, err)
-+		} else if got.AsString() != want.String() {
-+			c.failClass(ht, "FormatDate", "FormatDate(%q, %q) = %q, want %q", format.String(), ts, got.AsString(), want.String())
++			c.failClass(ht, "FormatDate", "FormatDate(%q, %q): %v", format, ts, err)
++		} else if got.AsString() != want {
++			c.failClass(ht, "FormatDate", "FormatDate(%q, %q) = %q, want %q", format, ts, got.AsString(), want)
 +		}
 +		// an invalid timestamp fails
-+		if got, err := stdlib.FormatDate(cty.StringVal(format.String()), cty.StringVal("2020-13-01T00:00:00Z")); err == nil {
-+			c.failClass(ht, "FormatDate invalid", "FormatDate(%q, month 13) = %s, want an error", format.String(), got.GoString())
++		if got, err := stdlib.FormatDate(cty.StringVal(format), cty.StringVal("2020-13-01T00:00:00Z")); err == nil {
++			c.failClass(ht, "FormatDate invalid", "FormatDate(%q, month 13) = %s, want an error", format, got.GoString())
 +		}
 +
 +		// TimeAdd against Go
-+		dur := pick(ht, []string{"1h", "-2h5m", "1.5h", "30s", "1000ms", "0s", "24h", "-1h30m10s", "1h1m1s"})
++		dur := dc.dur
 +		got, err = stdlib.TimeAdd(cty.StringVal(ts), cty.StringVal(dur))
 +		d, _ := time.ParseDuration(dur)
 +		if err != nil {
@@ -2381,10 +3531,10 @@ index 0000000..c8fef5e
 +}
 diff --git a/hegel/hegel_test.go b/hegel/hegel_test.go
 new file mode 100644
-index 0000000..af32d7e
+index 0000000..416048d
 --- /dev/null
 +++ b/hegel/hegel_test.go
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,274 @@
 +package hegel
 +
 +// Hegel property tests for go-cty, written for the Hegel zoo. See targets/go/go-cty/README.md.
@@ -2394,6 +3544,16 @@ index 0000000..af32d7e
 +// conversion rules, the JSON and msgpack serializations (a value marshalled with its type
 +// unmarshals to an equal value, the implied type reads it back), value operations and stdlib
 +// functions against models written from their documentation.
++//
++// Generators are values built from the binding's combinators (hegel_gen_test.go for the types
++// and values, each stdlib property's case record beside the property): a property draws one
++// record and judges it, and pure functions render the record into the arguments the library
++// and the model see. The shapes of the recorded bugs (bugs.toml) are drawn at their natural
++// rate, so the properties that meet them fail, naming the shape, and are the expected failures
++// mapped to the bugs (STYLE.md rule 11); hegel_shapes_test.go has one property per bug over
++// its shape region alone, and hegel_pins_test.go the regression examples. HEGEL_NO_KNOWN=1
++// switches the known shapes off (noKnown, below): the models then reproduce the recorded
++// behaviour and the codec generators leave the one shape the models cannot state out.
 +//
 +// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
 +// through hegelOpts; a panic in the code under test is turned into a failure of the current
@@ -2441,12 +3601,6 @@ index 0000000..af32d7e
 +		fn(ht)
 +	}, hegelOpts()...)
 +}
-+
-+func drawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
-+
-+func chance(tc hegel.TestCase, pct int) bool { return drawInt(tc, 1, 100) <= pct }
-+
-+func pick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
 +
 +var collecting = os.Getenv("ZOO_COLLECT") != ""
 +
@@ -2510,10 +3664,28 @@ index 0000000..af32d7e
 +	ht.Fatalf("%s", msg)
 +}
 +
++// mismatch is failClass on a case that has the shape of a recorded bug (shape names it, or is
++// "" for a plain failure): the message names the shape, so that the shrunk failure of a wide
++// property can be read off against bugs.toml.
++func (c *collector) mismatch(ht *hegel.T, class, shape string, format string, args ...any) {
++	if shape != "" {
++		format += " (the shape of " + shape + ")"
++	}
++	c.failClass(ht, class, format, args...)
++}
++
 +// --------------------------------------------------------------------------- known bugs
 +
++// noKnown: HEGEL_NO_KNOWN=1 looks past the recorded bugs (bugs.toml), read once. By default
++// every switch of Known is off: the models state the documented behaviour, the generators draw
++// the shapes of the bugs and the properties that meet them fail, naming the shape (mismatch).
++// Under HEGEL_NO_KNOWN=1 the switches are on: the models reproduce the recorded behaviour
++// instead, and the codec generators give the collections of go-cty/1 known, non-empty elements.
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") == "1"
++
 +// Known: the recorded bugs (bugs.toml). The model reproduces a behaviour while its switch is
-+// on; the pins assert the documented behaviour and fail while the bug exists.
++// on, which is so only under HEGEL_NO_KNOWN=1; the pins assert the documented behaviour and
++// fail while the bug exists, and hegel_shapes_test.go has a property per bug.
 +var Known = struct {
 +	// a null, unknown or empty-collection element under a collection type whose element type
 +	// holds a DynamicPseudoType (List(List(DynamicPseudoType)), Map(Map(DynamicPseudoType)))
@@ -2545,12 +3717,95 @@ index 0000000..af32d7e
 +	// dividend's sign (and Divide by zero does give the infinity)
 +	moduloByZeroIsDividend bool
 +}{
-+	dynamicElemNullLosesType:       true,
-+	titleUnderscore:                true,
-+	comparisonDescriptionsReversed: true,
-+	substrNegativeOffsetZeroLength: true,
-+	rangeZeroStepCheck:             true,
-+	formatZeroPrecision:            true,
-+	jsonDecodeTrailingBrackets:     true,
-+	moduloByZeroIsDividend:         true,
++	dynamicElemNullLosesType:       noKnown,
++	titleUnderscore:                noKnown,
++	comparisonDescriptionsReversed: noKnown,
++	substrNegativeOffsetZeroLength: noKnown,
++	rangeZeroStepCheck:             noKnown,
++	formatZeroPrecision:            noKnown,
++	jsonDecodeTrailingBrackets:     noKnown,
++	moduloByZeroIsDividend:         noKnown,
++}
++
++// shaped is the value for a recorded bug's shape region or, under HEGEL_NO_KNOWN=1, for the
++// neighbouring region past it.
++func shaped[T any](known, past T) T {
++	if noKnown {
++		return past
++	}
++	return known
++}
++
++// shapeIf names the bug when the case has its shape ("" otherwise), for mismatch.
++func shapeIf(has bool, id string) string {
++	if has {
++		return id
++	}
++	return ""
++}
++
++// known names the bug a property over its shape region is about, or nothing under
++// HEGEL_NO_KNOWN=1, when the property draws the neighbouring region.
++func known(id string) string { return shapeIf(!noKnown, id) }
++
++// --------------------------------------------------------------------------- generator idioms
++
++// choice is one alternative of a weighted choice.
++type choice[T any] struct {
++	weight int
++	gen    hegel.Generator[T]
++}
++
++// weighted generates from one of the choices, chosen with probability proportional to its
++// weight; it shrinks towards the first choice, so the simplest comes first.
++func weighted[T any](choices ...choice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	return hegel.FlatMap(hegel.Integers(0, total-1), func(i int) hegel.Generator[T] {
++		for _, c := range choices {
++			if i < c.weight {
++				return c.gen
++			}
++			i -= c.weight
++		}
++		panic("unreachable")
++	})
++}
++
++// chance is true pct percent of the time; it shrinks to false (Integers shrinks to 0, so the
++// true range is the top of the die, not the bottom).
++func chance(pct int) hegel.Generator[bool] {
++	return hegel.Map(hegel.Integers(0, 99), func(x int) bool { return x >= 100-pct })
++}
++
++// maybe generates from g pct percent of the time and the zero value otherwise, which is what
++// it shrinks to.
++func maybe[T any](pct int, g hegel.Generator[T]) hegel.Generator[T] {
++	var zero T
++	return weighted(choice[T]{100 - pct, hegel.Just(zero)}, choice[T]{pct, g})
++}
++
++func ptrTo[T any](x T) *T { return &x }
++
++// optional generates a pointer to a value of g pct percent of the time and nil otherwise (for
++// values whose zero value is a value in its own right).
++func optional[T any](pct int, g hegel.Generator[T]) hegel.Generator[*T] {
++	return maybe(pct, hegel.Map(g, ptrTo[T]))
++}
++
++// many is a list of lo to hi elements.
++func many[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	return hegel.Lists(g).MinSize(lo).MaxSize(hi)
++}
++
++// cat is the concatenation of two strings (the binding has no tuple combinator).
++func cat(a, b hegel.Generator[string]) hegel.Generator[string] {
++	return hegel.Composite(func(tc hegel.TestCase) string { return hegel.Draw(tc, a) + hegel.Draw(tc, b) })
++}
++
++// ints is an integer as an int64 (for cty.NumberIntVal).
++func ints(lo, hi int) hegel.Generator[int64] {
++	return hegel.Map(hegel.Integers(lo, hi), func(i int) int64 { return int64(i) })
 +}
