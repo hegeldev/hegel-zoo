@@ -49,10 +49,11 @@ below); each is mapped in `target.toml` to the bug it most often shrinks to.
 
 - `TestHegelDecodeSequenceFollowsTheGrammar` and `TestHegelParserReportsTheGrammarsEvents` —
   parameter lists up to and beyond the parser's buffer (x-ansi/1, /2), a 0x9C byte inside a
-  UTF-8 character of a control string (x-ansi/3, the usual basin), a private marker after the
-  parameters (x-ansi/4), two private markers (x-ansi/20), UTF-8 payloads in SOS/PM/APC strings
-  (x-ansi/18); `ESC \` after a string is reported as an ESC sequence of its own, as a VT parser
-  does.
+  UTF-8 character of a control string (x-ansi/3, the Parser's usual basin), a private marker
+  after the parameters (x-ansi/4), two private markers (x-ansi/20), UTF-8 payloads in SOS/PM/APC
+  strings (x-ansi/18), a C0 control inside a CSI or ESC sequence (x-ansi/23, the Decode
+  property's basin: three bytes), an introducer as the final after intermediates (x-ansi/24);
+  `ESC \` after a string is reported as an ESC sequence of its own, as a VT parser does.
 - `TestHegelStripAndWidthsFollowTheTokens` — the same documents; UTF-8 payloads in SOS/PM/APC
   strings are its basin (x-ansi/18).
 - `TestHegelTruncateFollowsItsModel` — `Cut` under WcWidth with `left > 0` (x-ansi/7, the
@@ -73,11 +74,12 @@ below); each is mapped in `target.toml` to the bug it most often shrinks to.
 - `TestHegelPaletteConversionsRoundTrip` — every palette entry, basic colours 7 and 8 included
   (x-ansi/17).
 - `TestHegelArbitraryTextIsDecodedWithoutLossOrPanic` — CSI parameter lists of any length
-  (x-ansi/1), clusters starting with ASCII (x-ansi/5, the basin); three disagreements between
-  the decoder's widths and `StringWidth` that are not recorded yet are counted, not judged
-  (`candidate/go/x-ansi-1`: a C0 control inside an ESC sequence, `"\x1b\a["`; `-2`: an
-  introducer after an intermediate, `"\x1b ]abc"`; `-3`: ESC inside a DCS, `"\x1bP\x1bPé"`).
-- Twenty-two narrow properties in `hegel_shapes_test.go`, one per recorded bug and named after
+  (x-ansi/1), clusters starting with ASCII (x-ansi/5, the basin), a private marker after the
+  parameters (x-ansi/4), UTF-8 inside an SOS/PM/APC string (x-ansi/18), and the three places
+  where the package's two parsers part: a C0 control inside a sequence (x-ansi/23,
+  `"\x1b\a["`), an introducer after intermediates (x-ansi/24, `"\x1b ]abc"`), an ESC right
+  after a DCS introducer (x-ansi/25, `"\x1bP\x1bPé"`).
+- Twenty-five narrow properties in `hegel_shapes_test.go`, one per recorded bug and named after
   what it tests (`TestHegelDecodeSequenceKeepsTheBufferOnLongParameterLists`,
   `TestHegelBufferSizedParameterListIsKeptWhole`,
   `TestHegelControlStringsKeepCharactersWithAnSTByte`,
@@ -93,16 +95,22 @@ below); each is mapped in `target.toml` to the bug it most often shrinks to.
   `TestHegelConvert16ReturnsTheBasicGreys`, `TestHegelStringsKeepUTF8Payloads`,
   `TestHegelWrappersKeepLeadingSpaces`, `TestHegelParserAndDecoderAgreeOnTwoPrivateMarkers`,
   `TestHegelWrappersKeepWhitespaceBeforeASequenceWithinTheLimit`,
-  `TestHegelMouseX10PayloadIsThreeBytes`): each draws its bug's shape region with random
-  contents and is the deterministic expected failure beside the pin.
+  `TestHegelMouseX10PayloadIsThreeBytes`, `TestHegelControlsInsideSequencesAreExecuted`,
+  `TestHegelIntroducerAfterIntermediatesIsAFinal`,
+  `TestHegelEscapeAfterADCSIntroducerCancelsIt`): each draws its bug's shape region with random
+  contents and is the deterministic expected failure beside the pin. The last three are shapes
+  the token grammar does not describe (a control inside a sequence, an introducer as a final, a
+  DCS cancelled by an ESC), so they check the two parsers against each other as the
+  arbitrary-text property does: the decoded widths add up to `StringWidth` and `Strip` is the
+  decoded text.
 
 ## Known shapes drawn by default
 
 A `Known` struct in `hegel_test.go` has one switch per bug shape, every one off by default:
 the generators draw the shapes (`shaped(Known.x, on, off)` at the generator) and `mismatch`
 names the bug whose shape the failing case has. Properties that fail every run are mapped
-plain to their most frequent basin (Decode and Parser to x-ansi/3, Truncate to /7, Hardwrap
-and Wrap to /12, Wordwrap to /19, XParseColor to /14); those a 100-case run misses now and
+plain to their most frequent basin (Decode to x-ansi/23, Parser to x-ansi/3, Truncate to /7,
+Hardwrap and Wrap to /12, Wordwrap to /19, XParseColor to /14); those a 100-case run misses now and
 then are intermittent (Strip /18, ReadStyleColor /15, Palette /17, the arbitrary text /5).
 `HEGEL_NO_KNOWN=1`, read once, turns every switch on: the shapes are left out at the
 generators, the narrow properties draw the neighbouring region, and every property passes
@@ -134,6 +142,9 @@ except the pins.
 | x-ansi/20 | low | With two private markers the Parser keeps the first and DecodeSequence the last |
 | x-ansi/21 | low | Whitespace followed by an escape sequence is flushed past the limit by Wordwrap and Wrap |
 | x-ansi/22 | medium | MouseX10 encodes its payload bytes as runes: coordinates from 95 upwards become two UTF-8 bytes |
+| x-ansi/23 | medium | A C0 control inside an ESC or CSI sequence: DecodeSequence cancels the sequence and prints its rest, the Parser executes it into the CSI's command |
+| x-ansi/24 | low | ESC, intermediates and one of [ ] P X ^ _ is a three-byte escape sequence to the Parser and the start of a CSI, DCS or string to DecodeSequence |
+| x-ansi/25 | low | An ESC right after a DCS introducer is put into the string by the transition table, so Strip and the widths swallow the text that follows; DecodeSequence cancels the DCS |
 
 ## Not bugs
 
@@ -156,4 +167,10 @@ except the pins.
   lists and colours as records rendered by pure functions) and the file split in six; the known
   shapes drawn by default with twenty-two narrow properties; the model's `lastWordWidth` now
   measures by the method under test and the 8-bit introducers are raw C1 bytes; three
-  decoder/parser disagreements surfaced as candidates (above), to be judged and recorded.
+  decoder/parser disagreements surfaced as candidates and were judged against ECMA-48 and the
+  VT500 state machine and recorded the same day as x-ansi/23–25 (a C0 control inside a
+  sequence: the decoder cancels and the Parser corrupts the CSI command; an introducer after
+  intermediates: the decoder opens a sequence where the table dispatches; an ESC right after a
+  DCS introducer: the table's screen-passthrough extension swallows the text), each with a pin
+  and a narrow property, the first two drawn by the token grammar too (`Known.ctrlInSeq`,
+  `Known.interIntro`); the Decode property's basin moved to x-ansi/23.
