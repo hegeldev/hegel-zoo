@@ -16,9 +16,9 @@ patch and files nothing upstream.
 `go test -count=1 -run TestHegel -v ./spdxexp` in the module root. The patch adds, as the
 external package `spdxexp_test`, `hegel_test.go` (harness, the `Known` switches),
 `hegel_model_test.go` (trees, tokenizer, parser, canonical rendering, compatibility, expansion,
-the models of Satisfies and Validate), `hegel_props_test.go` (generators, properties) and
-`hegel_pins_test.go` (one plain test per bug), and requires `hegel.dev/go/hegel v0.6.33` in
-go.mod.
+the models of Satisfies and Validate), `hegel_props_test.go` (generators, properties),
+`hegel_shapes_test.go` (the sixteen narrow properties) and `hegel_pins_test.go` (one plain
+test per bug), and requires `hegel.dev/go/hegel v0.6.33` in go.mod.
 
 ## Oracle
 
@@ -62,11 +62,50 @@ include operators, parentheses, `+`, `-only`, `-or-later`, lower-case keywords, 
 | MutationsAgree | on a mutated expression, `ValidateLicenses` and the model agree on validity and `Satisfies` on error and verdict |
 | PoolsAreKnown | the generator's identifiers are on this version's lists |
 
-Each recorded bug has a `Known` switch: the model reproduces the behaviour or the generator
-avoids the shape while it is on; the pins assert the documented behaviour and fail while the
-bug exists. `ZOO_COLLECT=1` records mismatches instead of failing and prints the agreement
-classes: in SatisfiesFollowsTheModel about 5% of the cases get a verdict that differs from the
-documented meaning (bugs 1-3), in MutationsAgree about 15% of the mutated strings stay valid.
+Sixteen narrow properties in `hegel_shapes_test.go`, one per bug, each over the bug's shape
+region with random contents and judged by the same model: `LicenseRefAlternativesCount` (1),
+`AndTermsKeepTheirOwnAlternatives` (2), `OrAlternativesKeepAllAndTerms` (3),
+`SatisfiesNeverPanics` (4), `OptionsApplyInsideExpressions` (5), `WithExpressionsValidate`
+(6), `MITIsSatisfiedLikeOthers` (7), `SatisfiesValidatesTheAllowedList` (8),
+`UnlistedSuffixIdentifiersRejected` (9), `LicenseRefWithExceptionParses` (10),
+`KeywordsNeedSeparation` (11), `LowercaseWithIsConsistent` (12),
+`PlusNormalizationIsConsistent` (13), `ExtractLicensesIsOrdered` (14),
+`MPLNoCopyleftExceptionIsInRange` (15), `ParserNeverPanics` (16). Each fails on its bug (10
+and 13 name go-spdx/6 beside their own, since the WITH fast path changes the expectation on
+those surfaces too); under `HEGEL_NO_KNOWN=1` it draws the neighbouring region and passes.
+
+## Known shapes drawn by default
+
+The sixteen `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them
+on): the model says what the documentation and the SPDX grammar say - `eval`, the meaning of
+the expression, for `Satisfies`; every range group for the version table; the options as
+documented; a sequence for `ExtractLicenses` - and the generators draw every recorded shape as
+an explicit alternative of the expression tower (`refInOr`, `refOrUnderAnd`, `orOfAndWithOr`,
+`orOfAndOfRefOr`, `nestedAndChain` beyond four licenses), of the atoms (deprecated `+`
+identifiers, unlisted suffixes, `LicenseRef WITH`, lower-case `with`), of the spelling (glued
+keywords, `X+ WITH Y`, parentheses around `WITH`) and of the allowed list (invalid entries,
+padded entries, `MIT+` against `MIT`, range-group neighbours); a mismatch names the shapes the
+case has (`mismatch(ht, shapes, ...)`), with `explains` flipping each bug's switches to see
+which change the expectation (bug 4 needs 1 and 3, bug 12 needs 8). Over nine default
+rounds Normalize shrank to go-spdx/9 six times, ValidateOptions to go-spdx/6 seven times and
+SatisfiesFollowsTheModel to go-spdx/7 seven times (plain); SatisfiesMonotone splits between
+go-spdx/10 (a `LicenseRef WITH exception` stranger in the valid list) and go-spdx/4 (the
+panic) and passed once in some sixty runs, and MutationsAgree fails at a natural rate of
+about 2% of the mutated strings, passing about one run in four (both intermittent). Under
+`HEGEL_NO_KNOWN=1` the switches reproduce the package and the four-license cap steers as
+before; no case is assumed away and every property passes (1000 cases).
+
+The generators are package-level values in combinator style: atoms as `atomSpec` records with
+a pure `text()` drawn from the pools, trees as records from a depth-indexed eager tower
+(`nodeKit.levels`), the spelling as a record of gap and parenthesis tapes read modulo by a
+pure `render` that also reports the marks it left (glued keywords, suffixes, a lower-case
+`with`), the allowed list as a record derived from the tree (own atoms in a drawn form,
+strangers, range neighbours, invalid extras, a rotation), mutations as edit records applied
+modulo the live length; the judges `judgeSatisfies`/`judgeValidate`/`judgeNormalize` are
+shared by the wide and the narrow properties. `ExtractLicenses` is memoised per input within a
+run: hegel-go treats a non-deterministic failure as a pass, so go-spdx/14's random order would
+otherwise hide itself. `ZOO_COLLECT=1` records mismatches instead of failing and prints the
+classes.
 
 ## Accepted differences
 
@@ -101,3 +140,4 @@ group is unreachable; the parser panics on input ending after `(` or a DocumentR
 ## History
 
 - 2026-09-21 (turn 343): target added at 48a80b3 (v2.7.0) with five properties, 16 pins.
+- 2026-10-07: generators rewritten in combinator style; the sixteen known shapes drawn by default (three wide properties plain, two intermittent); sixteen narrow properties added; the model's end-of-keyword inputs reclassified from the panic shape to a plain error, and the WITH fast path's deprecated `+` identifier gated by go-spdx/13.
