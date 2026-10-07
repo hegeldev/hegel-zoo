@@ -129,6 +129,15 @@ i64)` drawing `one_of!(ints(1, 999).map(...), compose!(|tc| { ... }))`.
 Things learnt on the way: hegel-go's `Lists` yields a nil slice for zero elements (compare with
 `slices.Equal`, not `reflect.DeepEqual` against `[]string{}`); a Rust generator returned as `impl
 Generator<T>` cannot be drawn (`impl PrintableGenerator<T>`), and `compose!`'s body needs braces.
+hegel-java's `integers()` and `longs()` draws are magnitude-biased toward zero, not spread over
+their range: up to a range of a hundred they are close to even, over 0..999 three quarters of the
+draws fall in the lower half, over 0..999999 the median is 0.2 % of the range, over 0..2^53 96 %
+of the draws lie in the first percent, and a signed range clusters around zero symmetrically. So a
+"uniform fraction" built as `long / 2^53` sits at its lower bound (java/commons-numbers' `G.in`
+did, until 2026-10-07, hiding four bugs behind it), and a value that should spread over an
+interval is `doubles().min(lo).max(hi).allowNan(false).allowInfinity(false)` (deciles 9–13 %
+each, a quarter of the draws within 1e-6 of zero when the interval spans it); the integer draws
+are for counts, indices and decimals built from small parts, where small values are the point.
 
 ## What the survey found (turn 413, four language surveys over the committed patches)
 
