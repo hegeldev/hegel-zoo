@@ -131,11 +131,13 @@ passed eight), both intermittent; `TestHegelLinkifyAgreesWithGfmAutolinkLiterals
 goldmark/22 nine times (19 six, 20, 18 once; never passed), plain;
 `TestHegelAstIsWellFormed` to goldmark/23 fifteen times (passed twice), intermittent.
 Under `HEGEL_NO_KNOWN=1` the classifiers skip the known shapes before judging as before, and
-every wide property passes at the default case count (a 1000-case run still finds shapes the
-regexes miss - a known shape inside a container, a lazy delimiter row - which are being
-chased); the skip is 35-40% of the CommonMark, GFM and rewrite documents,
-mostly the over-approximating regexes of bugs 4 (any image followed by a backtick, 16%), 21, 9,
-5, 10 and 16 - tightening them is on the worklist.
+every wide property passes (three 1000-case runs, after thirteen 20000-case collect sweeps
+that taught the rules every container form); the skip is about half of the CommonMark and
+GFM documents, mostly the over-approximating regexes of bugs 4 (any image followed by a
+backtick, 16%), 21, 9, 5, 10 and 16 - tightening them is on the worklist. Every rule's regex
+shares a `containerPrefix` (quote markers, list markers, whitespace) and accepts CRLF: a probe
+wrapping each narrow generator's output in `> ` and `- ` found ten rules that did not
+recognise their bug inside a container.
 
 Every bug has a narrow property over its shape region, judged by the same oracle: the ten of
 2026-09-28 in `hegel_test.go` and twenty-four new ones in `hegel_shapes_test.go`
@@ -169,14 +171,31 @@ table. Three regexes were retuned so that the shapes are recognised inside neste
 (`> \t` under `>\t`), after spaces before the tab (`- *  \tb`) and for raw HTML only (not
 autolinks) in image alt text.
 
-Four candidate bugs found by the rewrite are gated by classifier rules named
-`candidate/go/goldmark-1..4` (switches off by default, so the shapes are drawn and fail by
-name) and await standalone reproduction before they are recorded: a one-character info string
-of a fence opened on the document's last line without a final newline is dropped (1);
-`<pre/>` (script, style, textarea too) at a line start opens a type-1 HTML block that runs to
-the end of the document where the references read a type-7 block ending at the blank line (2);
-an e-mail autolink literal starting with `-`, `+` or `.` is not linked at all (3); a hyphen in
-the last segment of an autolink literal's domain ends the link before it (4).
+Fifteen candidate bugs found by the rewrite and the sweeps are gated by classifier rules named
+`candidate/go/goldmark-1..15` (switches off by default, so the shapes are drawn and fail by
+name; the inputs, outputs and spec readings are in the rules' comments) and await standalone
+reproduction before they are recorded: a one-character info string of a fence opened on the
+document's last line without a final newline is dropped (1); `<pre/>` (script, style, textarea
+too) at a line start opens a type-1 HTML block that runs to the end of the document where the
+references read a type-7 block ending at the blank line (2); an e-mail autolink literal
+starting with `-`, `+` or `.` is not linked at all (3); a hyphen in the last segment of an
+autolink literal's domain ends the link before it (4); a lazy continuation line is read as a
+table line (`> a |\n| --- |`, `- a |\n| --- |`, `> a\n:--`; CommonMark 5.1 lets only paragraph
+continuation text drop the marker and the GFM text breaks a table at another block structure;
+v1.8.6 too) (5); a backslash-escaped tilde is counted into the strikethrough run beside it
+(6); an odd run of three or more backslashes before a line ending is not a hard break (7); a
+complete tag followed by a tab opens a paragraph instead of a type-7 HTML block (8); a
+backslash before a hard break's trailing spaces escapes the next line's first character (9);
+`</script>`, `</style>` or `</pre>` alone on a line is not a type-7 block start (10); a table
+row of `=` only or of `--` ends the table (11); a table that interrupted a paragraph is
+re-parsed at a later delimiter row, duplicating lines and losing text (12, a v2 regression);
+`-` alone after a link reference definition opens an empty list item (13); a table after a
+blank line inside a list item does not make the list loose (14); a pipe after an escaped
+backslash is read as an escaped pipe (15). Six ambiguous or reference-quirk shapes were added
+beside them (an indented header row, a list item that may not interrupt a paragraph after a
+table, a task marker without a space, commonmark.js ending the info string at a no-break
+space, micromark ending an autolink before punctuation that precedes a `)` and opening an
+HTML block on a lazy line).
 
 ## Not tested
 
@@ -186,4 +205,4 @@ East Asian line breaking, CJK options, the `text` package's readers directly, an
 - 2026-09-17: base bumped 710cc2656aa3 → c4c7034e4ff2 (2026-09-17, "chore: delete debug print"; v2.1.3); 29 bug(s) still reproduce. 36 tests pass.
 - 2026-09-18: base bumped c4c7034e4ff2 → dcdeda312dc8 (2026-09-19, "fix(text): ForceNewLine breaks original source bytes"; v2.1.4); 29 bug(s) still reproduce. 36 tests pass.
 - 2026-09-20: base bumped dcdeda312dc8 → 63f3cd21f554 (2026-09-19, "docs(CONTRIBUTING): add CONTRIBUTING.md"; v2.1.5+); 29 bug(s) still reproduce. 37 tests pass.
-- 2026-10-07: generators rewritten in combinator style; all known shapes drawn by default (two wide properties plain, three intermittent); twenty-four narrow properties added; four candidates gated by name.
+- 2026-10-07: generators rewritten in combinator style; all known shapes drawn by default (two wide properties plain, three intermittent); twenty-four narrow properties added; fifteen candidates gated by name after the classifier rules were taught every container form.
