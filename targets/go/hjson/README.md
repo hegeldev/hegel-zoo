@@ -73,8 +73,8 @@ plain test per bug), requires `hegel.dev/go/hegel v0.6.33` in go.mod and raises 
 
 `TestHegelJSON`, `TestHegelParse`, `TestHegelRoundTrip`, `TestHegelTypedRoundTrip`,
 `TestHegelNodeFixedPoint`, `TestHegelOrderedMap`, `TestHegelNodeAPI`, `TestHegelTypedHints`,
-`TestHegelMarshalers`, `TestHegelCommentRoundTrip`; and two narrow ones over a recorded
-bug's region, `TestHegelArrayMultilineLayout` (10) and `TestHegelEmptyLastValue` (20).
+`TestHegelMarshalers`, `TestHegelCommentRoundTrip`; and twenty narrow ones, one per recorded
+bug, in `hegel_shapes_test.go` (see "Known shapes drawn by default").
 
 ## Bugs
 
@@ -97,7 +97,46 @@ spelling a number beyond float64 is written quoteless, and the text then fails t
 `interface{}` (19). A braceless root object whose last member has no value at the end of the
 input, `a:`, reads as `{"a": "\x00"}` (20).
 
-## Modelled as recorded
+## Known shapes drawn by default
+
+The nineteen `Known` switches are off by default: the models say what the documentation says,
+the generators draw every recorded shape at its natural rate (`1.`-style numbers, numbers
+beyond float64 and root strings with a colon included), and the wide properties fail on the
+shapes with the mismatch naming the bug (`mismatch(ht, class, shape, ...)`). Over 17 default
+rounds `TestHegelNodeAPI` shrank to hjson/2, `TestHegelMarshalers` to hjson/13 and
+`TestHegelNodeFixedPoint` to hjson/3 every time (mapped plain); `TestHegelTypedHints` to
+hjson/14 ten times (16 three, 11 two, passed two), `TestHegelCommentRoundTrip` to hjson/12
+five times (6 and 18 three each, 1 two, 4 and 20 once, passed two), `TestHegelJSON` to hjson/1
+five times (passed twelve), `TestHegelParse` to hjson/11 eight times (1 once, passed eight),
+`TestHegelRoundTrip` to hjson/20 twelve times (6 four, 4 once) and `TestHegelTypedRoundTrip`
+to hjson/7 seven times (6 six, 4 four) - each mapped to its plurality basin as intermittent;
+`TestHegelOrderedMap` reaches no recorded shape. `HEGEL_NO_KNOWN=1` (read once) turns every
+switch on: the models reproduce the recorded behaviour, the few remaining skips (the
+multiline-after-comment and unpreserved-string regions of the comment round trip, 1.7% and
+1.3%; the typed round trip's 0.5%; the rest under 1%) apply, and every property passes while
+the twenty pins fail.
+
+One narrow property per bug lives in `hegel_shapes_test.go`, each drawing the bug's shape
+region with random contents and judged by the same model: `SurrogatePairStrings` (1),
+`NodeInsertExistingKey` (2), `NodeBaseIndentation` (3), `SingleLineMultilineLeadingWhitespace`
+(4), `SingleLineMultilineTrailingQuote` (5), `QuotelessUnicodeSpaces` (6), `CommentTagCRLF` (7,
+struct types built with `reflect.StructOf` and random comment tags), `NodeCRLF` (8),
+`RootStringWithColon` (9), `ArrayMultilineLayout` (10), `TrailingDecimalPointNumbers` (11),
+`HugeNumberNodeValue` (12), `PointerReceiverMarshalers` (13), `TextUnmarshalerElementHints`
+(14), `TextMarshalerKeyOrder` (15), `FoldedKeyHints` (16), `RootScalarTrailingComment` (17,
+judged as the pin is: each comment occurs as often in the written text as in the document,
+since the wide comment round trip's fixed-point check cannot see a doubling that is
+idempotent), `MultilineAfterKeyComment` (18), `HugeNumberStrings` (19) and `EmptyLastValue`
+(20). Under `HEGEL_NO_KNOWN=1` each draws the neighbouring region and passes.
+
+The generators are package-level values in combinator style: strings as joined atom lists,
+values as a depth-indexed tower of generators, the Hjson document as a tree of syntax records
+(spelling, key form, separators, a whitespace-and-comment tape per gap, line ends, braceless
+root) rendered by a pure writer that also computes the value it denotes, the JSON text as a
+value tree plus spelling tapes, the typed-hint documents and Marshaler specs as records, the
+API operations as lists applied modulo the live size.
+
+## Modelled as recorded (under `HEGEL_NO_KNOWN=1`)
 
 - Strings: the models reproduce bugs 4, 5, 6, 9 and 19 (`stringOutcome`); strings that break
   the document are skipped and counted.
@@ -117,12 +156,13 @@ input, `a:`, reads as `{"a": "\x00"}` (20).
 - The grammar model generates no `1.`-style numbers, no exponents beyond float64 and no root
   quoteless strings with a colon; surrogate pairs decode as two U+FFFD (1) in both decoding
   properties.
-- Drawn by default and expected to fail (STYLE.md rule 11): a root `key :` with nothing after
-  the colon but blanks and comments (20), which `TestHegelRoundTrip`, `TestHegelNodeFixedPoint`
-  and `TestHegelCommentRoundTrip` reach in about one case in a hundred, and a quoted string with
-  an escaped line feed in an array, which the comment round trip's `'''` skip (it looks at the
-  input text only) lets through to bug 10 now and then. `HEGEL_NO_KNOWN=1` skips the first and
-  the narrow properties.
+- A root `key :` with nothing after the colon but blanks and comments (20) is skipped; a root
+  string such as `a":` is of the same shape (quotes are allowed inside key names, so the
+  parser reads a braceless object).
+- Two model corrections of 2026-10-07: a string quoted for a trailing comment that breaks as
+  recorded (5) is skipped by the comment round trip rather than reported as changed; the
+  hjson/11 Internal error depends on the destination (an unknown field decodes), so the typed
+  hints accept it rather than require it.
 
 ## Not tested
 
@@ -137,3 +177,5 @@ input, `a:`, reads as `{"a": "\x00"}` (20).
   (`TestHegelMarshalers`); bugs 13-16.
 - 2026-09-21: comment round trips of hand-written documents (`TestHegelCommentRoundTrip`);
   bugs 17-19.
+- 2026-10-07: generators rewritten in combinator style; known shapes drawn by default (three
+  wide properties plain, six intermittent); eighteen narrow properties added.
