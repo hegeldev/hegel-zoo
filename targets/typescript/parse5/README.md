@@ -10,7 +10,7 @@ a rewriting stream built on it and a plain-text-to-document stream. The monorepo
 The patch adds `hegel/`: `hegel-zoo.mjs` (the zoo's harness), `gen.mjs` (random HTML), `dat.mjs`
 (the html5lib-tests `.dat` tree format for any tree adapter), `oracles.mjs` and the two oracle
 children, `common.mjs` (the vote, source-position arithmetic), `trees.mjs` and `streams.mjs`
-(properties), `known.mjs` (one gate per recorded bug) and `pins.mjs` (one plain test per bug).
+(properties), `known.mjs` (the shape of each recorded bug) and `pins.mjs` (one plain test per bug).
 
 ## Oracles
 
@@ -87,20 +87,30 @@ The SAX parser drops the newline after a tag that follows `<pre>`, `<textarea>` 
 raw-text start tag and after a raw-text element until the next start tag (17). The htmlparser2
 adapter keeps one attribute per local name, `href` beside `xlink:href` losing the earlier one (18).
 
-Drawn by default (STYLE.md rule 11): the shapes of 16, 17 and 18, and the routes to 4 (astral
-characters in attribute names, bogus comments and end tags) and 11 (CDATA and NUL after a
-self-closing foreign root) that the weekly 1000-case run of 2026-10-05 found; the wide properties
-that reach them (`TestHegelSaxTokensMatchTheParser`, `TestHegelReemittedTokensParseAlike`,
-`TestHegelLocationsPointIntoTheSource`, `TestHegelRewritingStreamPassesTheSourceThrough`,
-`TestHegelTreeAdaptersAgree`) are mapped intermittent, one narrow property per bug fails every run
-beside the pin, and `HEGEL_NO_KNOWN=1` (read once, `noKnown` in `known.mjs`) switches those shapes
-off. The older routes to 1-15 are still gated by default in `known.mjs`, as before.
+Drawn by default (STYLE.md rule 11, the whole target since 2026-10-07): the generators draw every
+recorded shape, and a finding that a recorded bug explains (`known.mjs`, consulted by `verdict` in
+`common.mjs`) fails with `(shape of parse5/N)` appended to its message. `TestHegelParseMatchesTheOracles`
+(1, in 18% of its cases), `TestHegelPlainTextBecomesAPreElement` (6, every case),
+and `TestHegelLocationsPointIntoTheSource` (3; also 2, 4, 5) fail every run and are mapped plain;
+`TestHegelRewritingStreamPassesTheSourceThrough` (8; also 7, 4), `TestHegelParseErrorsAreReported` (2),
+`TestHegelReemittedTokensParseAlike` (9; also 10, 11, 17), `TestHegelSaxTokensMatchTheParser` (11; also
+12, 16), `TestHegelTreeAdaptersAgree` (18; also 13), `TestHegelSerializeRoundTrips` (14),
+`TestHegelStreamedParseMatchesTheOneShot` (2) and `TestHegelParseFragmentMatchesTheOracles` (15) reach
+their shapes at a few cases per thousand and are mapped intermittent. One narrow property per bug
+(`TestHegelSerializedAttributeValuesEscapeAngleBrackets` for 1, `TestHegelANewlineAfterAnAmpersandCountsOnce`
+for 2, and so on: eighteen, named in target.toml) draws the shape region with random contents and fails
+every run beside the pin. `HEGEL_NO_KNOWN=1` (read once, `noKnown` in `hegel-zoo.mjs`) switches the
+shapes off: an explained finding is counted (`known parse5/N`, 18% of the parse property's cases for 1,
+under 5% elsewhere) and the narrow properties are skipped, so every property passes.
 
 ## Conventions followed, not recorded
 
 The `.dat` format names an attribute's namespace (`xmlns xmlns=""`) where parse5's own test
 serializer prints the token prefix; `dat.mjs` prints the namespace. `&#13;` yields a CR that the
 serializer writes as is and a parser reads as LF: not round-trippable, by the spec. A fragment's text
-is escaped whatever the context element. The SAX parser reports adjusted SVG tag and attribute names
+is escaped whatever the context element. The serialization algorithm does not round-trip an initial
+line feed in `pre`, `textarea` or `listing` ("for historical reasons", the spec's own note; html5ever
+agrees), so a tree whose `pre` text starts with one (`<pre>\n\nx`, `<pre><caption>\nx`) is a
+round-trip hazard, not a finding. The SAX parser reports adjusted SVG tag and attribute names
 and `image` as `img`, and hands out foreign attributes as `{ prefix, name }`. The `select` and
 `frameset` divergences of the feedback simulator (12) are recorded once, not per element.
