@@ -1217,3 +1217,5 @@ Batch 51 (2026-10-07, after a re-measurement of the whole corpus with the turn-4
 Batch 52 (2026-10-07, next down the re-measured list): go/osv-scalibr (the ten known shapes drawn by default, ten narrow properties beside the pins; the two wide properties intermittent), go/phonenumbers (lookups in every language and the alpha-keeping check on every raw input by default; three narrow properties; three more python-oracle patches to Java's reading).
 
 Batch 53 (2026-10-07): go/go-cmp (the two known shapes drawn by default, narrow properties beside the pins; the wide options property reaches them only in principle and is not mapped), go/xz (the eight Known switches off by default, eight narrow properties; the silent form of xz/2 found on the way; two performance shapes left reachable behind candidate assumes).
+
+Batch 54 (2026-10-07): go/packageurl-go (the eleven Known switches off by default, the build and parse properties mapped to their plurality basin, the round trip intermittent; ten narrow properties; a spelling record of per-byte tapes rendered by a pure function).

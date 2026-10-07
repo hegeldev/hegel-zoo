@@ -18,7 +18,8 @@ tests in its own patch and files nothing upstream.
 specification's suite is upstream's own test, not run here). The patch adds, as the external
 package `packageurl_test`, `hegel_test.go` (harness, the `Known` switches),
 `hegel_model_test.go` (the specification model), `hegel_gen_test.go` (generators),
-`hegel_props_test.go` and `hegel_pins_test.go` (one plain test per bug), and requires
+`hegel_props_test.go`, `hegel_shapes_test.go` (one narrow property per bug) and
+`hegel_pins_test.go` (one plain test per bug), and requires
 `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive rises to 1.26).
 
 ## Oracles
@@ -54,14 +55,21 @@ inserted, a byte removed, a prefix uppercased).
 | ParseFollowsTheSpec | `FromString` accepts iff the parse procedure does and yields the same components |
 | RoundTrip | on any string `FromString` accepts: `ToString` parses back to the same value and is a fixed point; `Normalize` on a parsed value changes nothing |
 | QualifiersRoundTrip | `QualifiersFromMap(m).Map() == m`, sorted by key; `Qualifiers.String` and `Qualifier.String` are the encoded, `&`-joined form |
+| TypeStartsWithALetter … SwidRequiresTagID (`hegel_shapes_test.go`) | one narrow property per recorded bug over the bug's shape region, judged by the same model |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (types and keys starting with punctuation, encoded slashes in segments, dotted and empty
-subpath segments, slashes around the name and empty namespace segments, the unenforced
-namespace and swid requirements, the case rules of eight types, chrome-extension letters,
-empty-valued qualifiers before `Normalize`); the pins assert the specification and fail while
-the bug exists. `ZOO_COLLECT=1` records mismatches instead of failing and prints the class
-counts.
+The known shapes are drawn by default: every property draws the shape of every recorded bug and
+fails on it, and is listed in `target.toml` mapped to the bug it finds (the wide build and parse
+properties shrink most often to the unenforced namespace requirement, bug 8, with bugs 4 and 5
+the other basins; the round trip meets an encoded slash inside a namespace segment, bug 5's
+empty namespace segment through bug 3's door, in under half a percent of cases and is mapped
+intermittent). `HEGEL_NO_KNOWN=1`, read once, switches the `Known` shapes off: the generators
+draw less of those regions (types and keys starting with a letter, segments without slashes or
+dots, a namespace that fits the type's requirement, empty values only with valid keys) and the
+remaining shapes are skipped (measured under 2% per class), and every property passes. The
+narrow properties of `hegel_shapes_test.go` draw one bug's region each with random contents and
+fail every run; under `HEGEL_NO_KNOWN=1` they draw the neighbouring region and pass. The pins
+assert the specification and fail while the bug exists. `ZOO_COLLECT=1` records mismatches
+instead of failing and prints the class counts.
 
 ## Accepted differences
 
@@ -98,3 +106,8 @@ keys; swid's required `tag_id` is not checked.
 ## History
 
 - 2026-09-21 (turn 338): target added at 3417966 (v0.1.7+2) with four properties, 10 pins.
+- 2026-10-07: generators rewritten in combinator style (package-level generator values, a
+  spelling record of per-byte tapes rendered by a pure function, mutations as data); the
+  `Known` switches off by default so the wide properties find the recorded bugs; ten narrow
+  properties; bug 9's build gate narrowed to empty values with invalid keys (the old gate
+  skipped passing cases); the swid rule always applied by the model.
