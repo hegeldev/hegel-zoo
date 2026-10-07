@@ -8,8 +8,10 @@ clusters through displaywidth, or wcwidth-style through go-runewidth), `Truncate
 `Cut`, `Hardwrap`/`Wordwrap`/`Wrap`, the SGR `Style` builder and `ReadStyleColor`, `XParseColor`
 and the xterm palette conversions, plus constructors for hundreds of sequences. Pinned at
 c615ff2f7805 (2026-09-13, past `ansi/v0.11.8`). MIT. No CONTRIBUTING.md, AGENTS.md or AI policy
-in the repository; not archived, active. Checked 2026-09-15. The harness lives in
-`ansi/hegel_test.go` (package `ansi_test`).
+in the repository; not archived, active. Checked 2026-09-15. The test lives in
+`ansi/` (package `ansi_test`): `hegel_test.go` (harness, the `Known` switches), `hegel_gen_test.go`,
+`hegel_model_test.go`, `hegel_props_test.go`, `hegel_shapes_test.go` (one narrow property per bug)
+and `hegel_pins_test.go`.
 
 ## Oracles
 
@@ -42,28 +44,69 @@ in the repository; not archived, active. Checked 2026-09-15. The harness lives i
 
 ## Properties
 
-- `TestHegelDecodeSequenceFollowsTheGrammar` — clean (two private markers included: the decoder
-  keeps the last).
-- `TestHegelParserReportsTheGrammarsEvents` — clean with one private marker (x-ansi/20) and
-  ASCII payloads in SOS/PM/APC strings (x-ansi/18); ESC \ after a string is reported as an
-  ESC sequence of its own, as a VT parser does.
-- `TestHegelStripAndWidthsFollowTheTokens` — clean (same payload restriction).
-- `TestHegelTruncateFollowsItsModel` — clean; `Cut` under WcWidth with `left > 0` not judged
-  (x-ansi/7); under WcWidth the ZWJ sequence is left out of the alphabet (x-ansi/6).
-- `TestHegelHardwrapFollowsTheGreedyModel` — clean; a cluster wider than the limit (x-ansi/12)
-  not judged; no no-break space in the input (x-ansi/13).
-- `TestHegelWordwrapKeepsWordsAndStyles`, `TestHegelWrapKeepsLinesWithinTheLimit` — clean;
-  not judged for width: lines with a breakpoint or followed by one (x-ansi/8, /9), lines ending
-  in a word at least as wide as the limit (x-ansi/10), inputs with a line starting with a space
-  (x-ansi/19) or with whitespace followed by sequences and whitespace (x-ansi/21), clusters
-  wider than the limit (x-ansi/12); `Wrap` = `Hardwrap` only without the no-break space.
-- `TestHegelStylesRoundTripThroughTheDecoder`, `TestHegelReadStyleColorFollowsT416` — clean
-  (components 0–255; x-ansi/15 pinned).
-- `TestHegelXParseColorFollowsX11` — clean for two-digit `rgb:`/`rgba:` components, invalid
-  components and `#rgb`/`#rrggbb`; the other digit counts are x-ansi/14.
-- `TestHegelPaletteConversionsRoundTrip` — clean; basic colours 7 and 8 not judged (x-ansi/17).
-- `TestHegelArbitraryTextIsDecodedWithoutLossOrPanic` — clean; inputs with 31 or more CSI
-  parameter separators skipped (x-ansi/1).
+The wide properties draw the shapes of the recorded bugs by default and fail on them (see
+below); each is mapped in `target.toml` to the bug it most often shrinks to.
+
+- `TestHegelDecodeSequenceFollowsTheGrammar` and `TestHegelParserReportsTheGrammarsEvents` —
+  parameter lists up to and beyond the parser's buffer (x-ansi/1, /2), a 0x9C byte inside a
+  UTF-8 character of a control string (x-ansi/3, the usual basin), a private marker after the
+  parameters (x-ansi/4), two private markers (x-ansi/20), UTF-8 payloads in SOS/PM/APC strings
+  (x-ansi/18); `ESC \` after a string is reported as an ESC sequence of its own, as a VT parser
+  does.
+- `TestHegelStripAndWidthsFollowTheTokens` — the same documents; UTF-8 payloads in SOS/PM/APC
+  strings are its basin (x-ansi/18).
+- `TestHegelTruncateFollowsItsModel` — `Cut` under WcWidth with `left > 0` (x-ansi/7, the
+  basin), the ZWJ sequence under WcWidth (x-ansi/6), clusters starting with ASCII (x-ansi/5).
+- `TestHegelHardwrapFollowsTheGreedyModel` — clusters wider than the limit (x-ansi/12, the
+  basin), the no-break space at the start (x-ansi/13).
+- `TestHegelWordwrapKeepsWordsAndStyles`, `TestHegelWrapKeepsLinesWithinTheLimit` — lines with
+  a breakpoint or followed by one (x-ansi/8, /9), a word as wide as the limit after a leading
+  space (x-ansi/10), the ideographic space (x-ansi/11), clusters wider than the limit
+  (x-ansi/12, Wrap's basin), lines starting with a space (x-ansi/19, Wordwrap's basin),
+  whitespace followed by sequences and whitespace (x-ansi/21); a line ending in a word wider
+  than the limit is tolerated (it fits nowhere); `Wrap` = `Hardwrap` without whitespace or
+  breakpoints.
+- `TestHegelStylesRoundTripThroughTheDecoder` — clean.
+- `TestHegelReadStyleColorFollowsT416` — components beyond 255 (x-ansi/15).
+- `TestHegelXParseColorFollowsX11` — one-, two-, three- and four-digit `rgb:`/`rgba:`
+  components and invalid ones (x-ansi/14), `#rgb`/`#rrggbb`.
+- `TestHegelPaletteConversionsRoundTrip` — every palette entry, basic colours 7 and 8 included
+  (x-ansi/17).
+- `TestHegelArbitraryTextIsDecodedWithoutLossOrPanic` — CSI parameter lists of any length
+  (x-ansi/1), clusters starting with ASCII (x-ansi/5, the basin); three disagreements between
+  the decoder's widths and `StringWidth` that are not recorded yet are counted, not judged
+  (`candidate/go/x-ansi-1`: a C0 control inside an ESC sequence, `"\x1b\a["`; `-2`: an
+  introducer after an intermediate, `"\x1b ]abc"`; `-3`: ESC inside a DCS, `"\x1bP\x1bPé"`).
+- Twenty-two narrow properties in `hegel_shapes_test.go`, one per recorded bug and named after
+  what it tests (`TestHegelDecodeSequenceKeepsTheBufferOnLongParameterLists`,
+  `TestHegelBufferSizedParameterListIsKeptWhole`,
+  `TestHegelControlStringsKeepCharactersWithAnSTByte`,
+  `TestHegelPrivateMarkerAfterParametersIsOneSequence`,
+  `TestHegelClustersStartingWithASCIIDecodeWhole`, `TestHegelTruncateWcFitsByWcWidth`,
+  `TestHegelCutWcRemovesTheLeftCells`, `TestHegelWrapKeepsBreakpointLinesWithinTheLimit`,
+  `TestHegelWordwrapKeepsBreakpointLinesWithinTheLimit`,
+  `TestHegelWordwrapMovesAWordAsWideAsTheLimitToItsOwnLine`,
+  `TestHegelWordwrapMeasuresWhitespaceInCells`,
+  `TestHegelWrappersStartWithTextWhenAClusterIsWiderThanTheLimit`,
+  `TestHegelHardwrapKeepsTheNoBreakSpaceAtALineStart`, `TestHegelXParseColorScalesByDigitCount`,
+  `TestHegelReadStyleColorRejectsComponentsBeyond255`, `TestHegelByteToGraphemeRangeCountsCells`,
+  `TestHegelConvert16ReturnsTheBasicGreys`, `TestHegelStringsKeepUTF8Payloads`,
+  `TestHegelWrappersKeepLeadingSpaces`, `TestHegelParserAndDecoderAgreeOnTwoPrivateMarkers`,
+  `TestHegelWrappersKeepWhitespaceBeforeASequenceWithinTheLimit`,
+  `TestHegelMouseX10PayloadIsThreeBytes`): each draws its bug's shape region with random
+  contents and is the deterministic expected failure beside the pin.
+
+## Known shapes drawn by default
+
+A `Known` struct in `hegel_test.go` has one switch per bug shape, every one off by default:
+the generators draw the shapes (`shaped(Known.x, on, off)` at the generator) and `mismatch`
+names the bug whose shape the failing case has. Properties that fail every run are mapped
+plain to their most frequent basin (Decode and Parser to x-ansi/3, Truncate to /7, Hardwrap
+and Wrap to /12, Wordwrap to /19, XParseColor to /14); those a 100-case run misses now and
+then are intermittent (Strip /18, ReadStyleColor /15, Palette /17, the arbitrary text /5).
+`HEGEL_NO_KNOWN=1`, read once, turns every switch on: the shapes are left out at the
+generators, the narrow properties draw the neighbouring region, and every property passes
+except the pins.
 
 ## Bugs
 
@@ -108,3 +151,9 @@ in the repository; not archived, active. Checked 2026-09-15. The harness lives i
 - `ESC \` after an ESC-terminated string is dispatched by the `Parser` as an escape sequence;
   that is how a VT parser sees the 7-bit String Terminator.
 - 2026-09-20: base bumped c615ff2f7805 → 53e2afe73ae5 (2026-09-20, "chore(powernap): update lsp configs from nvim-lspconfig"; v0.11.8+); 22 bug(s) still reproduce. 13 tests pass.
+- 2026-10-07: generators rewritten in combinator style (package-level generator values, the
+  token grammar as a `OneOf` of `Composite` token kinds, documents as lists of tokens, parameter
+  lists and colours as records rendered by pure functions) and the file split in six; the known
+  shapes drawn by default with twenty-two narrow properties; the model's `lastWordWidth` now
+  measures by the method under test and the 8-bit introducers are raw C1 bytes; three
+  decoder/parser disagreements surfaced as candidates (above), to be judged and recorded.
