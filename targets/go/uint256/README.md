@@ -51,8 +51,23 @@ and values with a non-zero top word (the fast paths of `AddMod`/`MulMod`).
   spaces, letters, non-ASCII digits, corrupted strings, values at and beyond 2^256) and read
   the same value as big.Int.
 
-All general properties pass at 1000 cases × 3 and at 10 000 cases. Five pinned expected
-failures.
+- `TestHegelFloat64RoundsToNearest`, `TestHegelJSONNullInIntFieldsIsANoOp`,
+  `TestHegelEncodersAcceptANilReceiver`, `TestHegelMulDivOverflowRemAliasesTheRemainderWithAnyOperand`,
+  `TestHegelPaddedBytesNeverTruncates` (`hegel_shapes_test.go`) — one narrow property per
+  recorded bug over the bug's shape region with random contents, judged by the same oracle.
+
+The known shapes are drawn by default: the wide properties draw the shape of every recorded bug
+and fail on it, and are listed in `target.toml` mapped to the bug they find — the unary property
+calls `Float64` (bug 1, every run), the parsers property feeds `null` through `encoding/json`
+(bug 2), the encodings property draws a nil receiver and `PaddedBytes` lengths below the byte
+length (bugs 3 and 5, shrinking most often to the nil receiver), the modular property draws
+every aliasing form of `MulDivOverflowRem` including `m == d` and `m == z` (bug 4, the panic
+recovered and named). `HEGEL_NO_KNOWN=1`, read once, switches the `Known` shapes off at the
+generator (exactly representable operands, no `null`, non-nil receivers, lengths at or above
+the byte length, the six working aliasing forms) and every property passes with no case
+skipped. The narrow properties fail every run and under `HEGEL_NO_KNOWN=1` draw the
+neighbouring region and pass. The five tests named after the bugs' expectations
+(`TestHegelFloat64IsTheNearestFloat` and so on) are the pins.
 
 ## Bugs (5)
 
@@ -91,3 +106,12 @@ missing null check); the probe confirmed them all at once.
 External test package with a dot import; `HEGEL_TEST_CASES` via `hegelOpts`; `property()`
 turns panics into test-case failures. A run of all five general properties takes under half a
 second at the default budget.
+
+## History
+
+- 2026-09-14: target added at 3b6e9cd with five properties and five pins.
+- 2026-10-07: generators rewritten in combinator style (package-level shape generators, format
+  and number-text records rendered by pure functions, one case record per property); the
+  known shapes drawn by default behind a `Known` struct that `HEGEL_NO_KNOWN=1` switches off;
+  five narrow properties. One flaky-verdict event seen once in a hundred runs (hegel-go
+  reports a case that fails and then passes on replay as a pass), not reproduced.
