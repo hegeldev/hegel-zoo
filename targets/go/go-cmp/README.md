@@ -66,12 +66,17 @@ directive `go test`'s vet pass rejects unkeyed struct literals in upstream's own
 | OptionsFollowTheModel | `Equal` and `Diff` with a random combination of the options above (some nested in `cmp.Options`) on a document and a mutated or independent one, against the model; symmetry; `Equal(x, x)` |
 | ReporterSeesTheDifferences | the set of unequal and ignored paths a `Reporter` receives against the model's, the `ByMethod`/`ByIgnore` flags, and the `Equal` result |
 | MisusePanicsAsDocumented | a table of 70 valid and invalid constructions (panic or not, with the documented message), and generated `IgnoreFields` selectors accepted exactly when the grammar says |
+| SortMapsKeepsIgnoredEntriesIgnored, SortSlicesKeepsNilUnequalToNonNil | one narrow property per recorded bug (`hegel_shapes_test.go`): its shape region with random contents, judged by the same model |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (`IgnoreMapEntries` is not combined with `SortMaps`; a nil slice is not put against a
-longer one when `SortSlices` and an element ignore are both on); the pins assert the correct
-behaviour and fail while the bug exists. `ZOO_COLLECT=1` records mismatches instead of failing
-and prints the class counts.
+Both bugs are drawn by default and found by the properties (DESIGN.md decision 3): the option
+generator combines `SortMaps` with `IgnoreMapEntries`, and the model property judges a nil slice
+against a longer one under `SortSlices` with an element ignore, so `OptionsFollowTheModel` can
+meet either shape (it does so only in principle - two and one of 30,000 cases - so it is not an
+expected failure); the narrow properties draw each shape deterministically and are the expected
+failures mapped to the bugs, beside the pins. `HEGEL_NO_KNOWN=1` switches the shapes off (the two
+options are not combined, the nil-slice case is assumed away, the narrow properties draw the
+neighbouring region) and every property passes. `ZOO_COLLECT=1` records mismatches instead of
+failing and prints the class counts.
 
 ## Accepted differences
 
@@ -101,3 +106,9 @@ transform turns nil into an empty slice).
 ## History
 
 - 2026-09-21 (turn 336): target added at b133f1f (v0.7.0+3) with five properties, 2 pins.
+- 2026-10-07: generators rewritten in combinator style (STYLE.md): package-level generator
+  values (`values`/`structs` as a mutually recursive `Composite` pair with the leaf kinds in a
+  `OneOf`, nil first, and nil/empty/filled containers as explicit alternatives; an `opts` record
+  and `docsOf(opts)`; documents, edits and mutations drawn as data and applied by pure functions
+  modulo the live size; the `IgnoreFields` selector as a record of segments), the known shapes
+  drawn by default with the narrow properties beside the pins.

@@ -1215,3 +1215,5 @@ by drawing the narrow properties' digits without one.
 Batch 51 (2026-10-07, after a re-measurement of the whole corpus with the turn-413 survey's counts: 92 Go targets still have value-returning helpers over the test case, 967 helpers, 292 switch-on-draw ladders and 994 `if chance` sites in all): go/go-toml.
 
 Batch 52 (2026-10-07, next down the re-measured list): go/osv-scalibr (the ten known shapes drawn by default, ten narrow properties beside the pins; the two wide properties intermittent), go/phonenumbers (lookups in every language and the alpha-keeping check on every raw input by default; three narrow properties; three more python-oracle patches to Java's reading).
+
+Batch 53 (2026-10-07): go/go-cmp (the two known shapes drawn by default, narrow properties beside the pins; the wide options property reaches them only in principle and is not mapped).
