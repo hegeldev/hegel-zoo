@@ -301,12 +301,710 @@ index 0000000..9d62207
 +		t.Errorf("after the empty read: %q, %v", rest, err)
 +	}
 +}
+diff --git a/hegel_shapes_test.go b/hegel_shapes_test.go
+new file mode 100644
+index 0000000..f0f98ae
+--- /dev/null
++++ b/hegel_shapes_test.go
+@@ -0,0 +1,692 @@
++package xz_test
++
++// One narrow property per recorded bug (bugs.toml): each draws the bug's
++// shape region with random contents and judges it by the checks of the wide
++// properties in hegel_test.go. Under HEGEL_NO_KNOWN=1 each draws the
++// neighbouring region instead (shaped) and passes. Every case here is small
++// and forks the xz tool at most once.
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"testing"
++
++	"github.com/ulikunitz/xz"
++	"github.com/ulikunitz/xz/lzma"
++	"hegel.dev/go/hegel"
++)
++
++// hashTable4 is the default matcher, which the narrow properties of the
++// other bugs keep so that each lands on its own bug.
++var hashTable4 = hegel.Just(lzma.HashTable4)
++
++// plainXzConfigs: Writer configurations with the default matcher.
++var plainXzConfigs = hegel.Composite(func(tc hegel.TestCase) xzConfig {
++	c := hegel.Draw(tc, xzConfigs)
++	c.matcher = hegel.Draw(tc, hashTable4)
++	return c
++})
++
++// plainLzmaConfigs: classic Writer configurations with the default matcher.
++var plainLzmaConfigs = hegel.Composite(func(tc hegel.TestCase) lzmaConfig {
++	c := hegel.Draw(tc, lzmaConfigs)
++	c.matcher = hegel.Draw(tc, hashTable4)
++	return c
++})
++
++// smallSizes: the data sizes of the narrow properties.
++var smallSizes = weighted(choice[int]{3, hegel.Integers(1, 64)}, choice[int]{2, hegel.Integers(65, 4096)})
++
++// ---------------------------------------------------------------------------
++// xz/1: a stream cut inside a block header or exactly at a block boundary
++// (before the next block's header or the index) decodes with a clean EOF.
++
++// cut is where a multi-block stream is cut: a block (taken modulo the block
++// count) and a point of it - inside its header, at its end (the boundary
++// before the next block or the index), or inside its data and check.
++type cut struct {
++	block int
++	where string
++	off   int
++}
++
++func (c cut) String() string { return fmt.Sprintf("cut in block %d %s at %d", c.block, c.where, c.off) }
++
++// apply returns the prefix of in that the cut leaves.
++func (c cut) apply(in []byte, l xzLayout) ([]byte, int) {
++	blk := l.blocks[at(c.block, len(l.blocks))]
++	var pos int
++	switch c.where {
++	case "header":
++		pos = blk.start + at(c.off, blk.headerLen)
++	case "boundary":
++		pos = blk.end
++	default: // data
++		pos = blk.start + blk.headerLen + at(c.off, blk.end-blk.start-blk.headerLen)
++	}
++	return in[:pos], pos
++}
++
++// cutCase: data written in small blocks by the Writer with a checksum, and
++// the cut.
++type cutCase struct {
++	data   dataSpec
++	cfg    xzConfig
++	writes writePlan
++	cut    cut
++}
++
++func (c cutCase) GoString() string {
++	return fmt.Sprintf("%v with %v, %v; %v", c.data, c.cfg, c.writes, c.cut)
++}
++
++var (
++	cutPlaces = shaped[hegel.Generator[string]](pick("header", "boundary"), hegel.Just("data"))
++	cuts      = hegel.Composite(func(tc hegel.TestCase) cut {
++		return cut{block: hegel.Draw(tc, positions), where: hegel.Draw(tc, cutPlaces), off: hegel.Draw(tc, positions)}
++	})
++	cutCases = hegel.Composite(func(tc hegel.TestCase) cutCase {
++		cfg := hegel.Draw(tc, plainXzConfigs)
++		cfg.block = blockSpec{blockSmall, hegel.Draw(tc, hegel.Integers(1, 64))}
++		cfg.check = hegel.Draw(tc, checked)
++		cfg.dictCap = hegel.Draw(tc, pick(4096, 8192, 1<<16)) // a small dictionary: every block allocates one
++		return cutCase{data: hegel.Draw(tc, dataSpecsOf(smallSizes)), cfg: cfg, writes: hegel.Draw(tc, writePlans), cut: hegel.Draw(tc, cuts)}
++	})
++)
++
++// TestHegelStreamsCutAtBlockBoundariesAreErrors: a checked multi-block stream
++// cut inside a block header or exactly between blocks (xz/1; under
++// HEGEL_NO_KNOWN=1 inside a block's data or check) is an error for the Reader,
++// as it is for xz.
++func TestHegelStreamsCutAtBlockBoundariesAreErrors(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, cutCases)
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
++		valid, err := compressGo(c, tc.writes, data)
++		if err != nil {
++			mismatch(ht, writerShape(c, len(data)), "%v\n%s", err, describeWriterConfig(c))
++		}
++		bad, pos := tc.cut.apply(valid, layoutOf(valid))
++		note(ht, "%s; cut at %d of %d bytes (%s)", describeWriterConfig(c), pos, len(valid), tc.cut.where)
++		got, goErr := decodeGo(readPlan{[]int{4096}}, bad, len(data)+1<<20)
++		_, xzErr := xzCLI(t, bad, "-dc")
++		if xzErr == nil {
++			fail(ht, "xz decodes the stream cut at %d of %d bytes", pos, len(valid))
++		}
++		if goErr == nil {
++			mismatch(ht, "xz/1", "the Reader returned %d bytes with a clean EOF from the stream cut at %d of %d bytes (%s, data %d bytes); xz: %v\n%s", len(got), pos, len(valid), tc.cut.where, len(data), xzErr, describeWriterConfig(c))
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/2: incompressible data longer than a DictCap under 64 KiB.
++
++// smallDictCase: random data longer than the dictionary, the writer (the .xz
++// Writer or lzma.Writer2) and its DictCap.
++type smallDictCase struct {
++	data   dataSpec
++	kind   string
++	dict   int
++	writes writePlan
++}
++
++func (c smallDictCase) GoString() string {
++	return fmt.Sprintf("%s writer with DictCap %d, %v, %v", c.kind, c.dict, c.data, c.writes)
++}
++
++var (
++	smallDicts     = shaped[hegel.Generator[int]](pick(4096, 8192, 12288, 1<<14, 3<<13, 1<<15), pick(1<<16, 1<<17, 1<<20))
++	smallDictCases = hegel.Composite(func(tc hegel.TestCase) smallDictCase {
++		dict := hegel.Draw(tc, smallDicts)
++		return smallDictCase{
++			data:   dataSpec{size: dict + hegel.Draw(tc, hegel.Integers(1, 100000)), kind: kindRandom, seed: hegel.Draw(tc, seeds)},
++			kind:   hegel.Draw(tc, pick("xz", "lzma2")),
++			dict:   dict,
++			writes: hegel.Draw(tc, writePlans),
++		}
++	})
++)
++
++// TestHegelSmallDictionariesCompressIncompressibleData: random data longer
++// than a DictCap under 64 KiB (xz/2; under HEGEL_NO_KNOWN=1 a DictCap of 64
++// KiB or more) is written without an error and round-trips.
++func TestHegelSmallDictionariesCompressIncompressibleData(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, smallDictCases)
++		data := tc.data.bytes()
++		note(ht, "%s writer, DictCap %d, %d random bytes", tc.kind, tc.dict, len(data))
++		var buf bytes.Buffer
++		var w io.WriteCloser
++		var err error
++		if tc.kind == "xz" {
++			w, err = xz.WriterConfig{DictCap: tc.dict}.NewWriter(&buf)
++		} else {
++			w, err = lzma.Writer2Config{DictCap: tc.dict}.NewWriter2(&buf)
++		}
++		if err != nil {
++			fail(ht, "NewWriter: %v", err)
++		}
++		if err := tc.writes.write(w, data); err != nil {
++			mismatch(ht, "xz/2", "%s writer with DictCap %d on %d random bytes: Write: %v", tc.kind, tc.dict, len(data), err)
++		}
++		if err := w.Close(); err != nil {
++			mismatch(ht, "xz/2", "%s writer with DictCap %d on %d random bytes: Close: %v", tc.kind, tc.dict, len(data), err)
++		}
++		var got []byte
++		if tc.kind == "xz" {
++			got, err = decode(buf.Bytes())
++		} else {
++			var r io.Reader
++			r, err = lzma.Reader2Config{DictCap: tc.dict}.NewReader2(bytes.NewReader(buf.Bytes()))
++			if err == nil {
++				got, err = io.ReadAll(r)
++			}
++		}
++		if err != nil || !bytes.Equal(got, data) {
++			mismatch(ht, "xz/2", "%s writer with DictCap %d on %d random bytes: Write and Close succeeded but the %d-byte stream decodes to %d bytes, %v", tc.kind, tc.dict, len(data), buf.Len(), len(got), err)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/3: the BinaryTree matcher on small-alphabet data with a small dictionary.
++
++// matcherCase: small-alphabet data, the matcher, a small DictCap and BufSize,
++// and the format (.xz or classic .lzma).
++type matcherCase struct {
++	data    dataSpec
++	matcher lzma.MatchAlgorithm
++	dict    int
++	bufSize int
++	format  string
++	writes  writePlan
++}
++
++func (c matcherCase) GoString() string {
++	return fmt.Sprintf("%s %s with DictCap %d, BufSize %d, %v, %v", c.format, c.matcher, c.dict, c.bufSize, c.data, c.writes)
++}
++
++var (
++	treeMatchers = shaped[hegel.Generator[lzma.MatchAlgorithm]](hegel.Just(lzma.BinaryTree), hashTable4)
++	matcherCases = hegel.Composite(func(tc hegel.TestCase) matcherCase {
++		return matcherCase{
++			data:    dataSpec{size: hegel.Draw(tc, hegel.Integers(10000, 40000)), kind: kindSmallAlphabet, seed: hegel.Draw(tc, seeds)},
++			matcher: hegel.Draw(tc, treeMatchers),
++			dict:    hegel.Draw(tc, pick(4096, 8192, 1<<14)),
++			bufSize: hegel.Draw(tc, pick(0, 4096)),
++			format:  hegel.Draw(tc, pick("xz", "lzma")),
++			writes:  hegel.Draw(tc, writePlans),
++		}
++	})
++)
++
++// TestHegelBinaryTreeMatcherStreamsDecode: streams the BinaryTree matcher
++// writes from small-alphabet data with a small dictionary (xz/3; under
++// HEGEL_NO_KNOWN=1 the HashTable4 matcher) decode with the Go readers and
++// with xz.
++func TestHegelBinaryTreeMatcherStreamsDecode(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, matcherCases)
++		data := tc.data.bytes()
++		descr := fmt.Sprintf("%s %s DictCap %d BufSize %d, %d small-alphabet bytes", tc.format, tc.matcher, tc.dict, tc.bufSize, len(data))
++		note(ht, "%s", descr)
++		var buf bytes.Buffer
++		var w io.WriteCloser
++		var err error
++		if tc.format == "xz" {
++			w, err = xz.WriterConfig{DictCap: tc.dict, BufSize: tc.bufSize, Matcher: tc.matcher}.NewWriter(&buf)
++		} else {
++			w, err = lzma.WriterConfig{DictCap: tc.dict, BufSize: tc.bufSize, Matcher: tc.matcher}.NewWriter(&buf)
++		}
++		if err != nil {
++			fail(ht, "NewWriter: %v (%s)", err, descr)
++		}
++		if err := tc.writes.write(w, data); err != nil {
++			mismatch(ht, "xz/3", "Write: %v (%s)", err, descr)
++		}
++		if err := w.Close(); err != nil {
++			mismatch(ht, "xz/3", "Close: %v (%s)", err, descr)
++		}
++		out := buf.Bytes()
++		var r io.Reader
++		args := []string{"-dc"}
++		if tc.format == "xz" {
++			r, err = xz.NewReader(bytes.NewReader(out))
++		} else {
++			r, err = lzma.NewReader(bytes.NewReader(out))
++			args = []string{"--format=lzma", "-dc"}
++		}
++		if err != nil {
++			fail(ht, "NewReader: %v (%s)", err, descr)
++		}
++		got, err := io.ReadAll(r)
++		if err != nil {
++			mismatch(ht, "xz/3", "Read: %v after %d of %d bytes (%s)", err, len(got), len(data), descr)
++		}
++		if !bytes.Equal(got, data) {
++			mismatch(ht, "xz/3", "decoded %d bytes, want %d (first difference at %d) (%s)", len(got), len(data), firstDiff(got, data), descr)
++		}
++		xzGot, err := xzCLI(t, out, args...)
++		if err != nil {
++			mismatch(ht, "xz/3", "%v (%s)", err, descr)
++		}
++		if !bytes.Equal(xzGot, data) {
++			mismatch(ht, "xz/3", "xz gave %d bytes, want %d (%s)", len(xzGot), len(data), descr)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/4: SizeInHeader with Size 0.
++
++// sizeHeaderCase: empty data (under HEGEL_NO_KNOWN=1 a few bytes) and a
++// classic Writer configuration with SizeInHeader.
++type sizeHeaderCase struct {
++	data dataSpec
++	cfg  lzmaConfig
++}
++
++func (c sizeHeaderCase) GoString() string { return fmt.Sprintf("%v with %v", c.data, c.cfg) }
++
++var (
++	headerSizes     = shaped[hegel.Generator[int]](hegel.Just(0), hegel.Integers(1, 64))
++	sizeHeaderCases = hegel.Composite(func(tc hegel.TestCase) sizeHeaderCase {
++		cfg := hegel.Draw(tc, plainLzmaConfigs)
++		cfg.sizeMode = "sizeInHeader"
++		return sizeHeaderCase{data: hegel.Draw(tc, dataSpecsOf(headerSizes)), cfg: cfg}
++	})
++)
++
++// TestHegelExplicitSizeHeadersRoundTrip: a classic stream written with
++// SizeInHeader carries the data's size in its header, Size 0 included (xz/4;
++// under HEGEL_NO_KNOWN=1 a non-empty input), has no EOS marker and decodes
++// with lzma.Reader and xz.
++func TestHegelExplicitSizeHeadersRoundTrip(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, sizeHeaderCases)
++		data := tc.data.bytes()
++		c := lzma.WriterConfig{Properties: tc.cfg.props, DictCap: tc.cfg.dictCap, BufSize: tc.cfg.bufSize, Matcher: tc.cfg.matcher, SizeInHeader: true, Size: int64(len(data))}
++		s := describeLzmaConfig(c)
++		note(ht, "%s, %d data bytes", s, len(data))
++		var buf bytes.Buffer
++		w, err := c.NewWriter(&buf)
++		if err != nil {
++			fail(ht, "NewWriter: %v\n%s", err, s)
++		}
++		if _, err := w.Write(data); err != nil {
++			fail(ht, "Write: %v\n%s", err, s)
++		}
++		if err := w.Close(); err != nil {
++			fail(ht, "Close: %v\n%s", err, s)
++		}
++		out := buf.Bytes()
++		r, err := lzma.NewReader(bytes.NewReader(out))
++		if err != nil {
++			fail(ht, "NewReader: %v\n%s", err, s)
++		}
++		h, ok := r.Header()
++		if !ok || h.Size != int64(len(data)) {
++			mismatch(ht, "xz/4", "Header() = %+v, %v; want Size %d\n%s", h, ok, len(data), s)
++		}
++		got, err := io.ReadAll(r)
++		if err != nil || !bytes.Equal(got, data) {
++			mismatch(ht, "xz/4", "decoded %d bytes, %v; want %d\n%s", len(got), err, len(data), s)
++		}
++		if r.EOSMarker() {
++			mismatch(ht, "xz/4", "EOSMarker() true for a stream written with SizeInHeader\n%s", s)
++		}
++		props := lzma.Properties{LC: 3, LP: 0, PB: 2}
++		if c.Properties != nil {
++			props = *c.Properties
++		}
++		xzGot, err := xzCLI(t, out, "--format=lzma", "-dc")
++		if props.LC+props.LP > 4 {
++			if err == nil {
++				fail(ht, "xz decoded a .lzma stream with lc+lp = %d, which liblzma documents as unsupported\n%s", props.LC+props.LP, s)
++			}
++		} else if err != nil || !bytes.Equal(xzGot, data) {
++			mismatch(ht, "xz/4", "xz --format=lzma -dc gave %d bytes, %v; want %d\n%s", len(xzGot), err, len(data), s)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/5: lzma.Writer2 over a sink that fails.
++
++// flushCase: random data of at least 64 bytes, a sink failing after limit
++// bytes (before the first chunk), and the writer over it.
++type flushCase struct {
++	data   dataSpec
++	kind   string
++	cfg    writer2Config
++	xcfg   xzConfig
++	lcfg   lzmaConfig
++	limit  int
++	writes writePlan
++}
++
++func (c flushCase) GoString() string {
++	return fmt.Sprintf("%s writer over a sink failing after %d bytes, %v, %v", c.kind, c.limit, c.data, c.writes)
++}
++
++var (
++	flushKinds = shaped[hegel.Generator[string]](hegel.Just("lzma2"), pick("xz", "lzma"))
++	flushCases = hegel.Composite(func(tc hegel.TestCase) flushCase {
++		return flushCase{
++			data:   dataSpec{size: hegel.Draw(tc, hegel.Integers(64, 4096)), kind: kindRandom, seed: hegel.Draw(tc, seeds)},
++			kind:   hegel.Draw(tc, flushKinds),
++			cfg:    hegel.Draw(tc, writer2Configs),
++			xcfg:   hegel.Draw(tc, plainXzConfigs),
++			lcfg:   hegel.Draw(tc, plainLzmaConfigs),
++			limit:  hegel.Draw(tc, hegel.Integers(13, 40)),
++			writes: hegel.Draw(tc, writePlans),
++		}
++	})
++)
++
++// TestHegelWriter2ReportsTheFlushError: lzma.Writer2 over a sink that fails
++// before its first chunk reports the sink's error from Write or Close (xz/5;
++// under HEGEL_NO_KNOWN=1 the .xz Writer and the classic Writer do).
++func TestHegelWriter2ReportsTheFlushError(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, flushCases)
++		data := tc.data.bytes()
++		sink := &failWriter{limit: tc.limit}
++		var w io.WriteCloser
++		var err error
++		switch tc.kind {
++		case "xz":
++			w, err = tc.xcfg.config(len(data)).NewWriter(sink)
++		case "lzma":
++			w, err = tc.lcfg.config(len(data)).NewWriter(sink)
++		default:
++			w, err = tc.cfg.config(len(data)).NewWriter2(sink)
++		}
++		note(ht, "%s writer over a sink failing after %d bytes, %d random bytes", tc.kind, tc.limit, len(data))
++		if err != nil {
++			if !errors.Is(err, errSink) {
++				fail(ht, "%s NewWriter over a failing sink: %v (not the sink's error)", tc.kind, err)
++			}
++			return // the header write already failed: reported
++		}
++		werr := tc.writes.write(w, data)
++		cerr := w.Close()
++		if !sink.failed {
++			fail(ht, "the sink accepted %d bytes of a stream for %d random bytes without failing", sink.n, len(data))
++		}
++		if werr == nil && cerr == nil {
++			mismatch(ht, "xz/5", "%s writer over a sink that fails after %d bytes: neither Write nor Close reported an error (sink got %d bytes)", tc.kind, tc.limit, sink.n)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/6: Write and Close after Close.
++
++// closedCase: data, the writer (the classic Writer; under HEGEL_NO_KNOWN=1
++// the .xz Writer or lzma.Writer2) and its chunking.
++type closedCase struct {
++	data   dataSpec
++	kind   string
++	cfg    xzConfig
++	lcfg   lzmaConfig
++	w2cfg  writer2Config
++	writes writePlan
++}
++
++func (c closedCase) GoString() string {
++	return fmt.Sprintf("%s writer, %v, %v", c.kind, c.data, c.writes)
++}
++
++var (
++	closedKinds = shaped[hegel.Generator[string]](hegel.Just("lzma"), pick("xz", "lzma2"))
++	closedCases = hegel.Composite(func(tc hegel.TestCase) closedCase {
++		return closedCase{
++			data:   hegel.Draw(tc, dataSpecsOf(byteSizes)),
++			kind:   hegel.Draw(tc, closedKinds),
++			cfg:    hegel.Draw(tc, plainXzConfigs),
++			lcfg:   hegel.Draw(tc, plainLzmaConfigs),
++			w2cfg:  hegel.Draw(tc, writer2Configs),
++			writes: hegel.Draw(tc, writePlans),
++		}
++	})
++)
++
++// TestHegelLzmaWriterRefusesWritesAfterClose: after Close, the classic
++// Writer (xz/6; under HEGEL_NO_KNOWN=1 the .xz Writer and lzma.Writer2)
++// refuses a Write and a second Close.
++func TestHegelLzmaWriterRefusesWritesAfterClose(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, closedCases)
++		data := tc.data.bytes()
++		var buf bytes.Buffer
++		var w io.WriteCloser
++		var err error
++		switch tc.kind {
++		case "xz":
++			w, err = tc.cfg.config(len(data)).NewWriter(&buf)
++		case "lzma":
++			w, err = tc.lcfg.config(len(data)).NewWriter(&buf)
++		default:
++			w, err = tc.w2cfg.config(len(data)).NewWriter2(&buf)
++		}
++		note(ht, "%s writer, %d data bytes", tc.kind, len(data))
++		if err != nil {
++			fail(ht, "NewWriter: %v", err)
++		}
++		if err := tc.writes.write(w, data); err != nil {
++			mismatch(ht, writer2Shape(tc.w2cfg.config(len(data)), len(data)), "Write: %v", err)
++		}
++		if err := w.Close(); err != nil {
++			fail(ht, "Close: %v", err)
++		}
++		if _, err := w.Write([]byte("more")); err == nil {
++			mismatch(ht, "xz/6", "%s writer accepted a Write after Close", tc.kind)
++		}
++		if err := w.Close(); err == nil {
++			mismatch(ht, "xz/6", "%s writer accepted a second Close", tc.kind)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/7: an empty read of lzma.Reader while data remains.
++
++// emptyReadCase: a classic stream (by the Writer or by xz) of 2..4096 bytes,
++// read partly (first bytes, taken modulo the size so that some remain), then
++// with an empty buffer (under HEGEL_NO_KNOWN=1 a one-byte buffer), then to
++// the end.
++type emptyReadCase struct {
++	data   dataSpec
++	fromXz bool
++	cfg    lzmaConfig
++	args   lzma1Args
++	first  int
++	probe  int
++}
++
++func (c emptyReadCase) GoString() string {
++	src := c.cfg.String()
++	if c.fromXz {
++		src = c.args.String()
++	}
++	return fmt.Sprintf("%v from %s; read %d bytes, then %d, then the rest", c.data, src, c.first, c.probe)
++}
++
++var (
++	probeSizes     = shaped[hegel.Generator[int]](hegel.Just(0), hegel.Just(1))
++	emptyReadCases = hegel.Composite(func(tc hegel.TestCase) emptyReadCase {
++		return emptyReadCase{
++			data:   hegel.Draw(tc, dataSpecsOf(hegel.Integers(2, 4096))),
++			fromXz: hegel.Draw(tc, hegel.Booleans()),
++			cfg:    hegel.Draw(tc, plainLzmaConfigs),
++			args:   hegel.Draw(tc, lzma1ArgSets),
++			first:  hegel.Draw(tc, positions),
++			probe:  hegel.Draw(tc, probeSizes),
++		}
++	})
++)
++
++// TestHegelEmptyReadsAreNotEOFWhileDataRemains: lzma.Reader read partly and
++// then with an empty buffer (xz/7; under HEGEL_NO_KNOWN=1 a one-byte buffer)
++// returns 0, nil rather than io.EOF, and the rest of the data follows.
++func TestHegelEmptyReadsAreNotEOFWhileDataRemains(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, emptyReadCases)
++		data := tc.data.bytes()
++		var stream []byte
++		var src string
++		if tc.fromXz {
++			out, err := xzCLI(t, data, tc.args.args()...)
++			if err != nil {
++				fail(ht, "oracle failed: %v", err)
++			}
++			stream, src = out, tc.args.String()
++		} else {
++			var buf bytes.Buffer
++			w, err := tc.cfg.config(len(data)).NewWriter(&buf)
++			if err != nil {
++				fail(ht, "NewWriter: %v", err)
++			}
++			if _, err := w.Write(data); err != nil {
++				fail(ht, "Write: %v", err)
++			}
++			if err := w.Close(); err != nil {
++				fail(ht, "Close: %v", err)
++			}
++			stream, src = buf.Bytes(), describeLzmaConfig(tc.cfg.config(len(data)))
++		}
++		first := 1 + at(tc.first, len(data)-1)
++		note(ht, "%s, %d data bytes; read %d, then %d bytes", src, len(data), first, tc.probe)
++		r, err := lzma.NewReader(bytes.NewReader(stream))
++		if err != nil {
++			fail(ht, "NewReader: %v", err)
++		}
++		got, err := io.ReadFull(r, make([]byte, first))
++		if err != nil {
++			fail(ht, "reading the first %d of %d bytes: %v (%s)", first, len(data), err, src)
++		}
++		k, err := r.Read(make([]byte, tc.probe))
++		if k < 0 || k > tc.probe || err != nil {
++			mismatch(ht, "xz/7", "Read with a %d-byte buffer after %d of %d bytes = %d, %v; want 0..%d, nil (%s)", tc.probe, first, len(data), k, err, tc.probe, src)
++		}
++		rest, err := io.ReadAll(r)
++		if err != nil || got+k+len(rest) != len(data) {
++			mismatch(ht, "xz/7", "after %d bytes and a %d-byte read, ReadAll gave %d bytes, %v; want %d (%s)", first, tc.probe, len(rest), err, len(data)-first-k, src)
++		}
++	})
++}
++
++// ---------------------------------------------------------------------------
++// xz/8: an LZMA2 chunk's compressed-size field over- or understated.
++
++// packedEdit is the edit of one LZMA chunk's compressed-size field: the
++// chunk (taken modulo the number of LZMA chunks), the direction and the
++// amount (clamped to the field's range).
++type packedEdit struct {
++	chunk int
++	over  bool
++	delta int
++}
++
++func (e packedEdit) String() string {
++	dir := "understated"
++	if e.over {
++		dir = "overstated"
++	}
++	return fmt.Sprintf("chunk %d packed size %s by %d", e.chunk, dir, e.delta)
++}
++
++// apply returns a copy of in with the edit, the offset of the field and the
++// old and new values; a nil copy when the stream has no LZMA chunk.
++func (e packedEdit) apply(in []byte) ([]byte, int, int, int) {
++	offs := lzma2PackedSizeOffsets(in)
++	if len(offs) == 0 {
++		return nil, 0, 0, 0
++	}
++	p := offs[2*at(e.chunk, len(offs)/2)]
++	old := int(in[p])<<8 | int(in[p+1])
++	v := old - e.delta
++	if e.over {
++		v = old + e.delta
++	}
++	v = max(0, min(v, 0xffff))
++	out := append([]byte(nil), in...)
++	out[p] = byte(v >> 8)
++	out[p+1] = byte(v)
++	return out, p, old, v
++}
++
++// packedCase: compressible data written by the Writer and the edit.
++type packedCase struct {
++	data   dataSpec
++	cfg    xzConfig
++	writes writePlan
++	edit   packedEdit
++}
++
++func (c packedCase) GoString() string {
++	return fmt.Sprintf("%v with %v, %v; %v", c.data, c.cfg, c.writes, c.edit)
++}
++
++var (
++	compressible = hegel.SampledFrom([]dataKind{kindText, kindRuns, kindSmallAlphabet})
++	// compressibleSpecs: data with at least one LZMA chunk in its stream.
++	compressibleSpecs = hegel.Composite(func(tc hegel.TestCase) dataSpec {
++		return dataSpec{size: hegel.Draw(tc, hegel.Integers(256, 4096)), kind: hegel.Draw(tc, compressible), seed: hegel.Draw(tc, seeds)}
++	})
++	directions  = shaped[hegel.Generator[bool]](pick(true, false), hegel.Just(false))
++	packedEdits = hegel.Composite(func(tc hegel.TestCase) packedEdit {
++		return packedEdit{chunk: hegel.Draw(tc, positions), over: hegel.Draw(tc, directions), delta: hegel.Draw(tc, hegel.Integers(1, 255))}
++	})
++	packedCases = hegel.Composite(func(tc hegel.TestCase) packedCase {
++		cfg := hegel.Draw(tc, plainXzConfigs)
++		cfg.check = hegel.Draw(tc, shaped[hegel.Generator[checkKind]](checks, checked))
++		cfg.block = blockSpec{} // one block, so that the data is not split into stored chunks
++		return packedCase{
++			data:   hegel.Draw(tc, compressibleSpecs),
++			cfg:    cfg,
++			writes: hegel.Draw(tc, writePlans),
++			edit:   hegel.Draw(tc, packedEdits),
++		}
++	})
++)
++
++// TestHegelLzma2PackedSizesAreVerified: a stream with one LZMA chunk's
++// compressed-size field overstated or understated (xz/8; under
++// HEGEL_NO_KNOWN=1 understated in a checked stream) is rejected by the
++// Reader as it is by xz, or decodes to exactly the original.
++func TestHegelLzma2PackedSizesAreVerified(t *testing.T) {
++	property(t, func(ht *hegel.T) {
++		tc := hegel.Draw(ht, packedCases)
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
++		valid, err := compressGo(c, tc.writes, data)
++		if err != nil {
++			mismatch(ht, writerShape(c, len(data)), "%v\n%s", err, describeWriterConfig(c))
++		}
++		bad, p, old, v := tc.edit.apply(valid)
++		ht.Assume(bad != nil && v != old) // an LZMA chunk to edit, and a change
++		note(ht, "%s; %s at %d: %d -> %d", describeWriterConfig(c), tc.edit, p, old, v)
++		ctx := fmt.Sprintf("%s; %s at %d: %d -> %d (data %d bytes, stream %d)", describeWriterConfig(c), tc.edit, p, old, v, len(data), len(valid))
++		got, goErr := decodeGo(readPlan{[]int{4096}}, bad, len(data)+1<<20)
++		xzGot, xzErr := xzCLI(t, bad, "-dc")
++		xzOK := xzErr == nil && bytes.Equal(xzGot, data)
++		if goErr == nil {
++			if !bytes.Equal(got, data) {
++				mismatch(ht, "xz/8", "the Reader returned %d bytes with a clean EOF, the original has %d (first difference at %d); xz: %v\n%s", len(got), len(data), firstDiff(got, data), xzErr, ctx)
++			}
++			if !xzOK {
++				mismatch(ht, "xz/8", "the Reader accepted the edited stream (data intact); xz rejects it: %v\n%s", xzErr, ctx)
++			}
++			return
++		}
++		if xzOK {
++			fail(ht, "the Reader rejected the edited stream (%v after %d bytes) although xz decodes it to the original\n%s", goErr, len(got), ctx)
++		}
++	})
++}
 diff --git a/hegel_test.go b/hegel_test.go
 new file mode 100644
-index 0000000..cc080c5
+index 0000000..b9dc079
 --- /dev/null
 +++ b/hegel_test.go
-@@ -0,0 +1,1370 @@
+@@ -0,0 +1,2183 @@
 +package xz_test
 +
 +// Hegel property tests for github.com/ulikunitz/xz.
@@ -314,11 +1012,26 @@ index 0000000..cc080c5
 +// Oracles: XZ Utils' `xz` command-line tool (5.4.x on this machine; a stream
 +// written by the Go Writer must decode with `xz -dc`, `xz --robot -l` must see
 +// the blocks and the check the Writer was configured for, and a stream written
-+// by `xz` with any option set must decode with the Go Reader — for the .xz
++// by `xz` with any option set must decode with the Go Reader - for the .xz
 +// container, the classic .lzma format (`--format=lzma`) and raw LZMA2 chunk
-+// sequences (`--format=raw --lzma2`)), plus the round trip Writer→Reader under
++// sequences (`--format=raw --lzma2`)), plus the round trip Writer->Reader under
 +// random configurations and read/write chunkings, the documented Verify rules
 +// for the configuration structs, and the io.Reader/io.WriteCloser contracts.
++//
++// Every property draws one case record built from generator values. The bulk
++// bytes of a case are a dataSpec (a size, a kind and a PRNG seed, rendered by
++// fill, so that a 256 KB input is three draws), a writer's chunking a
++// writePlan (sizes taken modulo what is left, the empty plan one Write), a
++// reader's chunking a readPlan (buffer sizes cycled, some empty), the writer
++// configurations records rendered into the library's config structs by pure
++// methods, the xz tool's options a record rendered to its argument list, and a
++// corruption a mutation record applied at a position taken modulo the stream's
++// length. The shapes of the recorded bugs (bugs.toml) are drawn by default and
++// the properties that meet them fail, naming the shape (STYLE.md rule 11); the
++// pins in hegel_pins_test.go are the regression examples and
++// hegel_shapes_test.go has one property per bug over its shape region alone.
++// HEGEL_NO_KNOWN=1 switches the known shapes off (noKnown, Known below) for a
++// run that looks past the bugs.
 +//
 +// Set XZ_COLLECT=1 to make the properties record mismatches instead of failing
 +// and print them (shortest first) at the end of each test.
@@ -425,64 +1138,144 @@ index 0000000..cc080c5
 +	}, hegelOpts()...)
 +}
 +
-+func n(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
-+
-+func chance(tc hegel.TestCase, pct int) bool { return n(tc, 1, 100) <= pct }
-+
-+func pick[T any](tc hegel.TestCase, xs ...T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
-+
 +func note(ht *hegel.T, format string, args ...any) { ht.Note(fmt.Sprintf(format, args...)) }
 +
-+// Known gates the input shapes of recorded bugs (see bugs.toml); every switch
-+// is on while the bug is open so the properties run clean, and the pin tests
-+// in hegel_pins_test.go assert the correct behaviour and fail meanwhile.
++// noKnown: HEGEL_NO_KNOWN=1 looks past the recorded bugs (bugs.toml), read
++// once. By default the generators draw the bugs' shapes and the properties
++// that meet them fail, naming the shape (mismatch); under HEGEL_NO_KNOWN=1 the
++// Known switches are on, the shapes are left out of the generators (shaped) or
++// their checks are skipped, and a mismatch that still has a known shape is
++// skipped.
++var noKnown = os.Getenv("HEGEL_NO_KNOWN") == "1"
++
++// Known switches off the input shapes of recorded bugs (see bugs.toml); every
++// switch is off by default, so the properties draw the shapes and fail on the
++// bugs (and are declared as expected failures beside their pins in
++// hegel_pins_test.go), and on under HEGEL_NO_KNOWN=1, which makes the
++// properties run clean.
 +var Known = struct {
 +	truncatedBlockHeaderIsEOF bool // xz/1: a stream cut inside or just before a block header ends with a clean EOF
-+	smallDictNoSpace          bool // xz/2: incompressible data with DictCap < 64 KiB fails with "insufficient space"
++	smallDictNoSpace          bool // xz/2: incompressible data with DictCap < 64 KiB fails with "insufficient space" (or, below 64 KiB of input, is silently cut: Writer2.Close swallows the error, xz/5)
 +	binaryTreeMatcher         bool // xz/3: Matcher BinaryTree writes undecodable streams (classic and LZMA2)
 +	sizeZeroHeader            bool // xz/4: SizeInHeader with Size 0 writes an unknown-size header without an EOS marker
 +	writer2CloseSwallows      bool // xz/5: Writer2.Close returns nil when the flush fails
 +	lzmaWriterAfterClose      bool // xz/6: lzma.Writer accepts Write and Close after Close
 +	emptyReadEOF              bool // xz/7: lzma.Reader.Read with an empty buffer returns io.EOF while output is still buffered
 +	lzma2PackedSizeUnchecked  bool // xz/8: an LZMA2 chunk's compressed-size field is not verified against what the decoder consumed
-+}{truncatedBlockHeaderIsEOF: true, smallDictNoSpace: true, binaryTreeMatcher: true, sizeZeroHeader: true, writer2CloseSwallows: true, lzmaWriterAfterClose: true, emptyReadEOF: true, lzma2PackedSizeUnchecked: true}
++}{truncatedBlockHeaderIsEOF: noKnown, smallDictNoSpace: noKnown, binaryTreeMatcher: noKnown, sizeZeroHeader: noKnown, writer2CloseSwallows: noKnown, lzmaWriterAfterClose: noKnown, emptyReadEOF: noKnown, lzma2PackedSizeUnchecked: noKnown}
 +
-+// ---------------------------------------------------------------------------
-+// Data generators. Bulk bytes come from math/rand seeded by a drawn value, so
-+// the shape (kind, size, seed) is what Hegel shrinks.
-+
-+func genSize(tc hegel.TestCase) int {
-+	switch n(tc, 0, 9) {
-+	case 0:
-+		return 0
-+	case 1, 2, 3:
-+		return n(tc, 1, 64)
-+	case 4, 5, 6:
-+		return n(tc, 65, 4096)
-+	case 7, 8:
-+		return n(tc, 4097, 1<<16)
-+	default:
-+		return n(tc, 1<<16+1, 1<<18)
++// shaped is the value for a recorded bug's shape region or, under
++// HEGEL_NO_KNOWN=1, for the neighbouring region past it.
++func shaped[T any](known, past T) T {
++	if noKnown {
++		return past
 +	}
++	return known
 +}
 +
-+func genData(tc hegel.TestCase) []byte {
-+	size := genSize(tc)
-+	seed := hegel.Draw(tc, hegel.Integers[int64](0, 1<<40))
-+	kind := n(tc, 0, 5)
-+	rng := rand.New(rand.NewSource(seed))
++// mismatch reports a disagreement with the oracle on a case whose shape is
++// that of the recorded bug shape names ("" for none): the failure names the
++// shape, and under HEGEL_NO_KNOWN=1 a disagreement on a known shape is skipped
++// instead (rare then, since the generators leave most shapes out).
++func mismatch(ht *hegel.T, shape string, format string, args ...any) {
++	if noKnown {
++		ht.Assume(shape == "")
++	}
++	if shape != "" {
++		format = "the shape of " + shape + ": " + format
++	}
++	fail(ht, format, args...)
++}
++
++// ---------------------------------------------------------------------------
++// Generator idioms.
++
++// choice is one alternative of a weighted choice.
++type choice[T any] struct {
++	weight int
++	gen    hegel.Generator[T]
++}
++
++// weighted generates from one of the choices, chosen with probability
++// proportional to its weight; it shrinks towards the first choice, so the
++// simplest comes first.
++func weighted[T any](choices ...choice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	return hegel.FlatMap(hegel.Integers(0, total-1), func(i int) hegel.Generator[T] {
++		for _, c := range choices {
++			if i < c.weight {
++				return c.gen
++			}
++			i -= c.weight
++		}
++		panic("unreachable")
++	})
++}
++
++// chance is true pct percent of the time; it shrinks to false (Integers
++// shrinks to 0, so the true range is the top of the die, not the bottom).
++func chance(pct int) hegel.Generator[bool] {
++	return hegel.Map(hegel.Integers(0, 99), func(x int) bool { return x >= 100-pct })
++}
++
++// maybe generates from g pct percent of the time and the zero value
++// otherwise, which is what it shrinks to.
++func maybe[T any](pct int, g hegel.Generator[T]) hegel.Generator[T] {
++	var zero T
++	return weighted(choice[T]{100 - pct, hegel.Just(zero)}, choice[T]{pct, g})
++}
++
++// many is a list of lo to hi elements.
++func many[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	return hegel.Lists(g).MinSize(lo).MaxSize(hi)
++}
++
++func pick[T any](xs ...T) hegel.Generator[T] { return hegel.SampledFrom(xs) }
++
++// positions are taken modulo the live size of whatever they index.
++var positions = hegel.Integers(0, 1<<20)
++
++func at(pos, size int) int {
++	if size <= 0 {
++		return 0
++	}
++	return pos % size
++}
++
++// ---------------------------------------------------------------------------
++// Data. Bulk bytes come from math/rand seeded by a drawn value, so the shape
++// (kind, size, seed) is what Hegel shrinks and bytes() renders it.
++
++type dataKind int
++
++const (
++	kindRandom dataKind = iota
++	kindText
++	kindRuns
++	kindRepeats
++	kindSmallAlphabet
++	kindMixed
++)
++
++var kindNames = []string{"random", "text", "runs", "repeats", "small-alphabet", "mixed"}
++
++var words = []string{"the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dog.\n", "xz ", "lzma2 ", "0", "1", "\t"}
++
++func fill(rng *rand.Rand, kind dataKind, size int) []byte {
 +	out := make([]byte, size)
 +	switch kind {
-+	case 0: // random bytes
++	case kindRandom:
 +		rng.Read(out)
-+	case 1: // text of a small vocabulary
-+		words := []string{"the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dog.\n", "xz ", "lzma2 ", "0", "1", "\t"}
++	case kindText: // text of a small vocabulary
 +		var b strings.Builder
 +		for b.Len() < size {
 +			b.WriteString(words[rng.Intn(len(words))])
 +		}
 +		copy(out, b.String())
-+	case 2: // constant runs
++	case kindRuns: // constant runs
 +		for i := 0; i < size; {
 +			c := byte(rng.Intn(256))
 +			l := 1 + rng.Intn(300)
@@ -491,7 +1284,7 @@ index 0000000..cc080c5
 +				i++
 +			}
 +		}
-+	case 3: // random with long-distance repeats
++	case kindRepeats: // random with long-distance repeats
 +		rng.Read(out)
 +		for k := 0; k < 8 && size > 16; k++ {
 +			l := 1 + rng.Intn(size/2)
@@ -499,7 +1292,7 @@ index 0000000..cc080c5
 +			dst := rng.Intn(size - l + 1)
 +			copy(out[dst:dst+l], out[src:src+l])
 +		}
-+	case 4: // small alphabet
++	case kindSmallAlphabet:
 +		alpha := []byte("ab")
 +		if rng.Intn(2) == 0 {
 +			alpha = []byte("abcd\n")
@@ -532,73 +1325,214 @@ index 0000000..cc080c5
 +	return out
 +}
 +
-+// ---------------------------------------------------------------------------
-+// Configuration generators.
-+
-+var dictCaps = []int{0, 4096, 8192, 12288, 1 << 14, 3 << 13, 1 << 16, 1 << 17, 1 << 20, 3 << 19, 8 << 20}
-+
-+func genProps(tc hegel.TestCase, lzma2 bool) *lzma.Properties {
-+	if chance(tc, 30) {
-+		return nil
-+	}
-+	lc := n(tc, 0, 4)
-+	lp := n(tc, 0, 4)
-+	if lzma2 {
-+		lp = n(tc, 0, 4-lc)
-+	} else if chance(tc, 60) {
-+		lc = n(tc, 0, 8)
-+	}
-+	return &lzma.Properties{LC: lc, LP: lp, PB: n(tc, 0, 4)}
++// dataSpec is the input of a case: size bytes of the kind from a PRNG seeded
++// with seed.
++type dataSpec struct {
++	size int
++	kind dataKind
++	seed int64
 +}
 +
-+func genWriterConfig(tc hegel.TestCase, dataLen int) xz.WriterConfig {
-+	c := xz.WriterConfig{
-+		Properties: genProps(tc, true),
-+		DictCap:    pick(tc, dictCaps...),
++func (d dataSpec) bytes() []byte { return fill(rand.New(rand.NewSource(d.seed)), d.kind, d.size) }
++
++func (d dataSpec) String() string {
++	return fmt.Sprintf("%d %s bytes (seed %d)", d.size, kindNames[d.kind], d.seed)
++}
++
++var (
++	// byteSizes: empty a tenth of the time, mostly small, sometimes past the
++	// 64 KiB chunk, rarely up to 256 KiB; shrinks to 0.
++	byteSizes = weighted(
++		choice[int]{1, hegel.Just(0)},
++		choice[int]{3, hegel.Integers(1, 64)},
++		choice[int]{3, hegel.Integers(65, 4096)},
++		choice[int]{2, hegel.Integers(4097, 1<<16)},
++		choice[int]{1, hegel.Integers(1<<16+1, 1<<18)},
++	)
++	// nonEmptySizes: the same without the empty input.
++	nonEmptySizes = weighted(
++		choice[int]{3, hegel.Integers(1, 64)},
++		choice[int]{3, hegel.Integers(65, 4096)},
++		choice[int]{2, hegel.Integers(4097, 1<<16)},
++		choice[int]{1, hegel.Integers(1<<16+1, 1<<18)},
++	)
++	dataKinds = hegel.SampledFrom([]dataKind{kindRandom, kindText, kindRuns, kindRepeats, kindSmallAlphabet, kindMixed})
++	seeds     = hegel.Integers[int64](0, 1<<40)
++)
++
++// dataSpecsOf draws a dataSpec with its size from sizes.
++func dataSpecsOf(sizes hegel.Generator[int]) hegel.Generator[dataSpec] {
++	return hegel.Composite(func(tc hegel.TestCase) dataSpec {
++		return dataSpec{size: hegel.Draw(tc, sizes), kind: hegel.Draw(tc, dataKinds), seed: hegel.Draw(tc, seeds)}
++	})
++}
++
++var (
++	dataSpecs         = dataSpecsOf(byteSizes)
++	nonEmptyDataSpecs = dataSpecsOf(nonEmptySizes)
++)
++
++// ---------------------------------------------------------------------------
++// Configuration records, rendered into the library's config structs.
++
++// dictCaps: the default (0) first, then edges from the minimum up to 8 MiB;
++// the values under 64 KiB are the shape of xz/2 with incompressible data
++// longer than the dictionary.
++var dictCaps = []int{0, 4096, 8192, 12288, 1 << 14, 3 << 13, 1 << 16, 1 << 17, 1 << 20, 3 << 19, 8 << 20}
++
++var (
++	// lzma2Props: lc+lp <= 4, as LZMA2 requires.
++	lzma2Props = hegel.Composite(func(tc hegel.TestCase) *lzma.Properties {
++		lc := hegel.Draw(tc, hegel.Integers(0, 4))
++		return &lzma.Properties{LC: lc, LP: hegel.Draw(tc, hegel.Integers(0, 4-lc)), PB: hegel.Draw(tc, hegel.Integers(0, 4))}
++	})
++	// classicProps: lc up to 8 most of the time (liblzma refuses lc+lp > 4,
++	// which the classic property expects).
++	classicProps = hegel.Composite(func(tc hegel.TestCase) *lzma.Properties {
++		return &lzma.Properties{
++			LC: hegel.Draw(tc, weighted(choice[int]{40, hegel.Integers(0, 4)}, choice[int]{60, hegel.Integers(0, 8)})),
++			LP: hegel.Draw(tc, hegel.Integers(0, 4)),
++			PB: hegel.Draw(tc, hegel.Integers(0, 4)),
++		}
++	})
++	dictCapPool = hegel.SampledFrom(dictCaps)
++	bufSizes    = maybe(30, pick(4096, 8192, 300, 1<<16))
++	// matchers: the default HashTable4 first, BinaryTree (the shape of xz/3)
++	// as the second alternative; never BinaryTree under HEGEL_NO_KNOWN=1.
++	matchers = shaped[hegel.Generator[lzma.MatchAlgorithm]](
++		weighted(choice[lzma.MatchAlgorithm]{70, hegel.Just(lzma.HashTable4)}, choice[lzma.MatchAlgorithm]{30, hegel.Just(lzma.BinaryTree)}),
++		hegel.Just(lzma.HashTable4))
++	// readerDicts: a ReaderConfig.DictCap a third of the time (0: the default).
++	readerDicts = maybe(30, dictCapPool)
++)
++
++func propsName(p *lzma.Properties) string {
++	if p == nil {
++		return "nil"
 +	}
-+	if chance(tc, 30) {
-+		c.BufSize = pick(tc, 4096, 8192, 300, 1<<16)
++	return p.String()
++}
++
++// blockSpec is the Writer's BlockSize: none (the default, one block), a
++// small size, a size relative to the data (n taken modulo the length plus
++// one), or a large one.
++type blockSpec struct {
++	kind blockKind
++	n    int
++}
++
++type blockKind int
++
++const (
++	blockNone blockKind = iota
++	blockSmall
++	blockRelative
++	blockLarge
++)
++
++func (b blockSpec) size(dataLen int) int64 {
++	switch b.kind {
++	case blockSmall, blockLarge:
++		return int64(b.n)
++	case blockRelative:
++		return int64(1 + at(b.n, dataLen+1))
 +	}
-+	switch n(tc, 0, 4) {
-+	case 0:
-+		c.BlockSize = int64(n(tc, 1, 64))
-+	case 1:
-+		c.BlockSize = int64(n(tc, 1, dataLen+1))
-+	case 2:
-+		c.BlockSize = int64(n(tc, 1, 1<<20))
++	return 0
++}
++
++func (b blockSpec) String() string {
++	switch b.kind {
++	case blockSmall:
++		return fmt.Sprintf("small %d", b.n)
++	case blockRelative:
++		return fmt.Sprintf("relative %d", b.n)
++	case blockLarge:
++		return fmt.Sprintf("large %d", b.n)
 +	}
-+	switch n(tc, 0, 5) {
-+	case 0:
-+		c.CheckSum = xz.CRC32
-+	case 1:
-+		c.CheckSum = xz.CRC64
-+	case 2:
-+		c.CheckSum = xz.SHA256
-+	case 3:
-+		c.NoCheckSum = true
-+	}
-+	if chance(tc, 30) && !Known.binaryTreeMatcher {
-+		c.Matcher = lzma.BinaryTree
++	return "none"
++}
++
++var blockSpecs = weighted(
++	choice[blockSpec]{2, hegel.Just(blockSpec{})},
++	choice[blockSpec]{1, hegel.Map(hegel.Integers(1, 64), func(n int) blockSpec { return blockSpec{blockSmall, n} })},
++	choice[blockSpec]{1, hegel.Map(positions, func(n int) blockSpec { return blockSpec{blockRelative, n} })},
++	choice[blockSpec]{1, hegel.Map(hegel.Integers(1, 1<<20), func(n int) blockSpec { return blockSpec{blockLarge, n} })},
++)
++
++// checkKind is the Writer's check: the default (CRC64) first.
++type checkKind int
++
++const (
++	checkDefault checkKind = iota
++	checkCRC32
++	checkCRC64
++	checkSHA256
++	checkNone
++)
++
++var checkNames = []string{"default", "CRC32", "CRC64", "SHA-256", "none"}
++
++func (k checkKind) String() string { return checkNames[k] }
++
++var (
++	checks = hegel.SampledFrom([]checkKind{checkDefault, checkDefault, checkCRC32, checkCRC64, checkSHA256, checkNone})
++	// checked: the checks that leave a checksum in the stream.
++	checked = hegel.SampledFrom([]checkKind{checkDefault, checkCRC32, checkCRC64, checkSHA256})
++)
++
++// xzConfig is the .xz Writer's configuration as drawn; config renders it.
++type xzConfig struct {
++	props   *lzma.Properties
++	dictCap int
++	bufSize int
++	block   blockSpec
++	check   checkKind
++	matcher lzma.MatchAlgorithm
++}
++
++// config renders the record for data of dataLen bytes.
++func (c xzConfig) config(dataLen int) xz.WriterConfig {
++	w := xz.WriterConfig{Properties: c.props, DictCap: c.dictCap, BufSize: c.bufSize, BlockSize: c.block.size(dataLen), Matcher: c.matcher}
++	switch c.check {
++	case checkCRC32:
++		w.CheckSum = xz.CRC32
++	case checkCRC64:
++		w.CheckSum = xz.CRC64
++	case checkSHA256:
++		w.CheckSum = xz.SHA256
++	case checkNone:
++		w.NoCheckSum = true
 +	}
 +	// Every block builds a fresh dictionary and matcher of DictCap bytes, so
 +	// thousands of tiny blocks with a large dictionary take minutes: keep the
 +	// block count within 64 (not a recorded bug; see the README).
-+	if c.BlockSize > 0 && int64(dataLen)/c.BlockSize > 64 {
-+		c.BlockSize = int64(dataLen)/64 + 1
++	if w.BlockSize > 0 && int64(dataLen)/w.BlockSize > 64 {
++		w.BlockSize = int64(dataLen)/64 + 1
 +	}
-+	if Known.smallDictNoSpace && c.DictCap != 0 && c.DictCap < 1<<16 && dataLen > c.DictCap {
-+		c.DictCap = 1 << 16
++	if Known.smallDictNoSpace && w.DictCap != 0 && w.DictCap < 1<<16 && dataLen > w.DictCap {
++		w.DictCap = 1 << 16
 +	}
-+	return c
++	return w
 +}
 +
-+func describeWriterConfig(c xz.WriterConfig) string {
-+	p := "nil"
-+	if c.Properties != nil {
-+		p = c.Properties.String()
++func (c xzConfig) String() string {
++	return fmt.Sprintf("{props %s, DictCap %d, BufSize %d, block %s, check %s, %s}", propsName(c.props), c.dictCap, c.bufSize, c.block, c.check, c.matcher)
++}
++
++var xzConfigs = hegel.Composite(func(tc hegel.TestCase) xzConfig {
++	return xzConfig{
++		props:   hegel.Draw(tc, maybe(70, lzma2Props)),
++		dictCap: hegel.Draw(tc, dictCapPool),
++		bufSize: hegel.Draw(tc, bufSizes),
++		block:   hegel.Draw(tc, blockSpecs),
++		check:   hegel.Draw(tc, checks),
++		matcher: hegel.Draw(tc, matchers),
 +	}
++})
++
++func describeWriterConfig(c xz.WriterConfig) string {
 +	return fmt.Sprintf("WriterConfig{Properties: %s, DictCap: %d, BufSize: %d, BlockSize: %d, CheckSum: %#x, NoCheckSum: %v, Matcher: %s}",
-+		p, c.DictCap, c.BufSize, c.BlockSize, c.CheckSum, c.NoCheckSum, c.Matcher)
++		propsName(c.Properties), c.DictCap, c.BufSize, c.BlockSize, c.CheckSum, c.NoCheckSum, c.Matcher)
 +}
 +
 +// checkName is the name `xz --robot -l` prints for the check the config selects.
@@ -624,6 +1558,106 @@ index 0000000..cc080c5
 +	}
 +	return int((int64(dataLen) + c.BlockSize - 1) / c.BlockSize)
 +}
++
++// lzmaConfig is the classic lzma.Writer's configuration as drawn: the size
++// mode is how the data's size reaches the header ("eos": no size and an EOS
++// marker; "size": Size alone, which the Writer writes for a positive size and
++// otherwise falls back to a marker; "size+eos": both; "sizeInHeader":
++// SizeInHeader with the size, 0 included - the shape of xz/4).
++type lzmaConfig struct {
++	props    *lzma.Properties
++	dictCap  int
++	bufSize  int
++	matcher  lzma.MatchAlgorithm
++	sizeMode string
++}
++
++// mode is the effective size mode for data of dataLen bytes: under
++// HEGEL_NO_KNOWN=1 an explicit size of 0 is not written.
++func (c lzmaConfig) mode(dataLen int) string {
++	if Known.sizeZeroHeader && dataLen == 0 {
++		return "eos"
++	}
++	return c.sizeMode
++}
++
++func (c lzmaConfig) config(dataLen int) lzma.WriterConfig {
++	w := lzma.WriterConfig{Properties: c.props, DictCap: c.dictCap, BufSize: c.bufSize, Matcher: c.matcher}
++	switch c.mode(dataLen) {
++	case "size":
++		w.Size = int64(dataLen)
++	case "size+eos":
++		w.Size = int64(dataLen)
++		w.EOSMarker = true
++	case "sizeInHeader":
++		w.SizeInHeader = true
++		w.Size = int64(dataLen)
++	}
++	return w
++}
++
++func (c lzmaConfig) String() string {
++	return fmt.Sprintf("{props %s, DictCap %d, BufSize %d, %s, %s}", propsName(c.props), c.dictCap, c.bufSize, c.matcher, c.sizeMode)
++}
++
++func describeLzmaConfig(c lzma.WriterConfig) string {
++	return fmt.Sprintf("lzma.WriterConfig{Properties: %s, DictCap: %d, BufSize: %d, Matcher: %s, SizeInHeader: %v, Size: %d, EOSMarker: %v}",
++		propsName(c.Properties), c.DictCap, c.BufSize, c.Matcher, c.SizeInHeader, c.Size, c.EOSMarker)
++}
++
++var (
++	sizeModes   = pick("eos", "size", "size+eos", "sizeInHeader")
++	lzmaConfigs = hegel.Composite(func(tc hegel.TestCase) lzmaConfig {
++		return lzmaConfig{
++			props:    hegel.Draw(tc, maybe(70, classicProps)),
++			dictCap:  hegel.Draw(tc, dictCapPool),
++			bufSize:  hegel.Draw(tc, bufSizes),
++			matcher:  hegel.Draw(tc, matchers),
++			sizeMode: hegel.Draw(tc, sizeModes),
++		}
++	})
++)
++
++// writer2Config is lzma.Writer2's configuration as drawn.
++type writer2Config struct {
++	props   *lzma.Properties
++	dictCap int
++	bufSize int
++	matcher lzma.MatchAlgorithm
++}
++
++func (c writer2Config) config(dataLen int) lzma.Writer2Config {
++	w := lzma.Writer2Config{Properties: c.props, DictCap: c.dictCap, BufSize: c.bufSize, Matcher: c.matcher}
++	if Known.smallDictNoSpace && w.DictCap != 0 && w.DictCap < 1<<16 && dataLen > w.DictCap {
++		w.DictCap = 1 << 16
++	}
++	return w
++}
++
++// dict is the dictionary size the stream was written with (the default when 0).
++func (c writer2Config) dict(dataLen int) int {
++	if d := c.config(dataLen).DictCap; d != 0 {
++		return d
++	}
++	return 8 << 20
++}
++
++func (c writer2Config) String() string {
++	return fmt.Sprintf("{props %s, DictCap %d, BufSize %d, %s}", propsName(c.props), c.dictCap, c.bufSize, c.matcher)
++}
++
++func describeWriter2Config(c lzma.Writer2Config) string {
++	return fmt.Sprintf("Writer2Config{Properties: %s, DictCap: %d, BufSize: %d, Matcher: %s}", propsName(c.Properties), c.DictCap, c.BufSize, c.Matcher)
++}
++
++var writer2Configs = hegel.Composite(func(tc hegel.TestCase) writer2Config {
++	return writer2Config{
++		props:   hegel.Draw(tc, maybe(70, lzma2Props)),
++		dictCap: hegel.Draw(tc, dictCapPool),
++		bufSize: hegel.Draw(tc, bufSizes),
++		matcher: hegel.Draw(tc, matchers),
++	}
++})
 +
 +// ---------------------------------------------------------------------------
 +// The xz command-line tool.
@@ -708,78 +1742,246 @@ index 0000000..cc080c5
 +	return l, nil
 +}
 +
-+// genXzArgs draws options for `xz -c`.
-+func genXzArgs(tc hegel.TestCase) []string {
-+	args := []string{"-c", "--format=xz"}
-+	switch n(tc, 0, 3) {
-+	case 0:
-+		args = append(args, "-"+strconv.Itoa(n(tc, 0, 6)))
-+		if chance(tc, 30) {
++// xzFilter is the LZMA2 filter `xz -c` is given: a preset (with -e), or the
++// filter's own options.
++type xzFilter struct {
++	preset  bool
++	level   int
++	extreme bool
++	dict    string
++	lc, lp  int
++	pb      int
++	mode    string
++	mf      string
++	nice    int
++}
++
++func (f xzFilter) args() []string {
++	if f.preset {
++		args := []string{"-" + strconv.Itoa(f.level)}
++		if f.extreme {
 +			args = append(args, "-e")
 +		}
-+	default:
-+		lc := n(tc, 0, 4)
-+		opts := []string{
-+			"dict=" + pick(tc, "4KiB", "8KiB", "12KiB", "64KiB", "1MiB", "8MiB", "5000", "100000"),
-+			"lc=" + strconv.Itoa(lc),
-+			"lp=" + strconv.Itoa(n(tc, 0, 4-lc)),
-+			"pb=" + strconv.Itoa(n(tc, 0, 4)),
-+			"mode=" + pick(tc, "fast", "normal"),
-+			"mf=" + pick(tc, "hc3", "hc4", "bt2", "bt3", "bt4"),
-+			"nice=" + strconv.Itoa(n(tc, 2, 273)),
-+		}
-+		args = append(args, "--lzma2="+strings.Join(opts, ","))
++		return args
 +	}
-+	switch n(tc, 0, 5) {
-+	case 0:
-+		args = append(args, "--check=none")
-+	case 1:
-+		args = append(args, "--check=crc32")
-+	case 2:
-+		args = append(args, "--check=crc64")
-+	case 3:
-+		args = append(args, "--check=sha256")
++	return []string{fmt.Sprintf("--lzma2=dict=%s,lc=%d,lp=%d,pb=%d,mode=%s,mf=%s,nice=%d", f.dict, f.lc, f.lp, f.pb, f.mode, f.mf, f.nice)}
++}
++
++var (
++	xzDicts        = pick("4KiB", "8KiB", "12KiB", "64KiB", "1MiB", "8MiB", "5000", "100000")
++	xzModes        = pick("fast", "normal")
++	xzMatchFinders = pick("hc3", "hc4", "bt2", "bt3", "bt4")
++	// xzFilters: a preset a quarter of the time, else explicit options.
++	xzFilters = weighted(
++		choice[xzFilter]{1, hegel.Composite(func(tc hegel.TestCase) xzFilter {
++			return xzFilter{preset: true, level: hegel.Draw(tc, hegel.Integers(0, 6)), extreme: hegel.Draw(tc, chance(30))}
++		})},
++		choice[xzFilter]{3, hegel.Composite(func(tc hegel.TestCase) xzFilter {
++			lc := hegel.Draw(tc, hegel.Integers(0, 4))
++			return xzFilter{
++				dict: hegel.Draw(tc, xzDicts),
++				lc:   lc,
++				lp:   hegel.Draw(tc, hegel.Integers(0, 4-lc)),
++				pb:   hegel.Draw(tc, hegel.Integers(0, 4)),
++				mode: hegel.Draw(tc, xzModes),
++				mf:   hegel.Draw(tc, xzMatchFinders),
++				nice: hegel.Draw(tc, hegel.Integers(2, 273)),
++			}
++		})},
++	)
++	xzChecks     = pick("", "", "none", "crc32", "crc64", "sha256")
++	xzBlockSizes = maybe(40, pick(1, 7, 100, 1000, 4096, 65536))
++)
++
++// xzArgs are the options of `xz -c --format=xz`: the filter, a check and a
++// block size (0: none); args renders them.
++type xzArgs struct {
++	filter    xzFilter
++	check     string
++	blockSize int
++}
++
++func (a xzArgs) args() []string {
++	args := append([]string{"-c", "--format=xz"}, a.filter.args()...)
++	if a.check != "" {
++		args = append(args, "--check="+a.check)
 +	}
-+	if chance(tc, 40) {
-+		args = append(args, "--block-size="+strconv.Itoa(pick(tc, 1, 7, 100, 1000, 4096, 65536)))
++	if a.blockSize != 0 {
++		args = append(args, "--block-size="+strconv.Itoa(a.blockSize))
 +	}
 +	return args
 +}
 +
-+// ---------------------------------------------------------------------------
-+// Reading through random chunkings.
++func (a xzArgs) String() string { return "xz " + strings.Join(a.args(), " ") }
 +
-+// wrapReader returns r behind a randomly chosen io.Reader adapter.
-+func wrapReader(tc hegel.TestCase, r io.Reader) (io.Reader, string) {
-+	switch n(tc, 0, 4) {
-+	case 0:
-+		return iotest.OneByteReader(r), "OneByteReader"
-+	case 1:
-+		return iotest.HalfReader(r), "HalfReader"
-+	case 2:
-+		return iotest.DataErrReader(r), "DataErrReader"
-+	default:
-+		return r, "plain"
-+	}
++var xzArgSets = hegel.Composite(func(tc hegel.TestCase) xzArgs {
++	return xzArgs{filter: hegel.Draw(tc, xzFilters), check: hegel.Draw(tc, xzChecks), blockSize: hegel.Draw(tc, xzBlockSizes)}
++})
++
++// lzma1Args are the options of `xz -c --format=lzma`; args renders them.
++type lzma1Args struct {
++	dict   string
++	lc, lp int
++	pb     int
 +}
 +
-+// readAllChunked reads r to EOF with buffers of the drawn sizes (cycling,
-+// some empty unless zero is false), capped at limit bytes, and returns the
-+// data and the final error (nil on a clean io.EOF).
-+func readAllChunked(tc hegel.TestCase, r io.Reader, limit int, zero bool) ([]byte, error) {
-+	sizes := []int{pick(tc, 1, 2, 3, 7, 64, 1000, 4096, 1<<16)}
-+	if chance(tc, 50) {
-+		lo := 1
-+		if zero {
-+			lo = 0
-+		}
-+		sizes = append(sizes, n(tc, 1, 5000), n(tc, lo, 10))
++func (a lzma1Args) args() []string {
++	return []string{"-c", "--format=lzma", fmt.Sprintf("--lzma1=dict=%s,lc=%d,lp=%d,pb=%d", a.dict, a.lc, a.lp, a.pb)}
++}
++
++func (a lzma1Args) String() string { return "xz " + strings.Join(a.args(), " ") }
++
++var lzma1ArgSets = hegel.Composite(func(tc hegel.TestCase) lzma1Args {
++	lc := hegel.Draw(tc, hegel.Integers(0, 4))
++	return lzma1Args{dict: hegel.Draw(tc, pick("4KiB", "64KiB", "1MiB", "8MiB")), lc: lc, lp: hegel.Draw(tc, hegel.Integers(0, 4-lc)), pb: hegel.Draw(tc, hegel.Integers(0, 4))}
++})
++
++// rawArgs are the options of `xz -c --format=raw --lzma2`; args renders them
++// and dict is the dictionary size the Reader2 is given.
++type rawArgs struct {
++	dict   int
++	lc, lp int
++	pb     int
++	mf     string
++}
++
++func (a rawArgs) args() []string {
++	return []string{"-c", "--format=raw", fmt.Sprintf("--lzma2=dict=%d,lc=%d,lp=%d,pb=%d,mf=%s", a.dict, a.lc, a.lp, a.pb, a.mf)}
++}
++
++func (a rawArgs) String() string { return "xz " + strings.Join(a.args(), " ") }
++
++var rawArgSets = hegel.Composite(func(tc hegel.TestCase) rawArgs {
++	lc := hegel.Draw(tc, hegel.Integers(0, 4))
++	return rawArgs{dict: hegel.Draw(tc, pick(4096, 1<<16, 1<<20, 8<<20)), lc: lc, lp: hegel.Draw(tc, hegel.Integers(0, 4-lc)), pb: hegel.Draw(tc, hegel.Integers(0, 4)), mf: hegel.Draw(tc, xzMatchFinders)}
++})
++
++// ---------------------------------------------------------------------------
++// Writing and reading through drawn chunkings.
++
++// writePlan is how a writer receives the data: the sizes of the Writes, each
++// taken modulo what is left plus one (so 0 is an empty Write), then one Write
++// of the rest. The empty plan is one Write, what a case shrinks to.
++type writePlan struct {
++	sizes []int
++}
++
++func (p writePlan) String() string {
++	if len(p.sizes) == 0 {
++		return "one write"
 +	}
-+	var out []byte
++	return fmt.Sprintf("writes %v", p.sizes)
++}
++
++// write performs the plan and reports the writer's first error.
++func (p writePlan) write(w io.Writer, data []byte) error {
++	for _, s := range p.sizes {
++		k := at(s, len(data)+1)
++		m, err := w.Write(data[:k])
++		if err != nil {
++			return err
++		}
++		if m != k {
++			return fmt.Errorf("Write returned %d for %d bytes without an error", m, k)
++		}
++		data = data[k:]
++	}
++	if len(data) > 0 {
++		m, err := w.Write(data)
++		if err != nil {
++			return err
++		}
++		if m != len(data) {
++			return fmt.Errorf("Write returned %d for %d bytes without an error", m, len(data))
++		}
++	}
++	return nil
++}
++
++var (
++	writeSizes = weighted(choice[int]{1, hegel.Just(0)}, choice[int]{2, hegel.Integers(1, 100)}, choice[int]{2, hegel.Integers(1, 1<<18)})
++	writePlans = hegel.Map(many(writeSizes, 0, 6), func(sizes []int) writePlan { return writePlan{sizes} })
++)
++
++// chunkPlan is a writePlan for lzma.Writer2 with a Flush after the pieces
++// whose entry in flushes (read modulo their number) is set; no flushes
++// without a list.
++type chunkPlan struct {
++	sizes   []int
++	flushes []bool
++}
++
++func (p chunkPlan) String() string {
++	return fmt.Sprintf("%s, flushes %v", writePlan{p.sizes}, p.flushes)
++}
++
++// write performs the plan and reports the number of flushes and the first error.
++func (p chunkPlan) write(w *lzma.Writer2, data []byte) (int, error) {
++	flushes := 0
++	piece := func(i int, b []byte) error {
++		if m, err := w.Write(b); err != nil {
++			return fmt.Errorf("Write: %w", err)
++		} else if m != len(b) {
++			return fmt.Errorf("Write returned %d for %d bytes without an error", m, len(b))
++		}
++		if len(p.flushes) > 0 && p.flushes[i%len(p.flushes)] {
++			if err := w.Flush(); err != nil {
++				return fmt.Errorf("Flush: %w", err)
++			}
++			flushes++
++		}
++		return nil
++	}
 +	i := 0
-+	for {
-+		size := sizes[i%len(sizes)]
++	for _, s := range p.sizes {
++		k := at(s, len(data)+1)
++		if err := piece(i, data[:k]); err != nil {
++			return flushes, err
++		}
++		data = data[k:]
 +		i++
++	}
++	if len(data) > 0 {
++		if err := piece(i, data); err != nil {
++			return flushes, err
++		}
++	}
++	return flushes, nil
++}
++
++var chunkPlans = hegel.Composite(func(tc hegel.TestCase) chunkPlan {
++	return chunkPlan{sizes: hegel.Draw(tc, many(writeSizes, 0, 6)), flushes: hegel.Draw(tc, many(hegel.Booleans(), 0, 4))}
++})
++
++// readPlan is how a reader is read to EOF: buffer sizes cycled, the first
++// one never empty (so a plan of empty reads alone cannot spin), the others
++// empty at times (an empty read of lzma.Reader is the shape of xz/7).
++type readPlan struct {
++	sizes []int
++}
++
++func (p readPlan) String() string { return fmt.Sprintf("reads %v", p.sizes) }
++
++// classic is the plan for lzma.Reader: under HEGEL_NO_KNOWN=1 its empty reads
++// are one-byte reads.
++func (p readPlan) classic() readPlan {
++	if !Known.emptyReadEOF {
++		return p
++	}
++	sizes := make([]int, len(p.sizes))
++	for i, s := range p.sizes {
++		sizes[i] = max(s, 1)
++	}
++	return readPlan{sizes}
++}
++
++// readAll reads r to EOF with the plan's buffers, capped at limit bytes, and
++// returns the data and the final error (nil on a clean io.EOF).
++func (p readPlan) readAll(r io.Reader, limit int) ([]byte, error) {
++	var out []byte
++	idle := 0
++	for i := 0; ; i++ {
++		size := p.sizes[i%len(p.sizes)]
 +		buf := make([]byte, size)
 +		k, err := r.Read(buf)
 +		if k < 0 || k > size {
@@ -792,58 +1994,89 @@ index 0000000..cc080c5
 +		if err != nil {
 +			return out, err
 +		}
-+		if size == 0 && k == 0 && i > 3 {
-+			// a zero-length read tells nothing; move on
-+			continue
-+		}
 +		if len(out) > limit {
 +			return out, fmt.Errorf("more than %d bytes without EOF", limit)
 +		}
-+	}
-+}
-+
-+// writeChunked writes data to w in randomly sized pieces (some empty).
-+func writeChunked(tc hegel.TestCase, w io.Writer, data []byte) error {
-+	for len(data) > 0 || chance(tc, 20) {
-+		k := 0
-+		if len(data) > 0 {
-+			switch n(tc, 0, 3) {
-+			case 0:
-+				k = len(data)
-+			case 1:
-+				k = n(tc, 1, min(len(data), 100))
-+			default:
-+				k = n(tc, 1, len(data))
++		if k == 0 && size > 0 {
++			if idle++; idle > 1000 {
++				return out, fmt.Errorf("Read returned 0, nil for a %d-byte buffer %d times in a row", size, idle)
 +			}
-+		}
-+		m, err := w.Write(data[:k])
-+		if err != nil {
-+			return err
-+		}
-+		if m != k {
-+			return fmt.Errorf("Write returned %d for %d bytes without an error", m, k)
-+		}
-+		data = data[k:]
-+		if k == 0 {
-+			break
++		} else if k > 0 {
++			idle = 0
 +		}
 +	}
-+	return nil
 +}
 +
-+func compressGo(tc hegel.TestCase, c xz.WriterConfig, data []byte) ([]byte, error) {
++var (
++	firstReadSizes = weighted(choice[int]{3, pick(1, 2, 3, 7, 64, 1000, 4096, 1<<16)}, choice[int]{1, hegel.Integers(1, 5000)}, choice[int]{1, hegel.Integers(1, 10)})
++	readSizes      = weighted(choice[int]{3, pick(1, 2, 3, 7, 64, 1000, 4096, 1<<16)}, choice[int]{1, hegel.Integers(1, 5000)}, choice[int]{1, hegel.Integers(0, 10)})
++	readPlans      = hegel.Composite(func(tc hegel.TestCase) readPlan {
++		return readPlan{append([]int{hegel.Draw(tc, firstReadSizes)}, hegel.Draw(tc, many(readSizes, 0, 3))...)}
++	})
++)
++
++// wraps: the io.Reader adapter the stream is read through; plain first.
++var wraps = pick("plain", "plain", "OneByteReader", "HalfReader", "DataErrReader")
++
++func wrap(name string, r io.Reader) io.Reader {
++	switch name {
++	case "OneByteReader":
++		return iotest.OneByteReader(r)
++	case "HalfReader":
++		return iotest.HalfReader(r)
++	case "DataErrReader":
++		return iotest.DataErrReader(r)
++	}
++	return r
++}
++
++// compressGo writes data with the Writer under c through the plan.
++func compressGo(c xz.WriterConfig, plan writePlan, data []byte) ([]byte, error) {
 +	var buf bytes.Buffer
 +	w, err := c.NewWriter(&buf)
 +	if err != nil {
 +		return nil, fmt.Errorf("NewWriter: %v", err)
 +	}
-+	if err := writeChunked(tc, w, data); err != nil {
++	if err := plan.write(w, data); err != nil {
 +		return nil, fmt.Errorf("Write: %v", err)
 +	}
 +	if err := w.Close(); err != nil {
 +		return nil, fmt.Errorf("Close: %v", err)
 +	}
 +	return buf.Bytes(), nil
++}
++
++// writerShape names the recorded bug of a Writer failure on data of dataLen
++// bytes under c: xz/2 for a DictCap under 64 KiB with more data than it
++// holds, xz/3 for BinaryTree; "" otherwise.
++func writerShape(c xz.WriterConfig, dataLen int) string {
++	if c.DictCap != 0 && c.DictCap < 1<<16 && dataLen > c.DictCap {
++		return "xz/2"
++	}
++	if c.Matcher == lzma.BinaryTree {
++		return "xz/3"
++	}
++	return ""
++}
++
++// Performance candidates (not recorded bugs; reported with reproductions):
++// the cases of these shapes are skipped behind named gates so that a case
++// stays within seconds.
++
++// candidate/go/xz-9: the BinaryTree matcher is superlinear on low-entropy
++// input: 256 KiB of a two-letter alphabet takes 29 s (128 KiB 5 s, 64 KiB
++// 0.9 s; 256 KiB of the 13-word text 5 s), where HashTable4 takes 20 ms and
++// `xz --lzma2=mf=bt4` 0.12 s.
++func slowMatcher(d dataSpec, m lzma.MatchAlgorithm) bool {
++	return m == lzma.BinaryTree && d.size > 1<<16 && (d.kind == kindText || d.kind == kindSmallAlphabet)
++}
++
++// candidate/go/xz-10: xz.Reader allocates a fresh dictionary of the stream's
++// dictionary size (and a decoder) for every block: a 256 KiB file that xz
++// wrote with --block-size=1 (262144 blocks, 8 MiB dictionary) takes over 80 s
++// and gigabytes of heap in the Reader, where `xz -dc` takes 0.07 s.
++func manyBlocks(a xzArgs, dataLen int) bool {
++	return a.blockSize > 0 && dataLen/a.blockSize > 4096
 +}
 +
 +func short(b []byte) string {
@@ -862,8 +2095,63 @@ index 0000000..cc080c5
 +	return min(len(a), len(b))
 +}
 +
++func padding(n int) []byte { return make([]byte, 4*n) }
++
 +// ---------------------------------------------------------------------------
 +// Properties.
++
++// extraStream is a further stream concatenated after the first, with 4-byte
++// padding units before it.
++type extraStream struct {
++	data   dataSpec
++	cfg    xzConfig
++	writes writePlan
++	pad    int
++}
++
++func (e extraStream) String() string {
++	return fmt.Sprintf("%d padding bytes, then %v with %v, %v", 4*e.pad, e.data, e.cfg, e.writes)
++}
++
++var extraStreams = hegel.Composite(func(tc hegel.TestCase) extraStream {
++	return extraStream{data: hegel.Draw(tc, dataSpecs), cfg: hegel.Draw(tc, xzConfigs), writes: hegel.Draw(tc, writePlans), pad: hegel.Draw(tc, maybe(50, hegel.Integers(1, 3)))}
++})
++
++// roundTripCase: the data, the Writer's configuration and chunking, further
++// streams, trailing padding units, the Reader's DictCap and adapter, and the
++// read chunking.
++type roundTripCase struct {
++	data        dataSpec
++	cfg         xzConfig
++	writes      writePlan
++	extra       []extraStream
++	trailingPad int
++	readerDict  int
++	wrap        string
++	reads       readPlan
++}
++
++func (c roundTripCase) GoString() string {
++	var sb strings.Builder
++	fmt.Fprintf(&sb, "%v with %v, %v; %d extra streams, %d trailing padding bytes, ReaderConfig.DictCap %d, %s, %v", c.data, c.cfg, c.writes, len(c.extra), 4*c.trailingPad, c.readerDict, c.wrap, c.reads)
++	for i, e := range c.extra {
++		fmt.Fprintf(&sb, "\n  extra %d: %v", i, e)
++	}
++	return sb.String()
++}
++
++var roundTripCases = hegel.Composite(func(tc hegel.TestCase) roundTripCase {
++	return roundTripCase{
++		data:        hegel.Draw(tc, dataSpecs),
++		cfg:         hegel.Draw(tc, xzConfigs),
++		writes:      hegel.Draw(tc, writePlans),
++		extra:       hegel.Draw(tc, weighted(choice[[]extraStream]{7, hegel.Just[[]extraStream](nil)}, choice[[]extraStream]{3, many(extraStreams, 1, 2)})),
++		trailingPad: hegel.Draw(tc, maybe(30, hegel.Integers(1, 2))),
++		readerDict:  hegel.Draw(tc, readerDicts),
++		wrap:        hegel.Draw(tc, wraps),
++		reads:       hegel.Draw(tc, readPlans),
++	}
++})
 +
 +// TestHegelWriterOutputRoundTripsThroughTheReader: whatever the Writer writes
 +// under any configuration, the Reader gives back, through any read chunking;
@@ -871,13 +2159,19 @@ index 0000000..cc080c5
 +// concatenation, and SingleStream stops after the first.
 +func TestHegelWriterOutputRoundTripsThroughTheReader(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
-+		c := genWriterConfig(ht, len(data))
-+		note(ht, "%s, %d data bytes", describeWriterConfig(c), len(data))
-+		out, err := compressGo(ht, c, data)
-+		if err != nil {
-+			fail(ht, "%v\n%s, data %s", err, describeWriterConfig(c), short(data))
++		tc := hegel.Draw(ht, roundTripCases)
++		ht.Assume(!slowMatcher(tc.data, tc.cfg.matcher)) // candidate/go/xz-9
++		for _, e := range tc.extra {
++			ht.Assume(!slowMatcher(e.data, e.cfg.matcher)) // candidate/go/xz-9
 +		}
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
++		note(ht, "%s, %d data bytes", describeWriterConfig(c), len(data))
++		out, err := compressGo(c, tc.writes, data)
++		if err != nil {
++			mismatch(ht, writerShape(c, len(data)), "%v\n%s, data %s", err, describeWriterConfig(c), short(data))
++		}
++		shape := writerShape(c, len(data)) // of any of the streams, the first one's first
 +		if !xz.ValidHeader(out[:12]) {
 +			fail(ht, "ValidHeader false on the Writer's own header %x\n%s", out[:12], describeWriterConfig(c))
 +		}
@@ -886,44 +2180,36 @@ index 0000000..cc080c5
 +		streams := [][]byte{out}
 +		want := append([]byte(nil), data...)
 +		joined := append([]byte(nil), out...)
-+		extra := 0
-+		if chance(ht, 30) {
-+			extra = n(ht, 1, 2)
-+		}
-+		for i := 0; i < extra; i++ {
-+			d2 := genData(ht)
-+			c2 := genWriterConfig(ht, len(d2))
-+			o2, err := compressGo(ht, c2, d2)
++		for _, e := range tc.extra {
++			d2 := e.data.bytes()
++			c2 := e.cfg.config(len(d2))
++			o2, err := compressGo(c2, e.writes, d2)
 +			if err != nil {
-+				fail(ht, "second stream: %v\n%s", err, describeWriterConfig(c2))
++				mismatch(ht, writerShape(c2, len(d2)), "second stream: %v\n%s", err, describeWriterConfig(c2))
 +			}
-+			if chance(ht, 50) {
-+				joined = append(joined, make([]byte, 4*n(ht, 1, 3))...)
++			if shape == "" {
++				shape = writerShape(c2, len(d2))
 +			}
++			joined = append(joined, padding(e.pad)...)
 +			joined = append(joined, o2...)
 +			streams = append(streams, o2)
 +			want = append(want, d2...)
 +		}
-+		trailingPad := chance(ht, 30)
-+		if trailingPad {
-+			joined = append(joined, make([]byte, 4*n(ht, 1, 2))...)
-+		}
++		trailingPad := tc.trailingPad > 0
++		joined = append(joined, padding(tc.trailingPad)...)
 +
-+		rc := xz.ReaderConfig{}
-+		if chance(ht, 30) {
-+			rc.DictCap = pick(ht, dictCaps...)
-+		}
-+		src, wrapName := wrapReader(ht, bytes.NewReader(joined))
++		rc := xz.ReaderConfig{DictCap: tc.readerDict}
++		src := wrap(tc.wrap, bytes.NewReader(joined))
 +		r, err := rc.NewReader(src)
 +		if err != nil {
-+			fail(ht, "NewReader: %v\n%s, %d streams, %s", err, describeWriterConfig(c), len(streams), wrapName)
++			fail(ht, "NewReader: %v\n%s, %d streams, %s", err, describeWriterConfig(c), len(streams), tc.wrap)
 +		}
-+		got, err := readAllChunked(ht, r, len(want)+1<<20, true)
++		got, err := tc.reads.readAll(r, len(want)+1<<20)
 +		if err != nil {
-+			fail(ht, "Read: %v after %d of %d bytes\n%s, %d streams (%d extra, trailing padding %v), reader %s, data %s", err, len(got), len(want), describeWriterConfig(c), len(streams), extra, trailingPad, wrapName, short(data))
++			mismatch(ht, shape, "Read: %v after %d of %d bytes\n%s, %d streams (%d extra, trailing padding %v), reader %s, data %s", err, len(got), len(want), describeWriterConfig(c), len(streams), len(tc.extra), trailingPad, tc.wrap, short(data))
 +		}
 +		if !bytes.Equal(got, want) {
-+			fail(ht, "decoded %d bytes, want %d (first difference at %d)\n%s, %d streams, reader %s, data %s", len(got), len(want), firstDiff(got, want), describeWriterConfig(c), len(streams), wrapName, short(data))
++			mismatch(ht, shape, "decoded %d bytes, want %d (first difference at %d)\n%s, %d streams, reader %s, data %s", len(got), len(want), firstDiff(got, want), describeWriterConfig(c), len(streams), tc.wrap, short(data))
 +		}
 +		// a further Read stays at EOF
 +		k, err := r.Read(make([]byte, 10))
@@ -937,7 +2223,7 @@ index 0000000..cc080c5
 +			if err != nil {
 +				fail(ht, "SingleStream NewReader: %v", err)
 +			}
-+			got1, err := readAllChunked(ht, r1, len(data)+1<<20, true)
++			got1, err := tc.reads.readAll(r1, len(data)+1<<20)
 +			if !bytes.Equal(got1, data) {
 +				fail(ht, "SingleStream decoded %d bytes, want the first stream's %d (err %v)", len(got1), len(data), err)
 +			}
@@ -948,24 +2234,39 @@ index 0000000..cc080c5
 +	})
 +}
 +
++// writerCase: the data, the Writer's configuration and chunking.
++type writerCase struct {
++	data   dataSpec
++	cfg    xzConfig
++	writes writePlan
++}
++
++func (c writerCase) GoString() string { return fmt.Sprintf("%v with %v, %v", c.data, c.cfg, c.writes) }
++
++var writerCases = hegel.Composite(func(tc hegel.TestCase) writerCase {
++	return writerCase{data: hegel.Draw(tc, dataSpecs), cfg: hegel.Draw(tc, xzConfigs), writes: hegel.Draw(tc, writePlans)}
++})
++
 +// TestHegelXzToolDecodesTheWriterOutput: the xz tool decodes what the Writer
 +// writes, and its listing shows the blocks, sizes and check the Writer was
 +// configured for.
 +func TestHegelXzToolDecodesTheWriterOutput(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
-+		c := genWriterConfig(ht, len(data))
++		tc := hegel.Draw(ht, writerCases)
++		ht.Assume(!slowMatcher(tc.data, tc.cfg.matcher)) // candidate/go/xz-9
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
 +		note(ht, "%s, %d data bytes", describeWriterConfig(c), len(data))
-+		out, err := compressGo(ht, c, data)
++		out, err := compressGo(c, tc.writes, data)
 +		if err != nil {
-+			fail(ht, "%v\n%s, data %s", err, describeWriterConfig(c), short(data))
++			mismatch(ht, writerShape(c, len(data)), "%v\n%s, data %s", err, describeWriterConfig(c), short(data))
 +		}
 +		got, err := xzCLI(t, out, "-dc")
 +		if err != nil {
-+			fail(ht, "%v\n%s, data %s\nstream %x", err, describeWriterConfig(c), short(data), out)
++			mismatch(ht, writerShape(c, len(data)), "%v\n%s, data %s\nstream %x... (%d bytes)", err, describeWriterConfig(c), short(data), out[:min(len(out), 96)], len(out))
 +		}
 +		if !bytes.Equal(got, data) {
-+			fail(ht, "xz -dc gave %d bytes, want %d (first difference at %d)\n%s, data %s", len(got), len(data), firstDiff(got, data), describeWriterConfig(c), short(data))
++			mismatch(ht, writerShape(c, len(data)), "xz -dc gave %d bytes, want %d (first difference at %d)\n%s, data %s", len(got), len(data), firstDiff(got, data), describeWriterConfig(c), short(data))
 +		}
 +		l, err := xzList(t, out)
 +		if err != nil {
@@ -997,49 +2298,89 @@ index 0000000..cc080c5
 +	})
 +}
 +
++// xzStream is one stream written by the tool, with 4-byte padding units
++// before it (ignored for the first stream).
++type xzStream struct {
++	data dataSpec
++	args xzArgs
++	pad  int
++}
++
++func (s xzStream) String() string {
++	return fmt.Sprintf("%d padding bytes, then %v of %v", 4*s.pad, s.args, s.data)
++}
++
++var xzStreams = hegel.Composite(func(tc hegel.TestCase) xzStream {
++	return xzStream{data: hegel.Draw(tc, dataSpecs), args: hegel.Draw(tc, xzArgSets), pad: hegel.Draw(tc, maybe(50, hegel.Integers(1, 3)))}
++})
++
++// toolOutputCase: one to three streams from the tool, trailing padding, the
++// Reader's adapter, DictCap and read chunking.
++type toolOutputCase struct {
++	streams     []xzStream
++	trailingPad int
++	wrap        string
++	readerDict  int
++	reads       readPlan
++}
++
++func (c toolOutputCase) GoString() string {
++	var sb strings.Builder
++	fmt.Fprintf(&sb, "%d streams, %d trailing padding bytes, %s, ReaderConfig.DictCap %d, %v", len(c.streams), 4*c.trailingPad, c.wrap, c.readerDict, c.reads)
++	for i, s := range c.streams {
++		fmt.Fprintf(&sb, "\n  stream %d: %v", i, s)
++	}
++	return sb.String()
++}
++
++var toolOutputCases = hegel.Composite(func(tc hegel.TestCase) toolOutputCase {
++	return toolOutputCase{
++		streams:     hegel.Draw(tc, weighted(choice[[]xzStream]{7, many(xzStreams, 1, 1)}, choice[[]xzStream]{3, many(xzStreams, 2, 3)})),
++		trailingPad: hegel.Draw(tc, maybe(30, hegel.Integers(1, 2))),
++		wrap:        hegel.Draw(tc, wraps),
++		readerDict:  hegel.Draw(tc, readerDicts),
++		reads:       hegel.Draw(tc, readPlans),
++	}
++})
++
 +// TestHegelReaderDecodesTheXzToolOutput: streams written by the xz tool with
 +// any options, alone or concatenated with padding, decode with the Reader.
 +func TestHegelReaderDecodesTheXzToolOutput(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		count := 1
-+		if chance(ht, 30) {
-+			count = n(ht, 2, 3)
++		tc := hegel.Draw(ht, toolOutputCases)
++		for _, s := range tc.streams {
++			ht.Assume(!manyBlocks(s.args, s.data.size)) // candidate/go/xz-10
 +		}
 +		var joined, want []byte
 +		var descr []string
-+		for i := 0; i < count; i++ {
-+			data := genData(ht)
-+			args := genXzArgs(ht)
++		for i, s := range tc.streams {
++			data := s.data.bytes()
++			args := s.args.args()
 +			out, err := xzCLI(t, data, args...)
 +			if err != nil {
 +				fail(ht, "oracle failed: %v", err)
 +			}
-+			if i > 0 && chance(ht, 50) {
-+				joined = append(joined, make([]byte, 4*n(ht, 1, 3))...)
++			if i > 0 {
++				joined = append(joined, padding(s.pad)...)
 +			}
 +			joined = append(joined, out...)
 +			want = append(want, data...)
 +			descr = append(descr, fmt.Sprintf("xz %s (%d bytes -> %d)", strings.Join(args, " "), len(data), len(out)))
 +		}
-+		if chance(ht, 30) {
-+			joined = append(joined, make([]byte, 4*n(ht, 1, 2))...)
-+		}
++		joined = append(joined, padding(tc.trailingPad)...)
 +		note(ht, "%s", strings.Join(descr, "; "))
-+		src, wrapName := wrapReader(ht, bytes.NewReader(joined))
-+		rc := xz.ReaderConfig{}
-+		if chance(ht, 30) {
-+			rc.DictCap = pick(ht, dictCaps...)
-+		}
++		src := wrap(tc.wrap, bytes.NewReader(joined))
++		rc := xz.ReaderConfig{DictCap: tc.readerDict}
 +		r, err := rc.NewReader(src)
 +		if err != nil {
 +			fail(ht, "NewReader: %v\n%s", err, strings.Join(descr, "; "))
 +		}
-+		got, err := readAllChunked(ht, r, len(want)+1<<20, true)
++		got, err := tc.reads.readAll(r, len(want)+1<<20)
 +		if err != nil {
-+			fail(ht, "Read: %v after %d of %d bytes\n%s, reader %s", err, len(got), len(want), strings.Join(descr, "; "), wrapName)
++			fail(ht, "Read: %v after %d of %d bytes\n%s, reader %s", err, len(got), len(want), strings.Join(descr, "; "), tc.wrap)
 +		}
 +		if !bytes.Equal(got, want) {
-+			fail(ht, "decoded %d bytes, want %d (first difference at %d)\n%s, reader %s", len(got), len(want), firstDiff(got, want), strings.Join(descr, "; "), wrapName)
++			fail(ht, "decoded %d bytes, want %d (first difference at %d)\n%s, reader %s", len(got), len(want), firstDiff(got, want), strings.Join(descr, "; "), tc.wrap)
 +		}
 +	})
 +}
@@ -1047,46 +2388,49 @@ index 0000000..cc080c5
 +// ---------------------------------------------------------------------------
 +// The classic .lzma format.
 +
-+type lzmaShape struct {
-+	c        lzma.WriterConfig
-+	sizeMode string
++// classicCase: the data, the lzma.Writer's configuration and chunking, the
++// lzma.Reader's DictCap, adapter and read chunking, and the tool's options
++// for its own .lzma stream.
++type classicCase struct {
++	data       dataSpec
++	cfg        lzmaConfig
++	writes     writePlan
++	readerDict int
++	wrap       string
++	reads      readPlan
++	args       lzma1Args
 +}
 +
-+func genLzmaWriterConfig(tc hegel.TestCase, dataLen int) lzmaShape {
-+	c := lzma.WriterConfig{
-+		Properties: genProps(tc, false),
-+		DictCap:    pick(tc, dictCaps...),
-+	}
-+	if chance(tc, 30) {
-+		c.BufSize = pick(tc, 4096, 8192, 300, 1<<16)
-+	}
-+	if chance(tc, 30) && !Known.binaryTreeMatcher {
-+		c.Matcher = lzma.BinaryTree
-+	}
-+	mode := pick(tc, "eos", "size", "size+eos", "sizeInHeader")
-+	if Known.sizeZeroHeader && dataLen == 0 && mode != "eos" {
-+		mode = "eos"
-+	}
-+	switch mode {
-+	case "size":
-+		c.Size = int64(dataLen)
-+	case "size+eos":
-+		c.Size = int64(dataLen)
-+		c.EOSMarker = true
-+	case "sizeInHeader":
-+		c.SizeInHeader = true
-+		c.Size = int64(dataLen)
-+	}
-+	return lzmaShape{c, mode}
++func (c classicCase) GoString() string {
++	return fmt.Sprintf("%v with %v, %v; ReaderConfig.DictCap %d, %s, %v; %v", c.data, c.cfg, c.writes, c.readerDict, c.wrap, c.reads, c.args)
 +}
 +
-+func (s lzmaShape) String() string {
-+	p := "nil"
-+	if s.c.Properties != nil {
-+		p = s.c.Properties.String()
++var classicCases = hegel.Composite(func(tc hegel.TestCase) classicCase {
++	return classicCase{
++		data:       hegel.Draw(tc, dataSpecs),
++		cfg:        hegel.Draw(tc, lzmaConfigs),
++		writes:     hegel.Draw(tc, writePlans),
++		readerDict: hegel.Draw(tc, readerDicts),
++		wrap:       hegel.Draw(tc, wraps),
++		reads:      hegel.Draw(tc, readPlans),
++		args:       hegel.Draw(tc, lzma1ArgSets),
 +	}
-+	return fmt.Sprintf("lzma.WriterConfig{Properties: %s, DictCap: %d, BufSize: %d, Matcher: %s, SizeInHeader: %v, Size: %d, EOSMarker: %v} (%s)",
-+		p, s.c.DictCap, s.c.BufSize, s.c.Matcher, s.c.SizeInHeader, s.c.Size, s.c.EOSMarker, s.sizeMode)
++})
++
++// classicShape names the recorded bug of a classic round-trip failure: xz/3
++// for BinaryTree, xz/4 for SizeInHeader with an empty input, xz/7 for a read
++// plan with an empty read; "" otherwise.
++func classicShape(c lzma.WriterConfig, dataLen int, reads readPlan) string {
++	if c.Matcher == lzma.BinaryTree {
++		return "xz/3"
++	}
++	if c.SizeInHeader && dataLen == 0 {
++		return "xz/4"
++	}
++	if slices.Contains(reads.sizes, 0) {
++		return "xz/7"
++	}
++	return ""
 +}
 +
 +// TestHegelClassicLzmaRoundTrips: lzma.Writer output decodes with lzma.Reader
@@ -1095,15 +2439,19 @@ index 0000000..cc080c5
 +// lzma.Reader and passes ValidHeader.
 +func TestHegelClassicLzmaRoundTrips(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
-+		s := genLzmaWriterConfig(ht, len(data))
++		tc := hegel.Draw(ht, classicCases)
++		ht.Assume(!slowMatcher(tc.data, tc.cfg.matcher)) // candidate/go/xz-9
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
++		mode := tc.cfg.mode(len(data))
++		s := describeLzmaConfig(c) + " (" + mode + ")"
 +		note(ht, "%s, %d data bytes", s, len(data))
 +		var buf bytes.Buffer
-+		w, err := s.c.NewWriter(&buf)
++		w, err := c.NewWriter(&buf)
 +		if err != nil {
 +			fail(ht, "NewWriter: %v\n%s", err, s)
 +		}
-+		if err := writeChunked(ht, w, data); err != nil {
++		if err := tc.writes.write(w, data); err != nil {
 +			fail(ht, "Write: %v\n%s", err, s)
 +		}
 +		if err := w.Close(); err != nil {
@@ -1115,22 +2463,18 @@ index 0000000..cc080c5
 +		}
 +
 +		// Go reader
-+		rc := lzma.ReaderConfig{}
-+		tooSmall := false
-+		if chance(ht, 30) {
-+			rc.DictCap = pick(ht, dictCaps...)
-+			eff := s.c.DictCap
-+			if eff == 0 {
-+				eff = 8 << 20
-+			}
-+			tooSmall = rc.DictCap != 0 && rc.DictCap < eff
++		rc := lzma.ReaderConfig{DictCap: tc.readerDict}
++		eff := c.DictCap
++		if eff == 0 {
++			eff = 8 << 20
 +		}
-+		src, wrapName := wrapReader(ht, bytes.NewReader(out))
++		tooSmall := rc.DictCap != 0 && rc.DictCap < eff
++		src := wrap(tc.wrap, bytes.NewReader(out))
 +		r, err := rc.NewReader(src)
 +		if tooSmall {
 +			var e *lzma.ErrDictSize
 +			if err == nil || !errors.As(err, &e) {
-+				fail(ht, "ReaderConfig{DictCap: %d} on a stream with dictionary %d: NewReader err %v, want *ErrDictSize", rc.DictCap, s.c.DictCap, err)
++				fail(ht, "ReaderConfig{DictCap: %d} on a stream with dictionary %d: NewReader err %v, want *ErrDictSize", rc.DictCap, c.DictCap, err)
 +			}
 +			return
 +		}
@@ -1138,29 +2482,27 @@ index 0000000..cc080c5
 +			fail(ht, "NewReader: %v\n%s", err, s)
 +		}
 +		h, ok := r.Header()
-+		wantDict := uint32(s.c.DictCap)
-+		if s.c.DictCap == 0 {
-+			wantDict = 8 << 20
-+		}
++		wantDict := uint32(eff)
 +		wantProps := lzma.Properties{LC: 3, LP: 0, PB: 2}
-+		if s.c.Properties != nil {
-+			wantProps = *s.c.Properties
++		if c.Properties != nil {
++			wantProps = *c.Properties
 +		}
 +		wantSize := int64(-1)
-+		if s.sizeMode == "sizeInHeader" || (s.sizeMode != "eos" && len(data) > 0) {
++		if mode == "sizeInHeader" || (mode != "eos" && len(data) > 0) {
 +			wantSize = int64(len(data))
 +		}
 +		if !ok || h.DictSize != wantDict || h.Properties != wantProps || h.Size != wantSize {
-+			fail(ht, "Header() = %+v, %v; want DictSize %d, %s, Size %d\n%s", h, ok, wantDict, wantProps.String(), wantSize, s)
++			mismatch(ht, classicShape(c, len(data), readPlan{}), "Header() = %+v, %v; want DictSize %d, %s, Size %d\n%s", h, ok, wantDict, wantProps.String(), wantSize, s)
 +		}
-+		got, err := readAllChunked(ht, r, len(data)+1<<20, !Known.emptyReadEOF)
++		reads := tc.reads.classic()
++		got, err := reads.readAll(r, len(data)+1<<20)
 +		if err != nil {
-+			fail(ht, "Read: %v after %d of %d bytes\n%s, reader %s, data %s", err, len(got), len(data), s, wrapName, short(data))
++			mismatch(ht, classicShape(c, len(data), reads), "Read: %v after %d of %d bytes\n%s, reader %s, data %s", err, len(got), len(data), s, tc.wrap, short(data))
 +		}
 +		if !bytes.Equal(got, data) {
-+			fail(ht, "decoded %d bytes, want %d (first difference at %d)\n%s, reader %s", len(got), len(data), firstDiff(got, data), s, wrapName)
++			mismatch(ht, classicShape(c, len(data), reads), "decoded %d bytes, want %d (first difference at %d)\n%s, reader %s", len(got), len(data), firstDiff(got, data), s, tc.wrap)
 +		}
-+		wantMarker := s.sizeMode == "eos" || s.sizeMode == "size+eos" || (s.sizeMode == "size" && len(data) == 0)
++		wantMarker := mode == "eos" || mode == "size+eos" || (mode == "size" && len(data) == 0)
 +		if r.EOSMarker() != wantMarker {
 +			fail(ht, "EOSMarker() = %v, want %v\n%s", r.EOSMarker(), wantMarker, s)
 +		}
@@ -1173,16 +2515,15 @@ index 0000000..cc080c5
 +			}
 +		} else {
 +			if err != nil {
-+				fail(ht, "%v\n%s, data %s\nstream %x", err, s, short(data), out[:min(len(out), 64)])
++				mismatch(ht, classicShape(c, len(data), readPlan{}), "%v\n%s, data %s\nstream %x", err, s, short(data), out[:min(len(out), 64)])
 +			}
 +			if !bytes.Equal(xzGot, data) {
-+				fail(ht, "xz --format=lzma -dc gave %d bytes, want %d\n%s", len(xzGot), len(data), s)
++				mismatch(ht, classicShape(c, len(data), readPlan{}), "xz --format=lzma -dc gave %d bytes, want %d\n%s", len(xzGot), len(data), s)
 +			}
 +		}
 +
 +		// and the Reader decodes xz's .lzma
-+		lc := n(ht, 0, 4)
-+		args := []string{"-c", "--format=lzma", "--lzma1=dict=" + pick(ht, "4KiB", "64KiB", "1MiB", "8MiB") + fmt.Sprintf(",lc=%d,lp=%d,pb=%d", lc, n(ht, 0, 4-lc), n(ht, 0, 4))}
++		args := tc.args.args()
 +		xzOut, err := xzCLI(t, data, args...)
 +		if err != nil {
 +			fail(ht, "oracle failed: %v", err)
@@ -1194,12 +2535,12 @@ index 0000000..cc080c5
 +		if err != nil {
 +			fail(ht, "NewReader on xz %s output: %v", strings.Join(args, " "), err)
 +		}
-+		got2, err := readAllChunked(ht, r2, len(data)+1<<20, !Known.emptyReadEOF)
++		got2, err := reads.readAll(r2, len(data)+1<<20)
 +		if err != nil {
-+			fail(ht, "Read of xz %s output: %v after %d of %d bytes", strings.Join(args, " "), err, len(got2), len(data))
++			mismatch(ht, classicShape(lzma.WriterConfig{}, len(data), reads), "Read of xz %s output: %v after %d of %d bytes", strings.Join(args, " "), err, len(got2), len(data))
 +		}
 +		if !bytes.Equal(got2, data) {
-+			fail(ht, "xz %s output decoded to %d bytes, want %d (first difference at %d)", strings.Join(args, " "), len(got2), len(data), firstDiff(got2, data))
++			mismatch(ht, classicShape(lzma.WriterConfig{}, len(data), reads), "xz %s output decoded to %d bytes, want %d (first difference at %d)", strings.Join(args, " "), len(got2), len(data), firstDiff(got2, data))
 +		}
 +	})
 +}
@@ -1207,71 +2548,83 @@ index 0000000..cc080c5
 +// ---------------------------------------------------------------------------
 +// Raw LZMA2 chunk sequences.
 +
++// lzma2Case: the data, lzma.Writer2's configuration and chunking (with
++// flushes), the Reader2's adapter and read chunking, and the tool's options
++// for its own raw stream.
++type lzma2Case struct {
++	data   dataSpec
++	cfg    writer2Config
++	writes chunkPlan
++	wrap   string
++	reads  readPlan
++	args   rawArgs
++}
++
++func (c lzma2Case) GoString() string {
++	return fmt.Sprintf("%v with %v, %v; %s, %v; %v", c.data, c.cfg, c.writes, c.wrap, c.reads, c.args)
++}
++
++var lzma2Cases = hegel.Composite(func(tc hegel.TestCase) lzma2Case {
++	return lzma2Case{
++		data:   hegel.Draw(tc, dataSpecs),
++		cfg:    hegel.Draw(tc, writer2Configs),
++		writes: hegel.Draw(tc, chunkPlans),
++		wrap:   hegel.Draw(tc, wraps),
++		reads:  hegel.Draw(tc, readPlans),
++		args:   hegel.Draw(tc, rawArgSets),
++	}
++})
++
++// writer2Shape names the recorded bug of a Writer2 failure on data of dataLen
++// bytes under c: xz/2 for a DictCap under 64 KiB with more data than it
++// holds, xz/3 for BinaryTree; "" otherwise.
++func writer2Shape(c lzma.Writer2Config, dataLen int) string {
++	if c.DictCap != 0 && c.DictCap < 1<<16 && dataLen > c.DictCap {
++		return "xz/2"
++	}
++	if c.Matcher == lzma.BinaryTree {
++		return "xz/3"
++	}
++	return ""
++}
++
 +// TestHegelLzma2ChunkSequencesRoundTrip: Writer2 output (with Flush calls in
 +// between) decodes with Reader2 and with `xz --format=raw --lzma2 -dc`; xz's
 +// raw LZMA2 decodes with Reader2; EOS() reports the end-of-stream chunk.
 +func TestHegelLzma2ChunkSequencesRoundTrip(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
-+		c := lzma.Writer2Config{Properties: genProps(ht, true), DictCap: pick(ht, dictCaps...)}
-+		if Known.smallDictNoSpace && c.DictCap != 0 && c.DictCap < 1<<16 && len(data) > c.DictCap {
-+			c.DictCap = 1 << 16
-+		}
-+		if chance(ht, 30) {
-+			c.BufSize = pick(ht, 4096, 8192, 300, 1<<16)
-+		}
-+		if chance(ht, 30) && !Known.binaryTreeMatcher {
-+			c.Matcher = lzma.BinaryTree
-+		}
-+		p := "nil"
-+		if c.Properties != nil {
-+			p = c.Properties.String()
-+		}
-+		descr := fmt.Sprintf("Writer2Config{Properties: %s, DictCap: %d, BufSize: %d, Matcher: %s}", p, c.DictCap, c.BufSize, c.Matcher)
++		tc := hegel.Draw(ht, lzma2Cases)
++		ht.Assume(!slowMatcher(tc.data, tc.cfg.matcher)) // candidate/go/xz-9
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
++		descr := describeWriter2Config(c)
 +		note(ht, "%s, %d data bytes", descr, len(data))
 +		var buf bytes.Buffer
 +		w, err := c.NewWriter2(&buf)
 +		if err != nil {
 +			fail(ht, "NewWriter2: %v\n%s", err, descr)
 +		}
-+		flushes := 0
-+		rest := data
-+		for len(rest) > 0 {
-+			k := len(rest)
-+			if chance(ht, 50) {
-+				k = n(ht, 1, len(rest))
-+			}
-+			if _, err := w.Write(rest[:k]); err != nil {
-+				fail(ht, "Write: %v\n%s", err, descr)
-+			}
-+			rest = rest[k:]
-+			if chance(ht, 40) {
-+				if err := w.Flush(); err != nil {
-+					fail(ht, "Flush: %v\n%s", err, descr)
-+				}
-+				flushes++
-+			}
++		flushes, err := tc.writes.write(w, data)
++		if err != nil {
++			mismatch(ht, writer2Shape(c, len(data)), "%v\n%s", err, descr)
 +		}
 +		if err := w.Close(); err != nil {
-+			fail(ht, "Close: %v\n%s", err, descr)
++			mismatch(ht, writer2Shape(c, len(data)), "Close: %v\n%s", err, descr)
 +		}
 +		out := buf.Bytes()
-+		dict := c.DictCap
-+		if dict == 0 {
-+			dict = 8 << 20
-+		}
++		dict := tc.cfg.dict(len(data))
 +
-+		src, wrapName := wrapReader(ht, bytes.NewReader(out))
++		src := wrap(tc.wrap, bytes.NewReader(out))
 +		r, err := lzma.Reader2Config{DictCap: dict}.NewReader2(src)
 +		if err != nil {
 +			fail(ht, "NewReader2: %v\n%s", err, descr)
 +		}
-+		got, err := readAllChunked(ht, r, len(data)+1<<20, true)
++		got, err := tc.reads.readAll(r, len(data)+1<<20)
 +		if err != nil {
-+			fail(ht, "Read: %v after %d of %d bytes\n%s, %d flushes, reader %s", err, len(got), len(data), descr, flushes, wrapName)
++			mismatch(ht, writer2Shape(c, len(data)), "Read: %v after %d of %d bytes\n%s, %d flushes, reader %s", err, len(got), len(data), descr, flushes, tc.wrap)
 +		}
 +		if !bytes.Equal(got, data) {
-+			fail(ht, "decoded %d bytes, want %d (first difference at %d)\n%s, %d flushes, reader %s", len(got), len(data), firstDiff(got, data), descr, flushes, wrapName)
++			mismatch(ht, writer2Shape(c, len(data)), "decoded %d bytes, want %d (first difference at %d)\n%s, %d flushes, reader %s", len(got), len(data), firstDiff(got, data), descr, flushes, tc.wrap)
 +		}
 +		if !r.EOS() {
 +			fail(ht, "EOS() false after reading the closed stream to its end\n%s", descr)
@@ -1279,24 +2632,22 @@ index 0000000..cc080c5
 +
 +		xzGot, err := xzCLI(t, out, "--format=raw", "--lzma2=dict="+strconv.Itoa(dict), "-dc")
 +		if err != nil {
-+			fail(ht, "%v\n%s, %d flushes, data %s\nstream %x", err, descr, flushes, short(data), out[:min(len(out), 64)])
++			mismatch(ht, writer2Shape(c, len(data)), "%v\n%s, %d flushes, data %s\nstream %x", err, descr, flushes, short(data), out[:min(len(out), 64)])
 +		}
 +		if !bytes.Equal(xzGot, data) {
-+			fail(ht, "xz --format=raw -dc gave %d bytes, want %d (first difference at %d)\n%s", len(xzGot), len(data), firstDiff(xzGot, data), descr)
++			mismatch(ht, writer2Shape(c, len(data)), "xz --format=raw -dc gave %d bytes, want %d (first difference at %d)\n%s", len(xzGot), len(data), firstDiff(xzGot, data), descr)
 +		}
 +
-+		lc := n(ht, 0, 4)
-+		xdict := pick(ht, 4096, 1<<16, 1<<20, 8<<20)
-+		args := []string{"-c", "--format=raw", fmt.Sprintf("--lzma2=dict=%d,lc=%d,lp=%d,pb=%d,mf=%s", xdict, lc, n(ht, 0, 4-lc), n(ht, 0, 4), pick(ht, "hc3", "hc4", "bt2", "bt3", "bt4"))}
++		args := tc.args.args()
 +		xzOut, err := xzCLI(t, data, args...)
 +		if err != nil {
 +			fail(ht, "oracle failed: %v", err)
 +		}
-+		r2, err := lzma.Reader2Config{DictCap: xdict}.NewReader2(bytes.NewReader(xzOut))
++		r2, err := lzma.Reader2Config{DictCap: tc.args.dict}.NewReader2(bytes.NewReader(xzOut))
 +		if err != nil {
 +			fail(ht, "NewReader2 on xz %s output: %v", strings.Join(args, " "), err)
 +		}
-+		got2, err := readAllChunked(ht, r2, len(data)+1<<20, true)
++		got2, err := tc.reads.readAll(r2, len(data)+1<<20)
 +		if err != nil {
 +			fail(ht, "Read of xz %s output: %v after %d of %d bytes", strings.Join(args, " "), err, len(got2), len(data))
 +		}
@@ -1312,62 +2663,83 @@ index 0000000..cc080c5
 +// ---------------------------------------------------------------------------
 +// Corruption.
 +
++// mutation is one corruption of a stream: the kind, the byte it hits (at,
++// taken modulo the length) and the value it uses; a flip XORs with a non-zero
++// mask, an append adds the value and tail, the paddings add 1-3 or 4-12 zero
++// bytes.
 +type mutation struct {
 +	kind string
 +	at   int
 +	val  byte
++	tail []byte
++	n    int
 +}
 +
 +func (m mutation) String() string { return fmt.Sprintf("%s at %d (%#x)", m.kind, m.at, m.val) }
 +
-+func mutate(tc hegel.TestCase, in []byte) ([]byte, mutation) {
++// apply returns a copy of in with the mutation and the position it hit.
++func (m mutation) apply(in []byte) ([]byte, int) {
 +	out := append([]byte(nil), in...)
-+	m := mutation{kind: pick(tc, "flip", "zero", "truncate", "delete", "insert", "append", "shortpad", "pad", "flip", "truncate")}
++	pos := at(m.at, len(out))
 +	switch m.kind {
 +	case "flip":
-+		m.at = n(tc, 0, len(out)-1)
-+		m.val = byte(n(tc, 1, 255))
-+		out[m.at] ^= m.val
++		out[pos] ^= byte(1 + at(int(m.val), 255))
 +	case "zero":
-+		m.at = n(tc, 0, len(out)-1)
-+		out[m.at] = 0
++		out[pos] = 0
 +	case "truncate":
-+		m.at = n(tc, 0, len(out)-1)
-+		out = out[:m.at]
++		out = out[:pos]
 +	case "delete":
-+		m.at = n(tc, 0, len(out)-1)
-+		out = append(out[:m.at], out[m.at+1:]...)
++		out = append(out[:pos], out[pos+1:]...)
 +	case "insert":
-+		m.at = n(tc, 0, len(out))
-+		m.val = byte(n(tc, 0, 255))
-+		out = append(out[:m.at], append([]byte{m.val}, out[m.at:]...)...)
++		pos = at(m.at, len(out)+1)
++		out = append(out[:pos], append([]byte{m.val}, out[pos:]...)...)
 +	case "append":
-+		m.at = len(out)
-+		m.val = byte(n(tc, 1, 255))
-+		out = append(out, m.val)
-+		for i := n(tc, 0, 5); i > 0; i-- {
-+			out = append(out, byte(n(tc, 0, 255)))
-+		}
++		pos = len(out)
++		out = append(out, byte(1+at(int(m.val), 255)))
++		out = append(out, m.tail...)
 +	case "shortpad":
-+		m.at = len(out)
-+		out = append(out, make([]byte, n(tc, 1, 3))...)
++		pos = len(out)
++		out = append(out, make([]byte, 1+at(m.n, 3))...)
 +	case "pad":
-+		m.at = len(out)
-+		out = append(out, make([]byte, 4*n(tc, 1, 3))...)
++		pos = len(out)
++		out = append(out, padding(1+at(m.n, 3))...)
 +	}
-+	return out, m
++	return out, pos
 +}
 +
-+// lzma2PackedSizeOffsets walks a valid .xz stream (header, blocks of LZMA2 chunks with
-+// padding and check, index) and returns the offsets of the two compressed-size bytes of
-+// every LZMA chunk header — the field xz/8 leaves unverified. Nothing here decodes.
-+func lzma2PackedSizeOffsets(b []byte) []int {
-+	var out []int
++var mutations = hegel.Composite(func(tc hegel.TestCase) mutation {
++	return mutation{
++		kind: hegel.Draw(tc, pick("flip", "zero", "truncate", "delete", "insert", "append", "shortpad", "pad", "flip", "truncate")),
++		at:   hegel.Draw(tc, positions),
++		val:  byte(hegel.Draw(tc, hegel.Integers(0, 255))),
++		tail: hegel.Draw(tc, hegel.Binary(0, 5)),
++		n:    hegel.Draw(tc, hegel.Integers(0, 2)),
++	}
++})
++
++// xzBlock is one block of a valid .xz stream as xzLayout walks it: the
++// offset of its header, the header's length, the offset after its check,
++// and the offsets of the compressed-size field (two bytes, high first) of
++// every LZMA chunk in it.
++type xzBlock struct {
++	start, headerLen, end int
++	packed                []int
++}
++
++// xzLayout is the structure of a valid .xz stream: its blocks and the offset
++// of the index. Nothing here decodes.
++type xzLayout struct {
++	blocks []xzBlock
++	index  int
++}
++
++func layoutOf(b []byte) xzLayout {
++	var l xzLayout
 +	checkSize := map[byte]int{0: 0, 1: 4, 4: 8, 10: 32}[b[7]&0x0f]
 +	pos := 12
 +	for pos < len(b) && b[pos] != 0 { // 0 is the index indicator
-+		start := pos
-+		pos += (int(b[pos]) + 1) * 4 // block header
++		blk := xzBlock{start: pos, headerLen: (int(b[pos]) + 1) * 4}
++		pos += blk.headerLen
 +		for pos < len(b) {
 +			c := b[pos]
 +			if c == 0 { // end of the LZMA2 data
@@ -1379,91 +2751,156 @@ index 0000000..cc080c5
 +				continue
 +			}
 +			packed := (int(b[pos+3])<<8 | int(b[pos+4])) + 1
-+			out = append(out, pos+3, pos+4)
++			blk.packed = append(blk.packed, pos+3)
 +			hdr := 5
 +			if c >= 0xC0 { // a properties byte follows
 +				hdr = 6
 +			}
 +			pos += hdr + packed
 +		}
-+		for (pos-start)%4 != 0 {
++		for (pos-blk.start)%4 != 0 {
 +			pos++ // block padding
 +		}
 +		pos += checkSize
++		blk.end = pos
++		l.blocks = append(l.blocks, blk)
++	}
++	l.index = pos
++	return l
++}
++
++// lzma2PackedSizeOffsets walks a valid .xz stream (header, blocks of LZMA2 chunks with
++// padding and check, index) and returns the offsets of the two compressed-size bytes of
++// every LZMA chunk header - the field xz/8 leaves unverified.
++func lzma2PackedSizeOffsets(b []byte) []int {
++	var out []int
++	for _, blk := range layoutOf(b).blocks {
++		for _, p := range blk.packed {
++			out = append(out, p, p+1)
++		}
 +	}
 +	return out
 +}
 +
++// streamSource is where the valid stream of a corruption case comes from:
++// the Go Writer under a configuration, or the tool with its options.
++type streamSource struct {
++	fromXz bool
++	cfg    xzConfig
++	args   xzArgs
++}
++
++func (s streamSource) String() string {
++	if s.fromXz {
++		return s.args.String()
++	}
++	return "Writer " + s.cfg.String()
++}
++
++var streamSources = hegel.OneOf(
++	hegel.Map(xzConfigs, func(c xzConfig) streamSource { return streamSource{cfg: c} }),
++	hegel.Map(xzArgSets, func(a xzArgs) streamSource { return streamSource{fromXz: true, args: a} }),
++)
++
++// corruptCase: the data, the source of the valid stream, the Writer's
++// chunking, the mutation and the read chunking.
++type corruptCase struct {
++	data   dataSpec
++	src    streamSource
++	writes writePlan
++	mut    mutation
++	reads  readPlan
++}
++
++func (c corruptCase) GoString() string {
++	return fmt.Sprintf("%v from %v (%v): %v; %v", c.data, c.src, c.writes, c.mut, c.reads)
++}
++
++var corruptCases = hegel.Composite(func(tc hegel.TestCase) corruptCase {
++	return corruptCase{
++		data:   hegel.Draw(tc, dataSpecs),
++		src:    hegel.Draw(tc, streamSources),
++		writes: hegel.Draw(tc, writePlans),
++		mut:    hegel.Draw(tc, mutations),
++		reads:  hegel.Draw(tc, readPlans),
++	}
++})
++
 +// decodeGo decodes an .xz stream fully; a nil error means a clean EOF.
-+func decodeGo(tc hegel.TestCase, in []byte, limit int) ([]byte, error) {
++func decodeGo(reads readPlan, in []byte, limit int) ([]byte, error) {
 +	r, err := xz.NewReader(bytes.NewReader(in))
 +	if err != nil {
 +		return nil, err
 +	}
-+	return readAllChunked(tc, r, limit, true)
++	return reads.readAll(r, limit)
 +}
 +
 +// TestHegelCorruptStreamsAreRejected: one mutation of a valid stream (by the
-+// Writer or by xz) — the Reader either fails or returns exactly the original
++// Writer or by xz) - the Reader either fails or returns exactly the original
 +// data (a mutation that changes nothing), never panics, never returns
 +// different data or a truncation with a clean EOF; and its verdict agrees with
 +// `xz -dc`.
 +func TestHegelCorruptStreamsAreRejected(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
++		tc := hegel.Draw(ht, corruptCases)
++		ht.Assume(!manyBlocks(tc.src.args, tc.data.size) || !tc.src.fromXz)   // candidate/go/xz-10
++		ht.Assume(!slowMatcher(tc.data, tc.src.cfg.matcher) || tc.src.fromXz) // candidate/go/xz-9
++		data := tc.data.bytes()
 +		var valid []byte
 +		var origin string
-+		if chance(ht, 50) {
-+			c := genWriterConfig(ht, len(data))
-+			out, err := compressGo(ht, c, data)
-+			if err != nil {
-+				fail(ht, "%v\n%s", err, describeWriterConfig(c))
-+			}
-+			valid, origin = out, describeWriterConfig(c)
-+		} else {
-+			args := genXzArgs(ht)
++		if tc.src.fromXz {
++			args := tc.src.args.args()
 +			out, err := xzCLI(t, data, args...)
 +			if err != nil {
 +				fail(ht, "oracle failed: %v", err)
 +			}
 +			valid, origin = out, "xz "+strings.Join(args, " ")
++		} else {
++			c := tc.src.cfg.config(len(data))
++			out, err := compressGo(c, tc.writes, data)
++			if err != nil {
++				mismatch(ht, writerShape(c, len(data)), "%v\n%s", err, describeWriterConfig(c))
++			}
++			valid, origin = out, describeWriterConfig(c)
 +		}
-+		bad, m := mutate(ht, valid)
++		bad, pos := tc.mut.apply(valid)
++		m := tc.mut
++		m.at = pos
 +		note(ht, "%s; %s on %d bytes", origin, m, len(valid))
 +
-+		got, goErr := decodeGo(ht, bad, len(data)+1<<20)
++		got, goErr := decodeGo(tc.reads, bad, len(data)+1<<20)
 +		xzGot, xzErr := xzCLI(t, bad, "-dc")
 +		xzOK := xzErr == nil && bytes.Equal(xzGot, data)
 +		hasCheck := valid[7]&0x0f != 0
 +		ctx := fmt.Sprintf("%s; %s on the %d-byte stream (data %d bytes, check %#x)\nvalid  %x\nmutant %x", origin, m, len(valid), len(data), valid[7], valid[:min(len(valid), 96)], bad[:min(len(bad), 96)])
 +		if goErr == nil {
-+			if Known.lzma2PackedSizeUnchecked && (m.kind == "flip" || m.kind == "zero") && slices.Contains(lzma2PackedSizeOffsets(valid), m.at) {
-+				return // xz/8: the chunk's compressed size is not verified (overstated: decoded as if right; understated: a clean EOF)
-+			}
-+			if Known.truncatedBlockHeaderIsEOF && bytes.Equal(got, data[:min(len(got), len(data))]) &&
-+				(m.kind == "truncate" || (xzErr != nil && strings.Contains(xzErr.Error(), "Unexpected end of input"))) {
-+				// xz/1: a cut before the index (all data intact) or inside a block header; or a
-+				// mutation that makes the stream end early by xz's own verdict (an index indicator
-+				// flipped into a block-header size byte turns the index and footer into a truncated header)
-+				return
++			// The recorded shapes of a clean decode of a damaged stream: xz/8, a
++			// flipped or zeroed compressed-size byte of an LZMA chunk (overstated:
++			// decoded as if right; understated: a clean EOF); xz/1, a cut before
++			// the index (all data intact) or inside a block header, or a mutation
++			// that makes the stream end early by xz's own verdict (an index
++			// indicator flipped into a block-header size byte turns the index and
++			// footer into a truncated header).
++			shape := ""
++			if (m.kind == "flip" || m.kind == "zero") && slices.Contains(lzma2PackedSizeOffsets(valid), pos) {
++				shape = "xz/8"
++			} else if bytes.Equal(got, data[:min(len(got), len(data))]) && (m.kind == "truncate" || (xzErr != nil && strings.Contains(xzErr.Error(), "Unexpected end of input"))) {
++				shape = "xz/1"
 +			}
 +			if !hasCheck && xzErr == nil && !bytes.Equal(xzGot, data) {
 +				// no check: corruption of the payload is undetectable; the two decoders must still agree
 +				if !bytes.Equal(got, xzGot) {
-+					fail(ht, "unchecked stream: the Reader decoded %d bytes, xz %d (first difference at %d), neither with an error\n%s", len(got), len(xzGot), firstDiff(got, xzGot), ctx)
++					mismatch(ht, shape, "unchecked stream: the Reader decoded %d bytes, xz %d (first difference at %d), neither with an error\n%s", len(got), len(xzGot), firstDiff(got, xzGot), ctx)
 +				}
 +				return
 +			}
 +			if !bytes.Equal(got, data) {
-+				fail(ht, "the Reader returned %d bytes with a clean EOF, the original has %d (first difference at %d); xz: %v\n%s", len(got), len(data), firstDiff(got, data), xzErr, ctx)
++				mismatch(ht, shape, "the Reader returned %d bytes with a clean EOF, the original has %d (first difference at %d); xz: %v\n%s", len(got), len(data), firstDiff(got, data), xzErr, ctx)
 +			}
 +			if !xzOK {
-+				fail(ht, "the Reader accepted the mutated stream (data intact); xz rejects it: %v\n%s", xzErr, ctx)
++				mismatch(ht, shape, "the Reader accepted the mutated stream (data intact); xz rejects it: %v\n%s", xzErr, ctx)
 +			}
 +			return
-+		}
-+		if goErr == io.ErrUnexpectedEOF && m.kind != "truncate" && m.kind != "shortpad" && m.kind != "delete" && m.kind != "flip" && m.kind != "zero" && m.kind != "insert" {
-+			// (informational: which mutations are reported as unexpected EOF)
 +		}
 +		if xzOK {
 +			fail(ht, "the Reader rejected the mutated stream (%v after %d bytes) although xz decodes it to the original\n%s", goErr, len(got), ctx)
@@ -1476,22 +2913,57 @@ index 0000000..cc080c5
 +
 +func inRange(x, lo, hi int) bool { return lo <= x && x <= hi }
 +
++// configCase: a WriterConfig of in- and out-of-range values, a
++// ReaderConfig.DictCap and the classic WriterConfig's size fields.
++type configCase struct {
++	props        *lzma.Properties
++	dictCap      int
++	bufSize      int
++	blockSize    int
++	checkSum     byte
++	noCheckSum   bool
++	matcher      lzma.MatchAlgorithm
++	readerDict   int
++	size         int64
++	sizeInHeader bool
++	eosMarker    bool
++}
++
++func (c configCase) GoString() string {
++	return fmt.Sprintf("props %s, DictCap %d, BufSize %d, BlockSize %d, CheckSum %#x, NoCheckSum %v, Matcher %d; ReaderConfig.DictCap %d; Size %d, SizeInHeader %v, EOSMarker %v",
++		propsName(c.props), c.dictCap, c.bufSize, c.blockSize, c.checkSum, c.noCheckSum, c.matcher, c.readerDict, c.size, c.sizeInHeader, c.eosMarker)
++}
++
++var (
++	// edgeProps: each field one past its documented range on both sides.
++	edgeProps = hegel.Composite(func(tc hegel.TestCase) *lzma.Properties {
++		return &lzma.Properties{LC: hegel.Draw(tc, hegel.Integers(-1, 9)), LP: hegel.Draw(tc, hegel.Integers(-1, 5)), PB: hegel.Draw(tc, hegel.Integers(-1, 5))}
++	})
++	configCases = hegel.Composite(func(tc hegel.TestCase) configCase {
++		return configCase{
++			props: hegel.Draw(tc, maybe(70, edgeProps)),
++			// (MaxDictCap-sized values are valid but allocate gigabytes: not drawn)
++			dictCap:      hegel.Draw(tc, pick(0, 4095, 4096, 8<<20, -1, 100)),
++			bufSize:      hegel.Draw(tc, pick(0, 1, 272, 273, 4096, -5)),
++			blockSize:    hegel.Draw(tc, pick(0, 1, 100, -1, -100)),
++			checkSum:     hegel.Draw(tc, pick[byte](0, xz.CRC32, xz.CRC64, xz.SHA256, 0x02, 0x0f, 0x10, 0xff)),
++			noCheckSum:   hegel.Draw(tc, chance(30)),
++			matcher:      hegel.Draw(tc, pick[lzma.MatchAlgorithm](0, 1, 2, 200)),
++			readerDict:   hegel.Draw(tc, pick(0, 4095, 4096, 1<<20, -1)),
++			size:         hegel.Draw(tc, pick[int64](0, -1, 5, 1<<40)),
++			sizeInHeader: hegel.Draw(tc, chance(40)),
++			eosMarker:    hegel.Draw(tc, chance(40)),
++		}
++	})
++)
++
 +// TestHegelConfigsAreVerified: Verify accepts exactly the documented ranges
 +// (zero values default) and NewWriter/NewReader refuse invalid configs with an
 +// error rather than a panic; the accepted configs produce a decodable stream.
 +func TestHegelConfigsAreVerified(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		c := xz.WriterConfig{}
-+		if chance(ht, 70) {
-+			c.Properties = &lzma.Properties{LC: n(ht, -1, 9), LP: n(ht, -1, 5), PB: n(ht, -1, 5)}
-+		}
-+		// (MaxDictCap-sized values are valid but allocate gigabytes: not drawn)
-+		c.DictCap = pick(ht, 0, 4095, 4096, 8<<20, -1, 100)
-+		c.BufSize = pick(ht, 0, 1, 272, 273, 4096, -5)
-+		c.BlockSize = int64(pick(ht, 0, 1, 100, -1, -100))
-+		c.CheckSum = pick(ht, 0, xz.CRC32, xz.CRC64, xz.SHA256, 0x02, 0x0f, 0x10, 0xff)
-+		c.NoCheckSum = chance(ht, 30)
-+		c.Matcher = lzma.MatchAlgorithm(pick(ht, 0, 1, 2, 200))
++		tc := hegel.Draw(ht, configCases)
++		c := xz.WriterConfig{Properties: tc.props, DictCap: tc.dictCap, BufSize: tc.bufSize, BlockSize: int64(tc.blockSize), CheckSum: tc.checkSum, NoCheckSum: tc.noCheckSum, Matcher: tc.matcher}
 +		descr := describeWriterConfig(c)
 +
 +		wantOK := true
@@ -1522,13 +2994,13 @@ index 0000000..cc080c5
 +			if err := w.Close(); err != nil {
 +				fail(ht, "Close: %v\n%s", err, descr)
 +			}
-+			got, err := decodeGo(ht, buf.Bytes(), 1<<20)
++			got, err := decodeGo(readPlan{[]int{1000}}, buf.Bytes(), 1<<20)
 +			if err != nil || string(got) != "abc" {
 +				fail(ht, "round trip gave %q, %v\n%s", got, err, descr)
 +			}
 +		}
 +
-+		rc := xz.ReaderConfig{DictCap: pick(ht, 0, 4095, 4096, 1<<20, -1)}
++		rc := xz.ReaderConfig{DictCap: tc.readerDict}
 +		rerr := rc.Verify()
 +		wantR := rc.DictCap == 0 || inRange(rc.DictCap, 4096, 1<<32-1)
 +		if (rerr == nil) != wantR {
@@ -1543,10 +3015,7 @@ index 0000000..cc080c5
 +		}
 +
 +		// classic lzma writer config
-+		lc := lzma.WriterConfig{DictCap: c.DictCap, BufSize: c.BufSize, Matcher: c.Matcher, Properties: c.Properties}
-+		lc.Size = int64(pick(ht, 0, -1, 5, 1<<40))
-+		lc.SizeInHeader = chance(ht, 40)
-+		lc.EOSMarker = chance(ht, 40)
++		lc := lzma.WriterConfig{DictCap: c.DictCap, BufSize: c.BufSize, Matcher: c.Matcher, Properties: c.Properties, Size: tc.size, SizeInHeader: tc.sizeInHeader, EOSMarker: tc.eosMarker}
 +		wantL := true
 +		if lc.Properties != nil {
 +			p := lc.Properties
@@ -1559,8 +3028,7 @@ index 0000000..cc080c5
 +		wantL = wantL && !(sizeInHeader && lc.Size < 0)
 +		lerr := lc.Verify()
 +		if (lerr == nil) != wantL {
-+			fail(ht, "lzma.WriterConfig{Properties: %v, DictCap: %d, BufSize: %d, Matcher: %d, SizeInHeader: %v, Size: %d, EOSMarker: %v}.Verify() = %v, want ok=%v",
-+				c.Properties, lc.DictCap, lc.BufSize, lc.Matcher, lc.SizeInHeader, lc.Size, lc.EOSMarker, lerr, wantL)
++			fail(ht, "%s.Verify() = %v, want ok=%v", describeLzmaConfig(lc), lerr, wantL)
 +		}
 +	})
 +}
@@ -1588,30 +3056,65 @@ index 0000000..cc080c5
 +	return len(p), nil
 +}
 +
++// sinkCase: non-empty data, a sink that fails after limit bytes, which
++// writer is over it (with its configuration) and the write chunking.
++type sinkCase struct {
++	data   dataSpec
++	limit  int
++	kind   string
++	cfg    xzConfig
++	lcfg   lzmaConfig
++	writes writePlan
++}
++
++func (c sinkCase) GoString() string {
++	cfg := "default"
++	switch c.kind {
++	case "xz":
++		cfg = c.cfg.String()
++	case "lzma":
++		cfg = c.lcfg.String()
++	}
++	return fmt.Sprintf("%s writer %s over a sink failing after %d bytes, %v, %v", c.kind, cfg, c.limit, c.data, c.writes)
++}
++
++var (
++	writerKinds = pick("xz", "lzma", "lzma2")
++	sinkCases   = hegel.Composite(func(tc hegel.TestCase) sinkCase {
++		return sinkCase{
++			data:   hegel.Draw(tc, nonEmptyDataSpecs),
++			limit:  hegel.Draw(tc, hegel.Integers(0, 40)),
++			kind:   hegel.Draw(tc, writerKinds),
++			cfg:    hegel.Draw(tc, xzConfigs),
++			lcfg:   hegel.Draw(tc, lzmaConfigs),
++			writes: hegel.Draw(tc, writePlans),
++		}
++	})
++)
++
++// newWriterOver opens the writer of the kind over the sink.
++func newWriterOver(c sinkCase, sink io.Writer, dataLen int) (io.WriteCloser, error) {
++	switch c.kind {
++	case "xz":
++		return c.cfg.config(dataLen).NewWriter(sink)
++	case "lzma":
++		return c.lcfg.config(dataLen).NewWriter(sink)
++	}
++	return lzma.NewWriter2(sink)
++}
++
 +// TestHegelWritersReportTheirSinksErrors: when the underlying writer fails, the
 +// error surfaces from Write or Close (never swallowed), and the writers refuse
 +// use after Close.
 +func TestHegelWritersReportTheirSinksErrors(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
-+		if len(data) == 0 {
-+			data = []byte("x")
-+		}
-+		limit := n(ht, 0, 40)
-+		kind := pick(ht, "xz", "lzma", "lzma2")
++		tc := hegel.Draw(ht, sinkCases)
++		ht.Assume(!slowMatcher(tc.data, tc.cfg.matcher) || tc.kind != "xz")    // candidate/go/xz-9
++		ht.Assume(!slowMatcher(tc.data, tc.lcfg.matcher) || tc.kind != "lzma") // candidate/go/xz-9
++		data := tc.data.bytes()
++		kind, limit := tc.kind, tc.limit
 +		sink := &failWriter{limit: limit}
-+		var w io.WriteCloser
-+		var err error
-+		switch kind {
-+		case "xz":
-+			c := genWriterConfig(ht, len(data))
-+			w, err = c.NewWriter(sink)
-+		case "lzma":
-+			s := genLzmaWriterConfig(ht, len(data))
-+			w, err = s.c.NewWriter(sink)
-+		default:
-+			w, err = lzma.NewWriter2(sink)
-+		}
++		w, err := newWriterOver(tc, sink, len(data))
 +		note(ht, "%s writer over a sink failing after %d bytes, %d data bytes", kind, limit, len(data))
 +		if err != nil {
 +			if !errors.Is(err, errSink) && !strings.Contains(err.Error(), "sink failed") {
@@ -1619,15 +3122,14 @@ index 0000000..cc080c5
 +			}
 +			return // the header write already failed: fine
 +		}
-+		var werr error
-+		for len(data) > 0 && werr == nil {
-+			k := n(ht, 1, len(data))
-+			_, werr = w.Write(data[:k])
-+			data = data[k:]
-+		}
++		werr := tc.writes.write(w, data)
 +		cerr := w.Close()
 +		if sink.failed && werr == nil && cerr == nil && !(Known.writer2CloseSwallows && kind == "lzma2") {
-+			fail(ht, "%s writer over a sink that fails after %d bytes: neither Write nor Close reported an error (sink got %d bytes)", kind, limit, sink.n)
++			shape := ""
++			if kind == "lzma2" {
++				shape = "xz/5"
++			}
++			mismatch(ht, shape, "%s writer over a sink that fails after %d bytes: neither Write nor Close reported an error (sink got %d bytes)", kind, limit, sink.n)
 +		}
 +		if Known.lzmaWriterAfterClose && kind == "lzma" {
 +			return
@@ -1636,11 +3138,18 @@ index 0000000..cc080c5
 +			return // Close returned nil without marking the writer closed
 +		}
 +		// after Close: Write and Close fail
++		shape := ""
++		switch {
++		case kind == "lzma":
++			shape = "xz/6"
++		case kind == "lzma2" && sink.failed:
++			shape = "xz/5"
++		}
 +		if _, err := w.Write([]byte("more")); err == nil {
-+			fail(ht, "%s writer accepted a Write after Close", kind)
++			mismatch(ht, shape, "%s writer accepted a Write after Close", kind)
 +		}
 +		if err := w.Close(); err == nil {
-+			fail(ht, "%s writer accepted a second Close", kind)
++			mismatch(ht, shape, "%s writer accepted a second Close", kind)
 +		}
 +	})
 +}
@@ -1650,11 +3159,13 @@ index 0000000..cc080c5
 +// stream one byte at a time never returns n < 0 or n > len(p).
 +func TestHegelReadersAreIOReaders(t *testing.T) {
 +	property(t, func(ht *hegel.T) {
-+		data := genData(ht)
-+		c := genWriterConfig(ht, len(data))
-+		out, err := compressGo(ht, c, data)
++		tc := hegel.Draw(ht, writerCases)
++		ht.Assume(!slowMatcher(tc.data, tc.cfg.matcher)) // candidate/go/xz-9
++		data := tc.data.bytes()
++		c := tc.cfg.config(len(data))
++		out, err := compressGo(c, tc.writes, data)
 +		if err != nil {
-+			fail(ht, "%v\n%s", err, describeWriterConfig(c))
++			mismatch(ht, writerShape(c, len(data)), "%v\n%s", err, describeWriterConfig(c))
 +		}
 +		r, err := xz.NewReader(bytes.NewReader(out))
 +		if err != nil {
@@ -1668,12 +3179,12 @@ index 0000000..cc080c5
 +		}
 +		got, err := io.ReadAll(r)
 +		if err != nil || !bytes.Equal(got, data) {
-+			fail(ht, "ReadAll after empty reads: %d bytes, %v; want %d\n%s", len(got), err, len(data), describeWriterConfig(c))
++			mismatch(ht, writerShape(c, len(data)), "ReadAll after empty reads: %d bytes, %v; want %d\n%s", len(got), err, len(data), describeWriterConfig(c))
 +		}
 +		var sink bytes.Buffer
 +		r2, _ := xz.NewReader(iotest.OneByteReader(bytes.NewReader(out)))
 +		if k, err := io.Copy(&sink, r2); err != nil || k != int64(len(data)) || !bytes.Equal(sink.Bytes(), data) {
-+			fail(ht, "io.Copy: %d bytes, %v; want %d\n%s", k, err, len(data), describeWriterConfig(c))
++			mismatch(ht, writerShape(c, len(data)), "io.Copy: %d bytes, %v; want %d\n%s", k, err, len(data), describeWriterConfig(c))
 +		}
 +	})
 +}

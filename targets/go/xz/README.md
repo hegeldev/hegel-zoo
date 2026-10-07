@@ -51,13 +51,20 @@ through `HEGEL_XZ`.
 | WritersReportTheirSinksErrors | a failing underlying writer surfaces from Write or Close; Write/Close after Close fail |
 | ReadersAreIOReaders | empty reads, `io.ReadAll`, `io.Copy` through a one-byte reader |
 
-A `Known` switch per recorded bug gates the input shape while the bug is open (truncations
-that decode cleanly are not counted; DictCap under 64 KiB is raised for data longer than the
-dictionary; every Writer uses HashTable4 only; an explicit size of 0 is not written; the
-Writer2 sink checks and the lzma.Writer after-Close checks are skipped; the classic Reader is not
-given empty buffers). With everything gated the nine properties run clean at 300 cases (about
-2 minutes, most of it xz processes); `XZ_COLLECT=1` records mismatches instead of failing and
-prints them shortest-first, `HEGEL_VERBOSE=1` turns on the engine's log. Hegel's too-slow health
+Every recorded bug is drawn by default and found by the properties (DESIGN.md decision 3): the
+generators draw truncations anywhere, dictionaries under 64 KiB, the BinaryTree matcher, an
+explicit size of 0 and empty reads, and run the Writer2 sink and lzma.Writer after-Close checks,
+so the wide properties fail naming the shape - every run for `WritersReportTheirSinksErrors`
+(xz/6), at a few percent of cases for the round trips (xz/2), the classic round trip (xz/4, in
+some runs xz/7) and the corruption property (xz/1), mapped as intermittent expected failures.
+The narrow properties of `hegel_shapes_test.go` draw each shape region deterministically, one
+per bug: `StreamsCutAtBlockBoundariesAreErrors` (1), `SmallDictionariesCompressIncompressibleData`
+(2), `BinaryTreeMatcherStreamsDecode` (3), `ExplicitSizeHeadersRoundTrip` (4),
+`Writer2ReportsTheFlushError` (5), `LzmaWriterRefusesWritesAfterClose` (6),
+`EmptyReadsAreNotEOFWhileDataRemains` (7) and `Lzma2PackedSizesAreVerified` (8). `HEGEL_NO_KNOWN=1`
+switches the shapes off (the `Known` switches come on, the narrow properties draw the
+neighbouring region) and every property passes. `XZ_COLLECT=1` records mismatches instead of
+failing and prints them shortest-first, `HEGEL_VERBOSE=1` turns on the engine's log. Hegel's too-slow health
 check is suppressed: the xz-forking properties take over a second per case on a loaded machine,
 and the check then fails the run (hegel-go reports a run-level error with no message — the first
 clean `zoo test` failed that way while five bumps were building in parallel).
@@ -67,7 +74,7 @@ clean `zoo test` failed that way while five bumps were building in parallel).
 | id | summary | severity |
 |----|---------|----------|
 | xz/1 | a truncated stream decodes with a clean `io.EOF` when the cut falls in a block header, between blocks, or (no check) inside block data — 66 of 299 prefixes of a 3-block stream; also reached by a flip that turns the index indicator into a block-header size byte | high |
-| xz/2 | Writer/Writer2 fail with "insufficient space" on incompressible data when DictCap < 64 KiB (uncompressed chunk copied from a dictionary that no longer holds it) | medium |
+| xz/2 | Writer/Writer2 fail with "insufficient space" on incompressible data when DictCap < 64 KiB (uncompressed chunk copied from a dictionary that no longer holds it), or, when the data ends before the chunk does, write a broken stream with no error at all | medium |
 | xz/3 | `Matcher: BinaryTree` writes undecodable streams, classic and LZMA2 ("distance out of range" in lzma.Reader, "corrupt" for xz); known in upstream's TODO | medium |
 | xz/4 | `SizeInHeader` with `Size: 0` writes an unknown-size header without an EOS marker: the empty stream is unreadable | medium |
 | xz/5 | `Writer2.Close` returns nil when the flush fails | medium |
@@ -109,7 +116,13 @@ compressed-size bytes of a single-block stream showed both directions.
 - Every block allocates a new dictionary and matcher of `DictCap` bytes, so many small blocks
   with a large dictionary are slow (64 KiB in one-byte blocks with the default 8 MiB
   dictionary and BinaryTree: minutes). A performance shape, not recorded; the generator keeps
-  the block count within 64.
+  the block count within 64. The Reader does the same per block (`xz -c --block-size=1` of
+  256 KiB of random data, 262144 blocks with the default 8 MiB dictionary, runs the Go Reader
+  for over a minute and out of memory where `xz -dc` takes 0.07 s), and the BinaryTree matcher
+  is superlinear on low-entropy input (256 KiB of a two-letter alphabet: 29 s against 20 ms for
+  HashTable4 and 0.12 s for `xz --lzma2=mf=bt4`); both are left reachable behind named assumes
+  (`candidate/go/xz-10`: more than 4096 blocks from the tool; `candidate/go/xz-9`: BinaryTree
+  on more than 64 KiB of low-entropy data) and not recorded.
 - `DictCap` up to `MaxDictCap` (4 GiB − 1) is valid and allocates a dictionary and hash table
   of that size at once (a 2 GiB value ran the test process out of memory); the config property
   draws dictionaries up to 8 MiB.
@@ -122,3 +135,9 @@ Filters other than LZMA2 (the package supports none), multi-threading (none), th
 `xb` commands, `internal/*`, Writer2 output concatenated after a Flush without Close, dictionary
 sizes above 8 MiB, streams above 256 KiB.
 - 2026-09-20: base bumped 024f9092972a → 6ead826b4d3c (2026-09-19, "Prepare release v0.5.17"; v0.5.17); 8 bug(s) still reproduce. 9 tests pass.
+- 2026-10-07: generators rewritten in combinator style (STYLE.md): package-level generator
+  values (data as a `dataSpec` record filled from a seeded source, writer configs as records
+  rendered by pure `config` methods with the defaults first, read and write plans as lists of
+  sizes applied modulo what is left, corruptions as a `mutation` record with a pure `apply`,
+  the xz arguments as a record), the known shapes drawn by default with the narrow properties
+  beside the pins; xz/2's silent form found on the way.
