@@ -12,8 +12,9 @@ keeps its tests in its own patch and files nothing upstream.
 
 ## Build
 
-`go test -count=1 -v .` in the module root. The patch adds `hegel_test.go` (properties),
-`hegel_pins_test.go` (one plain test per bug) and `hegel_oracle.mjs` (a node child process that
+`go test -count=1 -v .` in the module root. The patch adds `hegel_test.go` (harness, oracles,
+classifiers, properties), `hegel_gen_test.go` (the generators), `hegel_shapes_test.go` (narrow
+properties), `hegel_pins_test.go` (one plain test per bug) and `hegel_oracle.mjs` (a node child process that
 answers render requests over stdin/stdout), and requires `hegel.dev/go/hegel v0.6.33` and
 `github.com/yuin/goldmark v1.8.6` in go.mod. The `[run] setup` step installs commonmark.js,
 micromark and `micromark-extension-gfm` under `.hegel/` (4 MB, excluded from the patch); node 22
@@ -48,7 +49,7 @@ NUL bytes.
 | CommonMarkAgreesWithCommonmarkJs | exact HTML agreement (XHTML, unsafe) with commonmark.js; micromark's verdict on every mismatch |
 | GfmAgreesWithMicromark | tables + strikethrough + task lists against micromark + gfm, on documents whose CommonMark core the two reference implementations agree on |
 | RewriteAgreesWithVersion1 | v2 against v1.8.6, CommonMark then GFM, minus the documented v2 changes |
-| ...AgreesWithCommonmarkJs, ...AgreesWithMicromark (ten) | narrow properties over the shape regions of bugs 9, 10, 16, 25, 28 and 30–34, judged by the same oracles; each fails deterministically |
+| ...AgreesWithCommonmarkJs, ...AgreesWithMicromark, ...AgreesWithGfmAutolinkLiterals, AstIsWellFormedWithTables (thirty-four) | narrow properties over the shape region of every bug, judged by the same oracles; each fails deterministically |
 | LinkifyAgreesWithGfmAutolinkLiterals | the Linkify extension against `micromark-extension-gfm-autolink-literal` on runs of URLs, emails and words separated by the GFM start characters |
 | SafeOutputIsWellFormedHtml | every extension on, raw HTML off: balanced tags, quoted attributes, every `&` an escape, no `javascript:`/`vbscript:`/`file:`/`data:` (except images) href or src |
 | AstIsWellFormed | parent/sibling links, `ChildCount`, `OwnerDocument`, `Source()` segments inside the source and in order, `Dump` runs, rendering the same tree twice and from a string source gives the same HTML |
@@ -59,11 +60,10 @@ NUL bytes.
 | RenderingTimeIsNotSuperLinear | random repeated units at 1500 and 6000 repetitions; nothing found |
 | Pin UpstreamFixturesStillPass | the 652 spec examples through `testutil.DoTestCases` (passes) |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (regexes and two small scanners for table cell counts), and accepted differences are
-normalised on both sides. With the switches of bugs 1–29 gated the four differential properties fail only on
-bugs 30–34 (below); `ZOO_COLLECT=1 go test -run TestHegel... -v .` prints the class counts and the
-first 25 mismatches instead of failing.
+Mismatches are classified: a rule per recorded bug (regexes and two small scanners for table
+cell counts) names the bug a mismatching document has the shape of, and accepted differences
+are normalised on both sides; `ZOO_COLLECT=1 go test -run TestHegel... -v .` prints the class
+counts and the first 25 mismatches instead of failing.
 
 ## Accepted differences (not bugs)
 
@@ -109,14 +109,74 @@ strikethrough (31), and seven in the Linkify extension (18, 19, 20, 22, 24, 27).
 visible: a paragraph line followed by a tab-indented `---` becomes a one-column table. Five are v2
 regressions (4, 8, 11, 29, 33); the rest are shared with v1.8.6.
 
-Bugs 30–34 came out of the weekly 1000-case run of 2026-09-28 and are drawn by default: their
-`Known` switches are off unless `HEGEL_NO_KNOWN=1` is set, so the CommonMark differential fails
-at its natural rate on 30 (and 33, 34), the GFM differential on 32 (and 31), the rewrite property
-on 33, and each is listed in `target.toml` as an intermittent expected failure mapped to one of
-them. Each of the five, and bugs 9, 10, 16, 25 and 28, also has a narrow property over its shape
-region (`...AgreesWithCommonmarkJs` / `...AgreesWithMicromark`) that fails deterministically
-beside the pin. The `Known` switches of bugs 1–29 are still on by default, which is steering;
-unsteering them is on the worklist.
+Bugs 30–34 came out of the weekly 1000-case run of 2026-09-28; since 2026-10-07 every known
+shape is drawn by default (next section).
+
+## Known shapes drawn by default
+
+All 34 `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them on):
+the generators draw a leading BOM, lone carriage returns and NUL bytes at their natural rates,
+the classifiers (`commonMarkShapes`, `linkifyShapes`, `gfmShapes`: tables of `{bug, class,
+switch, regex}`) no longer skip a document before it is judged, and on a mismatch they name
+the bugs whose shape the document has (`mismatch(ht, bugs, ...)`; a document of a known shape
+on which goldmark and the oracle agree counts as ok, since the regexes over-approximate).
+Accepted and ambiguous shapes are consulted after judging too, so a mismatch of an accepted
+shape is still excused but an agreement is no longer thrown away (the raw-HTML-in-alt rule
+alone used to skip a fifth of the GFM documents). Over 17 default rounds
+`TestHegelCommonMarkAgreesWithCommonmarkJs` shrank to goldmark/1 and goldmark/2 six times
+each (11 twice, 14, 7, 25 once; never passed) and is mapped to goldmark/1;
+`TestHegelGfmAgreesWithMicromark` to goldmark/8 eight times (10, 21 once; passed six) and
+`TestHegelRewriteAgreesWithVersion1` to goldmark/4 three times (11 three, 29, 10, 15 once;
+passed eight), both intermittent; `TestHegelLinkifyAgreesWithGfmAutolinkLiterals` to
+goldmark/22 nine times (19 six, 20, 18 once; never passed), plain;
+`TestHegelAstIsWellFormed` to goldmark/23 fifteen times (passed twice), intermittent.
+Under `HEGEL_NO_KNOWN=1` the classifiers skip the known shapes before judging as before, and
+every wide property passes at the default case count (a 1000-case run still finds shapes the
+regexes miss - a known shape inside a container, a lazy delimiter row - which are being
+chased); the skip is 35-40% of the CommonMark, GFM and rewrite documents,
+mostly the over-approximating regexes of bugs 4 (any image followed by a backtick, 16%), 21, 9,
+5, 10 and 16 - tightening them is on the worklist.
+
+Every bug has a narrow property over its shape region, judged by the same oracle: the ten of
+2026-09-28 in `hegel_test.go` and twenty-four new ones in `hegel_shapes_test.go`
+(`LeadingBom`, `LoneCarriageReturn`, `EmptyItemUnderCrlf`, `ImageAltWithCodeSpan`,
+`ImageAltWithAutolink`, `ImageAltWithHardBreak`, `NulInput`, `OpenTagAtEndOfLine`,
+`DelimiterAfterQuoteMarker`, `InfoStringTab`, `CodeSpanCrlf`, `DefinitionInListItem`,
+`LowercaseDeclaration`, `UnclosedFenceInContainer`, `InvalidTitleLine` - each
+`...AgreesWithCommonmarkJs`; `TableCellCount` and `IndentedDelimiterRow`
+`...AgreesWithMicromark`; `AstIsWellFormedWithTables` for 23; `AutolinkLiteralWithStar`,
+`EmailAutolinkWithLeadingUnderscore`, `WwwAutolinkWithOnePeriod`,
+`AutolinkLiteralParenAfterDomain`, `EmailAutolinkLocalPart`, `UnderscoreInWwwDomain`
+`...AgreesWithGfmAutolinkLiterals`). Each fails on its bug; under `HEGEL_NO_KNOWN=1` the new
+ones draw the neighbouring region and pass (the ten older ones draw their shape regardless).
+
+The generators are package-level values in combinator style (`hegel_gen_test.go`): every
+construct a record (`emphasis{marker, inner, closer}`, `link{bang, form, text, dest, title}`,
+`fence{indent, marker, info, body, close}`, `blockQuote{prefixes, inner}`, `list{ordered,
+start, bullet, delim, loose, items}`, `table{header, seps, rows}`, ...) rendered to Markdown
+by pure functions; the inline and block grammars are depth-indexed generators memoised per
+depth with words and paragraphs as the first alternatives; a `document` carries its body and
+a `docStyle{lineEnd, trailer, bom, nul}`; the grammar is built once per configuration
+(`plainDocs` without bare URLs for the CommonMark and GFM properties, `proseDocs` with them).
+
+Judging changes of 2026-10-07: micromark's agreement with commonmark.js is checked before the
+emphasis-stripping comparison, so an emphasis-only disagreement is no longer excused as a
+commonmark.js quirk (bug 12's region was unreachable before); the rewrite property normalises
+whitespace-only lines inside `<pre>` on both sides (`v1-blank-line-in-code`) instead of
+skipping the document; the Linkify judge applies the GFM property's micromark-core tie-break;
+the AST property skips (under `HEGEL_NO_KNOWN=1`) exactly the documents whose tree contains a
+table. Three regexes were retuned so that the shapes are recognised inside nested quotes
+(`> \t` under `>\t`), after spaces before the tab (`- *  \tb`) and for raw HTML only (not
+autolinks) in image alt text.
+
+Four candidate bugs found by the rewrite are gated by classifier rules named
+`candidate/go/goldmark-1..4` (switches off by default, so the shapes are drawn and fail by
+name) and await standalone reproduction before they are recorded: a one-character info string
+of a fence opened on the document's last line without a final newline is dropped (1);
+`<pre/>` (script, style, textarea too) at a line start opens a type-1 HTML block that runs to
+the end of the document where the references read a type-7 block ending at the blank line (2);
+an e-mail autolink literal starting with `-`, `+` or `.` is not linked at all (3); a hyphen in
+the last segment of an autolink literal's domain ends the link before it (4).
 
 ## Not tested
 
@@ -126,3 +186,4 @@ East Asian line breaking, CJK options, the `text` package's readers directly, an
 - 2026-09-17: base bumped 710cc2656aa3 → c4c7034e4ff2 (2026-09-17, "chore: delete debug print"; v2.1.3); 29 bug(s) still reproduce. 36 tests pass.
 - 2026-09-18: base bumped c4c7034e4ff2 → dcdeda312dc8 (2026-09-19, "fix(text): ForceNewLine breaks original source bytes"; v2.1.4); 29 bug(s) still reproduce. 36 tests pass.
 - 2026-09-20: base bumped dcdeda312dc8 → 63f3cd21f554 (2026-09-19, "docs(CONTRIBUTING): add CONTRIBUTING.md"; v2.1.5+); 29 bug(s) still reproduce. 37 tests pass.
+- 2026-10-07: generators rewritten in combinator style; all known shapes drawn by default (two wide properties plain, three intermittent); twenty-four narrow properties added; four candidates gated by name.
