@@ -42,6 +42,38 @@ and `ToMixedString` of a prefixed subnet that is not a prefix block writes wildc
 segments as 0.0.0.0, turning 2^32 addresses into one (3, medium). Parsing agreed with Python
 and netip on everything the two accept, and the subnet, range and trie operations were exact.
 
-Gates (`hegel/known.go`) match the shapes of the three bugs so the properties stay green;
-subnets that split into more than 4000 sequential blocks skip the span and merge checks
-(the library builds one block per piece), and nothing else is excluded.
+Known shapes are drawn by default (`hegel/known.go`): the classifier of the three bugs is
+consulted only under `HEGEL_NO_KNOWN=1` (read once), and otherwise `TestHegelStringsRoundTrip`
+fails on them with the mismatch naming the bug. The string form checked is part of the drawn
+case, so the IPv4 full string (ipaddress-go/1, a quarter of IPv4 addresses) is one alternative
+among the forms rather than a quarter of every case: the property shrinks to `"0.0.0.8"
+through ToFullString` in about three default rounds of four (13 of 17) and is mapped to
+ipaddress-go/1 as intermittent; the /2 and /3 shapes are a few hundredths of a percent of
+cases once the form is drawn and were not reached by a default round. Under
+`HEGEL_NO_KNOWN=1` the classifier skips the three shapes (1% of round-trip cases) and every
+property passes while the three pins fail. One narrow property per bug lives in
+`hegel/hegel_shapes_test.go`: `IPv4FullStringsParseBack` (1), `IPv6MixedStringsOfPrefixBlocksParseBack`
+(2: prefix blocks with a prefix length of 97-111 or 113-127) and `IPv6MixedStringsKeepWildcardTails`
+(3: prefixed subnets that are not prefix blocks with full-range last two segments; those the
+library reads as a prefix block are a counted class); under `HEGEL_NO_KNOWN=1` each draws the
+neighbouring region (IPv6 full strings, prefix lengths on segment boundaries, single-valued or
+short-range tails) and passes. The generators are package-level values in combinator style:
+addresses as records (octets or groups, a spelling record for IPv6 - compression, padding, case,
+embedded tail, zone, prefix - rendered by a pure function), mutations as edits applied modulo the
+live length, wide forms as per-segment records, round-trip, arithmetic, subnet and trie cases as
+records whose sample points are resolved modulo the live sizes.
+
+Counted, not failed, beyond the classes above (differences between ipaddr and Python's
+ipaddress, seen at 3000 cases): a second `%` in a zone (ipaddr's `ValidateZoneStr` refuses
+only `:` and `/`, so `::%eth0%zone` reads with the zone `eth0%zone`; Python rejects it); an
+embedded IPv4 tail of fewer than four parts, an inet_aton form (`::ff9b:200.0`); and a zone
+containing a colon (`::328%1:`), which Python reads and ipaddr and `net/netip` refuse.
+
+Subnets that split into more than 4000 sequential blocks skip the span and merge checks
+(the library builds one block per piece); nothing else is excluded.
+
+## History
+
+- 2026-09-20: new target, six properties, three bugs.
+- 2026-10-07: generators rewritten in combinator style; known shapes drawn by default
+  (`TestHegelStringsRoundTrip` mapped to ipaddress-go/1, intermittent); three narrow properties.
