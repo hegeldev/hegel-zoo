@@ -49,7 +49,7 @@ NUL bytes.
 | CommonMarkAgreesWithCommonmarkJs | exact HTML agreement (XHTML, unsafe) with commonmark.js; micromark's verdict on every mismatch |
 | GfmAgreesWithMicromark | tables + strikethrough + task lists against micromark + gfm, on documents whose CommonMark core the two reference implementations agree on |
 | RewriteAgreesWithVersion1 | v2 against v1.8.6, CommonMark then GFM, minus the documented v2 changes |
-| ...AgreesWithCommonmarkJs, ...AgreesWithMicromark, ...AgreesWithGfmAutolinkLiterals, AstIsWellFormedWithTables (forty-three) | narrow properties over the shape region of every bug, judged by the same oracles; each fails deterministically |
+| ...AgreesWithCommonmarkJs, ...AgreesWithMicromark, ...AgreesWithGfmAutolinkLiterals, AstIsWellFormedWithTables (fifty) | narrow properties over the shape region of every bug, judged by the same oracles; each fails deterministically |
 | LinkifyAgreesWithGfmAutolinkLiterals | the Linkify extension against `micromark-extension-gfm-autolink-literal` on runs of URLs, emails and words separated by the GFM start characters |
 | SafeOutputIsWellFormedHtml | every extension on, raw HTML off: balanced tags, quoted attributes, every `&` an escape, no `javascript:`/`vbscript:`/`file:`/`data:` (except images) href or src |
 | AstIsWellFormed | parent/sibling links, `ChildCount`, `OwnerDocument`, `Source()` segments inside the source and in order, `Dump` runs, rendering the same tree twice and from a string source gives the same HTML |
@@ -95,30 +95,36 @@ counts and the first 25 mismatches instead of failing.
   paragraph for a definition followed by a `---` line, JavaScript `trim()` of Unicode spaces at
   paragraph and heading ends, `<blockquote>\n</blockquote>`, `%25` for a stray `%`.
 - micromark quirks the GFM property skips: `*_*a` emphasis, a `5)` list after code, indented
-  rows, `&#1;` to U+FFFD, `www.x`/`Www.` and after-`)` autolinks, `;` trailing punctuation.
+  rows, `&#1;` to U+FFFD, `www.x`/`Www.` and after-`)` autolinks, `;` trailing punctuation; an
+  ordered list that does not start at 1 right after an indented code block (`    a\n\n0. a`) is a
+  paragraph in micromark (commonmark.js and both goldmarks open the list), so a `--` after it is
+  its setext underline there - the rewrite property's tolerance for v1's hyphens-only lazy table
+  line (`v1-lazy-hyphen-table`) therefore no longer consults micromark.
 
 ## Bugs
 
-Forty-three, all with commonmark.js and micromark (and where they apply, cmark or the GFM text)
+Fifty, all with commonmark.js and micromark (and where they apply, cmark or the GFM text)
 agreeing on the correct answer, except bug 33, where micromark alone sides with goldmark against
 commonmark.js, cmark and markdown-it; see `bugs.toml`. By theme: line endings (2, 3, 14; a leading
 BOM, 1), tabs inside containers (9, 16, 28), image alt text (4, 5, 6), link destinations and
-titles (25, 26), HTML block starts (11, 17, 36, 38, 40), fences (10, 13, 21, 35), backslashes
+titles (25, 26), HTML block starts (11, 17, 36, 38, 40, 50), fences (10, 13, 21, 35), backslashes
 before a line ending (37, 39), NUL handling (7), emphasis after a bare quote marker (12) and the
-rule of three (33), lists (15, 30, 34, 41), tables (8, 23, 29, 32), strikethrough (31), and eight
+rule of three (33), lists (15, 30, 34, 41), tables (8, 23, 29, 32, 45, 46, 47, 48, 49), strikethrough (31, 44), and eight
 in the Linkify extension (18, 19, 20, 22, 24, 27, 42, 43). Bug 29 is the most visible: a paragraph
 line followed by a tab-indented `---` becomes a one-column table; bug 36 the most damaging: a
-`<pre/>` line copies the rest of the document through as raw HTML. Five are v2 regressions (4, 8,
-11, 29, 33); the rest are shared with v1.8.6.
+`<pre/>` line copies the rest of the document through as raw HTML. Six are v2 regressions (4, 8,
+11, 29, 33, 49); the rest are shared with v1.8.6.
 
 Bugs 30–34 came out of the weekly 1000-case run of 2026-09-28; since 2026-10-07 every known
 shape is drawn by default (next section). Bugs 35–43 are nine of the fifteen candidates that the
 rewrite of 2026-10-07 gated, reproduced standalone the same day against goldmark v2 and v1.8.6,
-commonmark.js, micromark and the spec text (none a v2 regression).
+commonmark.js, micromark and the spec text (none a v2 regression); bugs 44–49 are the six GFM
+candidates, reproduced the same way (49 a v2 regression: v1 stopped at the first table), and
+bug 50 the `</b/>` shape seen while probing the regions of 35–43.
 
 ## Known shapes drawn by default
 
-All 43 `Known` switches (and the six candidates') are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them on):
+All 50 `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them on):
 the generators draw a leading BOM, lone carriage returns and NUL bytes at their natural rates,
 the classifiers (`commonMarkShapes`, `linkifyShapes`, `gfmShapes`: tables of `{bug, class,
 switch, regex}`) no longer skip a document before it is judged, and on a mismatch they name
@@ -144,7 +150,7 @@ wrapping each narrow generator's output in `> ` and `- ` found ten rules that di
 recognise their bug inside a container.
 
 Every bug has a narrow property over its shape region, judged by the same oracle: the ten of
-2026-09-28 in `hegel_test.go` and thirty-three in `hegel_shapes_test.go` (twenty-four of the
+2026-09-28 in `hegel_test.go` and forty in `hegel_shapes_test.go` (twenty-four of the
 rewrite: `LeadingBom`, `LoneCarriageReturn`, `EmptyItemUnderCrlf`, `ImageAltWithCodeSpan`,
 `ImageAltWithAutolink`, `ImageAltWithHardBreak`, `NulInput`, `OpenTagAtEndOfLine`,
 `DelimiterAfterQuoteMarker`, `InfoStringTab`, `CodeSpanCrlf`, `DefinitionInListItem`,
@@ -156,7 +162,10 @@ rewrite: `LeadingBom`, `LoneCarriageReturn`, `EmptyItemUnderCrlf`, `ImageAltWith
 `...AgreesWithGfmAutolinkLiterals`; and nine for bugs 35–43: `FenceInfoAtEndOfDocument`,
 `SelfClosingRawTag`, `BackslashRunBeforeLineEnding`, `TagThenTab`, `BackslashBeforeHardBreak`,
 `ClosingRawTag`, `HyphenAfterDefinition` `...AgreesWithCommonmarkJs`,
-`EmailAutolinkAfterPunctuation` and `LastDomainSegment` `...AgreesWithGfmAutolinkLiterals`).
+`EmailAutolinkAfterPunctuation` and `LastDomainSegment` `...AgreesWithGfmAutolinkLiterals`; and
+seven for bugs 44–50: `EscapedTildeBeforeRun`, `PipeAfterEscapedBackslash`, `EqualsRow`,
+`TableAfterBlankInItem`, `LazyTableLine`, `InterruptedTableRedelimited` `...AgreesWithMicromark`
+and `ClosingTagWithSlash` `...AgreesWithCommonmarkJs`).
 Each fails on its bug; under `HEGEL_NO_KNOWN=1` the new ones draw the neighbouring region and
 pass (the ten older ones draw their shape regardless). A region is probed with `ZOO_COLLECT=1`
 before it is saved: the oracle agrees on part of a region more often than the regex suggests
@@ -182,28 +191,19 @@ table. Three regexes were retuned so that the shapes are recognised inside neste
 (`> \t` under `>\t`), after spaces before the tab (`- *  \tb`) and for raw HTML only (not
 autolinks) in image alt text.
 
-Six candidate bugs found by the rewrite and the sweeps, all in the GFM extensions, are still
-gated by classifier rules named `candidate/go/goldmark-5, 6, 11, 12, 14, 15` (switches off by
-default, so the shapes are drawn and fail by name; the inputs, outputs and spec readings are in
-the rules' comments) and await standalone reproduction before they are recorded: a lazy
-continuation line is read as a table line (`> a |\n| --- |`, `- a |\n| --- |`, `> a\n:--`;
-CommonMark 5.1 lets only paragraph continuation text drop the marker and the GFM text breaks a
-table at another block structure; v1.8.6 too) (5); a backslash-escaped tilde is counted into
-the strikethrough run beside it (6); a table row of `=` only or of `--` ends the table (11); a
-table that interrupted a paragraph is re-parsed at a later delimiter row, duplicating lines and
-losing text (12, a v2 regression); a table after a blank line inside a list item does not make
-the list loose (14); a pipe after an escaped backslash is read as an escaped pipe (15). The
-other nine candidates of 2026-10-07 (a fence's one-character info string at the end of the
+No candidate rule is left: the six GFM candidates of 2026-10-07 (5, 6, 11, 12, 14, 15) are bugs
+48, 44, 46, 49, 47 and 45, the other nine (a fence's one-character info string at the end of the
 document, `<pre/>`, backslash runs before a line ending and before a hard break's spaces, a tab
 after a complete tag, `</script>` alone on a line, `-` after a link reference definition, an
-e-mail literal starting with punctuation, a hyphen in the last domain segment) are bugs 35–43.
-Six ambiguous or reference-quirk shapes were added beside them (an indented header row, a list
-item that may not interrupt a paragraph after a table, a task marker without a space,
-commonmark.js ending the info string at a no-break space, micromark ending an autolink before
-punctuation that precedes a `)` and opening an HTML block on a lazy line). Seen while probing
-the regions of 35–43 and not recorded: `</b/>` alone on a line (no closing tag: spec 6.6 allows
-no `/` in one) opens a type-7 HTML block in goldmark where commonmark.js and micromark read a
-paragraph (`parser/html_block.go`'s `scanHTMLBlockOpen7` accepts `/>` after a closing tag's name).
+e-mail literal starting with punctuation, a hyphen in the last domain segment) are bugs 35–43,
+and `</b/>` alone on a line, seen while probing the regions of 35–43, is bug 50; none was
+rejected as ambiguous. Six ambiguous or reference-quirk shapes stand beside them (an indented
+header row, a list item that may not interrupt a paragraph after a table, a task marker without
+a space, commonmark.js ending the info string at a no-break space, micromark ending an autolink
+before punctuation that precedes a `)` and opening an HTML block on a lazy line). The
+lazy-table-line scanner of bug 48 now recognises a table whose delimiter row is a continuation
+line of a list item (no marker of its own), and bug 49's rule excludes hyphens-only rows, which
+are bug 46's setext shape.
 
 ## Not tested
 
@@ -215,3 +215,4 @@ East Asian line breaking, CJK options, the `text` package's readers directly, an
 - 2026-09-20: base bumped dcdeda312dc8 → 63f3cd21f554 (2026-09-19, "docs(CONTRIBUTING): add CONTRIBUTING.md"; v2.1.5+); 29 bug(s) still reproduce. 37 tests pass.
 - 2026-10-07: generators rewritten in combinator style; all known shapes drawn by default (two wide properties plain, three intermittent); twenty-four narrow properties added; fifteen candidates gated by name after the classifier rules were taught every container form.
 - 2026-10-07: candidates 1, 2, 7, 8, 9, 10, 13, 3 and 4 reproduced standalone (goldmark v2 and v1.8.6, commonmark.js, micromark, the spec text) and recorded as goldmark/35–43, a pin and a narrow property each; the rules of 38 and 41 widened (a tab before a tag's `>`; a definition's destination on the next line), of 39 tightened (exactly two trailing spaces) and of 43 widened (digits and upper-case letters in the last segment). 32 tests pass, 90 expected failures.
+- 2026-10-07: candidates 6, 15, 11, 14, 5 and 12 reproduced standalone the same way and recorded as goldmark/44–47, 48 and 49 (49 a v2 regression), `</b/>` as goldmark/50; a pin and a narrow property each; bug 48's scanner taught the item-continuation delimiter row, bug 49's rule narrowed to rows with a pipe or a colon; the rewrite property excuses v1's hyphens-only lazy table line without micromark. 32 tests pass, 104 expected failures (105 when the rewrite property fails).
