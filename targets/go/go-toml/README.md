@@ -60,7 +60,19 @@ see `HACKING.md`).
   the finite `MaxFloat32` is rejected for a `float32` field; the encoder's own output for
   `float32(math.MaxFloat32)` (`340282350000000000000000000000000000000.0`) cannot be read back.
 
-## Not bugs (and what the general generators avoid)
+Both bugs are drawn by default and found by the properties (DESIGN.md decision 3): the integer
+literals written for float fields are spelled like any other integer, so
+`TestHegelIntegerLiteralsDecodeIntoNumericFieldsExactlyWhenTheyFit` meets a hex, octal or binary
+literal in about 2.6% of its cases (go-toml/1, intermittent), and `math.MaxFloat32` sits in the
+float pool as the float32 edge, so `TestHegelStructsRoundTripThroughMarshalAndUnmarshal` meets the
+encoder's own unreadable output in about 1.5% of its cases (go-toml/2, intermittent). The narrow
+properties of `hegel_shapes_test.go` draw each shape region deterministically:
+`TestHegelHexOctalAndBinaryIntegersDecodeIntoFloatFields` (go-toml/1) and
+`TestHegelFloatLiteralsRoundingToMaxFloat32DecodeIntoFloat32Fields` (go-toml/2, literals
+`MaxFloat32 + j·2^75` that round to `MaxFloat32`). `HEGEL_NO_KNOWN=1` switches the shapes off
+(decimal literals for float fields, literals below `MaxFloat32`) and every property passes.
+
+## Not bugs
 
 - go-toml implements TOML 1.1 (`\e`, `\xHH`, seconds optional in times, newlines in inline
   tables…); generated documents stay within TOML 1.0 so that `tomllib` can arbitrate, and
@@ -77,11 +89,16 @@ see `HACKING.md`).
 - `unstable.RawMessage` bytes must be a bare value: a trailing `# comment` is refused by the
   encoder's validation.
 - Fixed-size array targets silently drop extra elements (as `encoding/json` does).
-- Generators avoid each pinned shape: float fields receive decimal integer literals only
-  (go-toml/1); float32 values stay below 10³⁸ and float literals in `(MaxFloat32,
-  MaxFloat32 × (1 + 2⁻²⁵))` are skipped (go-toml/2).
 - Upstream's own tests all pass at this commit.
 
 ## History
 
 - 2026-09-14: written at 686c980c4758 (after v2.4.3, 2026-07-18), hegel.dev/go/hegel v0.6.33.
+- 2026-10-07: generators rewritten in combinator style (STYLE.md): package-level generator values
+  (`texts` from weighted ASCII/Unicode/control pieces, `int64s`/`floats` as `OneOf` with the
+  plain arms first, `trees` as a forward-declared recursive `Composite` with `Maps` for tables
+  and `Lists` for arrays, a case record per property with a `GoString`), and the TOML text
+  written by a pure `writeDoc(tree, tape)` whose syntax choices come from a drawn tape of small
+  integers (plain option first, so a shrunk document is plain). Known-bug gates are off by
+  default; narrow properties added in `hegel_shapes_test.go`; the raw `é ß 日本 😀 Ω` literals are
+  now `\u` escapes with the same bytes. No new bug.

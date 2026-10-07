@@ -1211,3 +1211,5 @@ them for as long as the binary is unchanged and moves when it changes: "run it s
 little, and it is declared intermittent. A note on the harness: net/http drops a `Max-Age` with
 a leading zero (RFC 6265's grammar) where fasthttp reads it (the algorithm of 5.2.2), tolerated
 by drawing the narrow properties' digits without one.
+
+Batch 51 (2026-10-07, after a re-measurement of the whole corpus with the turn-413 survey's counts: 92 Go targets still have value-returning helpers over the test case, 967 helpers, 292 switch-on-draw ladders and 994 `if chance` sites in all): go/go-toml.
