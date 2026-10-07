@@ -58,7 +58,7 @@ spaces, quotes, dots and non-ASCII). A canonical string form with type tags comp
   `OmitNil`; `Dup` is independent of the original; `Diff`/`Compare` empty exactly for equal
   values (nil members as absent); `Match` on the value and on key subsets; `Checksum` equal
   for equal values.
-- Eighteen narrow properties in `hegel_shapes_test.go`, one per bug, each over the bug's shape
+- Twenty-three narrow properties in `hegel_shapes_test.go`, one per bug, each over the bug's shape
   region with random contents and judged by the same model: `IntegersNearInt64LimitsParse`
   (1), `ValidateRejectsUnclosedContainers` (2), `SetAtOrAfterArrayEndAppends` (3),
   `DelOutOfRangeIsNoOp` (4), `SENQuotesDashStrings` (5), `SENQuotesLiteralWords` (6),
@@ -67,13 +67,15 @@ spaces, quotes, dots and non-ASCII). A canonical string form with type tags comp
   `NegativeStepSliceOnEmptyArray` (11), `NegativeStepSliceOutOfRangeBounds` (12),
   `SurrogatePairEscapesDecode` (13), `UnionKeysWithQuotesEscape` (14), `LocateMaxOverSlices`
   (15), `MatchDescentIntoNestedArrays` (16), `MatchFilterSeveralElements` (17),
-  `TruncatedLiteralBeforeCommaRejected` (18). Each fails on its bug; under `HEGEL_NO_KNOWN=1`
-  it draws the neighbouring region and passes.
+  `TruncatedLiteralBeforeCommaRejected` (18), `ObjectMemberWithoutValueRejected` (19),
+  `TruncatedLiteralMemberRejected` (20), `FilterNotEqualSelectsFloatMembers` (21),
+  `SENQuotesBOMStrings` (22), `ZeroMantissaExponentsParse` (23). Each fails on its bug; under
+  `HEGEL_NO_KNOWN=1` it draws the neighbouring region and passes.
 
 
 ## Bugs
 
-Eighteen, see `bugs.toml`: integers at the int64 limits parsed as `json.Number` (1);
+Twenty-three, see `bugs.toml`: integers at the int64 limits parsed as `json.Number` (1);
 `Validate` accepting unclosed arrays and objects (2); `Set` refusing to append to an existing
 array although documented to add elements (3); `Del` erroring on an out-of-range index where
 everything comparable is a no-op (4); the SEN writer leaving strings starting with `-` and the
@@ -85,17 +87,25 @@ bounds onto the array (12); surrogate pair escapes not combined (13); union keys
 or backslash rendered unescaped (14); `Locate` ignoring `max` for slices (15); `oj.Match`
 not searching inside an element a descent matched, so `$..*` yields only top-level children (16) and only one callback for a filter matching
 several elements, with the wrong path (17); a truncated literal before a comma (`[nul,1]`)
-accepted by `Parse` and `Validate` with the value dropped (18).
+accepted by `Parse` and `Validate` with the value dropped (18); an object member with no value
+before the closing brace (`{"a":}`) accepted by both and dropped (19); a truncated literal
+member followed by a comma and another member (`{"k":nul,"a":1}`) panicking `Parse`,
+`Parser.Parse` and `Unmarshal` with "assignment to entry in nil map" while `Validate` accepts
+it (20); a filter `!=` false for a float member compared with a string, boolean, null or a
+different float (21); the SEN writer leaving a root string starting with a byte order mark
+bare, which `sen.Parse` reads past the mark (22); `0e5`, `0e+100` and `-0E1` rejected as
+invalid numbers by `Parse`, `Validate` and `sen.Parse` (23).
 
 ## Known shapes drawn by default
 
-The eighteen `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them
+The twenty-three `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them
 on): the generators draw every recorded shape (integers at the int64 limits, `1.` and
 `[nul,1]` and unclosed containers among the mutations, negative-step slices over empty arrays
 and with out-of-range bounds, descents before bracket fragments, union keys with quotes,
 filters matching several elements, negative union indices under `Remove`, out-of-range `Set`
 and `Del` indices, SEN strings starting with `-` or spelling `null`/`true`/`false`,
-surrogate-pair escapes), the model says what the documentation says (`pySlice` without the
+surrogate-pair escapes, and the shapes of ojg/19-23 where the byte edits, the value tree and
+the filters reach them), the model says what the documentation says (`pySlice` without the
 clamp), and a mismatch names the shapes the case has (`mismatch(ht, shapes, ...)`). The first
 hundred cases hegel-go draws are strongly clustered on small values, so a shape drawn at a few
 percent passed a default-count run three or four times in twenty: the Parse, Write and SEN
@@ -116,15 +126,13 @@ read by a pure `emitJSON`, mutations as records applied modulo the live length, 
 fragments as records drawn from the data's keys (`fragsFor(keys)`, `pathCasesOver(data)`) and
 rewritten by `pastFilterSeveral` for the neighbouring region, edits as records.
 
-Five candidates are counted and assumed away pending reproduction: `{"a":}` accepted by
-`Parse` and `Validate` with the member dropped (`candidate/go/ojg-1`); `{"k":nul,"a":1}`
-panicking in `Parse`, `Parser.Parse` and `Unmarshal` with "assignment to entry in nil map"
-(`oj/parser.go`; `Validate` accepts) (2); a filter `!=` on a float64 member compared with a
-string (`$[?(@.a != 'zzz')]` on `[{"a":0.5}]`) false where the model says true
-(`jp/script.go` around line 537, a missing `ok` guard) (3); `sen.String` leaving a string that
-starts with a BOM bare, which `sen.Parse` then reads as the value after the BOM (4); `0e5`,
-`0e+100` and `-0E1` rejected as invalid numbers by `oj.Parse`, `oj.Validate` and `sen.Parse`
-though valid JSON (5; `1e+400` parses to +Inf without error).
+The five candidates of the rewrite are recorded as ojg/19-23: the Invalid property names a
+member without a value (19), a truncated literal member whose `Parse` panic `judgeText` recovers
+(20) and a zero before an exponent (23) through `mismatch`, the Path property names ojg/21 on a
+`Get` disagreement and the SEN property ojg/22 on a root string; under `HEGEL_NO_KNOWN=1` the
+verdicts are excused like the others, except the text `Parse` would panic on, which is skipped
+before any parser sees it (the `zeroExpRx`/`memberTruncLitRx` gates match inside string
+literals too), and `unbare` puts a letter before a root string starting with a byte order mark.
 
 ## Modelled as recorded, not counted
 
@@ -146,3 +154,4 @@ though valid JSON (5; `1e+400` parses to +Inf without error).
 ## History
 
 - 2026-10-07: generators rewritten in combinator style; the eighteen known shapes drawn by default (six wide properties plain); eighteen narrow properties added; five candidates counted.
+- 2026-10-07: ojg/19-23 recorded, the five candidates of the rewrite.
