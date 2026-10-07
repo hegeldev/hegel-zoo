@@ -152,7 +152,9 @@ toolchain is universal). Language backends encapsulate the per-language mechanic
 ```
 zoo fetch  <target>…     clone upstream into work/<lang>/<name>/ at base.commit (cached)
 zoo apply  <target>…     fetch + git apply hegel.patch (fails loudly if it does not apply)
-zoo test   <target>…     apply + run; honours expected_failures; prints a per-test verdict
+zoo test   <target>…     apply + run; honours expected_failures; prints a per-test verdict (a
+                         run cut short - go test's deadline, out of memory, killed - is named
+                         with ABORT, so a test without a result reads as unreached, not misconfigured)
 zoo check  [<target>…]   static: target.toml valid, patch applies cleanly, hegel.version == pin,
                          every expected_failures entry names an open bug, every open bug has
                          a test, README present
