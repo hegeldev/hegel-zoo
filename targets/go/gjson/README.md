@@ -11,7 +11,8 @@ tests, and the zoo keeps its tests in its own patch and files nothing upstream.
 
 ## Build
 
-`go test -count=1 -v .` in the module root. The patch adds `hegel_test.go` (properties) and
+`go test -count=1 -v .` in the module root. The patch adds `hegel_test.go` (harness, generators,
+models and the twelve wide properties), `hegel_shapes_test.go` (one narrow property per bug) and
 `hegel_pins_test.go` (one plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in
 go.mod. No external oracle process: everything runs in-process.
 
@@ -49,11 +50,31 @@ go.mod. No external oracle process: everything runs in-process.
 | NothingPanicsOnArbitraryInput | random bytes, corrupted documents and random paths through Get/Parse/Value/String/Int/…/ForEach/GetMany/ForEachLine/Path |
 | WhitespaceDoesNotChangeTheValue | the same tree rendered with different whitespace gives the same result for the same path |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (three-digit integer wraparounds, surrogate-then-escape tokens, escaped keys as automatic
-multipath names, escaped wildcards in patterns, `Path()` on invalid documents, literals with a
-dot). With everything gated the properties run clean at 1000 cases; `ZOO_COLLECT=1` makes the
-path property print class counts and the first 25 mismatches instead of failing.
+Mismatches are classified before they count: a `Known` switch per recorded bug recognises the
+input shape (see below). `ZOO_COLLECT=1` makes the path property print class counts and the
+first 25 mismatches instead of failing.
+
+## Known shapes drawn by default
+
+A `Known` struct in `hegel_test.go` has one switch per recorded bug, every one off by
+default: the generators draw the shapes (`shaped(Known.x, on, off)` at the generator: 20-digit
+integer texts that wrap above the previous value, lone surrogates followed by an escape,
+escaped keys as automatic multipath names, escaped wildcards in patterns, `Path()` on invalid
+documents, literals with a dot or a bar, `:` in escaped keys) and the collector's `mismatch`
+names the bug whose shape the failing case has. `StringDecodingMatchesEncodingJson` fails every
+run on gjson/2 (plain); `NumberAccessorsMatchTheirModels` (gjson/1, about half the rounds at the
+default case count), `GetFollowsThePathModel` (gjson/4, /6 or /7, a round in eight) and
+`NothingPanicsOnArbitraryInput` (gjson/5, recovered and reported, a round in seventeen) reach
+their shapes at natural rates and are intermittent. `HEGEL_NO_KNOWN=1`, read once, turns every
+switch on: the shapes are left out at the generators or assumed away where they are
+recognised, the narrow properties draw the neighbouring region, and every property passes.
+Seven narrow properties in `hegel_shapes_test.go`, one per bug and named after what it tests
+(`TestHegelTwentyDigitIntegersSaturateThroughIntAndUint`,
+`TestHegelSurrogateEscapeKeepsTheNextEscape`, `TestHegelMultipathAutoNamesUnescapeTheKey`,
+`TestHegelEscapedWildcardsStayLiteralInPatterns`, `TestHegelPathSurvivesInvalidDocuments`,
+`TestHegelMultipathLiteralsAreNamedUnderscore`, `TestHegelColonKeysResolveInsideMultipaths`),
+each draw the bug's shape region with random contents and are the deterministic expected
+failures beside the pins.
 
 ## Accepted differences (not bugs)
 
@@ -106,3 +127,15 @@ pattern with another wildcard act as wildcards; 6: `{!7.5}` is named `"5"`; 7: `
 The `%`/`!%` pattern operators and `~` tilde operators in queries, nested queries, `@pretty`
 options, custom modifiers (`AddModifier`), `@dig` with multi-component paths, `Time()`,
 `DisableModifiers`/`DisableEscapeHTML`, and the deprecated `#[...]` query form.
+
+## History
+
+- 2026-10-07: generators rewritten in combinator style (scalars and keys as weighted choices
+  over the token forms, the tree as a depth-indexed generator built from the deepest level
+  up, whitespace as a tape applied by a pure renderer, paths as data — a list of step records
+  rendered and modelled against the live tree by a pure walk — corruptions and string tokens
+  as lists of records); the known shapes drawn by default with seven narrow properties. Four
+  latent model faults fixed (the gjson/1 classifier mirrors `parseUint`'s check, the gjson/2
+  classifier scans like gjson, `#.comp` and `@dig:comp` with a digits-only component also
+  index array elements, the multipath auto name is the unescaped key); `Index` of a piped path
+  is 0 and is no longer checked positionally.
