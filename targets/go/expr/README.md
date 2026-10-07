@@ -14,7 +14,8 @@ AI-written code. The package's own tests are example tables plus a Go fuzz test
 ## Build
 
 `go test -count=1 -run TestHegel -v .` in the module root. The patch adds `hegel_test.go`
-(the model and the properties) and `hegel_pins_test.go` (one plain test per bug) and
+(the harness, the generators, the model and the ten wide properties), `hegel_shapes_test.go`
+(one narrow property per bug) and `hegel_pins_test.go` (one plain test per bug) and
 requires `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive moves from 1.18 to
 1.26). The upstream fuzz corpus and environment (`test/fuzz/fuzz_corpus.txt`,
 `fuzz.NewEnv()`, `fuzz.Func()`) seed and host the self-consistency properties.
@@ -47,6 +48,32 @@ requires `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive moves from 1
   Disassemble, Dump or Run, and a program that compiled fails only with an error the fuzz
   test accepts.
 
+## Known shapes drawn by default
+
+A `Known` struct in `hegel_test.go` has one switch per bug shape, every one off by default:
+the generators draw the shapes (`shaped(Known.x, on, off)` at the generator, `let` nodes
+nested anywhere, integral float literals, finders and nil conditionals, the predicate builtins
+in the DisableBuiltin loop) and `mismatch` names the bug whose shape the failing case has.
+The wide properties reach the shapes at natural rates and are mapped intermittent:
+PrintedAstReparses to expr/2 (fails about 15 rounds in 17 at the default case count),
+StaticTypeMatchesRuntime to expr/1 (about 12 in 17), OptionsAreHonoured to expr/4 (about 1 in
+17 at the default count, 4 in 5 at 1000 cases). `HEGEL_NO_KNOWN=1`, read once, turns every
+switch on: the shapes are left out at the generators or assumed away where they are
+recognised, the narrow properties draw the neighbouring region, and every property passes.
+Four narrow properties in `hegel_shapes_test.go`, one per bug and named after what it tests
+(`TestHegelNilResultsMatchTheirStaticType`, `TestHegelIntegralFloatLiteralsReparse`,
+`TestHegelNestedLetsReparse`, `TestHegelDisableBuiltinCoversThePredicates`), each draw the
+bug's shape region with random contents and are the deterministic expected failures beside
+the pins.
+
+Candidates, gated by `Assume` and reproduced standalone, to be judged and recorded: the
+printer never parenthesises the operands of `..` (`(true ? 1 : 2)..3` prints as a different
+AST, `(1 ?? 2)..3` as text that does not parse); a seedless `reduce` is typed as its
+predicate but a one-element array returns the element; `min`/`max` are typed as their first
+argument (`min(1, 0.5)` static int, runtime float64); `sum` of an empty array is int 0
+whatever the element type; the optimizer folds `x and false` and `x or true` whatever x,
+hiding a run-time error of x.
+
 ## Bugs (4; details in bugs.toml)
 
 | id | summary | severity |
@@ -68,4 +95,17 @@ property tripped on `find(array, !ok)` (static int, runtime nil) and the array p
 string counts runes while `s[a:b]` slices bytes (undocumented either way); `mean`/`median`
 of an empty array are `0.0`; `fromPairs` builds a `map[any]any`; the `As*` numeric casts are
 documented in `docs/configuration.md` (AsFloat64 casts ints too, beyond the "float32" the
-docs mention). The properties run clean at 3000 cases.
+docs mention). Under `HEGEL_NO_KNOWN=1` the properties run clean at 3000 cases.
+
+## History
+
+- 2026-10-07: generators rewritten in combinator style (the environment as a record, the
+  typed expression grammar as depth-memoised weighted choices of node kinds realised and
+  rendered by pure functions, corpus mutations as edit records applied modulo the live
+  length, an evenly distributed corpus index composed from digits — `Integers` over 19 546
+  lines put seven draws in ten into the first tenth, which is why the old test never left
+  it); the known shapes drawn by default with four narrow properties. Three latent model
+  faults fixed: a predicate over an empty array never runs its (erroring) bound; the optimizer
+  folds a constant `% 0` into a compile error even in an untaken branch; `keys`/`values`/
+  `toPairs` results were compared in map order (tolerated as multisets now). Five library
+  bug candidates surfaced (above).
