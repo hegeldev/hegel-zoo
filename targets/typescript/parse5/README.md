@@ -52,7 +52,9 @@ place, so the whitespace after it joins the fostered text).
 - `TestHegelLocationsPointIntoTheSource`: with `sourceCodeLocationInfo`, every location is inside
   the input, its line and column match its offset (LF, CR and CR LF ending lines; columns in code
   units), start tags, end tags and attributes hold what their names say, text without references
-  or tags is its own slice, comments and doctypes start with their syntax.
+  or tags is its own slice (whitespace kept by the frameset modes spans the characters they drop
+  between it, which is how a text node's span is defined), comments and doctypes start with their
+  syntax.
 - `TestHegelParseErrorsAreReported`: error codes are known, their locations consistent, and the
   tree is the same with or without the error handler and location info.
 - `TestHegelStreamedParseMatchesTheOneShot`: `ParserStream` and `getFragmentStream` fed random
