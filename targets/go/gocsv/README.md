@@ -18,7 +18,8 @@ about AI-written code. The zoo keeps its tests in its own patch and files nothin
 `go test -count=1 -vet=off -run TestHegel -v .` in the module root. The patch adds
 `hegel_test.go` (harness, the column and cell model, the types under test, the Marshal and
 round-trip properties), `hegel_columns_test.go` (header matching, cell conversions, `csv[]`
-columns, the map helpers) and `hegel_pins_test.go` (one plain test per bug), and requires
+columns, the map helpers), `hegel_shapes_test.go` (the fifteen narrow properties) and
+`hegel_pins_test.go` (one plain test per bug), and requires
 `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive moves from 1.13 to 1.26.0 for it).
 `-vet=off` because under that directive `go test`'s vet fails the build on upstream's own
 `fmt.Errorf(nonConstant)` calls; gocsv has no dependencies and needs no external tool.
@@ -55,12 +56,48 @@ columns, the map helpers) and `hegel_pins_test.go` (one plain test per bug), and
 | SliceColumnsFollowTheTags | `csv[]` columns of a slice, a slice of structs and an array in any order and with columns missing: the slice grows to the highest index present, gaps are zero, absent fields stay nil |
 | MapsFollowTheModel | `CSVToMaps`, `CSVToChanMaps`, `CSVToMap` and `UnmarshalCSVToMap` (string and int values) against `encoding/csv` and the model |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (out-of-order `csv[]` columns beyond the growth, integer cells wider than the field, uint
-cells with a dot, float32 cells out of range, headers matched only after trimming, a longer
-target slice, extra columns on the headerless channel path, `default=` without headers, the
-off-by-one line). With everything gated the properties run clean; `ZOO_COLLECT=1` prints
-class counts and the first 25 mismatches instead of failing.
+Fifteen narrow properties in `hegel_shapes_test.go`, one per bug, each over the bug's shape
+region with random contents and judged by the same model: `SliceColumnsInAnyOrderGrow` (1),
+`InterfaceFieldsUnmarshal` (2), `HeaderlessChanIgnoresExtraColumns` (3),
+`IntegerCellsWiderThanTheFieldError` (4), `UintCellsWithDotFollowTheIntRule` (5),
+`Float32CellsOutOfRangeError` (6), `MultiKeyNestedHeadersPrefixOnce` (7),
+`ArrayFieldsRoundTrip` (8), `MapFieldsRoundTripOrError` (9), `TrimmedHeadersCountAsMatched`
+(10), `UnmarshalReplacesTheSlice` (11), `RaggedRowsDoNotPanic` (12), `StringerFieldsReadBack`
+(13), `HeaderlessPathsApplyDefault` (14), `HeaderlessChanErrorLineIsExact` (15). Each fails on
+its bug; under `HEGEL_NO_KNOWN=1` it draws the neighbouring region and passes.
+
+## Known shapes drawn by default
+
+The fifteen `Known` switches are off by default (`HEGEL_NO_KNOWN=1`, read once, turns them
+on): the generators draw every recorded shape - `csv[]` columns out of order and with gaps,
+integer cells wider than the field, uint cells with a dot, float32 cells out of range, headers
+matched only after trimming under `FailIfUnmatchedStructTags`, a longer pre-filled target
+slice, extra columns and a conversion error on the headerless channel path, `default=` on the
+headerless paths, ragged rows under a permissive reader for the map helpers, and the shapes
+that only pins reached before as extra struct types drawn beside the four plain ones (an
+`interface{}` field, a nested field with several keys, an array field without `csv[]`, a map
+field, a `time.Duration` field) - and a mismatch names the shapes the case has
+(`mismatch(ht, shapes, ...)`). The shapes are frequent by nature: a wide cell is about an
+eighth of the cells and a case has fifteen of them, so the Cells property fails every run;
+over nine default rounds Headers shrank to gocsv/10, Cells to gocsv/4 (gocsv/5 once),
+SliceColumns to gocsv/1 and UnmarshalInvertsMarshal to gocsv/11 every time (plain), Maps to
+gocsv/12 eight times and Marshal to gocsv/9 six times with passes between (intermittent).
+Under `HEGEL_NO_KNOWN=1` the switches steer as before - cells are drawn to fit the column
+(`fittingCells`), `csv[]` orders are repaired (`columnOrder.safe`), the extras, longer slices,
+header decorations and row deltas are shaped off - and every property passes; what remains
+are steers that still check (the empty-time error rows of the headerless channel path).
+`ZOO_COLLECT=1` prints class counts and the first 25 mismatches instead of failing.
+
+The generators are package-level values in combinator style: cells as combinators (`signs`,
+`digits`, `fraction` with a dot or a decimal comma, `exponent`, `number`, `cellsAround`),
+values per struct type as `Composite` records in a `valueOf` table (the reflection model stays
+the judge), tables as records (rows, nil elements, pointer rows, container kind), headers as
+`hdrCol` records rendered by a pure `render` (plain first; padding, BOM, zero-width, partial
+superstring, suffix and duplicate as alternatives), column orders as permutations with gaps,
+map-helper rows as records with a width delta. The round-trip property stops a case after its
+first panicking entry point, since `UnmarshalToCallback*` runs `UnmarshalToChan` in a
+goroutine where the gocsv/2 panic cannot be recovered; `CSVToMap` under the permissive reader
+also indexes past a short row, the root of gocsv/12, and is named so.
 
 ## Accepted differences (not bugs)
 
@@ -107,3 +144,4 @@ its switches and the map helpers otherwise agreed with the model throughout.
 ## History
 
 - 2026-09-20 (turn 331): target created at `9ab82d6` (master, untagged); 15 bugs.
+- 2026-10-07: generators rewritten in combinator style; the fifteen known shapes drawn by default (four wide properties plain, two intermittent); fifteen narrow properties added.
