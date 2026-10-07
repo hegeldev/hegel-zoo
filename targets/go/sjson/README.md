@@ -13,9 +13,9 @@ zoo keeps its tests in its own patch and files nothing upstream.
 
 ## Build
 
-`go test -count=1 -v .` in the module root. The patch adds `hegel_test.go` (properties) and
-`hegel_pins_test.go` (one plain test per bug) and requires `hegel.dev/go/hegel v0.6.33` in
-go.mod (the `go` directive moves from 1.14 to 1.26.0 for it; sjson's own dependency on gjson
+`go test -count=1 -v .` in the module root. The patch adds `hegel_test.go` (properties),
+`hegel_shapes_test.go` (one narrow property per bug) and `hegel_pins_test.go` (one plain test
+per bug) and requires `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive moves from 1.14 to 1.26.0 for it; sjson's own dependency on gjson
 stays at its pinned v1.14.2). No external oracle process: everything runs in-process.
 
 ## Oracles
@@ -45,13 +45,25 @@ stays at its pinned v1.14.2). No external oracle process: everything runs in-pro
 | ComplexPathsSetEveryMatch | `arr.#.key` sets the key in every element that has it, a wildcard component sets the first key in document order that matches (a rune-based glob model), no match leaves the document as it was, and Delete refuses a complex path with the input unchanged |
 | SetThenDeleteRestoresTheDocument | Set of a new key (or an append) then Delete of it gives the tree back; `SetRaw` of an existing value's own raw text is the identity on the bytes |
 | NothingPanicsOnArbitraryInput | random bytes, corrupted documents, random paths (digit runs capped, since an index asks for that many nulls) and random values through every entry point; a valid document with a nil error gives valid JSON |
+| WrappingIndexIsAnError … MinusOneDeleteOnAnObjectIsTheKey (`hegel_shapes_test.go`) | one narrow property per recorded bug over the bug's path shape with random documents and values, judged by the same model |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (non-finite floats, strings needing escapes under `ReplaceInPlace`, empty components,
-forced keys that hit an array element, `-1` under a scalar, unescaped leading brackets, nested
-`#` paths, escaped digits in an index, Delete of a key starting with a quote, `-1` under an
-object with a `#` member). With everything gated the properties run clean;
-`ZOO_COLLECT=1` prints class counts and the first 25 mismatches instead of failing.
+The known shapes are drawn by default: every property draws the shape of every recorded bug
+and fails on it, and is listed in `target.toml` mapped to the bug it finds. The set property
+fails every run and shrinks most often to the empty component (bug 4; the non-finite float,
+the wrapping index, `-1` under a scalar, the bracket key and the forced key are the other
+basins); the delete property meets the forced key (5) and the quote key (10), the agreement
+property the in-place escape (3), the complex-path property the two `#` segments (8), the
+robustness property a non-finite float (2) and the set-then-delete property the quote key (10)
+and the `#` member (11), each in a few percent of cases, so those five are mapped
+intermittent. The wrapping form of bug 1 (an index text at or above 2^63) is a drawn path
+kind of the set property; the padding form (an index that asks for that many `null`s) stays
+behind the digit cap of the robustness property, a resource limit rather than a judgement.
+`HEGEL_NO_KNOWN=1`, read once, switches the `Known` shapes off: the generators draw finite
+floats, plain strings in place, and the remaining shapes are skipped where met (under 1% per
+class), and every property passes. The narrow properties of `hegel_shapes_test.go` draw one
+bug's shape region each with random documents and values and fail every run; under
+`HEGEL_NO_KNOWN=1` they draw the neighbouring region and pass. `ZOO_COLLECT=1` prints class
+counts and the first 25 mismatches instead of failing.
 
 ## Accepted differences (not bugs)
 
@@ -86,3 +98,8 @@ writing them.
 ## History
 
 - 2026-09-20 (turns 325-327): target created at `3a21ce7`; 11 bugs.
+- 2026-10-07: generators rewritten in combinator style (a recursive node generator, document
+  styles as whitespace and escape tapes rendered by a pure writer, paths as lists of part
+  specs resolved against the live tree by a pure planner, one case record per property); the
+  `Known` switches off by default so the wide properties find the recorded bugs; bug 1's
+  wrapping form drawn; eleven narrow properties.
