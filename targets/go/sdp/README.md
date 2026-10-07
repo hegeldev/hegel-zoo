@@ -10,7 +10,13 @@ round trips of generated descriptions.
 ## Build
 
 The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
-`hegel_zoo_*_test.go` files that drive the public API. `go test -count=1 -run TestHegel -v ./hegel`
+`hegel_zoo_*_test.go` files and `hegel_shapes_test.go` that drive the public API. The generators
+are package-level values in combinator style: a line is a record `{key, fields, seps, bad}`
+rendered by a pure function, each malformed variant a named alternative beside the well-formed
+value; the document is the concatenation of the optional line records in grammar order with
+media sections as a list; the mutations are a list of `{kind, at, line}` edits applied modulo the
+live length; the line ends are a tape consumed by the renderer; the round-trip description is a
+`Composite` over `Composite`s of the structs. `go test -count=1 -run TestHegel -v ./hegel`
 
 ## Oracles
 
@@ -44,6 +50,8 @@ The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
   line ends only.
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
+- Thirteen narrow properties, one per bug, in `hegel_shapes_test.go` (see "Known shapes drawn
+  by default").
 
 ## Bugs
 
@@ -58,13 +66,38 @@ and range are never parsed, breaking the round trip (sdp/9); `m=` port `9/2/3` d
 is one short for a media line without formats (sdp/12); `WithExtMap` sets the whole text as
 the attribute key (sdp/13).
 
-## Modelled as recorded
+## Known shapes drawn by default
 
-sdp/1-12 are in the model behind `HZKnown` switches (`uintWraps`, `missingNumericIsZero`,
-`zeroAtEOFFails`, `truncatedDocumentAccepted`, `danglingByteIgnored`, `crCountTrimsLine`,
-`extraFieldStartsLine`, `timeZoneOddDropped`, `connectionTTLNotParsed`, `portRangeTailIgnored`,
-`protoErrorIsNumeric`, `emptyFormatsSizeOffByOne`); `ZOO_KNOWN_OFF=name` turns a switch off
-and the property then fails. sdp/13 is a builder and is pinned only.
+The twelve `HZKnown` switches (`uintWraps`, `missingNumericIsZero`, `zeroAtEOFFails`,
+`truncatedDocumentAccepted`, `danglingByteIgnored`, `crCountTrimsLine`, `extraFieldStartsLine`,
+`timeZoneOddDropped`, `connectionTTLNotParsed`, `portRangeTailIgnored`, `protoErrorIsNumeric`,
+`emptyFormatsSizeOffByOne`) are off by default: the model says what RFC 4566 and the package's
+own documentation say, the generators draw every recorded shape at its natural rate, and the
+two wide properties fail on them with the mismatch naming the bug (`mismatch(ht, class, shape,
+...)`). `TestHegelUnmarshal` shrinks to sdp/2 most often (7 of 17 default rounds; sdp/4 and
+sdp/3 four each, sdp/6 twice, sdp/10 once) and is mapped to sdp/2; `TestHegelRoundTrip`
+shrinks to sdp/12 (16 of 17; sdp/9 once) and is mapped to sdp/12. At 3000 cases the Unmarshal
+shapes run at about 12% (sdp/2), 8.5% (sdp/6), 7% (sdp/9), 6.5% (sdp/7), 4.7% (sdp/10) and
+under 0.5% each for sdp/1, /3, /4, /5, /8 and /11; the round trip reaches sdp/12 in 27% of
+cases and sdp/9 in 13%. `HEGEL_NO_KNOWN=1` (read once) turns every switch on: the model then
+reproduces the recorded behaviour as the earlier version did, nothing is skipped, and every
+property passes while the thirteen pins fail. sdp/13 (`WithExtMap`) is a builder outside the
+model and is reached by its pin and its narrow property only.
+
+One narrow property per bug lives in `hegel_shapes_test.go`, each drawing the bug's shape
+region with random contents and judged by the same model (or, for the round-trip bugs, by the
+documented behaviour): `NumbersBeyondUint64AreRejected` (1), `MissingNumericFieldIsRejected`
+(2), `FinalZeroWithoutLineBreakIsAccepted` (3), `DocumentCutOffBeforeTimingIsRejected` (4),
+`DanglingFinalByteIsRejected` (5), `CarriageReturnInsideTextLineKeepsTheLine` (6),
+`ExtraFieldsOnFieldLineAreRejected` (7), `UnpairedTimeZoneAdjustmentIsRejected` (8),
+`ConnectionAddressTTLAndRangeSurviveTheRoundTrip` (9), `MediaPortWithTwoSlashesIsRejected`
+(10), `UnknownTransportProtocolIsAnInvalidValue` (11), `MarshalSizeCountsAMediaLineWithoutFormats`
+(12) and `WithExtMapAddsAnExtmapAttribute` (13). Under `HEGEL_NO_KNOWN=1` each draws the
+neighbouring region (numbers within uint64, complete lines, a final line break, documents
+through `t=`, texts without CR, paired `z=` times, addresses without TTL or range, ports `p`
+or `p/a`, known protocols, media with formats, ExtMap texts the builder splits right) and passes.
+
+## Modelled as recorded
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -92,3 +125,5 @@ builders, `NewJSEPSessionDescription`.
 ## History
 
 - 2026-09-21: new target, two properties, 13 bugs.
+- 2026-10-07: generators rewritten in combinator style; known shapes drawn by default
+  (the two wide properties mapped to sdp/2 and sdp/12); thirteen narrow properties.
