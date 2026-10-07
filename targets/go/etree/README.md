@@ -19,8 +19,9 @@ its own patch and files nothing upstream.
 `go test -count=1 -run TestHegel -v .` in the module root, with `python3` and
 [lxml](https://lxml.de/) on the path (CI installs `lxml` in its venv; it is already there for
 go/xpath). The patch adds `hegel_test.go` (harness, model, generators, the writer/reader
-properties), `hegel_api_test.go` (paths, mutations, indentation), `hegel_pins_test.go` (one
-plain test per bug) and `hegel_oracle_test.go` (the lxml child), and requires
+properties), `hegel_api_test.go` (paths, mutations, indentation), `hegel_shapes_test.go` (one property
+per bug), `hegel_pins_test.go` (one plain test per bug) and `hegel_oracle_test.go` (the lxml
+child), and requires
 `hegel.dev/go/hegel v0.6.33` in go.mod (the `go` directive moves from 1.23.0 to 1.26.0 for it;
 etree itself has no dependencies).
 
@@ -67,12 +68,30 @@ etree itself has no dependencies).
 | MutationsFollowTheModel | up to 25 random operations keep the tree equal to the model, every child's `Index`/`Parent` right, `Text`/`Tail`/siblings/attribute lookups as documented, copies independent, and the result writable and readable |
 | IndentFollowsTheModel | on a parsed document, `IndentWithSettings` (spaces, tabs, CRLF, PreserveLeafWhitespace, SuppressTrailingWhitespace) gives the modelled tokens, is idempotent, reads back to itself, and `Unindent` restores the whitespace-stripped tree |
 
-Mismatches are classified before they count: a `Known` switch per recorded bug gates the input
-shape (unparented `Remove`, negative indices, copy indices, API-created whitespace text, comments
-among leading text, `[tag]` before `[n]`, `[0]`, `[` in quoted values, raw whitespace under the
-default escaping, prefixed attributes shadowing unprefixed ones, forbidden characters in CDATA).
-With everything gated the properties run clean; `ZOO_COLLECT=1` prints class counts and the
-first 25 mismatches instead of failing.
+Mismatches name the bug whose shape the failing case has: a `Known` struct has one switch per
+recorded bug, every one off by default, and the generators draw every shape — detached tokens
+removed and negative indices among the mutation operations (the panics recovered and named),
+`Copy`'s index and `SelectAttr` beside a prefixed attribute checked, `SetText` below a leading
+comment, carriage returns and attribute tabs under the default escaping and forbidden characters
+in CDATA judged against the documented sanitisation, `[tag][n]`, `[0]` and `[` in quoted values
+in the paths, trees built through the API in the indentation property. The wide properties land
+on the shapes at their natural rates: MutationsFollowTheModel shrinks to etree/1 (`Remove()` on
+a fresh comment; etree/3 some rounds), WriteThenReadIsIdentity to etree/9 (etree/11 some rounds),
+LxmlReadsTheOutput to etree/11 (etree/9 some rounds) every round and are mapped plain;
+PathsFollowTheModel reaches etree/8 (and etree/7) about five rounds in six and
+IndentFollowsTheModel etree/4 nearly every round, so both are mapped intermittent; etree/6 is
+in reach of the path property only in principle (0 of 1000 cases) and is left to its narrow
+property. `hegel_shapes_test.go` has one property per bug (`RemoveOnDetachedTokenReturnsFalse`,
+`NegativeIndicesAreOutOfBounds`, `CopyOfChildHasNoIndex`, `WhitespaceTextThroughTheAPIIsWhitespace`,
+`SetTextThenTextWithLeadingComment`, `ChildFilterThenPositionCountsCandidatesOnce`,
+`ZeroPositionSelectsNothing`, `QuotedValuesWithBracketsCompile`,
+`RawWhitespaceSurvivesDefaultEscaping`, `CreateAttrBesidePrefixedAttrIsSelected`,
+`CDataWithForbiddenCharactersReadsBack`), each drawing that bug's region and failing every run.
+`HEGEL_NO_KNOWN=1` (read once) turns the switches on: the shapes are skipped (the old
+`cr-gated` skips of a quarter of the cases are gone — the writer trees then draw carriage
+returns and attribute whitespace only where the drawn settings escape them) and the narrow
+properties draw the neighbouring region; every property then passes. `ZOO_COLLECT=1` prints
+class counts and the first 25 mismatches instead of failing.
 
 ## Accepted differences (not bugs)
 
@@ -112,3 +131,4 @@ and the path engine otherwise agreed with the model and lxml throughout.
 ## History
 
 - 2026-09-20 (turn 330): target created at `02c461a` (v1.8.0+1); 11 bugs.
+- 2026-10-07: generators rewritten in combinator style; known shapes drawn by default; eleven narrow properties.
