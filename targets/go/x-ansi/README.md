@@ -49,10 +49,11 @@ below); each is mapped in `target.toml` to the bug it most often shrinks to.
 
 - `TestHegelDecodeSequenceFollowsTheGrammar` and `TestHegelParserReportsTheGrammarsEvents` —
   parameter lists up to and beyond the parser's buffer (x-ansi/1, /2), a 0x9C byte inside a
-  UTF-8 character of a control string (x-ansi/3, the Parser's usual basin), a private marker
+  UTF-8 character of a control string (x-ansi/3, the Parser's basin before the control shape came first), a private marker
   after the parameters (x-ansi/4), two private markers (x-ansi/20), UTF-8 payloads in SOS/PM/APC
-  strings (x-ansi/18), a C0 control inside a CSI or ESC sequence (x-ansi/23, the Decode
-  property's basin: three bytes), an introducer as the final after intermediates (x-ansi/24);
+  strings (x-ansi/18), a C0 control inside a CSI or ESC sequence (x-ansi/23, the basin of both:
+  three bytes; a control inside a CSI is one in five, first in its choice, since the Decode
+  property must reach it every run), an introducer as the final after intermediates (x-ansi/24);
   `ESC \` after a string is reported as an ESC sequence of its own, as a VT parser does.
 - `TestHegelStripAndWidthsFollowTheTokens` — the same documents; UTF-8 payloads in SOS/PM/APC
   strings are its basin (x-ansi/18).
@@ -109,7 +110,7 @@ below); each is mapped in `target.toml` to the bug it most often shrinks to.
 A `Known` struct in `hegel_test.go` has one switch per bug shape, every one off by default:
 the generators draw the shapes (`shaped(Known.x, on, off)` at the generator) and `mismatch`
 names the bug whose shape the failing case has. Properties that fail every run are mapped
-plain to their most frequent basin (Decode to x-ansi/23, Parser to x-ansi/3, Truncate to /7,
+plain to their most frequent basin (Decode and Parser to x-ansi/23, Truncate to /7,
 Hardwrap and Wrap to /12, Wordwrap to /19, XParseColor to /14); those a 100-case run misses now and
 then are intermittent (Strip /18, ReadStyleColor /15, Palette /17, the arbitrary text /5).
 `HEGEL_NO_KNOWN=1`, read once, turns every switch on: the shapes are left out at the
