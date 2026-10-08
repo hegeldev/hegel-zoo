@@ -60,9 +60,12 @@ The known shapes are drawn by default: the wide properties draw the shape of eve
 and fail on it, and are listed in `target.toml` mapped to the bug they find — the unary property
 calls `Float64` (bug 1, every run), the parsers property feeds `null` through `encoding/json`
 (bug 2), the encodings property draws a nil receiver and `PaddedBytes` lengths below the byte
-length (bugs 3 and 5, shrinking most often to the nil receiver), the modular property draws
-every aliasing form of `MulDivOverflowRem` including `m == d` and `m == z` (bug 4, the panic
-recovered and named). `HEGEL_NO_KNOWN=1`, read once, switches the `Known` shapes off at the
+length (bugs 3 and 5, shrinking to the short length in 21 and to the nil receiver in 19 of
+forty rounds at a hundred cases, so it is mapped to bug 5), the modular property draws every
+aliasing form of `MulDivOverflowRem` with `m == d` and `m == z` first in the choice at a
+quarter and with non-zero operands, since a zero product or divisor gives zeros either way
+(bug 4, the panic recovered and named; at the tail of one table over all eight forms the
+engine missed the shape in one run of forty). `HEGEL_NO_KNOWN=1`, read once, switches the `Known` shapes off at the
 generator (exactly representable operands, no `null`, non-nil receivers, lengths at or above
 the byte length, the six working aliasing forms) and every property passes with no case
 skipped. The narrow properties fail every run and under `HEGEL_NO_KNOWN=1` draw the
