@@ -49,9 +49,10 @@ stays at its pinned v1.14.2). No external oracle process: everything runs in-pro
 
 The known shapes are drawn by default: every property draws the shape of every recorded bug
 and fails on it, and is listed in `target.toml` mapped to the bug it finds. The set property
-fails every run and shrinks most often to the empty component (bug 4; the non-finite float,
-the wrapping index, `-1` under a scalar, the bracket key and the forced key are the other
-basins); the delete property meets the forced key (5) and the quote key (10), the agreement
+fails every run and shrinks most often to the non-finite float (bug 2, twenty of forty rounds
+at a hundred cases; `-1` under a scalar, the wrapping index, the empty component, the bracket
+key and the forced key are the other basins, seven, six, five, one and one); the delete
+property meets the forced key (5) and the quote key (10), the agreement
 property the in-place escape (3), the complex-path property the two `#` segments (8), the
 robustness property a non-finite float (2) and the set-then-delete property the quote key (10)
 and the `#` member (11), each in a few percent of cases, so those five are mapped
