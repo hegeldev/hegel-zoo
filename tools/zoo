@@ -203,6 +203,36 @@ def resolve(specs: list[str]) -> list[Target]:
     return out
 
 
+def tag_version(t: Target, pattern: str) -> str:
+    """The checkout is shallow, so tags come from ls-remote."""
+    r = git(t, "ls-remote", "--tags", "origin", check=False, capture=True)
+    if r.returncode != 0:
+        return ""
+    head = git(t, "rev-parse", "HEAD", capture=True).stdout.strip()
+    tags: dict[str, str] = {}  # tag -> sha (peeled when annotated)
+    for line in r.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        name = ref.removeprefix("refs/tags/")
+        if name.endswith("^{}"):
+            tags[name[:-3]] = sha
+        else:
+            tags.setdefault(name, sha)
+    sub = t.meta.get("subdir", "")
+    prefix = f"{sub.rstrip('/')}/" if sub else ""   # multi-module repos tag as <dir>/vX.Y.Z
+
+    def key(v: str):
+        m = re.fullmatch(pattern, v)
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) is None, m.group(4) or "") if m else None
+
+    cands = {n[len(prefix):]: s for n, s in tags.items() if n.startswith(prefix) and key(n[len(prefix):])}
+    if not cands:
+        return ""
+    exact = sorted((v for v, s in cands.items() if s == head), key=key)
+    if exact:
+        return exact[-1]
+    return max(cands, key=key) + "+"
+
+
 # --------------------------------------------------------------------------- backends
 
 class Backend:
@@ -379,35 +409,8 @@ class Go(Backend):
         return [":(exclude,glob)**/go.sum"]
 
     def package_version(self, t: Target) -> str:
-        """The tag at the checked-out commit, or the highest tag with a "+" (after that release);
-        Go modules carry no version in-tree, and the checkout is shallow, so tags come from
-        ls-remote."""
-        r = git(t, "ls-remote", "--tags", "origin", check=False, capture=True)
-        if r.returncode != 0:
-            return ""
-        head = git(t, "rev-parse", "HEAD", capture=True).stdout.strip()
-        tags: dict[str, str] = {}  # tag -> sha (peeled when annotated)
-        for line in r.stdout.splitlines():
-            sha, _, ref = line.partition("\t")
-            name = ref.removeprefix("refs/tags/")
-            if name.endswith("^{}"):
-                tags[name[:-3]] = sha
-            else:
-                tags.setdefault(name, sha)
-        sub = t.meta.get("subdir", "")
-        prefix = f"{sub.rstrip('/')}/" if sub else ""   # multi-module repos tag as <dir>/vX.Y.Z
-
-        def key(v: str):
-            m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(-.*)?", v)
-            return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) is None, m.group(4) or "") if m else None
-
-        cands = {n[len(prefix):]: s for n, s in tags.items() if n.startswith(prefix) and key(n[len(prefix):])}
-        if not cands:
-            return ""
-        exact = sorted((v for v, s in cands.items() if s == head), key=key)
-        if exact:
-            return exact[-1]
-        return max(cands, key=key) + "+"
+        """Go modules carry no version in-tree."""
+        return tag_version(t, r"v(\d+)\.(\d+)\.(\d+)(-.*)?")
 
 
 class TypeScript(Backend):
@@ -547,7 +550,72 @@ class Java(Backend):
             return ""
 
 
-BACKENDS: dict[str, Backend] = {b.lang: b for b in (Rust(), Go(), TypeScript(), Java())}
+class OCaml(Backend):
+    """dune projects; the patch adds `hegel/` at the project root (see HACKING.md). `dune exec`
+    rather than `dune test`, which builds upstream's whole test tree and skips a cached run."""
+    lang = "ocaml"
+    dep_re = re.compile(r'^\+let hegel_pin = "(?P<v>[^"]+)"', re.M)
+    test_re = re.compile(r"^\+let(?:%hegel_test (\w+)| (pin_\w+) \(\) =)", re.M)
+
+    def patch_tests(self, patch_text: str) -> set[str]:
+        return {a or b for a, b in self.test_re.findall(patch_text)}
+
+    def default_command(self, t: Target) -> list[str]:
+        return ["dune", "exec", "--root", ".", "--display", "quiet", "--", "./hegel/zoo_tests.exe"]
+
+    def default_setup(self, t: Target) -> list[str]:
+        pin = t.meta.get("hegel", {}).get("version", "")
+        have = " && ".join(f'[ "$(opam show -f installed-version {p} 2>/dev/null)" = "{pin}" ]'
+                           for p in ("hegel", "ppx_hegel_test"))
+        opam = f"./{t.name}.opam" if (t.src / f"{t.name}.opam").is_file() else "."
+        repo = "git+https://github.com/hegeldev/hegel-ocaml.git"
+        # a switch with hegel pinned to a checkout is someone's development switch: never re-pin it
+        refuse = ('echo "zoo: switch $(opam switch show) has hegel pinned to $(opam show -f pin hegel);'
+                  ' run the zoo in a switch of its own (OPAMSWITCH=hegel-zoo, see HACKING.md)" >&2; exit 1')
+        return [f'{have} || case "$(opam show -f pin hegel 2>/dev/null)" in "" | {repo}#*) '
+                f"opam pin add -y {repo}#v{pin} ;; *) {refuse} ;; esac",
+                f"opam install -y --deps-only {opam}"]
+
+    def default_env(self, t: Target) -> dict:
+        return {"HEGEL_DATABASE": str(WORK / t.lang / f"{t.name}.hegel"), "HEGEL_COLOR": "0",
+                "OCAMLRUNPARAM": "b"}
+
+    _line = re.compile(r"^ZOO (ok|FAILED|ignored) (\S+)$", re.M)
+
+    abort_re = [re.compile(r"^Fatal error: [^\n]*", re.M),
+                re.compile(r"^Segmentation fault[^\n]*", re.M),
+                re.compile(r"^Killed[^\n]*", re.M)]
+
+    def parse_results(self, output: str) -> dict[str, str]:
+        res: dict[str, str] = {}
+        for m in self._line.finditer(output):
+            v, name = m.group(1), m.group(2)
+            if name in res and res[name] == "FAILED":
+                continue
+            res[name] = v
+        return res
+
+    def patch_excludes(self) -> list[str]:
+        return [":(exclude,glob)**/_build/**", ":(exclude,glob)**/*.opam.locked"]
+
+    def package_version(self, t: Target) -> str:
+        """dune-release projects keep no version in-tree, hence the tag fallback."""
+        try:
+            m = re.search(r"^\(version\s+([^\s)]+)\)", (t.src / "dune-project").read_text(), re.M)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        try:
+            m = re.search(r'^version:\s*"([^"]+)"', (t.src / f"{t.name}.opam").read_text(), re.M)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return tag_version(t, r"v?(\d+)\.(\d+)\.(\d+)(-.*|~.*)?")
+
+
+BACKENDS: dict[str, Backend] = {b.lang: b for b in (Rust(), Go(), TypeScript(), Java(), OCaml())}
 
 
 def backend(t: Target) -> Backend:
@@ -1347,7 +1415,7 @@ version = ""
 version = {toml_str(pin)}
 
 [run]
-{"setup = []" if lang in ("rust", "go") else "# no setup: the backend's default runs (npm install of the runtime deps + Hegel; mvn install for Java)"}
+{"setup = []" if lang in ("rust", "go") else "# no setup: the backend's default runs (npm install of the runtime deps + Hegel; mvn install for Java; opam pin + deps for OCaml)"}
 
 [expected_failures]
 ''')

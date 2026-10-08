@@ -23,7 +23,7 @@ import re
 import sys
 from pathlib import Path
 
-LANGS = ["rust", "go", "typescript", "java"]
+LANGS = ["rust", "go", "typescript", "java", "ocaml"]
 LINE_COST = 70
 DIGEST_CAP = 170_000  # as measured by cost()
 BLOCK_CAP = 12_000
