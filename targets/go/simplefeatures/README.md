@@ -88,7 +88,7 @@ and simplefeatures differ in leniency).
 
 ## Known bugs (drawn by default)
 
-Twelve bugs (`bugs.toml`): `Simplify` is not Ramer-Douglas-Peucker and drops vertices farther
+Fourteen bugs (`bugs.toml`): `Simplify` is not Ramer-Douglas-Peucker and drops vertices farther
 than the threshold from its result; TWKB of an empty geometry carries size and bounding box bytes
 its header does not declare; a GeometryCollection's TWKB bounding box is all zeros; an empty
 Point in a MultiPoint reads back from TWKB as `POINT (0 0)`; a MultiPolygon or collection with
@@ -102,8 +102,13 @@ lose a vertex shared with an operand that carries Z (9); a point on the boundary
 MultiPolygon nested in a collection is prepared-within rather than touching (10); an empty areal
 member raises a collection's prepared dimension so `Within`/`CoveredBy`/`Contains` against a
 point go false (11); prepared `Overlaps` is false for two lines sharing a segment that one of
-them crosses at a non-representable point (12). Bugs 10 to 12 are in JTS 1.20 too, inherited
-through the port.
+them crosses at a non-representable point (12); `Buffer` of a closed line whose inside the
+distance erodes keeps the hole-side offset curve that JTS 1.20 and GEOS 3.13 drop: under a
+mitre join its spike at a sharp notch pokes past the outer curve, and a tiny triangle gets a
+spurious hole (13); `Relate` of a closed line
+against a collection holding a point at its closing vertex beside another member puts none of
+the line outside it, so `CoveredBy`, `Within`, `Covers` and `Contains` are true (14). Bugs 10 to
+12 and 14 are in JTS 1.20 too, inherited through the port.
 
 The wide properties draw these shapes by default and fail naming them ("the shape of
 simplefeatures/N" on the mismatch), and `target.toml` maps each to the bug it meets most often,
@@ -114,26 +119,34 @@ STYLE.md rule 3's exception), `TestHegelDensifySimplifyMatchesGEOS` on 1 every r
 on 7 most often (five rounds of thirty fail: 12 twice, 7 twice, 6 once; intermittent),
 `TestHegelOverlaysMatchGEOS` on 8 (one round of thirty; intermittent).
 `TestHegelUnionManyMatchesGEOS` draws the shapes of 8 and 9 too but has not met them in sixty
-rounds at a hundred cases nor at three thousand, so it is not mapped. Each bug also has a narrow
+rounds at a hundred cases nor at three thousand, so it is not mapped; nor are
+`TestHegelBufferMatchesGEOS` (13: it met the tiny-triangle hole twice in thirty rounds at a
+hundred cases before the shape was named, none in the thirty after) and
+`TestHegelPredicatesMatchGEOS` (14: the shape is a point at a ring's closing vertex, which the
+oracle misjudges the same way for all but a line doubling back on itself; no hit in seventy
+rounds). The densify-simplify property fails on 1 in forty of forty rounds at a hundred cases
+but only a third of its rounds at twenty. Each bug also has a narrow
 property over its shape region in `hegel/hegel_shapes_test.go` that fails deterministically beside
 its pin. `HEGEL_NO_KNOWN=1` switches the shapes off (`hegel/known.go` names the shape of a drawn
 case or of the one disagreement regardless, and under `HEGEL_NO_KNOWN=1` the case is counted and
 skipped), and then every property passes.
 
-Two candidates are counted and skipped, not recorded until reproduced standalone: `Buffer` of a
-closed line whose inside is fully eroded under a mitre join keeps the hole-side offset curve that
-JTS and GEOS 3.13 drop (`candidate/go/simplefeatures-13`:
-`LINESTRING (0 2, 0 0, 2 1, 0 -1, 3 1, 0 2)` at distance 2, mitre limit 1, area 38.822 against
-38.714), and `CoveredBy`/`Within` (and the reverse `Covers`/`Contains`) of a closed line against a
-collection holding its closing point beside another member are true where GEOS says false, the
-DE-9IM both ports compute having F for interior-exterior (`candidate/go/simplefeatures-14`:
-`LINESTRING (0 0, 0 -1, 0 0)` against `GEOMETRYCOLLECTION (POINT (0 0), LINESTRING (0 1, 0 2))`).
+One candidate is counted and skipped, not recorded until reproduced standalone:
+`Intersects` of a point an ulp off a segment, where the plain cross product rounds to zero, is
+true while `Relate` (robust orientation) says disjoint and GEOS false
+(`candidate/go/simplefeatures-15`: `LINESTRING (0 -2, -4 0)` and
+`POINT (-2 -0.9999999999999999)`); the inconsistency with `Relate` is what is counted.
 
 Accepted differences with GEOS 3.13.1, not bugs: buffer offsets at turns shallower than three
 degrees, where GEOS places the segments differently from JTS 1.20 (which simplefeatures matches
 to the last digit); GEOS collapsing a ring whose start vertex lies within the tolerance of the
 simplifying chord; overlays of near-degenerate inputs (coordinates within 1e-9 of coincidence);
-a union whose lineal result differs only by noding; and WKT coordinates differing by 1e-16.
+a union whose lineal result differs only by noding; a buffer input with a vertex about a
+hundredth of the distance from the chord between its neighbours, which JTS's input
+simplification drops in one port and keeps in the other; two non-adjacent segments nearly parallel
+at twice the buffer distance apart, whose offset curves touch at a tiny angle and GEOS loses the
+lobe between them (a union of the segments' buffers agrees with simplefeatures); and WKT
+coordinates differing by 1e-16.
 
 ## Not tested
 
@@ -153,3 +166,5 @@ methods, `ExactEquals` options, TWKB ID lists and per-dimension precisions, the 
   the shape; a densify budget (200 000 vertices), `union_all` artifacts, buffers of tiny
   segments and near-reversals and a GEOS `relate` crash on nested empty areal parts tolerated;
   the TWKB shape first in its choice; mappings re-measured; two candidates counted.
+- 2026-10-08: the two candidates reproduced standalone and recorded as bugs 13 and 14, with
+  pins and narrow properties; 14 bugs.
