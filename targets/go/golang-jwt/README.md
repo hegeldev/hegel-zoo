@@ -84,7 +84,14 @@ a segment), NumericDatesRoundTrip to /1 (the fraction one unit early; /6 in two 
 eleven), and GoTokensReadInJoserfc to /3 intermittently (a RegisteredClaims token with a
 `1e19` date, under one percent of its cases, so it passes some default-count runs and fails
 every 1000-case run). SigningMethodsCheckKeysAndSignatures and RequestExtractorsFindTheToken
-reach no recorded shape and pass. `HEGEL_NO_KNOWN=1` (read once into `noKnown`) turns every
+reach no recorded shape and pass. Since 2026-10-08 the null date is the first alternative of
+both date choices at a fifth, the millisecond precision a first alternative of its own and
+whole non-zero milliseconds the first nanos alternative, by default only: the engine's bounded
+integer draw favours the lowest values unevenly from run to run, and as a three-percent
+alternative at index three the null passed two rounds in forty at a hundred cases, while the
+fraction needed a sub-second precision and non-zero nanoseconds past the first element of
+their tables (nanoseconds under a millisecond truncate to no fraction, so the simplest
+instance of the shape must itself reach the bug). `HEGEL_NO_KNOWN=1` (read once into `noKnown`) turns every
 switch on: the model then reproduces the package where the bug is a reading of the input
 (sub-second truncation, string dates, nulls, line breaks) and the generators stop drawing the
 shapes that are regions of the input (pre-epoch fractions, huge dates, odd precisions) - no
