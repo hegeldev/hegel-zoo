@@ -47,6 +47,15 @@ the case count):
   FIXED_LEN_BYTE_ARRAY of parquet-cpp's length for the precision, or INT32/INT64 with
   `store_decimal_as_integer`), turns ENUM into a string and bare repeated fields into LISTs.
 
+- Eighteen narrow properties, one per recorded bug, in `hegel/hegel_shapes_test.go` (thirteen
+  added 2026-10-08) and `hegel_props_test.go`/`hegel_reverse_test.go` (the five of 2026-09-28):
+  each draws the bug's shape region with random contents, is judged as the wide properties
+  judge and fails every run naming the bug; under `HEGEL_NO_KNOWN=1` each draws the
+  neighbouring region instead (required list elements, zeros of one sign, columns the file
+  has, level lengths as written, dictionary floats without NaN, non-negative index lengths,
+  `element`, matching physical types, files with rows, v1 pages, pages with values, codecs
+  other than LZ4_RAW, page counts as written) and passes.
+
 Twenty bugs, fourteen found 2026-09-20 at v0.32.0+ and six by the weekly 1000-case run of 2026-09-28. Writing: `Schema.Deconstruct` (and so the deprecated `Writer`)
 panics on `[]*T` list elements and writes `[]string` elements tagged optional as nulls (1,
 medium); a `[N]byte` decimal whose precision needs more than N bytes passes `SchemaOf` and
@@ -78,19 +87,44 @@ it (17, medium), the LZ4 codec doubles its buffer on every decode error until th
 (18, medium), a leaf annotated MAP or LIST makes `OpenFile` panic in `Kind` (19, medium), and a
 v2 page header counting more nulls than values panics in `makeNumValues` (20, medium).
 
-Gates (`hegel/known.go` and the statistics check) cover the shapes of bugs 1, 4, 5, 6, 7, 8, 9,
-11, 12 and 13 by default (bug 10 does not arise in the properties, whose Go types match the
-files); those are still steering and unsteering them is on the worklist. Bugs 14 to 20 are drawn
-by default: `TestHegelReadsBackWhatItWrites` fails at its natural rate on 14, `TestHegelReadsWhatPyarrowWrites`
-on 15 and `TestHegelDamagedFilesNeverPanic` on 16 to 20 (it opens and reads every damaged file in
-a 2.5 GB-capped child so that a death is attributable to its stage), each listed in `target.toml` as
-an intermittent expected failure mapped to one of them; `HEGEL_NO_KNOWN=1` (read once) switches
-those shapes off, and narrow properties over the shape regions of 15, 17, 18, 19 and 20 fail
-deterministically beside the pins. parquet-cpp's missing column index under an all-NaN page is
-tolerated, not a bug;
+## Known shapes drawn by default
+
+The generators draw the shapes of every recorded bug the wide properties can reach, at their
+natural rates: optional LIST elements, `[N]byte` columns, v2 data pages, float columns with
+signed zeros or NaN, dictionary encoding, LZ4_RAW with pages that compress by less than 3x
+(strings of thousands of characters in three cases in a hundred), pyarrow's element names,
+page versions, encodings and empty tables, and byte damage of every kind. A disagreement with
+pyarrow, with the rows written, or a death of the child process is classified by
+`known(caseInfo)` in `hegel/known.go` (and by the statistics check for bugs 4 and 7), and the
+property fails naming the bug ("the shape of parquet-go/N"). The wide properties are mapped
+in `target.toml` to the bug their shrunk failure lands on: `TestHegelWriterPathsAgree` to /1
+and `TestHegelReadsWhatPyarrowWrites` to /11 plain (forty of forty rounds at a hundred cases,
+thirty of thirty at twenty); `TestHegelPyarrowReadsWhatParquetGoWrites` to /4 (29 of 30 runs,
+one also /7), `TestHegelDamagedFilesNeverPanic` to /17 (28 of 30, with /5, /6, /8, /16, /18,
+/19 and /20 as its other basins) and `TestHegelReadsBackWhatItWrites` to /14 (19 of 30)
+intermittent, since a hundred-case run misses them now and then. Bug 10 (decimal byte order)
+is reached only by its pin and narrow property, since the wide properties' Go types match
+the files; bug 15 by its narrow property. `HEGEL_NO_KNOWN=1` (read once) ends a case whose
+shape the classifier names, and every property passes at a thousand cases (the twenty pins
+fail). parquet-cpp's missing column index under an all-NaN page is tolerated, not a bug;
 dictionary-encoded booleans, which the format allows for every physical type but parquet-cpp
 refuses to read ("Dictionary encoding not implemented for boolean type"), are counted, not
-compared. The generator keeps to the tag placements parquet-go accepts (logical types on LIST
+compared (under two per cent of cases). A candidate, counted and skipped
+(`candidate/go/parquet-go-21`, `HEGEL_DUMP=dir` keeps the file): reading a damaged page of a
+codec other than LZ4 sometimes exhausts the child's 2.5 GB address space - the RLE level
+decoder allocating the run length the damaged bytes claim - not yet reproduced standalone.
+The generator keeps to the tag placements parquet-go accepts (logical types on LIST
 elements go in `parquet-element`, bare slices take no logical type, pointers take no enum,
 time, uuid, json or delta). The patch also un-ignores `hegel/oracle.py` (upstream's
-`.gitignore` has `*.py`).
+`.gitignore` has `*.py`). Reads are bounded (the reflection reader stops a row past the
+count, the row API past each row group's `NumRows`), so a damaged file cannot read forever.
+
+## History
+
+- 2026-09-20: new target, five properties, 14 bugs; 2026-09-28: six bugs from the weekly run,
+  five narrow properties.
+- 2026-10-08: generators rewritten in combinator style (the schema as a depth-indexed tower
+  of field records, rows as a generator derived from the schema, writer and pyarrow options
+  as records, damage as a list of edits applied modulo the length); the classifier's rules for
+  bugs 1, 4-9 and 11-14 made unconditional so the shapes fail by default; thirteen narrow
+  properties; the wide mappings re-measured.
