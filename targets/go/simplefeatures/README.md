@@ -88,7 +88,7 @@ and simplefeatures differ in leniency).
 
 ## Known bugs (drawn by default)
 
-Fourteen bugs (`bugs.toml`): `Simplify` is not Ramer-Douglas-Peucker and drops vertices farther
+Fifteen bugs (`bugs.toml`): `Simplify` is not Ramer-Douglas-Peucker and drops vertices farther
 than the threshold from its result; TWKB of an empty geometry carries size and bounding box bytes
 its header does not declare; a GeometryCollection's TWKB bounding box is all zeros; an empty
 Point in a MultiPoint reads back from TWKB as `POINT (0 0)`; a MultiPolygon or collection with
@@ -107,7 +107,9 @@ distance erodes keeps the hole-side offset curve that JTS 1.20 and GEOS 3.13 dro
 mitre join its spike at a sharp notch pokes past the outer curve, and a tiny triangle gets a
 spurious hole (13); `Relate` of a closed line
 against a collection holding a point at its closing vertex beside another member puts none of
-the line outside it, so `CoveredBy`, `Within`, `Covers` and `Contains` are true (14). Bugs 10 to
+the line outside it, so `CoveredBy`, `Within`, `Covers` and `Contains` are true (14);
+`Intersects` of a point an ulp off a segment is true, the plain float64 cross product absorbing
+the nudge, while `Relate` says disjoint and `Disjoint` is true at the same time (15). Bugs 10 to
 12 and 14 are in JTS 1.20 too, inherited through the port.
 
 The wide properties draw these shapes by default and fail naming them ("the shape of
@@ -124,18 +126,13 @@ rounds at a hundred cases nor at three thousand, so it is not mapped; nor are
 hundred cases before the shape was named, none in the thirty after) and
 `TestHegelPredicatesMatchGEOS` (14: the shape is a point at a ring's closing vertex, which the
 oracle misjudges the same way for all but a line doubling back on itself; no hit in seventy
-rounds). The densify-simplify property fails on 1 in forty of forty rounds at a hundred cases
+rounds; 15: a point an ulp off a segment, which only a wild coordinate reaches, once in some
+six thousand cases). The densify-simplify property fails on 1 in forty of forty rounds at a hundred cases
 but only a third of its rounds at twenty. Each bug also has a narrow
 property over its shape region in `hegel/hegel_shapes_test.go` that fails deterministically beside
 its pin. `HEGEL_NO_KNOWN=1` switches the shapes off (`hegel/known.go` names the shape of a drawn
 case or of the one disagreement regardless, and under `HEGEL_NO_KNOWN=1` the case is counted and
 skipped), and then every property passes.
-
-One candidate is counted and skipped, not recorded until reproduced standalone:
-`Intersects` of a point an ulp off a segment, where the plain cross product rounds to zero, is
-true while `Relate` (robust orientation) says disjoint and GEOS false
-(`candidate/go/simplefeatures-15`: `LINESTRING (0 -2, -4 0)` and
-`POINT (-2 -0.9999999999999999)`); the inconsistency with `Relate` is what is counted.
 
 Accepted differences with GEOS 3.13.1, not bugs: buffer offsets at turns shallower than three
 degrees, where GEOS places the segments differently from JTS 1.20 (which simplefeatures matches
@@ -168,3 +165,7 @@ methods, `ExactEquals` options, TWKB ID lists and per-dimension precisions, the 
   the TWKB shape first in its choice; mappings re-measured; two candidates counted.
 - 2026-10-08: the two candidates reproduced standalone and recorded as bugs 13 and 14, with
   pins and narrow properties; 14 bugs.
+- 2026-10-08: the `Intersects` ulp candidate, met by the predicate property once the shapes of
+  13 and 14 were named, probed over every integer segment in a 21 by 21 grid and recorded as
+  bug 15 (its narrow property filters the drawn nudges by the library's own float64 test);
+  15 bugs.
