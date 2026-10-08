@@ -836,7 +836,10 @@ the engine's defects rather than recorded. Also seen: a wide property that had f
 of the subagent's runs passed once in the reviewer's (semver4j's fluent property), so
 `intermittent` is earned by observation, never by argument; and where the library panics inside
 a drawn call, the property has to recover the panic itself for the failure to be attributed to a
-shape (termenv's `catching`).
+shape (termenv's `catching`). Screened at forty rounds of a hundred cases (2026-10-08): termenv's
+sequence property, mapped plain to termenv/2, missed the 24 truncated channel values once from
+the plain channel draw; an RGB colour with a truncated channel now comes first in its colour
+choice at a quarter (rule 3's exception); mapstructure's three flagged properties held.
 
 The thirty-third batch (turn 488: gofrs-uuid, bitset, go-version and uuid rewritten straight to
 the standard, javaparser unsteered; 47 narrow properties) was mostly quiet, which is the point

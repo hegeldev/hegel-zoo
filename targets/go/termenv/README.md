@@ -37,7 +37,7 @@ policy; the README asks for issues.
 | --- | --- | --- |
 | `PaletteConversionsRoundTrip` | table = computed palette; Convert identities per profile; hex of entry *i* converts back to *i* | termenv/1 (grey entries convert back to a cube colour) |
 | `ConvertFollowsTheDocumentedAlgorithm` | random RGB → ANSI256 equals the model; idempotence; ANSI via ANSI256; result ranges; `FromColor` | termenv/1 (25 % of random colours are nearest a grey) |
-| `ColourSequencesFollowTheSGRTable` | `Sequence(bg)` of every colour kind; `ConvertToRGB` of `#rgb`/`#rrggbb` | termenv/2 (all 256 channel values are drawn) |
+| `ColourSequencesFollowTheSGRTable` | `Sequence(bg)` of every colour kind; `ConvertToRGB` of `#rgb`/`#rrggbb` | termenv/2 (all 256 channel values are drawn, and an RGB colour with a truncated channel comes first in the colour choice at a quarter, so every run reaches it) |
 | `StyledFollowsTheSGRTable` | styles built through the methods in every profile vs the SGR model; `Styled` = `String`; `String(a, b)` joins with a space; `Width` | termenv/3, intermittent (a `NoColor` step in 3 % of styles) |
 | `ProfileColorParsesTheDocumentedForms` | `#rgb`/`#rrggbb`/0–15/16–255/invalid strings → the converted colour or nil | termenv/4 (numbers outside 0–255 are one of five text forms) |
 | `TemplateHelpersRenderStyles` | `Color`/`Foreground`/`Background`/attribute helpers vs the style model, in every profile | termenv/2, intermittent (1 % of cases) |
