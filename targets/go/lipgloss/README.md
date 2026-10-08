@@ -4,8 +4,9 @@ Hegel property tests for `charm.land/lipgloss/v2`, the terminal layout and styli
 behind Bubble Tea, pinned at `6a419c65` (main, 2026-09-11). The tests live in
 `hegel_test.go`, `hegel_canvas_test.go` and `hegel_blend_test.go` (package `lipgloss`, internal
 so the property keys are reachable), `table/hegel_test.go` (package `table`, internal for the resizer) and
-`tree/hegel_test.go` (package `tree_test`, covering `tree` and `list`); the shared harness and
-cell model are in `internal/zootest`. Run with
+`tree/hegel_test.go` (package `tree_test`, covering `tree` and `list`), with one narrow
+property per recorded bug in a `hegel_shapes_test.go` beside each; the shared harness, cell
+model, generator idioms and the `Known` switches are in `internal/zootest`. Run with
 `go test -run TestHegel . ./table ./tree`.
 
 ## Approach
@@ -84,9 +85,60 @@ cell model are in `internal/zootest`. Run with
 | `TestHegelListEnumeratorsCount` | `list.Roman`, `list.Alphabet` vs reference formulas |
 | `TestHegelListsNestAsTrees` | `list.New(...)` auto-nesting vs a model of `ensureParent` |
 
-Set `LIPGLOSS_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
-instead of failing at the first one; shapes of pinned bugs are counted as `lipgloss/N-shape`
-and skipped.
+One narrow property per recorded bug draws that bug's shape region with random contents and
+is judged by the same models: in the root package ClustersSurviveTheSpaceStyler (lipgloss/1),
+ReverseReachesStyledSpaces (/2), SpacesTakeTheTextsUnderlineStyle (/3), HyperlinksCoverTextOnly
+(/4), FractionalPlacePositionsAreNotMirrored (/5), HeightHoldsUnderFractionalAlign (/6),
+FractionalHorizontalAlignIsHonoured (/7), CompositorDrawsAwayFromTheOrigin (/19),
+EqualZLayersKeepInsertionOrder (/22), BorderBlendsReachEveryCorner (/23),
+Blend1DKeepsTheLastStop (/24), Blend2DReachesTheLastStop (/25), StyleRunesKeepsMultiLineStrings
+(/26), Blend2DRightAnglesAreExact (/27), DarkChannelsStayDark (/28), AllNilBlendsRender (/29);
+in `table` TableWidthCountsTheBorders (/8), ShrinkingReachesTheFirstColumn (/9),
+BottomBorderSurvivesHeightWithoutHeaders (/10), HeaderHeightFollowsEveryColumn (/11),
+NoWrapKeepsEveryLine (/12), OverflowRowTakesItsOwnPadding (/13), NoWrapKeepsVerticalPadding
+(/18); in `tree` TrailingHiddenChildrenCloseTheBranch (/14), WidthPadsEveryLineOfAnItem (/15),
+OffsetEndIsAnIndex (/16), AlphabetEnumeratorNeverYieldsAt (/17), AutoNestingKeepsTheLeafHidden
+(/20), HiddenFirstChildKeepsTheNumbering (/21), StyleFunctionsGetSiblingIndexes (/30). Each is
+a deterministic expected failure; under `HEGEL_NO_KNOWN=1` each draws the neighbouring region
+instead and passes.
+
+## Known shapes drawn by default
+
+The generators draw the shape of every recorded bug as an explicit alternative beside the
+plain ones, and the models say what the documentation says: fractional positions and
+alignments are `round(gap * pos)`, spaces take the text's reverse and underline style, a
+hyperlink covers the text only, a table `Width` counts the borders and the resizer's median
+pass reaches the first column, `Wrap(false)` keeps every line and the vertical padding, the
+header row is as tall as its tallest cell, `Offset`'s end is an index, hidden children leave
+the branch and the numbering as if absent, the compositor paints at absolute positions in
+insertion order, blends reach every corner and every stop, right angles are exact, dark
+channels stay dark, an all-nil blend renders, and the style functions are called with
+sibling indexes. A wide property that meets a recorded shape fails naming the bug
+(`zootest.Mismatch`) and is listed in `target.toml` as the expected failure mapped to it,
+beside the pin: over nine rounds RenderFollowsTheBlockModel shrinks to lipgloss/4 most often
+(/1, /3 and /7 in other rounds), PlaceFollowsItsModel to /5, BorderBlendWrapsTheFrame to /29
+(the panic is the smallest failure, though /23 is the commonest shape), Blend2DIsARotatedRamp
+to /27, Blend2DReachesBothEnds to /25, StyleRunesStyleTheirRunes to /26,
+CompositorPaintsLayersInOrder to /22 (or /19), TableLaysOutItsGrid to /10 (or /12, /18; twenty-one rounds for these two),
+TreeFollowsTheLayout to /16 (or /15); Blend1DRunsThroughItsStops (/24), ListEnumeratorsCount
+(/17) and ListsNestAsTrees (/20) meet their shapes in a few percent of cases and are
+intermittent. Joins, Wrap, StyleRanges, Inherit, SetString and TableDataViews reach no recorded
+shape and pass. `HEGEL_NO_KNOWN=1` (read once into `zootest.NoKnown`) turns every switch of
+`zootest.Known` on: the models then follow the implementation where the bug is a reading of
+the input, the `tolerate` edits of /2-/4 apply, and the shape alternatives are weighted to zero
+in the generators; the remaining assumes are a few percent at most (a table width below the
+frame floors, a Blend2D cell on an exact boundary). Set `LIPGLOSS_COLLECT=1` (and
+`HEGEL_TEST_CASES=n`) to collect mismatches and statistics instead of failing at the first one;
+the shapes of recorded bugs are counted as `lipgloss/N-shape`.
+
+The generators are package-level values: the style a `Composite` of optional property records
+with a pure `apply()`, the text lists of grapheme records, positions, blocks, stops, rings and
+rune styles records, the layer tree and the tree nodes depth-indexed memoised towers with pure
+`build()`, the table a record whose per-cell styles are derived from the wrap and width
+settings, enumerator indexes a weighted choice with the `@` blocks as an alternative. The table
+model now includes the resizer (expand shortest-first, three shrink passes with floors and then
+without) and the row heights, so `Width` and `Height` are judged as documented and not only for
+consistency.
 
 ## Bugs (see `bugs.toml`)
 
@@ -123,14 +175,9 @@ and skipped.
 | lipgloss/29 | low | Render panics when every stop of a border foreground blend is nil |
 | lipgloss/30 | medium | tree: a hidden child anywhere but first makes the renderer call the style functions with an index past the children it passes them |
 
-The block-model property tolerates lipgloss/2–4 cell by cell (counted as `tolerated-*` in
-collect mode) and skips the cluster cases of lipgloss/1 (`cluster-torn`); the generators use
-only the position constants, so lipgloss/5–7 are pinned directly. The table, tree and
-compositor properties gate the shapes of lipgloss/8–22 and pin each one; the blend properties
-gate lipgloss/23–28 by cause (the two right-hand corners, rings with under two steps per
-segment, the last cell, strings with a newline, cells on an exact index boundary, ring
-colours with a 16-bit channel below 256), lipgloss/29 and lipgloss/30 (found through `go/bubbles`,
-whose tree component indexes the children its style functions are given) are pinned only.
+Every recorded bug has a pin, a narrow property and a wide property that reaches it (see
+"Known shapes drawn by default"); lipgloss/29 and lipgloss/30 were found through `go/bubbles`,
+whose tree component indexes the children its style functions are given.
 
 ## Not bugs (modelled as documented)
 
@@ -165,5 +212,15 @@ whose tree component indexes the children its style functions are given) are pin
 ## Not covered (yet)
 
 Blend2D at angles other than multiples of 90° beyond "every cell is a ramp colour",
-`Lighten`/`Darken`/`Complementary`, `table` shrinking heuristics beyond the total width,
-`tree` style functions and custom indenters.
+`Lighten`/`Darken`/`Complementary`, custom `tree` indenters. Two oddities of the table
+resizer are ported into the model rather than judged (the median excludes the first row, and
+the expand pass treats a zero-width column as fixed); they may be worth a look upstream.
+
+## History
+
+- 2026-09-11: target created at `6a419c65`; 28 bugs, lipgloss/29–30 added later through `go/bubbles`.
+- 2026-10-08 (turn 1306): generators rewritten in combinator style; a `Known` struct of thirty
+  switches added so that every recorded shape is drawn by default and the wide properties are the
+  expected failures mapped to the bugs; thirty narrow properties added; the table model gained
+  the resizer and the row heights, the tree model the documented `Offset` reading and style
+  functions that record out-of-range indexes.
