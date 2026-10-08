@@ -41,10 +41,20 @@ record of its function and arguments drawn from package-level generators, the fu
 `SampledFrom` with Digamma first; the shape region of every recorded `mathext` bug is drawn one
 time in five beside the plain arguments (never under `HEGEL_NO_KNOWN=1`), and the narrow
 properties draw the regions alone, with the region next to the shape under `HEGEL_NO_KNOWN=1`.
-Shapes for the special functions add half-integers and values near 1; distribution parameters
-are locations of moderate size, scales, counts and probabilities, plus per-distribution edge
-points (support ends, the mode, the mean, 1e20). Datasets of 0 to 40 values with weights that
-include zeros; the paired series for the regressions share the x profile.
+Shapes for the special functions add half-integers and values near 1. For `distuv` (part 2) a
+case is a distribution of a `SampledFrom` table of 22 specs, a method it has, parameters from
+the distribution's own package-level generators (locations of moderate size, scales, counts,
+probabilities, Chi and Weibull shape parameters capped for the moments, NoncentralT's Nu and Mu
+with their wild regions) and an argument - a point of the support (the ends, the mode, the mean,
+1e20), a number, or for a discrete distribution a small integer; the shape regions of the
+twenty-three `distuv` bugs and of the five `mathext` bugs the distributions inherit are drawn
+beside the plain calls with the same `known` weight as in `mathext`, never under
+`HEGEL_NO_KNOWN=1`, and where a region is a large share of a parameter's range (|Mu| above 38,
+Nu beyond 3000 or below 1e-3, a negative argument of the cumulatives of ChiSquared, F,
+InverseGamma and Chi, a Logistic density beyond 354 scales out, Chi K above 5 and Weibull K
+above 20 for the moments) its weight is zero under `HEGEL_NO_KNOWN=1`. Datasets of 0 to 40
+values with weights that include zeros; the paired series for the regressions share the x
+profile.
 
 ## Properties
 
@@ -56,10 +66,14 @@ include zeros; the paired series for the regressions share the x profile.
 - `TestHegelDistuv`: the 21 distributions' Prob, LogProb, CDF, Survival, Quantile, Mean, Median,
   Mode, Variance, StdDev, Skewness, ExKurtosis and Entropy agree with SciPy/mpmath to 1e-12
   relative (1e-9 for cumulatives and quantiles).
-- `TestHegelDistuvOther`: the AlphaStable moments and the Categorical distribution.
+- `TestHegelDistuvOther`: the AlphaStable moments and the Categorical distribution (no
+  recorded bug; passes).
 - `TestHegelDistuvLaws`: a distribution against itself: CDF + Survival = 1 to 1e-10,
   Quantile(CDF(x)) = x wherever the density is positive, LogProb = log Prob, StdDev² = Variance,
-  Mode inside the support, CDF monotone.
+  Mode inside the support, CDF monotone; it draws the same cases as `TestHegelDistuv`, so it
+  reaches the recorded shapes too and fails nearly every run, mapped intermittent to gonum/15
+  (Logistic's far-tail Prob is NaN while exp(LogProb) is 0), the plurality of its basins
+  (twenty-nine of forty rounds at a hundred cases; gonum/27's panic ten; one round passed).
 - `TestHegelStat`: 37 functions of `stat` (moments, means, correlation, covariance, Kendall,
   the entropies and divergences, histograms, quantiles and CDF, Kolmogorov–Smirnov, the linear
   regressions and R², Mode, StdErr, StdScore, Wasserstein) agree with the NumPy model to 1e-10
@@ -74,6 +88,17 @@ include zeros; the paired series for the regressions share the x profile.
   `ZetaNegativeQ` 13); `TestHegelMathext` itself fails every run and is mapped to gonum/9, the
   plurality of its shrunk basins (thirty-six of forty rounds at a hundred cases; gonum/11 the
   other four).
+- Twelve narrow properties, one per `distuv` bug gonum/14 to 25, each a region generator with
+  random contents judged exactly like `TestHegelDistuv` and failing every run
+  (`LogisticLogProbIgnoresItsParameters` 14, `LogisticProbInTheFarTails` 15,
+  `QuantileSkipsItsArgumentChecks` 16, `NoncentralTQuantileHitsItsBracketBound` 17 - kept
+  where the library's own CDF fails to invert its Quantile -, `NoncentralTWithALargeMu` 18,
+  `NoncentralTDensityWithALargeNu` 19, `NoncentralTCDFFarOut` 20, `NoncentralTWithATinyNu` 21,
+  `QuantileTakesLogOfOneMinusP` 22, `BinomialLogProbTakesLogOfOneMinusP` 23,
+  `NarrowTriangleFarFromZero` 24, `FCDFArgumentRoundsToOne` 25); bugs 26 to 36 get theirs in
+  part 3. `TestHegelDistuv` itself fails every run and is mapped to gonum/28, the basin it
+  shrinks to every time (forty of forty rounds at a hundred cases: Chi{1}.LogProb(0), the lowest
+  table entry whose minimal parameters are a shape - Logistic{0, 1} is outside gonum/14's).
 - `TestHegelPin…`: one per recorded bug, asserting the exact behaviour; expected failures.
 
 ## Bugs
@@ -118,24 +143,38 @@ within 1e-5|x| of a negative pole (10), the trivial-argument inverses asked to p
 beyond x = 1e12 (12) and with q < 0 (13). `HEGEL_NO_KNOWN=1` switches the shapes off: the wide
 generator stops drawing the regions, the narrow properties draw the region next to the shape,
 a case the classifier still names is skipped (2.5 % of three thousand cases) or judged at the
-old relaxed tolerance, and every property passes. The `distuv` and `stat` bugs (14 to 39) are
-still modelled as before, until their parts of the rewrite: each has an `HZKnown` switch that
-is on by default and keeps the generator away from the shape or relaxes the check - Logistic
-LogProb not judged and Prob skipped beyond |z| = 354; Quantile(p ∉ [0, 1]) not asked of Logistic
-and NoncentralT; NoncentralT judged for |Mu| ≤ 38, 1e-3 ≤ Nu ≤ 3000, x² ≤ 1e9 Nu, densities above
-1e-3 and cumulatives above 1e-6 (variance to 3e-15 lgamma(Nu/2) Mu²); Exponential, Weibull and
-Laplace quantiles for p ≥ 1e-6; Bernoulli/Binomial log(1 − P) to 1e-13 absolute; Triangle widths
-above 1e-9|a| and CDF values above 1e-6; F cumulatives skipped when d2/(d1 x) < 1e-8; LogNormal
-x ≤ 0 skipped; negative x not sent to ChiSquared, F, InverseGamma, Chi; support edges skipped
-for Prob; Weibull{K: 1}.Prob(0) skipped; Survival not judged below 1e-4; Chi K ≤ 1e5 (moment
-limits per method), Weibull K ≤ 170 (200 for the variance), LogNormal Sigma ≥ 1e-3 (0.05 for the
-kurtosis); StudentsT cumulatives skipped within 1e-5 Sigma√Nu of Mu and Quantile for Nu >
-1e6(2.5(p − 0.5))², and for Nu < 0.1; Poisson densities for λ ≤ 1e5; empty HarmonicMean,
-constant weighted StdDev and Quantile(p ≥ 1 − 1e-12, Empirical, weighted) skipped; the
-distributions' inverse-beta and gamma cases keep the old `mathext` limits (`gammaIncInvUnderflow`,
-`gammaIncCompInvNearOne`, `digammaPrecision`, `invRegIncBetaLarge`, `regIncBetaTinyB` stay on for
-`distuv`). The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns those switches
-off and the properties then fail.
+old relaxed tolerance, and every property passes. The `distuv` bugs (14 to 36) are found the
+same way since part 2: the classifiers `distShape` (from the parameters and argument) and
+`distShapeOf` (from the oracle's answer) hold the old steering's predicates exactly - Logistic
+LogProb (14) and Prob beyond |z| = 354 (15); Quantile(p ∉ [0, 1]) of Logistic and NoncentralT
+(16); a NoncentralT quantile NaN or at its bracket bound 2^24 (17); NoncentralT with |Mu| > 38
+(18), with Nu > 3000, the densities for |x| < 1e-8 Nu, below 1e-3 and the CDF below 1e-5, the
+quantile within 1e-4 of the ends (19), the cumulatives for x² > 1e9 Nu and a quantile out there
+(20), Nu < 1e-3 (21); Exponential and Weibull quantiles for p < 1e-6 and Laplace's within 1e-5
+of the ends (22); Bernoulli/Binomial LogProb and Entropy for P < 1e-6 (23); Triangle moments
+for |a| > 300 (b − a) and a CDF below 1e-6 (24); F cumulatives for d2/(d1 x) < 1e-12 and a
+quantile through an argument within 1e-8 of 1 (25); LogNormal densities and cumulatives at
+x ≤ 0 (26); a negative x or −0 to the cumulatives of ChiSquared, F, InverseGamma and Chi (27);
+the densities at the support edges where 0 log 0 occurs (28); Weibull{K: 1}.Prob(0) (29); a
+Survival below 1e-4 in Normal, LogNormal, GumbelRight, Logistic, Poisson, Binomial, Triangle,
+Uniform and F (30); Chi moments beyond K = 1e5 (300 for the variance, 30 for the skewness, 5 for
+the kurtosis) (31); StudentsT cumulatives within 1e-5 Sigma√Nu of Mu and the quantile for Nu >
+1e6(2.5(p − 0.5))² (32); Weibull moments beyond K = 200 (50 for the skewness, 20 for the
+kurtosis) (33) and for order/K > 170 (34); LogNormal moments for Sigma < 1e-3 (0.05 for the
+kurtosis) (35); Poisson densities for λ > 1e5 (36) - and the distributions inherit the `mathext`
+regions through their quantiles, cumulatives and entropies (an inverse gamma answer below
+1e-18 (4), InverseGamma's quantile within 1e-6 of 1 (5), the inverse beta within 1e-6 of the
+ends or beyond 1e4 (6), RegIncBeta's second parameter below 1 within 1e-3 of 1 (7), every
+Entropy that sums digammas (9), judged at 1e-10 of the parameters' scale under
+`HEGEL_NO_KNOWN=1` only). Under `HEGEL_NO_KNOWN=1` a case the classifiers still name is skipped
+(5 % of `TestHegelDistuv`'s cases and 8 % of the Laws', mostly Logistic's LogProb and the
+support edges) and every property passes. Between a CDF of 1e-6 and 1e-5 the NoncentralT CDF is
+still 1e-7 off one time in five, so the old steering's 1e-6 became 1e-5 in part 2. The `stat`
+bugs (37 to 39) are still modelled as before, until part 3: each has an `HZKnown` switch that
+is on by default and keeps the generator away from the shape - empty HarmonicMean, constant
+weighted StdDev and Quantile(p ≥ 1 − 1e-12, Empirical, weighted) skipped - the collector counts
+the avoidances, and `ZOO_KNOWN_OFF=name,name` turns those switches off so that the property
+fails.
 
 ## Not judged
 
@@ -144,9 +183,8 @@ Results in the denormal range (|want| < 1e-280, LogProb below −708); Zeta to 1
 fractional order whose deviations are roundoff; RSquared, LinearRegression and the other
 regressions to 1e-13 of their cancellation ratio (|α| + |β| max|x| + max|y|)/spread(y);
 constant-data skewness and kurtosis (0/0); Kendall with ties (the model is τ-b, gonum's τ-a is
-documented); Entropy to 1e-10 where it uses Digamma; NoncentralT beyond the bounds above (the
-quadrature oracle is slow for a tiny Nu); Beta.Quantile and F.Quantile through InvRegIncBeta's
-recorded limits; Mode of an empty or tied dataset (either value).
+documented); the NoncentralT variance to 3e-15 lgamma(Nu/2) Mu² extra and its quantile root at 0 to 1e-13 of
+the parameters (rounding noise); Mode of an empty or tied dataset (either value).
 
 ## Not tested
 
@@ -163,3 +201,8 @@ second part.
   number records, the function table and argument records, the thirteen `mathext` shapes drawn by
   default and named by the property, thirteen narrow properties, the inverse-beta oracle solving
   for the complement; `distuv` and `stat` to follow.
+- 2026-10-08: part 2 (the complement solve of part 1 recursed forever at the symmetric point
+  a = b, y = 1/2; once only now), `distuv`: the table of specs and their package-level parameter generators,
+  the twenty-three `distuv` shapes and the five inherited `mathext` shapes drawn by default and
+  named by the classifiers, twelve narrow properties (gonum/14 to 25), the NoncentralT CDF
+  shape widened from 1e-6 to 1e-5; the eleven remaining narrow properties and `stat` in part 3.
