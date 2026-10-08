@@ -23,39 +23,65 @@ records bugs.
 
 ## Approach
 
-- **A rune-slice model of the editor.** Random inputs (letters, spaces, digits, wide CJK
-  runes, accented letters) are set up with a prompt, an optional width (set before the
-  content), a `CharLimit`, one of three validators (none, a maximum length, "required") and an
-  echo mode, then driven for up to 40 steps through `Update` with every binding of the default
-  key map (characters, left/right/home/end, backspace/delete, ctrl+w, alt+d, ctrl+k, ctrl+u,
-  alt+b/alt+f), `tea.PasteMsg` with tabs and newlines, `SetValue`, `SetCursor` and `Reset`.
+- **A rune-slice model of the editor.** A case is a record of the start (a prompt, an
+  optional width set before the content, a `CharLimit`, one of three validators — none, a
+  maximum length, "required" — an echo mode, EchoNone among them, and an initial value of
+  letters, spaces, digits, wide CJK runes and accented letters) and a list of up to 40
+  operation records applied in order: every binding of the default key map (characters,
+  left/right/home/end, backspace/delete, ctrl+w, alt+d, ctrl+k, ctrl+u, alt+b/alt+f),
+  `tea.PasteMsg` with tabs and newlines, `SetValue`, `SetCursor`, `SetWidth` and `Reset`.
   After each step `Value`, `Position` and `Err` must equal the model's (word motions: past
   spaces, then past the word; masked modes jump to the ends; the sanitizer maps tabs and
-  newline characters to single spaces; `CharLimit` cuts pastes and `SetValue`).
+  newline characters to single spaces; `CharLimit` cuts pastes and `SetValue`; backspace on
+  an empty input asks the validator). A classifier over the model's state before the step
+  (`stepShape`: a required validator and backspace on nothing, bubbles/9; ctrl+w on a word
+  after one leading space, 10; alt+d on the last rune, 1) and over the library's window after
+  it (`viewShape`: a window wider than the field, 7; the rune under the cursor past the window,
+  11; EchoNone with a width, 12, or with the cursor inside the value, 98) names the recorded
+  bug a step has; the comparison is always made and fails naming the shape. Under
+  `HEGEL_NO_KNOWN=1` the steps with a shape are replayed on the model only, and EchoNone is
+  not drawn.
 - **The view, parsed into cells.** `View()` is split into graphemes with their reverse-video
   flag (the virtual cursor). It must be prompt + the echoed window `value[offset:offsetRight]`
-  (the library's own offsets) + a blank cursor if the cursor is past the window + padding to
-  exactly `Width+1` cells; the reversed run must sit at `prompt + width(echo(value[offset:pos]))`
-  and be as wide as the rune under the cursor. `Cursor()` (the real cursor) must report the
-  same column.
-- **Placeholders and suggestions.** The placeholder view is the placeholder cut to `Width+1`
-  runes and padded, cursor on its first cell when focused. Suggestions are modelled as the
-  case-insensitive prefix matches of the value with the index reset when the match list
-  changes; up/down cycle, tab appends the current suggestion's remainder, and the view shows
-  that remainder after the cursor.
-- **textarea: a line-slice model with a selection.** Random text (several lines, wide runes,
-  sometimes tabs, CRs or CRLFs) is edited for up to 30 steps through every default binding —
-  characters, Enter, backspace/delete, ctrl+k/ctrl+u, ctrl+w/alt+d, left/right/home/end,
-  alt+b/alt+f, ctrl+home/ctrl+end, ctrl+t, alt+u/l/c, shift+arrows, alt+shift+b/f, ctrl+g —
-  plus pastes, `SetValue`, `InsertString`, `SetCursorColumn` and `Reset`, with a `CharLimit`
-  and a `MaxHeight` some of the time; `Value`, `Line`, `Column`, `LineCount`, `HasSelection`
-  and `SelectedText` must follow the model (CRLF is one line break, limits count runes, a
-  paste is cut to the line limit, an empty selection anchors at the cursor). Vertical motion
-  is checked against the library's own `wrap` grid: Up and Down move exactly one visual row.
-  `View()` is parsed into cells and compared row by row with the grid (prompt, line number or
-  blank gutter, the row's runes, padding, end-of-buffer rows), the cursor's row must be in the
-  viewport and its cell the only reversed one at `gutter + CharOffset`; `Cursor()` and
-  `PositionAt` must agree with that cell; `LineInfo` must describe the grid row.
+  (the library's own offsets, which must hold the cursor and never be wider than the field)
+  + the rune under the cursor (a blank past the end of the value) + padding to exactly
+  `Width+1` cells; with EchoNone a blank cursor cell and the padding; the reversed run must
+  sit at `prompt + width(echo(value[offset:pos]))` and be as wide as the rune under the cursor.
+  `Cursor()` (the real cursor) must report the same column (the library adds the rune index
+  to the prompt, bubbles/8, the shape the cursor property shrinks to).
+- **Placeholders and suggestions.** The placeholder view, at any width (none, negative, 1 to
+  12) and with wide runes among the placeholder's, is the placeholder cut to `Width+1` cells
+  and padded, cursor on its first cell when focused (cut to one rune without a width, bubbles/2;
+  sliced by display width, 3; a panic on a negative width, 4). Suggestions are modelled as the
+  case-insensitive prefix matches of the value, refreshed by `SetValue` and `Reset` (bubbles/5),
+  with the index reset when the match list changes and kept at 0 by up with no match (6);
+  up/down cycle, tab appends the current suggestion's remainder, and the view shows that
+  remainder after the cursor.
+- **textarea: a line-slice model with a selection.** A case is a record of the start (random
+  text of several lines, wide runes, sometimes tabs, CRs or CRLFs; a `CharLimit` and a
+  `MaxHeight` some of the time) and a list of up to 30 operation records: every default
+  binding — characters, Enter, backspace/delete, ctrl+k/ctrl+u, ctrl+w/alt+d,
+  left/right/home/end, alt+b/alt+f, ctrl+home/ctrl+end, ctrl+t, alt+u/l/c, shift+arrows,
+  alt+shift+b/f, ctrl+g — plus pastes (CRLF among their line breaks), `SetValue`,
+  `InsertString`, `SetCursorColumn` and `Reset`; `Value`, `Line`, `Column`, `LineCount`,
+  `HasSelection` and `SelectedText` must follow the model (CRLF is one line break, limits
+  count runes and bind Enter too, a paste is cut to the line limit and to `MaxHeight`, an
+  empty selection anchors at the cursor, Delete on the last rune of a line removes only it).
+  A classifier over the model's state before each step names the recorded bug the step has
+  (bubbles/20, 17, 21, 25, 13, 24, 26: the texts, limits and positions where the library and
+  the model part); the comparison is always made and fails naming the shape, and a panic in
+  the library is a failure naming it too. Vertical motion is checked against the library's
+  own `wrap` grid: Up and Down move exactly one visual row (the rows of two runes or fewer, a
+  lone trailing-space row and a row ending in a wide rune are bubbles/14's shape, found
+  from the grid before the move). `View()` is parsed into cells and compared row by row with
+  the grid (prompt, line number or blank gutter, the row's runes, padding, end-of-buffer
+  rows; a width from a `MaxWidth` below the prompt and gutter, bubbles/22, a gutter too narrow
+  for the line numbers, 18, a row wider than the width, 16, a blank placeholder, 23, and a
+  value set without the cursor shown, 19, are shapes the view property draws), the cursor's
+  row must be in the viewport and its cell the only reversed one at `gutter + CharOffset`;
+  `Cursor()` and `PositionAt` must agree with that cell; `LineInfo` must describe the grid row
+  (at the start of a wrapped row too, bubbles/15). Under `HEGEL_NO_KNOWN=1` the steps and
+  rows with a shape are replayed on the model, or the library, only.
 - **viewport: a scroll model over rows of cells.** A viewport of random size (sometimes with a
   `NormalBorder` frame, a two-cell gutter, `SoftWrap`, `FillHeight`; the content area is always
   at least one cell) gets up to eight random lines (wide runes, sometimes tabs or CRLF) and is
@@ -204,7 +230,7 @@ records bugs.
 | Test | What it checks |
 |---|---|
 | `TestHegelEditingFollowsTheModel` | every key, paste, SetValue/SetCursor/Reset vs the model; Value, Position, Err, View after each step |
-| `TestHegelPlaceholderFillsTheField` | the placeholder view (ASCII, width > 0; the other shapes are pinned) |
+| `TestHegelPlaceholderFillsTheField` | the placeholder view at any width, wide runes among the placeholder's |
 | `TestHegelSuggestionsFollowThePrefix` | matched suggestions, index, `CurrentSuggestion`, tab completion, the completion in the view |
 | `TestHegelRealCursorSitsUnderTheVirtualOne` | `Cursor()` vs the column where View draws the cursor |
 | `TestHegelTextareaEditingFollowsTheModel` | every key, paste and setter vs the line-slice model: value, cursor, selection |
@@ -229,20 +255,40 @@ records bugs.
 | `TestHegelSpinnerAdvances` | `Tick`, rounds, spinner swaps, foreign/stale/broadcast ticks vs the mirror: the frame shown, the tag, the ticks emitted |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
-instead of failing at the first one; in the rewritten packages (cursor, key, spinner,
-stopwatch, timer, paginator, help, progress) the shapes of the recorded bugs are counted as
-`shape bubbles/N` and, under `HEGEL_NO_KNOWN=1`, the skipped ones as `known bubbles/N`; in the
-others still as `bubbles/N-shape`. The wide properties of the rewritten packages draw the
-shapes of their packages' recorded bugs and are expected failures mapped to the bug they shrink
-to (`TestHegelCursorFollowsFocus` bubbles/97, `TestHegelSpinnerAdvances` 95,
+instead of failing at the first one; in the rewritten packages (textinput, textarea, cursor,
+key, spinner, stopwatch, timer, paginator, help, progress) the shapes of the recorded bugs are
+counted as `shape bubbles/N` and, under `HEGEL_NO_KNOWN=1`, the skipped ones as `known
+bubbles/N` and the filtered ones as `filtered <name>`; in the others still as `bubbles/N-shape`.
+The wide properties of the rewritten packages draw the shapes of their packages' recorded bugs
+and are expected failures mapped to the bug they shrink to, the plurality basin where a property
+draws several (`TestHegelEditingFollowsTheModel` bubbles/1, `TestHegelPlaceholderFillsTheField`
+4, `TestHegelSuggestionsFollowThePrefix` 6, `TestHegelRealCursorSitsUnderTheVirtualOne` 8,
+`TestHegelTextareaEditingFollowsTheModel` 26, `TestHegelVerticalMotionMovesOneVisualRow` 14,
+`TestHegelViewShowsTheWrappedRows` and `TestHegelRealCursorAndPositionAtAgree` 16, both
+intermittent, their shapes being a few percent of their cases, `TestHegelLineInfoDescribesTheWrappedRow`
+15, intermittent too, one pass in forty rounds at a hundred, `TestHegelCursorFollowsFocus` 97, `TestHegelSpinnerAdvances` 95,
 `TestHegelStopwatchCounts` 91, `TestHegelTimerCountsDown` 92, `TestHegelPaginatorFollowsTheModel`
-41, `TestHegelHelpFitsTheWidth` 57, `TestHegelProgressDrawsTheModel` 62,
-`TestHegelProgressSettles` 63; each fails every run but the progress draw property, intermittent:
-its shapes are a tenth of its cases and it passed one round of forty at a hundred), and beside them sixteen narrow
+41, `TestHegelHelpFitsTheWidth` 57, `TestHegelProgressDrawsTheModel` 62, intermittent:
+its shapes are a tenth of its cases and it passed one round of forty at a hundred,
+`TestHegelProgressSettles` 63), and beside them forty-three narrow
 properties, one per bug of those packages, in `<package>/hegel_shapes_test.go` — the bug's
 shape region with random contents, judged like the wide property, failing every run by default
 and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every property passes:
-`TestHegelCursorModeOutOfRange` (96), `TestHegelCursorZeroValueFocused` (97),
+`TestHegelTextinputDeleteWordForwardOnTheLastRune` (1), `TestHegelTextinputPlaceholderWithoutAWidth`
+(2), `TestHegelTextinputWidePlaceholderRunes` (3), `TestHegelTextinputNegativeWidthPlaceholder` (4),
+`TestHegelTextinputSetValueKeepsStaleSuggestions` (5), `TestHegelTextinputPrevSuggestionWithoutAMatch`
+(6), `TestHegelTextinputSetWidthLeavesTheWindowWide` (7), `TestHegelTextinputRealCursorInAScrolledWindow`
+(8), `TestHegelTextinputBackspaceOnAnEmptyRequiredField` (9),
+`TestHegelTextinputDeleteWordBackwardAfterOneLeadingSpace` (10), `TestHegelTextinputCursorScrolledPastTheWindow`
+(11), `TestHegelTextinputEchoNoneFieldShrinks` (12), `TestHegelTextinputEchoNoneCursorInsideTheValue`
+(98), `TestHegelTextareaDeleteOnTheLastRuneOfALine` (13), `TestHegelTextareaVerticalMotionAcrossAShortRow`
+(14), `TestHegelTextareaLineInfoAtTheEndOfARow` (15), `TestHegelTextareaWideRuneOverflowsTheRow` (16),
+`TestHegelTextareaCharLimitCountsColumns` (17), `TestHegelTextareaNoLimitGutterShiftsLineTen` (18),
+`TestHegelTextareaSetValueDoesNotScroll` (19), `TestHegelTextareaPasteWithCRLF` (20),
+`TestHegelTextareaPastePastMaxHeight` (21), `TestHegelTextareaMaxWidthBelowThePromptAndGutter` (22),
+`TestHegelTextareaBlankPlaceholder` (23), `TestHegelTextareaDeleteWordBackwardAfterOneLeadingSpace`
+(24), `TestHegelTextareaEnterAtTheCharLimit` (25), `TestHegelTextareaEmptySelectionThenShiftArrow`
+(26), `TestHegelCursorModeOutOfRange` (96), `TestHegelCursorZeroValueFocused` (97),
 `TestHegelSpinnerTickWithTagZeroAfterTheFirst` (95), `TestHegelStopwatchWithoutAnInterval` (91),
 `TestHegelStopwatchStartedTwiceBeforeTheFirstTick` (94), `TestHegelTimerStartedTwice` (92),
 `TestHegelTimerTimeoutNotAMultipleOfTheInterval` (93), `TestHegelPaginatorPageOutlivesTheTotal`
@@ -251,7 +297,8 @@ and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every proper
 (58), `TestHegelProgressStopsOnTheWayDown` (59), `TestHegelProgressColorFuncSurvivesALaterBlend`
 (60), `TestHegelProgressWideFillRunesWidenTheBar` (61),
 `TestHegelProgressColorFuncToldThePercentagePastOne` (62), `TestHegelProgressNaNPercentNeverSettles`
-(63). The other seven packages still steer off their bugs (counted, pins only); they follow.
+(63). The other five packages (viewport, table, list, filepicker, tree) still steer off their
+bugs (counted, pins only); they follow.
 
 ## Bugs (see `bugs.toml`)
 
@@ -354,20 +401,31 @@ and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every proper
 | bubbles/95 | low | spinner: a tick carrying tag 0 is never rejected, so two initial Ticks advance the spinner by two frames |
 | bubbles/96 | low | cursor: Mode.String panics for a value outside blink/static/hidden |
 | bubbles/97 | low | cursor: a zero-value Model panics in Focus, Blink and on the initial blink message |
+| bubbles/98 | low | textinput: with EchoNone the cursor vanishes while it is inside the value |
 
-Eight of the twelve were visible in the source on a first reading (`textinput.go` is under a
-thousand lines); the properties confirmed them and found bubbles/7's typing and ctrl+u cases,
-bubbles/9 and bubbles/10. The editing property gates bubbles/1, /7, /9, /10 and /11 by cause,
-the placeholder property /2, /3 and /4, the suggestion property /5 and /6, the cursor property
-/8; each is pinned.
+Eight of the twelve textinput bugs of the first pass were visible in the source on a first
+reading (`textinput.go` is under a thousand lines); the properties confirmed them and found
+bubbles/7's typing and ctrl+u cases, bubbles/9 and bubbles/10; the thirteenth, bubbles/98, came
+out of the rewrite, when the view model stated a blank cursor cell for EchoNone wherever the
+cursor is instead of accepting what the library drew. The editing property draws the shapes of
+bubbles/1, /7, /9, /10, /11, /12 and /98 (per thousand cases about 40 of /11, 110 of /7, 65 of
+/12, 40 of /9, 40 of /1, 20 of /10) and shrinks to /1 or /9 about equally, /12, /11, /7 and
+/98 less often (over forty rounds at a hundred cases: 12, 10, 7, 5, 4 and 2), the placeholder
+property /2, /3 and /4 (basins 4, 3, 2 at 18, 13 and 9), the suggestion property /5 and /6
+(basin 6), the cursor property /8 and /11 (basin 8); each is pinned and has its narrow property.
 
 For textarea (2 100 lines, read in full first) eleven of the fourteen were suspicions from the
 reading, confirmed by one probe file; the properties found bubbles/14's third and fourth cases,
 bubbles/25 and bubbles/26 — the last as a panic in the test's own model, whose cause (a stale
-anchor the library keeps) turned out to crash the library too. The editing property gates
-/13, /17, /20, /21, /24, /25 and /26 by cause, the vertical property /14 (rows of two runes or
-fewer, or ending in a wide rune, around the move), the view and cursor properties /16 (a
-row wider than the width), the LineInfo property /15; each is pinned.
+anchor the library keeps) turned out to crash the library too. The editing property draws the
+shapes of /13, /17, /20, /21, /24, /25 and /26 (per thousand cases about 120 of /20, 90 of /21,
+65 of /26, 50 of /25, a dozen of /17, ten of /24, one of /13) and shrinks to /26 (21 of forty
+rounds at a hundred cases; /20 11, /25 4, /21 and /24 2), the vertical property /14 (a short
+row, a lone trailing-space row or a row ending in a wide rune around the move: half its cases,
+basin 14), the view property /16, /22 and /23 and the cursor property /16 (a row wider than
+the width: a few percent of their cases, both intermittent), the LineInfo property /15 (a
+quarter of its cases; it passed one round of forty at a hundred, so intermittent); each is
+pinned and has its narrow property.
 
 For viewport (765 lines plus `highlight.go`, read in full first) eleven of the thirteen were
 on paper — `SetContent` splitting before the CRLF check, `maxXOffset` against `Width()`,
@@ -574,3 +632,16 @@ margin) and `Select` past the end (bubbles/40's shape).
   latent model bugs fixed on the way: the paginator's dots view would have panicked at zero
   pages, and the progress narrow generators had to avoid `PercentFormat("")`, which prints a
   `%!(EXTRA …)` of up to 36 cells.
+- Part 2 (2026-10-08): textinput and textarea rewritten the same way (a record of a start and
+  a list of operation records; classifiers over the model's state before the step and over the
+  library's window after it; the shapes the old properties never drew — EchoNone, a negative or
+  missing placeholder width, `SetWidth` after the value, CRLF in a paste, a paste past
+  `MaxHeight`, a `MaxWidth` below the prompt and gutter, a white-space placeholder — drawn as
+  alternatives), the model told the truth where it had been bent to the library (the rune
+  under the cursor shown, the window never wider than the field, a blank cursor cell under
+  EchoNone, a panic always a failure, an empty selection anchored at the cursor, CharLimit in
+  runes, Enter bound by it, a paste bound by MaxHeight) and twenty-seven narrow properties
+  added. Found on the way: bubbles/98 (the EchoNone cursor vanishes inside the value), which
+  the old view model had accepted. Two latent model bugs fixed: alt+b/alt+f computed the word
+  boundary after moving the cursor, and the suggestion model had no cursor (`SetValue` keeps
+  the library's).
