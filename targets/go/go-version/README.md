@@ -46,7 +46,8 @@ settles the one case the table leaves out (`~> 1`).
 - `TestHegelPrecedenceFollowsSemver` — pairs of related versions (shared or neighbouring
   segments, the same value with more or fewer trailing zeros, derived pre-releases, different
   metadata): `Compare` and the five comparison methods agree with the model both ways;
-  `sort.Sort(Collection)` orders 2–6 related versions as the model does. Finds /1 (and /2, /3).
+  `sort.Sort(Collection)` orders 2–6 related versions as the model does. Finds /2 most often (34
+  of forty rounds at a hundred cases; /1 the other six, and /3 in principle).
 - `TestHegelConstraintsFollowTheirRules` — one to three comparators with every operator
   (including the bare version), versions of one to four segments with optional pre-release,
   `v` prefix and zero padding, random blanks: `Check` of the whole and of each `Constraint`

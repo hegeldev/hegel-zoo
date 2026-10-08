@@ -856,7 +856,10 @@ a model written beside a gate often shares the gate's assumption. Three wide pro
 declared intermittent after passing once in the reviewer's rounds (bitset's ExtractAndDeposit at
 100 cases, go-version's malformed and constraint properties at 3-4% of cases), and a race
 property (uuid/1) stays intermittent on a two-core machine whatever its rounds, with hegel-go
-printing no failure line when the shrunk case's final replay passes. Java targets of
+printing no failure line when the shrunk case's final replay passes. (Screened at forty rounds
+of a hundred cases on 2026-10-08: go-version's precedence property shrinks to go-version/2 in
+34 rounds and to /1 in 6, so it is remapped to /2; cast's, pflag's and the other go-version
+plain mappings hold.) Java targets of
 javaparser's size verify at 1000 cases in four to nine minutes and 3000 does not fit a
 ten-minute command; the impossible headers of bitset/7 are drawn from 2^52 up because 2^51 is a
 fatal out-of-memory rather than a recoverable panic.
