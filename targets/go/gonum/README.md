@@ -19,7 +19,8 @@ Python over a JSON-lines subprocess, floats travelling as their shortest round-t
 mpmath at 30 digits (40 to 90 where the moments cancel) is the reference for `mathext`: the
 regularised incomplete beta and gamma and their inverses (the inverses refined by a root search
 in log space against the 30-digit forward function, with the exact leading term when the root is
-below 1e-18), lgamma, digamma, the elliptic integrals, `hyp2f1`, Airy and the dilogarithm; the
+below 1e-18, and solving for the complement when the root is above 1/2: the secant's first log
+step used to land beyond 1 and the oracle skipped every answer above 0.78), lgamma, digamma, the elliptic integrals, `hyp2f1`, Airy and the dilogarithm; the
 Hurwitz zeta is an Euler–Maclaurin sum of the test's own (mpmath's `zeta(s, q)` loses digits for
 large `s` and `q`). SciPy's `stats` gives the distributions, with mpmath taking over where SciPy
 is known to fail: the Bernoulli and Binomial moments near P = 1, the Chi moments (a difference of
@@ -33,11 +34,17 @@ raw moments, which multiply 0 by an infinite power as gonum does).
 
 Numbers of ten magnitude profiles (small integers, quarters, three decimals, tiny 1e-3…1e-12,
 large 10…1e9, huge to 1e100, binary fractions, near integers, integers) with a 40% sign;
-probabilities with the ends, 1e-2…1e-15 and their complements. Shapes for the special functions
-add half-integers and values near 1; distribution parameters are locations of moderate size,
-scales, counts and probabilities, plus per-distribution edge points (support ends, the mode, the
-mean, 1e20). Datasets of 0 to 40 values with weights that include zeros; the paired series for
-the regressions share the x profile.
+probabilities with the ends, 1e-2…1e-15 and their complements. For `mathext` (rewritten in
+combinator style, part 1 of three) a number is a record of profile, mantissa, exponent and sign
+rendered by a pure function, the plainest profile first; the argument list of a function is a
+record of its function and arguments drawn from package-level generators, the function table a
+`SampledFrom` with Digamma first; the shape region of every recorded `mathext` bug is drawn one
+time in five beside the plain arguments (never under `HEGEL_NO_KNOWN=1`), and the narrow
+properties draw the regions alone, with the region next to the shape under `HEGEL_NO_KNOWN=1`.
+Shapes for the special functions add half-integers and values near 1; distribution parameters
+are locations of moderate size, scales, counts and probabilities, plus per-distribution edge
+points (support ends, the mode, the mean, 1e20). Datasets of 0 to 40 values with weights that
+include zeros; the paired series for the regressions share the x profile.
 
 ## Properties
 
@@ -57,6 +64,16 @@ the regressions share the x profile.
   the entropies and divergences, histograms, quantiles and CDF, Kolmogorov–Smirnov, the linear
   regressions and R², Mode, StdErr, StdScore, Wasserstein) agree with the NumPy model to 1e-10
   of the data's magnitude.
+- Thirteen narrow properties, one per `mathext` bug, each a generator over the bug's shape
+  region with random contents judged like `TestHegelMathext` and failing every run
+  (`HypergeoIsDefinedAtItsSpecialPoints` 1, `HypergeoNearTheUnitPoint` 2,
+  `LbetaWithALargeArgument` 3, `GammaIncRegInvTinyAnswers` 4, `GammaIncRegCompInvNearOne` 5,
+  `InvRegIncBetaNearTheEnds` 6, `RegIncBetaSmallSecondParameterNearOne` 7,
+  `EllipticAmplitudeBeyondAQuarterTurn` 8, `DigammaToFullPrecision` 9,
+  `DigammaNextToANegativePole` 10, `InverseIncompleteArgumentChecks` 11, `ZetaHugeExponent` 12,
+  `ZetaNegativeQ` 13); `TestHegelMathext` itself fails every run and is mapped to gonum/9, the
+  plurality of its shrunk basins (thirty-six of forty rounds at a hundred cases; gonum/11 the
+  other four).
 - `TestHegelPin…`: one per recorded bug, asserting the exact behaviour; expected failures.
 
 ## Bugs
@@ -89,14 +106,21 @@ weight sum rounds short (39).
 
 ## Modelled as recorded
 
-Every bug has an `HZKnown` switch (39). While a switch is on the generator keeps away from the
-shape or the check is relaxed: Hypergeo judged only for c > 0, −0.9 < z < 0.99 and parameters
-below 10, and its NaN/panic inputs skipped; Lbeta/Beta judged to 1e-15 of their lgamma scale;
-the inverse incomplete functions not judged where the answer is below 1e-18 (gamma) or within
-1e-6 (1e-3 beyond parameter 1e4) of the ends (beta), and to 1e-7 for shapes beyond 1e4;
-GammaIncRegCompInv to 1e-15/(a(1 − y)); RegIncBeta skipped for b < 1 within 1e-4 of 1; elliptic
-amplitudes within π/2; Digamma to 1e-10 absolute and skipped within 1e-5|x| of a negative pole;
-the trivial-argument inverses not asked to panic; Zeta skipped for x > 1e12 and q < 0; Logistic
+The `mathext` bugs (1 to 13) are found: the property draws every recorded shape by default
+(one time in five beside the plain arguments), judges it at the strict tolerance and fails
+naming the bug ("the shape of gonum/N"), the classifier `mathShape` holding the shape
+predicates - Hypergeo at z = 1 with c − a − b > 0 or a nonpositive integer c (1), a parameter of
+10 or more, a negative c, z ≤ −0.9 or z ≥ 0.99 (2), Lbeta/Beta with an argument beyond 1e6 (3),
+an inverse incomplete gamma answer below 1e-18 (4), GammaIncRegCompInv within 1e-6 of 1 (5),
+InvRegIncBeta within 1e-6 of the ends or a parameter beyond 1e4 (6), RegIncBeta with b < 1
+within 1e-3 of 1 (7), an elliptic amplitude beyond π/2 (8), any Digamma at 1e-13 (9), Digamma
+within 1e-5|x| of a negative pole (10), the trivial-argument inverses asked to panic (11), Zeta
+beyond x = 1e12 (12) and with q < 0 (13). `HEGEL_NO_KNOWN=1` switches the shapes off: the wide
+generator stops drawing the regions, the narrow properties draw the region next to the shape,
+a case the classifier still names is skipped (2.5 % of three thousand cases) or judged at the
+old relaxed tolerance, and every property passes. The `distuv` and `stat` bugs (14 to 39) are
+still modelled as before, until their parts of the rewrite: each has an `HZKnown` switch that
+is on by default and keeps the generator away from the shape or relaxes the check - Logistic
 LogProb not judged and Prob skipped beyond |z| = 354; Quantile(p ∉ [0, 1]) not asked of Logistic
 and NoncentralT; NoncentralT judged for |Mu| ≤ 38, 1e-3 ≤ Nu ≤ 3000, x² ≤ 1e9 Nu, densities above
 1e-3 and cumulatives above 1e-6 (variance to 3e-15 lgamma(Nu/2) Mu²); Exponential, Weibull and
@@ -107,9 +131,11 @@ for Prob; Weibull{K: 1}.Prob(0) skipped; Survival not judged below 1e-4; Chi K �
 limits per method), Weibull K ≤ 170 (200 for the variance), LogNormal Sigma ≥ 1e-3 (0.05 for the
 kurtosis); StudentsT cumulatives skipped within 1e-5 Sigma√Nu of Mu and Quantile for Nu >
 1e6(2.5(p − 0.5))², and for Nu < 0.1; Poisson densities for λ ≤ 1e5; empty HarmonicMean,
-constant weighted StdDev and Quantile(p ≥ 1 − 1e-12, Empirical, weighted) skipped. The collector
-counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns switches off and the properties then
-fail.
+constant weighted StdDev and Quantile(p ≥ 1 − 1e-12, Empirical, weighted) skipped; the
+distributions' inverse-beta and gamma cases keep the old `mathext` limits (`gammaIncInvUnderflow`,
+`gammaIncCompInvNearOne`, `digammaPrecision`, `invRegIncBetaLarge`, `regIncBetaTinyB` stay on for
+`distuv`). The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns those switches
+off and the properties then fail.
 
 ## Not judged
 
@@ -133,3 +159,7 @@ second part.
 ## History
 
 - 2026-09-22: new target, seven properties, 39 bugs.
+- 2026-10-08: part 1 of the rewrite in combinator style: the harness and `mathext` - package-level
+  number records, the function table and argument records, the thirteen `mathext` shapes drawn by
+  default and named by the property, thirteen narrow properties, the inverse-beta oracle solving
+  for the complement; `distuv` and `stat` to follow.
