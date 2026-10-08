@@ -145,17 +145,21 @@ ada accepts it), and runes python's `unicodedata` does not know.
 ## Known shapes drawn by default
 
 The wide properties draw every recorded shape and fail on it, each mapped in `target.toml` to
-the bug its shrunk failure lands on most often (forty-seven rounds for the fragment property,
-thirteen for the others): `ParseAgreesWithTheOracles` to x-net/3 (`</>` is a draw-free
-alternative and wins the shrink; /1, /2, /8, /10, /11 and /12 behind it),
-`FragmentsAgreeWithTheOracles` to x-net/8 (fifteen of forty-seven; /10, /3 and /1 the others),
+the bug its shrunk failure lands on most often (forty rounds at a hundred cases with the shape
+token first): `ParseAgreesWithTheOracles` to x-net/2 (forty of forty: the doctype NUL is the
+first shape token the shrinker can keep; while the shape token was the last soup alternative the
+draw-free `</>` of x-net/3 won the shrink, with /1, /2, /8, /10, /11 and /12 behind it),
+`FragmentsAgreeWithTheOracles` to x-net/8 (thirty-four of forty; /3 and /10 the others),
 `ChunkedReadsParseAlike` to x-net/4 (the crash, which the wild region reached at a thousand
 cases anyway; the first version of the shape drew a tag or comment after `</html>` two times in
 three, which parses, and a CI run at a hundred cases passed the property; the shape is now the
 first alternative of the chunked choice, since the engine's bounded integer draw favours low
 values unevenly from run to run: as the second alternative it was drawn between one and
-thirty-four times in a hundred cases, as the first between six and fifty-two), `RenderedTreesReparseAlike` to x-net/1 (a `&#13;` in a comment; /12 and /6 at
-times), `LookupAgreesWithWHATWG` to x-net/13 and `RegistrationAgreesWithIDNA2008` to x-net/14
+thirty-four times in a hundred cases, as the first between six and fifty-two),
+`RenderedTreesReparseAlike` to x-net/1 (a `&#13;` in a comment, forty of forty; it passed one
+round in forty at a hundred cases while the shape token was the last alternative of the soup
+token choice and the NUL attribute pair the last of the attribute list choice, so both are now
+the first), `LookupAgreesWithWHATWG` to x-net/13 and `RegistrationAgreesWithIDNA2008` to x-net/14
 (a lone NV8 rune is the first piece alternative, since the shrinker otherwise ends on a CONTEXTO
 rune from the Greek pool, x-net/15). `TokenizerRawCoversTheInput`, `UnescapeAgreesWithEntities`,
 `PunycodeAgreesWithTheCodec` and `LookupIsAFixedPoint` reach no recorded shape. Under
