@@ -52,8 +52,9 @@ named like a void one with children, mixed whitespace in `<noscript>`, a raw tex
 the attribute list), a structured document of depth-indexed element records, or either under a
 list of edit records applied modulo the live length; a fragment context is a record (the raw
 text and column-group contexts drawn as alternatives, a raw text context's own end tag inserted
-at a drawn position, and content after `</html>` in a foreign context drawn in a fifth of the
-chunked cases), the chunking a list of cut lengths, a reference text a list of reference pieces.
+at a drawn position, and text after `</html>` in a foreign context drawn in a fifth of the
+chunked cases: text alone reaches the nil current node, a tag or comment after the ignored end
+tag parses), the chunking a list of cut lengths, a reference text a list of reference pieces.
 By default a mismatch the classifier in `known.go` names fails the property naming the bug, and
 x-net/4's crash is recovered and named; under `HEGEL_NO_KNOWN=1` the shape alternatives have
 weight zero, the classifier's answer is counted as a known bug, and the crash is assumed away
@@ -149,7 +150,11 @@ thirteen for the others): `ParseAgreesWithTheOracles` to x-net/3 (`</>` is a dra
 alternative and wins the shrink; /1, /2, /8, /10, /11 and /12 behind it),
 `FragmentsAgreeWithTheOracles` to x-net/8 (fifteen of forty-seven; /10, /3 and /1 the others),
 `ChunkedReadsParseAlike` to x-net/4 (the crash, which the wild region reached at a thousand
-cases anyway), `RenderedTreesReparseAlike` to x-net/1 (a `&#13;` in a comment; /12 and /6 at
+cases anyway; the first version of the shape drew a tag or comment after `</html>` two times in
+three, which parses, and a CI run at a hundred cases passed the property; the shape is now the
+first alternative of the chunked choice, since the engine's bounded integer draw favours low
+values unevenly from run to run: as the second alternative it was drawn between one and
+thirty-four times in a hundred cases, as the first between six and fifty-two), `RenderedTreesReparseAlike` to x-net/1 (a `&#13;` in a comment; /12 and /6 at
 times), `LookupAgreesWithWHATWG` to x-net/13 and `RegistrationAgreesWithIDNA2008` to x-net/14
 (a lone NV8 rune is the first piece alternative, since the shrinker otherwise ends on a CONTEXTO
 rune from the Greek pool, x-net/15). `TokenizerRawCoversTheInput`, `UnescapeAgreesWithEntities`,
