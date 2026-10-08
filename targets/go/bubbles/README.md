@@ -78,10 +78,15 @@ records bugs.
   to `colstart − 6` when its end is past the width). The reversed cells of every visible row
   must be exactly the matched cells clipped to the window; a newline counts as one cell after
   its line's last.
-- **paginator: pages over a slice.** `PerPage` 1–5 and 1–40 items; the default bindings and
-  `NextPage`/`PrevPage` move the page by one within `[0, pages−1]`, `SetTotalPages` recomputes
-  `ceil(items / PerPage)`, `GetSliceBounds`/`ItemsOnPage` are the page's slice, `View` is the
-  dots or the Arabic format for the page.
+- **paginator: pages over a slice.** A case is a record of `PerPage` 1–5, the display options,
+  1–40 items and a list of one to thirty operation records (the default bindings,
+  `NextPage`/`PrevPage`, another key, a new item count — zero one time in five, and one time in
+  five raised to the count that keeps the current page); the page moves by one within
+  `[0, pages−1]`, `SetTotalPages` recomputes `ceil(items / PerPage)` (none for no items) and
+  keeps the page within the pages, `GetSliceBounds`/`ItemsOnPage` are the page's slice, `View`
+  is the dots or the Arabic format for the page. The shapes of the two recorded bugs (a count of
+  zero, bubbles/41; a count below the page's first item, bubbles/40) are drawn like any other
+  case and fail naming them; under `HEGEL_NO_KNOWN=1` neither is drawn.
 - **table: the selection in view.** Random columns (1–4, widths 0–7, titles), rows of that
   many fields (letters, spaces, wide runes; sometimes a row with one field too many), a height
   of 2–9 and a width of 8–50, the styles set to `Reverse` for the selection and the default
@@ -113,7 +118,11 @@ records bugs.
   the separator; `FullHelpView` one column per group with an enabled binding — the separator on
   the first line, keys and descriptions each padded to the widest, columns joined at the top;
   with a width, both must stop before the first item or column that does not fit and end in
-  ` …` when it fits, so the output is never wider than the width. `View` follows `ShowAll`.
+  ` …` when it fits, so the output is never wider than the width. `View` follows `ShowAll`. A
+  case is a layout record at a width; the layout model returns, beside the expected text, the
+  recorded bug the width meets (an ellipsis that would end exactly at the width, bubbles/58; an
+  item added when neither it nor the ellipsis fits, bubbles/57), which a mismatch names; under
+  `HEGEL_NO_KNOWN=1` the width is drawn from the layout's widths that meet neither.
 - **progress: a cell model with colours.** Up to five options in random order (`WithColors`
   with none, one, two or three colours, `WithDefaultBlend`, `WithColorFunc`, `WithScaled`,
   `WithFillCharacters` — sometimes wide runes — `WithoutPercentage`, `WithWidth`), then
@@ -127,7 +136,17 @@ records bugs.
   `SetPercent`/`IncrPercent`/`DecrPercent`, checks the clamped target and that stale or
   foreign frames are ignored, then feeds frame messages until `IsAnimating` is false: the shown
   percentage must be within 0.001 of the target with a settled velocity, `View` must be
-  `ViewAs` of it throughout, and a frame after that must be a no-op.
+  `ViewAs` of it throughout, and a frame after that must be a no-op. Both properties draw
+  records (the option records, the width, the format, the percentage; the spring, the setter
+  records with their frame counts) and a classifier names the recorded bug a case has — a colour
+  function surviving a later blend (bubbles/60, the colour-function option first in its choice),
+  a two-cell fill rune (61), a colour function with a percentage past 1 (62), a NaN setter (63,
+  first among the values; the model takes NaN as a percentage of 0) and an animation that stops
+  on the way down with the velocity it still has (59, the library's own `stopsEarly` replayed) —
+  so a mismatch or a panic names it; under `HEGEL_NO_KNOWN=1` the option shapes are not drawn
+  and the relations (59, and the option shapes a sequence of options still composes) are
+  filtered out. The blend step next to a black stop that x/ansi shifts (lipgloss/28) is a
+  tolerated difference, counted under that id.
 - **filepicker: a directory tree and a window mirror.** Each case builds a random tree in a
   fresh temporary directory (files of a few extensions, some hidden; one level of
   subdirectories; sometimes symlinks to a file, a directory or nowhere), sets a height (or
@@ -170,7 +189,15 @@ records bugs.
   stale or a foreign tag (the real blink commands are not waited for), and must match on
   `IsBlinked`, `Mode`, the tag, whether a command came back and the view (the character,
   reversed exactly when the cursor is shown). `key.Matches` must be membership among the
-  enabled bindings while keys, help, enabled/disabled and `Unbind` are changed.
+  enabled bindings while keys, help, enabled/disabled and `Unbind` are changed. Each case is a
+  record of the start (the timer's interval and a timeout that is a multiple of it or not, the
+  stopwatch from `New()` or `NewWithInterval`, fresh or primed, the spinner's frames, the cursor
+  from `New()` or the zero-value `Model`) and a list of operation records; the shapes of the
+  seven recorded bugs are drawn by default — a bare `New()` stopwatch (bubbles/91), a tick with
+  tag 0 after the first (94, 95), a second start of a running timer (92), a timeout with a
+  remainder (93), a mode out of range printed by the step note (96), a focus of the zero-value
+  cursor (97) — and a mismatch or a panic names the shape; under `HEGEL_NO_KNOWN=1` none is
+  drawn.
 
 ## Properties
 
@@ -202,7 +229,29 @@ records bugs.
 | `TestHegelSpinnerAdvances` | `Tick`, rounds, spinner swaps, foreign/stale/broadcast ticks vs the mirror: the frame shown, the tag, the ticks emitted |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
-instead of failing at the first one; shapes of pinned bugs are counted as `bubbles/N-shape`.
+instead of failing at the first one; in the rewritten packages (cursor, key, spinner,
+stopwatch, timer, paginator, help, progress) the shapes of the recorded bugs are counted as
+`shape bubbles/N` and, under `HEGEL_NO_KNOWN=1`, the skipped ones as `known bubbles/N`; in the
+others still as `bubbles/N-shape`. The wide properties of the rewritten packages draw the
+shapes of their packages' recorded bugs and are expected failures mapped to the bug they shrink
+to (`TestHegelCursorFollowsFocus` bubbles/97, `TestHegelSpinnerAdvances` 95,
+`TestHegelStopwatchCounts` 91, `TestHegelTimerCountsDown` 92, `TestHegelPaginatorFollowsTheModel`
+41, `TestHegelHelpFitsTheWidth` 57, `TestHegelProgressDrawsTheModel` 62,
+`TestHegelProgressSettles` 63; each fails every run but the progress draw property, intermittent:
+its shapes are a tenth of its cases and it passed one round of forty at a hundred), and beside them sixteen narrow
+properties, one per bug of those packages, in `<package>/hegel_shapes_test.go` — the bug's
+shape region with random contents, judged like the wide property, failing every run by default
+and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every property passes:
+`TestHegelCursorModeOutOfRange` (96), `TestHegelCursorZeroValueFocused` (97),
+`TestHegelSpinnerTickWithTagZeroAfterTheFirst` (95), `TestHegelStopwatchWithoutAnInterval` (91),
+`TestHegelStopwatchStartedTwiceBeforeTheFirstTick` (94), `TestHegelTimerStartedTwice` (92),
+`TestHegelTimerTimeoutNotAMultipleOfTheInterval` (93), `TestHegelPaginatorPageOutlivesTheTotal`
+(40), `TestHegelPaginatorEmptiedListKeepsTheOldTotal` (41),
+`TestHegelHelpItemAddedWhenTheEllipsisDoesNotFit` (57), `TestHegelHelpEllipsisFittingExactlyIsDropped`
+(58), `TestHegelProgressStopsOnTheWayDown` (59), `TestHegelProgressColorFuncSurvivesALaterBlend`
+(60), `TestHegelProgressWideFillRunesWidenTheBar` (61),
+`TestHegelProgressColorFuncToldThePercentagePastOne` (62), `TestHegelProgressNaNPercentNeverSettles`
+(63). The other seven packages still steer off their bugs (counted, pins only); they follow.
 
 ## Bugs (see `bugs.toml`)
 
@@ -338,8 +387,9 @@ the property showed that bubbles/42 fires only once the long row is within a pag
 and that bubbles/44 is every up move, not just the first. The table property gates /42 (a panic
 on the op that brings the row into the window), /43 (a setter that leaves the selection out of
 view), /44 (an up move while it is out), /45 (a negative cursor with rows) and /46 (a header
-wider than the width) by cause; the paginator property /40 and /41; /47 and /48 are pinned only
-(heights are drawn from 2 and values carry no tabs); each is pinned.
+wider than the width) by cause; /47 and /48 are pinned only (heights are drawn from 2 and
+values carry no tabs); each is pinned. The paginator property draws /40 and /41 and fails
+naming them (its basin /41, the simplest: one item, then a count of zero).
 
 For list (1 321 lines plus the delegate, keys and styles, read in full first) six of the eight
 were on paper — `itemsAsFilterItems` without indices, `RemoveItem`'s one index for two slices,
@@ -362,11 +412,12 @@ For help (253 lines) and progress (438 lines), both read in full first, help's t
 — and the wide runes came from asking what the width contract covers. The properties found
 nothing new in either bubble but made a known bug visible: every blend step next to a black
 stop renders a bright spike in a zero channel — lipgloss/28, x/ansi's channel shift, counted
-under that id (`lipgloss/28`) and not as a bubbles bug. The help property gates /58 (a tail
-that would end exactly at the width) before /57 (an output wider than the width); the progress
-draw property /60 (a colour function surviving `WithColors`), /61 (wide runes: only the width
-check) and /62 (a total other than clamp(p)), the settle property /59 (|velocity| ≥ 0.01 at
-the stop); /63 is pinned only (NaN is not drawn); each is pinned.
+under that id (`lipgloss/28`) and not as a bubbles bug. The help property draws /58 (a tail
+that would end exactly at the width) and /57 (an output wider than the width) and fails naming
+them (its basin /57: width 1, one binding); the progress draw property /60 (a colour function
+surviving `WithColors`), /61 (wide runes) and /62 (a total other than clamp(p)), basin /62 or
+/60 by run (a one-option case either way), the settle property /59 (|velocity| ≥ 0.01 at the
+stop) and /63 (a NaN setter, its basin); each is pinned, and each has a narrow property.
 
 For filepicker (539 lines, read in full first) eight of the eleven were on paper — the page
 keys' `maxIdx − Height`, the resize handlers without `selected`, `G`'s `len − 0`, `SetHeight`'s
@@ -411,8 +462,10 @@ tag-0 escape shared by the stopwatch and the spinner (/94, /95), `Mode.String` (
 zero-value cursor (/97). /92 is counted whenever more than one tick is in flight for a running
 timer (the mirror then decrements once per tick, as the library does), /93 after every
 decrement below zero, /94 and /95 when a tick with tag 0 is accepted by a model whose tag is
-not 0; the stopwatch property always passes `WithInterval` (/91), and the cursor property uses
-`New()` and in-range modes (/96, /97).
+not 0, and the properties fail naming the shape; the stopwatch property draws `New()` beside
+`NewWithInterval` (/91, its basin), the cursor property the zero-value `Model` beside `New()`
+(/97, its basin) and modes out of range, which the step note prints (/96); the timer's basin
+is /92 (a start then a round) in most runs, /93 in some.
 
 ## Not bugs (modelled as documented)
 
@@ -506,3 +559,18 @@ styles with their own paddings; paginator's `PerPage` of 0 (a division by zero);
 spinner, status messages (timers), full help (`?`), `SetShowFilter`/`SetFilteringEnabled`,
 delegates other than the default, `UnsortedFilter`, the delegate's spacing 0 (its pagination
 margin) and `Select` past the end (bubbles/40's shape).
+
+## History
+
+- Part 1 of the rewrite (2026-10-08): the harness gained `internal/zootest/gen.go` (the
+  combinator idioms every package shares: `Weighted`/`W`, `Coin`, `Maybe`, `Sampled`, `Ints`,
+  `Unless`, `Only`, `Shaped`, `Known`, `Tuple`, `Counted`, `Seq`, `One`; `NoKnown` read once)
+  and a `Judge` that names the recorded bug a case has, so a mismatch or a library panic fails
+  "(the shape of bubbles/N)" and under `HEGEL_NO_KNOWN=1` the case is skipped; cursor, key,
+  spinner, stopwatch, timer, paginator, help and progress rewritten in combinator style (cases as
+  records of a start and a list of operation records, the simplest alternative first, the shape
+  of the bug a plain-mapped wide property must reach first at a solid weight), their
+  always-on `Count; return` gates turned around, and sixteen narrow properties added. Two
+  latent model bugs fixed on the way: the paginator's dots view would have panicked at zero
+  pages, and the progress narrow generators had to avoid `PercentFormat("")`, which prints a
+  `%!(EXTRA …)` of up to 36 cells.
