@@ -105,14 +105,29 @@ point go false (11); prepared `Overlaps` is false for two lines sharing a segmen
 them crosses at a non-representable point (12). Bugs 10 to 12 are in JTS 1.20 too, inherited
 through the port.
 
-The wide properties draw these shapes by default and fail at their natural rates
-(`TestHegelSimplifyStaysClose` and `TestHegelDensifySimplifyMatchesGEOS` on 1,
-`TestHegelTWKBRoundTrip` on 2, `TestHegelPreparedAgrees` on 6, 7, 10, 11 and 12,
-`TestHegelOverlaysMatchGEOS` and `TestHegelUnionManyMatchesGEOS` on 8 and 9); `target.toml` maps
-each to the bug it meets most often. Each bug also has a narrow property over its shape region in
-`hegel/hegel_shapes_test.go` that fails deterministically beside its pin. `HEGEL_NO_KNOWN=1`
-switches the shapes off (`hegel/known.go` gates them by generated shape or by the shape of the one
-disagreement), and then every property passes.
+The wide properties draw these shapes by default and fail naming them ("the shape of
+simplefeatures/N" on the mismatch), and `target.toml` maps each to the bug it meets most often,
+measured over thirty rounds at a hundred cases: `TestHegelTWKBRoundTrip` on 2 every run (an empty
+geometry with a size header comes first in its choice at a fifth, so the property cannot miss it;
+STYLE.md rule 3's exception), `TestHegelDensifySimplifyMatchesGEOS` on 1 every run (plain),
+`TestHegelSimplifyStaysClose` on 1 in nearly every run (intermittent), `TestHegelPreparedAgrees`
+on 7 most often (five rounds of thirty fail: 12 twice, 7 twice, 6 once; intermittent),
+`TestHegelOverlaysMatchGEOS` on 8 (one round of thirty; intermittent).
+`TestHegelUnionManyMatchesGEOS` draws the shapes of 8 and 9 too but has not met them in sixty
+rounds at a hundred cases nor at three thousand, so it is not mapped. Each bug also has a narrow
+property over its shape region in `hegel/hegel_shapes_test.go` that fails deterministically beside
+its pin. `HEGEL_NO_KNOWN=1` switches the shapes off (`hegel/known.go` names the shape of a drawn
+case or of the one disagreement regardless, and under `HEGEL_NO_KNOWN=1` the case is counted and
+skipped), and then every property passes.
+
+Two candidates are counted and skipped, not recorded until reproduced standalone: `Buffer` of a
+closed line whose inside is fully eroded under a mitre join keeps the hole-side offset curve that
+JTS and GEOS 3.13 drop (`candidate/go/simplefeatures-13`:
+`LINESTRING (0 2, 0 0, 2 1, 0 -1, 3 1, 0 2)` at distance 2, mitre limit 1, area 38.822 against
+38.714), and `CoveredBy`/`Within` (and the reverse `Covers`/`Contains`) of a closed line against a
+collection holding its closing point beside another member are true where GEOS says false, the
+DE-9IM both ports compute having F for interior-exterior (`candidate/go/simplefeatures-14`:
+`LINESTRING (0 0, 0 -1, 0 0)` against `GEOMETRYCOLLECTION (POINT (0 0), LINESTRING (0 1, 0 2))`).
 
 Accepted differences with GEOS 3.13.1, not bugs: buffer offsets at turns shallower than three
 degrees, where GEOS places the segments differently from JTS 1.20 (which simplefeatures matches
@@ -133,3 +148,8 @@ methods, `ExactEquals` options, TWKB ID lists and per-dimension precisions, the 
   with hegel.dev/go/hegel v0.6.33; 8 bugs.
 - 2026-09-28: the weekly 1000-case run failed the overlay and prepared properties; bugs 9-12 recorded, the
   known shapes drawn by default with narrow properties, four oracle tolerances added; 12 bugs.
+- 2026-10-08: generators rewritten in combinator style (geometries as records rendered to WKT
+  by pure functions from a depth-indexed tower; per-property case records); the mismatch names
+  the shape; a densify budget (200 000 vertices), `union_all` artifacts, buffers of tiny
+  segments and near-reversals and a GEOS `relate` crash on nested empty areal parts tolerated;
+  the TWKB shape first in its choice; mappings re-measured; two candidates counted.
