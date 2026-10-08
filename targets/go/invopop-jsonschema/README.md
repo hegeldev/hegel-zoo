@@ -43,7 +43,7 @@ needs `python3` with the `jsonschema` package (4.18+) on the PATH.
   and validation as above, with counts of the values the recorded bugs reject.
 - `TestHegelPin…`: one pin per recorded bug (expected failures); the fatal one runs in a child
   process.
-- Fourteen narrow properties (`hegel_zoo_shapes_test.go`), one per bug, each drawing the bug's
+- Fifteen narrow properties (`hegel_zoo_shapes_test.go`), one per bug, each drawing the bug's
   shape with random other fields, options and values and judged by the same model and oracle:
   `URLFieldsAreObjects` (1), `SignedIntegerKeysAllowNegatives` (2), `DashCommaNamesAKey` (3),
   `OuterFieldWinsOverEmbedded` (4), `InlineIsNotAJSONOption` (5),
@@ -63,7 +63,7 @@ description with the candidates drawn from the constraints as data.
 
 ## Bugs
 
-Fourteen, recorded in `bugs.toml`. Schemas that reject the package's own JSON: `url.URL` as a
+Fifteen, recorded in `bugs.toml`. Schemas that reject the package's own JSON: `url.URL` as a
 string with format `uri` while `encoding/json` writes an object (invopop-jsonschema/1); signed
 integer map keys under `^[0-9]+$`, so negative keys fail (2); `json:"-,"` fields dropped (3); a
 later field with the same key replacing an earlier one, so an embedded struct's field overrides
@@ -71,32 +71,39 @@ the outer field's type (4); the yaml `inline` option honoured on json tags (5); 
 embedded non-struct type as a required property (6); `net.IP` always `ipv4` (9); `nullable` as
 `oneOf`, rejecting null for `any`/`json.RawMessage` fields (14). Tags: `uniqueItems=false` is
 true (7); `jsonschema_extras` `maximum=5` a string, an invalid schema (8); type-specific tags on
-named slice fields dropped (10); array `default=` values always strings (11). Options:
+named slice fields dropped (10); array `default=` values always strings (11); the `,string`
+option applied at any pointer depth, so a `**int` field is typed `string` while `encoding/json`
+writes the number (15). Options:
 `ExpandedStruct` on a recursive type leaves dangling `$ref`s (12); `DoNotReference` on a
 recursive type overflows the stack (13).
 
 ## Known shapes drawn by default
 
 The model states the documented behaviour. By default the generators draw the shapes of the
-twelve bugs the wide properties can reach as explicit alternatives (a `url.URL` field, a map
+thirteen bugs the wide properties can reach as explicit alternatives (a `url.URL` field, a map
 with signed integer keys, the `-,` tag, a key shared by an embedded struct's field and an
 outer field, the `inline` option, `uniqueItems=false`, a `jsonschema_extras` with `maximum=`, a
 `net.IP` field, type-specific tags on a named slice field, `default=` on an array field,
-`ExpandedStruct` with the recursive type, `nullable` on an `any`/`json.RawMessage` field), and a
+`ExpandedStruct` with the recursive type, `nullable` on an `any`/`json.RawMessage` field, a
+`**int`/`**bool` field tagged `,string`), and a
 mismatch between the library's schema and the model, a `check_schema` failure or a validation
 failure is classified by `HZKnown.explains`, whose rules are the old model switches: the
 property fails naming the bug ("the shape of invopop-jsonschema/N"). Each wide property is
 mapped in `target.toml` to the bug its shrunk failure lands on most often over forty rounds at
-a hundred cases: `TestHegelSchema` to /3 (fourteen; /5 twelve, /12 eight, /1 five, /8 one),
-`TestHegelValidate` to /3 (eighteen; /5 seven, /8, /9 and /12 five each); both fail every
-round. Under `HEGEL_NO_KNOWN=1` (read once) the shape alternatives
+a hundred cases: `TestHegelSchema` to /15 (twelve; /12 ten, /3 and /5 six each, /1 five, /8
+one), `TestHegelValidate` to /15 (thirteen; /3 eleven, /12 nine, /9 four, /5 two, /8 one);
+both fail every round. Before /15 was recorded both landed on /3 most often (fourteen and
+eighteen of forty); its shape is a small field, so the shrinker keeps it when it is there, and
+it is the second alternative of the field choice, not the first, so that it does not displace
+every other basin. Under `HEGEL_NO_KNOWN=1` (read once) the shape alternatives
 have weight zero and both wide properties pass against the model (a mismatch the classifier
 still explains would be a shape leaking through the generator: it is counted as such and ends
 the case; a thousand cases count none). Bugs 6 and 13 are reached only by their pin and narrow
-property. A candidate, counted as not judged (`candidate/invopop-jsonschema-15`) and reproduced
-standalone: the `,string` option is applied at any pointer depth, so a `**bool` or `**int` field
-tagged `,string` gets `type: string` while `encoding/json` writes `true` and `7` (it applies the
-option through one unnamed pointer only); the model follows `encoding/json`.
+property. The fifteenth, the `,string` option applied at any pointer depth (a `**bool` or `**int`
+field tagged `,string` gets `type: string` while `encoding/json`, which applies the option
+through one unnamed pointer only, writes `true` and `7`), was a candidate of the rewrite,
+reproduced standalone and recorded the same day with its pin, narrow property and shape
+alternative (one struct field in twelve); the model follows `encoding/json`.
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -110,7 +117,7 @@ Design notes the model follows (undocumented, taken from the code):
   tags other than `minItems`/`maxItems`/`uniqueItems`/`default`/`format`/`pattern` go to the
   items when the items have a scalar type, `,string` turns integer, number and boolean types into
   `string` before the type-specific keywords, through at most one unnamed pointer as
-  `encoding/json` does (the library applies it at any depth: the candidate above). A pointer
+  `encoding/json` does (the library applies it at any depth: invopop-jsonschema/15). A pointer
   root given to `Reflect` is reflected as the pointer (`ReflectFromType` strips one pointer
   only): no `$id`, and `ExpandedStruct` does not expand it. A quoted scalar whose tags
   constrain its text (`enum`, `pattern`, the lengths) gets no value drawn: the value generator
@@ -136,6 +143,6 @@ their fields).
 
 - 2026-09-21: new target, two properties, 14 bugs.
 - 2026-10-08: generators rewritten in combinator style; the model states the documented
-  behaviour and the twelve reachable shapes are drawn by default, both wide properties mapped
-  to their plurality basins; fourteen narrow properties; the `,string` rule corrected to
-  `encoding/json`'s, which surfaced the candidate above.
+  behaviour and the thirteen reachable shapes are drawn by default, both wide properties mapped
+  to their plurality basins; fifteen narrow properties; the `,string` rule corrected to
+  `encoding/json`'s, which surfaced invopop-jsonschema/15, recorded the same day.
