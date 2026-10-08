@@ -43,6 +43,23 @@ needs `python3` with the `jsonschema` package (4.18+) on the PATH.
   and validation as above, with counts of the values the recorded bugs reject.
 - `TestHegelPin…`: one pin per recorded bug (expected failures); the fatal one runs in a child
   process.
+- Fourteen narrow properties (`hegel_zoo_shapes_test.go`), one per bug, each drawing the bug's
+  shape with random other fields, options and values and judged by the same model and oracle:
+  `URLFieldsAreObjects` (1), `SignedIntegerKeysAllowNegatives` (2), `DashCommaNamesAKey` (3),
+  `OuterFieldWinsOverEmbedded` (4), `InlineIsNotAJSONOption` (5),
+  `UnexportedEmbeddedTypesAreNotProperties` (6, over declared types, since `reflect.StructOf`
+  cannot embed an unexported type), `UniqueItemsFalseIsFalse` (7), `ExtrasKeywordsAreTyped` (8),
+  `IPFieldsAcceptIPv6` (9), `NamedSliceFieldsKeepTheirTags` (10), `ArrayDefaultsAreTyped` (11),
+  `ExpandedStructKeepsItsRefs` (12), `DoNotReferenceTerminates` (13, the reflection in a child
+  process with the verdict cached per case), `NullableAcceptsNull` (14); under `HEGEL_NO_KNOWN=1`
+  each draws the neighbouring region and passes.
+
+Generators (`hegel_zoo_gen_test.go`) are package-level values: reflector options as a record, a
+type description as a record drawn from a depth-indexed memoised tower (struct, named, pointer,
+slice, map and scalar kinds as alternatives, the plainest first), a struct as a list of field
+records (name, type, a json tag record, keyword tags, extras, embedding, export) whose struct
+tag string is rendered by a pure function, the value of a type as a generator derived from the
+description with the candidates drawn from the constraints as data.
 
 ## Bugs
 
@@ -58,14 +75,28 @@ named slice fields dropped (10); array `default=` values always strings (11). Op
 `ExpandedStruct` on a recursive type leaves dangling `$ref`s (12); `DoNotReference` on a
 recursive type overflows the stack (13).
 
-## Modelled as recorded
+## Known shapes drawn by default
 
-Twelve are in the model behind `HZKnown` switches (`urlIsString`, `intKeysNonNegative`,
-`dashNameIgnored`, `sameKeyOverwrites`, `inlineOptionEmbeds`, `uniqueItemsAlwaysTrue`,
-`extrasMaximumString`, `ipAlwaysV4`, `refTagsDropped`, `arrayDefaultsAreStrings`,
-`expandedDanglingRef`, `nullableOneOfRejectsNull`); `ZOO_KNOWN_OFF=name` turns a switch off and
-the properties then fail. Bug 6 is pinned only (`reflect.StructOf` cannot embed an unexported
-type) and bug 13 too (the generated types exclude the recursive type under `DoNotReference`).
+The model states the documented behaviour. By default the generators draw the shapes of the
+twelve bugs the wide properties can reach as explicit alternatives (a `url.URL` field, a map
+with signed integer keys, the `-,` tag, a key shared by an embedded struct's field and an
+outer field, the `inline` option, `uniqueItems=false`, a `jsonschema_extras` with `maximum=`, a
+`net.IP` field, type-specific tags on a named slice field, `default=` on an array field,
+`ExpandedStruct` with the recursive type, `nullable` on an `any`/`json.RawMessage` field), and a
+mismatch between the library's schema and the model, a `check_schema` failure or a validation
+failure is classified by `HZKnown.explains`, whose rules are the old model switches: the
+property fails naming the bug ("the shape of invopop-jsonschema/N"). Each wide property is
+mapped in `target.toml` to the bug its shrunk failure lands on most often over forty rounds at
+a hundred cases: `TestHegelSchema` to /3 (fourteen; /5 twelve, /12 eight, /1 five, /8 one),
+`TestHegelValidate` to /3 (eighteen; /5 seven, /8, /9 and /12 five each); both fail every
+round. Under `HEGEL_NO_KNOWN=1` (read once) the shape alternatives
+have weight zero and both wide properties pass against the model (a mismatch the classifier
+still explains would be a shape leaking through the generator: it is counted as such and ends
+the case; a thousand cases count none). Bugs 6 and 13 are reached only by their pin and narrow
+property. A candidate, counted as not judged (`candidate/invopop-jsonschema-15`) and reproduced
+standalone: the `,string` option is applied at any pointer depth, so a `**bool` or `**int` field
+tagged `,string` gets `type: string` while `encoding/json` writes `true` and `7` (it applies the
+option through one unnamed pointer only); the model follows `encoding/json`.
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -78,7 +109,14 @@ Design notes the model follows (undocumented, taken from the code):
   (strings for `string`, numbers for `integer`/`number`, `true`/`false` for `boolean`), array
   tags other than `minItems`/`maxItems`/`uniqueItems`/`default`/`format`/`pattern` go to the
   items when the items have a scalar type, `,string` turns integer, number and boolean types into
-  `string` before the type-specific keywords. Extras go last and overwrite the keyword of the
+  `string` before the type-specific keywords, through at most one unnamed pointer as
+  `encoding/json` does (the library applies it at any depth: the candidate above). A pointer
+  root given to `Reflect` is reflected as the pointer (`ReflectFromType` strips one pointer
+  only): no `$id`, and `ExpandedStruct` does not expand it. A quoted scalar whose tags
+  constrain its text (`enum`, `pattern`, the lengths) gets no value drawn: the value generator
+  does not shape the JSON text, so the case is counted as unsatisfiable (found by the second
+  thousand-case `HEGEL_NO_KNOWN=1` run as a hidden failure of the array-defaults property:
+  `int` with `json:",string"` and `enum=x` drew `-10`). Extras go last and overwrite the keyword of the
   same name; a repeated key collects strings.
 - `map[string]any` has no `additionalProperties`; unsigned integer keys have none of the signed
   keys' pattern. A slice of `uint8` under any name is a base64 string, an array of bytes an
@@ -97,3 +135,7 @@ their fields).
 ## History
 
 - 2026-09-21: new target, two properties, 14 bugs.
+- 2026-10-08: generators rewritten in combinator style; the model states the documented
+  behaviour and the twelve reachable shapes are drawn by default, both wide properties mapped
+  to their plurality basins; fourteen narrow properties; the `,string` rule corrected to
+  `encoding/json`'s, which surfaced the candidate above.
