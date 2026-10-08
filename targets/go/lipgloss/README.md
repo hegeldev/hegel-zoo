@@ -118,7 +118,12 @@ sibling indexes. A wide property that meets a recorded shape fails naming the bu
 beside the pin: over nine rounds RenderFollowsTheBlockModel shrinks to lipgloss/4 most often
 (/1, /3 and /7 in other rounds), PlaceFollowsItsModel to /5, BorderBlendWrapsTheFrame to /29
 (the panic is the smallest failure, though /23 is the commonest shape), Blend2DIsARotatedRamp
-to /27, Blend2DReachesBothEnds to /25, StyleRunesStyleTheirRunes to /26,
+to /27 (its shape, a one-row or one-column right-angle gradient, is the first alternative of
+the cases at a fifth since 2026-10-08: as a draw of 180 or 270 among ten angles with a size
+that lands a cell on a ramp index it passed two rounds in forty at a hundred cases),
+Blend2DReachesBothEnds to /25, StyleRunesStyleTheirRunes to /26 (likewise: a first line and
+a strictly shorter second one as the first alternative, since a three-percent newline at the
+last index of the rune choice passed a full run, and a lone newline pads nothing),
 CompositorPaintsLayersInOrder to /22 (or /19), TableLaysOutItsGrid to /10 (or /12, /18; twenty-one rounds for these two),
 TreeFollowsTheLayout to /16 (or /15); Blend1DRunsThroughItsStops (/24), ListEnumeratorsCount
 (/17) and ListsNestAsTrees (/20) meet their shapes in a few percent of cases and are
