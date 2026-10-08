@@ -904,7 +904,10 @@ splits were as before (brotli's Encoders 4:3 between /6 and /1, koanf's Operatio
 masterminds-semver's Constraints mostly /5 with /3, /4 and /7 in the rest): mapped to the
 majority, plain (koanf's Operations passed one round of forty at a hundred cases in the
 2026-10-08 screen, 29:6:4 otherwise, so it is intermittent now; cast's string-slice-map
-property held). A nominally rare shape can be met every run because Hegel starts at the
+property held; brotli's matchfinder-writers and HTTP-negotiation properties were fragile at a
+hundred cases, 38 of 40 each, and got their shape first in its choice - a flate or gzip writer
+on 300 to 3000 zeros at a quarter, a header line with a cased br or gzip of positive weight at
+two in seven, zero under `HEGEL_NO_KNOWN=1` - for 40 of 40). A nominally rare shape can be met every run because Hegel starts at the
 smallest case (compress/4 is the empty `EncodeAll` frame, 0.1 % of cases and found first in
 every run so far); it is declared intermittent on its rate, not its record. A check that only
 a recorded bug can fail and that fires on a large share of cases (cast's out-of-range

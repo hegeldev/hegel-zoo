@@ -65,7 +65,11 @@ properties are expected failures mapped to the bug they land on: DamagedStreams 
 accumulated `dst`; brotli/8 in some runs, a pass in others: intermittent),
 EncodersAcceptAnyMatches on brotli/6 (two- and three-byte matches into `FastEncoder`; on
 brotli/1 nearly as often), MatchfinderWritersRoundTrip on brotli/1 (flate matches over 258
-bytes) and HTTPCompressorNegotiates on brotli/2 (mixed-case codings; brotli/4 now and then).
+bytes: a flate or gzip writer on 300 to 3000 zeros is the first alternative of its case at a
+quarter, so the property cannot miss it; STYLE.md rule 3's exception) and
+HTTPCompressorNegotiates on brotli/2 (mixed-case codings: a line with a cased br or gzip of
+positive weight is the first alternative of the header lists at two in seven; brotli/4 now and
+then).
 Three of the eight bugs surface as panics, which the harness recovers and names. Each bug also
 has a narrow property over its own shape region in `hegel_shapes_test.go`, the deterministic
 expected failure beside the pin: `TestHegelFlateWritersSplitLongMatches` (brotli/1),
