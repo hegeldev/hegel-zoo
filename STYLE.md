@@ -902,7 +902,9 @@ which the flat-key model cannot represent; others are drawn but never the basin 
 cast/11 sit behind cast/12 in the map property, which a failing run reports first). Basin
 splits were as before (brotli's Encoders 4:3 between /6 and /1, koanf's Operations 10:3:1,
 masterminds-semver's Constraints mostly /5 with /3, /4 and /7 in the rest): mapped to the
-majority, plain. A nominally rare shape can be met every run because Hegel starts at the
+majority, plain (koanf's Operations passed one round of forty at a hundred cases in the
+2026-10-08 screen, 29:6:4 otherwise, so it is intermittent now; cast's string-slice-map
+property held). A nominally rare shape can be met every run because Hegel starts at the
 smallest case (compress/4 is the empty `EncodeAll` frame, 0.1 % of cases and found first in
 every run so far); it is declared intermittent on its rate, not its record. A check that only
 a recorded bug can fail and that fires on a large share of cases (cast's out-of-range

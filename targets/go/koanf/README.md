@@ -73,7 +73,8 @@ The generators draw the shape of every recorded bug but koanf/6 (STYLE.md rule 1
 wide properties are expected failures mapped to the bug they land on: OperationsFollowTheModel
 on koanf/1 in most runs (a failed strict Load that has already written a key; the failed
 merge is repeated on up to twenty fresh copies so that Go's map order cannot hide it), on /2
-or /5 in the rest; ValuesAreCopied on koanf/3 (the provider's map rewritten in place); and
+or /5 in the rest, and it passed one round of forty at a hundred cases, so it is mapped
+intermittent (29 rounds on /1, 6 on /2, 4 on /5); ValuesAreCopied on koanf/3 (the provider's map rewritten in place); and
 GettersConvert on koanf/4 (`Float64` of `"1e400"`; about 2.6 % of cases, intermittent). Each
 bug also has a narrow property over its own shape region in `hegel_shapes_test.go`, the
 deterministic expected failure beside the pin: `TestHegelStrictLoadIsAtomic` (koanf/1),
