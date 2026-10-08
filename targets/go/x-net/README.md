@@ -43,6 +43,22 @@ case count):
   one of its own name where the content model forbids it, no plaintext, no raw text holding its
   own end tag, no text where a table or select structure cannot hold it).
 
+The generators are records rendered by pure functions: a document is a soup of token records
+(start tags with attribute records, end tags, text, comments, doctypes, and by default the
+recorded shapes as a modest alternative of their own - a comment or CDATA section holding a
+character reference, a NUL in a doctype, `</>`, a raw text tag in a frameset, a foreign element
+named like a void one with children, mixed whitespace in `<noscript>`, a raw text element under
+`<math>`, a `&#xD;` after `<pre>`; a NUL attribute name beside a U+FFFD one is an alternative of
+the attribute list), a structured document of depth-indexed element records, or either under a
+list of edit records applied modulo the live length; a fragment context is a record (the raw
+text and column-group contexts drawn as alternatives, a raw text context's own end tag inserted
+at a drawn position, and content after `</html>` in a foreign context drawn in a fifth of the
+chunked cases), the chunking a list of cut lengths, a reference text a list of reference pieces.
+By default a mismatch the classifier in `known.go` names fails the property naming the bug, and
+x-net/4's crash is recovered and named; under `HEGEL_NO_KNOWN=1` the shape alternatives have
+weight zero, the classifier's answer is counted as a known bug, and the crash is assumed away
+(under half a percent of the fragment and chunked cases).
+
 Twelve bugs in `html`, all found 2026-09-19 at commit 520c891 (v0.59.0+): character references decoded
 inside comments (1, medium: the tree is lossy and Render escapes every `&` of a comment to
 compensate) and inside CDATA sections (7); a NUL kept in a doctype (2); `</>` becoming an empty
@@ -53,7 +69,16 @@ switching the tokenizer (5); `Render` failing with an error on a parsed tree hol
 `<mtext>` (9); whitespace misplaced when a text token mixes it with other characters in the
 head-noscript and column-group modes (8); a raw text fragment context ending its text at an end
 tag of its own name (10); a `&#xD;` after `<pre>` dropped like a newline (11); and an attribute name holding a NUL escaping
-the duplicate check, leaving two attributes of one name (12). Thirteen pins.
+the duplicate check, leaving two attributes of one name (12). Thirteen pins, and one narrow
+property per bug in `hegel_shapes_test.go`, each drawing the bug's shape region with random
+contents and judged by the same vote: `CommentsKeepTheirCharacterReferences` (1),
+`DoctypeNulBecomesReplacementCharacter` (2), `EmptyEndTagsAreIgnored` (3),
+`ForeignFragmentsSurviveTheHtmlEndTag` (4), `IgnoredRawTextTagsLeaveTheTokenizer` (5),
+`RenderAcceptsForeignElementsNamedLikeVoids` (6), `CDATAKeepsCharacterReferences` (7),
+`MixedWhitespaceTextIsSplit` (8), `RawTextUnderMathRendersUnescaped` (9),
+`RawTextContextsKeepTheirOwnEndTag` (10), `CarriageReturnReferencesSurviveAfterPre` (11) and
+`NulAttributeNamesAreDeduplicated` (12); under `HEGEL_NO_KNOWN=1` each draws the neighbouring
+region and passes.
 
 Not judged (the oracles lag or the specification is silent): anything holding `<select` and the
 select-related fragment contexts (the 2025 change), the head fragment context (the specification
@@ -96,7 +121,14 @@ Three bugs (13-15), all in the profiles' validation: a label that is the bare AC
 decodes to the empty string and is accepted by the lookup profiles as an empty label (13; UTS #46
 records P4, the conformance suite has the case); `Registration` accepts the NV8/XV8 code points
 IDNA2008 disallows, such as `¡` and `☕` (14; a TODO in the code); and `Registration` applies none
-of the CONTEXTO rules, so a lone katakana middle dot or `a·b` passes (15).
+of the CONTEXTO rules, so a lone katakana middle dot or `a·b` passes (15). Three pins, and the
+narrow properties `BareACEPrefixIsAnError`, `RegistrationRejectsNV8` and
+`RegistrationAppliesContextO` in `hegel_shapes_test.go`. A domain name is a record (labels as
+records of a kind - pieces from the pools, a raw or encoded ACE label, a word, a long label, an
+empty one, an upper-case ACE label, and by default the bare `xn--` prefix in three names of ten
+for the lookup properties and a lone NV8 rune or a CONTEXTO-marked label for the registration
+property - with the separators, a leading or trailing dot and an over-length tail) rendered by a
+pure function; the tame share of names draws one pool per label so that the Bidi rule holds.
 
 Not judged: names node's URL parser acts on before the host (ASCII specials, controls, `%`,
 IPv4 shapes, an empty host, a forbidden host code point after mapping), Bidi domain names
@@ -105,4 +137,33 @@ ACE labels decoding to ASCII only or starting with a delimiter (x/net/idna rejec
 purpose; the oracles are lenient), U+1E9E (ada maps it to `ss` as tables before 15.1 did),
 U+FFFD in a Punycode encoding (refused since Unicode 16), the registration profile's rejection of
 upper-case ASCII (it maps nothing) and of a trailing dot (a VerifyDnsLength error since Unicode
-16, not an RFC 5891 one), and runes python's `unicodedata` does not know.
+16, not an RFC 5891 one), an ACE label decoding to a label that begins with a combining mark
+(UTS #46's fifth validity criterion; x/net/idna and python idna reject `xn--wzb`, U+08CA, and
+ada accepts it), and runes python's `unicodedata` does not know.
+
+## Known shapes drawn by default
+
+The wide properties draw every recorded shape and fail on it, each mapped in `target.toml` to
+the bug its shrunk failure lands on most often (forty-seven rounds for the fragment property,
+thirteen for the others): `ParseAgreesWithTheOracles` to x-net/3 (`</>` is a draw-free
+alternative and wins the shrink; /1, /2, /8, /10, /11 and /12 behind it),
+`FragmentsAgreeWithTheOracles` to x-net/8 (fifteen of forty-seven; /10, /3 and /1 the others),
+`ChunkedReadsParseAlike` to x-net/4 (the crash, which the wild region reached at a thousand
+cases anyway), `RenderedTreesReparseAlike` to x-net/1 (a `&#13;` in a comment; /12 and /6 at
+times), `LookupAgreesWithWHATWG` to x-net/13 and `RegistrationAgreesWithIDNA2008` to x-net/14
+(a lone NV8 rune is the first piece alternative, since the shrinker otherwise ends on a CONTEXTO
+rune from the Greek pool, x-net/15). `TokenizerRawCoversTheInput`, `UnescapeAgreesWithEntities`,
+`PunycodeAgreesWithTheCodec` and `LookupIsAFixedPoint` reach no recorded shape. Under
+`HEGEL_NO_KNOWN=1` every property passes; the classifier still counts the known shapes the wild
+region reaches (x-net/1 on about a tenth of the parse and fragment cases, from `&` in
+comment bodies, which ends the case as known).
+
+## History
+
+- 2026-09-19: target added at 520c891 (html and idna), fifteen bugs with pins.
+- 2026-10-08: generators rewritten in combinator style (batch 66): token, element, edit, context
+  and label records rendered by pure functions, the idna generator's package-level pool state
+  replaced by a drawn record; the classifiers' answers fail the wide properties by default and
+  count under `HEGEL_NO_KNOWN=1`, x-net/4's crash drawn and recovered; fifteen narrow
+  properties; `xn--` alone is x-net/13 rather than an empty host; an ACE label decoding to a
+  leading combining mark is not judged (ada accepts it against UTS #46).
