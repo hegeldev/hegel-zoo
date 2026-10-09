@@ -101,7 +101,14 @@ values for the information functions and the result branches.
 - `TestHegelMath`: 70 functions of one to six numbers (rounding, elementary, trigonometric
   and hyperbolic, combinatorial, number-theoretic, BASE/DECIMAL, ROMAN/ARABIC, sums and
   products) agree with the oracle to 1e-12, or return the documented error; the two round
-  trips.
+  trips. A case is a record of the function and its arguments drawn from per-function
+  generators built from the argument kinds, with the shape of every recorded Math bug drawn
+  by default (see "Drawn shapes" below) and named by the classifier before the library is
+  called; it fails every run (basin SEC, the first entry of its table, excelize/2).
+- `TestHegelMath…`: twenty narrow properties, one per Math bug (excelize/2, 6, 7, 8, 9, 10,
+  15, 17, 18, 19, 21, 23, 29, 31, 33, 34, 79, 80, 81, 82), each drawing random contents of
+  its bug's shape, judged by the same judge, and the neighbouring region past it; each fails
+  every run naming its bug and passes under `HEGEL_NO_KNOWN=1`.
 - `TestHegelStat`: 80 functions over ranges (descriptive statistics, percentiles, quartiles,
   ranks, sums of products, regressions, correlations, tests and confidence intervals, and the
   `A` forms and legacy names) agree with the oracle to 1e-9, or return the documented error;
@@ -123,7 +130,7 @@ values for the information functions and the result branches.
 
 ## Bugs
 
-Seventy-eight, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
+Eighty-three, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
 and QUARTILE.EXC panic with an index out of range for k outside (1/(n+1), n/(n+1)) (excelize/1);
 SEC returns the cosine (2); HARMEAN of a range is always #N/A (3); AVEDEV takes a range as one
 value (4). Several lose most digits: the inverse searches of CHISQ.INV.RT, CHIINV and GAMMA.INV
@@ -150,6 +157,16 @@ negative arguments (16). Contract: infinite results come back as the text +INF/-
 MULTINOMIAL accept out-of-range arguments (18, 19, 23); a dozen domain ends are the wrong way
 round (25); error codes differ from the documented ones in some 20 functions (21); a negative zero
 is formatted as -0 (34).
+
+Found by the rewritten Math property (79–82): COMBINA(0,0) is 0 (79); TRUNC floors a negative
+fractional num_digits, TRUNC(685,-1.5) = 600 (80); TRUNC converts the scaled number to an
+int64 and overflows, TRUNC(123456.789,15) = -9223.37203685478 (81); DECIMAL strips a 0x prefix
+in every radix, DECIMAL("0x1F",16) = 31 where X is no hexadecimal digit and DECIMAL("0x1F",36)
+= 51 where the text is the base-36 number 42819 (82). Found by the Stat property at a thousand
+cases: GEOMEAN is PRODUCT^(1/COUNT) and overflows to +INF for a long range of large values,
+GEOMEAN(1E+200,1E+200) = +INF, or underflows to #NUM! (83); the property reaches it at its
+natural rate (about one case in a thousand) and is mapped to it as intermittent until part 2
+draws the shape.
 
 Dates and times (35–47): EDATE panics with an index out of range for a December after the 28th
 reached through a multiple of twelve months (40) and lands a year early whenever the month sum
@@ -189,27 +206,52 @@ value_if_false is omitted (70); ISTEXT("1") is FALSE, N("1") is 1, ISLOGICAL("TR
 ISNUMBER(TRUE) are TRUE (75); SWITCH compares texts (76); the logical text coercions differ from
 function to function (73).
 
+## Drawn shapes (the Math functions, part 1 of the rewrite)
+
+`TestHegelMath` follows the zoo's standard: nothing steers off a recorded bug by default. The
+argument kinds are package-level generators of weighted alternatives, the simplest first, and
+every Math bug's shape is one of them at a solid weight — ODD in (0, 1) (7), a fractional
+num_digits (8), significance 0 and the mode and negative-significance forms of CEILING.MATH and
+FLOOR.MATH (9), the arguments whose true result is infinite, LN(0), ATANH(1), FACT(171), EXP and
+SINH overflowing, MULTINOMIAL and SERIESSUM overflowing (10), fractional counts (15), COTH at
+710 and under 0.01 (17), ROMAN outside 0..3999, a form outside 0..4 and the form TRUE (18),
+BASE's min_length outside 0..255, a number outside 0..2^53 and DECIMAL's radix 0 (19), the
+error-code cases (21), negative counts (23), DEGREES(0) and ATAN2(0,0) (31), a 0x prefix for
+DECIMAL (82), a negative fractional num_digits and a num_digits that overflows TRUNC (80, 81),
+zero counts for COMBINA (79), SEC itself (2) — or a relation between the drawn values that the
+generator selects with a filter over a Go-side exact-decimal model of the function (the binary
+quotient or product within rounding of an integer, 29; TRUNC's shortcut, 33; COMBIN's floating
+product rounding up, 6). The classifier `mathShape` names the bug from the case and the
+oracle's verdict before the library is called, the most specific shape first (80 and 81 before
+33 and 29, 82 before 21, 79 before 21 and 23); every comparison is made and a mismatch fails
+naming the shape. A negative zero (34) is the shape of one check on the result's text, failing
+by default where the true result is 0 and the library prints -0 (the rounding functions,
+QUOTIENT and PRODUCT of a small negative). Under `HEGEL_NO_KNOWN=1` the alternatives have weight
+zero, the relations are filtered out, the -0 check is dropped, and the property passes (at
+three thousand cases: 0 mismatches, 2.4% of the cases filtered or skipped). Per thousand cases
+by default, 86 mismatch: 21 in 27, 34 in 10, 8 in 9, 2 and 19 in 7, 10 in 6, 18 and 82 in 4,
+29 in 3, 6, 17 and 23 in 2, 15 and 7 in 1, 31, 33 and 79 under one, 80 one in thirty thousand
+and 81 none in thirty thousand (the long num_digits alternative is at the tail of its choice;
+their narrow properties reach them every case). Model facts that are not gates: ACOT to 1e-9,
+the binary sums to 1e-12 of the largest term, COMBINA with n < k, MROUND with multiple 0 and
+SECH/CSCH beyond 700 not judged by the oracle.
+
 ## Modelled as recorded
 
-Every bug reached by generated cases has an `HZKnown` switch (78 of them; excelize/34 is pinned
-only, and excelize/15 gained a switch in part 3). While a switch is on the generator keeps away from the shape or the check is relaxed: k
-outside the safe range not sent to PERCENTILE.EXC; SEC, HARMEAN and AVEDEV of a range not judged;
-pairs containing a 0 skipped for CORREL and the SUMX functions; COMBIN and COMBINA judged to ±1;
-ODD in (0, 1), fractional num_digits, num_digits beyond the binary resolution, a quotient by the
-significance within rounding of an integer (or a half for MROUND), TRUNC's shortcut shape,
-significance 0, FLOOR of 0 by a negative significance and the three-argument or negative forms of
-CEILING.MATH/FLOOR.MATH avoided; an infinite result accepted for a documented #NUM!; results below
+The other five properties still have an `HZKnown` switch per bug they reach (parts 2 to 4 of
+the rewrite follow). While a switch is on the generator keeps away from the shape or the check is relaxed: k
+outside the safe range not sent to PERCENTILE.EXC; HARMEAN and AVEDEV of a range not judged;
+pairs containing a 0 skipped for CORREL and the SUMX functions; an infinite result accepted for
+a documented #NUM!; results below
 1e-8 not judged; NORM.S.INV judged to 1e-8 and NORM.INV to 1e-6; CHISQ.INV.RT, CHIINV and
 GAMMA.INV not judged, nor BETA.INV with both shapes below 0.5; cumulative HYPGEOM.DIST only with a
-support starting at 0; fractional integer arguments replaced; GAMMA of a negative number, COTH
-beyond 710 or below 0.01, FISHERINV beyond 355 avoided; ROMAN, BASE and DECIMAL within Excel's
-ranges; PERCENTRANK results below 0.1 not judged; a different error code accepted; negative counts
-avoided; ill-conditioned ranges (|mean| > 1000·sd) skipped for the one-pass variances; constant
+support starting at 0; fractional integer arguments replaced; GAMMA of a negative number and
+FISHERINV beyond 355 avoided; PERCENTRANK results below 0.1 not judged; a different error code
+accepted; ill-conditioned ranges (|mean| > 1000·sd) skipped for the one-pass variances; constant
 ranges skipped for the regressions, SKEW, KURT, Z.TEST and T.TEST, and a zero covariance for the
 regressions; the wrong domain ends avoided; T.INV judged to 1e-7 within [1e-3, 100] and
 CONFIDENCE.T to 1e-7 for alpha below 0.99; cumulative GAMMA.DIST only within 1.2 α and for α < 20;
-BESSELJ within |x| ≤ 20 and BESSELY within x ≤ 5; GAMMALN below 170; DEGREES(0) and ATAN2(0,0)
-avoided; counts and gamma arguments above 170 avoided. For the dates: serials below 61 and the
+BESSELJ within |x| ≤ 20 and BESSELY within x ≤ 5; GAMMALN below 170; counts and gamma arguments above 170 avoided. For the dates: serials below 61 and the
 January and February 1900 results of DATE avoided for the functions that read the calendar, and
 WEEKNUM's whole 1900 except type 21; DAY of a multiple of 31 or a fraction below 61 avoided;
 serials and results beyond 2958465 and DATE years outside 1900..9999 avoided; EDATE offsets 0..11 that reach a December and multiples of twelve landing on
@@ -274,3 +316,5 @@ the efp parser's).
 - 2026-09-22: part 2, the date and time functions (`TestHegelDate`), 13 bugs (35–47).
 - 2026-09-22: part 3, the text, logical and information functions (`TestHegelText`,
   `TestHegelLogic`), 31 bugs (48–78).
+- 2026-10-09: part 1 of the rewrite in combinator style (the harness idioms, `TestHegelMath`
+  drawing every Math shape, twenty narrow properties), 5 bugs (79–83).
