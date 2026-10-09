@@ -220,36 +220,81 @@ records bugs.
   and the relations (59, and the option shapes a sequence of options still composes) are
   filtered out. The blend step next to a black stop that x/ansi shifts (lipgloss/28) is a
   tolerated difference, counted under that id.
-- **filepicker: a directory tree and a window mirror.** Each case builds a random tree in a
-  fresh temporary directory (files of a few extensions, some hidden; one level of
-  subdirectories; sometimes symlinks to a file, a directory or nowhere), sets a height (or
-  none), `ShowHidden`, `AutoHeight`, the permission/size columns, `FileAllowed`/`DirAllowed`
-  and `AllowedTypes`, and drives the picker for up to 25 steps: every default binding (g, G,
-  j/k/arrows/ctrl+n/ctrl+p, J/K/pgup/pgdown, h/backspace/left/esc, l/right, enter),
-  `WindowSizeMsg`, `SetHeight`, toggling `ShowHidden`, changing the allowed flags and types;
-  the commands are run and their messages fed back. The model keeps the listing as `readDir`
-  defines it (directories first, names ascending, hidden names filtered), the selection, the
-  window with the library's own arithmetic (mirrored line for line, since the shapes that break
-  it are the bugs) and the view stack; after each step `CurrentDirectory`, `Path`,
-  `HighlightedPath`, the internal indices and the lines of `View` (cursor, mode, size, name,
-  symlink target; the padding; the empty-directory message) must match, the window must hold
-  the selection and neither more rows than the height nor fewer than the entries allow, and
-  after an enter `DidSelectFile`/`DidSelectDisabledFile` must report the entry it was pressed
-  on per the allowed flags and types.
-- **tree: a random tree and a mirror of the selection, the offsets and the scroll.** Each case
-  generates a tree three levels deep (leaves and `Root` nodes, some closed, values from a
-  word list with a few multi-line, empty and over-wide ones), a width and a height, and
-  sometimes a scroll-off, hidden help, another cursor character, other open/closed characters
-  or the rounded enumerator, then drives the model for up to 45 steps: every default binding
-  through `Update` (each of its keys), `SetYOffset`, `SetSize`/`SetHeight`/`SetWidth`,
-  `SetScrollOff`, `SetShowHelp`, `SetNodes`, `SetCursorCharacter`. The mirror lays the visible
-  nodes out in DFS order with their node and line offsets and their rendered rows (indents,
-  enumerators, indicators, continuation lines), keeps the selection with the library's clamp,
-  the viewport height as `SetSize` computes it, and the viewport offset with the scroll-off
-  rule mirrored line for line; after each step `YOffset`, `Size`, `NodeAtCurrentOffset`,
-  `Node(i)`, every visible node's `YOffset`/`LineOffset`/`IsSelected`, `Width`/`Height`, the
-  viewport's height and offset, the number of lines of `View` and each row of the viewport
-  window must match, and the selected node's line must be inside the window.
+- **filepicker: a directory tree and the true window.** A case is a record of a start (the
+  tree's spec — which of eight file names exist and their sizes, which of three subdirectory
+  names exist, two levels deep, symlinks to a file, a directory and nowhere, a subdirectory made
+  unreadable — `ShowHidden`, `AutoHeight`, the permission and size columns,
+  `FileAllowed`/`DirAllowed`, `AllowedTypes` and a height or none) and a list of one to
+  twenty-five operation records (every default binding: g, G, j/down/ctrl+n, k/up/ctrl+p,
+  J/pgdown, K/pgup, h/backspace/left/esc, l/right, enter; a `WindowSizeMsg`, `SetHeight`,
+  toggling `ShowHidden`, new allowed flags and types) applied in order, the commands run and
+  their messages fed back; the tree is built under a fresh temporary directory per case. The
+  model keeps the listing as `readDir` defines it (directories first, names ascending, hidden
+  names dropped unless `ShowHidden`), the selection, the window and the view stack, and states
+  the true window — the selection inside the listing and the window, never more rows than the
+  height and never fewer than the entries allow: the page keys clamp to a window of Height
+  entries, a smaller height keeps the selection in view, G without a height selects the last
+  entry and shows it, a larger height fills the window, Back restores the parent's selection
+  clamped to the re-read listing and its window fitted to the current height, a negative height
+  is no height, an unreadable directory is not entered — and the true selection report
+  (`DidSelectFile` looks at the entry enter was pressed on). After the start and after every
+  operation `CurrentDirectory`, `Path`, the selection and window indices, the height,
+  `HighlightedPath` and the lines of `View` (cursor, mode, size, name, symlink target; blank
+  rows to the height; the empty-directory message) must follow, and after an enter
+  `DidSelectFile`/`DidSelectDisabledFile` must report the pressed entry per the allowed flags
+  and types. A classifier names the recorded bug a step has before it is taken, on a clone
+  where the step is replayed with the library's arithmetic beside the true one (a page key
+  clamping at an end, 64, or any page key at a negative height, 74; a resize hiding the
+  selection, 65, or leaving rows blank over hidden entries, 67; G without a height, 66; Back
+  onto a listing of another length, 68, or at another height, 73; Open or enter on an
+  unreadable directory, 69; enter on a directory with `DirAllowed`, 72); the comparison is
+  always made and fails naming the shape. The trailing newline (71) is the shape of every
+  non-empty directory's view and cannot be drawn or not: the view's line count is its own
+  check, which fails at the end of the case naming 71 (a step's own shape fails first), so the
+  wide property's basin is 71 in every round; under `HEGEL_NO_KNOWN=1` that one check is
+  dropped (counted as known once per case) and the lines are compared with the newline
+  stripped, the unreadable directory is not drawn and the operations with a shape are dropped
+  from the case on a replay of the model. Back from the default directory `.` (70) needs the
+  working directory and lives in its narrow property alone, which moves the working directory
+  into the tree's root for the case.
+- **tree: a random tree and the true layout, selection and scroll.** A case is a record of a
+  start (the tree's nodes three levels deep — leaves and `Root` nodes, some closed, values
+  from a word list with wide, multi-line and empty ones, a first child sometimes hidden — a
+  width and a height, a scroll-off, whether the help is shown, the cursor and the open/closed
+  characters, the rounded enumerator, a `TreeStyle` with a top frame or a border or a padded
+  `NodeStyle`, or a nil tree) and a list of one to forty-five operation records applied in
+  order: every default binding through `Update` (each of its keys, the spacebar among the
+  page-down keys), `SetYOffset`, `SetSize`/`SetHeight`/`SetWidth`, `SetScrollOff`,
+  `SetShowHelp`, `SetNodes` (a drawn tree or nil), `SetCursorCharacter`, `Node.SetValue` on a
+  drawn node followed by `SetNodes` of the same root, and the `Root().Value()` query. The model
+  states what the library should do: the visible nodes laid out in DFS order through the open
+  nodes, a hidden node and its subtree skipped, each with a node offset and a line offset that
+  counts every rendered row above it (the rows of a multi-line ancestor, the indicator row of
+  an open empty-valued node, the padding rows of a padded node style); the rows as the cursor
+  column joined to the tree's rows (indents, enumerators, indicators, continuation rows, the
+  frame of the `TreeStyle` around them), a value wider than the width cut by the viewport, a
+  child's `SetValue` drawn, a nil root drawn as an empty value; the selection clamped as the
+  library clamps it; the viewport's height as Height less the help's height at the current
+  width and help mode; the viewport's offset by the library's own scroll-off rule after every
+  operation, a resize and a `SetNodes` clamping the selection to the root included; the
+  spacebar paging down; `Root().Value()` with one indicator; `SetNodes(nil)` an empty tree.
+  After each step `YOffset`, `Size`, `NodeAtCurrentOffset`, `Node(i)`, every visible node's
+  `YOffset`/`LineOffset`/`IsSelected`, `Width`/`Height`, the viewport's height and offset, the
+  number of lines of `View` and each row of the viewport window must match, and the selected
+  node's line must be inside the window. A classifier over the model and the operation names
+  the recorded bug the step has (a space key, 87; `?` changing the help's height, 77; a width
+  change with the full help shown, 89; a resize whose true scroll differs from none, 78; a
+  movement of zero at the root with the offset past it, 90; `SetNodes(nil)`, 75;
+  `Root().Value()` with an indicator, 81; `SetValue` on a child, 80) and one over the state
+  names the shape the layout has (a hidden node, 76; a nil root, 82; the three styles,
+  83/84/85; a node whose library line offset is short, 86/88; a row wider than the width,
+  79); every comparison is made and fails naming the shape. Under `HEGEL_NO_KNOWN=1` the
+  shapes are not drawn (no wide values, no narrow widths, no multi-line or empty value on a
+  node with children, no hidden node, no nil tree, no style, no spacebar) and the operations
+  whose shape is a relation with the live state (77, 78, 89, 90, 81, 80) are dropped from the
+  case on a replay of the model. Only the first child of a parent is ever hidden: hiding any
+  other child panics inside lipgloss's renderer (lipgloss/30), a dependency bug not ours to
+  draw.
 - **cursor, key, timer, stopwatch, spinner: the small state machines against mirrors.** The
   timer, stopwatch and spinner are driven with their own commands, run synchronously (batches
   and sequences flattened; intervals of a microsecond or two so a tick command returns at
@@ -293,8 +338,8 @@ records bugs.
 | `TestHegelHelpFitsTheWidth` | `ShortHelpView`, `FullHelpView` and `View` vs the layout model: enabled items, separators, aligned columns, the width and the ellipsis |
 | `TestHegelProgressDrawsTheModel` | `ViewAs` rune by rune vs the options model: fill and empty runes, the solid, blend, scaled and colour-function colours, the percentage text, the width |
 | `TestHegelProgressSettles` | the setters' clamping and commands, stale and foreign frames ignored, the spring driven to equilibrium |
-| `TestHegelFilepickerFollowsTheModel` | every binding, resize and setter over a random directory tree vs the listing/window/selection mirror: the paths, the indices, the lines of `View`, the window invariants, the `DidSelect` reports |
-| `TestHegelTreeFollowsTheModel` | every binding and setter over a random tree vs the layout/selection/scroll mirror: the offsets of every node, the selection, the viewport height and offset, the rows of `View`, the selection in view |
+| `TestHegelFilepickerFollowsTheModel` | every binding, resize and setter over a random directory tree vs the true listing/window/selection model: the paths, the indices, the lines of `View`, the window invariants, the `DidSelect` reports |
+| `TestHegelTreeFollowsTheModel` | every binding and setter over a random tree vs the true layout/selection/scroll model: the offsets of every node, the selection, the viewport height and offset, the rows of `View`, the selection in view |
 | `TestHegelCursorFollowsFocus` | focus, blur, mode changes, initial/tagged/stale/foreign blink messages vs the mirror: `IsBlinked`, `Mode`, the tag, the command returned, the reversed cell |
 | `TestHegelKeyMatches` | `Matches` vs membership among enabled bindings; `Keys`, `Help`, `Enabled` through `SetKeys`/`SetEnabled`/`Unbind`/`SetHelp` |
 | `TestHegelTimerCountsDown` | start/stop/toggle, rounds of tick delivery, foreign/stale/broadcast ticks vs the mirror of the countdown and the chains in flight: `Timeout`, `Running`, `Timedout`, `View`, the ticks and `TimeoutMsg` emitted |
@@ -302,11 +347,10 @@ records bugs.
 | `TestHegelSpinnerAdvances` | `Tick`, rounds, spinner swaps, foreign/stale/broadcast ticks vs the mirror: the frame shown, the tag, the ticks emitted |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
-instead of failing at the first one; in the rewritten packages (textinput, textarea, viewport,
-table, list, cursor, key, spinner, stopwatch, timer, paginator, help, progress) the shapes of the recorded bugs are
-counted as `shape bubbles/N` and, under `HEGEL_NO_KNOWN=1`, the skipped ones as `known
-bubbles/N` and the filtered ones as `filtered <name>`; in the others still as `bubbles/N-shape`.
-The wide properties of the rewritten packages draw the shapes of their packages' recorded bugs
+instead of failing at the first one; the shapes of the recorded bugs are counted as `shape
+bubbles/N` and, under `HEGEL_NO_KNOWN=1`, the skipped ones as `known bubbles/N` and the
+filtered ones as `filtered <name>`.
+The wide properties draw the shapes of their packages' recorded bugs
 and are expected failures mapped to the bug they shrink to, the plurality basin where a property
 draws several (`TestHegelEditingFollowsTheModel` bubbles/1, `TestHegelPlaceholderFillsTheField`
 4, `TestHegelSuggestionsFollowThePrefix` 6, `TestHegelRealCursorSitsUnderTheVirtualOne` 8,
@@ -319,8 +363,9 @@ intermittent, their shapes being a few percent of their cases, `TestHegelLineInf
 `TestHegelStopwatchCounts` 91, `TestHegelTimerCountsDown` 92, `TestHegelPaginatorFollowsTheModel`
 41, `TestHegelHelpFitsTheWidth` 57, `TestHegelProgressDrawsTheModel` 62, intermittent:
 its shapes are a tenth of its cases and it passed one round of forty at a hundred,
-`TestHegelProgressSettles` 63), and beside them seventy-one narrow
-properties, one per bug of those packages, in `<package>/hegel_shapes_test.go` — the bug's
+`TestHegelProgressSettles` 63, `TestHegelFilepickerFollowsTheModel` 71, every non-empty
+directory's view having its shape, `TestHegelTreeFollowsTheModel` 82, the nil tree being the
+plain alternative), and beside them ninety-eight narrow properties, one per bug, in `<package>/hegel_shapes_test.go` — the bug's
 shape region with random contents, judged like the wide property, failing every run by default
 and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every property passes:
 `TestHegelTextinputDeleteWordForwardOnTheLastRune` (1), `TestHegelTextinputPlaceholderWithoutAWidth`
@@ -360,8 +405,20 @@ and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every proper
 (58), `TestHegelProgressStopsOnTheWayDown` (59), `TestHegelProgressColorFuncSurvivesALaterBlend`
 (60), `TestHegelProgressWideFillRunesWidenTheBar` (61),
 `TestHegelProgressColorFuncToldThePercentagePastOne` (62), `TestHegelProgressNaNPercentNeverSettles`
-(63). The other two packages (filepicker, tree) still steer off their bugs (counted, pins
-only); they follow.
+(63), `TestHegelFilepickerPageKeyClampsToTheHeight` (64), `TestHegelFilepickerShrinkKeepsTheSelectionInView`
+(65), `TestHegelFilepickerGoToLastWithoutAHeight` (66), `TestHegelFilepickerGrowFillsTheWindow` (67),
+`TestHegelFilepickerBackIntoAShrunkListing` (68), `TestHegelFilepickerOpenAnUnreadableDirectory` (69),
+`TestHegelFilepickerBackFromTheDefaultDirectory` (70), `TestHegelFilepickerViewHasHeightLines` (71),
+`TestHegelFilepickerEnterOnADirectoryReportsIt` (72), `TestHegelFilepickerBackRestoresTheWindowAtTheNewHeight`
+(73), `TestHegelFilepickerNegativeHeightAndAPageKey` (74), `TestHegelTreeSetNodesNil` (75),
+`TestHegelTreeHiddenFirstChild` (76), `TestHegelTreeFullHelpFitsTheHeight` (77),
+`TestHegelTreeShrinkKeepsTheSelectionInView` (78), `TestHegelTreeWideValueIsCut` (79),
+`TestHegelTreeChildSetValueIsDrawn` (80), `TestHegelTreeRootValueHasOneIndicator` (81),
+`TestHegelTreeNilRootDrawsEmpty` (82), `TestHegelTreeTopFrameKeepsTheCursor` (83),
+`TestHegelTreeBorderShowsItsRightEdge` (84), `TestHegelTreeNodePaddingKeepsTheOffsets` (85),
+`TestHegelTreeMultiLineParentOffsets` (86), `TestHegelTreeSpacebarPagesDown` (87),
+`TestHegelTreeEmptyParentOffsets` (88), `TestHegelTreeSetSizeMeasuresTheHelpAtTheNewWidth` (89),
+`TestHegelTreeSetNodesScrollsToTheRoot` (90).
 
 ## Bugs (see `bugs.toml`)
 
@@ -550,35 +607,47 @@ keys' `maxIdx − Height`, the resize handlers without `selected`, `G`'s `len �
 index-against-count test, the `readDirMsg` handler without a clamp, the missing `errorMsg`
 case, `Dir(".")`, the padding loop's newline — and confirmed by one probe file; the property
 found bubbles/72 (the selection report after entering a directory), bubbles/73 (the restored
-window under another height) and bubbles/74 (the negative height). The window's invariants —
-the selection inside it, no more rows than the height, no fewer than the entries allow — are
-checked on the library's indices with a sticky cause per invariant: a resize (/65, /67), `G`
-without a height (/66), a page key (/64, or /74 once a page key was pressed at a negative
-height), a `Back` whose listing changed (/68) or whose height changed (/73) or whose saved
-window already carried a shape, and a page key from a window already oversized (it inherits
-that window's cause: the library's page arithmetic strands the selection); /68 is also
-counted before an Open with the selection out of range, /72 as a `DidSelect` report differing right after an enter that entered a directory;
-/69, /70 and /71 are pinned only (readable trees, absolute paths, the trailing newline
-modelled); each is pinned.
+window under another height) and bubbles/74 (the negative height). The wide property draws a
+directory tree, a start record and an op list and compares the library with a true model of
+the window at every step; the shape of each op is read off the op against the model's state
+before it: a page key with more entries than the height (/64), or at a negative height once a
+page key was pressed (/74), a shrink with the selection past the new height (/65), `G` without
+a height (/66), a grow with rows to fill (/67), a `Back` into a listing that changed (/68) or
+at another height (/73), opening a directory made unreadable with `chmod 0` (/69), enter on a
+directory (/72); the trailing newline (/71) is the shape of the one check every non-empty
+directory's view fails, counted once at the end of the case. Per thousand cases of up to
+twenty-five ops, 994 mismatch: /71 in 438, /64 in 272, /67 in 112, /66 in 101, /65 in 27, /74
+in 24, /72 in 10, /69 in 6, /73 in 4 and /68 in one per three thousand. Under `HEGEL_NO_KNOWN`
+no directory is locked, an op that would reach a shape is dropped on a replay of the model,
+and the views are compared with the newline trimmed, the /71 check counted as known. The
+working directory (/70) lives in its narrow property alone, which `t.Chdir`s per case; each of
+the eleven has a narrow property and is pinned.
 
 For tree (744 lines plus the node's 400, read in full first, with lipgloss's tree renderer
 beside it) eleven of the sixteen were on paper or found by a probe file — the unguarded
 `setYOffsets` in `SetNodes`, hidden children still counted, `?` without a `SetSize`, `SetSize`
 without a scroll, the `TreeStyle.Width` wrap, the child `SetValue`, the doubled indicator,
 `<nil>`, the frame and the border, the padded node style — and the property found bubbles/86
-(children of a multi-line node), /87 (the spacebar), /88 (an empty-valued parent) and /89
-(the help measured at the old width) and /90 (the early return after `SetNodes`). The mirror computes the correct line offsets and
-scrolls by the library's (short by the multi-line ancestors' rows), so /86 and /88 are counted
-per node and the view check skipped while the selected node is under a multi-line ancestor;
-/77 is counted as a view taller than the height while `ShowAll` differs from its value at the
-last `SetSize`, /89 while the help's height differed before and after that call, /78 as the
-selected line outside the window after a resize with no scroll since, /90 as the same after an
-update that took the early return with the offset past the root, /79 whenever a rendered
-row is wider than the width (the scroll is then taken from the library until the content is
-re-rendered), /87 by sending the spacebar and expecting nothing; /75, /76 and /80–/85 are
-pinned only (no nil root, no hidden nodes, no `SetValue`, no styles in the property); each is
-pinned. Hiding any child but the first also panics inside lipgloss's renderer (lipgloss/30,
-recorded in `go/lipgloss`).
+(children of a multi-line node), /87 (the spacebar), /88 (an empty-valued parent), /89 (the
+help measured at the old width) and /90 (the early return after `SetNodes`). The wide property
+draws a tree spec (plain, wide, multi-line and empty values; open and closed nodes; a hidden
+first child), a start record (width, height, help, one of the three drawn styles) and an op
+list, and compares the library's view, selection and offset with a true layout at every step,
+with its own `help.Model` for the viewport's height; the shape is read off the op and the
+state: the nil tree (/75, /82), a hidden first child (/76), `?` with a help whose height
+changes (/77), a resize with the selection out of the window (/78), a row wider than the width
+(/79), `SetValue` on a child (/80), a root with an indicator (/81), the top frame (/83), the
+border (/84) and the node padding (/85) whenever a style is drawn, a node under a multi-line
+(/86) or empty-valued (/88) ancestor, the spacebar (/87), a width change under the full help
+(/89) and an update after `SetNodes` with the offset past the root (/90). Per thousand cases of
+up to forty-five ops, 767 mismatch: /79 in 231, /82 in 145, /76 in 144, /86 in 118, /85 in 98,
+/81 in 97, /77 in 92, /80 in 83, /87 in 61, /78 in 52, /83 in 51, /84 in 16, /75 in 9, /88 in 9,
+/90 in 6 and /89 in none of three thousand (the full help at a width that changes its line
+count is a rare draw; its narrow property reaches it every case). Under `HEGEL_NO_KNOWN` no
+wide, multi-line or empty value, hidden node, nil tree, style or spacebar is drawn and the ops
+that would reach a shape are dropped on a replay. Hiding any child but the first also panics
+inside lipgloss's renderer (lipgloss/30, recorded in `go/lipgloss`), so only a first child is
+ever hidden; each of the sixteen has a narrow property and is pinned.
 
 For the five small packages (1 105 lines together, read end to end) all seven were on paper and
 confirmed by a probe file per package before the properties, which agreed with their mirrors
@@ -670,8 +739,8 @@ is /92 (a start then a round) in most runs, /93 in some.
 
 the cursor's real blink timing (the commands' cancel contexts; the property builds the blink
 messages itself); timer/stopwatch/spinner ticks in real time (microsecond intervals, the
-commands run synchronously); tree's styles beyond the pinned frames and
-paddings (the selected/parent/root colours), custom indenters and multi-line enumerators,
+commands run synchronously); tree's styles beyond the drawn top frame, border and padded node
+style (the selected/parent/root colours), hidden nodes other than a first child (lipgloss/30), custom indenters and multi-line enumerators,
 `SetViewportYOffset`, `Node.Close`/`Open` on a node other than the selected one, help's styles; progress's `PercentageStyle`
 and springs outside frequency 1–60 / damping 0.1–2; filepicker's styles, a custom `Cursor`,
 directories that change underneath it beyond `ShowHidden`, `IsHidden` on Windows; textinput's clipboard paste (`Paste` reads the
@@ -727,3 +796,19 @@ margin) and `Select` past the end (bubbles/40's shape).
   overhang; `MoveUp(0)` and `MoveDown(0)` were one operation; the list model typed at the end of
   the filter input rather than at its cursor, and reset the filter on an out-of-range
   `RemoveItem` under an empty filter as the library does not.
+- Part 4 (2026-10-09): filepicker and tree rewritten the same way, the last two packages; the
+  old `N`/`Pick`/`Chance`/`Note` helpers removed from the harness. The filepicker's model
+  states the true window where the old mirror had copied the library's arithmetic line for
+  line (the page keys clamped to the height, a shrink and a grow keeping the selection in view
+  and the window full, G without a height showing the last entry, Back refitting the parent's
+  window and clamping its selection, a negative height no height) and the true `DidSelect`
+  report; an unreadable directory and the relative start `.` are drawn (the latter by the
+  narrow property, which moves the working directory), and the trailing newline (71) is the
+  view's line-count check, failing at the end of the case and dropped under `HEGEL_NO_KNOWN=1`.
+  The tree's model counts every row of a multi-line, empty-valued or padded ancestor in the
+  line offsets, cuts a wide value instead of wrapping it, keeps the selection in view after
+  `?`, a resize and `SetNodes`, measures the help at the new width, pages down on the
+  spacebar, skips a hidden node, draws a child's `SetValue` and an empty root, and takes
+  `SetNodes(nil)` for an empty tree; a nil tree, a hidden first child, the three styles,
+  `SetValue` and `Root().Value()` are drawn alternatives. Twenty-seven narrow properties added;
+  no new bug, no candidate.
