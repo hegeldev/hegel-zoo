@@ -90,3 +90,8 @@ says the generators avoid shapes (the older practice; a worklist). `--test-cases
   reads), and the tests: `let%hegel_test` properties and `let pin_… () =` pins, each passed to
   `Zoo.run`. The default setup pins hegel from its release tag and installs the deps of
   `<name>.opam`. Run in a switch with OCaml 5.1+, e.g. `OPAMSWITCH=hegel-zoo opam exec -- tools/zoo test ocaml/...`.
+  Where `implicit_transitive_deps` is off, `hegel/dune` lists every library the tests use. A
+  library hegel itself depends on (ipaddr, sexplib0, …) or one not built with dune (zarith)
+  makes `hegel/` a dune project of its own that builds symlinks to the upstream sources, run
+  with `--root hegel` (`targets/ocaml/ipaddr`, `targets/ocaml/zarith`); a library with C and
+  OCaml backends builds one executable per backend (`targets/ocaml/digestif`).
