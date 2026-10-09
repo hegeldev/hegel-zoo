@@ -136,7 +136,17 @@ values for the information functions and the result branches.
 - `TestHegelDate`: 23 date and time functions (DATE, DAY, MONTH, YEAR, WEEKDAY, WEEKNUM,
   ISOWEEKNUM, EDATE, EOMONTH, DAYS, DAYS360, DATEDIF, NETWORKDAYS, NETWORKDAYS.INTL, WORKDAY,
   WORKDAY.INTL, YEARFRAC, TIME, HOUR, MINUTE, SECOND, DATEVALUE, TIMEVALUE) agree with the
-  1900-system model to 1e-12, or return the documented error, and never panic.
+  1900-system model to 1e-12, or return the documented error, and never panic. A case is a
+  record of the function and its arguments from per-function generators over the kinds
+  (serials of six profiles, the quirk region first; days, weekends, holidays near the start,
+  texts), with the shape of every recorded Date bug drawn by default (see "Drawn shapes"
+  below) and named by the classifier before the library is called, by replicas of the
+  library's calendar beside the model; it fails every run (basin MONTH(0), the first entry of
+  its table and the first serial profile, excelize/38).
+- `TestHegelDate…`: sixteen narrow properties, one per Date bug (excelize/35 to 47) and one
+  each for the Date instances of 15 and 21, each drawing random contents of its bug's shape,
+  judged by the same judge, and the neighbouring region past it; each fails every run naming
+  its bug and passes under `HEGEL_NO_KNOWN=1`.
 - `TestHegelText`: 30 text functions (CHAR, CODE, UNICODE, UNICHAR, CLEAN, TRIM, UPPER, LOWER,
   PROPER, LEN, LEFT, RIGHT, MID, REPT, CONCAT, CONCATENATE, TEXTJOIN, EXACT, FIND, SEARCH,
   REPLACE, SUBSTITUTE, FIXED, TEXT, TEXTAFTER, TEXTBEFORE, VALUE, T, N, VALUETOTEXT) return the
@@ -194,16 +204,21 @@ Dates and times (35–47): EDATE panics with an index out of range for a Decembe
 reached through a multiple of twelve months (40) and lands a year early whenever the month sum
 is 12 to 23, EDATE(DATE(2020,12,15),0) is 15 December 2019 (39); the serials 0 to 60 are placed
 on the real calendar a day before Excel's (MONTH(1) = 12), DATE is a day late in January and
-February 1900 unless the year is literally 1900, and WEEKNUM counts 1900 from a Monday 1 January
-where Excel's is a Sunday, and DATEVALUE of the phantom 29 February 1900 is #VALUE! (38); DAY of the first sixty serials is serial mod 31 with the fraction
+February 1900 unless the year is literally 1900, WEEKNUM counts 1900 from a Monday 1 January
+where Excel's is a Sunday (the Monday-start return types a week short), DAY between 60 and 61
+is the real 28 February, and DATEVALUE of the phantom 29 February 1900 is #VALUE! (38); DAY of the first sixty serials is serial mod 31 with the fraction
 (DAY(31) = 0, DAY(2.5) = 2.5) (35); DATE does not add 1900 to a year below 1900 and accepts a
 negative one (37); WEEKNUM's return type 21 is not the ISO week where the ISO year differs (44);
 YEARFRAC does not swap a start after the end (42) and skips the 31st-to-30th rule after a
 February start (43); WORKDAY backwards skips only the holidays before the first one found (46);
 NETWORKDAYS and WORKDAY count a holiday listed twice as two (45); TIME does not wrap at 24 hours
-(41). Contract: serials beyond 9999 and DATE results outside the range are accepted (36);
-YEARFRAC of equal dates and WORKDAY.INTL of 0 days return before checking the basis or the
-weekend argument (47).
+(41). Contract: serials beyond 9999 and DATE results outside the range are accepted, DATEDIF
+alone accepts a negative serial, and EDATE and EOMONTH return 0 for a result before 1900 (36);
+YEARFRAC of equal dates, WORKDAY.INTL of 0 days and DATEDIF of equal dates return before
+checking the basis, the weekend argument (any invalid mask too) or the unit (47). Shared with
+the other properties: WEEKDAY's return type, the weekend numbers of NETWORKDAYS.INTL and
+WORKDAY.INTL and DATEDIF's unit are #VALUE! where Excel documents #NUM! (21); TIME keeps a
+fractional argument and WORKDAY a fractional count below 1 moves a weekend start (15).
 
 Text (48–68, 77, 78): TEXTAFTER and TEXTBEFORE panic with a slice bound below zero when a
 backward search reaches a delimiter at the start of the text and wants another (77) and skip an
@@ -228,7 +243,7 @@ value_if_false is omitted (70); ISTEXT("1") is FALSE, N("1") is 1, ISLOGICAL("TR
 ISNUMBER(TRUE) are TRUE (75); SWITCH compares texts (76); the logical text coercions differ from
 function to function (73).
 
-## Drawn shapes (the Math, Stat and Dist functions, parts 1 and 2 of the rewrite)
+## Drawn shapes (the Math, Stat, Dist and Date functions, parts 1 to 3 of the rewrite)
 
 `TestHegelMath` follows the zoo's standard: nothing steers off a recorded bug by default. The
 argument kinds are package-level generators of weighted alternatives, the simplest first, and
@@ -327,21 +342,41 @@ binomial cumulative with a fractional number_s is right, BESSELK and BESSELY tak
 part of an order below 2; the LOGNORM.INV results in the subnormals at a huge standard
 deviation pass through the 1e-300 atol (a model fact).
 
+`TestHegelDate` draws the same way: serials of six profiles with the quirk region 0..62 first
+and a time fraction a quarter of the time, and every Date bug's shape among the kinds — the
+day-early calendar below serial 61 read by MONTH, YEAR, WEEKNUM, EDATE, EOMONTH and the
+two-date functions, DAY between 60 and 61, DATE's January and February 1900 reached by a
+month or day offset, the Monday-start WEEKNUM types through 1900 and the phantom 29 February
+1900 as a DATEVALUE text (38, named only where a replica of the library's calendar differs
+from Excel's: MONTH(2) is right, MONTH(1) is not), DAY of a fraction or of 31 on the modulo
+path (35), the far end past 2958465, DATE years past 9999, results outside the range and
+DATEDIF's negative serials (36), DATE years below 1900 (37), EDATE offsets 0..11 that reach a
+December (39, by a replica of the month arithmetic) and month ends whose month sum is a
+multiple of twelve (40, the panic), TIME totals of a day or more (41), reversed YEARFRAC pairs
+at a fifth (42), February-end starts to a 31st with basis 0 (43), the January and December
+days whose ISO year differs with type 21 (44, by a replica of the library's count), a holiday
+listed twice (45) and an early holiday sorted before one inside a backward WORKDAY span (46,
+by a replica of the walk), equal dates with a basis or unit outside the table and 0 days with
+an invalid weekend (47), the error-code cases (21: WEEKDAY's type, the weekend numbers,
+DATEDIF's unit) and fractional TIME arguments and WORKDAY counts below 1 (15). The
+classifier `dateShape` orders 40 before 39 and before the skips, 21 before 36, 47 before 42,
+46 before 45, and 35 before 38 for DAY. Under `HEGEL_NO_KNOWN=1` the property passes (at three
+thousand cases: 0 mismatches, no case skipped; EDATE a fifth and WORKDAY.INTL a seventh of
+their draws filtered, the rest under a tenth). Per thousand cases by default, about 170
+mismatch (two runs of three thousand): 36 in 40 to 50, 38 in 30 to 45, 21 in 15, 39 in 9 to
+15, 35 in 10, 45 in 6 to 11, 41 in 3 to 12, 15 in 5 to 10, 47 in 6 to 8, 46 in 6, 42 in 5,
+37 in 2 to 4, 43 in 3, 44 in 1 to 3, 40 in 2. Not shapes, found by the drawn regions: DATE, EDATE,
+EOMONTH, WEEKDAY, WEEKNUM and YEARFRAC truncate a fractional argument; the WEEKNUM types
+12 to 17 are right through 1900; a negative serial is #NUM! on both sides for every function
+but DATEDIF; excelize/10 has no Date instance.
+
 ## Modelled as recorded
 
-The other three properties (Date, Text, Logic) still have an `HZKnown` switch per bug
-they reach (parts 3 and 4 of the rewrite follow). While a switch is on the generator keeps
+The other two properties (Text, Logic) still have an `HZKnown` switch per bug
+they reach (part 4 of the rewrite follows). While a switch is on the generator keeps
 away from the shape or the check is relaxed: an infinite result accepted for
 a documented #NUM!; a different error code accepted; fractional integer arguments replaced.
-For the dates: serials below 61 and the
-January and February 1900 results of DATE avoided for the functions that read the calendar, and
-WEEKNUM's whole 1900 except type 21; DAY of a multiple of 31 or a fraction below 61 avoided;
-serials and results beyond 2958465 and DATE years outside 1900..9999 avoided; EDATE offsets 0..11 that reach a December and multiples of twelve landing on
-a December after the 28th avoided; TIME totals of a day or more avoided; YEARFRAC only with the
-start before the end, and not with an out-of-range basis on equal dates nor with basis 0 from a
-February end to a 31st; WEEKNUM type 21 avoided where the ISO year differs; holiday lists
-deduplicated and holidays before the span not sent to a negative WORKDAY; WORKDAY.INTL of 0 days
-only with a valid weekend. For the texts: numbers of a million or more, below 1E-04, of 16
+For the texts: numbers of a million or more, below 1E-04, of 16
 digits or that Go prints differently are not sent to text functions; MID ranges ending one past
 the text, interior double spaces and tabs for TRIM, REPT of a non-text or beyond 1000 repeats, an
 empty old_text, FIXED without decimals, with a falsy third argument, with a decimal half case or
@@ -404,3 +439,5 @@ the efp parser's).
   narrow properties); the notes of 21, 22, 26 and 29 widened by the drawn shapes.
 - 2026-10-09: part 2b of the rewrite (`TestHegelDist` drawing every Dist shape, sixteen
   narrow properties), 2 bugs (84, 85).
+- 2026-10-09: part 3 of the rewrite (`TestHegelDate` drawing every Date shape, sixteen
+  narrow properties); the notes of 15, 21, 36, 38 and 47 widened by the drawn regions.
