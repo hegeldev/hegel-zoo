@@ -45,7 +45,8 @@ years 0..1899 and normalises the month with divmod, EDATE and EOMONTH clamp to t
 rules, actual/actual as Excel's whole-year average, actual/360, actual/365, European 30/360),
 DAYS360 and DATEDIF as documented, NETWORKDAYS and WORKDAY (and the `.INTL` forms with weekend
 codes and masks) by counting days, TIME modulo a day, DATEVALUE and TIMEVALUE for ISO and
-US-slash dates and 12/24-hour times.
+US-slash dates (a two-digit year read as 2000–2029 and 1930–1999, Excel's rule) and 12/24-hour
+times.
 
 The text model is Python's `str` with Excel's rules written out: a number in a text context
 becomes its General text of at most 15 significant digits (judged between 1E-04 and 1E+15, where
@@ -56,7 +57,9 @@ and the `~` escape become a regular expression; SUBSTITUTE's instance counts non
 occurrences; FIXED and TEXT round the 15-digit decimal half away from zero (`decimal`), with the
 `#,##0`, `0%`, `0.00E+00`, `@`/General and the common date and time formats (`mm` is minutes after
 `hh` or before `ss`); VALUE accepts Excel's spellings (grouped thousands, a percent sign, an
-exponent, surrounding spaces, ISO and US dates, times) and nothing else; CHAR/CODE follow
+exponent, surrounding spaces, ISO and US dates, times) and nothing else; TEXTAFTER and
+TEXTBEFORE reject an instance of 0 or beyond the text's length with #VALUE! (Excel's documented
+rule) and answer #N/A, or if_not_found, when the delimiter's instance is missing; CHAR/CODE follow
 Windows-1252 where it agrees with Latin-1 (1–127, 160–255) and UNICHAR/UNICODE are code points
 with the surrogates rejected. The logical model: TRUE/FALSE, non-zero numbers and the texts
 "TRUE"/"FALSE" are logical values, other texts #VALUE!; IF's omitted value_if_false is FALSE;
@@ -92,7 +95,8 @@ with control characters for CLEAN and TRIM (spliced in as `CHAR(n)`); substrings
 the thing to find or replace; counts −1..14 with fractions; numbers of eight profiles (integers,
 cents, millions and beyond, small fractions, thirds, sums like 0.1 + 0.2) wherever a text
 function takes a value; TEXT's 29 formats with matching values; VALUE texts in fifteen
-spellings (grouped, spaced, percent, exponent, Go-only forms, garbage, dates, times); logical
+spellings (grouped, spaced, percent, exponent, Go-only forms, garbage, dates with four- and
+two-digit years and invalid ones, times); logical
 arguments as booleans, small numbers, fractions and the texts TRUE/FALSE/true/1/0/x; error
 values for the information functions and the result branches.
 
@@ -150,9 +154,22 @@ values for the information functions and the result branches.
 - `TestHegelText`: 30 text functions (CHAR, CODE, UNICODE, UNICHAR, CLEAN, TRIM, UPPER, LOWER,
   PROPER, LEN, LEFT, RIGHT, MID, REPT, CONCAT, CONCATENATE, TEXTJOIN, EXACT, FIND, SEARCH,
   REPLACE, SUBSTITUTE, FIXED, TEXT, TEXTAFTER, TEXTBEFORE, VALUE, T, N, VALUETOTEXT) return the
-  model's text, number or boolean exactly, or the documented error.
+  model's text, number or boolean exactly, or the documented error. A case is a record of the
+  function and its arguments from per-function generators over the kinds (texts of an
+  alphabet, substrings, numbers for a text context, counts, formats, logical values, VALUE's
+  spellings), with the shape of every recorded Text bug drawn by default (see "Drawn shapes"
+  below) and named by the classifier before the library is called, by replicas of the
+  library's text rules beside the model; it fails every run (basin CHAR(0), the first entry of
+  its table, excelize/59).
 - `TestHegelLogic`: 26 logical and information functions (AND, OR, XOR, NOT, IF, IFS, SWITCH,
-  IFERROR, IFNA, the IS functions, TYPE, ERROR.TYPE, N, T, NA, TRUE, FALSE) agree with the model.
+  IFERROR, IFNA, the IS functions, TYPE, ERROR.TYPE, N, T, NA, TRUE, FALSE) agree with the model;
+  the same record and classifier, with the shape of every recorded Logic bug drawn by default;
+  it fails every run (basin IF(2,0): the first entry of its table and the first alternative
+  of IF's arguments, excelize/69).
+- `TestHegelText…`, `TestHegelLogic…`: thirty-three narrow properties, one per Text and Logic
+  bug (excelize/48 to 78) and one each for the Text instances of 15 and 21, each drawing random
+  contents of its bug's shape, judged by the same judge, and the neighbouring region past it;
+  each fails every run naming its bug and passes under `HEGEL_NO_KNOWN=1`.
 - `TestHegelPin…`: one per recorded bug, asserting the Excel behaviour; expected failures.
 
 ## Bugs
@@ -233,7 +250,8 @@ overflows (56); CODE and UNICODE return the first UTF-8 byte (58); UNICHAR rejec
 above 55295 (60); FIND treats ? and * as wildcards (61) while SEARCH lacks the tilde escape and
 leaks regular-expression syntax (62); TEXTAFTER/TEXTBEFORE cut at byte offsets (65) and return ""
 instead of #N/A when the delimiter is missing (66); VALUE takes Go's number spellings (0x10, 1_000,
-inf, misplaced commas) and rejects surrounding spaces (67); TEXT rounds the binary value (68);
+inf, misplaced commas), rejects surrounding spaces and turns an invalid date text into 0 (67);
+TEXT rounds the binary value (68);
 REPT rejects a number (51) and builds texts beyond the cell limit (52); CHAR(0) is a NUL (59);
 FIND accepts a start of 0 (63); TEXTJOIN wants a literal boolean (64). Logical (69–76): IF and IFS
 treat only the number 1 as TRUE, IF(2,1,0) = 0 (69); ISEVEN is TRUE for every odd number except 1
@@ -241,9 +259,11 @@ treat only the number 1 as TRUE, IF(2,1,0) = 0 (69); ISEVEN is TRUE for every od
 returns a boolean result as 1/0 and an error result as text (71) and "" instead of FALSE when
 value_if_false is omitted (70); ISTEXT("1") is FALSE, N("1") is 1, ISLOGICAL("TRUE") and
 ISNUMBER(TRUE) are TRUE (75); SWITCH compares texts (76); the logical text coercions differ from
-function to function (73).
+function to function (73). Shared with the other properties: ISEVEN of an error is #VALUE!
+instead of the error, and IFS of a non-logical text is #N/A instead of #VALUE! (21); TEXTAFTER
+and TEXTBEFORE compare a fractional instance untruncated with the text's length (15).
 
-## Drawn shapes (the Math, Stat, Dist and Date functions, parts 1 to 3 of the rewrite)
+## Drawn shapes (every property, parts 1 to 4 of the rewrite)
 
 `TestHegelMath` follows the zoo's standard: nothing steers off a recorded bug by default. The
 argument kinds are package-level generators of weighted alternatives, the simplest first, and
@@ -370,28 +390,42 @@ EOMONTH, WEEKDAY, WEEKNUM and YEARFRAC truncate a fractional argument; the WEEKN
 12 to 17 are right through 1900; a negative serial is #NUM! on both sides for every function
 but DATEDIF; excelize/10 has no Date instance.
 
-## Modelled as recorded
-
-The other two properties (Text, Logic) still have an `HZKnown` switch per bug
-they reach (part 4 of the rewrite follows). While a switch is on the generator keeps
-away from the shape or the check is relaxed: an infinite result accepted for
-a documented #NUM!; a different error code accepted; fractional integer arguments replaced.
-For the texts: numbers of a million or more, below 1E-04, of 16
-digits or that Go prints differently are not sent to text functions; MID ranges ending one past
-the text, interior double spaces and tabs for TRIM, REPT of a non-text or beyond 1000 repeats, an
-empty old_text, FIXED without decimals, with a falsy third argument, with a decimal half case or
-more than 15 decimals, REPLACE of non-ASCII text or a negative count, CODE/UNICODE of non-ASCII or
-empty text, CHAR of 0, UNICHAR beyond 55295, FIND with wildcards, SEARCH with a tilde or with
-wildcards beside a backslash or braces, a start_num outside 1..LEN, TEXTJOIN with a non-boolean
-ignore_empty, TEXTAFTER/TEXTBEFORE over non-ASCII text, a missing instance, a backward search over adjacent
-delimiters or reaching a delimiter at the start, VALUE texts that Go
-alone accepts or with surrounding spaces, TEXT at a decimal half case, all avoided. For the
-logical functions: IF/IFS tests other than 0/1 and booleans, IF without value_if_false or with a
-boolean or error branch, texts other than TRUE/FALSE as logical arguments, XOR of a text, a
-decisive OR/AND argument followed by more, odd numbers for ISEVEN and booleans or errors for
-ISODD, numeric or TRUE/FALSE texts for ISTEXT/N/ISLOGICAL and booleans for ISNUMBER, SWITCH
-values of another type or texts, all avoided. The collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns
-switches off and the properties then fail.
+The Text and Logic properties (part 4) draw the shape of every bug 48 to 78 and of the Text
+instances of 15 and 21 as alternatives of the kinds: numbers whose `%g` text differs from
+Excel's General (48), MID's range ending one past the text (49), interior double spaces and
+tabs for TRIM (50), a number or boolean for REPT (51) and a count that overshoots the cell
+limit for this text (52), an empty old_text (53), FIXED alone (54), with a false no_commas and
+a number of a thousand or more (55) and at a decimal half case (56), non-ASCII text and a
+negative count for REPLACE (57), a non-ASCII first character or the empty text for CODE (58),
+CHAR of a value truncating to 0 (59), UNICHAR beyond 55295 (60), a wildcard in FIND's find
+text (61), a tilde or a regexp character beside a wildcard in SEARCH's (62), a start of 0 for
+FIND (63), a non-boolean ignore_empty (64), non-ASCII text before the delimiter (65), a missing
+delimiter or instance (66), Go's spellings, surrounding spaces and invalid dates for VALUE
+(67), TEXT at a half case (68), IF/IFS tests beyond 0 and 1 (69), IF of two arguments with a
+false test (70), a boolean or error branch (71), a decisive AND/OR argument followed by an
+error text (72), the ParseBool spellings and XOR's texts (73), odd numbers, booleans and errors
+for ISEVEN/ISODD (74), numeric and TRUE/FALSE texts for the IS functions (75), SWITCH values
+whose texts agree across kinds or differ in case (76), the backward search from a delimiter at
+the start (77) and over adjacent delimiters (78), a fractional instance beyond the length whose
+truncation is within it (15) and the error-code cases (21: ISEVEN of an error, IFS of a
+non-logical text). The classifiers `textShape` and `logicShape` decide the relation shapes by
+replicas of the library's rules beside the model (the `%g` text against General, the byte cut
+against the character cut, `int(x·10^d + 0.5)` against the decimal rounding, the backward
+search's resume point, AND/OR's early return, SWITCH's text equality), naming only the cases
+that fail: a half case that rounds right by luck, a non-ASCII character after the cut or a
+SWITCH text case that differs in content are plain. The function is drawn from a table of
+thirty (Text) or twenty-six (Logic): the engine's draw over a table that long is lumpy (at
+three thousand cases the least-drawn function came 33 to 66 times and the most 156 to 175),
+so each function's shapes are alternatives at a fifth of its draws. Under `HEGEL_NO_KNOWN=1`
+both properties pass (at three thousand cases: 0 mismatches, no case skipped; FIND, MID,
+TEXTAFTER, ISEVEN, OR and SWITCH filtered under one per cent). Per thousand cases by default,
+about 120 Text and 90 Logic mismatches (three thousand cases): 48 in 15, 64 in 10, 50, 58, 65
+and 66 in 8 to 9, 57 and 59 in 6 to 7, 67 in 5, 51, 53, 55, 60 in 4, 61, 62 in 4, 56, 63 in 3,
+49, 54, 68 in 2, 77 and 78 in 1 to 2, 15 and 52 in about one per three thousand; 73 in 26, 69
+in 17, 74 in 13, 72 in 8, 70, 71, 21 in 5 to 6, 75 in 5, 76 in 4. Not shapes, found by the
+drawn regions: FIXED with one decimal never shows 56 (the binary product lands on the half) and
+the format "0.0" never shows 68; the scientific formats show 68 only at exact binary halves;
+TEXTAFTER's length check reads a positive instance only.
 
 ## Not judged
 
@@ -414,8 +448,11 @@ above 23 without. Texts: numbers beyond 1E+15 or below 1E-04 in a text context (
 switches to an exponent is not modelled); CHAR 128–159 and CODE of characters beyond Latin-1
 (code-page dependent); UNICHAR(65534) and (65535); lower-case "true"/"false" as logical texts;
 counts in (−1, 0); a space before a percent sign in VALUE; a trailing tilde in a SEARCH pattern;
-the sign of a negative that rounds to zero in FIXED and TEXT; TEXTAFTER with an empty delimiter or
-a fractional instance below 1; the B functions (LENB, LEFTB, ...: DBCS-locale semantics), DBCS,
+the sign of a negative that rounds to zero in FIXED and TEXT; TEXTAFTER with an empty delimiter,
+an empty text (whether Excel's "instance beyond the length" #VALUE! or the "not found" #N/A comes
+first) or a fractional instance below 1; VALUE of a dash-separated date with a two-digit year
+("20-05-03": Excel's reading is not modelled; the calculator gives 0); the B functions (LENB,
+LEFTB, ...: DBCS-locale semantics), DBCS,
 BAHTTEXT, ARRAYTOTEXT and UNIQUE; ISBLANK, ISREF, ISFORMULA, SHEET and SHEETS of references.
 
 ## Not tested
@@ -441,3 +478,8 @@ the efp parser's).
   narrow properties), 2 bugs (84, 85).
 - 2026-10-09: part 3 of the rewrite (`TestHegelDate` drawing every Date shape, sixteen
   narrow properties); the notes of 15, 21, 36, 38 and 47 widened by the drawn regions.
+- 2026-10-09: part 4 of the rewrite (`TestHegelText` and `TestHegelLogic` drawing every Text
+  and Logic shape, thirty-three narrow properties; the old per-bug switches removed, so
+  `HEGEL_NO_KNOWN=1` is the only switch); the notes of 15, 21 and 67 widened; the model's
+  DATEVALUE reads a two-digit year as Excel does and TEXTAFTER/TEXTBEFORE reject an instance
+  beyond the text's length as Excel documents.
