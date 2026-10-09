@@ -4197,7 +4197,7 @@ line2` | wrong-result | low | 0.6.8 (58fb0747c) | open |  |
 | [base64/2](targets/ocaml/base64/bugs.toml) | decode with ~pad:true accepts a final quantum of one character and three '=' and drops the character | contract | low | v3.5.2+ (08f344520) | open |  |
 | [base64/3](targets/ocaml/base64/bugs.toml) | Base64_rfc2045 encoder with a `Manual destination of fewer than 6 bytes corrupts its output | silent-corruption | low | v3.5.2+ (08f344520) | open |  |
 | [checkseum/1](targets/ocaml/checkseum/bugs.toml) | the OCaml backend's bounds-checked digest_* return a checksum for a negative length or an offset outside the input | contract | low | v0.5.3+ (fef8888d9) | open |  |
-| [containers/1](targets/ocaml/containers/bugs.toml) | range_by goes past j, wrapping around, when j - i overflows | contract | low | 3.18 (3a2bba397) | open |  |
+| [containers/1](targets/ocaml/containers/bugs.toml) | range_by in CCList, CCInt, CCInt64, CCInt32 and CCNativeint goes past j, wrapping around, when j - i overflows | contract | low | 3.18 (3a2bba397) | open |  |
 | [containers/2](targets/ocaml/containers/bugs.toml) | CCVector.resize_with and resize_with_init shrink the vector to a smaller size | contract | medium | 3.18 (3a2bba397) | open |  |
 | [containers/3](targets/ocaml/containers/bugs.toml) | CCDeque.append_back/append_front of a deque into itself corrupts it, or never returns | hang | low | 3.18 (3a2bba397) | open |  |
 | [containers/4](targets/ocaml/containers/bugs.toml) | CCDeque.update_front/update_back leave the length unchanged when they remove an element | silent-corruption | medium | 3.18 (3a2bba397) | open |  |

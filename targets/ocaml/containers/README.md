@@ -11,7 +11,8 @@ S-expressions against stdlib models, and six data structures as state machines a
   occurrence): against list models.
 - `list_sorted_diff_inverts_merge`, `list_sorted_remove_inverts_insert`: the documented inverses,
   and `List.merge`.
-- `int_range_by`, `int_floor_div_rem`, `int_pow`, `int_popcount`, `int_to_string_binary`.
+- `int_range_by`, `int64_range_by`, `int32_range_by`, `nativeint_range_by`, `int_floor_div_rem`,
+  `int_pow`, `int_popcount`, `int_to_string_binary`.
 - `utf8_is_valid` (against `String.is_valid_utf_8`, with overlong, surrogate and truncated
   sequences), `utf8_to_list`, `sexp_roundtrip`.
 - `vector_machine`, `deque_machine`, `bitvector_machine`, `heap_machine`, `fqueue_machine`,
@@ -29,3 +30,4 @@ The rest of both packages, including `CCParse`, `CCFormat`, the hash tables and 
 ## History
 
 - 2026-10-09: created at 3a2bba39 (3.18), hegel-ocaml 0.26.1; four bugs.
+- 2026-10-09: `range_by` of `CCInt64`, `CCInt32` and `CCNativeint` added to containers/1.
