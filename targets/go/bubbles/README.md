@@ -82,28 +82,49 @@ records bugs.
   `Cursor()` and `PositionAt` must agree with that cell; `LineInfo` must describe the grid row
   (at the start of a wrapped row too, bubbles/15). Under `HEGEL_NO_KNOWN=1` the steps and
   rows with a shape are replayed on the model, or the library, only.
-- **viewport: a scroll model over rows of cells.** A viewport of random size (sometimes with a
-  `NormalBorder` frame, a two-cell gutter, `SoftWrap`, `FillHeight`; the content area is always
-  at least one cell) gets up to eight random lines (wide runes, sometimes tabs or CRLF) and is
-  driven for up to twelve steps with every default binding (j/k/arrows, f/b/space/pgdown/pgup,
-  d/u, h/l/arrows), the mouse wheel (three directions), `SetYOffset`/`SetXOffset`, `GotoTop`/
-  `GotoBottom`, `ScrollDown`/`ScrollUp`, `SetContent`, `SetHeight` and `EnsureVisible`. The
-  model keeps the lines as rows of cells (soft-wrapped greedily at the content width) and the
-  two offsets (down moves stop at the bottom, up moves snap a past-bottom offset back, a page
-  is the content height, a horizontal step is six columns). After each step `YOffset`,
-  `XOffset`, `TotalLineCount`, `AtTop`/`AtBottom`, `ScrollPercent` and the view must follow:
-  the view is parsed into cells row by row and must be exactly `height` rows of `width` cells,
-  each the gutter plus the row's cells in `[x, x+width)` (a wide cell across the right edge is
-  dropped, one across the left edge is kept whole, as `ansi.Cut` does), blank or `~ ` rows
-  below the content.
-- **viewport: highlights.** Random byte ranges of the content (sorted, disjoint, on rune
-  boundaries — a range may start at or run over a newline) are set with `SetHighlights` under
-  a `Reverse` style; `HighlightNext`/`HighlightPrevious` and scrolling are driven and the
-  selected index and the offsets must follow (the nearest match is the first one starting at
-  or below the top row; `EnsureVisible` scrolls only when the match is outside, horizontally
-  to `colstart − 6` when its end is past the width). The reversed cells of every visible row
-  must be exactly the matched cells clipped to the window; a newline counts as one cell after
-  its line's last.
+- **viewport: a scroll model over rows of cells.** A case is a record of the start (a
+  `NormalBorder` frame three times in ten, a two-cell gutter, `SoftWrap`, `FillHeight`, a
+  `Style` width below the viewport's one time in ten, a width of 1–12 and a height of 1–6 past
+  the frame — the content area is always at least one cell — and none to eight lines of
+  letters, spaces, wide runes, digits and accents, with CRLF endings one time in ten and a tab
+  one time in twelve) and none to twelve operation records: every default binding (j/k/arrows,
+  f/b/space/pgdown/pgup, d/u, h/l/arrows), the mouse wheel (three directions),
+  `SetYOffset`/`SetXOffset` with literal arguments, `GotoTop`/`GotoBottom`,
+  `ScrollDown`/`ScrollUp`, `SetContent`, `SetHeight` and `EnsureVisible`. The model keeps the
+  lines as rows of cells (soft-wrapped greedily at the content width) and the two offsets (down
+  moves stop at the bottom, up moves snap a past-bottom offset back, a page is the content
+  height, a horizontal step is six columns, the horizontal limit is the longest row less the
+  content width, `SetContent` clamps both offsets). After the start and after each step
+  `YOffset`, `XOffset`, `TotalLineCount`, `AtTop`/`AtBottom`, `ScrollPercent` (over the content
+  height), `GetContent` and the view must follow: the view is parsed into cells row by row and
+  must be exactly `height` rows of `width` cells, each the gutter plus the row's cells in
+  `[x, x+width)` (a wide cell across the right edge is dropped, one across the left edge is
+  kept whole, as `ansi.Cut` does), blank or `~ ` rows below the content. A classifier over the
+  model's state names the recorded bug a case or a step has — before the step, on a clone where
+  it is replayed (`SetContent` narrower than the horizontal offset, bubbles/39; a page move
+  inside a frame, 30; `EnsureVisible` under soft wrap, 33) and over the state the step leaves
+  (a carriage return in the content, 27; a tab, 28; a `Style` width, 37; a wide cell on a cut
+  boundary, 32; the horizontal offset past the limit with a gutter or a frame, 29; a frame's
+  scroll percent, 31; numbered fill rows under soft wrap with a gutter, 38); the comparison is
+  always made and fails naming the shape. Under `HEGEL_NO_KNOWN=1` CRLF, tabs, frames, `Style`
+  widths and wide runes are not drawn and the steps with a shape (about three percent of the
+  cases) are skipped.
+- **viewport: highlights.** A case is a record of the start (a width of 1–12, a height of 1–6,
+  `SoftWrap` one time in five, `SelectedHighlightStyle` left unset one time in five instead of
+  `Reverse`, up to six lines of up to sixteen runes with one of them lipgloss-styled one time in
+  ten, an initial `YOffset`), one to four match records (a skip and a length, laid out in order
+  as byte ranges on rune boundaries — a range may start at or run over a newline) set with
+  `SetHighlights`, and none to six operations (`HighlightNext`/`HighlightPrevious`, down, up).
+  The selected index and the offsets must follow (the nearest match is the first one starting
+  at or below the top row; `EnsureVisible` scrolls only when the match is outside, by its visual
+  row, horizontally to `colstart − 6` when its end is past the width; `HighlightPrevious` from
+  no selection lands on the last match) and the reversed cells of every visible row must be
+  exactly the matched cells clipped to the window, the selected match included; a newline counts
+  as one cell after its line's last. The classifier names a styled line (bubbles/35), an unset
+  selected style (36), `EnsureVisible` under soft wrap (33), `HighlightPrevious` with no selected
+  match among two or more (34) and a wide cell kept whole at the left edge (32). Under
+  `HEGEL_NO_KNOWN=1` the styled line and the unset style are not drawn, soft-wrapped content
+  fits the width, and `HighlightPrevious` from none is left out of the operations.
 - **paginator: pages over a slice.** A case is a record of `PerPage` 1–5, the display options,
   1–40 items and a list of one to thirty operation records (the default bindings,
   `NextPage`/`PrevPage`, another key, a new item count — zero one time in five, and one time in
@@ -113,30 +134,56 @@ records bugs.
   is the dots or the Arabic format for the page. The shapes of the two recorded bugs (a count of
   zero, bubbles/41; a count below the page's first item, bubbles/40) are drawn like any other
   case and fail naming them; under `HEGEL_NO_KNOWN=1` neither is drawn.
-- **table: the selection in view.** Random columns (1–4, widths 0–7, titles), rows of that
-  many fields (letters, spaces, wide runes; sometimes a row with one field too many), a height
-  of 2–9 and a width of 8–50, the styles set to `Reverse` for the selection and the default
-  paddings. Every default binding, `MoveUp`/`MoveDown` by any count, `SetCursor`, `SetRows`,
-  `SetColumns`, `SetHeight`, `SetWidth`, `GotoTop`/`GotoBottom`, `Blur`/`Focus` and
-  `FromValues` are driven against a cursor clamped to the rows; `Cursor` and `SelectedRow`
-  must agree with it, `View` must be the header (each title truncated with `…` and padded to
-  its column, between one space each side) over `Height` consecutive rows rendered the same
-  way and cut to the width, the cursor's row must be shown and be the only reversed line.
-- **list: items, filter and selection.** Up to 25 items titled `wNN` plus one to five letters
-  from `a`–`e` (so fuzzy terms of one to three such letters match some of them), a width of
-  20–60 and a height of 12–30, the default delegate with or without descriptions. The model
-  keeps the items, the filter state and term, the visible indices (all items, or
-  `DefaultFilter`'s ranks — the library's own filter is the oracle for the order; the list's
-  bookkeeping around it is what is tested), the selection index and a mirror of the paginator
-  (`PerPage` from the height minus the chrome, the page count as the library last computed
-  it). Every default binding, the filter input (typing, backspace, enter/down to accept, esc),
-  `Select`, `SetItems`, `SetItem`, `InsertItem`, `RemoveItem`, `SetSize`, the section toggles,
-  `SetFilterText`, `ResetFilter`, the page/end methods and `InfiniteScrolling` are driven;
-  the commands `Update` returns are run at once and their messages fed back. After each step
-  `Index`, `Cursor`, `Page`, `TotalPages`, `PerPage`, `SelectedItem`, `GlobalIndex`,
-  `VisibleItems`, `FilterState`/`FilterValue` and the lines of `View` (the title or filter
-  line, the status text, the page's items with the selected one marked by the border, the
-  pagination dots or `p/n`) must agree.
+- **table: the selection in view.** A case is a record of the start (one to four columns of
+  widths 0–7 and titles of up to eight runes; up to thirty rows of that many fields — letters,
+  spaces, wide runes, a tab between two halves one time in sixty — one row given a field too
+  many eight times in a hundred; a height of 2–9 or, one time in twenty, 0 or 1; a width of
+  8–50; the styles set to `Reverse` for the selection and the default paddings) and one to
+  forty operation records: every default binding, `MoveUp`/`MoveDown` by 0–40, `SetCursor` with
+  a literal −3 to 33, `SetRows`, `SetColumns`, `SetHeight`, `SetWidth`, `GotoTop`/`GotoBottom`,
+  `Blur`/`Focus` and `FromValues`. The model keeps the cursor clamped to the rows and a mirror
+  of the library's window (the rows `New` and the moves bring into view) so that it can tell
+  when the selection is hidden; `Cursor` and `SelectedRow` must agree with the cursor, `View`
+  must be the header (each title truncated with `…` and padded to its column, between one
+  space each side, the line cut to the width) over `Height` consecutive rows (the table's height
+  less the header) rendered the same way and cut to the width, a tab in a cell four cells, the
+  cursor's row must be shown and be the only reversed line. A classifier over the model's state
+  names the recorded bug a case or a step has (on a clone where the step is replayed): a ragged
+  row the library would render (bubbles/42, a panic, named by `Judge.Recover`), a height under
+  two (47), a header wider than the width (46), a tab in a rendered cell (48), the library's
+  cursor left at −1 by a move on an empty table (45), a setter, `Blur`, `Focus` or a key while
+  blurred that leaves the selection out of view (43), an up move that leaves it below (44); the
+  comparison is always made and fails naming the shape. Under `HEGEL_NO_KNOWN=1` ragged rows,
+  tabs and heights under two are not drawn and the operations with a shape are left out of the
+  case (the model replayed over the kept ones).
+- **list: items, filter and selection.** A case is a record of the start (none to 25 items
+  titled `wNN` plus one to five letters from `a`–`e`, so that fuzzy terms of one to three such
+  letters match some of them; a width of 20–60 and a height of 12–30; the default delegate
+  with descriptions seven times in ten; `SetSize` after `New` four times in five; the help
+  shown half the time) and one to forty operation records: every default binding, the filter
+  input (typing `a`–`e`, backspace, enter/down to accept, esc), `Select`, `SetItems`, `SetItem`,
+  `InsertItem`, `RemoveItem` with a literal index of −1 to 26, `SetSize`, the section toggles,
+  `SetFilterText`, `ResetFilter`, the page/end methods and `InfiniteScrolling`; the commands
+  `Update` returns are run at once and their messages fed back. The model keeps the items, the
+  filter state and term, the visible indices (all items, or `DefaultFilter`'s ranks — the
+  library's own filter is the oracle for the order; the list's bookkeeping around it is what is
+  tested), the selection index, the bindings as `updateKeybindings` last set them and a mirror
+  of the paginator (`PerPage` from the height minus the chrome, the page count as the matches
+  give it). After the start and after each step `Index`, `Cursor`, `Page`, `TotalPages`,
+  `PerPage`, `SelectedItem`, `GlobalIndex` (the true index under any filter), `VisibleItems`,
+  `FilterState`/`FilterValue` and the lines of `View` (the title or filter line, the status
+  text, the page's items with the selected one marked by the border, the pagination dots or
+  `p/n`, the help; every line within the width) must agree. A classifier over the model's
+  state names the recorded bug a step has — before it (a negative index to `RemoveItem`,
+  bubbles/51, a panic named by `Judge.Recover`; `RemoveItem` under a filter where the index into
+  the match records takes another item, 50; a page key or `/` whose binding the library did not
+  refresh, 56) and over the state it leaves, on a clone where it is replayed (the matches
+  showing other items than the truth, 50; a page count the matches did not update, 52; the
+  selection restored past the end, 53; a `GlobalIndex` of 0 under an empty term, 49; an unsized
+  filter input or help line, 54; a status bar, pagination or help line wider than the width,
+  55); the comparison is always made and fails naming the shape. Under `HEGEL_NO_KNOWN=1` the
+  fresh list is always sized, the help starts hidden, and the operations with a shape are left
+  out of the case (the model replayed over the kept ones).
 - **help: a layout model.** Up to six bindings (keys and descriptions from a small set of words
   — empty, `?`, `ctrl+c`, `↑/k`, `move down`, a wide `全角` — 15 % of them disabled), up to
   four groups of up to three (some nil), the separators and the ellipsis changed some of the
@@ -255,8 +302,8 @@ records bugs.
 | `TestHegelSpinnerAdvances` | `Tick`, rounds, spinner swaps, foreign/stale/broadcast ticks vs the mirror: the frame shown, the tag, the ticks emitted |
 
 Set `BUBBLES_COLLECT=1` (and `HEGEL_TEST_CASES=n`) to collect mismatches and statistics
-instead of failing at the first one; in the rewritten packages (textinput, textarea, cursor,
-key, spinner, stopwatch, timer, paginator, help, progress) the shapes of the recorded bugs are
+instead of failing at the first one; in the rewritten packages (textinput, textarea, viewport,
+table, list, cursor, key, spinner, stopwatch, timer, paginator, help, progress) the shapes of the recorded bugs are
 counted as `shape bubbles/N` and, under `HEGEL_NO_KNOWN=1`, the skipped ones as `known
 bubbles/N` and the filtered ones as `filtered <name>`; in the others still as `bubbles/N-shape`.
 The wide properties of the rewritten packages draw the shapes of their packages' recorded bugs
@@ -266,11 +313,13 @@ draws several (`TestHegelEditingFollowsTheModel` bubbles/1, `TestHegelPlaceholde
 `TestHegelTextareaEditingFollowsTheModel` 26, `TestHegelVerticalMotionMovesOneVisualRow` 14,
 `TestHegelViewShowsTheWrappedRows` and `TestHegelRealCursorAndPositionAtAgree` 16, both
 intermittent, their shapes being a few percent of their cases, `TestHegelLineInfoDescribesTheWrappedRow`
-15, intermittent too, one pass in forty rounds at a hundred, `TestHegelCursorFollowsFocus` 97, `TestHegelSpinnerAdvances` 95,
+15, intermittent too, one pass in forty rounds at a hundred, `TestHegelViewShowsTheScrolledRows`
+28, `TestHegelHighlightsMarkTheMatches` 36, `TestHegelTableShowsTheSelectedRow`
+45, `TestHegelListFollowsTheModel` 51, `TestHegelCursorFollowsFocus` 97, `TestHegelSpinnerAdvances` 95,
 `TestHegelStopwatchCounts` 91, `TestHegelTimerCountsDown` 92, `TestHegelPaginatorFollowsTheModel`
 41, `TestHegelHelpFitsTheWidth` 57, `TestHegelProgressDrawsTheModel` 62, intermittent:
 its shapes are a tenth of its cases and it passed one round of forty at a hundred,
-`TestHegelProgressSettles` 63), and beside them forty-three narrow
+`TestHegelProgressSettles` 63), and beside them seventy-one narrow
 properties, one per bug of those packages, in `<package>/hegel_shapes_test.go` — the bug's
 shape region with random contents, judged like the wide property, failing every run by default
 and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every property passes:
@@ -288,7 +337,21 @@ and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every proper
 `TestHegelTextareaPastePastMaxHeight` (21), `TestHegelTextareaMaxWidthBelowThePromptAndGutter` (22),
 `TestHegelTextareaBlankPlaceholder` (23), `TestHegelTextareaDeleteWordBackwardAfterOneLeadingSpace`
 (24), `TestHegelTextareaEnterAtTheCharLimit` (25), `TestHegelTextareaEmptySelectionThenShiftArrow`
-(26), `TestHegelCursorModeOutOfRange` (96), `TestHegelCursorZeroValueFocused` (97),
+(26), `TestHegelViewportCRLFContentKeepsTheCarriageReturn` (27), `TestHegelViewportTabInTheContent`
+(28), `TestHegelViewportHorizontalScrollWithAGutterOrFrame` (29), `TestHegelViewportPageDownInsideAFrame`
+(30), `TestHegelViewportScrollPercentInsideAFrame` (31), `TestHegelViewportWideRuneOnACutBoundary` (32),
+`TestHegelViewportHighlightUnderSoftWrap` (33), `TestHegelViewportHighlightPreviousFromNone` (34),
+`TestHegelViewportHighlightsOnStyledContent` (35), `TestHegelViewportSelectedMatchWithTheDefaultStyle`
+(36), `TestHegelViewportStyleWidthBelowTheViewports` (37), `TestHegelViewportFillRowsUnderSoftWrap` (38),
+`TestHegelViewportSetContentKeepsTheXOffset` (39), `TestHegelTableRowWithTooManyFields` (42),
+`TestHegelTableSetCursorBeyondTheView` (43), `TestHegelTableMoveUpFromASelectionBelow` (44),
+`TestHegelTableMoveOnAnEmptyTable` (45), `TestHegelTableHeaderWiderThanTheTable` (46),
+`TestHegelTableHeightBelowTwo` (47), `TestHegelTableTabInACell` (48),
+`TestHegelListGlobalIndexUnderAnEmptyFilter` (49), `TestHegelListRemoveItemUnderAFilter` (50),
+`TestHegelListRemoveItemWithANegativeIndex` (51), `TestHegelListSetItemsUnderAFilterStallsThePages`
+(52), `TestHegelListSetItemsLeavesTheCursorPastTheEnd` (53), `TestHegelListNewDoesNotSizeTheHelp` (54),
+`TestHegelListChromeOverflowsTheWidth` (55), `TestHegelListRemoveItemKeepsTheBindings` (56),
+`TestHegelCursorModeOutOfRange` (96), `TestHegelCursorZeroValueFocused` (97),
 `TestHegelSpinnerTickWithTagZeroAfterTheFirst` (95), `TestHegelStopwatchWithoutAnInterval` (91),
 `TestHegelStopwatchStartedTwiceBeforeTheFirstTick` (94), `TestHegelTimerStartedTwice` (92),
 `TestHegelTimerTimeoutNotAMultipleOfTheInterval` (93), `TestHegelPaginatorPageOutlivesTheTotal`
@@ -297,8 +360,8 @@ and drawing the neighbouring region under `HEGEL_NO_KNOWN=1`, where every proper
 (58), `TestHegelProgressStopsOnTheWayDown` (59), `TestHegelProgressColorFuncSurvivesALaterBlend`
 (60), `TestHegelProgressWideFillRunesWidenTheBar` (61),
 `TestHegelProgressColorFuncToldThePercentagePastOne` (62), `TestHegelProgressNaNPercentNeverSettles`
-(63). The other five packages (viewport, table, list, filepicker, tree) still steer off their
-bugs (counted, pins only); they follow.
+(63). The other two packages (filepicker, tree) still steer off their bugs (counted, pins
+only); they follow.
 
 ## Bugs (see `bugs.toml`)
 
@@ -427,42 +490,47 @@ the width: a few percent of their cases, both intermittent), the LineInfo proper
 quarter of its cases; it passed one round of forty at a hundred, so intermittent); each is
 pinned and has its narrow property.
 
-For viewport (765 lines plus `highlight.go`, read in full first) eleven of the thirteen were
-on paper — `SetContent` splitting before the CRLF check, `maxXOffset` against `Width()`,
+For viewport (765 lines plus `highlight.go`, read in full first) eleven of the thirteen were on
+paper — `SetContent` splitting before the CRLF check, `maxXOffset` against `Width()`,
 `PageDown`/`ScrollPercent` against `Height()`, `EnsureVisible`/`findNearestMatch` in real lines
 under soft wrap, `(hiIdx−1+n)%n` from −1, `parseMatches` indexing the raw content with a
 stripped position, `StyleRanges` replacing the style, tabs at width 0 — and a probe of
 `ansi.Cut` on wide runes gave bubbles/32; the properties found bubbles/38 (numbered fill rows)
-and bubbles/39 (the stale horizontal offset). The view property gates /27, /28, /29, /30, /31,
-/32, /38 and /39 by cause, the highlight property /32, /33 and /34; /35, /36 and /37 need a
-style and are pinned only; each is pinned.
+and bubbles/39 (the stale horizontal offset). The scroll property draws the shapes of /27, /28,
+/29, /30, /31, /32, /33, /37, /38 and /39 (per thousand cases about 200 of /32, 120 each of /37
+and /28, 90 of /31, 60 of /27, 33 of /29, 28 of /30, 6 of /39, 4 of /33 and a few of /38 in
+three thousand) and shrinks to /28 most often (over forty rounds at a hundred cases: 28 twelve,
+31 and 27 nine each, 37 and 32 four, 29 two); the highlight property draws /32, /33, /34, /35
+and /36 (per thousand about 140 of /36, 70 of /34, 50 of /33, 32 of /32, 22 of /35) and shrinks
+to /36 (21 of forty rounds; /33 9, /34 5, /35 4, /32 1); each is pinned and has its narrow
+property. Under `HEGEL_NO_KNOWN=1` the scroll property skips about three percent of its cases
+(/29, /33, /39, /38 reached from the live state) and the highlight property under one percent.
 
 For paginator (200 lines) and table (453 lines), both read in full first, seven of the nine were
 on paper — the unclamped page, the early return for no items, `renderRow` indexing the columns
-by the row's fields, the offset untouched by the setters, `MoveUp`'s cases, the `−1` cursor of an
-empty table, the header outside the viewport — and a probe of cell contents gave bubbles/48;
+by the row's fields, the offset untouched by the setters, `MoveUp`'s cases, the `−1` cursor of
+an empty table, the header outside the viewport — and a probe of cell contents gave bubbles/48;
 the property showed that bubbles/42 fires only once the long row is within a page of the cursor
-and that bubbles/44 is every up move, not just the first. The table property gates /42 (a panic
-on the op that brings the row into the window), /43 (a setter that leaves the selection out of
-view), /44 (an up move while it is out), /45 (a negative cursor with rows) and /46 (a header
-wider than the width) by cause; /47 and /48 are pinned only (heights are drawn from 2 and
-values carry no tabs); each is pinned. The paginator property draws /40 and /41 and fails
-naming them (its basin /41, the simplest: one item, then a count of zero).
+and that bubbles/44 is every up move, not just the first. The table property draws the shapes of
+all seven (per thousand cases about 195 of /46, 170 each of /48 and /42, 150 of /43, 62 of /47,
+42 of /45, 22 of /44) and shrinks to /45 (forty rounds of forty: an empty table and one move is
+the shortest case there is); each is pinned and has its narrow property. Under
+`HEGEL_NO_KNOWN=1` nothing is skipped: the shapes are not drawn or the operations with one are
+left out. The paginator property draws /40 and /41 and fails naming them (its basin /41, the
+simplest: one item, then a count of zero).
 
 For list (1 321 lines plus the delegate, keys and styles, read in full first) six of the eight
 were on paper — `itemsAsFilterItems` without indices, `RemoveItem`'s one index for two slices,
-the `FilterMatchesMsg` handler returning before `updatePagination`, the cursor left by the
-index restore, `New` without the `SetWidth` calls, the paddings outside the truncations — the
-probe of a negative `RemoveItem` gave bubbles/51, and the property found bubbles/56 (`/`
-opening the filter on an emptied list; the page keys dead after a toggle). The property
-mirrors the bindings as `updateKeybindings` last set them and gates /49 (a zero
-`GlobalIndex` under an empty term, counted and carried on), /50 (a divergence right after
-`RemoveItem` under a filter, or a stale `GlobalIndex` after one), /51 (the panic), /52 (a
-page count differing from the matches under an applied filter — the model mirrors the stale
-count while a term is typed, where the navigation keys are disabled), /53 (`SelectedItem`
-nil with the index past the end), /55 (a chrome line wider than the width, counted and
-carried on) and /56 (a page key or `/` pressed while the mirror and the truth differ); /54 is
-avoided by `SetSize` after `New` and pinned; each is pinned.
+the `FilterMatchesMsg` handler returning before `updatePagination`, the cursor left by the index
+restore, `New` without the `SetWidth` calls, the paddings outside the truncations — the probe of
+a negative `RemoveItem` gave bubbles/51, and the property found bubbles/56 (`/` opening the
+filter on an emptied list; the page keys dead after a toggle). The property mirrors the bindings
+as `updateKeybindings` last set them and draws the shapes of all eight (per thousand cases about
+235 of /55, 82 of /52, 76 of /54, 52 of /53, 27 of /51, 19 each of /49 and /50, one of /56) and
+shrinks to /51 or /55 (twenty rounds each of forty at a hundred cases, 18 against 12 at twenty;
+mapped to /51); each is pinned and has its narrow property. Under `HEGEL_NO_KNOWN=1` nothing is
+skipped: the fresh list is sized, the help starts hidden and the operations with a shape are
+left out.
 
 For help (253 lines) and progress (438 lines), both read in full first, help's two were in
 `shouldAddItem` on paper and confirmed by a width sweep; of progress's five, four were on paper
@@ -645,3 +713,17 @@ margin) and `Select` past the end (bubbles/40's shape).
   the old view model had accepted. Two latent model bugs fixed: alt+b/alt+f computed the word
   boundary after moving the cursor, and the suggestion model had no cursor (`SetValue` keeps
   the library's).
+- Part 3 (2026-10-09): viewport, table and list rewritten the same way (classifiers over the
+  model's state before the step, on a clone, and over the state it leaves; the shapes the old
+  properties never drew — styled content, an unset `SelectedHighlightStyle`, a `Style` width
+  below the viewport's, a table height under two, a tab in a cell, a list left unsized after
+  `New` — drawn as alternatives), the model told the truth where it had been bent to the
+  library (the table's cursor clamped into the rows, its header cut to the width, the selection
+  always in view; the list's `GlobalIndex` the true index, its chrome fitted to the width, its
+  help sized by `New`; the viewport's offsets, percent and fill rows as the content has them)
+  and twenty-eight narrow properties added. Latent model bugs fixed on the way: the viewport's
+  wide-cell predicate missed runes cut mid-row; the table judge indexed the rows of an empty
+  table, took `"a\t"` in a one-wide column for a truncation and could not see a blank header
+  overhang; `MoveUp(0)` and `MoveDown(0)` were one operation; the list model typed at the end of
+  the filter input rather than at its cursor, and reset the filter on an out-of-range
+  `RemoveItem` under an empty filter as the library does not.
