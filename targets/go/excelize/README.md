@@ -122,9 +122,17 @@ values for the information functions and the result branches.
   15, 17, 20, 21, 22, 24, 26, 83), each drawing random contents of its bug's shape, judged by
   the same judge, and the neighbouring region past it; each fails every run naming its bug and
   passes under `HEGEL_NO_KNOWN=1`.
-- `TestHegelDist`: 70 distribution functions (densities, cumulatives, inverses, legacy
+- `TestHegelDist`: 73 distribution functions (densities, cumulatives, inverses, legacy
   names, GAMMA, GAMMALN, PHI, GAUSS, the error and Bessel functions) agree with SciPy to
-  1e-8 (1e-6 for the Bessel functions), or return the documented error.
+  1e-8 (1e-6 for the Bessel functions, 1e-12 for the inverse normals), or return the
+  documented error. A case is a record of the function and its arguments from per-function
+  generators over the argument kinds, with the shape of every recorded Dist bug drawn by
+  default (see "Drawn shapes" below) and named by the classifier before the library is
+  called; it fails every run (basin NORM.S.INV, the first entry of its table, excelize/12).
+- `TestHegelDist…`: sixteen narrow properties, one per Dist bug (excelize/10, 11, 12, 13,
+  14, 15, 16, 21, 25, 26, 27, 28, 30, 32, 84, 85), each drawing random contents of its bug's
+  shape, judged by the same judge, and the neighbouring region past it; each fails every run
+  naming its bug and passes under `HEGEL_NO_KNOWN=1`.
 - `TestHegelDate`: 23 date and time functions (DATE, DAY, MONTH, YEAR, WEEKDAY, WEEKNUM,
   ISOWEEKNUM, EDATE, EOMONTH, DAYS, DAYS360, DATEDIF, NETWORKDAYS, NETWORKDAYS.INTL, WORKDAY,
   WORKDAY.INTL, YEARFRAC, TIME, HOUR, MINUTE, SECOND, DATEVALUE, TIMEVALUE) agree with the
@@ -139,7 +147,7 @@ values for the information functions and the result branches.
 
 ## Bugs
 
-Eighty-three, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
+Eighty-five, recorded in `bugs.toml`. Four crash or destroy the result outright: PERCENTILE.EXC
 and QUARTILE.EXC panic with an index out of range for k outside (1/(n+1), n/(n+1)) (excelize/1);
 SEC returns the cosine (2); HARMEAN of a range is always #N/A (3); AVEDEV takes a range as one
 value (4). Several lose most digits: the inverse searches of CHISQ.INV.RT, CHIINV and GAMMA.INV
@@ -175,6 +183,12 @@ in every radix, DECIMAL("0x1F",16) = 31 where X is no hexadecimal digit and DECI
 cases: GEOMEAN is PRODUCT^(1/COUNT) and overflows to +INF for a long range of large values,
 GEOMEAN(1E+200,1E+200) = +INF, or underflows to #NUM! (83); the property reached it at its
 natural rate (about one case in a thousand) until part 2a drew the shape.
+
+Found by the rewritten Dist property (84, 85): the inverse F is (1 / BETA.INV(1 - p) - 1) · d2/d1
+and cancels for a tiny quantile, F.INV(0.0000000001,1,1) = 0 (want 2.47E-20) and
+FINV(0.999999,1,38) is 2e-3 off (84); the binomial densities multiply a coefficient by two
+powers and a power underflows while the value is representable, BINOM.DIST(41,163,0.998,FALSE)
+= 0 (want 2.97E-291), NEGBINOMDIST(120,50,0.998) = 0 (want 1.26E-281) (85).
 
 Dates and times (35–47): EDATE panics with an index out of range for a December after the 28th
 reached through a multiple of twelve months (40) and lands a year early whenever the month sum
@@ -214,7 +228,7 @@ value_if_false is omitted (70); ISTEXT("1") is FALSE, N("1") is 1, ISLOGICAL("TR
 ISNUMBER(TRUE) are TRUE (75); SWITCH compares texts (76); the logical text coercions differ from
 function to function (73).
 
-## Drawn shapes (the Math and Stat functions, parts 1 and 2a of the rewrite)
+## Drawn shapes (the Math, Stat and Dist functions, parts 1 and 2 of the rewrite)
 
 `TestHegelMath` follows the zoo's standard: nothing steers off a recorded bug by default. The
 argument kinds are package-level generators of weighted alternatives, the simplest first, and
@@ -276,19 +290,50 @@ narrow range skipped, at most 17 cases per function filtered). Per thousand case
 tolerances of `hzStatTol`; LARGE and SMALL with a fractional k, MODE with a tie, a PERCENTRANK
 rank within 1e-9 of a digit boundary not judged by the oracle.
 
+`TestHegelDist` (part 2b) draws the same way: the standard scores, locations, scales,
+probabilities, degrees of freedom, shapes and counts are package-level kinds, each
+function's arguments a tuple of them with the bug's region a one-in-ten alternative
+(`withShape`), off under NO_KNOWN — the far tail of the normal from z = -5.6 down, where
+0.5(1 + erf(z/√2)) has lost its digits, and of LOGNORM.DIST through ln(x) (11; the F and
+negative-binomial cumulatives below 1e-8 are named by a replica of the reflected incomplete
+beta tail), a fractional df, count or Bessel order of 2.5 and up, and a df below 1 (15),
+GAMMA of a negative non-integer (16), the domain ends (25: BETA.INV at 1, F.INV at 0,
+CHISQ.DIST.RT at 0, the CHISQ.DIST density at 0 with df above 2, BINOM.INV at 0 and 1,
+POISSON with mean 0, a standard deviation of 0, a negative x for CHIDIST with an even df or
+df 1 and for WEIBULL, s2 below s), the error-code cases (21: GAMMA at 0 and the negative
+integers, the inverse normals at 0 and 1 and beyond, a negative standard deviation, WEIBULL
+with beta 0, POISSON with a negative mean), GAMMALN past 171.62 (30), counts above 170 and
+the F, gamma and Poisson densities whose factors overflow while the true density is
+representable (32), a hypergeometric support starting above 0 whose spoiled sum exceeds the
+tolerance (14, by a replica of the sum with the library's fact of a negative), the
+cumulative GAMMA.DIST where the library's 33-term series differs from the converged value
+(27, by a replica of the series), BESSELJ beyond |x| = 25.25 + 0.4·max(0, n − 5) and BESSELY
+beyond x = 5 (28, measured on a half-step grid), the inverse searches CHISQ.INV.RT, CHIINV,
+GAMMA.INV and GAMMAINV as functions (13, off the table under NO_KNOWN) and BETA.INV's flat
+region of small equal shapes, infinities (10: the CHISQ.DIST density at 0 with df 1, BESSELK
+and BESSELY at a small x and a high order, LOGNORM.INV overflowing), a tiny F quantile with
+q·d1/d2 below 5e-10 (84) and a binomial power underflowing while the value is representable
+(85, by a replica of the powers). The precision of the inverse normals (12, 1e-9 against
+1e-12) and of the T inverses (26, 1e-7 against 1e-12) is the shape of one check: judged at
+the model's tolerance, a mismatch within the relaxed one fails naming the bug, and under
+NO_KNOWN the relaxed tolerance stands. The classifier `distShape` orders 13 before 27 and 25,
+30 and 32 before 10, 32 before 85, 84 before 11 and 25. Under `HEGEL_NO_KNOWN=1` the property
+passes (at three thousand cases: 0 mismatches, no case skipped; at most 33 cases per function
+filtered). Per thousand cases by default, 181 mismatch: 12 in 84, 13 in 50, 15 in 20, 11 in
+19, 21 in 10, 26 in 9, 28 in 8, 32 in 7, 25 and 85 in 4, 14 and 84 in 3, 10 in 2, 30 under
+one, 16 and 27 one in three thousand. Not shapes, found by the drawn regions: FINV at 1 and 0 are right
+(only F.INV is 10 at 1 and 25 at 0), CHIDIST truncates a fractional df of 1 and up, the
+binomial cumulative with a fractional number_s is right, BESSELK and BESSELY take the integer
+part of an order below 2; the LOGNORM.INV results in the subnormals at a huge standard
+deviation pass through the 1e-300 atol (a model fact).
+
 ## Modelled as recorded
 
-The other four properties (Dist, Date, Text, Logic) still have an `HZKnown` switch per bug
-they reach (parts 2b to 4 of the rewrite follow). While a switch is on the generator keeps
+The other three properties (Date, Text, Logic) still have an `HZKnown` switch per bug
+they reach (parts 3 and 4 of the rewrite follow). While a switch is on the generator keeps
 away from the shape or the check is relaxed: an infinite result accepted for
-a documented #NUM!; results below
-1e-8 not judged; NORM.S.INV judged to 1e-8 and NORM.INV to 1e-6; CHISQ.INV.RT, CHIINV and
-GAMMA.INV not judged, nor BETA.INV with both shapes below 0.5; cumulative HYPGEOM.DIST only with a
-support starting at 0; fractional integer arguments replaced; GAMMA of a negative number
-avoided; a different error code
-accepted; the wrong domain ends avoided; T.INV judged to 1e-7 within [1e-3, 100];
-cumulative GAMMA.DIST only within 1.2 α and for α < 20;
-BESSELJ within |x| ≤ 20 and BESSELY within x ≤ 5; GAMMALN below 170; counts and gamma arguments above 170 avoided. For the dates: serials below 61 and the
+a documented #NUM!; a different error code accepted; fractional integer arguments replaced.
+For the dates: serials below 61 and the
 January and February 1900 results of DATE avoided for the functions that read the calendar, and
 WEEKNUM's whole 1900 except type 21; DAY of a multiple of 31 or a fraction below 61 avoided;
 serials and results beyond 2958465 and DATE years outside 1900..9999 avoided; EDATE offsets 0..11 that reach a December and multiples of twelve landing on
@@ -357,3 +402,5 @@ the efp parser's).
   drawing every Math shape, twenty narrow properties), 5 bugs (79–83).
 - 2026-10-09: part 2a of the rewrite (`TestHegelStat` drawing every Stat shape, fourteen
   narrow properties); the notes of 21, 22, 26 and 29 widened by the drawn shapes.
+- 2026-10-09: part 2b of the rewrite (`TestHegelDist` drawing every Dist shape, sixteen
+  narrow properties), 2 bugs (84, 85).
