@@ -109,10 +109,19 @@ values for the information functions and the result branches.
   15, 17, 18, 19, 21, 23, 29, 31, 33, 34, 79, 80, 81, 82), each drawing random contents of
   its bug's shape, judged by the same judge, and the neighbouring region past it; each fails
   every run naming its bug and passes under `HEGEL_NO_KNOWN=1`.
-- `TestHegelStat`: 80 functions over ranges (descriptive statistics, percentiles, quartiles,
+- `TestHegelStat`: 76 functions over ranges (descriptive statistics, percentiles, quartiles,
   ranks, sums of products, regressions, correlations, tests and confidence intervals, and the
   `A` forms and legacy names) agree with the oracle to 1e-9, or return the documented error;
-  SUBTOTAL and AGGREGATE agree with the function they number.
+  SUBTOTAL and AGGREGATE agree with the function they number. A case is a record of the
+  function, its arguments (ranges drawn as counted series of one profile, the second range a
+  function of the first) and the SUBTOTAL/AGGREGATE numbers it also checks, with the shape of
+  every recorded Stat bug drawn by default (see "Drawn shapes" below) and named by the
+  classifier before the library is called; it fails every run (basin HARMEAN of a range, the
+  first entry of its table, excelize/3).
+- `TestHegelStat…`: fourteen narrow properties, one per Stat bug (excelize/1, 3, 4, 5, 10, 12,
+  15, 17, 20, 21, 22, 24, 26, 83), each drawing random contents of its bug's shape, judged by
+  the same judge, and the neighbouring region past it; each fails every run naming its bug and
+  passes under `HEGEL_NO_KNOWN=1`.
 - `TestHegelDist`: 70 distribution functions (densities, cumulatives, inverses, legacy
   names, GAMMA, GAMMALN, PHI, GAUSS, the error and Bessel functions) agree with SciPy to
   1e-8 (1e-6 for the Bessel functions), or return the documented error.
@@ -164,16 +173,15 @@ int64 and overflows, TRUNC(123456.789,15) = -9223.37203685478 (81); DECIMAL stri
 in every radix, DECIMAL("0x1F",16) = 31 where X is no hexadecimal digit and DECIMAL("0x1F",36)
 = 51 where the text is the base-36 number 42819 (82). Found by the Stat property at a thousand
 cases: GEOMEAN is PRODUCT^(1/COUNT) and overflows to +INF for a long range of large values,
-GEOMEAN(1E+200,1E+200) = +INF, or underflows to #NUM! (83); the property reaches it at its
-natural rate (about one case in a thousand) and is mapped to it as intermittent until part 2
-draws the shape.
+GEOMEAN(1E+200,1E+200) = +INF, or underflows to #NUM! (83); the property reached it at its
+natural rate (about one case in a thousand) until part 2a drew the shape.
 
 Dates and times (35–47): EDATE panics with an index out of range for a December after the 28th
 reached through a multiple of twelve months (40) and lands a year early whenever the month sum
 is 12 to 23, EDATE(DATE(2020,12,15),0) is 15 December 2019 (39); the serials 0 to 60 are placed
 on the real calendar a day before Excel's (MONTH(1) = 12), DATE is a day late in January and
 February 1900 unless the year is literally 1900, and WEEKNUM counts 1900 from a Monday 1 January
-where Excel's is a Sunday (38); DAY of the first sixty serials is serial mod 31 with the fraction
+where Excel's is a Sunday, and DATEVALUE of the phantom 29 February 1900 is #VALUE! (38); DAY of the first sixty serials is serial mod 31 with the fraction
 (DAY(31) = 0, DAY(2.5) = 2.5) (35); DATE does not add 1900 to a year below 1900 and accepts a
 negative one (37); WEEKNUM's return type 21 is not the ISO week where the ISO year differs (44);
 YEARFRAC does not swap a start after the end (42) and skips the 31st-to-30th rule after a
@@ -206,7 +214,7 @@ value_if_false is omitted (70); ISTEXT("1") is FALSE, N("1") is 1, ISLOGICAL("TR
 ISNUMBER(TRUE) are TRUE (75); SWITCH compares texts (76); the logical text coercions differ from
 function to function (73).
 
-## Drawn shapes (the Math functions, part 1 of the rewrite)
+## Drawn shapes (the Math and Stat functions, parts 1 and 2a of the rewrite)
 
 `TestHegelMath` follows the zoo's standard: nothing steers off a recorded bug by default. The
 argument kinds are package-level generators of weighted alternatives, the simplest first, and
@@ -236,21 +244,50 @@ their narrow properties reach them every case). Model facts that are not gates: 
 the binary sums to 1e-12 of the largest term, COMBINA with n < k, MROUND with multiple 0 and
 SECH/CSCH beyond 700 not judged by the oracle.
 
+`TestHegelStat` (part 2a) draws the same way: the ranges are counted series of one profile
+(integers, tenths, thousandths, thousands, or a pool of one to three values repeated, so that
+ties and constant ranges are common), the second range a function of the first (the same
+length, a noisy linear image of it, or another length), and every Stat bug's shape is an
+alternative at a solid weight — k outside [1/(n+1), n/(n+1)] or at n/(n+1) for PERCENTILE.EXC,
+QUARTILE.EXC and AGGREGATE 18/19, which panics (1), the range form of HARMEAN (3, every case:
+the literal form is the region past it) and of AVEDEV (4), a 0 planted in a pair for CORREL
+and the SUMX functions (5), a fractional size, quart or significance (15), FISHERINV at 355
+(17), FISHER at 1, a literal HARMEAN of a non-positive, a PERCENTILE k outside [0, 1],
+STANDARDIZE with a standard deviation of 0 or below, STEYX with constant known_x, T.TEST and
+COVARIANCE.S of ranges too short (21), a range whose exponents sum past 308 or below -308 for
+GEOMEAN (83) — or a relation decided by a replica of the library's arithmetic in Go, since
+the oracle cannot be asked at draw time: SKEW.P of a constant range whose one-pass variance
+comes out exactly 0 is -INF (10), the one-pass variance of a narrow range off the two-pass
+value by more than the tolerance (22, with STEYX's one-pass sums), a constant range whose
+mean is inexact in binary passing the zero-variance checks and a covariance of exactly 0 or
+constant known_y in the regressions (24), a PERCENTRANK result below 0.1 whose truncation to
+significance decimal places differs from significant digits (20, an exact rational rank
+model), a binary floor of an exact decimal rank (29). The precision of CONFIDENCE and
+CONFIDENCE.NORM (12, the inverse normal's 1e-9) is the shape of one check: the result is
+judged to 1e-10 and a mismatch within 1e-8 fails naming 12; CONFIDENCE.T is the same at
+1e-7 (26), its region alpha ≥ 0.99 drawn deliberately. The classifier `statShape` names the
+bug from the case and the oracle's verdict (3 before 21 for HARMEAN, the replica's verdict
+deciding 10 against 22 and 21 against 24). Under `HEGEL_NO_KNOWN=1` the alternatives have
+weight zero, the relations are filtered out, the precise checks are relaxed to 1e-8 and 1e-7,
+and the property passes (at three thousand cases: 0 mismatches, one SUBTOTAL of a shared
+narrow range skipped, at most 17 cases per function filtered). Per thousand cases by default,
+95 mismatch: 12 in 26, 3 in 13, 1 in 12, 5 and 21 in 10, 15 in 7, 4 in 6, 22 in 5, 24 in 4,
+20 in 2, 17, 26 and 83 in 1, 10 and 29 under one. Model facts that are not gates: the
+tolerances of `hzStatTol`; LARGE and SMALL with a fractional k, MODE with a tie, a PERCENTRANK
+rank within 1e-9 of a digit boundary not judged by the oracle.
+
 ## Modelled as recorded
 
-The other five properties still have an `HZKnown` switch per bug they reach (parts 2 to 4 of
-the rewrite follow). While a switch is on the generator keeps away from the shape or the check is relaxed: k
-outside the safe range not sent to PERCENTILE.EXC; HARMEAN and AVEDEV of a range not judged;
-pairs containing a 0 skipped for CORREL and the SUMX functions; an infinite result accepted for
+The other four properties (Dist, Date, Text, Logic) still have an `HZKnown` switch per bug
+they reach (parts 2b to 4 of the rewrite follow). While a switch is on the generator keeps
+away from the shape or the check is relaxed: an infinite result accepted for
 a documented #NUM!; results below
 1e-8 not judged; NORM.S.INV judged to 1e-8 and NORM.INV to 1e-6; CHISQ.INV.RT, CHIINV and
 GAMMA.INV not judged, nor BETA.INV with both shapes below 0.5; cumulative HYPGEOM.DIST only with a
-support starting at 0; fractional integer arguments replaced; GAMMA of a negative number and
-FISHERINV beyond 355 avoided; PERCENTRANK results below 0.1 not judged; a different error code
-accepted; ill-conditioned ranges (|mean| > 1000·sd) skipped for the one-pass variances; constant
-ranges skipped for the regressions, SKEW, KURT, Z.TEST and T.TEST, and a zero covariance for the
-regressions; the wrong domain ends avoided; T.INV judged to 1e-7 within [1e-3, 100] and
-CONFIDENCE.T to 1e-7 for alpha below 0.99; cumulative GAMMA.DIST only within 1.2 α and for α < 20;
+support starting at 0; fractional integer arguments replaced; GAMMA of a negative number
+avoided; a different error code
+accepted; the wrong domain ends avoided; T.INV judged to 1e-7 within [1e-3, 100];
+cumulative GAMMA.DIST only within 1.2 α and for α < 20;
 BESSELJ within |x| ≤ 20 and BESSELY within x ≤ 5; GAMMALN below 170; counts and gamma arguments above 170 avoided. For the dates: serials below 61 and the
 January and February 1900 results of DATE avoided for the functions that read the calendar, and
 WEEKNUM's whole 1900 except type 21; DAY of a multiple of 31 or a fraction below 61 avoided;
@@ -318,3 +355,5 @@ the efp parser's).
   `TestHegelLogic`), 31 bugs (48–78).
 - 2026-10-09: part 1 of the rewrite in combinator style (the harness idioms, `TestHegelMath`
   drawing every Math shape, twenty narrow properties), 5 bugs (79–83).
+- 2026-10-09: part 2a of the rewrite (`TestHegelStat` drawing every Stat shape, fourteen
+  narrow properties); the notes of 21, 22, 26 and 29 widened by the drawn shapes.
