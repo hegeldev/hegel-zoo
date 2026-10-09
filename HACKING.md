@@ -95,3 +95,8 @@ says the generators avoid shapes (the older practice; a worklist). `--test-cases
   makes `hegel/` a dune project of its own that builds symlinks to the upstream sources, run
   with `--root hegel` (`targets/ocaml/ipaddr`, `targets/ocaml/zarith`); a library with C and
   OCaml backends builds one executable per backend (`targets/ocaml/digestif`).
+  Jane Street's libraries build only with OxCaml: their targets follow upstream's `oxcaml` branch
+  (`[base] branch`, which `drift` and `bump` read; master builds only against unpublished
+  masters of the other Jane Street libraries) and set `[run] opam_switch = "oxcaml"`, the switch
+  setup and the command run in (`ZOO_OPAM_SWITCH` overrides it; CI runs them in a job of their
+  own on setup-ocaml's OxCaml switch). See `targets/ocaml/base`.
