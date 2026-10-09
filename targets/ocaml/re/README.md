@@ -1,7 +1,8 @@
 # re
 
 `Re.Perl` patterns against Python's `re` on bytes: search, `all`, `replace_string`,
-`split_delim`, and `Re.Pcre.quote`.
+`split_delim`, and `Re.Pcre.quote`. Needs Python 3.14+, where `\B` matches the empty string as
+in Perl.
 
 ## What is tested
 
