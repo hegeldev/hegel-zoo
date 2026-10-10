@@ -14,7 +14,7 @@ command that the generated shell scripts call) over the same trees.
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of nine
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of ten
 `hegel_zoo_*_test.go` files that drive the public API (a `cobra.Command` tree built from a
 spec, `ExecuteC` with `SilenceErrors`/`SilenceUsage`, the output writers on buffers, the help
 and usage functions replaced by recorders, the default completion command disabled):
@@ -24,9 +24,10 @@ and usage functions replaced by recorders, the default completion command disabl
 token records), `hegel_zoo_props_test.go` (the execution cases, the corner shapes, the
 classifier and `TestHegelExecute`), `hegel_zoo_execute_shapes_test.go` (the ten narrow
 properties of the dispatcher's bugs), `hegel_zoo_exec_test.go` (the spec records, the real
-tree and the model of the dispatcher; the old generators the completion property still runs),
-`hegel_zoo_complete_test.go` (the completion half of the model and `TestHegelComplete`) and
-`hegel_zoo_pins_test.go`.
+tree and the model of the dispatcher), `hegel_zoo_complete_test.go` (the completion extras
+and the requests as records, the completion half of the model, the classifier and
+`TestHegelComplete`), `hegel_zoo_complete_shapes_test.go` (the five narrow properties of the
+completion bugs) and `hegel_zoo_pins_test.go`.
 `go test -count=1 -run TestHegel -v ./hegel`
 
 ## Oracles
@@ -104,9 +105,17 @@ tree and the model of the dispatcher; the old generators the completion property
   over a walk towards one command with flags and positionals (or a truncated argument list
   of the first property) and a word to complete from the corners (empty, `-`, `--`, a flag
   name or its prefix, `--name=`, `-s=v`, a subcommand or valid-argument prefix, an odd
-  token); the printed lines and the directive against the model. Still through the old
-  generators and the model following the recorded bugs (the second part of the rewrite
-  takes it over).
+  token); the printed lines and the directive against the model. The cases are records
+  (`completeCase`: the tree, the request's arguments, `__completeNoDesc` or not): the tree
+  the first property's with the completion extras drawn as a transform
+  (`completionTreesWith`), the request a list of token records - the prefix a well-formed
+  walk to the drawn command (55 %) or the argument list of an execution case cut short
+  (45 %: the plain walk or one of the dispatcher's corner shapes, so the dispatcher's bugs
+  reach the completion requests too), then a last flag wanting a value (25 %), then the word
+  from the fourteen-way table. It fails on cobra/11 and the dispatcher's bugs at their
+  natural rates (38 of forty runs at a hundred cases; the shrunk case cobra/11's in
+  fifteen, 2's in six, 1's and 8's in five each, 9's in three, 5's and 15's in two) and is
+  mapped intermittent to cobra/11.
 - Ten narrow properties, one per dispatcher bug, each a generator over the bug's shape
   region with random contents (a drawn tree with the options forced, the shape's tokens with
   drawn flags, values, names and surroundings), judged exactly like `TestHegelExecute` and
@@ -117,6 +126,11 @@ tree and the model of the dispatcher; the old generators the completion property
   `…HelpFlagsTakeNoValue` (8), `…PrefixesAreCaseInsensitive` (9),
   `…SuggestionsAreUnique` (10). Under `HEGEL_NO_KNOWN=1` each draws the region next to its
   shape instead and passes.
+- Five narrow properties, one per completion bug, the same way (a drawn tree with the
+  options and extras forced, the request's tokens with drawn flags, values and words),
+  judged like `TestHegelComplete`: `TestHegelCompleteFunctionsSeeFlagsOnce` (cobra/11),
+  `…CombinedShortValuesKeepTheirLetters` (12), `…SubcommandPrefixesAreCaseInsensitive`
+  (13), `…TraversePersistentFlagsBeforeNames` (14), `…NoDescHidesDescriptions` (15).
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
 
@@ -171,9 +185,14 @@ version flags on a parent under `TraverseChildren` (cobra/6) is that the parent'
 shown, or its version printed; the version flag's instance (`root --version x sub` is
 `unknown flag: --version`) is recorded in cobra/6's note.
 
-The five completion bugs (cobra/11 to 15) are still followed by the model in
-`TestHegelComplete` (`hzKnownAll` there) until the second part of the rewrite; no completion
-switch changes an `Execute` result.
+`TestHegelComplete` draws the shapes of cobra/11 to 15 at the natural rates of its request
+table (over three thousand cases 11 in 55: a count, slice or array flag set before a word an
+echo function completes; 14 and 15 under one in a thousand, 12 and 13 never - a case
+variant of a name prefix is not in the table) and the dispatcher's shapes through its cut
+execution prefixes (9 in 30, 8 in 22, 1 in 21, 2 in 18); `completeShape` names them the
+same way over all fifteen switches, the dispatcher's bugs first in the order (every one of
+the 146 by sufficiency, no hole); under `HEGEL_NO_KNOWN=1` the execution cases bring no
+shape and the rest is filtered (4.7 %). No completion switch changes an `Execute` result.
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -200,6 +219,14 @@ Design notes the model follows (undocumented, taken from the code):
   prefix of a bool flag completes nothing; the required flags are listed before the nouns
   and left out of the flag-name list when set; the `help` command's topic is found from the
   root over the remaining arguments; the root's persistent hooks run for `__complete`.
+- Completion and the recorded bugs, as the narrow properties found them: a count flag set
+  with `--count=3` is set, not accumulated, so only the bare form, slices and arrays reach
+  cobra/11; when a flag's value is being completed the required-flag listing and the group
+  enforcement are skipped, so only the flag's own completion function sees the letters
+  cobra/12 drops (a file annotation on the flag answers before it); subcommand-name
+  completion offers names only, never aliases (so cobra/13 has no alias instance); only a
+  persistent flag taking no value, in its bare form, reaches cobra/14 - a flag taking a value
+  takes the next argument on both sides and a `--flag=value` token is skipped alone.
 
 ## Not tested
 
@@ -216,3 +243,7 @@ completion, help and usage text, `DisableFlagParsing`, `FParseErrWhitelist`,
   style, the model stating the documented behaviour with the switches a value,
   `TestHegelExecute` drawing cobra/1 to 10 and mapped to its plurality basin, ten narrow
   properties; cobra/6's note widened to the version flag.
+- 2026-10-10: rewrite, part 2 of two: the completion extras and requests as records,
+  `TestHegelComplete` drawing cobra/11 to 15 and the dispatcher's shapes, mapped intermittent
+  to cobra/11, five narrow properties; the old generators removed; the notes of cobra/13 and
+  14 corrected.
