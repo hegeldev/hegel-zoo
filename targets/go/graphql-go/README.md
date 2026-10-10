@@ -10,7 +10,7 @@ spreads, `@skip`/`@include`, a second operation selected by name) against genera
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of eleven
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of thirteen
 `hegel_zoo_*_test.go` files that drive the public API. `go test -count=1 -run TestHegel -v ./hegel`
 needs `python3` with the `graphql-core` package (3.2+) on the PATH.
 
@@ -31,7 +31,12 @@ are compared as well.
   2-3 objects, an optional union; root data with values of the right kind (a few of the wrong
   kind, nulls in non-null positions, non-lists for lists, wrong `__typename`s); an operation of
   up to 25 field selections with the features above. Classes counted: ok, errors agree, both
-  reject (request errors), both reject with agreeing paths.
+  reject (request errors), both reject with agreeing paths. Expected failure: the operations
+  carry the shapes of graphql-go/1 to 8 at their natural rates (a null literal and a non-null
+  variable with a default each in one case of four, a twin selection with a variable-driven
+  `@skip` on the first copy in one of fifteen), and the shrunk one is the twin
+  selection (7): `query($v1: Boolean!) { __typename @skip(if: $v1) __typename }`, the fewest
+  draws (a null literal needs a field with an argument).
 - `TestHegelIntrospection`: graphql-core's introspection query (without the newer fields) on the
   same type system; the results must agree after normalisation (introspection types and
   directives left out, lists sorted by name, built-in scalar descriptions and an interface's own
@@ -50,11 +55,16 @@ are compared as well.
   table's thirty-six, and reach the bug only when no other mutation beside them makes both
   sides reject (29 of forty runs at a hundred cases fail; 18 more often than 17 under the
   engine's draw).
-- Four narrow properties, one per introspection and validation bug, each a generator over the
-  bug's shape with random contents and the wide property's judge, failing every run:
+- Twelve narrow properties, one per introspection, validation and execution bug, each a
+  generator over the bug's shape with random contents and the wide property's judge, failing
+  every run:
   `TestHegelIntrospectionDefaultsAreLiterals` (15), `TestHegelIntrospectionMissingDescriptionsAreNull`
   (16), `TestHegelValidateDirectivesAreUniquePerLocation` (17), `TestHegelValidateDefinitionsAreExecutable`
-  (18).
+  (18), `TestHegelExecuteNullLiteralsParse` (1), `TestHegelExecuteDefaultedNonNullArgumentsAreOptional`
+  (2), `TestHegelExecuteNonNullVariablesTakeDefaults` (3), `TestHegelExecuteNullVariablesStayNull`
+  (4), `TestHegelExecuteVariablesOfTheWrongKindAreRejected` (5), `TestHegelExecuteIntLiteralsAre32Bit`
+  (6), `TestHegelExecuteSkippedSelectionsMergeWithTheirTwins` (7), `TestHegelExecuteInlineFragmentsNeedNoCondition`
+  (8).
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
 
 ## Bugs
@@ -77,7 +87,7 @@ accepted (18); a field conflict reached only through a fragment spread inside a 
 validation and executes (19: the rule's recursion compares the nested fragments with the
 enclosing fragment instead of the selection set).
 
-## Drawn shapes (the introspection and validation properties; the execution property follows)
+## Drawn shapes (the introspection, validation and execution properties; the root data follows)
 
 The properties draw the shapes of the recorded bugs by default and name them before the library
 is called (DESIGN.md decision 3, STYLE.md rule 11); `HEGEL_NO_KNOWN=1` switches the shapes off
@@ -102,15 +112,44 @@ reject it as misplaced) (17); a valid generated document plus a drawn type, inte
 enum, input, scalar, schema, directive or `extend type` definition before or after the
 operation (`extend` of the other kinds is a syntax error to graphql-go, so both reject) (18).
 
-`TestHegelExecute` still keeps its generators away from the fourteen execution bugs behind
-`HZKnown` switches (no null literals, non-null arguments with defaults always provided, no
-defaults on non-null variables, no null variable values, only wrong-kind variable values both
-sides reject, no out-of-range Int literals, variable-driven directive conditions only on
-freshly aliased fields, no condition-less inline fragments under wrapped fields, no wrong-kind
-leaf values of the recorded kinds; with `rootPropagationDropsErrors`, graphql-go's error paths
-need only be among graphql-core's when both data are null); the collector counts the
-avoidances, and `ZOO_KNOWN_OFF=name` turns a switch off. Part 2 of the rewrite replaces that
-with drawn shapes and fourteen narrow properties.
+The operation is a drawn tree of records (selections, variable and fragment definitions)
+rendered to text by pure functions, with the shapes of graphql-go/1 to 8 as weights of its
+choices (`operationShapes`; zero under NO_KNOWN, and zero for the validation properties, whose
+base document must be valid on both sides): a null literal at a nullable literal position at
+15 % (1); a non-null argument or input field with a default left out at the nullable ones'
+rate (2); a default on a non-null variable at 30 % (3); a null runtime value where a default
+of the variable's or the argument's or an input field's applies and an echo field shows the
+substitution, at 15 % (4); a runtime value of a kind graphql-go coerces instead of rejecting
+(an Int from "3", 1.5 or true; a Float from "1.5" or true; a String or an ID from a number, a
+boolean or a list; a Boolean from a string, a number or a list) at 4 beside 92 strict and 8
+both sides reject, where wrong kinds are drawn (5); an Int literal outside 32 bits the same
+way (6); a selection twice with a variable-driven `@skip`/`@include` on the first copy and
+none on the second, the variable excluding it three times in four, at 5 % of the selections
+(7; a variable condition then also goes on any selection, where under NO_KNOWN it goes only on
+a freshly aliased field, which nothing merges with); the type condition left off an inline
+fragment directly under a list or non-null field at 20 % (8). `executeShape` names the bug
+from the operation record and graphql-core's reply before graphql-go is called: where
+graphql-core rejects the request, 5 then 6 unless something makes graphql-go reject too; where
+it executes, 1, 2, 3, 8 in that order; else a replica of graphql-go's query plan (`plan.go
+collectInto`: the first selection with a response key keeps its predicates, later ones merge
+into it and lose theirs) is walked beside graphql-core's collection over graphql-core's data
+for a key one side includes and the other drops (7), then for an echo field showing a
+substituted default (4). 5 and 6 are named in few cases of the wide property (an operation
+with a wrong-kind draw nearly always carries a null literal or a left-out default too, which
+makes graphql-go reject for its own reasons); their narrow properties reach them every case.
+The narrow execution properties add one field to Query for the shape (`zn(n: T)`, `zd(n: T! =
+v, in: InD)`, `zv`, `echoZ`, `zk`, `zi`, `zt`, `zw: Query!`), draw the shape at the root of an
+otherwise clean operation (no shape, no value both sides reject) and are judged by
+`judgeExecute` like the wide property.
+
+The root data is still the old generator wrapped (`dataFor`), and `TestHegelExecute` keeps
+the six serialization bugs behind `HZKnown` switches (no wrong-kind leaf values of the
+recorded kinds; with `rootPropagationDropsErrors`, graphql-go's error paths need only be among
+graphql-core's when both data are null); the collector counts the avoidances, and
+`ZOO_KNOWN_OFF=name` turns a switch off. A field conflict graphql-core reports on an
+unmutated document and graphql-go accepts (19) is skipped and counted by both the validation
+and the execution judge until part 2b draws that shape on purpose. Part 2b of the rewrite
+replaces all of that with drawn shapes and seven narrow properties.
 
 Design notes:
 
@@ -124,6 +163,8 @@ Design notes:
   generated input objects give none there.
 - The mutations are inserted at the first brace outside the variable definitions (a variable's
   default may be an input object literal with braces of its own).
+- A variable's default value is drawn like an argument literal (strict at 90 %), where the old
+  generator drew it strict always, so that the shape of graphql-go/6 reaches variable defaults.
 
 ## Not tested
 
@@ -140,3 +181,5 @@ locations, the printer.
 - 2026-10-09: rewrite part 1 of two: the type system as a combinator generator, the
   introspection and validation properties drawing the recorded shapes, four narrow properties;
   graphql-go/19 found on an unmutated document.
+- 2026-10-10: rewrite part 2a: the operation as a drawn tree, the execution property drawing
+  the shapes of the operation bugs 1 to 8, eight narrow properties.
