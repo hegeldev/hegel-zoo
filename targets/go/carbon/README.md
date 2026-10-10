@@ -26,13 +26,17 @@ family, a model `expected(c, k)` of every checked value that follows the
 recorded bugs in `k` as replicas of the library's code, the classifier that
 names a case's shape from the model alone, the judge), `hegel_core_shapes_test.go`
 (eleven narrow properties, one per bug the core properties can reach),
-`hegel_gen_test.go` (the older generators and the models the formatting and
-calendar properties still use), `hegel_props_test.go` (the three formatting
-and parsing properties on the older generators), `hegel_calendar_test.go`
-(four properties on the calendars with reference algorithms) and
-`hegel_pins_test.go` (thirty pins). No external tool is needed; the run
-takes about ten seconds at the default case count (the shrinking of the
-properties that reach a bug) and four under `HEGEL_NO_KNOWN=1`.
+`hegel_format_test.go` (the three formatting and parsing properties: the
+format records with a pure renderer, the forty-nine output entries, the
+locales read from the library's `lang/*.json`, the models with the replicas
+of the literal-marker, timestamp-layout, literal-copying, receiver-moving
+and English-`l` rules), `hegel_format_shapes_test.go` (six narrow
+properties), `hegel_gen_test.go` (the older generators and the models the
+calendar properties still use), `hegel_calendar_test.go` (four properties
+on the calendars with reference algorithms) and `hegel_pins_test.go`
+(thirty pins). No external tool is needed; the run takes about ten seconds
+at the default case count (the shrinking of the properties that reach a
+bug) and a few under `HEGEL_NO_KNOWN=1`.
 
 ## Oracles
 
@@ -88,9 +92,9 @@ properties that reach a bug) and four under `HEGEL_NO_KNOWN=1`.
 | `TestHegelSeasonAndConstellationAgreeWithTables` | `Season`, `Is<Season>`, `Constellation`, `Is<Sign>` against the tables | carbon/5 on November 22 |
 | `TestHegelCreatorsAgreeWithTime` | `CreateFromDate/Time/DateTime/Timestamp*/StdTime`, `Parse` of RFC 3339 and the default layouts | — |
 | `TestHegelWrapperTypesRoundTrip` | `DateTime`, `Date`, `Time…`, `Timestamp…` wrapper types through `encoding/json` and `database/sql` scanning | — |
-| `TestHegelFormatAgreesWithModel` | `Format` against the letter model and `Layout` against the Go twin, in every zone and week start | (part 2) |
-| `TestHegelFormatParsesBack` | `ParseByFormat(Format(f), f)` and `ParseByLayout(Layout(l), l)` recover the instant to the format's precision | (part 2) |
-| `TestHegelOutputStringsParseBack` | 45 `To…String` outputs match their documented layout and `Parse`/`ParseByLayout` read them back | (part 2) |
+| `TestHegelFormatAgreesWithModel` | `Format` against the letter model (the names from the drawn locale) and `Layout` against the Go twin, in every zone, week start and locale | carbon/1 on `D` with a non-Monday week start, carbon/25 on `l` under a locale |
+| `TestHegelFormatParsesBack` | `ParseByFormat(Format(f), f)` and `ParseByLayout(Layout(l), l)` recover the instant to the format's precision; the format's literals drawn from a pool that includes Go-token spellings | carbon/10 on a timestamp letter, carbon/13 on a colliding literal |
+| `TestHegelOutputStringsParseBack` | 45 `To…String` outputs and the four timestamp layouts match their documented text, `Parse`/`ParseByLayout` read them back, a drawn timezone argument leaves the receiver | carbon/8 on a Zulu/Http output outside UTC, carbon/10 on a timestamp layout, carbon/14 on a timezone argument |
 | `TestHegelHebrewCalendarAgreesWithReingoldDershowitz` | `Hebrew()`/`CreateFromHebrew` and the `hebrew` package against the reference algorithm, both ways | (part 3) |
 | `TestHegelPersianCalendarAgreesWithBirashk` | `Persian()`/`CreateFromPersian` against Birashk and the official Nowruz dates, both ways | (part 3) |
 | `TestHegelJulianDayAgreesWithTheInstant` | `Julian().JD()/MJD()` and `CreateFromJulian` against `unix/86400 + 2440587.5` | (part 3) |
@@ -106,6 +110,12 @@ properties that reach a bug) and four under `HEGEL_NO_KNOWN=1`.
 | `TestHegelZeroCarbonIsUsable` | twenty-two methods on the zero `Carbon{}` against the Carbon created from the zero time | carbon/11 |
 | `TestHegelZeroTimeIsNotBetweenAnEmptyRange` | `BetweenIncluded*` on a zero receiver with an equal, inverted or invalid bound | carbon/28 |
 | `TestHegelDiffInMonthsNeverPassesTheEnd` | `DiffInMonths` from the 29th–31st to an end its one correction does not reach | carbon/30 |
+| `TestHegelZuluOutputsAreUtc` | the six GMT/Z outputs on a moment outside UTC, printed and read back | carbon/8 |
+| `TestHegelTimestampLayoutsReadBack` | the `unix…` layouts and the `S`/`U`/`V`/`X` letters through both parsers | carbon/10 |
+| `TestHegelFormatLiteralsAreLiteralWhenParsing` | a round-trip format with a literal that spells a Go layout token | carbon/13 |
+| `TestHegelOutputWithTimezoneLeavesTheReceiver` | an output call with a timezone argument, good or bad | carbon/14 |
+| `TestHegelFormatWeekdayNameIsLocalised` | `Format("l")` under a non-English locale | carbon/25 |
+| `TestHegelDiffForHumansReadsTheNowResource` | `DiffForHumans` with a `now` resource of several `\|`-separated forms | carbon/12 |
 
 The fourteen core properties draw the shapes of the recorded bugs at their
 natural rates — a sub-second part in two moments of three, a bad duration
@@ -114,10 +124,13 @@ quarter of the year/month pairs, November 22 one day in 365, the zero time
 as the engine's first case — and are the expected failures mapped to the
 bug they shrink to most often over forty rounds (`target.toml`: the
 getters, duration, small-unit, string, extrema and comparison properties
-plain, the clock addition, year/month and season ones intermittent; `HEGEL_NO_KNOWN=1` switches
+plain, the clock addition, year/month and season ones intermittent; the
+formatting properties plain to carbon/1, 10 and 14, the last the plurality
+over carbon/8 by twenty-one rounds to nineteen; `HEGEL_NO_KNOWN=1` switches
 the shapes off, and under it every property passes and only the pins fail).
 Five of them (the calendar travellers, boundaries, setters, creators and
-wrappers) reach no recorded bug and pass. The eleven narrow
+wrappers) reach no recorded bug and pass; the three formatting properties
+draw their shapes too. The eleven narrow
 properties draw one bug's shape each, with random contents, and fail every
 run; under `HEGEL_NO_KNOWN=1` they draw the region next to the shape and
 pass. Thirty pins record the bugs in `bugs.toml` — wrong weekday names for
@@ -155,10 +168,34 @@ Two documented edges are modelled, not gated: a `Date`-layout wrapper of
 in the default zone as the zero instant and marshals `null` the second
 time (`MarshalJSON` writes `null` for a zero value; `UnmarshalJSON` parses
 in the default zone); and `TimestampNano` is checked within 1700–2200 only.
-Under `HEGEL_NO_KNOWN=1` the shapes are generator shape: whole seconds,
+The formatting properties draw a locale (`en` seven times in ten, one of
+the other thirty-three otherwise), a timezone argument for an output (none
+seven in ten, a good zone two, a bad name one), the timestamp layouts and
+letters one time in twenty, and format literals from a pool whose half
+spells a Go layout token; their models follow the library under the
+switches as replicas (`D` from the Sunday-first names indexed by the day of
+the week counted from the week start; `l` the English name; a timestamp
+layout an error from the parsers; `ParseByFormat` parsing with the layout
+`format2layout` builds, literals copied; the marked outputs printing the
+local wall clock and the Zulu layouts read in the given zone; the receiver
+moved by the timezone argument) and the classifier names every shaped case
+by sufficiency with the replica agreeing on all of them. Four more notes
+were widened or corrected standalone: `ToRfc7231String` is wrong in UTC
+too (prints `UTC`) while the GMT and Z outputs are right at a zero offset,
+and the Zulu layouts have a parse face (`ParseByLayout` reads a Zulu text's
+wall clock in the given zone) (carbon/8); `DiffInString` and
+`DiffAbsInString` panic like `DiffForHumans` (carbon/12); a colliding
+literal wins only after the fields (carbon/13). The Go `time` limits are
+not gates and are drawn past: a two-digit year outside 1969–2068, a
+non-alphabetic abbreviation under a `Z`/`T` letter, a sub-minute LMT offset
+under any zone letter, and the outputs that are not default `Parse` layouts
+are counted by name and their read-back not asked. Under
+`HEGEL_NO_KNOWN=1` the shapes are generator shape: whole seconds,
 one zone and one offset per pair, no overflowing amount, no bad string, no
 zero time, no November 22, and the exact carbon/30 region filtered by the
-classifier (one case in 270).
+classifier (one case in 270); `D` and `l` only escaped or under Monday and
+`en`, no timestamp layout, literals from the harmless half of the pool, no
+timezone argument, no marked output outside a zero offset.
 
 ## History
 
@@ -166,6 +203,7 @@ classifier (one case in 270).
 - 2026-10-10: rewrite, part 1 of three — the fourteen core properties on
   records drawn from package-level generators at the nominal rates, the
   `known` value with replicas of the library's rules, the classifier, nine
-  shapes drawn and eleven narrow properties; the formatting (part 2) and
-  calendar (part 3) properties still on the older generators with their
-  `Known` gates.
+  shapes drawn and eleven narrow properties; part 2 — the three formatting
+  and parsing properties on format and output records, five more shapes
+  drawn and six narrow properties; the calendar properties (part 3) still
+  on the older generators with their `Known` gates.
