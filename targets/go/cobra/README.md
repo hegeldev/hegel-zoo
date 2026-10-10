@@ -14,10 +14,19 @@ command that the generated shell scripts call) over the same trees.
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of four
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of nine
 `hegel_zoo_*_test.go` files that drive the public API (a `cobra.Command` tree built from a
 spec, `ExecuteC` with `SilenceErrors`/`SilenceUsage`, the output writers on buffers, the help
-and usage functions replaced by recorders, the default completion command disabled).
+and usage functions replaced by recorders, the default completion command disabled):
+`hegel_zoo_idioms_test.go` (the generator idioms shared with the other Go targets),
+`hegel_zoo_test.go` (the harness, the `known` switches, the collector and the judge),
+`hegel_zoo_trees_test.go` (the command trees), `hegel_zoo_argv_test.go` (the argument lists as
+token records), `hegel_zoo_props_test.go` (the execution cases, the corner shapes, the
+classifier and `TestHegelExecute`), `hegel_zoo_execute_shapes_test.go` (the ten narrow
+properties of the dispatcher's bugs), `hegel_zoo_exec_test.go` (the spec records, the real
+tree and the model of the dispatcher; the old generators the completion property still runs),
+`hegel_zoo_complete_test.go` (the completion half of the model and `TestHegelComplete`) and
+`hegel_zoo_pins_test.go`.
 `go test -count=1 -run TestHegel -v ./hegel`
 
 ## Oracles
@@ -78,7 +87,16 @@ and usage functions replaced by recorders, the default completion command disabl
   dedicated shapes for the corners (a combined short token with a value before a command
   name, `--` before a command name, a valid argument then a typo, an empty argument, a help
   flag before a command name, the `help` command, a case variant of a prefix, a `SuggestFor`
-  word); against the model.
+  word); against the model. The cases are records (`executeCase`: the tree and the argument
+  list) drawn from package-level generators: the tree one `hegel.Composite` over a small live
+  state (the names used so far, the anchor of a corner shape) with `treesWith(treeShapes)`
+  forcing the options a shape needs; the argument list a list of token records (a flag
+  occurrence with its form and value, a combined token, an odd token, a command name in a
+  variant, a positional) rendered to strings by pure functions, the plain walk at 65 % and
+  the corner shapes at 35 % together. The corner shapes reach the recorded bugs cobra/1 to
+  10 and the property fails nearly every run (see "Drawn shapes"): 39 of forty runs at a
+  hundred cases (a second forty, 40 of 40), the shrunk case cobra/1's in ten of them, 9's in
+  nine, 3's in seven, 2's and 8's in five each; it is mapped intermittent to cobra/1.
 - `TestHegelComplete`: the same trees with `ValidArgsFunction`s (an echo of the arguments,
   the word to complete and the changed flags, or fixed choices with a fixed directive),
   `ArgAliases`, `DefaultShellCompDirective`, hidden flags, flag completion functions,
@@ -86,7 +104,19 @@ and usage functions replaced by recorders, the default completion command disabl
   over a walk towards one command with flags and positionals (or a truncated argument list
   of the first property) and a word to complete from the corners (empty, `-`, `--`, a flag
   name or its prefix, `--name=`, `-s=v`, a subcommand or valid-argument prefix, an odd
-  token); the printed lines and the directive against the model.
+  token); the printed lines and the directive against the model. Still through the old
+  generators and the model following the recorded bugs (the second part of the rewrite
+  takes it over).
+- Ten narrow properties, one per dispatcher bug, each a generator over the bug's shape
+  region with random contents (a drawn tree with the options forced, the shape's tokens with
+  drawn flags, values, names and surroundings), judged exactly like `TestHegelExecute` and
+  failing on the bug every run: `TestHegelExecuteCombinedShortValuesAreSkipped` (cobra/1),
+  `…DashDashEndsTheCommandNames` (2), `…TraverseRejectsUnknownCommands` (3),
+  `…InvalidArgumentsAreSuggested` (4), `…EmptyArgumentsNameNoCommand` (5),
+  `…HelpFlagsOnParentsShowHelp` (6), `…HelpCommandNeedsNoFlags` (7),
+  `…HelpFlagsTakeNoValue` (8), `…PrefixesAreCaseInsensitive` (9),
+  `…SuggestionsAreUnique` (10). Under `HEGEL_NO_KNOWN=1` each draws the region next to its
+  shape instead and passes.
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
 
@@ -113,15 +143,37 @@ completion at the subcommand, where `Execute` runs the sub-subcommand (cobra/14)
 `__completeNoDesc` prints the descriptions when an empty argument is prefix-matched
 (cobra/15).
 
-## Modelled as recorded
+## Drawn shapes
 
-All fifteen are in the model behind `HZKnown` switches (`combinedShortKeepsValue`,
-`traverseDashDashValue`, `traverseSkipsUnknownCheck`, `validArgsSuggestFirst`,
-`emptyPrefixDispatch`, `traverseHelpFlagError`, `helpCommandChecksFlags`,
-`helpFlagSwallowsNext`, `prefixCaseSensitive`, `duplicateSuggestions`,
-`completionParsesTwice`, `combinedFlagValueDropsLetters`, `completionCaseSensitive`,
-`traverseUnmergedFlags`, `prefixMatchResetsCalledAs`); `ZOO_KNOWN_OFF=name` turns a switch
-off and the property then fails.
+The model takes the set of recorded behaviours it follows as a value (`known`, fifteen
+switches in bug order, `hzKnownNone` by default: the model states the documented behaviour).
+`TestHegelExecute` draws the shapes of cobra/1 to 10 by default and fails on them: the plain
+walk reaches them at its natural rate (2.8 % of its cases, nearly all cobra/3: a positional
+naming no command at a root with `TraverseChildren` and no `Args`) and the eight corner
+shapes of the old generator, a fortieth of the cases each, reach them on purpose (a combined
+short token before a command name: 1; `--` before one: 2, with `TraverseChildren` seven times
+in ten; a valid argument then a typo at an `OnlyValidArgs` command: 4; an empty argument at a
+command with one subcommand under prefix matching and `TraverseChildren`: 5 (or 3 at a root
+with no `Args`); a help or version flag before a command name: 8 in Find mode, 6 or 8 under
+`TraverseChildren`; the `help` command under the root's required flags and groups: 7; a case
+variant of a prefix: 9; a typo or `SuggestFor` word: 10). The shape of a case is named before
+the library is called by `executeShape`, which runs the model, not the library: the case
+departs from the documented behaviour where the model with every switch on (the old oracle,
+which agreed with the library) differs from the model with none, and the bug is the first in
+order 1 to 10 whose switch alone reproduces the departure (sufficiency), else the first
+whose switch is necessary to it (`--help x sub` under `TraverseChildren` at a command with an
+`Args` validator is 6 this way: the parent's help is shown either way, only the error needs
+the switch); over three thousand cases 525 are named by sufficiency, 8 by necessity, none
+left over. The judge counts the shape, the failure names it, and under `HEGEL_NO_KNOWN=1`
+the corner shapes are not drawn and the plain walk is filtered by the classifier (2.8 %
+rejected), so the property passes. The model's documented behaviour for the help and
+version flags on a parent under `TraverseChildren` (cobra/6) is that the parent's help is
+shown, or its version printed; the version flag's instance (`root --version x sub` is
+`unknown flag: --version`) is recorded in cobra/6's note.
+
+The five completion bugs (cobra/11 to 15) are still followed by the model in
+`TestHegelComplete` (`hzKnownAll` there) until the second part of the rewrite; no completion
+switch changes an `Execute` result.
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -160,3 +212,7 @@ completion, help and usage text, `DisableFlagParsing`, `FParseErrWhitelist`,
 
 - 2026-09-22: new target, one property, 10 bugs.
 - 2026-09-22: shell completion (`TestHegelComplete`), 5 more bugs.
+- 2026-10-10: rewrite, part 1 of two: the tree and argument-list generators in combinator
+  style, the model stating the documented behaviour with the switches a value,
+  `TestHegelExecute` drawing cobra/1 to 10 and mapped to its plurality basin, ten narrow
+  properties; cobra/6's note widened to the version flag.
