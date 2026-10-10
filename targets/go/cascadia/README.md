@@ -9,18 +9,20 @@ extensions (`:contains`, `:containsOwn`, `:matches`, `:matchesOwn` on regular ex
 `:haschild`, `:input`, `[attr!=val]`, `[attr#=regexp]`), pseudo-elements, specificity and
 serialisation.
 
-The patch adds the `hegel.dev/go/hegel` requirement to `go.mod` and eleven test files (package
+The patch adds the `hegel.dev/go/hegel` requirement to `go.mod` and twelve test files (package
 `cascadia_test`): `hegel_test.go` (plumbing, the collector, the case judge and the `known`
 value of the fourteen recorded bugs' switches), `hegel_idioms_test.go` (the generator idioms
 shared with the other rewritten Go targets), `hegel_doc_test.go` (the `dnode` document record,
 the pools, serialisation and parsing), `hegel_docs_test.go` (the documents of the matching
 properties as records drawn from package-level generators), `hegel_sel_test.go` (the selector
-records, their canonical and variant spellings, the model matcher and the specificity model),
+records, the pure renderer of their canonical and variant spellings, the model matcher and the
+specificity model),
 `hegel_selectors_test.go` (the selectors of the matching properties as records), `hegel_oracle_test.go`
 (the soupsieve child process), `hegel_match_test.go` (the classifier, the shared judge and the
 two matching properties), `hegel_match_shapes_test.go` (the ten narrow matching properties),
-`hegel_props_test.go` (the four other properties, still over the old draw-helper generators
-until part 2 of the rewrite) and `hegel_pins_test.go` (fourteen pins). **Needs `python3` with
+`hegel_props_test.go` (the classifiers, judges and properties of serialisation, spelling,
+specificity and pseudo-elements, and the drawn `style` records), `hegel_syntax_shapes_test.go`
+(their four narrow properties) and `hegel_pins_test.go` (fourteen pins). **Needs `python3` with
 the `soupsieve` and `beautifulsoup4` packages on PATH**: soupsieve is the second implementation
 the standard selectors are compared with. The whole run takes about fifteen seconds; the
 library's own tests run in the same `go test`.
@@ -32,17 +34,19 @@ library's own tests run in the same `go test`.
 | `TestHegelSelectorsAgreeWithSoupsieve` | Standard selector lists (type, universal, id, class, every attribute operator with and without `i`, the pseudo-classes above, `:not`, `:has` with explicit combinators, all four combinators, escaped identifiers and strings) over generated documents (nested containers, form controls, links, options, comments, text, attributes chosen to exercise `:lang`, `:checked`, `:enabled`/`:disabled`) select the same nodes, in the same order, as soupsieve 2.9 over BeautifulSoup's parse of the same HTML and as the model; the model agrees with soupsieve. The cases carry the shapes of the matching bugs at the pools' natural rates (see below): mapped intermittent to its plurality basin. |
 | `TestHegelSelectorsAgreeWithTheModel` | The full grammar, extensions included, selects the nodes a model of Selectors Level 4 and the HTML pseudo-class definitions says, over every node of the document (so a non-element node in a result is named); `QueryAll`, `Query`, `Selector.MatchAll`, `MatchFirst`, `Filter` and `Match` agree with the model. Mapped intermittent to its plurality basin. |
 | `TestHegelSelectorsMatchOnlyElements` and nine more (`TestHegelOptionsInDisabledOptgroupsAreDisabled`, `TestHegelHasIsAnchoredAtTheSubject`, `TestHegelLinksAreNotEnabled`, `TestHegelBlankValuesMatchSubstrings`, `TestHegelLangIsCaseInsensitive`, `TestHegelLangUsesTheNearestAttribute`, `TestHegelEmptyKeepsNonBreakingSpace`, `TestHegelHTMLAttributeValuesAreCaseInsensitive`, `TestHegelNestedFieldsetsAreDisabled`) | One narrow property per matching bug: a drawn document with the bug's ingredient forced at one point (a cased `lang`, a `lang` under a `lang`, a text of Unicode white space, a disabled optgroup, a fieldset inside a disabled one, a link with `href`, a white-space-only value, a cased `type`/`dir`, an element whose first kid is text, a `:has` subject inside the element its argument names) and a selector drawn from the document to reach it, judged like the wide properties; each fails every run while its bug is open and, under `HEGEL_NO_KNOWN=1`, draws the region next to the shape and passes. |
-| `TestHegelSerializationRoundTrips` | `ParseGroup(s).String()` parses again to a selector list with the same matches and specificities, and `String()` is idempotent. |
-| `TestHegelParserIgnoresSpelling` | The same selector written with other whitespace, `/* comments */`, upper-case names, single or double quotes, bare or quoted attribute values, hex and literal escapes, `odd`/`even`/`n`/`-n` spellings parses to the same selector (same `String()`, same matches). |
-| `TestHegelSpecificityFollowsTheSpec` | `Specificity()` of each selector equals the specification's count (ids; classes, attributes and pseudo-classes; types; the most specific argument for `:not`/`:has`). |
-| `TestHegelPseudoElements` | A trailing `::pseudo-element` is refused by `Parse`/`ParseGroup`, accepted by the `WithPseudoElement(s)` parsers, reported by `PseudoElement()`, adds (0,0,1) to the specificity, changes no match, and survives `String()`. |
+| `TestHegelSerializationRoundTrips` | `ParseGroup(s).String()` parses again to a selector list with the same matches and specificities, and `String()` is idempotent. The lists carry the shapes of bugs 2 and 3 at the pools' natural rates: intermittent to bug 3 (39 of forty rounds at a hundred cases; 3 twenty-four, 2 fifteen). |
+| `TestHegelParserIgnoresSpelling` | The same selector written with other whitespace, `/* comments */`, upper-case names, single or double quotes, bare or quoted attribute values, hex and literal escapes, `odd`/`even`/`n`/`-n` spellings (one to three drawn `style` records, the renderer pure) parses to the same selector (same `String()`, same matches). One list in ten carries an identifier holding U+FFFD and one style in five spells it with the zero escape, the shape of bug 13: intermittent to bug 13 (31 of forty). |
+| `TestHegelSpecificityFollowsTheSpec` | `Specificity()` of each selector equals the specification's count (ids; classes, attributes and pseudo-classes; types; the most specific argument for `:not`/`:has`). The lists carry the never-matching pseudo-classes at the table's rate, the shape of bug 4: intermittent to bug 4 (38 of forty). |
+| `TestHegelPseudoElements` | A trailing `::pseudo-element` is refused by `Parse`/`ParseGroup`, accepted by the `WithPseudoElement(s)` parsers, reported by `PseudoElement()`, adds (0,0,1) to the specificity, changes no match, and survives `String()`. The `String()` round trip reaches bugs 2 and 3: intermittent to bug 3 (39 of forty, all 3). |
+| `TestHegelSerializationEscapesAttributeValues`, `TestHegelSerializationEscapesLeadingDigits`, `TestHegelNeverMatchingPseudoClassesCount`, `TestHegelZeroEscapeIsReplacementCharacter` | One narrow property per syntax bug (2, 3, 4, 13): a drawn selector list with the bug's ingredient appended to a drawn compound (a value with a quote or backslash; a digit-leading class; a never-matching pseudo-class alone or as the most specific argument of `:not`/`:has`; a U+FFFD identifier spelled `\0 `), judged like the wide property of its family; each fails every run while its bug is open and, under `HEGEL_NO_KNOWN=1`, draws the region next to the shape and passes. |
 | `TestHegelPin...` | One plain test per recorded bug. |
 
 ## Bugs
 
 Fourteen, see `bugs.toml`: `:lang`, `:contains` and `:matches` match text, comment and document
 nodes, which `QueryAll`, `:has` and `~` then see (1); `String()` does not escape quotes and
-backslashes in attribute values (2) nor a leading digit of a class name (3); `:hover` and the
+backslashes in attribute values (2) nor a leading digit of a class name (3; a hyphen before the
+digit is escaped and reparses); `:hover` and the
 other never-matching pseudo-classes have specificity 0 (4); an option in a disabled optgroup is
 `:enabled`, and an option inside a disabled fieldset is `:disabled` (5); `:has()` is not anchored
 at its subject, so `span:has(div b)` matches a span inside the div (6); `:enabled` matches links
@@ -78,6 +82,18 @@ operators, the `i` flag on the HTML case-insensitive attributes, `:disabled` for
 the document has a link; a case that has a shape even so is filtered (counted `filtered shaped`,
 about 0.2 % at three thousand cases).
 
+The syntax properties draw the shapes of the other four bugs the same way, with classifiers
+written from the records: bug 2 where an attribute value (any operator but presence and `#=`)
+or a `:contains` argument holds a quote or a backslash (a quote or a trailing backslash makes
+`String()`'s output unparsable, any other backslash is read back as an escape, so `String()` is
+not idempotent - verified over every pool value), bug 3 where a class name begins with a digit
+(2 before 3), bug 4 where the specificity model with the never-matching pseudo-classes'
+switch differs from the model without it (the most specific argument of `:not`/`:has` may mask
+it), bug 13 where a drawn style spells a U+FFFD identifier with the zero escape (the pure
+renderer is asked). Under `HEGEL_NO_KNOWN=1` the zero escape is not drawn and the lists carrying
+2, 3 or 4 are filtered out at the old gates' rates (8 %, 11 % and 7 % of the draws of the
+round-trip, specificity and pseudo-element properties).
+
 ## Notes
 
 - The generated documents avoid every HTML parsing rule that could make `x/net/html` and
@@ -108,6 +124,8 @@ about 0.2 % at three thousand cases).
   rules under them, the documents and selectors of the matching properties records drawn from
   package-level generators at the nominal rates, the classifier, the two matching properties
   drawing the ten matching shapes, ten narrow properties; the notes of bugs 5, 6 and 10
-  corrected and bug 5's fieldset instance pinned. Part 2 (the serialisation, spelling,
-  specificity and pseudo-element properties with the shapes of bugs 2, 3, 4 and 13, the old
-  generators removed) follows.
+  corrected and bug 5's fieldset instance pinned.
+- 2026-10-10, part 2: the serialisation, spelling, specificity and pseudo-element properties
+  over the records, the renderer pure with drawn `style` records, the shapes of bugs 2, 3, 4
+  and 13 drawn and classified, four narrow properties, the old draw-helper generators removed;
+  the note of bug 3 corrected (a hyphen before the digit reparses). The rewrite complete.
