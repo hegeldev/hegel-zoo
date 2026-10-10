@@ -10,7 +10,7 @@ spreads, `@skip`/`@include`, a second operation selected by name) against genera
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of thirteen
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of fourteen
 `hegel_zoo_*_test.go` files that drive the public API. `go test -count=1 -run TestHegel -v ./hegel`
 needs `python3` with the `graphql-core` package (3.2+) on the PATH.
 
@@ -32,11 +32,13 @@ are compared as well.
   kind, nulls in non-null positions, non-lists for lists, wrong `__typename`s); an operation of
   up to 25 field selections with the features above. Classes counted: ok, errors agree, both
   reject (request errors), both reject with agreeing paths. Expected failure: the operations
-  carry the shapes of graphql-go/1 to 8 at their natural rates (a null literal and a non-null
-  variable with a default each in one case of four, a twin selection with a variable-driven
-  `@skip` on the first copy in one of fifteen), and the shrunk one is the twin
-  selection (7): `query($v1: Boolean!) { __typename @skip(if: $v1) __typename }`, the fewest
-  draws (a null literal needs a field with an argument).
+  and the root data carry the shapes of graphql-go/1 to 14 and 19 at their natural rates (a
+  null literal and a non-null variable with a default each in one case of four, a twin
+  selection with a variable-driven `@skip` on the first copy in one of fifteen, a transitive
+  field conflict in one of forty, a wrong-kind leaf value of a recorded kind drawn in a sixth
+  of the cases and selected in a tenth of those), and the shrunk one is the twin selection
+  (7): `query($v1: Boolean!) { __typename @skip(if: $v1) __typename }`, the fewest draws (a
+  null literal needs a field with an argument).
 - `TestHegelIntrospection`: graphql-core's introspection query (without the newer fields) on the
   same type system; the results must agree after normalisation (introspection types and
   directives left out, lists sorted by name, built-in scalar descriptions and an interface's own
@@ -53,18 +55,21 @@ are compared as well.
   selection); `ValidateDocument`'s verdict must equal graphql-core's `validate`. Intermittent
   expected failure: the two mutations graphql-go misses (17, 18) are one entry each of the
   table's thirty-six, and reach the bug only when no other mutation beside them makes both
-  sides reject (29 of forty runs at a hundred cases fail; 18 more often than 17 under the
-  engine's draw).
-- Twelve narrow properties, one per introspection, validation and execution bug, each a
-  generator over the bug's shape with random contents and the wide property's judge, failing
-  every run:
+  sides reject, and the transitive field conflict (19) is drawn in one operation of forty
+  (36 of forty runs at a hundred cases fail; the shrunk failure is 17 in twenty-one of them and 18
+  in fifteen, never 19, whose chain of fragments the shrinker trades for a mutation).
+- Nineteen narrow properties, one per recorded bug, each a generator over the bug's shape with
+  random contents and the wide property's judge, failing every run:
   `TestHegelIntrospectionDefaultsAreLiterals` (15), `TestHegelIntrospectionMissingDescriptionsAreNull`
   (16), `TestHegelValidateDirectivesAreUniquePerLocation` (17), `TestHegelValidateDefinitionsAreExecutable`
-  (18), `TestHegelExecuteNullLiteralsParse` (1), `TestHegelExecuteDefaultedNonNullArgumentsAreOptional`
-  (2), `TestHegelExecuteNonNullVariablesTakeDefaults` (3), `TestHegelExecuteNullVariablesStayNull`
-  (4), `TestHegelExecuteVariablesOfTheWrongKindAreRejected` (5), `TestHegelExecuteIntLiteralsAre32Bit`
-  (6), `TestHegelExecuteSkippedSelectionsMergeWithTheirTwins` (7), `TestHegelExecuteInlineFragmentsNeedNoCondition`
-  (8).
+  (18), `TestHegelValidateTransitiveFragmentConflictsAreCaught` (19), `TestHegelExecuteNullLiteralsParse`
+  (1), `TestHegelExecuteDefaultedNonNullArgumentsAreOptional` (2), `TestHegelExecuteNonNullVariablesTakeDefaults`
+  (3), `TestHegelExecuteNullVariablesStayNull` (4), `TestHegelExecuteVariablesOfTheWrongKindAreRejected`
+  (5), `TestHegelExecuteIntLiteralsAre32Bit` (6), `TestHegelExecuteSkippedSelectionsMergeWithTheirTwins`
+  (7), `TestHegelExecuteInlineFragmentsNeedNoCondition` (8), `TestHegelExecuteEnumsSerializeOnlyNames`
+  (9), `TestHegelExecuteLeafSerializationErrorsAreReported` (10), `TestHegelExecuteIntsDoNotTruncate`
+  (11), `TestHegelExecuteBooleansAreStrict` (12), `TestHegelExecuteStringsAreStrict` (13),
+  `TestHegelExecuteRootErrorsAreAllReported` (14).
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
 
 ## Bugs
@@ -87,7 +92,7 @@ accepted (18); a field conflict reached only through a fragment spread inside a 
 validation and executes (19: the rule's recursion compares the nested fragments with the
 enclosing fragment instead of the selection set).
 
-## Drawn shapes (the introspection, validation and execution properties; the root data follows)
+## Drawn shapes
 
 The properties draw the shapes of the recorded bugs by default and name them before the library
 is called (DESIGN.md decision 3, STYLE.md rule 11); `HEGEL_NO_KNOWN=1` switches the shapes off
@@ -101,9 +106,10 @@ two mutations from the table with the duplicate-directive and type-definition mu
 their natural weight (left out under NO_KNOWN); `validateShape` names 17 or 18 when the
 unmutated document is valid by graphql-core's verdict, a mutation graphql-go misses was applied,
 and every other mutation applied is one both sides accept (an operation of a kind the schema has
-no root type for). A field conflict graphql-core reports on the unmutated document and
-graphql-go accepts (19) is skipped and counted until part 2 of the rewrite draws that shape on
-purpose. The narrow properties draw a type system with every description present and one
+no root type for), and 19 where graphql-core's only errors on the unmutated document are field
+conflicts and a replica of graphql-go's rule on the operation tree misses them (19 before 17
+and 18: graphql-go accepts the document whatever the mutation, unless one makes both sides
+reject). The narrow properties draw a type system with every description present and one
 deliberate enum, list or input-object default (15); one description blanked in a drawn place,
 with scalar defaults only (16); a valid generated document plus `@skip` or `@include` two or
 three times on a drawn placement (a root field, `__typename`, a fragment spread, an inline
@@ -142,14 +148,33 @@ v, in: InD)`, `zv`, `echoZ`, `zk`, `zi`, `zt`, `zw: Query!`), draw the shape at 
 otherwise clean operation (no shape, no value both sides reject) and are judged by
 `judgeExecute` like the wide property.
 
-The root data is still the old generator wrapped (`dataFor`), and `TestHegelExecute` keeps
-the six serialization bugs behind `HZKnown` switches (no wrong-kind leaf values of the
-recorded kinds; with `rootPropagationDropsErrors`, graphql-go's error paths need only be among
-graphql-core's when both data are null); the collector counts the avoidances, and
-`ZOO_KNOWN_OFF=name` turns a switch off. A field conflict graphql-core reports on an
-unmutated document and graphql-go accepts (19) is skipped and counted by both the validation
-and the execution judge until part 2b draws that shape on purpose. Part 2b of the rewrite
-replaces all of that with drawn shapes and seven narrow properties.
+The root data is a drawn record too (`hzData`, the value resolved for each field as a sum
+type: null, a leaf value, a wrong-kind leaf value with the bug it reaches, a list, a non-list,
+an object, an object of a type not possible for the abstract type, left out), rendered to the
+map both sides resolve from; of the wrong-kind leaf values, the kinds both sides serialize
+alike (an Int from "3", 4.0 or true, a String from a number, a Boolean from a number, an ID
+from an int) are four draws in five and the recorded shapes one in five (`dataShapes`; none
+under NO_KNOWN): an enum from a slice or a map (9), an Int from a non-numeric string, a slice
+or an int outside 32 bits, a Float from a non-numeric string, a slice or a map, an enum from
+an unknown or lowercased name, a number or a bool (10, named in a nullable position only: in a
+non-null one both sides report and propagate alike), an Int from a fractional float (11), a
+Boolean from a string, a slice or a map (12), a String from a slice or a map, an ID from a
+bool, a fractional float, a slice or a map (13). The plan replica walks the data beside
+graphql-core's reply and names the shape of a wrong value at a path graphql-core reported an
+error for, 9 to 13 before 7 and 4; 14 (a non-null root field null beside another root field's
+error, graphql-go dropping the other) is named last, from graphql-core's data being null with
+two field errors; it has no generator switch of its own (it is plain data), so under NO_KNOWN
+the judge skips its rare instance (about one case in three thousand). The transitive field
+conflict (19) is an alternative of a selection set at one in fifty: a leaf field or
+`__typename` under a fresh alias beside a chain of two or three fragments ending in a field
+of a different name under the same alias; the replica of graphql-go's
+OverlappingFieldsCanBeMerged rule (`hegel_zoo_conflict_test.go`, run as graphql-go has it and
+with step (E) corrected) decides in the generator and the classifiers whether the document has
+a conflict graphql-go catches (both reject) or one it misses (the shape, confirmed by
+graphql-core's verdict); under NO_KNOWN the operations are filtered by it. The narrow
+properties of 9 to 13 resolve one added leaf field of Query to a value of the shape in
+otherwise plain data; 14's resolves an added `zl: [Int]` to an Int and `zn: Int!` to null; 19's
+puts the conflicting chain at the root of a valid document.
 
 Design notes:
 
@@ -165,6 +190,9 @@ Design notes:
   default may be an input object literal with braces of its own).
 - A variable's default value is drawn like an argument literal (strict at 90 %), where the old
   generator drew it strict always, so that the shape of graphql-go/6 reaches variable defaults.
+- The lowercased enum value of the wrong-kind pool is the first value with a capital in lower
+  case; the old pool lowercased the first value, which for an enum like `beta` was a valid
+  value.
 
 ## Not tested
 
@@ -183,3 +211,6 @@ locations, the printer.
   graphql-go/19 found on an unmutated document.
 - 2026-10-10: rewrite part 2a: the operation as a drawn tree, the execution property drawing
   the shapes of the operation bugs 1 to 8, eight narrow properties.
+- 2026-10-10: rewrite part 2b, the series complete: the root data as a drawn record, the
+  execution property drawing the serialization bugs 9 to 14 and the transitive field conflict
+  19, seven more narrow properties, the old switches removed.
