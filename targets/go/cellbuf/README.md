@@ -19,9 +19,11 @@ set, the Buffer and Render cases, models and properties), `hegel_style_test.go` 
 model, the sequence model, the replica of `DiffSequence`, the two style properties),
 `hegel_wrap_test.go` (`Wrap` transcribed, the Wrap property), `hegel_tabs_test.go` (the tab-stop
 word-array model, the TabStops property), `hegel_cells_test.go` (the cell constructors),
-`hegel_shapes_test.go` (eleven narrow properties), `hegel_screen_test.go` (the Screen property
-and its replays, with the older helpers it still uses) and `hegel_pins_test.go` (the eighteen
-pins and the fixed examples). `go test -count=1 -timeout 20m -run TestHegel -v .`.
+`hegel_shapes_test.go` (eleven narrow properties), `hegel_screen_test.go` (the Screen family: the
+frame records, the predictors replayed on a copy of the screen, the emulator comparison, the
+property), `hegel_screen_shapes_test.go` (eight narrow properties of the Screen family, the
+child process for the hang) and `hegel_pins_test.go` (the nineteen pins and the fixed
+examples). `go test -count=1 -timeout 20m -run TestHegel -v .`.
 
 ## Oracles
 
@@ -37,6 +39,11 @@ pins and the fixed examples). `go test -count=1 -timeout 20m -run TestHegel -v .
   a test dependency): `Screen`'s output is replayed into `vt.NewEmulator(w, h)` after every
   `Render`+`Flush`, and the emulator's cells (content, width, attributes, underline, colours,
   hyperlink) must equal `Screen`'s new buffer; the current buffer must equal the new one too.
+  A differential cannot state a bug's picture, so the Screen family's classifier is a set of
+  predictors: replicas of `Render`'s decisions (`scrollOptimize`, `clearBottom`,
+  `transformLine`'s branches, `emitRange`, the overwrite cursor move) run on a deep copy of the
+  screen before the real `Render` of each frame, with a content-level model of the emulator
+  that tells which predicted shapes show (an orphan or a scroll the next rows redraw does not).
 - **Round trips**: `Render(buffer)` → `SetContent(new buffer)` restores every cell (the model
   of `RenderLine`'s writes read back by `printString`'s rules); `ReadStyle(s.Sequence())`
   restores `s`; `o.Sequence()` then `s.DiffSequence(o)` yields `s` (the diff's effect modelled
@@ -70,8 +77,9 @@ ASCII-based cluster, a width-adding pair, an equal pair are alternatives of weig
 filtered out by the classifier (an orphan or a lossy diff among the Render SetCells, a lossy
 or equal style pair, a trailing-space wrap: 6–14 % of the cases), or their steps and checks
 are dropped from the case (the Buffer property drops the shaped steps in the state the
-documented model reaches, the TabStops property the probes at columns beyond the width; both
-counted) — and every property passes there.
+documented model reaches, the TabStops property the probes at columns beyond the width, the
+Screen property the frames from the first predicted one on; all counted) — and every property
+passes there.
 
 | Test | What it checks | Shapes drawn |
 | --- | --- | --- |
@@ -82,35 +90,42 @@ counted) — and every property passes there.
 | `WrapKeepsContentAndStyles` | widths, content, styles, links, newlines, `Height` | spaces committed past the limit before a breakpoint or a sequence (/8); a wide grapheme at limit 1 is noted, not a failure |
 | `TabStopsFollowTheModel` | stops vs the set model through random ops | intervals other than 8 (/4, a fifth), columns beyond the width (/5, a tenth) |
 | `CellConstructorsFollowRunewidth` | widths/contents, `Clone`/`Blank`/`Equal`/`Empty`/`Clear`, `Line.String`/`At` | graphemes whose later runes add width (/7, a tenth) |
-| `ScreenRendersWhatTheEmulatorShows` | 1–6 frames of `SetContent`/`PrintAt`/`SetCell`/`FillRect`/`ClearRect`/line shifts on an alt-screen `Screen` (xterm, 256color, linux, screen, alacritty, vt100; cursor/hard-tab/backspace options; both width methods) replayed into `vt` | still gated as before (/2, /11–/15, /17, /18; the emulator's own DCH/ICH and IRM limits), to be unsteered in part 2 |
+| `ScreenRendersWhatTheEmulatorShows` | 1–6 frames of `SetContent`/`PrintAt`/`SetCell`/`FillRect`/`ClearRect`/line shifts on an alt-screen `Screen` (xterm, 256color, linux, screen, alacritty, vt100; cursor/hard-tab/backspace options; both width methods) replayed into `vt` | orphans in the screen (/2), a blank ending a written range under a visible pen (/11), the `clearBottom` row (/12), the `transformLine` hang (/13, judged in a child process), the overwrite move over a placeholder (/14), REP after Latin-1 (/15), a scroll of two or more lines without SU (/17), a shortened line ending with a wide cell (/19); frames that emit DCH/ICH or switch IRM on end the case as exclusions (the emulator's own limits), which keeps /18 for its narrow property |
 | `Examples` | fixed examples including one emulator replay | — |
 
 The wide properties fail by the shape they draw most often, measured over forty rounds at a
 hundred cases: Buffer by cellbuf/1 (intermittent; 36 of 40 rounds failed, 16 by cellbuf/1, 15
 by cellbuf/3, 4 by cellbuf/10, 1 by cellbuf/2), Render by cellbuf/9 (40 of 40), Style by
 cellbuf/16 (40), Wrap by cellbuf/8 (intermittent; 39), TabStops by cellbuf/4 (40, one of them
-by cellbuf/5), Cells by cellbuf/7 (intermittent; 39); the SGR table property passes.
+by cellbuf/5), Cells by cellbuf/7 (intermittent; 39); the SGR table property passes. Screen
+fails by cellbuf/12 (intermittent; over eighty rounds, the first forty having tied cellbuf/11
+and /12 at 16 each: 78 failed, 32 by cellbuf/12, 28 by /11, 6 by /2, 5 by /14, 3 by /15, 2 by
+/13, 2 by /19).
 
-Eleven narrow properties draw one bug's shape each with random surroundings and fail every
+Nineteen narrow properties draw one bug's shape each with random surroundings and fail every
 run; under `HEGEL_NO_KNOWN=1` each draws the region past the shape and passes:
 `ShiftedWideCellsSurvive` (/1), `WideCellsOverWideHeadsLeaveNoOrphan` (/2),
 `ShrinkingBlanksCutWideCells` (/3), `TabIntervalsOtherThanEightWork` (/4),
 `TabColumnsBeyondTheWidthAreNotStops` (/5), `DiffSequencesKeepSiblingAttributes` (/6),
 `NewCellTakesOnlyTheFirstCombiningRune` (/7), `WrappedLinesFitWithTrailingSpaces` (/8),
 `CombiningMarksStayOnTheirCell` (/9), `ShiftRectsBeyondTheBufferClip` (/10),
-`DiffSequencesOfEqualStylesAreEmpty` (/16).
+`DiffSequencesOfEqualStylesAreEmpty` (/16); and for the Screen family
+`BlanksAfterStyledCellsStayPlain` (/11), `ClearedBottomRowsKeepTheRowAbove` (/12),
+`WideCellsInColumnZeroRender` (/13), `CursorMovesKeepWideCells` (/14),
+`RepeatedLatin1CharactersAllShow` (/15), `ScrollsOfSeveralLinesReachTheTerminal` (/17),
+`InsertsBeforeWideCellsKeepTheRow` (/18, judged on a one-row line model that honours IRM,
+since the emulator ignores it) and `ShortenedLinesKeepTheirLastWideCell` (/19).
 
 Each `TestHegelPin…` reproduces one bug and is an expected failure. `ZOO_COLLECT=1` turns
-failures into a tally per property (the Screen property still reads `CELLBUF_COLLECT=1`). The
-`Render` hang (/13) is reproduced in a child process with `-test.timeout 5s`, so the pin itself
-cannot take the suite down. The `Screen` gates for /13 and /17 come from a replay of `Render`'s
-line loop (scroll optimisation, `clearBottom`, `transformLine` in order) on a deep copy of the
-screen: the code's own arithmetic, run before the real `Render`, since the hang cannot be
-recovered from once it starts.
+failures into a tally per property. The `Render` hang (/13) cannot be recovered from once it
+starts: the pin reproduces it in a child process with `-test.timeout 5s`, and the Screen
+property and its narrow property judge a frame the predictor marks as hanging by re-executing
+the test binary on the case (as JSON in the environment) with a 200 ms deadline, a timeout
+being the failure that names cellbuf/13.
 
 ## Modelled as recorded
 
-`known` holds eighteen switches, one per bug, off by default. In this part eleven are read
+`known` holds nineteen switches, one per bug, off by default. In this part eleven are read
 by the models: /1 (`Line.set` cell by cell, left to right, for `InsertLineRect`,
 `DeleteLineRect` and `DeleteCellRect`; `InsertCellRect` copies right to left and is spared),
 /2 (`Line.set` splits the wide cell at the target column only), /3 (`Resize` truncates the
@@ -121,7 +136,12 @@ last word's stale bits), /6 (`DiffSequence`'s attribute loop: 22 and 25 without 
 the sibling), /16 (an empty `ansi.Style` renders as the reset), /7 (`NewCell` appends every
 rune and sums the widths), /8 (`addSpace` before the fit check), /9 (`printString` starts the
 next cell with a mark decoded on its own, and sets a mark pending at the end as a zero-width
-cell of its own). The Screen switches (/11–/15, /17, /18) exist and are read in part 2.
+cell of its own). The Screen family does not read its switches (the emulator is the oracle);
+its predictors name /2 (`hasOrphan` on the new buffer), /11 (`emitRange`'s raw `line[0]` for
+the last cell of a range), /12 (`clearBottom`'s `move(0, top-1)`), /13 and /19 (the insert
+and delete branches of `transformLine`), /14 (the overwrite move passing a placeholder), /15
+(REP after a Latin-1 run), /17 (the scroll optimisation without SU); /18 lives behind the IRM
+exclusion and is found by its narrow property alone.
 
 ## Bugs
 
@@ -145,6 +165,7 @@ cell of its own). The Screen switches (/11–/15, /17, /18) exist and are read i
 | cellbuf/16 | low | `DiffSequence` of two equal non-empty styles is the reset sequence |
 | cellbuf/17 | high | scrolling up by two or more lines on a terminal without SU writes its newlines at the top row; the terminal never scrolls |
 | cellbuf/18 | medium | on terminals without ICH, inserting before a wide cell writes it twice in insert mode and loses the cell after it |
+| cellbuf/19 | high | a shortened line ending with a wide cell is erased from that cell's placeholder, blanking it on the terminal |
 
 ## Not bugs (or not cellbuf's)
 
@@ -158,6 +179,13 @@ cell of its own). The Screen switches (/11–/15, /17, /18) exist and are read i
   is what cellbuf then does with the stray mark. The Screen generators still use precomposed
   `é`/`ñ` and a Thai cluster; the Render and cell generators draw the ASCII-based clusters as
   the shape of cellbuf/9.
+- The Screen generators leave faint and rapid blink out of their styles by design: with them
+  in, the lossy diff of cellbuf/6 would be the most frequent shape of the differential; it is
+  drawn and named by the Render and Style properties and has its narrow property.
+- The `vt` emulator keeps a stale zero-width cell where cellbuf holds an orphan placeholder,
+  so an orphan (cellbuf/2) shows on the terminal only when the content around it differs;
+  and a scroll without SU (cellbuf/17) heals when the rows below are redrawn with newlines.
+  The predictors name only the instances that show.
 - `DiffSequence` of two *empty* styles is the reset sequence (`Sequence()` of an empty style),
   by design; for equal non-empty styles it is cellbuf/16.
 - `Ascii.Convert`-style profile downsampling (`ConvertStyle`) is not exercised: the screen
@@ -169,3 +197,7 @@ cell of its own). The Screen switches (/11–/15, /17, /18) exist and are read i
   whitespace commits the spaces too) and cellbuf/10 (which rectangles panic) corrected after
   standalone checks. The old model's shift paths blanked a moved wide cell through the stale
   head when they filled the vacated columns, a latent model bug fixed.
+- 2026-10-11: part 2, the Screen property on the predictors with eight narrow properties;
+  cellbuf/19 found by the delete-branch predictor and recorded; the notes of cellbuf/11 (the
+  blank must end the written range), 15 (a run of five or more), 17 (the rows below must stay
+  blank) and 18 (two spare columns) narrowed after standalone checks.
