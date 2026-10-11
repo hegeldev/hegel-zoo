@@ -6,39 +6,47 @@ paragraphs and changelogs, against dpkg itself, which defines all of these forma
 
 ## Build
 
-The patch adds a `hegel/` package; `go test -count=1 -run TestHegel -v ./hegel/` needs dpkg,
-dpkg-dev and dpkg's Perl modules (the `setup` commands of `target.toml` check them). A default
-run takes about forty seconds, nearly all of it the shrinking of the properties that reach a
-bug, each shrink candidate drawn through the engine (the oracle's answers are memoised and no
-longer the cost); under `HEGEL_NO_KNOWN=1` the part 1 properties take a few seconds.
+The patch adds a `hegel/` package; `go test -count=1 -run TestHegel -v ./hegel/` needs dpkg
+and dpkg's Perl modules (the `setup` commands of `target.toml` check them). A default run
+takes a little over a minute, nearly all of it the shrinking of the twenty-six properties that
+reach a bug, each shrink candidate drawn through the engine (the oracle's answers are memoised
+and no longer the cost); under `HEGEL_NO_KNOWN=1` about thirty seconds at a thousand cases.
 
-The version and dependency properties (part 1 of the rewrite, 2026-10-11) are written to the
-repository's standard (STYLE.md rule 11): a `known` value of nineteen switches, all off by
-default, one per recorded bug; each property's model (`versionExpected`, `compareExpected`,
-`dependencyExpected`, `roundTripExpected`, `archExpected`) states the documented behaviour -
-dpkg's reading of the text, asked once per case and cached in the record - with every switch
-off and, with a switch on, reproduces go-debian's rule for that bug as a replica of its code
-(`parseInto`'s split at the last hyphen and its `ParseInt` epoch, `String`'s zero epoch;
-`parseArchInto`'s padding with base/gnu and `archToStringWithTupletable`; the parser's
-two-character operator, its `=` shortcut, the untrimmed version number, the single-space list
-separators, the `[`/`<` fall-through into the name; `Possibility.String`'s braceless
-substvar and its list written before the version); the classifier runs the model per switch
-before the library is called and names the shape of the bug a case is in, so the property
-fails naming it; under `HEGEL_NO_KNOWN=1` the shapes are not drawn (the epochs beyond INT_MAX,
-the empty revision, the colon after a zero epoch, the deprecated and the `=`-prefixed
-operators, the padding before `)`, the tab and newline separators and `<>`, the glued lists,
-the substvars, a list on a possibility that has a version) or are filtered out by the
-classifier (the wildcard pairs whose padding changes a check, about three percent of the
-dependency cases whose whitespace composes go-debian/7). The control and changelog properties
-(part 2, pending) still gate their bugs the old way in `known.go`.
+The properties are written to the repository's standard (STYLE.md rule 11): a `known` value
+of nineteen switches, all off by default, one per recorded bug; each property's model
+(`versionExpected`, `compareExpected`, `dependencyExpected`, `roundTripExpected`,
+`archExpected`, `paragraphsExpected`, `writeExpected`, `changelogExpected`) states the
+documented behaviour - dpkg's reading of the text, asked once per case and cached in the
+record - with every switch off and, with a switch on, reproduces go-debian's rule for that bug
+as a replica of its code (`parseInto`'s split at the last hyphen and its `ParseInt` epoch,
+`String`'s zero epoch; `parseArchInto`'s padding with base/gnu and
+`archToStringWithTupletable`; the parser's two-character operator, its `=` shortcut, the
+untrimmed version number, the single-space list separators, the `[`/`<` fall-through into the
+name; `Possibility.String`'s braceless substvar and its list written before the version;
+`ParagraphReader.Next`'s newline per continuation line and its dot lines; `WriteTo`'s single
+replacement of `"\n \n"` and its unescaped dot lines; `ParseOne`'s space-only indent, its
+`RFC1123Z` date, its split at the first double space, its refusal of a comment line and its
+exactly-`"\n"` blank line); the classifier runs the model per switch before the library is
+called and names the shape of the bug a case is in, so the property fails naming it; under
+`HEGEL_NO_KNOWN=1` the shapes are not drawn (the epochs beyond INT_MAX, the empty revision,
+the colon after a zero epoch, the deprecated and the `=`-prefixed operators, the padding
+before `)`, the tab and newline separators and `<>`, the glued lists, the substvars, a list
+on a possibility that has a version, the dots-only and whitespace-only value lines, the
+tab-indented and comment change lines, the rare dates and maintainers, the whitespace line
+between entries) or are filtered out by the classifier (the wildcard pairs whose padding
+changes a check, about three percent of the dependency cases whose whitespace composes
+go-debian/7, the written values ending in an empty line), and the value checks of continued
+fields - go-debian/11's shape, the format of nearly every control file - are dropped by the
+judge (counted) while the keys, the order and the uncontinued values stay judged.
 
 ## Oracle
 
 dpkg 1.22 (Ubuntu 24.04 / the GitHub runner's `dpkg-dev`): `dpkg --validate-version` and
-`--compare-versions` per text, `dpkg-parsechangelog` per generated changelog, and dpkg's Perl
-library (`Dpkg::Deps`, `Dpkg::Arch`, `Dpkg::Version`, `Dpkg::Control::HashCore`) as one
-persistent `perl` child (`hegel/oracle.go`: hex-encoded arguments in, JSON out; every answer
-memoised by its arguments). Both readings are put in one shape and compared as text. The
+`--compare-versions` per text, and dpkg's Perl library (`Dpkg::Deps`, `Dpkg::Arch`,
+`Dpkg::Version`, `Dpkg::Control::HashCore`, and `Dpkg::Changelog::Debian` driven as
+`dpkg-parsechangelog --all --format rfc822` drives it, checked identical to the process on 3000
+changelogs) as one persistent `perl` child (`hegel/oracle.go`: hex-encoded arguments in, JSON
+out; every answer memoised by its arguments). Both readings are put in one shape and compared as text. The
 documented behaviour is dpkg's: `version.Parse` "verifies the version string as a whole, just
 like dpkg(1)", Policy 7.1 for relationships, Dpkg::Arch for architectures. Not judged, because
 the libraries differ by design or the input is outside the format: names dpkg refuses (go-debian
@@ -76,40 +84,67 @@ about.
   that possibility; when dpkg refuses the text, Parse may refuse or read it, and its written
   possibilities must still read back the same. Two thirds of the cases are in the shape of a
   recorded bug (per 3000 cases: go-debian/3 782, 7 339, 4 278, 5 271, 6 238, 9 67, 19 58); over
-  forty rounds at a hundred cases it fails every round, shrinking to go-debian/9
-  (`libc6<!nocheck>`) and go-debian/7 (`libc6 < >`) twenty times each (nineteen to eleven over
-  thirty rounds at twenty cases), so it is mapped to go-debian/9.
+  forty rounds at a hundred cases it fails every round, shrinking to go-debian/7
+  (`libc6 < >`) and go-debian/9 (`libc6<!nocheck>`) by turns (26 to 14 in one run of forty,
+  20 to 20 in another), so it is mapped to go-debian/7.
 - `TestHegelDependencyStringRoundTrips`: for a text Parse reads (substvars included),
   `Parse(String(Parse(x)))` is `Parse(x)` (names, qualifiers, relations, architecture tuples,
   restriction lists) and `String` is stable; go-debian's own parser reads a list before or
   after the version, so go-debian/19 does not reach it. The shapes of go-debian/10 (four
   percent), 3 (six) and 7 (three); over forty rounds at a hundred cases it fails every round,
-  shrinking to go-debian/10 (`${misc:Depends}`) 21 times, 7 fourteen and 3 five, so it is
-  mapped to go-debian/10.
+  shrinking to go-debian/10 (`${misc:Depends}`) about half the time (21 and 20 of forty in
+  two runs), 7 and 3 the rest, so it is mapped to go-debian/10.
 - `TestHegelArchMatchesDpkg`: `ParseArch` gives the tuple `Dpkg::Arch` gives
   (`debarch_to_debtuple`, or `debwildcard_to_debtuple` for wildcards), `String()` the
   canonical name, `Arch.Is` what `debarch_is` says and `ArchSet.Matches` what
   `debarch_is_concerned` says, over real architectures, wildcards and odd spellings; the
   padded wildcard of go-debian/3 in a fifth of the cases; over forty rounds it shrinks to
   go-debian/3 every time (`linux-any` against `amd64`).
-- `TestHegelParagraphsMatchDpkg`, `TestHegelParagraphWriteToMatchesDpkg`,
-  `TestHegelChangelogMatchesDpkg` (`hegel_control_test.go`, `hegel_changelog_test.go`): as
-  before the rewrite - a control file read by `control.ParagraphReader` gives
-  `Dpkg::Control::HashCore`'s paragraphs; a `Paragraph` is written by `WriteTo` as HashCore
-  writes it and reads back; a changelog parsed by `changelog.Parse` gives
-  `dpkg-parsechangelog --all --format rfc822`'s entries when dpkg reads it without a warning.
-  Their bugs (11 to 18) are gated by generated shape in `known.go` until part 2.
+- `TestHegelParagraphsMatchDpkg`: a control file (one to three paragraphs, fields with odd
+  spacing around the colon and trailing whitespace, continuation lines with dots, empty and
+  indented text, comment lines, blank lines, CRLF, no final newline, each part drawn
+  separately) read by `control.ParagraphReader` gives `Dpkg::Control::HashCore`'s paragraphs:
+  the same fields in order with the same values, or both refuse it; a text dpkg refuses for a
+  key go-debian does not validate is not judged, a whitespace-only line inside a paragraph
+  (a separator to dpkg, a continuation to go-debian, both allowed by Policy 5.1) is not drawn.
+  Nine paragraphs in ten have a continuation line, go-debian/11's shape (the reader's dots
+  line of 12 is named 11 first); over forty rounds at a hundred cases it shrinks to
+  go-debian/11 every time (`Package: foo\n more\n`).
+- `TestHegelParagraphWriteToMatchesDpkg`: a `Paragraph` with values of one to four lines
+  (empty, dot-only, whitespace and indented lines, a leading or trailing newline) is written by
+  `WriteTo` as HashCore writes the same fields (modulo trailing whitespace on a line) and
+  reads back with `ParagraphReader` as dpkg reads HashCore's text back. The shapes of
+  go-debian/12 (a dots-only line, 27 percent of the cases) and 16 (36) on the written text,
+  go-debian/11 on the read-back of every multi-line value; over forty rounds at a hundred
+  cases it shrinks to go-debian/16 every time (`Package: "a\n"`, written as a line of one
+  space).
+- `TestHegelChangelogMatchesDpkg`: a changelog of one to three entries (header lines with one
+  or more distributions and the urgency and other options in the spellings dpkg meets; change
+  lines with bullets, sections, blank lines, dashes and tabs; trailer lines with the date in
+  the forms dpkg's grammar allows) parsed by `changelog.Parse` gives
+  `Dpkg::Changelog::Debian`'s entries (source, version, distributions, urgency, maintainer,
+  timestamp, change lines) whenever dpkg reads it without a warning; when dpkg warns or fails,
+  or silently stops before the last entry, the case is noted, not judged - 87 percent of the
+  population as the old test drew it (options dpkg warns about, invalid versions, a ` ;`
+  header). The shapes of 13, 14, 15, 17 and 18 are the rare lines, dates, maintainers and
+  the whitespace separator at their old rates (0.3 to 1.3 percent of the cases each); over
+  forty rounds at a hundred cases it fails 28, shrinking to go-debian/14 (9 rounds), 15 (8),
+  18 (8), 13 (2) and 17 (1), so it is mapped to go-debian/14 as intermittent.
 
-One narrow property per bug of part 1, in `hegel_version_shapes_test.go` and
-`hegel_dependency_shapes_test.go`, draws the bug's shape with random surroundings and is
-judged by the same model, so it fails every run naming its bug by default and passes under
-`HEGEL_NO_KNOWN=1`, where it draws the region past the shape:
+One narrow property per bug, in the four shapes files, draws the bug's shape with random
+surroundings and is judged by the same model, so it fails every run naming its bug by default
+and passes under `HEGEL_NO_KNOWN=1`, where it draws the region past the shape:
 `TestHegelEmptyRevisionsAreRefused` (go-debian/1), `TestHegelEpochsStopAtIntMax` (2),
 `TestHegelWildcardsPadWithAny` (3), `TestHegelDeprecatedRelationsAreRead` (4),
 `TestHegelUnknownRelationsAreRefused` (5), `TestHegelVersionPaddingIsTrimmed` (6),
 `TestHegelListWhitespaceIsAnySpace` (7), `TestHegelZeroEpochsKeepTheirColon` (8),
 `TestHegelGluedListsAreLists` (9), `TestHegelSubstvarsKeepTheirBraces` (10),
-`TestHegelVersionsAreWrittenBeforeLists` (19).
+`TestHegelContinuationLinesJoinWithoutATrailingNewline` (11), `TestHegelDotLinesAreEscaped`
+(12) and `TestHegelBlankValueLinesAreDotLines` (16, both judged on the written text alone so
+that the read-back's go-debian/11 does not name the case first),
+`TestHegelTabIndentedChangesAreRead` (13), `TestHegelDatesNeedNoWeekday` (14),
+`TestHegelMaintainersMayHoldDoubleSpaces` (15), `TestHegelCommentLinesAreSkipped` (17),
+`TestHegelWhitespaceLinesSeparateEntries` (18), `TestHegelVersionsAreWrittenBeforeLists` (19).
 
 ## Bugs
 
@@ -138,5 +173,5 @@ The `deb` package (ar and tar reading, signature checks), OpenPGP clearsigned pa
 
 - 2026-09-20: written against cffc6a73b84de0ea4153fee14fa7084ed6a42d77 (2026-06-16, v0.21.0)
   with hegel.dev/go/hegel v0.6.33; 18 bugs.
-- 2026-10-11: the version and dependency properties rewritten to the standard (part 1 of two);
-  go-debian/19 found by the written-form check; 19 bugs.
+- 2026-10-11: rewritten to the standard in two parts (the version and dependency properties,
+  then the control and changelog ones); go-debian/19 found by the written-form check; 19 bugs.
