@@ -13,7 +13,7 @@ mapping of form, query and URI values into structs and maps by their `form`/`uri
 
 The patch adds `hegel.dev/go/hegel` to `go.mod` (and lets `go mod tidy` move `golang.org/x/sys`
 from v0.41.0 to v0.44.0), eight `hegel_zoo_*_test.go` files in package `gin` itself (the tree
-and `cleanPath` are unexported) and three in package `binding`. Every identifier carries the
+and `cleanPath` are unexported) and seven in package `binding`. Every identifier carries the
 `hz` prefix to stay clear of the upstream tests. `go test -count=1 -run TestHegel -v . ./binding`
 
 In package `gin` (part 1, rewritten 2026-10-11): `hegel_zoo_idioms_test.go` (the harness idioms
@@ -25,8 +25,14 @@ sets, requests, engine options, clean paths, with the realised rate beside every
 `hegel_zoo_router_test.go` (the tokenizer, the acceptance rule, the tree walk with the switch
 set threaded, `TestHegelMatch` and `TestHegelRouteOrder`), `hegel_zoo_engine_test.go` (the
 engine model and `TestHegelEngine`), `hegel_zoo_path_test.go` (`TestHegelCleanPath`),
-`hegel_zoo_router_shapes_test.go` (ten narrow properties) and `hegel_zoo_pins_test.go`. The
-binding package keeps its own harness until part 2.
+`hegel_zoo_router_shapes_test.go` (ten narrow properties) and `hegel_zoo_pins_test.go`.
+
+In package `binding` (part 2, rewritten 2026-10-11): the same idioms and harness files
+(byte-identical but for the package line, since a test package cannot import another's test
+files), `hegel_zoo_forms_test.go` (the type specs, tag specs, forms and the two case records
+with the realised rate beside every weight), `hegel_zoo_form_model_test.go` (the models with
+the replicas and the judges), `hegel_zoo_form_test.go` (the two wide properties),
+`hegel_zoo_form_shapes_test.go` (five narrow properties) and `hegel_zoo_pins_test.go`.
 
 ## Oracles
 
@@ -99,7 +105,7 @@ fifth of a percent of Match's) and every property passes.
 - `TestHegelMatch`: with redirects off, a request is served by the route the model picks, with
   the model's params, or is a 404 when the model finds none; the engine's rejections equal the
   predicted ones. Draws the shapes of gin/1, 2 and 14; its forty rounds at a hundred cases:
-  14 of 40 fail, gin/1 11 and gin/2 3; mapped intermittent to its plurality.
+  19 of 40 fail, gin/1 13, gin/2 5, gin/14 1; mapped intermittent to its plurality.
 - `TestHegelRouteOrder`: the accepted routes shuffled (a drawn Fisher-Yates over the drawn
   routes) and re-registered give the same acceptance and the same answers. No bug lives here.
 - `TestHegelCleanPath`: `cleanPath` against `path.Clean`, and idempotence.
@@ -108,8 +114,8 @@ fifth of a percent of Match's) and every property passes.
   Allow, or the panic). Draws the shapes of gin/1 to 7 and 13 to 15 at their natural rates
   (per 3000 cases: gin/3 about 50, gin/6 about 25, gin/2 about 12, gin/1 about 8, gin/4 about
   5, gin/5 a few, gin/13 and gin/15 under one, gin/7 and gin/14 as good as never - their
-  coverage is the narrow properties); its forty rounds: 38 of 40 fail,
-  gin/3 21, gin/1 9, gin/6 5, gin/4 2, gin/2 1; mapped intermittent to its plurality.
+  coverage is the narrow properties); its forty rounds: 39 of 40 fail,
+  gin/3 18, gin/1 9, gin/6 6, gin/2 3, gin/4, 5 and 15 one each; mapped intermittent to its plurality.
 - Ten narrow properties, one per router bug, each over the bug's shape region with random atoms
   and extra routes, judged by the same model, failing every run and naming its bug; under
   `HEGEL_NO_KNOWN=1` each draws the region past the shape and passes:
@@ -118,15 +124,29 @@ fifth of a percent of Match's) and every property passes.
   (4), `TestHegelPlusStaysInPathValues` (5), `TestHegelFixedPathRedirectsLandOnRoutes` (6),
   `TestHegelMethodTreesStartFresh` (7), `TestHegelSlashRedirectsSurviveParamSiblings` (13),
   `TestHegelMixedSegmentsDoNotOverflow` (14), `TestHegelEmptyParamPathsAreRecommended` (15).
-- `TestHegelFormMapping`: struct types built at runtime with `reflect.StructOf` (1-4 fields,
-  nested to depth 2, embedded structs and pointers to them, slices, arrays, pointers, maps,
-  `time.Time`, `time.Duration`, a `BindUnmarshaler` and a `TextUnmarshaler` type, `any`) with
-  generated tags (keys of their own or shared, `default=`, `parser=`, stray options,
-  `collection_format`, the time tags, a tag of the other name) and a form drawn for the keys
-  the type looks up, with values fit for each field and some bad ones, against the model (the
-  value reached and the error, by message).
-- `TestHegelFormMapDest`: map destinations of six types, by value and by pointer, nil or holding
-  an entry, forms with keys without values, against the model (result, error, or panic).
+- `TestHegelFormMapping`: struct types drawn as specs (1-4 fields, nested to depth 2, embedded
+  structs and pointers to them, slices, arrays, pointers, maps, `time.Time`, `time.Duration`, a
+  `BindUnmarshaler` and a `TextUnmarshaler` type, `any`) with drawn tags (keys of their own or
+  shared, `default=`, `parser=`, stray options, `collection_format`, the time tags, a tag of
+  the other name), built by a pure function with `reflect.StructOf`, the destination by value
+  one time in twenty, and a form drawn for the keys the spec looks up, with values fit for each
+  field and some bad ones, against the model (the value reached, the error by message - or
+  "some error" where the documentation names none - and the panic). Draws the shapes of
+  gin/10, 11 and 12 (per 3000 cases about 135, 265 and 15); its forty rounds at a hundred
+  cases: 40 of 40 fail, gin/10 30 and gin/11 10; mapped plain to gin/10 (nine rounds at the
+  default count had split them 5 to 4). Under `HEGEL_NO_KNOWN=1` the shaped cases are filtered
+  out (eleven percent).
+- `TestHegelFormMapDest`: map destinations of seven types, by value and by pointer, nil or
+  holding an entry, forms with keys without values, against the model (result, error, or
+  panic). Draws the shape of gin/8 in about one case in six; plain (40/40 at a hundred cases).
+- Five narrow properties, one per binding bug: `TestHegelNilMapsAreAllocated` (gin/8),
+  `TestHegelSelfReferencesStayNil` (9: a family of recursive named types - a node with its
+  parent, a list, a mutual pair - with forms that never hold the recursive key, bound in a
+  child process re-executed from the test binary, about 30 ms a case under a 16 MB stack cap;
+  the documented answer is the pointer left nil, the shape a fatal stack overflow),
+  `TestHegelValueDestinationsAreErrors` (10: a form that matches a field),
+  `TestHegelEmptyValuesLeaveStructsAndMaps` (11), `TestHegelEmptyValuesTakeCollectionDefaults`
+  (12: a default that differs from the zero and splits to the array's length).
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures).
 
@@ -166,10 +186,12 @@ behaviour and the properties fail on the bugs' shapes, mapped to them in `target
 switch on the model reproduces the tree's rule for that bug, which is how the classifier names
 a case and how the replicas are checked against the library (every shaped case by default
 agrees with the model with every switch on: a disagreement would be a replica defect or a
-further bug - that is how gin/13 was found). The binding package (part 2, not yet rewritten)
-still keeps its three rules in the model behind `HZKnown` switches ON by default (the inverse
-convention: `ZOO_KNOWN_OFF=name` turns one off and the property then fails), and gin/9 and
-gin/10 have pins only there.
+further bug - that is how gin/13 was found). The five binding bugs act in the form-mapping
+model the same way (the replicas of `setFormMap`, the pointer descent of `mapping`, the
+unaddressable `Set` and `Addr`, the JSON unmarshal of an empty value and `setByForm`'s check for
+no values at all). gin/9 is the one shape no generator of struct types can build
+(`reflect.StructOf` makes no cycles) and its failure is a fatal error, not a panic: the wide
+property does not draw it; its narrow property does, in a child process.
 
 Design notes on the tree that the model follows:
 
@@ -218,3 +240,5 @@ rendering.
 - 2026-10-11: part 1 rewritten to the standard (the switches off by default, every shape
   drawn, ten narrow properties, fair-bit dice, the acceptance rule); gin/13, gin/14 and gin/15
   found by the rewrite and recorded; the notes of gin/3, 4 and 7 corrected.
+- 2026-10-11: part 2 rewritten to the standard (spec records, the five binding switches, five
+  narrow properties, gin/9 in a child process); the note of gin/10 widened.
