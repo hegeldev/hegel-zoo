@@ -115,7 +115,8 @@ fifth of a percent of Match's) and every property passes.
   (per 3000 cases: gin/3 about 50, gin/6 about 25, gin/2 about 12, gin/1 about 8, gin/4 about
   5, gin/5 a few, gin/13 and gin/15 under one, gin/7 and gin/14 as good as never - their
   coverage is the narrow properties); its forty rounds: 39 of 40 fail,
-  gin/3 18, gin/1 9, gin/6 6, gin/2 3, gin/4, 5 and 15 one each; mapped intermittent to its plurality.
+  gin/3 18, gin/1 9, gin/6 6, gin/2 3, gin/4, 5 and 15 one each; mapped intermittent to its
+  plurality.
 - Ten narrow properties, one per router bug, each over the bug's shape region with random atoms
   and extra routes, judged by the same model, failing every run and naming its bug; under
   `HEGEL_NO_KNOWN=1` each draws the region past the shape and passes:
