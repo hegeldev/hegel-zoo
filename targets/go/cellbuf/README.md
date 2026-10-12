@@ -120,7 +120,7 @@ Each `TestHegelPin…` reproduces one bug and is an expected failure. `ZOO_COLLE
 failures into a tally per property. The `Render` hang (/13) cannot be recovered from once it
 starts: the pin reproduces it in a child process with `-test.timeout 5s`, and the Screen
 property and its narrow property judge a frame the predictor marks as hanging by re-executing
-the test binary on the case (as JSON in the environment) with a 200 ms deadline, a timeout
+the test binary on the case (as JSON in the environment) with a 50 ms deadline, a timeout
 being the failure that names cellbuf/13.
 
 ## Modelled as recorded
