@@ -2116,7 +2116,7 @@ line2` | wrong-result | low | 0.6.8 (58fb0747c) | open |  |
 | [kong/2](targets/go/kong/bugs.toml) | A flag with a default counts as used in its xor group, so giving the other member is an error | wrong-result | medium | v1.16.1-9-ga60008c (a60008c6d) | open |  |
 | [kong/3](targets/go/kong/bugs.toml) | A flag with a default counts as used in its and group, so an empty command line is an error | wrong-result | medium | v1.16.1-9-ga60008c (a60008c6d) | open |  |
 | [kong/4](targets/go/kong/bugs.toml) | A -- after the first value of a cumulative positional ends it and the rest is unexpected | wrong-result | medium | v1.16.1-9-ga60008c (a60008c6d) | open |  |
-| [kong/5](targets/go/kong/bugs.toml) | A required flag alone in its xor or lastwins group is not required at all | wrong-result | medium | v1.16.1-9-ga60008c (a60008c6d) | open |  |
+| [kong/5](targets/go/kong/bugs.toml) | A required flag alone in its xor, and or lastwins group is not required at all | wrong-result | medium | v1.16.1-9-ga60008c (a60008c6d) | open |  |
 | [kong/6](targets/go/kong/bugs.toml) | A counter flag with a default increments from zero, not from the default | wrong-result | low | v1.16.1-9-ga60008c (a60008c6d) | open |  |
 | [lipgloss/1](targets/go/lipgloss/bugs.toml) | Underline or Strikethrough styles the text rune by rune, tearing grapheme clusters apart | wrong-result | medium | v2 (charm.land/lipgloss/v2), untagged main 2026-09-11 (6a419c654) | open |  |
 | [lipgloss/2](targets/go/lipgloss/bugs.toml) | Reverse is dropped from spaces when the space styler is active | wrong-result | medium | v2 (charm.land/lipgloss/v2), untagged main 2026-09-11 (6a419c654) | open |  |

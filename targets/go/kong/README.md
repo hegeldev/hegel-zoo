@@ -10,10 +10,12 @@ Tested here: `Kong.Parse` over generated grammars and argument lists.
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of three
-`hegel_zoo_*_test.go` files that drive the public API: a grammar struct type built with
-`reflect.StructOf` from a generated spec (tags written as kong documents them), `kong.New`
-with `NoDefaultHelp` and `Parse`, then `Context.Command()` and the struct's fields read back.
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of seven
+`hegel_zoo_*_test.go` files (the idioms, the harness with the judge and the switch set, the
+spec records and the argument lists, the model, the wide property, the narrow properties, the
+pins) that drive the public API: a grammar struct type built with `reflect.StructOf` from a
+generated spec (tags written as kong documents them), `kong.New` with `NoDefaultHelp` and
+`Parse`, then `Context.Command()` and the struct's fields read back.
 `go test -count=1 -run TestHegel -v ./hegel`
 
 ## Oracles
@@ -31,40 +33,65 @@ with `NoDefaultHelp` and `Parse`, then `Context.Command()` and the struct's fiel
   `withargs` also for unmatched arguments), passthrough commands and positionals (all and
   partial), the package's error messages incl. "did you mean" suggestions. The model
   reimplements this over the same spec; values are parsed with the same `strconv`/`time`
-  calls.
+  calls. It takes the switch set of the recorded bugs (below) and, with a switch on, follows
+  kong's code for that bug instead.
 - The result compared: the error text, or `Command()` and every field of the grammar struct
   (nil kept apart from empty for slices, maps and pointers).
 
 ## Properties
 
-- `TestHegelRun`: a grammar of 1-3 levels (root, 0-3 subcommands, sub-subcommands), 0-3
-  flags per command from 15 kinds (bool, negatable bool, string, int, int8, uint16, float64,
-  duration, []string, []int, map[string]string, map[string]int, counter, *int, enum string)
-  with shorts, aliases, `required`, `hidden`, defaults (mostly valid), xor/and/lastwins groups;
-  1-3 positionals (string, int, int8, or a slice/map last, required or optional, sometimes
-  passthrough), subcommands with aliases, hidden and default commands, passthrough commands;
-  an argument list of up to 8 tokens, mostly a walk towards one command with its flags (all
-  forms, values fit for the kind and not, combined short tokens, `-s=v`) and its positionals,
-  with `--` and odd tokens (`-`, `-1`, `""`, unknown flags, whitespace) around; against the
-  model.
-- `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
-  failures).
+A case is a record: the grammar drawn as raw material (per command the flags with their
+kind, name index, short, aliases, groups and default, the positionals, the children) and built
+by a pure function that resolves the name collisions kong's duplicate check would refuse, and
+an argument list drawn as a walk over the built grammar; every weight carries the rate it
+realises over three thousand cases. The model `runExpected(case, known)` states the result
+with every switch off and, with a switch on, kong's rule for that bug; the classifier runs it
+per switch before the library is called and names the shape (sufficiency first, then
+necessity, holes counted: none over three thousand cases, every shaped case agreeing with the
+replica), and a case that fails names its bug in the message. Under `HEGEL_NO_KNOWN=1` the
+non-ASCII short is an alternative of weight zero and the cases the classifier names for
+kong/2 to 6 are drawn again (about 3 % of the draws); every property passes there.
+
+| Test | What it checks | Shapes drawn |
+| --- | --- | --- |
+| `Run` | a grammar of 1-3 levels (root, 0-3 subcommands, sub-subcommands), 0-3 flags per command from 15 kinds (bool, negatable bool, string, int, int8, uint16, float64, duration, []string, []int, map[string]string, map[string]int, counter, *int, enum string) with shorts, aliases, `required`, `hidden`, defaults (mostly valid), xor/and/lastwins groups; 1-3 positionals (string, int, int8, or a slice/map last, required or optional, sometimes passthrough), subcommands with aliases, hidden and default commands, passthrough commands; an argument list of up to 8 tokens, mostly a walk towards one command with its flags (all forms, values fit for the kind and not, combined short tokens, `-s=v`) and its positionals, with `--` and odd tokens (`-`, `-1`, `""`, unknown flags, whitespace) around; against the model | a non-ASCII short (/1, one short in twelve), group members with defaults (/2, /3), `--` among a cumulative positional's values (/4), a required member alone in its group (/5), counters with defaults (/6) |
+
+The wide property fails by the shape it draws most often, measured over forty rounds at a
+hundred cases: kong/5 (intermittent; 34 of 40 rounds failed, 24 by kong/5, 5 by kong/1, 3 by
+kong/6, 2 by kong/4), the lone required member being the commonest shape since every
+grammar draws required flags and groups independently; the six shapes together are about
+three per cent of the cases.
+
+Six narrow properties draw one bug's shape each with random surroundings (the shaped flags
+on the root or on a subcommand of a flagless root, beside plain flags, with one more emission
+sometimes) and fail every run; under `HEGEL_NO_KNOWN=1` each draws the region past the shape
+and passes: `NonASCIIShortFlagsAreGiven` (/1), `DefaultsDoNotCountInXorGroups` (/2),
+`DefaultsDoNotCountInAndGroups` (/3), `DashDashInsideCumulativePositionals` (/4, a cumulative
+positional that is not passthrough), `LoneRequiredChoiceMembersAreRequired` (/5, xor, lastwins
+and one-member and groups) and `CountersIncrementFromTheirDefault` (/6, a non-zero default).
+
+Each `TestHegelPin…` reproduces one bug and is an expected failure. `ZOO_COLLECT=1` turns
+failures into a tally per property.
 
 ## Bugs
 
 Six, recorded in `bugs.toml`: a short flag declared as a non-ASCII rune can never be given
 (kong/1); a flag with a default counts as used in its xor group, so the other member cannot
-be given (kong/2), and in its and group, so an empty command line fails (kong/3); `--` after
-the first value of a cumulative positional ends it and the rest is rejected (kong/4); a
-required flag alone in its xor or lastwins group is not required at all (kong/5); a counter
-with a default increments from zero (kong/6).
+be given and a required member beside it is never missing (kong/2), and in its and group, so
+an empty command line fails (kong/3); `--` after the first value of a cumulative positional
+ends it and the rest is rejected (kong/4); a required flag alone in its xor, and or lastwins
+group is not required at all (kong/5); a counter with a default increments from zero (kong/6).
 
 ## Modelled as recorded
 
-kong/2 and kong/3 are in the model behind the `HZKnown` switch `defaultsCountInGroups`,
-kong/4 behind `dashDashStopsCumulative`, kong/5 behind `requiredChoiceMemberOptional`, kong/6
-behind `counterIgnoresDefault`; `ZOO_KNOWN_OFF=name` turns a switch off and the property then
-fails. kong/1 is not reached (the generated shorts are ASCII).
+Six switches, off by default, under which the model follows kong's code instead of the
+documentation: `kShortSplitsByBytes` (/1: the scanner cuts a short token by bytes, so the
+first byte of the rune is the unknown flag and the suggestions follow), `kDefaultsCountInXor`
+(/2: a defaulted member counts as the group's use in the duplicate check and in the missing
+check), `kDefaultsCountInAnd` (/3: the same in the and-group check), `kDashDashStopsCumulative`
+(/4: the positional's decoder stops at `--`), `kLoneRequiredChoiceMember` (/5: a group's missing
+required members are reported only when two or more) and `kCounterIgnoresDefault` (/6: the
+increments start from the traced zero).
 
 Design notes the model follows (undocumented, taken from the code):
 
@@ -98,3 +125,5 @@ the path/file named mappers, custom mappers, `Validate()`, `AllowHyphenPrefixedP
 ## History
 
 - 2026-09-21: new target, one property, 6 bugs.
+- 2026-10-12: rewritten: cases as records, the switches off by default with the classifier
+  naming the shape, kong/1 drawn, six narrow properties; the notes of kong/2 and kong/5 widened.
