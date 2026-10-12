@@ -4224,12 +4224,12 @@ line2` | wrong-result | low | 0.6.8 (58fb0747c) | open |  |
 | [decompress/5](targets/ocaml/decompress/bugs.toml) | the gzip encoder writes MTIME big-endian | contract | low | v1.6.1+ (d0e44781e) | open |  |
 | [decompress/6](targets/ocaml/decompress/bugs.toml) | the zlib encoder makes no progress with a 2- or 3-byte output buffer | hang | low | v1.6.1+ (d0e44781e) | open |  |
 | [decompress/7](targets/ocaml/decompress/bugs.toml) | the gzip encoder makes no progress when the output buffer is smaller than the header | hang | medium | v1.6.1+ (d0e44781e) | open |  |
-| [decompress/8](targets/ocaml/decompress/bugs.toml) | De.Def.Ns.compress_bound is too small at levels 0-4 for incompressible input | contract | medium | v1.6.1+ (d0e44781e) | open |  |
+| [decompress/8](targets/ocaml/decompress/bugs.toml) | De.Def.Ns.deflate at levels 0-4 fails on input it stores uncompressed, whatever the output size | contract | medium | v1.6.1+ (d0e44781e) | open |  |
 | [decompress/9](targets/ocaml/decompress/bugs.toml) | the zlib decoder passes CINFO above 7 to allocate, which raises Invalid_argument | panic | medium | v1.6.1+ (d0e44781e) | open |  |
 | [decompress/10](targets/ocaml/decompress/bugs.toml) | the gzip decoder accepts a CM other than 8 and reserved FLG bits | contract | low | v1.6.1+ (d0e44781e) | open |  |
 | [decompress/11](targets/ocaml/decompress/bugs.toml) | De.Inf raises Invalid_argument on a stored block cut short at the end of a Manual input | panic | medium | v1.6.1+ (d0e44781e) | open |  |
 | [decompress/12](targets/ocaml/decompress/bugs.toml) | the gzip decoder fails unless the whole header and one more byte come in the first input chunk | contract | high | v1.6.1+ (d0e44781e) | open |  |
-| [decompress/13](targets/ocaml/decompress/bugs.toml) | De.Def.Ns.deflate at levels 5-9 writes no data for compressible input | silent-corruption | high | v1.6.1+ (d0e44781e) | open |  |
+| [decompress/13](targets/ocaml/decompress/bugs.toml) | De.Def.Ns.deflate at levels 5-9 writes nothing: compress_lazy is a stub that returns 0 | silent-corruption | high | v1.6.1+ (d0e44781e) | open |  |
 | [digestif/1](targets/ocaml/digestif/bugs.toml) | consistent_of_hex rejects a digest's hex followed by whitespace, which it documents as ignored | contract | low | v1.3.1+ (171cd7f6d) | open |  |
 | [ipaddr/1](targets/ocaml/ipaddr/bugs.toml) | V4.Prefix.subnets on 0.0.0.0/0 yields only the first subnet | contract | low | v5.6.2 (8332fff3d) | open |  |
 | [ipaddr/2](targets/ocaml/ipaddr/bugs.toml) | IPv6 parsing accepts a group of more than four hex digits when the extra ones are leading zeros | contract | low | v5.6.2 (8332fff3d) | open |  |
@@ -4246,7 +4246,7 @@ line2` | wrong-result | low | 0.6.8 (58fb0747c) | open |  |
 | [otoml/11](targets/ocaml/otoml/bugs.toml) | the printer raises Failure on an array of tables nested in a table inside an array of tables, a document otoml parses | panic | medium | 1.0.5 (04e6370e8) | open |  |
 | [otoml/12](targets/ocaml/otoml/bugs.toml) | in a multi-line literal string, a backslash before the final newline is taken as a line continuation and both are dropped | silent-corruption | low | 1.0.5 (04e6370e8) | open |  |
 | [sexplib/1](targets/ocaml/sexplib/bugs.toml) | load_sexp rejects a file whose one S-expression is followed by a sexp comment over an atom at the end of the file | contract | low | v0.18~preview.130.106+341 (f7dd083f4) | open |  |
-| [sexplib/2](targets/ocaml/sexplib/bugs.toml) | input_sexp swallows the character that ends an atom: on a(b) the next input_sexp reads b, then fails on the ) | silent-corruption | medium | v0.18~preview.130.106+341 (f7dd083f4) | open |  |
+| [sexplib/2](targets/ocaml/sexplib/bugs.toml) | input_sexp swallows the character that ends an atom: on a(b) the next input_sexp reads b and the ) is lost too | silent-corruption | medium | v0.18~preview.130.106+341 (f7dd083f4) | open |  |
 | [sexplib/3](targets/ocaml/sexplib/bugs.toml) | Path.parse wraps an index past max_int round: .[9223372036854775809] selects element 1 | contract | low | v0.18~preview.130.106+341 (f7dd083f4) | open |  |
 | [sexplib/4](targets/ocaml/sexplib/bugs.toml) | Conv.mat_of_sexp raises Out_of_memory instead of Of_sexp_error when m * n overflows to the length of the data | contract | low | v0.18~preview.130.106+341 (f7dd083f4) | open |  |
 | [sexplib/5](targets/ocaml/sexplib/bugs.toml) | scan_sexps and the other scan functions prepend the strings inside a block comment to the next quoted atom: #|"a"|# "b" reads as "ab" | silent-corruption | medium | v0.18~preview.130.106+341 (f7dd083f4) | open |  |
