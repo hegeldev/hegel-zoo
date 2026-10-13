@@ -37,7 +37,11 @@ their wide property), `hegel_zoo_shapes_test.go` (ten narrow properties) and
   the outcome `ok`, or the set of the error messages the merge can hit (the package stops at
   the first, in map order), or a crash where a switched bug reaches one (or a crash or one of
   the errors, whichever map order reaches first); the result compared structurally (nil and
-  empty containers alike, times by `Equal`, pointers by their targets).
+  empty containers alike, times by `Equal`, pointers by their targets), and two observations: the
+  unexported maps of the `Inner`s in the result (`private`, documented unchanged) and the targets
+  of the pointers the destination's interfaces held before the merge, read after it (`handles`,
+  documented changed only where the merge went through them). A typed nil pointer source is
+  `ErrNilArguments` (a conjecture: the pin accepts any error).
 - Laws that hold whatever the model says: the source is not modified; a zero source changes
   nothing (unless empty values override); merging the same source twice is the same as once
   (unless appending). Each law is also stated on the model, which is how its cases are
@@ -47,16 +51,30 @@ their wide property), `hegel_zoo_shapes_test.go` (ten narrow properties) and
   to one dereferenced first), a nested map maps into a struct field, a value of another kind
   is a "type mismatch" error, other keys are skipped; from a struct into a map, every exported
   field under its name in lower camel case, missing keys added, present ones replaced with
-  `WithOverride` when the field is not empty.
+  `WithOverride` when the field is not empty. A typed map with string keys maps like a
+  `map[string]interface{}` (the documentation: "src can be a map with string keys"); a typed nil
+  pointer value is skipped like an untyped nil; a value of the field's kind but another type is
+  the type-mismatch error with the types named; a key naming a promoted field through a nil
+  embedded pointer is skipped; a nil destination map is allocated; a typed map destination is
+  `ErrExpectedMapAsDestination` (the two error texts are conjectures: the pins accept any error,
+  and those shapes are never judged under `HEGEL_NO_KNOWN=1`).
 - The replicas of the recorded bugs the generators reach (`known`, one switch per bug, off by
   default): with a switch on the model follows the library's rule for that bug, transcribed
   from the source at the point named beside the switch (`isEmptyValue`'s array rule for
-  mergo/7, `deepMerge`'s pointer, struct, slice and map cases for 6, 8, 15, 16, 17, 19 and 20,
-  `deepMap`'s forced overwrite and interface mismatch for 10 and 9). The classifier runs the
-  model with no switch, with each switch alone and with all but each, before the library is
-  called, and names a case's shape by the first switch that changes the statement (then by
-  the first whose absence does); the library's statement is also compared with the model's
-  under every switch (replica agreement, 100 percent over three thousand cases).
+  mergo/7, `deepMerge`'s pointer, struct, slice and map cases for 6, 8, 12, 15, 16, 17, 18, 19
+  and 20, `deepMap`'s forced overwrite and interface mismatch for 10 and 9, `resolveValues` and
+  `_map` for 1, the Map case's deletion loop on an unexported map for 2, `deepMap`'s kind-only
+  check, nil-map assignment, typed-nil dereference, map type assertions and `FieldByName` for
+  3, 4, 5, 11 and 14, and 13). The classifier runs the model with no switch, with each switch
+  alone and with all but each, before the library is called, and names a case's shape by the
+  first switch that changes the statement (then by the first whose absence does); the
+  library's statement is also compared with the model's under every switch (replica agreement,
+  100 percent over three thousand cases). Where the replica states several outcomes (an error
+  on one key and a crash on another, the first key met deciding, and the library meets a
+  map's keys in Go's order) the library is called on fresh copies, up to sixty-four times,
+  until a call disagrees with the documented statement: a judgement that changed with the
+  order was nondeterministic to the engine, which reported the failure without a message or a
+  shrink (a fourth of the runs at one seed before).
 
 The type universe: a `Leaf` of scalars (with a named string type), an `Inner` with a field of
 every shape (embedded structs, pointers to scalars and structs, slices and maps of scalars,
@@ -65,9 +83,15 @@ and a pointer to one, unexported fields) and an `Outer` nesting `Inner` in every
 (with an embedded pointer, a `[]interface{}` and a JSON-like `map[string]interface{}`); the
 roots are these structs, maps of interfaces, structs, pointers and slices, and slices of
 structs, pointers, ints and interfaces. Interfaces hold nothing, scalars, slices, maps of
-interfaces, a `Leaf` or a pointer to one (typed nil included). Empty values are frequent (a
-nil pointer two times in five, a nil slice or map one in three, a zero array or time two in
-five, zero scalars a quarter). A value is drawn by a generator per type and depth, built once
+interfaces, typed maps (`map[string]int`, `map[string]string`), a `Leaf` or a pointer to one
+(typed nil included). Empty values are frequent (a nil pointer two times in five, a nil slice
+or map one in three, a zero array or time two in five, zero scalars a quarter); the unexported
+map of `Inner` is non-nil one time in ten; a source is a typed nil pointer one time in twenty.
+Under `Map` the values are also typed nil pointers, values of the field's kind but another
+type (a string for the named type, a `map[string]interface{}` for a typed map field, a
+`[]interface{}` for a typed slice, a struct of another type) and the flattened entries of
+`Outer`'s embedded `*Emb`; map destinations are nil or typed and sources typed about one time
+in twelve. A value is drawn by a generator per type and depth, built once
 from the field, element and entry generators and allocating afresh on every draw; the
 entries of a map are a counted list set in order (repeated keys collapse, as before); the
 figure beside every weight is the share the probe measured in context.
@@ -85,22 +109,25 @@ figure beside every weight is the share the probe measured in context.
   `TestHegelEntriesTheSourceMapLacksStay` (10), `TestHegelNilEntriesOfTheSourceMapAreEmpty`
   (15), `TestHegelZeroTimesDoNotOverride` (16),
   `TestHegelDeepCopyOverInterfaceElementsOfDifferentKinds` (17),
-  `TestHegelNoDerefOverPointerEntries` (19) and `TestHegelSliceDeepCopyMapEntries` (20).
+  `TestHegelNoDerefOverPointerEntries` (19), `TestHegelSliceDeepCopyMapEntries` (20),
+  `TestHegelNilPointerSourcesAreAnError` (1), `TestHegelUnexportedMapsAreLeftAlone` (2),
+  `TestHegelValuesOfTheFieldsKindButAnotherType` (3),
+  `TestHegelNilDestinationMapsAreAllocated` (4), `TestHegelTypedNilValuesAreSkipped` (5),
+  `TestHegelTypedDestinationMapsAreAnError` (11), `TestHegelReplacedPointersAreLeftAlone`
+  (12), `TestHegelPromotedKeysThroughNilEmbeddedPointers` (13), `TestHegelTypedSourceMaps`
+  (14) and `TestHegelTypedMapsOfDifferentTypesInInterfaces` (18).
 - `TestHegelPin…`: one pin per recorded bug, asserting the documented behaviour (expected
   failures in `target.toml`); the pins that can panic recover.
 
 The wide properties draw the shape of every switched bug at its natural rate (per three
-thousand cases: the merge model names mergo/7 185 times, 6 129, 15 106, 16 73, 8 37, 17 6, 9
-and 20 once; the `Map` model 10 235, 7 133, 9 58, 6 33, 8 17, 17 9, 15 3, 19 2; the laws 7
-119, 16 29, 19 16, 17 11) and fail by the shape they draw most often; the narrow properties
-fail every run. Under `HEGEL_NO_KNOWN=1` the cases the classifier names are not drawn (the
-merge model rejects 17 percent of its draws, the `Map` model 18, the laws 6) and the narrow
-properties draw the region past their shape; every property then passes. The bugs the
-generators keep away from (no nil sources, unexported fields zero, exactly typed `Map`
-values, non-nil map destinations, untyped nil for nil pointers in `Map` values,
-`map[string]interface{}` sources and destinations, embedded structs by value under `Map`,
-interface entries never holding typed maps of different types: mergo/1-5, 11-14 and 18) are
-pin-only until the second part of the rewrite draws them.
+thousand cases: the merge model names mergo/7 211 times, 6 114, 1 106, 15 88, 8 59, 12 35,
+16 30, 2 20, 17 6, 18 4; the `Map` model 10 340, 5 319, 3 195, 1 112, 14 101, 7 91, 11 87, 4
+66, 13 57, 9 33, 6 19, 8 8, 15 2, 2 once; the laws 7 66, 16 42, 19 25, 17 15, 18 9, 9 4, 2 3)
+and fail by the shape they shrink to (a nil pointer source is the simplest failing case, so
+the merge and `Map` models mostly end there); the narrow properties fail every run. Under
+`HEGEL_NO_KNOWN=1` the cases the classifier names are not drawn (the merge model rejects 16
+percent of its draws, the `Map` model 19, the laws 5) and the narrow properties draw the
+region past their shape; every property then passes.
 
 Shrinking: the engine keeps every attempt of a shrink in memory (a property of three
 thousand plain integer draws that always fails reaches 1.6 GB resident on this machine), and
@@ -108,25 +135,29 @@ a merge case of an `Outer` is a sequence of thousands of draws, so the harness b
 shrink of a failure to a budget of failing judgements (`HEGEL_SHRINK_BUDGET`, 1.5 MB of the
 first failure's message by default, between a hundred and three thousand attempts), after
 which the next attempt is rejected before it draws, which ends the shrink, and the engine's
-replay of the last failure prints it. A default run takes three to six minutes and under a
+replay of the last failure prints it. A default run takes two to five minutes and under a
 gigabyte of memory; a shrunk `Outer` case is less minimal than an unbounded shrink would give.
 
 ## Bugs
 
-Twenty, recorded in `bugs.toml`: twelve crashes (a typed nil pointer source; an unexported
-map field under `WithOverwriteWithEmptyValue`; `Map` values of the field's kind but another
-type, in particular a nested `map[string]interface{}` for a typed map field; a nil map
+Twenty, recorded in `bugs.toml`: twelve crashes (a typed nil pointer source of `Merge`, on
+which `Map` returns the wrong error; an unexported map field under
+`WithOverwriteWithEmptyValue`, through `Map` too; `Map` values of the field's kind but another
+type, in particular a nested `map[string]interface{}` for a typed map field and a struct of
+another type merged by field position; a nil map
 destination; a typed nil pointer value; a map destination or source of another map type; a
 promoted field through a nil embedded pointer; `WithSliceDeepCopy` over `[]interface{}`
 elements of different kinds (and, with no option, map-of-interfaces entries of different
 kinds), and over a map-of-interfaces entry that holds a slice in the source and a scalar,
 struct, pointer or non-empty map in the destination; interface entries holding maps of
-different types; `WithoutDereference` with `WithOverride` on pointer entries of maps and on
-the pointer fields of struct entries) and eight wrong results
+different types, a `map[string]interface{}` entry absorbing a typed map's entries silently
+instead; `WithoutDereference` with `WithOverride` on pointer entries of maps and on the
+pointer fields of struct entries) and eight wrong results
 (`WithSliceDeepCopy` merges only pointer and map elements; arrays are never empty;
 `WithoutDereference` with `WithOverride` leaves struct pointers alone; `Map` into a non-empty
 interface field of another dynamic type errors; `Map` removes map entries and pointers the
-source lacks; `WithOverride` merges into a pointer's target before replacing the entry; nil
+source lacks; `WithOverride` merges into a pointer's target before replacing the entry, the
+pointer fields of a typed map's struct entries included; nil
 map entries override without being empty for some kinds and never for pointers; a zero
 `time.Time` overrides under `WithOverride`).
 
@@ -161,3 +192,8 @@ kind (redirected to `Merge` without the type check), channels and funcs, concurr
   turned around (off by default, the properties failing by the shapes they draw), mergo/20
   a tenth switch, the value generators a table per type, ten narrow properties, the shrink
   budget; the notes of mergo/17 and 19 widened after standalone checks.
+- 2026-10-13: rewrite, part 2 of two: the ten bugs the generators kept away from drawn as
+  shapes (mergo/1-5, 11-14 and 18, each reproduced standalone first), ten more narrow
+  properties, the `private` and `handles` observations, the library called again on fresh
+  copies where map order decides its outcome; nine notes widened after standalone checks and
+  mergo/1's title corrected (`Map` returns `ErrNotSupported`, only `Merge` panics).

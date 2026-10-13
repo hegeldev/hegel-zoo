@@ -2178,7 +2178,7 @@ line2` | wrong-result | low | 0.6.8 (58fb0747c) | open |  |
 | [masterminds-semver/5](targets/go/masterminds-semver/bugs.toml) | A hyphen range after a blank-separated comparator in the same AND group is an "improper constraint" (`1.2.3 1.2 - 1.4`, `>=1.0 1.2 - 1.4`) | wrong-result | low | v3.5.0+ (dd2b995c6) | open |  |
 | [masterminds-semver/6](targets/go/masterminds-semver/bugs.toml) | `||` glued to a hyphen range is read as version characters and the constraint is "improper" (`1.2 - 1.4||2.0.1`, `<2.3||0.1.2 - 3.1.1`) | wrong-result | low | v3.5.0+ (dd2b995c6) | open |  |
 | [masterminds-semver/7](targets/go/masterminds-semver/bugs.toml) | With IncludePrerelease, `!= 1.2.x` accepts 1.2.3-alpha while `!= 1.x` rejects it | wrong-result | low | v3.5.0+ (dd2b995c6) | open |  |
-| [mergo/1](targets/go/mergo/bugs.toml) | Merge and Map panic on a typed nil pointer source instead of returning ErrNilArguments | crash | medium | v1.0.2 (7b33b2b01) | open |  |
+| [mergo/1](targets/go/mergo/bugs.toml) | Merge panics on a typed nil pointer source instead of returning ErrNilArguments (Map returns ErrNotSupported) | crash | medium | v1.0.2 (7b33b2b01) | open |  |
 | [mergo/2](targets/go/mergo/bugs.toml) | WithOverwriteWithEmptyValue panics on a non-nil unexported map field | crash | low | v1.0.2 (7b33b2b01) | open |  |
 | [mergo/3](targets/go/mergo/bugs.toml) | Map into a struct panics when a value has the kind of its field but another type | crash | medium | v1.0.2 (7b33b2b01) | open |  |
 | [mergo/4](targets/go/mergo/bugs.toml) | Map into a nil map[string]interface{} destination panics | crash | low | v1.0.2 (7b33b2b01) | open |  |
