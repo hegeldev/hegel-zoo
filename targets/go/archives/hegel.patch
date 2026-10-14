@@ -29,6 +29,1656 @@ index 4e10237..9182dec 100644
  	go4.org v0.0.0-20260112195520-a5071408f32f // indirect
 +	golang.org/x/sys v0.44.0 // indirect
  )
+diff --git a/hegel/hegel_zoo_archivefs_test.go b/hegel/hegel_zoo_archivefs_test.go
+new file mode 100644
+index 0000000..1f9acd9
+--- /dev/null
++++ b/hegel/hegel_zoo_archivefs_test.go
+@@ -0,0 +1,1644 @@
++package hegel
++
++// The ArchiveFS property: the raw-archive record (an archive written by hand with archive/tar
++// or archive/zip: implicit directories, entries out of order, "./" prefixes, a "." entry,
++// directory names with and without a trailing slash), its pure builder and writers, the model
++// of the file system ArchiveFS presents over it before and after its index is built, with
++// the replicas of the recorded bugs threaded on the switch set (archiveFSExpected), a
++// transcription of testing/fstest's TestFS over that model, and the wide property.
++//
++// The model: ArchiveFS's doc comment (fs.go :280-327) says it presents the archive as a
++// file system "that can be used to open and read the files" through fs.FS, fs.ReadDirFS,
++// fs.StatFS and fs.SubFS; the paths it holds are the entries' names cleaned of "./" and of
++// a trailing slash (fs.go :439, :565, :634) and every directory above them, which exist
++// whether or not the archive has an entry for them (an implicit directory: a FileInfo of
++// the directory's base name, mode ModeDir, size 0, zero time, fs.go :1137-1157). Open of a
++// path is the file or the directory of that name: a file reads its content, a directory is
++// a fs.ReadDirFile whose Stat is the directory's info and whose ReadDir lists its children
++// (the entries of its own name, by base name, and nothing deeper) in directory order, with
++// ReadDir(n > 0) paging and ReadDir(n <= 0) returning the children not yet read; the same
++// before and after the index (which ReadDir on the pointer builds, fs.go :598-722). Stat of
++// a path is that info, Stat of a missing name is fs.ErrNotExist (and so is Open), ReadDir
++// of a directory lists its children sorted, fs.WalkDir visits every path once with its
++// kind, Sub roots a subtree, and fstest.TestFS accepts the file system. The checks: "walk"
++// (the paths with their kinds), per path "stat fresh" and "stat indexed" (the info), per
++// missing name the same and "open fresh"/"open indexed" ("not exist"), per file "read
++// fresh"/"read indexed" (the content's hash), per directory "open fresh"/"open indexed" (the
++// info and the sorted children), "readdir" (fs.ReadDir on the pointer), "rest fresh"/"rest
++// indexed" (ReadDir(1) then ReadDir(-1), or ReadDir(1) to the end), "sub" (the walk of
++// Sub of the drawn directory), "testfs" (the classes of the lines of TestFS's report, "none").
++
++import (
++	"archive/tar"
++	"archive/zip"
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"path"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++	"testing/fstest"
++	"time"
++
++	"github.com/mholt/archives"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- the records
++
++// rawEntry is one entry of an archive written by hand: the name as written into the header
++// ("a/", "./a/b", "."), the kind, the content of a file, the target of a link, the
++// permission bits. Every entry is written with the time rawTime.
++type rawEntry struct {
++	Name string
++	Kind byte
++	Data []byte
++	Link string
++	Mode fs.FileMode
++}
++
++func (e rawEntry) clean() string { return path.Clean(e.Name) }
++
++var rawTime = time.Unix(1000000000, 0)
++
++// archiveFSCase is one case: the entries in archive order, the container (a zip, or a tar of
++// TarFormat 1..3: USTAR, PAX, GNU), the directory Sub is tried on ("" for none), whether the
++// missing names that are string prefixes of a base name are probed (Prefixes), and whether
++// the directory files are read as ReadDir(1) then ReadDir(-1) (Rest) or paged to the end.
++type archiveFSCase struct {
++	Entries   []rawEntry
++	Zip       bool
++	TarFormat int
++	SubDir    string
++	Prefixes  bool
++	Rest      bool
++}
++
++func (c archiveFSCase) GoString() string {
++	container := "zip"
++	if !c.Zip {
++		container = "tar " + []string{"", "USTAR", "PAX", "GNU"}[c.TarFormat]
++	}
++	s := fmt.Sprintf("archiveFSCase{%s, sub %q, prefixes %v, rest %v}\n", container, c.SubDir, c.Prefixes, c.Rest)
++	if len(c.Entries) == 0 {
++		return s + "  (no entries)\n"
++	}
++	for _, e := range c.Entries {
++		s += fmt.Sprintf("  %c %q", e.Kind, e.Name)
++		if e.Kind == 'f' {
++			s += fmt.Sprintf(" (%d bytes)", len(e.Data))
++		}
++		if e.Kind == 'l' {
++			s += fmt.Sprintf(" -> %q", e.Link)
++		}
++		s += "\n"
++	}
++	return s
++}
++
++// --------------------------------------------------------------------------- the generators
++
++// rawNames is the name pool of the raw archives (the old hzNames[:12]).
++var rawNames = treeNames[:12]
++
++// rawSpec is one entry as drawn, before the clash rule places it: a path of one to three
++// names, or (Child) a child of an earlier path (the one at ChildAt modulo their number), the
++// kind, the content or the link target, and the spelling of the name (a trailing slash on a
++// directory, a "./" prefix).
++type rawSpec struct {
++	Parts    []string
++	Child    bool
++	ChildAt  int
++	Kind     byte
++	Data     []byte
++	Link     string
++	Slash    bool
++	DotSlash bool
++}
++
++// rawSpecs: the depth 1..3 evenly, a child of an earlier path at 15, a directory 30, a file
++// 60, a link 10 for a tar (a zip holds no link: 30/70), the content of fileData, a
++// directory's trailing slash at 60 (always in a zip), the "./" prefix at dotSlashW (15 in
++// the wide property). Measured over the entries of 3000 cases, parents and all (the probe
++// sees the placed case, not the spec): depth 1/2/3 at 41/35/24 and 4+ at 1 (the children of
++// deep paths), kinds d/f/l at 52/45/3 (the explicit parents are directories), "./" on 11,
++// a tar directory's slash on 82 (the parents always carry one). A flat population (depth 1,
++// no child) is the region past archives/7, whose index names the root after the first
++// nested entry.
++func rawSpecs(zip bool, dotSlashW int, flat bool) hegel.Generator[rawSpec] {
++	kinds := halvesOver([]int{30, 60, 10}, byte('d'), byte('f'), byte('l'))
++	if zip {
++		kinds = halvesOver([]int{30, 70}, byte('d'), byte('f'))
++	}
++	slash := hegel.Just(true)
++	if !zip {
++		slash = dieCoin(60)
++	}
++	depth, childW := 3, 15
++	if flat {
++		depth, childW = 1, 0
++	}
++	return hegel.FlatMap(countedHalves(evenHalves(rawNames...), 1, depth), func(parts []string) hegel.Generator[rawSpec] {
++		return hegel.FlatMap(dieCoin(childW), func(child bool) hegel.Generator[rawSpec] {
++			at := hegel.Just(0)
++			if child {
++				at = rangeHalves(0, 7)
++			}
++			return hegel.FlatMap(at, func(childAt int) hegel.Generator[rawSpec] {
++				return hegel.FlatMap(kinds, func(kind byte) hegel.Generator[rawSpec] {
++					data := hegel.Just([]byte(nil))
++					if kind == 'f' {
++						data = fileData
++					}
++					link := hegel.Just("")
++					if kind == 'l' {
++						link = evenHalves(rawNames...)
++					}
++					return hegel.FlatMap(data, func(d []byte) hegel.Generator[rawSpec] {
++						return hegel.FlatMap(link, func(l string) hegel.Generator[rawSpec] {
++							return hegel.FlatMap(slash, func(sl bool) hegel.Generator[rawSpec] {
++								return hegel.Map(dieCoin(dotSlashW), func(ds bool) rawSpec {
++									return rawSpec{Parts: parts, Child: child, ChildAt: childAt, Kind: kind, Data: d, Link: l, Slash: sl && kind == 'd', DotSlash: ds}
++								})
++							})
++						})
++					})
++				})
++			})
++		})
++	})
++}
++
++// placed is the entries placed by the clash rule and the implicit parents they leave, sorted.
++type placed struct {
++	Entries  []rawEntry
++	Implicit []string
++}
++
++// placeSpecs places the injected entries (the shape of a narrow property) then the drawn
++// specs: a path already a file, a directory, or above or below a file is dropped (no path is
++// both a file and a directory; no duplicates); the parents without an entry of their own
++// are the implicit directories.
++func placeSpecs(inject []rawEntry, specs []rawSpec, zip bool) placed {
++	files := map[string]bool{}
++	dirs := map[string]bool{}
++	var paths []string
++	var out []rawEntry
++	place := func(e rawEntry) {
++		p := e.clean()
++		for q := range files {
++			if q == p || strings.HasPrefix(q, p+"/") || strings.HasPrefix(p, q+"/") {
++				return
++			}
++		}
++		if dirs[p] {
++			return
++		}
++		if e.Kind != 'd' {
++			for q := range dirs {
++				if strings.HasPrefix(q, p+"/") {
++					return
++				}
++			}
++		}
++		if e.Kind == 'd' {
++			dirs[p] = true
++		} else {
++			files[p] = true
++		}
++		paths = append(paths, p)
++		out = append(out, e)
++	}
++	for _, e := range inject {
++		place(e)
++	}
++	for _, s := range specs {
++		p := strings.Join(s.Parts, "/")
++		if s.Child && len(paths) > 0 {
++			p = paths[s.ChildAt%len(paths)] + "/" + s.Parts[0]
++		}
++		e := rawEntry{Name: p, Kind: s.Kind, Data: s.Data, Link: s.Link, Mode: 0o644}
++		switch s.Kind {
++		case 'd':
++			e.Mode = 0o755
++			if s.Slash || zip {
++				e.Name += "/"
++			}
++		case 'l':
++			e.Mode = 0o777
++		}
++		if s.DotSlash {
++			e.Name = "./" + e.Name
++		}
++		place(e)
++	}
++	implicit := map[string]bool{}
++	for _, p := range paths {
++		for d := path.Dir(p); d != "."; d = path.Dir(d) {
++			if !dirs[d] {
++				implicit[d] = true
++			}
++		}
++	}
++	var imp []string
++	for d := range implicit {
++		imp = append(imp, d)
++	}
++	sort.Strings(imp)
++	return placed{Entries: out, Implicit: imp}
++}
++
++// rawParams shapes the population: the container, whether every implicit parent gets an
++// entry (ExplicitAll) and the entries are ordered parents first (InOrder) - the regions past
++// the shapes of archives/4, 5 and 7 -, whether the drawn entries stay at the root (Flat: the
++// region past 7's naming of the root), the weight of the "./" prefix, the probes, and the
++// entries injected first (a narrow property's shape).
++type rawParams struct {
++	Zip          hegel.Generator[bool]
++	ExplicitAll  bool
++	ExplicitNone bool
++	InOrder      bool
++	Flat         bool
++	DotSlashW    int
++	Prefixes     hegel.Generator[bool]
++	Rest         hegel.Generator[bool]
++	Inject       []rawEntry
++}
++
++// wideRawParams is the wide property's population: a zip at 40 (realised 40 and 40 at 3000
++// cases, seeds 7 and 8), the explicit parents drawn (none, all, or each at 50: 40/30/30),
++// the order drawn (as placed, parents first, or shuffled: 35/30/35), "./" at 15, the prefix
++// probes at 40 (realised 39 and 42; never under HEGEL_NO_KNOWN=1: the probes are the shape
++// of archives/6) and ReadDir(1) then ReadDir(-1) at 50 (realised 52 and 49; paging only
++// under HEGEL_NO_KNOWN=1: the shape of archives/8).
++var wideRawParams = rawParams{
++	Zip:       dieCoin(40),
++	DotSlashW: 15,
++	Prefixes:  dieCoin(hzUnless(hzNoKnown, 40)),
++	Rest:      dieCoin(hzUnless(hzNoKnown, 50)),
++}
++
++// rawCasesWith is the cases of a population: 0..8 specs (the cases realise 0 to 19 entries
++// with the parents, 8 percent empty, 9 to 12 each from one to five, thinning past), the
++// explicit parents (none at 40, all at 30, each at 50 at 30 - all when ExplicitAll, none
++// when ExplicitNone; of the cases with a parent, realised all implicit 34 and 38, all
++// explicit 36 and 35, mixed 30 and 27 at seeds 7 and 8), the order (as placed - the parents
++// added last - at 35, parents first at 30, a stable sort by a key drawn per entry - the
++// shuffle as a drawn permutation - at 35; parents first when InOrder; realised: every
++// explicit parent before its contents in 41 and 39 of the cases with one), a "." or "./"
++// entry first at 10 each for a tar (realised 9/9 and 12/8 of the tars), the container's
++// format (a tar's 1..3 evenly, realised 33/35/31 and 31/31/38), the directory for Sub (one of
++// the sorted directories by a drawn index; 85 of the cases have one), the probes.
++func rawCasesWith(p rawParams) hegel.Generator[archiveFSCase] {
++	return hegel.FlatMap(p.Zip, func(zip bool) hegel.Generator[archiveFSCase] {
++		format := hegel.Just(0)
++		if !zip {
++			format = halvesOver([]int{1, 1, 1}, 1, 2, 3)
++		}
++		return hegel.FlatMap(format, func(tf int) hegel.Generator[archiveFSCase] {
++			return hegel.FlatMap(countedHalves(rawSpecs(zip, p.DotSlashW, p.Flat), 0, 8), func(specs []rawSpec) hegel.Generator[archiveFSCase] {
++				pl := placeSpecs(p.Inject, specs, zip)
++				explicit := hegel.Just(repeatBool(len(pl.Implicit), p.ExplicitAll))
++				if !p.ExplicitAll && !p.ExplicitNone {
++					explicit = hegel.FlatMap(halvesOver([]int{40, 30, 30}, 0, 1, 2), func(mode int) hegel.Generator[[]bool] {
++						switch mode {
++						case 0:
++							return hegel.Just(repeatBool(len(pl.Implicit), false))
++						case 1:
++							return hegel.Just(repeatBool(len(pl.Implicit), true))
++						}
++						return hzTuple(repeatGen(len(pl.Implicit), dieCoin(50))...)
++					})
++				}
++				return hegel.FlatMap(explicit, func(coins []bool) hegel.Generator[archiveFSCase] {
++					entries := withExplicitParents(pl, coins, zip)
++					order := hegel.Just(1)
++					if !p.InOrder {
++						order = halvesOver([]int{35, 30, 35}, 0, 1, 2)
++					}
++					return hegel.FlatMap(order, func(mode int) hegel.Generator[archiveFSCase] {
++						keys := hegel.Just([]int(nil))
++						if mode == 2 {
++							keys = hzTuple(repeatGen(len(entries), hegel.Integers(0, 1<<20))...)
++						}
++						return hegel.FlatMap(keys, func(keys []int) hegel.Generator[archiveFSCase] {
++							entries := orderEntries(entries, keys, mode == 1)
++							dot := hegel.Just(0)
++							if !zip {
++								dot = halvesOver([]int{80, 10, 10}, 0, 1, 2)
++							}
++							return hegel.FlatMap(dot, func(dot int) hegel.Generator[archiveFSCase] {
++								entries := withDotEntry(entries, dot)
++								return hegel.FlatMap(rangeHalves(0, 7), func(subAt int) hegel.Generator[archiveFSCase] {
++									return hegel.FlatMap(p.Prefixes, func(prefixes bool) hegel.Generator[archiveFSCase] {
++										return hegel.Map(p.Rest, func(rest bool) archiveFSCase {
++											return buildArchiveFSCase(entries, zip, tf, subAt, prefixes, rest)
++										})
++									})
++								})
++							})
++						})
++					})
++				})
++			})
++		})
++	})
++}
++
++func repeatBool(n int, v bool) []bool {
++	out := make([]bool, n)
++	for i := range out {
++		out[i] = v
++	}
++	return out
++}
++
++func repeatGen[T any](n int, g hegel.Generator[T]) []hegel.Generator[T] {
++	out := make([]hegel.Generator[T], n)
++	for i := range out {
++		out[i] = g
++	}
++	return out
++}
++
++// withExplicitParents appends an entry "d/" for every implicit directory whose coin is true
++// (in sorted order: the old generator iterated a map).
++func withExplicitParents(pl placed, coins []bool, zip bool) []rawEntry {
++	out := append([]rawEntry(nil), pl.Entries...)
++	for i, d := range pl.Implicit {
++		if coins[i] {
++			out = append(out, rawEntry{Name: d + "/", Kind: 'd', Mode: 0o755})
++		}
++	}
++	return out
++}
++
++// orderEntries is the entries stably sorted by the drawn keys (nil: as placed), or parents
++// first (fs.WalkDir's order of the clean paths) when inOrder.
++func orderEntries(entries []rawEntry, keys []int, inOrder bool) []rawEntry {
++	out := append([]rawEntry(nil), entries...)
++	switch {
++	case inOrder:
++		sort.SliceStable(out, func(i, j int) bool { return walkKey(out[i].clean()) < walkKey(out[j].clean()) })
++	case keys != nil:
++		idx := make([]int, len(out))
++		for i := range idx {
++			idx[i] = i
++		}
++		sort.SliceStable(idx, func(i, j int) bool { return keys[idx[i]] < keys[idx[j]] })
++		sorted := make([]rawEntry, len(out))
++		for i, j := range idx {
++			sorted[i] = out[j]
++		}
++		out = sorted
++	}
++	return out
++}
++
++// withDotEntry is the entries with a "." (1) or "./" (2) directory entry first, as tar makes
++// of the current directory.
++func withDotEntry(entries []rawEntry, dot int) []rawEntry {
++	if dot == 0 {
++		return entries
++	}
++	name := []string{"", ".", "./"}[dot]
++	return append([]rawEntry{{Name: name, Kind: 'd', Mode: 0o755}}, entries...)
++}
++
++// buildArchiveFSCase is the case: the directory for Sub is the sorted directories' subAt-th
++// modulo their number ("" without one).
++func buildArchiveFSCase(entries []rawEntry, zip bool, tf, subAt int, prefixes, rest bool) archiveFSCase {
++	c := archiveFSCase{Entries: entries, Zip: zip, TarFormat: tf, Prefixes: prefixes, Rest: rest}
++	if ds := rawDirs(entries); len(ds) > 0 {
++		c.SubDir = ds[subAt%len(ds)]
++	}
++	return c
++}
++
++// archiveFSCases is the cases of the wide property.
++var archiveFSCases = rawCasesWith(wideRawParams)
++
++// --------------------------------------------------------------------------- the paths
++
++// rawPaths is every path the file system holds (the entries' clean names but ".", and the
++// directories above them), sorted; rawDirs the directories among them (explicit or
++// implicit), sorted.
++func rawPaths(entries []rawEntry) []string {
++	seen := map[string]bool{}
++	for _, e := range entries {
++		p := e.clean()
++		if p == "." {
++			continue
++		}
++		seen[p] = true
++		for d := path.Dir(p); d != "."; d = path.Dir(d) {
++			seen[d] = true
++		}
++	}
++	var out []string
++	for p := range seen {
++		out = append(out, p)
++	}
++	sort.Strings(out)
++	return out
++}
++
++func rawDirs(entries []rawEntry) []string {
++	kinds := rawKinds(entries)
++	var out []string
++	for _, p := range rawPaths(entries) {
++		if kinds[p] == 'd' {
++			out = append(out, p)
++		}
++	}
++	return out
++}
++
++// rawKinds is the kind of every path: the entry's, 'd' for an implicit directory.
++func rawKinds(entries []rawEntry) map[string]byte {
++	out := map[string]byte{}
++	for _, p := range rawPaths(entries) {
++		out[p] = 'd'
++	}
++	for _, e := range entries {
++		if p := e.clean(); p != "." {
++			out[p] = e.Kind
++		}
++	}
++	return out
++}
++
++// entryAtPath is the entry of a path (nil for an implicit directory).
++func entryAtPath(entries []rawEntry, p string) *rawEntry {
++	for i := range entries {
++		if entries[i].clean() == p {
++			return &entries[i]
++		}
++	}
++	return nil
++}
++
++// --------------------------------------------------------------------------- the model
++
++// nodeInfo is a FileInfo as the checks spell it (testing/fstest's formatInfo: name, IsDir,
++// mode, size, time): a real entry's (archive/tar's headerFileInfo, archive/zip's: the base
++// name, the mode with its type bits, the size - a zip link's is its target's length -, the
++// time rawTime) or an implicit directory's (fs.go :1151-1157: ModeDir, 0, the zero time).
++type nodeInfo struct {
++	Name  string
++	Kind  byte
++	Mode  fs.FileMode
++	Size  int64
++	Mtime string
++}
++
++func (n nodeInfo) IsDir() bool { return n.Kind == 'd' }
++
++func (n nodeInfo) String() string {
++	return fmt.Sprintf("%s IsDir=%v Mode=%v Size=%d ModTime=%s", n.Name, n.IsDir(), n.Mode, n.Size, n.Mtime)
++}
++
++// entryString is fstest's formatEntry / formatInfoEntry.
++func (n nodeInfo) entryString() string {
++	return fmt.Sprintf("%s IsDir=%v Type=%v", n.Name, n.IsDir(), n.Mode.Type())
++}
++
++func infoOfEntry(e rawEntry, zip bool) nodeInfo {
++	n := nodeInfo{Name: path.Base(e.clean()), Kind: e.Kind, Mode: e.Mode, Mtime: strconv.FormatInt(rawTime.Unix(), 10)}
++	switch e.Kind {
++	case 'd':
++		n.Mode |= fs.ModeDir
++	case 'l':
++		n.Mode |= fs.ModeSymlink
++		if zip {
++			n.Size = int64(len(e.Link))
++		}
++	case 'f':
++		n.Size = int64(len(e.Data))
++	}
++	return n
++}
++
++func implicitInfo(name string) nodeInfo {
++	return nodeInfo{Name: name, Kind: 'd', Mode: fs.ModeDir, Mtime: "zero"}
++}
++
++// infoOf is the library's FileInfo spelled as nodeInfo (the actual side).
++func infoOf(fi fs.FileInfo) nodeInfo {
++	n := nodeInfo{Name: fi.Name(), Kind: 'f', Mode: fi.Mode(), Size: fi.Size(), Mtime: "zero"}
++	switch {
++	case fi.IsDir():
++		n.Kind = 'd'
++	case fi.Mode()&fs.ModeSymlink != 0:
++		n.Kind = 'l'
++	}
++	if !fi.ModTime().IsZero() {
++		n.Mtime = strconv.FormatInt(fi.ModTime().Unix(), 10)
++	}
++	return n
++}
++
++// fsIndex is the index ReadDir builds (fs.go :615-703): contents by clean path, the children
++// of every directory sorted by name.
++type fsIndex struct {
++	contents map[string]nodeInfo
++	dirs     map[string][]nodeInfo
++}
++
++// fsModel is the file system over the entries under the switch set: Prefix as Sub sets it,
++// and the index once ReadDir on the pointer built it (nil before).
++type fsModel struct {
++	entries []rawEntry
++	zip     bool
++	k       known
++	prefix  string
++	index   *fsIndex
++}
++
++func newFSModel(c archiveFSCase, k known) *fsModel {
++	return &fsModel{entries: c.Entries, zip: c.Zip, k: k}
++}
++
++// openResult is what Open gives: a file (not a fs.ReadDirFile; its info), or a directory
++// file with its info and children.
++type openResult struct {
++	File    bool
++	Info    nodeInfo
++	Entries []nodeInfo
++}
++
++var errNotExist = errors.New("not exist")
++
++// included is fileIsIncluded (archives.go :399-415) over a non-nil skip list: the name is in
++// the list, or under one of its entries without a trailing slash.
++func included(skip []string, name string) bool {
++	for _, s := range skip {
++		if name == s || strings.HasPrefix(name, strings.TrimSuffix(s, "/")+"/") {
++			return true
++		}
++	}
++	return false
++}
++
++// buildIndex transcribes ReadDir's handler (fs.go :628-703): every entry's clean name but
++// "." into contents and its parent's sorted children (a real entry replacing an implicit one
++// of the name), then up the path: each directory above gets the next segment as an implicit
++// child when it has none of the name, and - the archives/7 replica, :697-699 - contents of
++// that directory is set, when absent, to an implicit directory NAMED FOR THE SEGMENT BELOW
++// IT (the documented name is the directory's own base name).
++func (m *fsModel) buildIndex() *fsIndex {
++	ix := &fsIndex{contents: map[string]nodeInfo{}, dirs: map[string][]nodeInfo{}}
++	for _, e := range m.entries {
++		name := e.clean()
++		if name == "." {
++			continue
++		}
++		info := infoOfEntry(e, m.zip)
++		ix.contents[name] = info
++		ix.dirs[path.Dir(name)] = insertSorted(ix.dirs[path.Dir(name)], info, true)
++		start := strings.TrimPrefix(path.Dir(name), "/")
++		for dir, base := path.Dir(start), path.Base(start); base != "."; dir, base = path.Dir(dir), path.Base(dir) {
++			ix.dirs[dir] = insertSorted(ix.dirs[dir], implicitInfo(base), false)
++			if _, ok := ix.contents[dir]; !ok {
++				own := base
++				if !m.k[kStatImplicitDirName] {
++					own = path.Base(dir)
++				}
++				ix.contents[dir] = implicitInfo(own)
++			}
++		}
++	}
++	return ix
++}
++
++// insertSorted is the sorted insert of fs.go :656-663 and :684-689: by name; an entry of the
++// name is replaced when replace, else left.
++func insertSorted(list []nodeInfo, e nodeInfo, replace bool) []nodeInfo {
++	i := sort.Search(len(list), func(i int) bool { return list[i].Name >= e.Name })
++	if i < len(list) && list[i].Name == e.Name {
++		if replace {
++			list[i] = e
++		}
++		return list
++	}
++	list = append(list, nodeInfo{})
++	copy(list[i+1:], list[i:])
++	list[i] = e
++	return list
++}
++
++// readDir is ReadDir on the pointer (fs.go :598-722): the index is built once (an index with
++// no directory is built again on every call, :611, to the same end) and the directory's
++// sorted children returned (nil for a missing name or a file).
++func (m *fsModel) readDir(name string) []nodeInfo {
++	name = path.Join(m.prefix, name)
++	if m.index == nil || len(m.index.dirs) == 0 {
++		m.index = m.buildIndex()
++	}
++	return m.index.dirs[name]
++}
++
++// rootInfo is the root's info: Open(".") gives dirFileInfo{implicitDirInfo{"."}} (fs.go
++// :392-394, :408-411), Stat(".") implicitDirInfo{"."} (:529): the same values.
++var rootInfo = implicitInfo(".")
++
++// open transcribes Open (fs.go :338-512): the index first when built (:348-361: a directory
++// with children, an implicit one named for its path - the archives/7 replica -, a missing
++// name; a file or a childless directory falls through); "." before the index is the root
++// listed through an index built on a copy (:384-412); else the handler's walk of the
++// archive (:433-490) with Extract's skip list (tar.go :266, :295; zip.go :225, :253).
++func (m *fsModel) open(name string) (openResult, error) {
++	name = path.Join(m.prefix, name)
++	if m.index != nil {
++		if info, found := m.index.contents[name]; found {
++			if info.IsDir() {
++				if entries, ok := m.index.dirs[name]; ok {
++					return openResult{Info: info, Entries: entries}, nil
++				}
++			}
++		} else {
++			if entries, found := m.index.dirs[name]; found {
++				own := name
++				if !m.k[kStatImplicitDirName] {
++					own = path.Base(name)
++				}
++				return openResult{Info: implicitInfo(own), Entries: entries}, nil
++			}
++			return openResult{}, errNotExist
++		}
++	}
++	if name == "." {
++		copy := *m
++		copy.prefix = ""
++		return openResult{Info: rootInfo, Entries: copy.readDir(".")}, nil
++	}
++	return m.walkOpen(name)
++}
++
++// walkOpen is the handler's walk. The documented directory is set up before the walk when
++// the file system holds it (its entry's info, or the implicit one): under kOpenImplicitDirFile
++// (archives/4, :451-489) it is set up only by its own entry, so a descendant met first is
++// opened and returned as the directory. Its children: under kOpenDirFreshEntries
++// (archives/5) every entry under it is listed by base name as the walk meets it, a
++// subdirectory's entry stopping its descendants through the skip list of RAW names
++// (archives.go :410 against the raw name of :295/:253), so the files of an implicit or late
++// subdirectory and of a "./"-spelt one are its own children; documented, the children are
++// the entries of its own, an implicit subdirectory listed once at its first descendant.
++func (m *fsModel) walkOpen(name string) (openResult, error) {
++	k := m.k
++	kinds := rawKinds(m.entries)
++	var df *openResult
++	if !k[kOpenImplicitDirFile] && kinds[name] == 'd' {
++		info := implicitInfo(path.Base(name))
++		if e := entryAtPath(m.entries, name); e != nil {
++			info = infoOfEntry(*e, m.zip)
++		}
++		df = &openResult{Info: info}
++	}
++	var skip []string
++	listed := map[string]int{}
++	for _, e := range m.entries {
++		if included(skip, e.Name) {
++			continue
++		}
++		clean := e.clean()
++		if !strings.HasPrefix(clean+"/", name+"/") {
++			continue
++		}
++		if clean == name && e.Kind == 'd' {
++			if df == nil || k[kOpenImplicitDirFile] {
++				df = &openResult{Info: infoOfEntry(e, m.zip)}
++			} else {
++				df.Info = infoOfEntry(e, m.zip)
++			}
++			continue
++		}
++		if df != nil {
++			info := infoOfEntry(e, m.zip)
++			if k[kOpenDirFreshEntries] {
++				df.Entries = append(df.Entries, info)
++				if e.Kind == 'd' {
++					skip = append(skip, e.Name)
++				}
++				continue
++			}
++			rel := clean[len(name)+1:]
++			first, _, deeper := strings.Cut(rel, "/")
++			if i, ok := listed[first]; ok {
++				if !deeper {
++					df.Entries[i] = info
++				}
++				continue
++			}
++			listed[first] = len(df.Entries)
++			if deeper {
++				info = implicitInfo(first)
++			}
++			df.Entries = append(df.Entries, info)
++			continue
++		}
++		return openResult{File: true, Info: infoOfEntry(e, m.zip)}, nil
++	}
++	if df == nil {
++		return openResult{}, errNotExist
++	}
++	return *df, nil
++}
++
++// stat transcribes Stat (fs.go :516-594): "." is the root before anything (:521-531); the
++// index when built (:537-547: contents, else an implicit directory named for its path - the
++// archives/7 replica -, else not found); else the walk: the first entry of the clean name
++// (:565-569), else - the fallback of :572-574 - an implicit directory when some entry's
++// clean name has the name as a prefix: under kStatPrefixMissing a STRING prefix (archives/6),
++// documented a path prefix (the name followed by a slash, the guard Open's handler has at
++// :451); named for the full path under kStatImplicitDirName (archives/7), its base name
++// documented.
++func (m *fsModel) stat(name string) (nodeInfo, error) {
++	if name == "." {
++		return rootInfo, nil
++	}
++	name = path.Join(m.prefix, name)
++	if m.index != nil {
++		if info, ok := m.index.contents[name]; ok {
++			return info, nil
++		}
++		if _, ok := m.index.dirs[name]; ok {
++			return m.implicitNamed(name), nil
++		}
++		return nodeInfo{}, errNotExist
++	}
++	fallback := false
++	for _, e := range m.entries {
++		clean := e.clean()
++		if clean == name {
++			return infoOfEntry(e, m.zip), nil
++		}
++		if m.k[kStatPrefixMissing] {
++			fallback = fallback || strings.HasPrefix(clean, name)
++		} else {
++			fallback = fallback || strings.HasPrefix(clean, name+"/")
++		}
++	}
++	if fallback {
++		return m.implicitNamed(name), nil
++	}
++	return nodeInfo{}, errNotExist
++}
++
++func (m *fsModel) implicitNamed(name string) nodeInfo {
++	if m.k[kStatImplicitDirName] {
++		return implicitInfo(name)
++	}
++	return implicitInfo(path.Base(name))
++}
++
++// sub is Sub (fs.go :725-744): Stat of the directory, then a copy rooted at it (the index
++// shared).
++func (m *fsModel) sub(dir string) (*fsModel, error) {
++	info, err := m.stat(dir)
++	if err != nil {
++		return nil, err
++	}
++	if !info.IsDir() {
++		return nil, errors.New("not a directory")
++	}
++	copy := *m
++	copy.prefix = path.Join(m.prefix, dir)
++	return &copy, nil
++}
++
++// walk is fs.WalkDir from "." (ReadDir on the pointer per directory): the paths with their
++// kinds, sorted.
++func (m *fsModel) walk() []string {
++	var out []string
++	var rec func(dir string)
++	rec = func(dir string) {
++		for _, e := range m.readDir(dir) {
++			p := path.Join(dir, e.Name)
++			out = append(out, kindLetter(e)+" "+p)
++			if e.IsDir() {
++				rec(p)
++			}
++		}
++	}
++	rec(".")
++	sort.Strings(out)
++	return out
++}
++
++func kindLetter(n nodeInfo) string {
++	switch {
++	case n.IsDir():
++		return "d"
++	case n.Mode&fs.ModeSymlink != 0:
++		return "l"
++	}
++	return "f"
++}
++
++// dirHandle is a directory file's paging (dirFile.ReadDir, fs.go :1067-1085): n > 0 reads
++// the next n (io.EOF at the end); n <= 0 under kDirFileReadDirRest returns every child and
++// moves nothing (archives/8, :1068-1070), documented the children not yet read.
++type dirHandle struct {
++	entries []nodeInfo
++	read    int
++	k       known
++}
++
++func (h *dirHandle) readDir(n int) ([]nodeInfo, bool) {
++	if n <= 0 {
++		if h.k[kDirFileReadDirRest] {
++			return h.entries, false
++		}
++		rest := h.entries[h.read:]
++		h.read = len(h.entries)
++		return rest, false
++	}
++	if h.read >= len(h.entries) {
++		return nil, true
++	}
++	if h.read+n > len(h.entries) {
++		n = len(h.entries) - h.read
++	}
++	out := h.entries[h.read : h.read+n]
++	h.read += n
++	return out, false
++}
++
++// --------------------------------------------------------------------------- the values
++
++// listingValue spells a directory's children: the names sorted, a slash after a directory's,
++// duplicates kept.
++func listingValue(entries []nodeInfo) string {
++	var names []string
++	for _, e := range entries {
++		n := e.Name
++		if e.IsDir() {
++			n += "/"
++		}
++		names = append(names, n)
++	}
++	sort.Strings(names)
++	return "[" + strings.Join(names, " ") + "]"
++}
++
++// openValue spells an Open result: "file <info>" for a file (not a fs.ReadDirFile), "dir
++// <info> <children>" for a directory file, "not exist".
++func openValue(r openResult, err error) string {
++	if err != nil {
++		return err.Error()
++	}
++	if r.File {
++		return "file " + r.Info.String()
++	}
++	return "dir " + r.Info.String() + " " + listingValue(r.Entries)
++}
++
++func statValue(n nodeInfo, err error) string {
++	if err != nil {
++		return err.Error()
++	}
++	return n.String()
++}
++
++// restValue spells the reads of a directory file: with rest, ReadDir(1) then ReadDir(-1)
++// ("1 then N: <all names sorted>"); else ReadDir(1) to io.EOF and once more ("N pages then
++// EOF: ..."). The names are sorted (a directory file's order is not stated), so the value
++// says how many came each time and whether any came twice.
++func restValue(r openResult, err error, rest bool, k known) string {
++	if err != nil {
++		return err.Error()
++	}
++	if r.File {
++		return "not a directory file"
++	}
++	h := &dirHandle{entries: r.Entries, k: k}
++	if rest {
++		first, _ := h.readDir(1)
++		more, _ := h.readDir(-1)
++		return fmt.Sprintf("%d then %d: %s", len(first), len(more), listingValue(append(append([]nodeInfo(nil), first...), more...)))
++	}
++	var all []nodeInfo
++	pages := 0
++	for pages <= len(r.Entries) {
++		frag, eof := h.readDir(1)
++		if eof {
++			break
++		}
++		all = append(all, frag...)
++		pages++
++	}
++	_, eof := h.readDir(1)
++	end := "EOF"
++	if !eof {
++		end = "more"
++	}
++	return fmt.Sprintf("%d pages then %s: %s", pages, end, listingValue(all))
++}
++
++func sha8(b []byte) string {
++	sum := sha256.Sum256(b)
++	return hex.EncodeToString(sum[:4])
++}
++
++// missingNames are the names probed as missing for a path: its base name shortened by a
++// character (when Prefixes: the shape of archives/6, a string prefix of the entry's name),
++// a child of a file, and the name with "zz" appended - each when the file system does not
++// hold it.
++func missingNames(entries []rawEntry, p string, prefixes bool) []string {
++	kinds := rawKinds(entries)
++	var out []string
++	if b := path.Base(p); len(b) > 1 && prefixes {
++		out = append(out, path.Join(path.Dir(p), b[:len(b)-1]))
++	}
++	if kinds[p] != 'd' {
++		out = append(out, p+"/zz")
++	}
++	out = append(out, p+"zz")
++	var kept []string
++	for _, n := range out {
++		if _, held := kinds[n]; !held {
++			kept = append(kept, n)
++		}
++	}
++	return kept
++}
++
++// archiveFSExpected states every value the property checks for the case under the switch
++// set.
++func archiveFSExpected(c archiveFSCase, k known) checks {
++	out := checks{}
++	fresh := func() *fsModel { return newFSModel(c, k) }
++	indexed := newFSModel(c, k)
++	out.set("walk", strings.Join(indexed.walk(), ", "))
++	kinds := rawKinds(c.Entries)
++	for _, p := range rawPaths(c.Entries) {
++		out.set("stat fresh "+p, statValue(fresh().stat(p)))
++		out.set("stat indexed "+p, statValue(indexed.stat(p)))
++		for _, n := range missingNames(c.Entries, p, c.Prefixes) {
++			out.set("stat fresh "+n, statValue(fresh().stat(n)))
++			out.set("stat indexed "+n, statValue(indexed.stat(n)))
++			out.set("open fresh "+n, openValue(fresh().open(n)))
++			out.set("open indexed "+n, openValue(indexed.open(n)))
++		}
++		if kinds[p] == 'f' {
++			data := entryAtPath(c.Entries, p).Data
++			out.set("read fresh "+p, sha8(data))
++			out.set("read indexed "+p, sha8(data))
++		}
++	}
++	for _, d := range append([]string{"."}, rawDirs(c.Entries)...) {
++		out.set("open fresh "+d, openValue(fresh().open(d)))
++		out.set("open indexed "+d, openValue(indexed.open(d)))
++		out.set("readdir "+d, listingValue(indexed.readDir(d)))
++		r, err := fresh().open(d)
++		out.set("rest fresh "+d, restValue(r, err, c.Rest, k))
++		r, err = indexed.open(d)
++		out.set("rest indexed "+d, restValue(r, err, c.Rest, k))
++	}
++	if c.SubDir != "" {
++		sub, err := fresh().sub(c.SubDir)
++		if err != nil {
++			out.set("sub "+c.SubDir, err.Error())
++		} else {
++			out.set("sub "+c.SubDir, strings.Join(sub.walk(), ", "))
++		}
++	}
++	out.set("testfs", classesValue(testFSClassesOf(fresh(), rawPaths(c.Entries))))
++	return out
++}
++
++func init() {
++	for i, name := range []string{"walk", "stat", "open", "read", "readdir", "rest", "sub", "testfs"} {
++		checkRank[name] = 300 + i
++	}
++}
++
++// --------------------------------------------------------------------------- TestFS transcribed
++
++// testFSClassesOf transcribes testing/fstest's TestFS (testfs.go, Go 1.27) over the model:
++// the classes of the lines its report would carry. TestFS checks the root directory deep
++// first (checkDir: Open, ReadDir(-1), per child checkStat - Open, Stat, the entry against
++// the opened file's Stat and the entry's Info, fs.Stat and fsys.Stat against it - then the
++// child as a directory or a file; then ReadDir(-1) and ReadDir(1) at the end, a second and
++// a third Open, fsys.ReadDir - which builds the index -, fs.ReadDir and Glob), then the
++// expected names against those found, then the same over fs.Sub of the first directory
++// among the expected names. The classes: "open" (Open failed), "open dir not ReadDirFile",
++// "entry mismatch", "stat", "ReadDir at EOF", "ReadDir(1) at EOF", "dir list diff",
++// "readdir", "expected not found", "unexpected files", "file read", "glob", "close", "bad
++// path", "other"; those of the Sub test prefixed "sub ".
++func testFSClassesOf(m *fsModel, expected []string) []string {
++	t := &fsTester{m: m}
++	t.testFS(expected)
++	classes := t.classes
++	if len(classes) == 0 {
++		for _, name := range expected {
++			if i := strings.Index(name, "/"); i >= 0 {
++				dir, dirSlash := name[:i], name[:i+1]
++				var subExpected []string
++				for _, n := range expected {
++					if strings.HasPrefix(n, dirSlash) {
++						subExpected = append(subExpected, n[len(dirSlash):])
++					}
++				}
++				sub, err := m.sub(dir)
++				if err != nil {
++					classes = append(classes, "sub "+subErrClass(err.Error()))
++					break
++				}
++				st := &fsTester{m: sub, prefix: "sub "}
++				st.testFS(subExpected)
++				classes = append(classes, st.classes...)
++				break
++			}
++		}
++	}
++	return uniqueStrings(classes)
++}
++
++func subErrClass(s string) string {
++	if strings.Contains(s, "not a directory") {
++		return "not a directory"
++	}
++	return "stat error"
++}
++
++// classesValue spells a set of classes ("none" for the empty set).
++func classesValue(classes []string) string {
++	if len(classes) == 0 {
++		return "none"
++	}
++	return strings.Join(uniqueStrings(classes), ", ")
++}
++
++type fsTester struct {
++	m       *fsModel
++	prefix  string
++	classes []string
++	dirs    []string
++	files   []string
++}
++
++func (t *fsTester) add(class string) { t.classes = append(t.classes, t.prefix+class) }
++
++func (t *fsTester) testFS(expected []string) {
++	t.checkDir(".")
++	found := map[string]bool{}
++	for _, d := range t.dirs {
++		found[d] = true
++	}
++	for _, f := range t.files {
++		found[f] = true
++	}
++	delete(found, ".")
++	if len(expected) == 0 && len(found) > 0 {
++		t.add("unexpected files")
++	}
++	for _, name := range expected {
++		if !found[name] {
++			t.add("expected not found")
++		}
++	}
++}
++
++func (t *fsTester) openDir(dir string) *dirHandle {
++	r, err := t.m.open(dir)
++	if err != nil {
++		t.add("open")
++		return nil
++	}
++	if r.File {
++		t.add("open dir not ReadDirFile")
++		return nil
++	}
++	return &dirHandle{entries: r.Entries, k: t.m.k}
++}
++
++func (t *fsTester) checkDir(dir string) {
++	t.dirs = append(t.dirs, dir)
++	d := t.openDir(dir)
++	if d == nil {
++		return
++	}
++	list, _ := d.readDir(-1)
++	prefix := ""
++	if dir != "." {
++		prefix = dir + "/"
++	}
++	for _, info := range list {
++		p := prefix + info.Name
++		t.checkStat(p, info)
++		switch info.Mode.Type() {
++		case fs.ModeDir:
++			t.checkDir(p)
++		case fs.ModeSymlink:
++			t.files = append(t.files, p)
++		default:
++			t.checkFile(p)
++		}
++	}
++	if list2, _ := d.readDir(-1); len(list2) > 0 {
++		t.add("ReadDir at EOF")
++		return
++	}
++	if list2, eof := d.readDir(1); len(list2) > 0 || !eof {
++		t.add("ReadDir(1) at EOF")
++		return
++	}
++	if d = t.openDir(dir); d == nil {
++		return
++	}
++	list2, _ := d.readDir(-1)
++	t.checkDirList(list, list2)
++	if d = t.openDir(dir); d == nil {
++		return
++	}
++	list2 = nil
++	for {
++		n := 1
++		if len(list2) > 0 {
++			n = 2
++		}
++		frag, eof := d.readDir(n)
++		list2 = append(list2, frag...)
++		if eof {
++			break
++		}
++		if len(frag) == 0 {
++			t.add("readdir")
++			return
++		}
++	}
++	t.checkDirList(list, list2)
++	list2 = t.m.readDir(dir)
++	t.checkDirList(list, list2)
++	for i := 0; i+1 < len(list2); i++ {
++		if list2[i].Name >= list2[i+1].Name {
++			t.add("readdir")
++		}
++	}
++	list2 = t.m.readDir(dir)
++	t.checkDirList(list, list2)
++	// fs.Glob over the index finds the names it lists: no lines
++}
++
++// checkDirList is fstest's: the lists compared by name (a map of the first: duplicate names
++// collapse), then IsDir and Type.
++func (t *fsTester) checkDirList(list1, list2 []nodeInfo) {
++	old := map[string]*nodeInfo{}
++	for i := range list1 {
++		old[list1[i].Name] = &list1[i]
++	}
++	diffs := 0
++	for _, e2 := range list2 {
++		e1 := old[e2.Name]
++		if e1 == nil {
++			diffs++
++			continue
++		}
++		if e1.entryString() != e2.entryString() {
++			diffs++
++		}
++		delete(old, e2.Name)
++	}
++	diffs += len(old)
++	if diffs > 0 {
++		t.add("dir list diff")
++	}
++}
++
++func (t *fsTester) checkStat(p string, entry nodeInfo) {
++	r, err := t.m.open(p)
++	if err != nil {
++		t.add("open")
++		return
++	}
++	info := r.Info
++	symlink := entry.Mode&fs.ModeSymlink != 0
++	if entry.entryString() != info.entryString() && !symlink {
++		t.add("entry mismatch")
++	}
++	// the entry's Info is the entry itself (fs.FileInfoToDirEntry, implicitDirEntry.Info)
++	if !symlink && entry.String() != info.String() {
++		t.add("entry mismatch")
++	}
++	info2, err := t.m.stat(p)
++	if err != nil {
++		t.add("stat")
++		return
++	}
++	if info2.String() != info.String() {
++		t.add("stat")
++	}
++}
++
++func (t *fsTester) checkFile(p string) {
++	t.files = append(t.files, p)
++	r, err := t.m.open(p)
++	if err != nil {
++		t.add("open")
++		return
++	}
++	if !r.File {
++		// a name listed as a file that opens as a directory (archives/5 lists a
++		// subdirectory's file beside the subdirectory, under the same name): ReadAll of
++		// the directory file is "Open+ReadAll: cannot read a directory file"
++		t.add("file read")
++		return
++	}
++	// ReadAll, fs.ReadFile, a second Open and iotest.TestReader: no lines
++}
++
++// testFSClasses classes the lines of a TestFS report (the library side): the main report's
++// lines, and the Sub test's with the prefix "sub ".
++func testFSClasses(err error) []string {
++	if err == nil {
++		return nil
++	}
++	var out []string
++	prefix := ""
++	text := err.Error()
++	if rest, ok := strings.CutPrefix(text, "testing fs.Sub(fsys, "); ok {
++		prefix = "sub "
++		if i := strings.Index(rest, "): "); i >= 0 {
++			text = rest[i+3:]
++		}
++		if !strings.HasPrefix(text, "TestFS found errors:") {
++			return []string{"sub " + subErrClass(text)}
++		}
++	}
++	for _, line := range strings.Split(text, "\n") {
++		if line == "" || line == "TestFS found errors:" || line[0] == ' ' || line[0] == '\t' {
++			continue
++		}
++		out = append(out, prefix+testFSLineClass(line))
++	}
++	return uniqueStrings(out)
++}
++
++func testFSLineClass(line string) string {
++	switch {
++	case strings.HasPrefix(line, "expected but not found"):
++		return "expected not found"
++	case strings.HasPrefix(line, "expected empty file system"):
++		return "unexpected files"
++	case strings.Contains(line, "Open returned File type"):
++		return "open dir not ReadDirFile"
++	case strings.Contains(line, "ReadDir(-1) at EOF"):
++		return "ReadDir at EOF"
++	case strings.Contains(line, "ReadDir(1) at EOF"):
++		return "ReadDir(1) at EOF"
++	case strings.Contains(line, "mismatch"):
++		return "entry mismatch"
++	case strings.Contains(line, "entry.Info:"):
++		return "entry info"
++	case strings.Contains(line, "fs.Stat"), strings.Contains(line, "fsys.Stat"), strings.Contains(line, ": Stat:"):
++		return "stat"
++	case strings.Contains(line, "Open+ReadAll"), strings.Contains(line, "ReadFile"), strings.Contains(line, "second Open:"),
++		strings.Contains(line, "failed TestReader"), strings.Contains(line, "different data"):
++		return "file read"
++	case strings.Contains(line, ": Open:"):
++		return "open"
++	case strings.Contains(line, ": diff "):
++		return "dir list diff"
++	case strings.Contains(line, "ReadDir"):
++		return "readdir"
++	case strings.Contains(line, "Glob"):
++		return "glob"
++	case strings.Contains(line, "Close"):
++		return "close"
++	case strings.Contains(line, "succeeded, want error"):
++		return "bad path"
++	}
++	return "other: " + hzTrim(line, 60)
++}
++
++// --------------------------------------------------------------------------- the library
++
++// writeRawTar and writeRawZip write the entries by hand with archive/tar (the format given)
++// and archive/zip (Deflate; directories stored; a link's target as its content, mode
++// ModeSymlink), every entry at rawTime.
++func writeRawTar(entries []rawEntry, format tar.Format) []byte {
++	var buf bytes.Buffer
++	tw := tar.NewWriter(&buf)
++	for _, e := range entries {
++		h := &tar.Header{Name: e.Name, Mode: int64(e.Mode), Format: format, ModTime: rawTime}
++		switch e.Kind {
++		case 'd':
++			h.Typeflag = tar.TypeDir
++		case 'f':
++			h.Typeflag = tar.TypeReg
++			h.Size = int64(len(e.Data))
++		case 'l':
++			h.Typeflag = tar.TypeSymlink
++			h.Linkname = e.Link
++		}
++		if err := tw.WriteHeader(h); err != nil {
++			panic(err)
++		}
++		if e.Kind == 'f' {
++			tw.Write(e.Data)
++		}
++	}
++	tw.Close()
++	return buf.Bytes()
++}
++
++func writeRawZip(entries []rawEntry) []byte {
++	var buf bytes.Buffer
++	zw := zip.NewWriter(&buf)
++	for _, e := range entries {
++		h := &zip.FileHeader{Name: e.Name, Method: zip.Deflate, Modified: rawTime}
++		switch e.Kind {
++		case 'd':
++			h.SetMode(fs.ModeDir | e.Mode)
++			h.Method = zip.Store
++		case 'f':
++			h.SetMode(e.Mode)
++		case 'l':
++			h.SetMode(fs.ModeSymlink | e.Mode)
++		}
++		w, err := zw.CreateHeader(h)
++		if err != nil {
++			panic(err)
++		}
++		switch e.Kind {
++		case 'f':
++			w.Write(e.Data)
++		case 'l':
++			w.Write([]byte(e.Link))
++		}
++	}
++	zw.Close()
++	return buf.Bytes()
++}
++
++// archiveFSBuild writes the case's archive.
++func archiveFSBuild(c archiveFSCase) []byte {
++	if c.Zip {
++		return writeRawZip(c.Entries)
++	}
++	return writeRawTar(c.Entries, []tar.Format{0, tar.FormatUSTAR, tar.FormatPAX, tar.FormatGNU}[c.TarFormat])
++}
++
++// archiveFSOf is an ArchiveFS over the bytes, fresh.
++func archiveFSOf(c archiveFSCase, data []byte) *archives.ArchiveFS {
++	var format archives.Extractor = archives.Tar{}
++	if c.Zip {
++		format = archives.Zip{}
++	}
++	return &archives.ArchiveFS{Stream: io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data))), Format: format}
++}
++
++func errValue(err error) string {
++	if errors.Is(err, fs.ErrNotExist) {
++		return "not exist"
++	}
++	return "error: " + err.Error()
++}
++
++// libOpen spells the library's Open as openValue does (a directory file read whole).
++func libOpen(fsys fs.FS, name string) string {
++	f, err := fsys.Open(name)
++	if err != nil {
++		return errValue(err)
++	}
++	defer f.Close()
++	info, err := f.Stat()
++	if err != nil {
++		return "error: Stat: " + err.Error()
++	}
++	rdf, ok := f.(fs.ReadDirFile)
++	if !ok {
++		return "file " + infoOf(info).String()
++	}
++	ents, err := rdf.ReadDir(-1)
++	if err != nil {
++		return "error: ReadDir: " + err.Error()
++	}
++	return "dir " + infoOf(info).String() + " " + listingValue(entriesOf(ents))
++}
++
++func entriesOf(ents []fs.DirEntry) []nodeInfo {
++	var out []nodeInfo
++	for _, e := range ents {
++		n := nodeInfo{Name: e.Name(), Kind: 'f', Mode: e.Type()}
++		switch {
++		case e.IsDir():
++			n.Kind = 'd'
++		case e.Type()&fs.ModeSymlink != 0:
++			n.Kind = 'l'
++		}
++		out = append(out, n)
++	}
++	return out
++}
++
++func libStat(fsys fs.StatFS, name string) string {
++	info, err := fsys.Stat(name)
++	if err != nil {
++		return errValue(err)
++	}
++	return infoOf(info).String()
++}
++
++func libRead(fsys fs.FS, name string) string {
++	data, err := fs.ReadFile(fsys, name)
++	if err != nil {
++		return errValue(err)
++	}
++	return sha8(data)
++}
++
++func libRest(fsys fs.FS, name string, rest bool) string {
++	f, err := fsys.Open(name)
++	if err != nil {
++		return errValue(err)
++	}
++	defer f.Close()
++	rdf, ok := f.(fs.ReadDirFile)
++	if !ok {
++		return "not a directory file"
++	}
++	if rest {
++		first, err1 := rdf.ReadDir(1)
++		more, err2 := rdf.ReadDir(-1)
++		if err1 != nil && err1 != io.EOF {
++			return "error: " + err1.Error()
++		}
++		if err2 != nil {
++			return "error: " + err2.Error()
++		}
++		return fmt.Sprintf("%d then %d: %s", len(first), len(more), listingValue(entriesOf(append(append([]fs.DirEntry(nil), first...), more...))))
++	}
++	var all []fs.DirEntry
++	pages := 0
++	for pages <= 10000 {
++		frag, err := rdf.ReadDir(1)
++		if err == io.EOF {
++			break
++		}
++		if err != nil {
++			return "error: " + err.Error()
++		}
++		if len(frag) == 0 {
++			return "error: no entries and no EOF"
++		}
++		all = append(all, frag...)
++		pages++
++	}
++	end := "more"
++	if _, err := rdf.ReadDir(1); err == io.EOF {
++		end = "EOF"
++	}
++	return fmt.Sprintf("%d pages then %s: %s", pages, end, listingValue(entriesOf(all)))
++}
++
++func libWalk(fsys fs.FS) string {
++	var out []string
++	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return fmt.Errorf("at %q: %w", p, err)
++		}
++		if p != "." {
++			out = append(out, kindLetter(entriesOf([]fs.DirEntry{d})[0])+" "+p)
++		}
++		return nil
++	})
++	if err != nil {
++		return "error: " + err.Error()
++	}
++	sort.Strings(out)
++	return strings.Join(out, ", ")
++}
++
++// archiveFSActual asks the library the questions archiveFSExpected answered: every fresh
++// call on a new ArchiveFS over the bytes, the indexed ones on one whose ReadDir(".") was
++// called first.
++func archiveFSActual(c archiveFSCase, data []byte, withTestFS bool) checks {
++	out := checks{}
++	fresh := func() *archives.ArchiveFS { return archiveFSOf(c, data) }
++	indexed := archiveFSOf(c, data)
++	out.set("walk", libWalk(indexed))
++	indexed.ReadDir(".")
++	kinds := rawKinds(c.Entries)
++	for _, p := range rawPaths(c.Entries) {
++		out.set("stat fresh "+p, libStat(fresh(), p))
++		out.set("stat indexed "+p, libStat(indexed, p))
++		for _, n := range missingNames(c.Entries, p, c.Prefixes) {
++			out.set("stat fresh "+n, libStat(fresh(), n))
++			out.set("stat indexed "+n, libStat(indexed, n))
++			out.set("open fresh "+n, libOpen(fresh(), n))
++			out.set("open indexed "+n, libOpen(indexed, n))
++		}
++		if kinds[p] == 'f' {
++			out.set("read fresh "+p, libRead(fresh(), p))
++			out.set("read indexed "+p, libRead(indexed, p))
++		}
++	}
++	for _, d := range append([]string{"."}, rawDirs(c.Entries)...) {
++		out.set("open fresh "+d, libOpen(fresh(), d))
++		out.set("open indexed "+d, libOpen(indexed, d))
++		ents, err := indexed.ReadDir(d)
++		if err != nil {
++			out.set("readdir "+d, "error: "+err.Error())
++		} else {
++			out.set("readdir "+d, listingValue(entriesOf(ents)))
++		}
++		out.set("rest fresh "+d, libRest(fresh(), d, c.Rest))
++		out.set("rest indexed "+d, libRest(indexed, d, c.Rest))
++	}
++	if c.SubDir != "" {
++		sub, err := fresh().Sub(c.SubDir)
++		if err != nil {
++			out.set("sub "+c.SubDir, "error: "+err.Error())
++		} else {
++			out.set("sub "+c.SubDir, libWalk(sub))
++		}
++	}
++	if withTestFS {
++		out.set("testfs", classesValue(testFSClasses(fstest.TestFS(fresh(), rawPaths(c.Entries)...))))
++	}
++	return out
++}
++
++// --------------------------------------------------------------------------- the property
++
++// archiveFSSansTestFS is the model without the TestFS check (the narrow property of
++// archives/8 is judged on the directory files' reads alone: TestFS's lines on any non-empty
++// archive are the same bug, and under HEGEL_NO_KNOWN=1 they would be the shape of every
++// case).
++func archiveFSSansTestFS(c archiveFSCase, k known) checks {
++	out := archiveFSExpected(c, k)
++	delete(out, "testfs")
++	return out
++}
++
++// archiveFSJudgeOver is the judge of the family: the archive written by hand (the case's
++// construction), then the judgement over the model given (archiveFSExpected, or a narrow
++// property's view of it: past the earlier ids by pastSwitches, or without the TestFS check -
++// sansTestFS, which the library's values leave out too) and archiveFSActual; under
++// HEGEL_NO_KNOWN=1 the checks the switches drops change on their own are dropped from a case
++// rather than the case skipped (judgeByDropping).
++func archiveFSJudgeOver(expected func(archiveFSCase, known) checks, drops []int, sansTestFS bool) func(j *hzCaseJudge, c archiveFSCase) {
++	return func(j *hzCaseJudge, c archiveFSCase) {
++		if c.Zip {
++			hzTally("container zip")
++		} else {
++			hzTally("container tar")
++		}
++		hzTally("entries " + strconv.Itoa(len(c.Entries)))
++		if len(rawDirs(c.Entries)) > len(explicitDirs(c.Entries)) {
++			hzTally("implicit directory")
++		}
++		data := archiveFSBuild(c)
++		actual := func(c *archiveFSCase) checks {
++			out := archiveFSActual(*c, data, !sansTestFS)
++			return out
++		}
++		if len(drops) > 0 {
++			judgeByDropping(j, &c, expected, actual, drops)
++			return
++		}
++		judgeBy(j, &c, expected, actual)
++	}
++}
++
++func explicitDirs(entries []rawEntry) []string {
++	var out []string
++	for _, e := range entries {
++		if e.Kind == 'd' && e.clean() != "." {
++			out = append(out, e.clean())
++		}
++	}
++	return out
++}
++
++// archiveFSDrops are the switches whose checks the wide property drops under HEGEL_NO_KNOWN=1
++// rather than skipping the case: the fresh-mode checks of archives/4, 5, 6 and 7 (the
++// implicit parents, shuffles and "./" prefixes are the population: most cases carry one),
++// and the ReadDir(-1) reads and TestFS lines of archives/8 (every non-empty archive).
++var archiveFSDrops = []int{kOpenImplicitDirFile, kOpenDirFreshEntries, kStatPrefixMissing, kStatImplicitDirName, kDirFileReadDirRest}
++
++// TestHegelArchiveFS: an archive written by hand (implicit directories, entries out of
++// order, "./" prefixes, a "." entry, directories with and without a trailing slash) read
++// through ArchiveFS is the file system of the paths it holds: fs.WalkDir visits every path
++// once with its kind, Stat and Open give the same answers before and after the index is
++// built, a directory file lists its children and pages them, ReadDir lists them sorted,
++// missing names are fs.ErrNotExist, Sub roots a subtree, and testing/fstest accepts it. The
++// shapes of the recorded bugs (a directory opened before its entry, the children of an
++// implicit subdirectory or of "./" names listed by a fresh Open, a missing name that is a
++// string prefix of an entry's, an implicit directory's Name(), ReadDir(-1) after ReadDir(1))
++// are drawn at their natural rates and fail naming the first in id order; under
++// HEGEL_NO_KNOWN=1 the prefix probes and the ReadDir(-1) reads are not drawn, the checks
++// those shapes change are dropped from a case that has them, and a case the classifier
++// still names is skipped by the judge.
++func TestHegelArchiveFS(t *testing.T) {
++	judged(t, archiveFSCases, archiveFSJudgeOver(archiveFSExpected, archiveFSDrops, false))
++}
 diff --git a/hegel/hegel_zoo_compression_test.go b/hegel/hegel_zoo_compression_test.go
 new file mode 100644
 index 0000000..a458a0e
@@ -2820,16 +4470,15 @@ index 0000000..e8b2985
 +}
 diff --git a/hegel/hegel_zoo_gen_test.go b/hegel/hegel_zoo_gen_test.go
 new file mode 100644
-index 0000000..bd326ed
+index 0000000..95feb60
 --- /dev/null
 +++ b/hegel/hegel_zoo_gen_test.go
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,428 @@
 +package hegel
 +
-+// Generators: a tree of files, directories and symbolic links, written to a fstest.MapFS or
-+// to a directory on disk; archives written by hand with archive/tar and archive/zip (the
-+// shapes real archives have and FilesFromFS never produces: implicit directories, entries out
-+// of order, "./" prefixes, a "." entry); and a read-write-seekable byte buffer for Insert.
++// Generators of the old harness, kept for TestHegelInsert (part 4's): a tree of files,
++// directories and symbolic links, written to a fstest.MapFS or to a directory on disk; the
++// archival format; the extraction helper; and a read-write-seekable byte buffer for Insert.
 +
 +import (
 +	"archive/tar"
@@ -2842,7 +4491,6 @@ index 0000000..bd326ed
 +	"os"
 +	"path"
 +	"path/filepath"
-+	"sort"
 +	"strings"
 +	"testing/fstest"
 +	"time"
@@ -2895,7 +4543,7 @@ index 0000000..bd326ed
 +var hzNames = []string{
 +	"a", "b", "c.txt", "d.zip", "e.tar", "f.tar.gz", "g.tgz", "h i", "j.jpg", "K", "l.bak",
 +	"m.tar.txt", "n.gz", "o..p", "q-r", "s_t", "u.PNG", "v.7z", "w.zst", "x", "y.json", "z.tar.zst",
-+	"café", "0", "1.2.3", "long-name-with-many-characters-in-it-for-headers.txt",
++	"caf\u00e9", "0", "1.2.3", "long-name-with-many-characters-in-it-for-headers.txt",
 +}
 +
 +var hzSizes = []int{0, 1, 7, 100, 511, 512, 513, 1023, 1024, 1025, 1500, 4096}
@@ -3134,37 +4782,6 @@ index 0000000..bd326ed
 +	return z
 +}
 +
-+// hzCompression draws a compression format with random options.
-+func hzCompression(tc hegel.TestCase) archives.Compression {
-+	switch hzOldDrawInt(tc, 0, 9) {
-+	case 0:
-+		return archives.Gz{CompressionLevel: hzOldDrawInt(tc, 0, 9), Multithreaded: hzOldChance(tc, 30)}
-+	case 1:
-+		return archives.Bz2{CompressionLevel: hzOldDrawInt(tc, 0, 9)}
-+	case 2:
-+		return archives.Xz{}
-+	case 3:
-+		return archives.Zstd{}
-+	case 4:
-+		level := hzOldDrawInt(tc, 0, 9)
-+		if level != 0 && HZKnown.lz4CompressionLevel {
-+			hzAvoid("lz4CompressionLevel")
-+			level = 0
-+		}
-+		return archives.Lz4{CompressionLevel: level}
-+	case 5:
-+		return archives.Brotli{Quality: hzOldDrawInt(tc, 0, 11)}
-+	case 6:
-+		return archives.Sz{}
-+	case 7:
-+		return archives.Lzip{}
-+	case 8:
-+		return archives.Zlib{CompressionLevel: hzOldDrawInt(tc, 0, 9)}
-+	default:
-+		return archives.MinLZ{}
-+	}
-+}
-+
 +func hzFormatName(f archives.Format) string {
 +	switch v := f.(type) {
 +	case archives.Tar:
@@ -3284,210 +4901,6 @@ index 0000000..bd326ed
 +		return n, io.EOF
 +	}
 +	return n, nil
-+}
-+
-+// --------------------------------------------------------------------------- foreign archives
-+
-+// hzRawEntry is an entry of an archive written by hand.
-+type hzRawEntry struct {
-+	name string // as written into the header ("a/", "./a/b", ".")
-+	kind byte   // 'f', 'd', 'l'
-+	data []byte
-+	link string
-+	mode fs.FileMode
-+}
-+
-+// hzRawArchive is a hand-written archive and the model of what a file system over it holds.
-+type hzRawArchive struct {
-+	entries []hzRawEntry
-+	files   map[string][]byte // clean path -> content (links: the target as content for zip; empty for tar)
-+	links   map[string]string // clean path -> target
-+	dirs    map[string]bool   // clean path -> explicit?
-+}
-+
-+func hzClean(name string) string {
-+	c := path.Clean(name)
-+	return c
-+}
-+
-+// hzGenRawArchive draws entries with the shapes of real archives and builds the model.
-+func hzGenRawArchive(tc hegel.TestCase, zipOK bool) *hzRawArchive {
-+	a := &hzRawArchive{files: map[string][]byte{}, links: map[string]string{}, dirs: map[string]bool{}}
-+	n := hzOldDrawInt(tc, 0, 8)
-+	var paths []string
-+	for i := 0; i < n; i++ {
-+		depth := hzOldDrawInt(tc, 1, 3)
-+		var parts []string
-+		for j := 0; j < depth; j++ {
-+			parts = append(parts, hzOldPick(tc, hzNames[:12]))
-+		}
-+		p := strings.Join(parts, "/")
-+		if hzOldChance(tc, 15) && len(paths) > 0 {
-+			// a child of an earlier path
-+			p = hzOldPick(tc, paths) + "/" + hzOldPick(tc, hzNames[:12])
-+		}
-+		// no path may be both a file and a directory, and no duplicates
-+		clash := false
-+		for q := range a.files {
-+			if q == p || strings.HasPrefix(q, p+"/") || strings.HasPrefix(p, q+"/") {
-+				clash = true
-+			}
-+		}
-+		if _, isDir := a.dirs[p]; isDir {
-+			clash = true
-+		}
-+		if clash {
-+			continue
-+		}
-+		e := hzRawEntry{mode: 0o644}
-+		switch r := hzOldDrawInt(tc, 1, 100); {
-+		case r <= 30:
-+			e.kind = 'd'
-+			e.mode = 0o755
-+			a.dirs[p] = true
-+		case r <= 90 || zipOK:
-+			e.kind = 'f'
-+			e.data = hzData(tc)
-+			a.files[p] = e.data
-+		default:
-+			e.kind = 'l'
-+			e.link = hzOldPick(tc, hzNames[:12])
-+			e.mode = 0o777
-+			a.links[p] = e.link
-+			a.files[p] = nil
-+		}
-+		paths = append(paths, p)
-+		// implicit parents
-+		for d := path.Dir(p); d != "."; d = path.Dir(d) {
-+			if _, ok := a.dirs[d]; !ok {
-+				a.dirs[d] = false
-+			}
-+		}
-+		e.name = p
-+		if e.kind == 'd' && (zipOK || hzOldChance(tc, 60)) {
-+			e.name += "/"
-+		}
-+		if hzOldChance(tc, 15) {
-+			e.name = "./" + e.name
-+		}
-+		a.entries = append(a.entries, e)
-+	}
-+	// explicit parents become explicit directory entries when drawn so
-+	if hzOldChance(tc, 50) {
-+		for d, explicit := range a.dirs {
-+			if !explicit && hzOldChance(tc, 50) {
-+				a.dirs[d] = true
-+				a.entries = append(a.entries, hzRawEntry{name: d + "/", kind: 'd', mode: 0o755})
-+			}
-+		}
-+	}
-+	// order: as drawn (parents first mostly), or shuffled
-+	if hzOldChance(tc, 50) {
-+		for i := len(a.entries) - 1; i > 0; i-- {
-+			j := hzOldDrawInt(tc, 0, i)
-+			a.entries[i], a.entries[j] = a.entries[j], a.entries[i]
-+		}
-+	}
-+	if !zipOK && hzOldChance(tc, 20) {
-+		// a "." directory entry, as tar makes of the current directory
-+		a.entries = append([]hzRawEntry{{name: hzOldPick(tc, []string{".", "./"}), kind: 'd', mode: 0o755}}, a.entries...)
-+	}
-+	return a
-+}
-+
-+// hzModelPaths returns every path of the model (files, links, directories), sorted.
-+func (a *hzRawArchive) modelPaths() []string {
-+	var ps []string
-+	for p := range a.files {
-+		ps = append(ps, p)
-+	}
-+	for d := range a.dirs {
-+		ps = append(ps, d)
-+	}
-+	sort.Strings(ps)
-+	return ps
-+}
-+
-+// children lists the model's immediate children of dir (or of the root when dir is ".").
-+func (a *hzRawArchive) children(dir string) []string {
-+	var cs []string
-+	for _, p := range a.modelPaths() {
-+		if path.Dir(p) == dir {
-+			cs = append(cs, path.Base(p))
-+		}
-+	}
-+	sort.Strings(cs)
-+	return cs
-+}
-+
-+func (a *hzRawArchive) writeTar(format tar.Format) []byte {
-+	var buf bytes.Buffer
-+	tw := tar.NewWriter(&buf)
-+	for _, e := range a.entries {
-+		h := &tar.Header{Name: e.name, Mode: int64(e.mode), Format: format, ModTime: time.Unix(1000000000, 0)}
-+		switch e.kind {
-+		case 'd':
-+			h.Typeflag = tar.TypeDir
-+		case 'f':
-+			h.Typeflag = tar.TypeReg
-+			h.Size = int64(len(e.data))
-+		case 'l':
-+			h.Typeflag = tar.TypeSymlink
-+			h.Linkname = e.link
-+		}
-+		if err := tw.WriteHeader(h); err != nil {
-+			panic(err)
-+		}
-+		if e.kind == 'f' {
-+			tw.Write(e.data)
-+		}
-+	}
-+	tw.Close()
-+	return buf.Bytes()
-+}
-+
-+func (a *hzRawArchive) writeZip() []byte {
-+	var buf bytes.Buffer
-+	zw := zip.NewWriter(&buf)
-+	for _, e := range a.entries {
-+		h := &zip.FileHeader{Name: e.name, Method: zip.Deflate, Modified: time.Unix(1000000000, 0)}
-+		switch e.kind {
-+		case 'd':
-+			h.SetMode(fs.ModeDir | e.mode)
-+			h.Method = zip.Store
-+		case 'f':
-+			h.SetMode(e.mode)
-+		case 'l':
-+			h.SetMode(fs.ModeSymlink | e.mode)
-+		}
-+		w, err := zw.CreateHeader(h)
-+		if err != nil {
-+			panic(err)
-+		}
-+		switch e.kind {
-+		case 'f':
-+			w.Write(e.data)
-+		case 'l':
-+			w.Write([]byte(e.link))
-+		}
-+	}
-+	zw.Close()
-+	return buf.Bytes()
-+}
-+
-+func (a *hzRawArchive) String() string {
-+	var b strings.Builder
-+	for _, e := range a.entries {
-+		fmt.Fprintf(&b, "%c %q", e.kind, e.name)
-+		if e.kind == 'f' {
-+			fmt.Fprintf(&b, " (%d bytes)", len(e.data))
-+		}
-+		if e.kind == 'l' {
-+			fmt.Fprintf(&b, " -> %q", e.link)
-+		}
-+		b.WriteString("\n")
-+	}
-+	return b.String()
 +}
 diff --git a/hegel/hegel_zoo_identify_test.go b/hegel/hegel_zoo_identify_test.go
 new file mode 100644
@@ -5952,10 +7365,10 @@ index 0000000..53e21fe
 +}
 diff --git a/hegel/hegel_zoo_pins_test.go b/hegel/hegel_zoo_pins_test.go
 new file mode 100644
-index 0000000..f6d11ca
+index 0000000..43dbc12
 --- /dev/null
 +++ b/hegel/hegel_zoo_pins_test.go
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,504 @@
 +package hegel
 +
 +// One pin per recorded bug (bugs.toml). Each asserts the documented behaviour and fails while
@@ -6310,8 +7723,10 @@ index 0000000..f6d11ca
 +// archives/19
 +func TestHegelPinIdentifyNondeterministic(t *testing.T) {
 +	data := hzPinArchive(t, archives.Zip{}, hzPinFiles(t, map[string]string{"a.txt": "a"}))
++	// four hundred calls: the name's format wins about nine times in ten, so forty calls agree
++	// by chance about once in seventy runs
 +	var first string
-+	for i := 0; i < 40; i++ {
++	for i := 0; i < 400; i++ {
 +		f, _, err := archives.Identify(context.Background(), "x.tar", bytes.NewReader(data))
 +		r := fmt.Sprintf("err %v", err)
 +		if err == nil {
@@ -6460,30 +7875,21 @@ index 0000000..f6d11ca
 +}
 diff --git a/hegel/hegel_zoo_props_test.go b/hegel/hegel_zoo_props_test.go
 new file mode 100644
-index 0000000..b9f0299
+index 0000000..b336320
 --- /dev/null
 +++ b/hegel/hegel_zoo_props_test.go
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,189 @@
 +package hegel
 +
 +import (
-+	"archive/tar"
 +	"archive/zip"
 +	"bytes"
 +	"context"
-+	"crypto/sha256"
-+	"encoding/hex"
-+	"encoding/json"
 +	"fmt"
 +	"io"
 +	"io/fs"
-+	"os/exec"
-+	"path"
-+	"sort"
 +	"strings"
-+	"sync"
 +	"testing"
-+	"testing/fstest"
 +
 +	kzip "github.com/klauspost/compress/zip"
 +	"github.com/mholt/archives"
@@ -6491,182 +7897,6 @@ index 0000000..b9f0299
 +)
 +
 +var hzCtx = context.Background()
-+
-+// --------------------------------------------------------------------------- round trip
-+
-+// TestHegelArchiveRoundTrip: a tree gathered with FilesFromFS, archived with Tar or Zip (Tar
-+// also under every compression format), comes back from Extract entry for entry: names, kinds,
-+// contents, link targets, permissions, times and the header fields the options set. Identify
-+// names the format from the bytes, and returns them unread; the archive is a file system
-+// (ArchiveFS) that testing/fstest accepts; Python's tarfile/zipfile read the same entries.
-+func TestHegelArchiveRoundTrip(t *testing.T) {
-+	c := hzOldNewCollector(t)
-+	hzOldProperty(t, func(ht *hegel.T) {
-+		tree := hzGenTree(ht, 10)
-+		mfs := hzMapFS(tree)
-+		opts := &archives.FromFSOptions{ClearAttributes: hzOldChance(ht, 30)}
-+		files, err := archives.FilesFromFS(hzCtx, mfs, opts, nil)
-+		if err != nil {
-+			c.failClass(ht, "FilesFromFS error", "FilesFromFS: %v\n%s", err, hzTreeString(tree))
-+			return
-+		}
-+		archival := hzArchival(ht)
-+		var format archives.Format = archival
-+		var comp archives.Compression
-+		if _, isTar := archival.(archives.Tar); isTar && hzOldChance(ht, 50) {
-+			comp = hzCompression(ht)
-+			format = archives.CompressedArchive{Archival: archival, Extraction: archival, Compression: comp}
-+		}
-+		c.count("format " + hzFormatName(format))
-+
-+		var buf bytes.Buffer
-+		if err := format.(archives.Archiver).Archive(hzCtx, &buf, files); err != nil {
-+			if strings.Contains(err.Error(), "USTAR cannot encode") {
-+				c.count("archive: USTAR cannot encode a name (by design)")
-+				return
-+			}
-+			c.failClass(ht, "archive error", "%s Archive: %v\n%s", hzFormatName(format), err, hzTreeString(tree))
-+			return
-+		}
-+		data := buf.Bytes()
-+
-+		got, err := hzExtractAll(format.(archives.Extractor), data)
-+		if err != nil {
-+			c.failClass(ht, "extract error", "%s Extract: %v\n%s", hzFormatName(format), err, hzTreeString(tree))
-+			return
-+		}
-+		if len(got) != len(files) {
-+			c.failClass(ht, "entry count", "%s: %d entries in, %d out\nin: %v\nout: %v", hzFormatName(format), len(files), len(got), hzFileNames(files), hzGotNames(got))
-+			return
-+		}
-+		_, isZip := archival.(archives.Zip)
-+		for i, in := range files {
-+			out := got[i]
-+			where := fmt.Sprintf("%s entry %d (%q)", hzFormatName(format), i, in.NameInArchive)
-+			wantName := in.NameInArchive
-+			if isZip && in.IsDir() {
-+				wantName += "/"
-+			}
-+			if out.name != wantName {
-+				c.failClass(ht, "name", "%s: name %q out", where, out.name)
-+				continue
-+			}
-+			if out.isDir != in.IsDir() {
-+				c.failClass(ht, "kind dir", "%s: IsDir %v in, %v out", where, in.IsDir(), out.isDir)
-+				continue
-+			}
-+			inLink := in.Mode()&fs.ModeSymlink != 0
-+			if out.isLink != inLink {
-+				c.failClass(ht, "kind link", "%s: symlink %v in, %v out (mode %v)", where, inLink, out.isLink, out.mode)
-+				continue
-+			}
-+			if inLink && out.link != in.LinkTarget {
-+				c.failClass(ht, "link target", "%s: link target %q in, %q out", where, in.LinkTarget, out.link)
-+			}
-+			if !in.IsDir() && !inLink {
-+				want, _ := fs.ReadFile(mfs, in.NameInArchive)
-+				if !bytes.Equal(out.data, want) {
-+					c.failClass(ht, "content", "%s: %d bytes in, %d out (equal prefix %d)", where, len(want), len(out.data), hzCommonPrefix(want, out.data))
-+				}
-+				if out.size != int64(len(want)) {
-+					c.failClass(ht, "size", "%s: size %d in, %d out", where, len(want), out.size)
-+				}
-+			}
-+			if out.mode.Perm() != in.Mode().Perm() {
-+				c.failClass(ht, "mode", "%s: mode %v in, %v out", where, in.Mode(), out.mode)
-+			}
-+			if !opts.ClearAttributes && !inLink && !out.mtime.Equal(in.ModTime()) {
-+				c.failClass(ht, "mtime", "%s: mtime %v in, %v out", where, in.ModTime(), out.mtime)
-+			}
-+			switch h := out.header.(type) {
-+			case *tar.Header:
-+				tf := archival.(archives.Tar)
-+				// a PAX header without extended records is a USTAR block: archive/tar reads it back as USTAR
-+				if tf.Format != 0 && h.Format != tf.Format && !(tf.Format == tar.FormatPAX && h.Format == tar.FormatUSTAR) {
-+					c.failClass(ht, "tar format", "%s: format %v asked, %v written", where, tf.Format, h.Format)
-+				}
-+				if h.Uid != tf.Uid || h.Gid != tf.Gid || h.Uname != tf.Uname || h.Gname != tf.Gname {
-+					c.failClass(ht, "tar owner", "%s: owner %d/%d %q/%q asked, %d/%d %q/%q written", where, tf.Uid, tf.Gid, tf.Uname, tf.Gname, h.Uid, h.Gid, h.Uname, h.Gname)
-+				}
-+			case kzip.FileHeader:
-+				zf := archival.(archives.Zip)
-+				want := zf.Compression
-+				if in.IsDir() {
-+					want = zip.Store
-+				} else if zf.SelectiveCompression && hzCompressedExt(in.NameInArchive) {
-+					want = zip.Store
-+				}
-+				if h.Method != want {
-+					c.failClass(ht, "zip method", "%s: method %d wanted, %d written", where, want, h.Method)
-+				}
-+			default:
-+				c.failClass(ht, "header type", "%s: header %T", where, out.header)
-+			}
-+		}
-+
-+		// Identify from the bytes, named and unnamed, seekable and not
-+		for _, name := range []string{"", "x" + format.Extension(), "X" + strings.ToUpper(format.Extension()), "noext"} {
-+			for _, seekable := range []bool{true, false} {
-+				var r io.Reader = bytes.NewReader(data)
-+				if !seekable {
-+					r = struct{ io.Reader }{bytes.NewReader(data)}
-+				}
-+				f, rest, err := archives.Identify(hzCtx, name, r)
-+				where := fmt.Sprintf("%s Identify(%q, seekable=%v) on %d bytes", hzFormatName(format), name, seekable, len(data))
-+				named := name == "x"+format.Extension() || name == "X"+strings.ToUpper(format.Extension())
-+				if err != nil {
-+					if len(files) == 0 && !isZip && !named {
-+						// an empty tar is 1024 zero bytes: nothing for a stream match to see
-+						c.count("identify: empty tar unnamed NoMatch")
-+						continue
-+					}
-+					if len(files) == 0 && isZip && !named && HZKnown.zipEmptyStreamMatch {
-+						hzAvoid("zipEmptyStreamMatch")
-+						continue
-+					}
-+					c.failClass(ht, "identify error", "%s: %v", where, err)
-+					continue
-+				}
-+				if f.Extension() != format.Extension() {
-+					if len(files) == 0 && comp != nil && f.Extension() == comp.Extension() && !named {
-+						c.count("identify: empty tar under compression is the compression only")
-+						continue
-+					}
-+					c.failClass(ht, "identify format", "%s: got %s", where, hzFormatName(f))
-+					continue
-+				}
-+				back, err := io.ReadAll(rest)
-+				if err != nil || !bytes.Equal(back, data) {
-+					c.failClass(ht, "identify stream", "%s: the returned reader gives %d bytes (equal prefix %d), err %v", where, len(back), hzCommonPrefix(back, data), err)
-+				}
-+			}
-+		}
-+
-+		// the archive as a file system
-+		var expect []string
-+		for _, in := range files {
-+			expect = append(expect, in.NameInArchive)
-+		}
-+		afs := &archives.ArchiveFS{Stream: io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data))), Format: format.(archives.Extractor)}
-+		if err := fstest.TestFS(afs, expect...); err != nil {
-+			if rest := hzTestFSUnknown(err); rest != "" {
-+				for _, cls := range hzTestFSClasses(err) {
-+					c.count("TestFS " + cls)
-+				}
-+				c.failClass(ht, "TestFS", "%s: TestFS on the archive:\n%v\n%s", hzFormatName(format), hzTrim(rest, 2500), hzTreeString(tree))
-+			}
-+		}
-+
-+		// Python reads the archive
-+		if py := hzPythonReader(format); py != "" && hzPython() != "" {
-+			if msg := hzPythonCheck(py, data, files, isZip); msg != "" {
-+				c.failClass(ht, "python", "%s: %s\n%s", hzFormatName(format), msg, hzTreeString(tree))
-+			} else {
-+				c.count("python agreed")
-+			}
-+		}
-+	})
-+}
 +
 +func hzTreeString(t *hzTree) string {
 +	var b strings.Builder
@@ -6691,536 +7921,12 @@ index 0000000..b9f0299
 +	return ns
 +}
 +
-+func hzCommonPrefix(a, b []byte) int {
-+	i := 0
-+	for i < len(a) && i < len(b) && a[i] == b[i] {
-+		i++
-+	}
-+	return i
-+}
-+
-+func hzTrim(s string, n int) string {
-+	if len(s) > n {
-+		return s[:n] + "..."
-+	}
-+	return s
-+}
-+
-+// hzCompressedExt mirrors zip.go's compressedFormats set for the names the generator uses.
-+func hzCompressedExt(name string) bool {
-+	switch strings.ToLower(path.Ext(name)) {
-+	case ".7z", ".avi", ".br", ".bz2", ".cab", ".docx", ".gif", ".gz", ".jar", ".jpeg", ".jpg", ".lz", ".lz4", ".lzma",
-+		".m4v", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".png", ".pptx", ".rar", ".sz", ".tbz2", ".tgz", ".tsz", ".txz",
-+		".xlsx", ".xz", ".zip", ".zipx":
-+		return true
-+	}
-+	return false
-+}
-+
-+// hzTestFSUnknown drops the lines of a TestFS report that the recorded bugs explain (while
-+// their switches are on) and returns the rest, "" when nothing is left.
-+func hzTestFSUnknown(err error) string {
-+	var rest []string
-+	for _, line := range strings.Split(err.Error(), "\n") {
-+		l := strings.TrimSpace(line)
-+		switch {
-+		case l == "" || l == "TestFS found errors:":
-+			continue
-+		case strings.Contains(l, "ReadDir(-1) at EOF") && HZKnown.dirFileReadDirRest:
-+			hzAvoid("dirFileReadDirRest")
-+			continue
-+		}
-+		rest = append(rest, line)
-+	}
-+	return strings.Join(rest, "\n")
-+}
-+
-+// hzTestFSClasses names the kinds of error in a TestFS report.
-+func hzTestFSClasses(err error) []string {
-+	seen := map[string]bool{}
-+	var out []string
-+	for _, line := range strings.Split(err.Error(), "\n") {
-+		line = strings.TrimSpace(line)
-+		var cls string
-+		switch {
-+		case strings.Contains(line, "not a fs.ReadDirFile"):
-+			cls = "open dir not ReadDirFile"
-+		case strings.Contains(line, "expected but not found"):
-+			cls = "expected not found"
-+		case strings.HasSuffix(line, "mismatch:"):
-+			cls = "entry mismatch"
-+		case strings.Contains(line, "ReadDir(-1) at EOF"):
-+			cls = "ReadDir at EOF"
-+		case strings.Contains(line, "Stat"):
-+			cls = "stat"
-+		case strings.Contains(line, "ReadDir"):
-+			cls = "readdir"
-+		case strings.Contains(line, "Open"):
-+			cls = "open"
-+		default:
-+			continue
-+		}
-+		if !seen[cls] {
-+			seen[cls] = true
-+			out = append(out, cls)
-+		}
-+	}
-+	return out
-+}
-+
-+// --------------------------------------------------------------------------- python
-+
-+var (
-+	hzPythonOnce sync.Once
-+	hzPythonPath string
-+)
-+
-+func hzPython() string {
-+	hzPythonOnce.Do(func() {
-+		p, err := exec.LookPath("python3")
-+		if err == nil {
-+			hzPythonPath = p
-+		}
-+	})
-+	return hzPythonPath
-+}
-+
-+// hzPythonReader returns the Python module able to read the format, or "".
-+func hzPythonReader(f archives.Format) string {
-+	switch f.(type) {
-+	case archives.Zip:
-+		if f.(archives.Zip).Compression == archives.ZipMethodZstd || f.(archives.Zip).Compression == archives.ZipMethodXz {
-+			return ""
-+		}
-+		return "zipfile"
-+	case archives.Tar:
-+		return "tarfile"
-+	case archives.CompressedArchive:
-+		switch f.(archives.CompressedArchive).Compression.(type) {
-+		case archives.Gz, archives.Bz2, archives.Xz:
-+			return "tarfile"
-+		}
-+	}
-+	return ""
-+}
-+
-+const hzPyScript = `
-+import sys, io, json, tarfile, zipfile, hashlib
-+data = sys.stdin.buffer.read()
-+out = []
-+if sys.argv[1] == "tarfile":
-+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
-+        for m in tf:
-+            kind = "d" if m.isdir() else "l" if m.issym() else "f" if m.isfile() else "?"
-+            h = ""
-+            if kind == "f":
-+                h = hashlib.sha256(tf.extractfile(m).read()).hexdigest()
-+            out.append({"name": m.name, "kind": kind, "size": m.size, "link": m.linkname, "sha": h, "mode": m.mode & 0o777})
-+else:
-+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-+        for m in zf.infolist():
-+            mode = (m.external_attr >> 16) & 0o170000
-+            kind = "d" if m.is_dir() else "l" if mode == 0o120000 else "f"
-+            h = ""
-+            if kind == "f":
-+                h = hashlib.sha256(zf.read(m)).hexdigest()
-+            link = zf.read(m).decode("utf-8", "replace") if kind == "l" else ""
-+            out.append({"name": m.filename, "kind": kind, "size": m.file_size, "link": link, "sha": h, "mode": (m.external_attr >> 16) & 0o777})
-+json.dump(out, sys.stdout)
-+`
-+
-+type hzPyEntry struct {
-+	Name string `json:"name"`
-+	Kind string `json:"kind"`
-+	Size int64  `json:"size"`
-+	Link string `json:"link"`
-+	Sha  string `json:"sha"`
-+	Mode int    `json:"mode"`
-+}
-+
-+func hzPythonCheck(module string, data []byte, files []archives.FileInfo, isZip bool) string {
-+	cmd := exec.Command(hzPython(), "-c", hzPyScript, module)
-+	cmd.Stdin = bytes.NewReader(data)
-+	var stderr bytes.Buffer
-+	cmd.Stderr = &stderr
-+	out, err := cmd.Output()
-+	if err != nil {
-+		return fmt.Sprintf("python %s failed: %v\n%s", module, err, hzTrim(stderr.String(), 1500))
-+	}
-+	var got []hzPyEntry
-+	if err := json.Unmarshal(out, &got); err != nil {
-+		return fmt.Sprintf("python output: %v: %s", err, hzTrim(string(out), 500))
-+	}
-+	if len(got) != len(files) {
-+		return fmt.Sprintf("python sees %d entries, %d archived: %v vs %v", len(got), len(files), hzPyNames(got), hzFileNames(files))
-+	}
-+	for i, in := range files {
-+		g := got[i]
-+		wantName := in.NameInArchive
-+		if isZip && in.IsDir() {
-+			wantName += "/"
-+		}
-+		if g.Name != wantName {
-+			return fmt.Sprintf("python entry %d: name %q (archived %q)", i, g.Name, wantName)
-+		}
-+		kind := "f"
-+		if in.IsDir() {
-+			kind = "d"
-+		} else if in.Mode()&fs.ModeSymlink != 0 {
-+			kind = "l"
-+		}
-+		if g.Kind != kind {
-+			return fmt.Sprintf("python entry %d (%q): kind %s (archived %s)", i, g.Name, g.Kind, kind)
-+		}
-+		if kind == "l" && g.Link != in.LinkTarget {
-+			return fmt.Sprintf("python entry %d (%q): link %q (archived %q)", i, g.Name, g.Link, in.LinkTarget)
-+		}
-+		if kind == "f" {
-+			if g.Size != in.Size() {
-+				return fmt.Sprintf("python entry %d (%q): size %d (archived %d)", i, g.Name, g.Size, in.Size())
-+			}
-+			r, err := in.Open()
-+			if err != nil {
-+				return fmt.Sprintf("open %q: %v", in.NameInArchive, err)
-+			}
-+			b, _ := io.ReadAll(r)
-+			r.Close()
-+			if g.Sha != hzSha(b) {
-+				return fmt.Sprintf("python entry %d (%q): content differs", i, g.Name)
-+			}
-+		}
-+		if fs.FileMode(g.Mode) != in.Mode().Perm() {
-+			return fmt.Sprintf("python entry %d (%q): mode %o (archived %o)", i, g.Name, g.Mode, in.Mode().Perm())
-+		}
-+	}
-+	return ""
-+}
-+
-+func hzSha(b []byte) string {
-+	s := sha256.Sum256(b)
-+	return hex.EncodeToString(s[:])
-+}
-+
-+func hzPyNames(es []hzPyEntry) []string {
-+	var ns []string
-+	for _, e := range es {
-+		ns = append(ns, e.Name)
-+	}
-+	return ns
-+}
-+
-+// --------------------------------------------------------------------------- ArchiveFS
-+
-+// TestHegelArchiveFS: an archive written by hand (implicit directories, entries out of order,
-+// "./" prefixes, a "." entry, directories with and without a trailing slash) read through
-+// ArchiveFS behaves as the file system of the paths it holds: fs.WalkDir visits every path
-+// once with the right kind, Stat and Open work before and after the index is built, ReadDir
-+// lists the children sorted, missing names are ErrNotExist, Sub roots a subtree, and
-+// testing/fstest accepts it.
-+func TestHegelArchiveFS(t *testing.T) {
-+	c := hzOldNewCollector(t)
-+	hzOldProperty(t, func(ht *hegel.T) {
-+		useZip := hzOldChance(ht, 40)
-+		a := hzGenRawArchive(ht, useZip)
-+		var data []byte
-+		var format archives.Extractor
-+		if useZip {
-+			data = a.writeZip()
-+			format = archives.Zip{}
-+			c.count("zip")
-+		} else {
-+			data = a.writeTar(hzOldPick(ht, []tar.Format{tar.FormatUSTAR, tar.FormatPAX, tar.FormatGNU}))
-+			format = archives.Tar{}
-+			c.count("tar")
-+		}
-+		fresh := func() *archives.ArchiveFS {
-+			return &archives.ArchiveFS{Stream: io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data))), Format: format}
-+		}
-+		desc := func() string { return fmt.Sprintf("%T archive:\n%s", format, a.String()) }
-+
-+		// the walk (through ReadDir, which indexes)
-+		indexed := fresh()
-+		var visited []string
-+		kinds := map[string]bool{}
-+		err := fs.WalkDir(indexed, ".", func(p string, d fs.DirEntry, err error) error {
-+			if err != nil {
-+				return fmt.Errorf("at %q: %w", p, err)
-+			}
-+			if p != "." {
-+				visited = append(visited, p)
-+				kinds[p] = d.IsDir()
-+			}
-+			return nil
-+		})
-+		if err != nil {
-+			c.failClass(ht, "walk error", "WalkDir: %v\n%s", err, desc())
-+			return
-+		}
-+		sort.Strings(visited)
-+		want := a.modelPaths()
-+		if strings.Join(visited, "\n") != strings.Join(want, "\n") {
-+			c.failClass(ht, "walk paths", "WalkDir visited %q\nmodel %q\n%s", visited, want, desc())
-+			return
-+		}
-+		for _, p := range want {
-+			_, isDir := a.dirs[p]
-+			if kinds[p] != isDir {
-+				c.failClass(ht, "walk kind", "WalkDir: %q IsDir %v, model %v\n%s", p, kinds[p], isDir, desc())
-+			}
-+		}
-+
-+		// Stat, before and after indexing
-+		for _, p := range want {
-+			explicit, isDir := a.dirs[p]
-+			for _, mode := range []string{"fresh", "indexed"} {
-+				fsys := indexed
-+				if mode == "fresh" {
-+					fsys = fresh()
-+				}
-+				info, err := fsys.Stat(p)
-+				if err != nil {
-+					c.failClass(ht, "stat error", "%s Stat(%q): %v\n%s", mode, p, err, desc())
-+					continue
-+				}
-+				if info.IsDir() != isDir {
-+					c.failClass(ht, "stat kind", "%s Stat(%q): IsDir %v, model %v\n%s", mode, p, info.IsDir(), isDir, desc())
-+				}
-+				if isDir && !explicit && HZKnown.statImplicitDirName {
-+					hzAvoid("statImplicitDirName")
-+				} else if info.Name() != path.Base(p) {
-+					c.failClass(ht, "stat name", "%s Stat(%q): Name() %q\n%s", mode, p, info.Name(), desc())
-+				}
-+			}
-+		}
-+		// Stat of names that do not exist: a prefix of a name, a child of a file, a sibling
-+		for _, p := range want {
-+			var missing []string
-+			if b := path.Base(p); len(b) > 1 {
-+				missing = append(missing, path.Join(path.Dir(p), b[:len(b)-1]))
-+			}
-+			if _, isDir := a.dirs[p]; !isDir {
-+				missing = append(missing, p+"/zz")
-+			}
-+			missing = append(missing, p+"zz")
-+			for _, m := range missing {
-+				if hzModelHas(a, m) {
-+					continue
-+				}
-+				for _, mode := range []string{"fresh", "indexed"} {
-+					fsys := indexed
-+					if mode == "fresh" {
-+						fsys = fresh()
-+					}
-+					info, err := fsys.Stat(m)
-+					if err == nil && mode == "fresh" && a.hasEntryPrefix(m) && HZKnown.statPrefixMissing {
-+						hzAvoid("statPrefixMissing")
-+					} else if err == nil {
-+						c.failClass(ht, "stat missing", "%s Stat(%q) of a missing name: %q dir=%v\n%s", mode, m, info.Name(), info.IsDir(), desc())
-+					}
-+					if _, err := fsys.Open(m); err == nil {
-+						c.failClass(ht, "open missing", "%s Open(%q) of a missing name succeeds\n%s", mode, m, desc())
-+					}
-+				}
-+			}
-+		}
-+
-+		// Open + read files, fresh and indexed; Open + ReadDir directories
-+		for _, p := range want {
-+			if content, isFile := a.files[p]; isFile {
-+				if _, isLink := a.links[p]; isLink {
-+					continue
-+				}
-+				for _, mode := range []string{"fresh", "indexed"} {
-+					fsys := indexed
-+					if mode == "fresh" {
-+						fsys = fresh()
-+					}
-+					got, err := fs.ReadFile(fsys, p)
-+					if err != nil {
-+						c.failClass(ht, "readfile error", "%s ReadFile(%q): %v\n%s", mode, p, err, desc())
-+					} else if !bytes.Equal(got, content) {
-+						c.failClass(ht, "readfile content", "%s ReadFile(%q): %d bytes, model %d\n%s", mode, p, len(got), len(content), desc())
-+					}
-+				}
-+				continue
-+			}
-+			for _, mode := range []string{"fresh", "indexed"} {
-+				fsys := indexed
-+				if mode == "fresh" {
-+					fsys = fresh()
-+					if a.descendantBeforeDir(p) && HZKnown.openImplicitDirFile {
-+						hzAvoid("openImplicitDirFile")
-+						continue
-+					}
-+					if a.hasImplicitSubdir(p) && HZKnown.openDirFreshEntries {
-+						hzAvoid("openDirFreshEntries")
-+						continue
-+					}
-+				}
-+				f, err := fsys.Open(p)
-+				if err != nil {
-+					c.failClass(ht, "open dir error", "%s Open(%q): %v\n%s", mode, p, err, desc())
-+					continue
-+				}
-+				rdf, ok := f.(fs.ReadDirFile)
-+				if !ok {
-+					f.Close()
-+					c.failClass(ht, "open dir type", "%s Open(%q) of a directory: %T, not a ReadDirFile\n%s", mode, p, f, desc())
-+					continue
-+				}
-+				ents, err := rdf.ReadDir(-1)
-+				f.Close()
-+				if err != nil {
-+					c.failClass(ht, "open dir readdir error", "%s Open(%q).ReadDir(-1): %v\n%s", mode, p, err, desc())
-+					continue
-+				}
-+				got := hzEntryNames(ents)
-+				sort.Strings(got) // a ReadDirFile lists in directory order, which need not be sorted
-+				if strings.Join(got, "\n") != strings.Join(a.children(p), "\n") {
-+					c.failClass(ht, "open dir entries", "%s Open(%q).ReadDir(-1): %q, model %q\n%s", mode, p, got, a.children(p), desc())
-+				}
-+			}
-+			ents, err := fs.ReadDir(indexed, p)
-+			if err != nil {
-+				c.failClass(ht, "readdir error", "ReadDir(%q): %v\n%s", p, err, desc())
-+			} else if got := hzEntryNames(ents); strings.Join(got, "\n") != strings.Join(a.children(p), "\n") {
-+				c.failClass(ht, "readdir entries", "ReadDir(%q): %q, model %q\n%s", p, got, a.children(p), desc())
-+			}
-+		}
-+		if got := hzEntryNames(hzMust(fs.ReadDir(indexed, "."))); strings.Join(got, "\n") != strings.Join(a.children("."), "\n") {
-+			c.failClass(ht, "readdir root", "ReadDir(\".\"): %q, model %q\n%s", got, a.children("."), desc())
-+		}
-+
-+		// Sub
-+		if len(a.dirs) > 0 {
-+			ds := make([]string, 0, len(a.dirs))
-+			for d := range a.dirs {
-+				ds = append(ds, d)
-+			}
-+			sort.Strings(ds)
-+			d := hzOldPick(ht, ds)
-+			sub, err := fresh().Sub(d)
-+			if err != nil {
-+				c.failClass(ht, "sub error", "Sub(%q): %v\n%s", d, err, desc())
-+			} else {
-+				var got []string
-+				err := fs.WalkDir(sub, ".", func(p string, de fs.DirEntry, err error) error {
-+					if err != nil {
-+						return err
-+					}
-+					if p != "." {
-+						got = append(got, p)
-+					}
-+					return nil
-+				})
-+				var wantSub []string
-+				for _, p := range want {
-+					if strings.HasPrefix(p, d+"/") {
-+						wantSub = append(wantSub, p[len(d)+1:])
-+					}
-+				}
-+				sort.Strings(got)
-+				if err != nil {
-+					c.failClass(ht, "sub walk error", "Sub(%q) WalkDir: %v\n%s", d, err, desc())
-+				} else if strings.Join(got, "\n") != strings.Join(wantSub, "\n") {
-+					c.failClass(ht, "sub walk", "Sub(%q) WalkDir: %q, model %q\n%s", d, got, wantSub, desc())
-+				}
-+			}
-+		}
-+
-+		// testing/fstest (its Open of directories before the index is built meets the recorded bugs)
-+		files := a.modelPaths()
-+		skipTestFS := false
-+		for d := range a.dirs {
-+			if (a.descendantBeforeDir(d) && HZKnown.openImplicitDirFile) || (a.hasImplicitSubdir(d) && HZKnown.openDirFreshEntries) {
-+				skipTestFS = true
-+			}
-+		}
-+		if skipTestFS {
-+			hzAvoid("openImplicitDirFile")
-+		} else if err := fstest.TestFS(fresh(), files...); err != nil {
-+			if rest := hzTestFSUnknown(err); rest != "" {
-+				for _, cls := range hzTestFSClasses(err) {
-+					c.count("TestFS " + cls)
-+				}
-+				c.failClass(ht, "TestFS", "TestFS:\n%v\n%s", hzTrim(rest, 2500), desc())
-+			}
-+		}
-+	})
-+}
-+
-+// hasEntryPrefix reports whether some entry's clean name starts with the string s.
-+func (a *hzRawArchive) hasEntryPrefix(s string) bool {
-+	for _, e := range a.entries {
-+		if strings.HasPrefix(path.Clean(e.name), s) {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+// descendantBeforeDir reports whether dir has no entry of its own, or some entry under it
-+// comes before its own entry.
-+func (a *hzRawArchive) descendantBeforeDir(dir string) bool {
-+	own := -1
-+	first := -1
-+	for i, e := range a.entries {
-+		n := path.Clean(e.name)
-+		if n == dir {
-+			own = i
-+		} else if strings.HasPrefix(n, dir+"/") && first < 0 {
-+			first = i
-+		}
-+	}
-+	return own < 0 || (first >= 0 && first < own)
-+}
-+
-+// hasImplicitSubdir reports whether some directory under dir has no entry of its own, or an
-+// entry after one of its descendants, or whether an entry under dir is written with a "./"
-+// prefix: the shapes on which Open before the index lists descendants as children.
-+func (a *hzRawArchive) hasImplicitSubdir(dir string) bool {
-+	for d := range a.dirs {
-+		if strings.HasPrefix(d, dir+"/") && a.descendantBeforeDir(d) {
-+			return true
-+		}
-+	}
-+	for _, e := range a.entries {
-+		if strings.HasPrefix(e.name, "./") && strings.HasPrefix(path.Clean(e.name), dir+"/") {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
 +// hzZipName is the name Zip writes for a FileInfo.
 +func hzZipName(f archives.FileInfo) string {
 +	if f.IsDir() {
 +		return f.NameInArchive + "/"
 +	}
 +	return f.NameInArchive
-+}
-+
-+func hzModelHas(a *hzRawArchive, p string) bool {
-+	if _, ok := a.files[p]; ok {
-+		return true
-+	}
-+	_, ok := a.dirs[p]
-+	return ok
-+}
-+
-+func hzEntryNames(ents []fs.DirEntry) []string {
-+	var ns []string
-+	for _, e := range ents {
-+		ns = append(ns, e.Name())
-+	}
-+	return ns
-+}
-+
-+func hzMust[T any](v T, err error) T {
-+	if err != nil {
-+		panic(err)
-+	}
-+	return v
 +}
 +
 +// --------------------------------------------------------------------------- Insert
@@ -7362,12 +8068,805 @@ index 0000000..b9f0299
 +		}
 +	})
 +}
+diff --git a/hegel/hegel_zoo_roundtrip_test.go b/hegel/hegel_zoo_roundtrip_test.go
+new file mode 100644
+index 0000000..51d7b4f
+--- /dev/null
++++ b/hegel/hegel_zoo_roundtrip_test.go
+@@ -0,0 +1,787 @@
++package hegel
++
++// The round-trip property: the case record (a tree, an archival format - part 2's archFormat
++// with the zip pool of the old hzArchival, the Xz method included -, a compression format for
++// a tar - part 2's compFormat with the Lz4 levels -, ClearAttributes), its generators, the
++// documented model with the replicas of the recorded bugs threaded on the switch set
++// (roundTripExpected, over part 2's Identify replica), the TestFS and Python helpers, and the
++// wide property.
++//
++// The model: a tree gathered with FilesFromFS (the whole tree, fs.WalkDir's order, the paths
++// as names) and written by Tar or Zip (Tar under a compression format too) comes back from
++// Extract entry for entry: the name (a zip directory's with a trailing slash, zip.go :150-152;
++// a tar's as given, tar.go :129), the kind, the link target, the content and size, the
++// permission bits, the time unless cleared, the tar header's format and owner as the options
++// say (tar.go :134-155; archive/tar's rules: a USTAR header for what USTAR can encode, PAX
++// records for the rest, GNU as asked), the zip method (Store for directories and, under
++// SelectiveCompression, for names with a compressed extension, zip.go :149-164). The
++// archiving itself is a check: archive/tar's "USTAR cannot encode" of a non-ASCII or
++// over-long name under the USTAR format is its documented limit (the model states it), and
++// Lz4's "invalid compression level" is archives/10. Identify names the format from the
++// bytes, named or not, seekable or not, and returns them whole (part 2's rules: an empty
++// tar is 1024 zero bytes, nothing to match - the README's "Not judged", open -; under a
++// compression it is the compression alone); fstest.TestFS accepts the archive as an
++// ArchiveFS; Python's tarfile and zipfile read the same entries. The checks: "gathered",
++// "archived" ("ok" or the error kind), "extracted" ("ok" or the error kind), "entries" (the
++// count), "entry <i>" (the entry's values), "identify <name> seekable=<b>" (the answer: the
++// extension, "NoMatch", "error: <kind>"), "identify returned" ("whole"), "testfs" (the
++// classes of TestFS's lines, "none"), "python" (the count, "python failed", or open where
++// python3 or a reader is missing) and "python <i>" (the entry as Python lists it).
++
++import (
++	"archive/tar"
++	"archive/zip"
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os/exec"
++	"path"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"testing/fstest"
++
++	kzip "github.com/klauspost/compress/zip"
++	"github.com/mholt/archives"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- the records
++
++// roundTripCase is one case: the tree, the archival format, the compression of a tar (Kind
++// "" for none), ClearAttributes.
++type roundTripCase struct {
++	Tree  []fileEntry
++	Arch  archFormat
++	Comp  compFormat
++	Clear bool
++	notes []string // what the library left (the explanation of a failure)
++}
++
++func (c roundTripCase) GoString() string {
++	s := fmt.Sprintf("roundTripCase{%v", c.Arch)
++	if c.Comp.Kind != "" {
++		s += fmt.Sprintf(" under %v", c.Comp)
++	}
++	s += fmt.Sprintf(", ClearAttributes %v}\n%s", c.Clear, treeString(c.Tree))
++	for _, n := range c.notes {
++		s += "  " + n + "\n"
++	}
++	return s
++}
++
++// --------------------------------------------------------------------------- the generators
++
++// roundTripZipFormats: the method store 1, deflate 2, bzip2 1, zstd 1, xz 1 of six (the old
++// hzArchival's die; at the weights below the halving bits realised 17/28/19/18/18 at seed 7
++// and 20/31/16/22/11 at seed 8 over 3000 cases - the fair bits move five points between
++// seeds), xz at weight zero under HEGEL_NO_KNOWN=1 (the shape of archives/1),
++// SelectiveCompression at 30 (realised 32 and 30).
++var roundTripZipFormats = hegel.FlatMap(halvesOver([]int{4, 8, 4, 4, hzUnless(hzNoKnown, 4)}, zip.Store, zip.Deflate, uint16(archives.ZipMethodBzip2), uint16(archives.ZipMethodZstd), uint16(archives.ZipMethodXz)), func(m uint16) hegel.Generator[archFormat] {
++	return hegel.Map(dieCoin(30), func(sel bool) archFormat { return archFormat{Kind: "zip", ZipMethod: m, Selective: sel} })
++})
++
++// roundTripCases: a tar (part 2's tarFormats) or a zip half each (realised 52/48 and 52/48
++// at 3000 cases, seeds 7 and 8), a tree of up to ten entries (zip: of one to ten under
++// HEGEL_NO_KNOWN=1, the empty zip being the shape of archives/9; realised 7 percent empty,
++// 8 to 12 each from one to nine, 4 at ten), a tar under a compression format half the time
++// (realised 49 and 50 of the tars; part 2's compFormats: the Lz4 levels 1..9 are the shape
++// of archives/10, at weight zero under HEGEL_NO_KNOWN=1), ClearAttributes at 30 (realised
++// 30 and 29).
++var roundTripCases = hegel.FlatMap(halvesGens([]int{1, 1}, tarFormats, roundTripZipFormats), func(a archFormat) hegel.Generator[roundTripCase] {
++	trees := treesOf(10)
++	if hzNoKnown && a.Kind == "zip" {
++		trees = treesBetween(1, 10)
++	}
++	return hegel.FlatMap(trees, func(tree []fileEntry) hegel.Generator[roundTripCase] {
++		comp := hegel.Just(compFormat{})
++		if a.Kind == "tar" {
++			comp = dieMaybe(50, compFormats)
++		}
++		return hegel.FlatMap(comp, func(cf compFormat) hegel.Generator[roundTripCase] {
++			return hegel.Map(dieCoin(30), func(clear bool) roundTripCase {
++				return roundTripCase{Tree: tree, Arch: a, Comp: cf, Clear: clear}
++			})
++		})
++	})
++})
++
++// --------------------------------------------------------------------------- the entries
++
++// archiveEntries is the tree as FilesFromFS gathers it over the whole tree: every entry in
++// fs.WalkDir's order (lexical within a directory, a directory's contents right after it),
++// named by its path (part 1's model, the root itself not among them).
++func archiveEntries(tree []fileEntry) []fileEntry {
++	out := append([]fileEntry(nil), tree...)
++	sort.SliceStable(out, func(i, j int) bool { return walkKey(out[i].Path) < walkKey(out[j].Path) })
++	return out
++}
++
++// archiveName is the entry's name in the archive: a zip directory's ends in a slash.
++func archiveName(e fileEntry, a archFormat) string {
++	if a.Kind == "zip" && e.Kind == 'd' {
++		return e.Path + "/"
++	}
++	return e.Path
++}
++
++// zipMethodOf is the method Zip writes an entry with (zip.go :149-164): Store for a
++// directory, and under SelectiveCompression for a name whose lower-cased extension is in
++// compressedFormats (hzCompressedExt), else the format's.
++func zipMethodOf(e fileEntry, a archFormat) uint16 {
++	if e.Kind == 'd' || (a.Selective && hzCompressedExt(e.Path)) {
++		return zip.Store
++	}
++	return a.ZipMethod
++}
++
++// splitUSTAROK transcribes archive/tar's splitUSTARPath (writer.go :454-473): whether a name
++// over 100 bytes splits at a slash into a prefix of at most 155 and a suffix of at most 100.
++func splitUSTAROK(name string) bool {
++	const nameSize, prefixSize = 100, 155
++	length := len(name)
++	if length <= nameSize || !isASCIIName(name) {
++		return false
++	} else if length > prefixSize+1 {
++		length = prefixSize + 1
++	} else if name[length-1] == '/' {
++		length--
++	}
++	i := strings.LastIndex(name[:length], "/")
++	nlen := len(name) - i - 1
++	plen := i
++	return !(i <= 0 || nlen > nameSize || nlen == 0 || plen > prefixSize)
++}
++
++// ustarOK is whether USTAR can encode the entry (archive/tar common.go, allowedFormats: an
++// ASCII name of at most 100 bytes or one that splits, an ASCII link target of at most 100
++// bytes; the owner names of the pools are ASCII and under 32).
++func ustarOK(e fileEntry) bool {
++	nameOK := isASCIIName(e.Path) && (len(e.Path) <= 100 || splitUSTAROK(e.Path))
++	linkOK := isASCIIName(e.Link) && len(e.Link) <= 100
++	return nameOK && linkOK
++}
++
++// tarFormatOf is the format archive/tar reads back for the entry under the asked format
++// (common.go allowedFormats: a wanted PAX "implies USTAR", so the writer's switch in
++// writer.go WriteHeader takes USTAR whenever the entry allows it - an ASCII name of at most
++// 100 bytes or one that splits, an ASCII link target of at most 100 bytes - and PAX, with
++// its records, otherwise; the unknown format likewise, GNU always GNU; a PAX header without
++// records is a USTAR block, the README's "Not judged").
++func tarFormatOf(e fileEntry, a archFormat) string {
++	switch a.TarFormat {
++	case 1:
++		return "USTAR"
++	case 3:
++		return "GNU"
++	}
++	if ustarOK(e) {
++		return "USTAR"
++	}
++	return "PAX"
++}
++
++// entryValueOf spells an extracted entry as the checks compare it.
++func entryValueOf(e fileEntry, c roundTripCase) string {
++	s := fmt.Sprintf("%c name=%s", e.Kind, archiveName(e, c.Arch))
++	switch e.Kind {
++	case 'f':
++		s += fmt.Sprintf(" size=%d sha=%s", len(e.Data), sha8(e.Data))
++	case 'l':
++		s += fmt.Sprintf(" -> %q", e.Link)
++	}
++	s += fmt.Sprintf(" mode=%o %s", e.Mode.Perm(), roundTripTime(e.Mtime.Unix(), c.Clear))
++	if c.Arch.Kind == "tar" {
++		a := c.Arch
++		s += fmt.Sprintf(" format=%s owner=%d/%d/%q/%q", tarFormatOf(e, a), a.Uid, a.Gid, a.Uname, a.Gname)
++	} else {
++		s += fmt.Sprintf(" method=%d", zipMethodOf(e, c.Arch))
++	}
++	return s
++}
++
++func roundTripTime(unix int64, clear bool) string {
++	if clear {
++		return "mtime=-"
++	}
++	return "mtime=" + strconv.FormatInt(unix, 10)
++}
++
++// --------------------------------------------------------------------------- the model
++
++// roundTripBuilt is what the property built before the judgement: the gathered files, the
++// archive's bytes, the errors.
++type roundTripBuilt struct {
++	Files    []archives.FileInfo
++	Data     []byte
++	FilesErr error
++	ArchErr  error
++}
++
++// unreadableXz is the index of the first entry an archive written with ZipMethodXz cannot
++// give back (-1 for none): under kZipXzHeaderOffset (archives/1) every entry written through
++// the xz compressor - a file or a link not stored - has its local header offset pointing at
++// the 24-byte xz stream header the compressor emits at construction (zip.go :35-37 registers
++// ulikunitz/xz's NewWriter, archive/zip records the offset before the compressor is made),
++// and archive/zip's open of it fails with "not a valid zip file": a file when it is opened,
++// a link when Extract reads its target (zip.go :230-233).
++func unreadableXz(entries []fileEntry, c roundTripCase, k known) int {
++	if !k[kZipXzHeaderOffset] || c.Arch.Kind != "zip" {
++		return -1
++	}
++	for i, e := range entries {
++		if e.Kind != 'd' && zipMethodOf(e, c.Arch) == archives.ZipMethodXz {
++			return i
++		}
++	}
++	return -1
++}
++
++// identifyNames are the names Identify is asked under: none, the extension in lower and upper
++// case, a name without one.
++func identifyNames(c roundTripCase) []string {
++	ext := roundTripExt(c)
++	return []string{"", "x" + ext, "X" + strings.ToUpper(ext), "noext"}
++}
++
++func roundTripExt(c roundTripCase) string {
++	if c.Arch.Kind == "zip" {
++		return ".zip"
++	}
++	if c.Comp.Kind == "" {
++		return ".tar"
++	}
++	return ".tar" + c.Comp.Ext()
++}
++
++// identifyCheck is the check name of one call.
++func identifyCheck(name string, seekable bool) string {
++	if name == "" {
++		name = "(unnamed)"
++	}
++	return fmt.Sprintf("identify %s seekable=%v", name, seekable)
++}
++
++// roundTripStream is the idStream of the archive's bytes for the Identify replica: a zip or
++// a plain tar as they are (the archival formats match them by stream, tarByStream and
++// zipByStream), a compressed tar as its compression's own stream of a tar (an empty one
++// "emptytar").
++func roundTripStream(c roundTripCase, data []byte) idStream {
++	st := idStream{Bytes: data, InnerKind: "none"}
++	if c.Comp.Kind != "" {
++		st.Own, st.InnerKind = c.Comp.Kind, "tar"
++		if len(c.Tree) == 0 {
++			st.InnerKind = "emptytar"
++		}
++	}
++	return st
++}
++
++// identifyAnswers is the documented answer set of Identify for the stream under a name (part
++// 2's rule, identifyExpected): the name's answers, the stream's (identifyOutcomes, computed
++// once per model evaluation and passed in: it opens every third-party decoder on the bytes,
++// and the xz decoder allocates its dictionary - eight megabytes - before it rejects a
++// stream, faster than the collector frees them when a classification evaluates the model
++// once per switch), and the name's archive under the stream's compression; "error: <kind>"
++// for a decoder's error.
++func identifyAnswers(name string, stream idResult, k known) []string {
++	var answers []string
++	_, nameArchs := nameParts(identifyBase(name), k)
++	if name != "" {
++		for _, a := range nameAnswers(name, k) {
++			if a != "NoMatch" {
++				answers = append(answers, a)
++			}
++		}
++	}
++	for _, a := range stream.Answers {
++		switch {
++		case a == "NoMatch":
++		case a == "error":
++			for _, e := range stream.Errs {
++				answers = append(answers, "error: "+e)
++			}
++		default:
++			answers = append(answers, a)
++		}
++		if containsString(compKinds, strings.TrimPrefix(a, ".")) {
++			for _, arch := range nameArchs {
++				answers = append(answers, "."+arch+a)
++			}
++		}
++	}
++	if len(answers) == 0 {
++		answers = []string{"NoMatch"}
++	}
++	return uniqueStrings(answers)
++}
++
++// roundTripTestFS is the classes of TestFS's lines over the archive as an ArchiveFS: none
++// documented; under kDirFileReadDirRest (archives/8) "ReadDir at EOF" for every directory
++// with a child, so for any non-empty tree (TestFS returns from a directory there, so nothing
++// of a directory's later checks runs); under kZipXzHeaderOffset (archives/1) "open" for every
++// unreadable file (its Open fails in checkStat and checkFile), and when a link is unreadable
++// the root's Open (ReadDir's index reads link targets) fails: "open" and every expected name
++// "expected not found".
++func roundTripTestFS(entries []fileEntry, c roundTripCase, k known) string {
++	var classes []string
++	bad := unreadableXz(entries, c, k)
++	if bad >= 0 {
++		for _, e := range entries[bad:] {
++			if e.Kind == 'l' && zipMethodOf(e, c.Arch) == archives.ZipMethodXz {
++				return classesValue([]string{"open", "expected not found"})
++			}
++		}
++		classes = append(classes, "open")
++	}
++	if k[kDirFileReadDirRest] && len(entries) > 0 {
++		classes = append(classes, "ReadDir at EOF")
++	}
++	return classesValue(classes)
++}
++
++// pythonReader is the Python module that reads the archive: tarfile for a tar, plain or
++// under gz, bz2 or xz; zipfile for a zip (it lists every method and reads Store, Deflate and
++// Bzip2); "" for the rest.
++func pythonReader(c roundTripCase) string {
++	if c.Arch.Kind == "zip" {
++		return "zipfile"
++	}
++	switch c.Comp.Kind {
++	case "", "gz", "bz2", "xz":
++		return "tarfile"
++	}
++	return ""
++}
++
++// pythonReads is whether Python's zipfile decompresses the method.
++func pythonReads(method uint16) bool {
++	return method == zip.Store || method == zip.Deflate || method == archives.ZipMethodBzip2
++}
++
++// pythonEntryOf spells an entry as the Python script lists it: the name, kind, size, link
++// target and content hash (where it can read them), mode, and whether the local header is at
++// the recorded offset ("bad" under archives/1 for an entry written through the xz
++// compressor).
++func pythonEntryOf(e fileEntry, c roundTripCase, k known) string {
++	header := "ok"
++	readable := true
++	size := int64(0)
++	if c.Arch.Kind == "zip" {
++		m := zipMethodOf(e, c.Arch)
++		if k[kZipXzHeaderOffset] && e.Kind != 'd' && m == archives.ZipMethodXz {
++			header = "bad"
++		}
++		readable = header == "ok" && pythonReads(m)
++		if e.Kind == 'l' {
++			size = int64(len(e.Link))
++		}
++	}
++	if e.Kind == 'f' {
++		size = int64(len(e.Data))
++	}
++	link, sha := "-", "-"
++	if readable && e.Kind == 'l' {
++		link = e.Link
++	}
++	if readable && e.Kind == 'f' {
++		sha = hzSha(e.Data)
++	}
++	return fmt.Sprintf("name=%s kind=%c size=%d link=%s sha=%s mode=%o header=%s", archiveName(e, c.Arch), e.Kind, size, link, sha, e.Mode.Perm(), header)
++}
++
++// roundTripExpected states every value the property checks for the case under the switch
++// set, given the archive the property built.
++func roundTripExpected(c roundTripCase, k known, built roundTripBuilt) checks {
++	out := checks{}
++	out.set("gathered", "ok")
++	entries := archiveEntries(c.Tree)
++	// archives/10: the Lz4 writer of the construction fails to open (lz4.go :43-48)
++	if k[kLz4CompressionLevel] && c.Comp.Kind == "lz4" && c.Comp.Level != 0 {
++		out.set("archived", "error: invalid compression level")
++		return out
++	}
++	if c.Arch.Kind == "tar" && c.Arch.TarFormat == 1 {
++		for _, e := range entries {
++			if !ustarOK(e) {
++				out.set("archived", "error: USTAR cannot encode")
++				return out
++			}
++		}
++	}
++	out.set("archived", "ok")
++	bad := unreadableXz(entries, c, k)
++	if bad >= 0 {
++		out.set("extracted", "error: not a valid zip file")
++		out.set("entries", bad)
++	} else {
++		out.set("extracted", "ok")
++		out.set("entries", len(entries))
++	}
++	for i, e := range entries {
++		name := "entry " + strconv.Itoa(i)
++		if bad >= 0 && i >= bad {
++			out.unspecified(name)
++			continue
++		}
++		out.set(name, entryValueOf(e, c))
++	}
++	st := roundTripStream(c, built.Data)
++	open := c.Arch.Kind == "tar" && c.Comp.Kind == "" && len(c.Tree) == 0
++	var stream *idResult
++	for _, name := range identifyNames(c) {
++		for _, seekable := range []bool{true, false} {
++			check := identifyCheck(name, seekable)
++			switch {
++			case bad == 0:
++				// archives/1: the bytes begin with the xz stream header of the first entry,
++				// not a zip's local header; what Identify makes of them is not stated
++				out.unspecified(check)
++			case open && (name == "" || name == "noext"):
++				out.unspecified(check)
++			default:
++				if stream == nil {
++					r := identifyOutcomes("", st, k)
++					stream = &r
++				}
++				out[check] = hzSet(identifyAnswers(name, *stream, k)...)
++			}
++		}
++	}
++	out.set("identify returned", "whole")
++	out.set("testfs", roundTripTestFS(entries, c, k))
++	if hzPython() == "" || pythonReader(c) == "" {
++		out.unspecified("python")
++		return out
++	}
++	out.set("python", fmt.Sprintf("%d entries", len(entries)))
++	for i, e := range entries {
++		out.set("python "+strconv.Itoa(i), pythonEntryOf(e, c, k))
++	}
++	return out
++}
++
++func init() {
++	for i, name := range []string{"gathered", "archived", "extracted", "entries", "entry", "identify", "python"} {
++		checkRank[name] = 400 + i
++	}
++}
++
++// --------------------------------------------------------------------------- the library
++
++// roundTripBuild gathers the tree with FilesFromFS and writes the archive (a CompressedArchive
++// under a compression).
++func roundTripBuild(c roundTripCase) roundTripBuilt {
++	ctx := context.Background()
++	files, err := archives.FilesFromFS(ctx, treeMapFS(c.Tree), &archives.FromFSOptions{ClearAttributes: c.Clear}, nil)
++	if err != nil {
++		return roundTripBuilt{FilesErr: err}
++	}
++	var buf bytes.Buffer
++	if err := roundTripFormat(c).(archives.Archiver).Archive(ctx, &buf, files); err != nil {
++		return roundTripBuilt{Files: files, ArchErr: err}
++	}
++	return roundTripBuilt{Files: files, Data: buf.Bytes()}
++}
++
++// roundTripFormat is the archives.Format of the case.
++func roundTripFormat(c roundTripCase) archives.Format {
++	if c.Comp.Kind == "" {
++		return c.Arch.Format()
++	}
++	t := c.Arch.Format().(archives.Tar)
++	return archives.CompressedArchive{Archival: t, Extraction: t, Compression: c.Comp.Format()}
++}
++
++// archiveErrKind is the kind of an archiver's or extractor's error: the texts the model
++// states, else the text.
++func archiveErrKind(err error) string {
++	s := err.Error()
++	for _, key := range []string{"invalid compression level", "USTAR cannot encode", "not a valid zip file"} {
++		if strings.Contains(s, key) {
++			return key
++		}
++	}
++	return s
++}
++
++// gotValue spells an extracted entry as entryValueOf does.
++func gotValue(g hzGot, c roundTripCase) string {
++	kind := byte('f')
++	switch {
++	case g.isDir:
++		kind = 'd'
++	case g.isLink:
++		kind = 'l'
++	}
++	s := fmt.Sprintf("%c name=%s", kind, g.name)
++	switch kind {
++	case 'f':
++		s += fmt.Sprintf(" size=%d sha=%s", g.size, sha8(g.data))
++	case 'l':
++		s += fmt.Sprintf(" -> %q", g.link)
++	}
++	s += fmt.Sprintf(" mode=%o %s", g.mode.Perm(), roundTripTime(g.mtime.Unix(), c.Clear))
++	switch h := g.header.(type) {
++	case *tar.Header:
++		s += fmt.Sprintf(" format=%s owner=%d/%d/%q/%q", h.Format, h.Uid, h.Gid, h.Uname, h.Gname)
++	case kzip.FileHeader:
++		s += fmt.Sprintf(" method=%d", h.Method)
++	default:
++		s += fmt.Sprintf(" header=%T", g.header)
++	}
++	return s
++}
++
++// roundTripActual asks the library the questions roundTripExpected answered.
++func roundTripActual(c *roundTripCase, built roundTripBuilt) checks {
++	out := checks{}
++	if built.FilesErr != nil {
++		out.set("gathered", "error: "+built.FilesErr.Error())
++		return out
++	}
++	out.set("gathered", "ok")
++	if built.ArchErr != nil {
++		out.set("archived", "error: "+archiveErrKind(built.ArchErr))
++		c.notes = append(c.notes, "Archive: "+built.ArchErr.Error())
++		return out
++	}
++	out.set("archived", "ok")
++	data := built.Data
++	format := roundTripFormat(*c)
++	got, err := hzExtractAll(format.(archives.Extractor), data)
++	if err != nil {
++		out.set("extracted", "error: "+archiveErrKind(err))
++		c.notes = append(c.notes, "Extract: "+err.Error())
++	} else {
++		out.set("extracted", "ok")
++	}
++	out.set("entries", len(got))
++	for i, g := range got {
++		out.set("entry "+strconv.Itoa(i), gotValue(g, *c))
++	}
++	ctx := context.Background()
++	var returned []string
++	for _, name := range identifyNames(*c) {
++		for _, seekable := range []bool{true, false} {
++			var r io.Reader = bytes.NewReader(data)
++			if !seekable {
++				r = struct{ io.Reader }{bytes.NewReader(data)}
++			}
++			var f archives.Format
++			var rest io.Reader
++			var ierr error
++			check := identifyCheck(name, seekable)
++			if p := hzCall(func() { f, rest, ierr = archives.Identify(ctx, name, r) }); p != nil {
++				out.set(check, "panic")
++				returned = append(returned, "panic")
++				c.notes = append(c.notes, fmt.Sprintf("Identify(%q, seekable %v) panicked: %v", name, seekable, p))
++				continue
++			}
++			switch {
++			case errors.Is(ierr, archives.NoMatch):
++				out.set(check, "NoMatch")
++			case ierr != nil:
++				out.set(check, "error: "+errKindOfText(stripMatching(ierr.Error())))
++				c.notes = append(c.notes, fmt.Sprintf("Identify(%q, seekable %v): %v", name, seekable, ierr))
++			default:
++				out.set(check, f.Extension())
++			}
++			back, rerr := io.ReadAll(rest)
++			switch {
++			case rerr != nil:
++				returned = append(returned, "read error: "+rerr.Error())
++			case !bytes.Equal(back, data):
++				returned = append(returned, fmt.Sprintf("%d bytes back", len(back)))
++			default:
++				returned = append(returned, "whole")
++			}
++		}
++	}
++	out["identify returned"] = hzSet(returned...)
++	afs := &archives.ArchiveFS{Stream: io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data))), Format: format.(archives.Extractor)}
++	var expect []string
++	for _, e := range archiveEntries(c.Tree) {
++		expect = append(expect, e.Path)
++	}
++	terr := fstest.TestFS(afs, expect...)
++	out.set("testfs", classesValue(testFSClasses(terr)))
++	if terr != nil {
++		c.notes = append(c.notes, "TestFS: "+hzTrim(strings.ReplaceAll(terr.Error(), "\n", "\n  "), 1500))
++	}
++	if py := pythonReader(*c); py != "" && hzPython() != "" {
++		pythonChecks(c, py, data, out)
++	}
++	return out
++}
++
++// --------------------------------------------------------------------------- python
++
++var (
++	hzPythonOnce sync.Once
++	hzPythonPath string
++)
++
++// hzPython is the python3 on the PATH, "" for none (looked up once).
++func hzPython() string {
++	hzPythonOnce.Do(func() {
++		if p, err := exec.LookPath("python3"); err == nil {
++			hzPythonPath = p
++		}
++	})
++	return hzPythonPath
++}
++
++// hzPyScript lists an archive with tarfile or zipfile: per member the name, kind, size, link
++// target, content hash, mode, and for a zip whether the local header is at the recorded
++// offset (the target and the hash only for the methods zipfile reads: Store, Deflate, Bzip2).
++const hzPyScript = `
++import sys, io, json, tarfile, zipfile, hashlib
++data = sys.stdin.buffer.read()
++out = []
++if sys.argv[1] == "tarfile":
++    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
++        for m in tf:
++            kind = "d" if m.isdir() else "l" if m.issym() else "f" if m.isfile() else "?"
++            h = "-"
++            if kind == "f":
++                h = hashlib.sha256(tf.extractfile(m).read()).hexdigest()
++            link = m.linkname if kind == "l" else "-"
++            out.append({"name": m.name, "kind": kind, "size": m.size, "link": link, "sha": h, "mode": m.mode & 0o777, "header": "ok"})
++else:
++    with zipfile.ZipFile(io.BytesIO(data)) as zf:
++        for m in zf.infolist():
++            mode = (m.external_attr >> 16) & 0o170000
++            kind = "d" if m.is_dir() else "l" if mode == 0o120000 else "f"
++            header = "ok" if data[m.header_offset:m.header_offset+4] == b"PK\x03\x04" else "bad"
++            readable = header == "ok" and m.compress_type in (0, 8, 12)
++            h = "-"
++            link = "-"
++            if readable and kind == "f":
++                h = hashlib.sha256(zf.read(m)).hexdigest()
++            if readable and kind == "l":
++                link = zf.read(m).decode("utf-8", "replace")
++            out.append({"name": m.filename, "kind": kind, "size": m.file_size, "link": link, "sha": h, "mode": (m.external_attr >> 16) & 0o777, "header": header})
++json.dump(out, sys.stdout)
++`
++
++type hzPyEntry struct {
++	Name   string `json:"name"`
++	Kind   string `json:"kind"`
++	Size   int64  `json:"size"`
++	Link   string `json:"link"`
++	Sha    string `json:"sha"`
++	Mode   int    `json:"mode"`
++	Header string `json:"header"`
++}
++
++// pythonChecks runs the script and spells its listing as pythonEntryOf does.
++func pythonChecks(c *roundTripCase, module string, data []byte, out checks) {
++	cmd := exec.Command(hzPython(), "-c", hzPyScript, module)
++	cmd.Stdin = bytes.NewReader(data)
++	var stderr bytes.Buffer
++	cmd.Stderr = &stderr
++	raw, err := cmd.Output()
++	if err != nil {
++		out.set("python", "python failed")
++		c.notes = append(c.notes, fmt.Sprintf("python %s: %v: %s", module, err, hzTrim(lastLine(stderr.String()), 300)))
++		return
++	}
++	var got []hzPyEntry
++	if err := json.Unmarshal(raw, &got); err != nil {
++		out.set("python", "python output unreadable")
++		c.notes = append(c.notes, fmt.Sprintf("python output: %v: %s", err, hzTrim(string(raw), 300)))
++		return
++	}
++	out.set("python", fmt.Sprintf("%d entries", len(got)))
++	for i, g := range got {
++		out.set("python "+strconv.Itoa(i), fmt.Sprintf("name=%s kind=%s size=%d link=%s sha=%s mode=%o header=%s", g.Name, g.Kind, g.Size, g.Link, g.Sha, g.Mode, g.Header))
++	}
++}
++
++func lastLine(s string) string {
++	lines := strings.Split(strings.TrimSpace(s), "\n")
++	return lines[len(lines)-1]
++}
++
++func hzSha(b []byte) string {
++	s := sha256.Sum256(b)
++	return hex.EncodeToString(s[:])
++}
++
++// hzTrim cuts a text to n bytes with an ellipsis.
++func hzTrim(s string, n int) string {
++	if len(s) > n {
++		return s[:n] + "..."
++	}
++	return s
++}
++
++// hzCompressedExt mirrors zip.go's compressedFormats set (:388-425).
++func hzCompressedExt(name string) bool {
++	switch strings.ToLower(path.Ext(name)) {
++	case ".7z", ".avi", ".br", ".bz2", ".cab", ".docx", ".gif", ".gz", ".jar", ".jpeg", ".jpg", ".lz", ".lz4", ".lzma",
++		".m4v", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".png", ".pptx", ".rar", ".sz", ".tbz2", ".tgz", ".tsz", ".txz",
++		".xlsx", ".xz", ".zip", ".zipx":
++		return true
++	}
++	return false
++}
++
++// --------------------------------------------------------------------------- the property
++
++// roundTripJudgeOver is the judge of the family: the archive built with the library's
++// writers (the case's construction: its failure is the check "archived"), then the judgement
++// over roundTripExpected and roundTripActual. The checks the switches past change on their
++// own are left out (the narrow property of archives/1 is judged past 8: TestFS's lines on
++// any non-empty archive); under HEGEL_NO_KNOWN=1 the checks the switches drops change on
++// their own are dropped from a case rather than the case skipped (judgeByDropping: the wide
++// property drops 8's).
++func roundTripJudgeOver(past, drops []int) func(j *hzCaseJudge, c roundTripCase) {
++	return func(j *hzCaseJudge, c roundTripCase) {
++		hzTally("archival " + c.Arch.Kind)
++		if c.Arch.Kind == "zip" {
++			hzTally("zip method " + strconv.Itoa(int(c.Arch.ZipMethod)))
++		}
++		if c.Comp.Kind != "" {
++			hzTally("compression " + c.Comp.Kind)
++		}
++		hzTally("entries " + strconv.Itoa(len(c.Tree)))
++		built := roundTripBuild(c)
++		expected := func(c roundTripCase, k known) checks { return roundTripExpected(c, k, built) }
++		if len(past) > 0 {
++			expected = pastSwitches(expected, past)
++		}
++		actual := func(c *roundTripCase) checks { return roundTripActual(c, built) }
++		if len(drops) > 0 {
++			judgeByDropping(j, &c, expected, actual, drops)
++			return
++		}
++		judgeBy(j, &c, expected, actual)
++	}
++}
++
++// roundTripDrops are the switches whose checks the wide property drops under HEGEL_NO_KNOWN=1
++// rather than skipping the case: archives/8 marks TestFS's report on every non-empty archive.
++var roundTripDrops = []int{kDirFileReadDirRest}
++
++// TestHegelArchiveRoundTrip: a tree gathered with FilesFromFS, archived with Tar or Zip (Tar
++// also under every compression format), comes back from Extract entry for entry: names,
++// kinds, contents, link targets, permissions, times and the header fields the options set;
++// Identify names the format from the bytes and returns them unread; the archive is a file
++// system (ArchiveFS) that testing/fstest accepts; Python's tarfile and zipfile read the same
++// entries. The shapes of the recorded bugs (the Xz method, an Lz4 level, an empty zip,
++// ReadDir(-1) at the end of a directory) are drawn at their natural rates and fail naming the
++// first in id order; under HEGEL_NO_KNOWN=1 the Xz method, the Lz4 levels and the empty zip
++// are not drawn, the TestFS check is dropped from a case that still has 8's shape, and a case
++// the classifier still names is skipped by the judge.
++func TestHegelArchiveRoundTrip(t *testing.T) {
++	judged(t, roundTripCases, roundTripJudgeOver(nil, roundTripDrops))
++}
 diff --git a/hegel/hegel_zoo_shapes_test.go b/hegel/hegel_zoo_shapes_test.go
 new file mode 100644
-index 0000000..c829594
+index 0000000..ccb786e
 --- /dev/null
 +++ b/hegel/hegel_zoo_shapes_test.go
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,899 @@
 +package hegel
 +
 +// The narrow properties: one per recorded bug of the FilesFrom, DeepFS, Identify and
@@ -7378,11 +8877,13 @@ index 0000000..c829594
 +// draws the neighbouring region (hzShaped) and passes.
 +
 +import (
++	"archive/zip"
 +	"io/fs"
 +	"strings"
 +	"testing"
 +	"time"
 +
++	"github.com/mholt/archives"
 +	"hegel.dev/go/hegel"
 +)
 +
@@ -8033,12 +9534,244 @@ index 0000000..c829594
 +func TestHegelTruncatedLzipHeadersErrAlike(t *testing.T) {
 +	judged(t, truncatedLzipHeaderCases, identifyJudgeOver(3, []int{kIdentifyNondeterministic}, nil))
 +}
++
++// =========================================================================== the round trip and ArchiveFS
++
++// The narrow properties of the round-trip and ArchiveFS families (part 3): the shape of each
++// bug forced by construction (an injected entry, a flag), the regions past the earlier ids
++// left out of the judgement by pastSwitches where the surroundings carry them (a raw archive
++// with an implicit directory is the shape of 4, 5 and 7 together), the classifier as the
++// filter (regionOf) where the surroundings can take the shape away.
++
++// --------------------------------------------------------------------------- archives/1
++
++// hasKind reports whether the tree has an entry of the kind.
++func hasKind(tree []fileEntry, kind byte) bool {
++	for _, e := range tree {
++		if e.Kind == kind {
++			return true
++		}
++	}
++	return false
++}
++
++// xzZipCases: a zip written with ZipMethodXz (Deflate, Bzip2 or Zstd past the shape, a third
++// each) without SelectiveCompression over a tree of one to ten entries with at least one file
++// (an entry the method writes through the compressor), ClearAttributes at 30. Judged past
++// archives/8 (TestFS's lines on any non-empty archive); 9 needs an empty zip, 10 a compression
++// format.
++var xzZipCases = hegel.FlatMap(treesBetween(1, 10), func(tree []fileEntry) hegel.Generator[roundTripCase] {
++	withFile := hegel.Just(tree)
++	if !hasKind(tree, 'f') {
++		withFile = hegel.FlatMap(entryName, func(name string) hegel.Generator[[]fileEntry] {
++			return hegel.Map(aFile(freshName(tree, "", name, "")), func(f fileEntry) []fileEntry { return withEntry(tree, f) })
++		})
++	}
++	method := hzShaped(hegel.Just(uint16(archives.ZipMethodXz)), halvesOver([]int{1, 1, 1}, zip.Deflate, uint16(archives.ZipMethodBzip2), uint16(archives.ZipMethodZstd)))
++	return hegel.FlatMap(withFile, func(tree []fileEntry) hegel.Generator[roundTripCase] {
++		return hegel.FlatMap(method, func(m uint16) hegel.Generator[roundTripCase] {
++			return hegel.Map(dieCoin(30), func(clear bool) roundTripCase {
++				return roundTripCase{Tree: tree, Arch: archFormat{Kind: "zip", ZipMethod: m}, Clear: clear}
++			})
++		})
++	})
++})
++
++// TestHegelXzZipsExtract: a zip written with ZipMethodXz gives its entries back to Extract,
++// to ArchiveFS and to Python's zipfile as every other method does; archives/1 writes the xz
++// stream header before each entry's local header (the compressor emits it at construction,
++// before archive/zip writes the header at the recorded offset), and no reader can open the
++// entries.
++func TestHegelXzZipsExtract(t *testing.T) {
++	judgedWithCount(t, 100, xzZipAttempts, xzZipCases, roundTripJudgeOver([]int{kDirFileReadDirRest}, nil))
++}
++
++// xzZipAttempts caps the shrink of TestHegelXzZipsExtract at that many failing attempts:
++// every case runs Python's zipfile in a child process, and every case fails.
++const xzZipAttempts = 60
++
++// --------------------------------------------------------------------------- the raw archives
++
++// The views of archiveFSExpected the narrow properties are judged by: past the ids the
++// surroundings carry.
++var (
++	archiveFSPast78   = pastSwitches(archiveFSExpected, []int{kStatImplicitDirName, kDirFileReadDirRest})
++	archiveFSPast4678 = pastSwitches(archiveFSExpected, []int{kOpenImplicitDirFile, kStatPrefixMissing, kStatImplicitDirName, kDirFileReadDirRest})
++	archiveFSPast4578 = pastSwitches(archiveFSExpected, []int{kOpenImplicitDirFile, kOpenDirFreshEntries, kStatImplicitDirName, kDirFileReadDirRest})
++	archiveFSPast4568 = pastSwitches(archiveFSExpected, []int{kOpenImplicitDirFile, kOpenDirFreshEntries, kStatPrefixMissing, kDirFileReadDirRest})
++	archiveFSPast4567 = pastSwitches(archiveFSSansTestFS, []int{kOpenImplicitDirFile, kOpenDirFreshEntries, kStatPrefixMissing, kStatImplicitDirName})
++)
++
++// rawFile is a file entry at the path with drawn content; rawDir a directory entry with a
++// trailing slash.
++func rawFile(p string) hegel.Generator[rawEntry] {
++	return hegel.Map(fileData, func(data []byte) rawEntry { return rawEntry{Name: p, Kind: 'f', Data: data, Mode: 0o644} })
++}
++
++func rawDir(p string) rawEntry { return rawEntry{Name: p + "/", Kind: 'd', Mode: 0o755} }
++
++// twoNames is two names of the raw pool, the second not the first.
++var twoNames = hegel.FlatMap(evenHalves(rawNames...), func(a string) hegel.Generator[[]string] {
++	return hegel.Map(evenHalves(rawNames...), func(b string) []string {
++		if b == a {
++			b += ".x"
++		}
++		return []string{a, b}
++	})
++})
++
++// strictRaw is the population of a narrow property's past region: every parent explicit and
++// before its contents, no "./" prefix, no prefix probe, paging only - nothing of 4, 5, 6, 7
++// or 8 but the injected entries' own shape.
++func strictRaw(inject []rawEntry, zip hegel.Generator[bool]) rawParams {
++	return rawParams{Zip: zip, ExplicitAll: true, InOrder: true, Prefixes: hegel.Just(false), Rest: hegel.Just(false), Inject: inject}
++}
++
++// --------------------------------------------------------------------------- archives/4
++
++// lateDirCases: a file under a directory with no entry of its own (the parents left
++// implicit, the order drawn: an implicit or a late directory), the rest of the wide
++// population around it; past the shape the directory's entry first and the strict
++// population. The classifier confirms the shape (an implicit directory is Opened fresh in
++// every case; 4 is the family's first id). Judged past 7 (every nested entry names the root
++// after indexing, and the surroundings' implicit directories) and 8 (TestFS's lines on any
++// non-empty archive).
++var lateDirCases = regionOf("archives/4", archiveFSPast78, hegel.FlatMap(twoNames, func(n []string) hegel.Generator[archiveFSCase] {
++	return hegel.FlatMap(rawFile(n[0]+"/"+n[1]), func(f rawEntry) hegel.Generator[archiveFSCase] {
++		p := rawParams{Zip: dieCoin(40), ExplicitNone: true, DotSlashW: 15, Prefixes: hegel.Just(false), Rest: hegel.Just(false), Inject: []rawEntry{f}}
++		if hzNoKnown {
++			p = strictRaw([]rawEntry{rawDir(n[0]), f}, dieCoin(40))
++		}
++		return rawCasesWith(p)
++	})
++}))
++
++// TestHegelFreshOpenOfLateDirectoriesIsADirectory: ArchiveFS.Open of a directory before the
++// index is built is a directory file whether or not the archive has an entry for it and
++// wherever that entry is; archives/4 returns the first descendant it meets, opened as the
++// directory, when the directory's entry is missing or comes after a descendant. Judged past
++// archives/7 and 8.
++func TestHegelFreshOpenOfLateDirectoriesIsADirectory(t *testing.T) {
++	judged(t, lateDirCases, archiveFSJudgeOver(archiveFSPast78, nil, false))
++}
++
++// --------------------------------------------------------------------------- archives/5
++
++// wrongChildCases: an explicit directory first, then a file in a subdirectory of it: the
++// subdirectory with no entry of its own (half), or with an entry and the file spelt with a
++// "./" prefix (the skip list holds the raw names: the file's raw name is not under the
++// subdirectory's); the entries ordered parents first (a late parent is 4's shape, left out
++// of the judgement but taking the parent's listing with it), the parents left implicit; past
++// the shape the subdirectory's entry in place, the file spelt clean, and the strict
++// population. Judged past 4, 6, 7 and 8 (the implicit directories of the surroundings, the
++// probes, TestFS).
++var wrongChildCases = regionOf("archives/5", archiveFSPast4678, hegel.FlatMap(twoNames, func(n []string) hegel.Generator[archiveFSCase] {
++	return hegel.FlatMap(evenHalves(rawNames...), func(leaf string) hegel.Generator[archiveFSCase] {
++		return hegel.FlatMap(dieCoin(50), func(dotSlash bool) hegel.Generator[archiveFSCase] {
++			child := n[0] + "/" + n[1] + "/" + leaf
++			inject := []rawEntry{rawDir(n[0])}
++			if dotSlash {
++				child = "./" + child
++				inject = append(inject, rawDir(n[0]+"/"+n[1]))
++			}
++			return hegel.FlatMap(rawFile(child), func(f rawEntry) hegel.Generator[archiveFSCase] {
++				p := rawParams{Zip: dieCoin(40), ExplicitNone: true, InOrder: true, DotSlashW: 15, Prefixes: hegel.Just(false), Rest: hegel.Just(false), Inject: append(inject, f)}
++				if hzNoKnown {
++					f.Name = n[0] + "/" + n[1] + "/" + leaf
++					p = strictRaw([]rawEntry{rawDir(n[0]), rawDir(n[0] + "/" + n[1]), f}, dieCoin(40))
++				}
++				return rawCasesWith(p)
++			})
++		})
++	})
++}))
++
++// TestHegelFreshOpenListsOnlyChildren: a directory file opened before the index is built
++// lists the directory's own children, a subdirectory once by name whether or not the archive
++// has an entry for it, and the entries spelt "./" by their cleaned names; archives/5 lists
++// the files of an implicit or late subdirectory, and the "./"-spelt files of a subdirectory
++// whose entry is spelt clean (or the other way round), as the directory's own children (the
++// skip list of Extract compares raw names).
++func TestHegelFreshOpenListsOnlyChildren(t *testing.T) {
++	judged(t, wrongChildCases, archiveFSJudgeOver(archiveFSPast4678, nil, false))
++}
++
++// --------------------------------------------------------------------------- archives/6
++
++// prefixProbeCases: the wide population with a file of a name of two characters or more
++// (its base name shortened by one is a string prefix of the entry's clean name, which the
++// probe asks Stat for) and the prefix probes on (off past the shape). Judged past 4, 5, 7
++// and 8.
++var prefixProbeCases = regionOf("archives/6", archiveFSPast4578, hegel.FlatMap(evenHalves("c.txt", "d.zip", "e.tar", "h i", "j.jpg", "l.bak"), func(name string) hegel.Generator[archiveFSCase] {
++	return hegel.FlatMap(rawFile(name), func(f rawEntry) hegel.Generator[archiveFSCase] {
++		return rawCasesWith(rawParams{Zip: dieCoin(40), DotSlashW: 15, Prefixes: hegel.Just(hzShaped(true, false)), Rest: hegel.Just(false), Inject: []rawEntry{f}})
++	})
++}))
++
++// TestHegelFreshStatOfPrefixesIsNotExist: ArchiveFS.Stat of a name the archive does not hold
++// is fs.ErrNotExist before the index is built as after it; archives/6 answers an implicit
++// directory for a name that is a string prefix of some entry's clean name ("a/b" for
++// "a/bc.txt", "e.ta" for "e.tar"), the path-separator guard of Open's handler missing.
++func TestHegelFreshStatOfPrefixesIsNotExist(t *testing.T) {
++	judged(t, prefixProbeCases, archiveFSJudgeOver(archiveFSPast4578, nil, false))
++}
++
++// --------------------------------------------------------------------------- archives/7
++
++// implicitNameCases: a file two directories down with no entry for either (the parents left
++// implicit; the order drawn), the wide population around it: Stat fresh of the lower
++// directory names it by its path, Stat indexed of the upper by the lower's name. Past the
++// shape a flat archive (the file at the root, the strict population kept at the root): the
++// index names the root after the first nested entry, so the region past 7 has no nested
++// entry at all. Judged past 4, 5, 6 and 8.
++var implicitNameCases = regionOf("archives/7", archiveFSPast4568, hegel.FlatMap(twoNames, func(n []string) hegel.Generator[archiveFSCase] {
++	return hegel.FlatMap(evenHalves(rawNames...), func(leaf string) hegel.Generator[archiveFSCase] {
++		return hegel.FlatMap(rawFile(n[0]+"/"+n[1]+"/"+leaf), func(f rawEntry) hegel.Generator[archiveFSCase] {
++			p := rawParams{Zip: dieCoin(40), ExplicitNone: true, DotSlashW: 15, Prefixes: hegel.Just(false), Rest: hegel.Just(false), Inject: []rawEntry{f}}
++			if hzNoKnown {
++				f.Name = leaf
++				p = strictRaw([]rawEntry{f}, dieCoin(40))
++				p.Flat = true
++			}
++			return rawCasesWith(p)
++		})
++	})
++}))
++
++// TestHegelImplicitDirectoriesHaveBaseNames: Stat of a directory the archive has no entry for
++// gives a FileInfo named by the directory's base name, before and after the index is built,
++// and the root directory file is named "." whenever it is opened; archives/7 names the
++// implicit directory by its full path before (the handler's fallback) and, after, by the
++// name of the next path segment of the first entry two levels below it (the index loop
++// stores implicitDirInfo{base} under the parent's path), or by its full path when none - and
++// the root, once indexed, by the first segment of the first nested entry.
++func TestHegelImplicitDirectoriesHaveBaseNames(t *testing.T) {
++	judged(t, implicitNameCases, archiveFSJudgeOver(archiveFSPast4568, nil, false))
++}
++
++// --------------------------------------------------------------------------- archives/8
++
++// dirRestCases: the wide population with an entry (the root directory file has a child) and
++// the directory files read as ReadDir(1) then ReadDir(-1) (paged one by one to the end past
++// the shape). Judged past 4, 5, 6 and 7 on the model without the TestFS check (its lines are
++// the same bug).
++var dirRestCases = regionOf("archives/8", archiveFSPast4567, hegel.FlatMap(evenHalves(rawNames...), func(name string) hegel.Generator[archiveFSCase] {
++	return hegel.FlatMap(rawFile(name), func(f rawEntry) hegel.Generator[archiveFSCase] {
++		return rawCasesWith(rawParams{Zip: dieCoin(40), DotSlashW: 15, Prefixes: hegel.Just(false), Rest: hegel.Just(hzShaped(true, false)), Inject: []rawEntry{f}})
++	})
++}))
++
++// TestHegelDirectoryFilesReadTheRest: a directory file's ReadDir(n <= 0) after ReadDir(1)
++// returns the children not yet read; archives/8 returns them all again.
++func TestHegelDirectoryFilesReadTheRest(t *testing.T) {
++	judged(t, dirRestCases, archiveFSJudgeOver(archiveFSPast4567, nil, true))
++}
 diff --git a/hegel/hegel_zoo_test.go b/hegel/hegel_zoo_test.go
 new file mode 100644
-index 0000000..6bef58f
+index 0000000..cda2737
 --- /dev/null
 +++ b/hegel/hegel_zoo_test.go
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,227 @@
 +package hegel
 +
 +// Hegel property tests for mholt/archives, written for the Hegel zoo. See
@@ -8061,7 +9794,7 @@ index 0000000..6bef58f
 +// a judge names the shape of a failing case; HEGEL_NO_KNOWN=1 switches the shapes off. This
 +// file and hegel_zoo_gen_test.go, hegel_zoo_props_test.go are the OLD harness (its names
 +// carry the hzOld prefix where the new one took the name) for the properties not yet
-+// rewritten (ArchiveRoundTrip, ArchiveFS, Insert) and the pins: the switches in HZKnown are
++// rewritten (Insert, part 4's) and the pins: the switches in HZKnown are
 +// gates, all on by default, read by those.
 +//
 +// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
@@ -8071,6 +9804,7 @@ index 0000000..6bef58f
 +
 +import (
 +	"fmt"
++	"io/fs"
 +	"os"
 +	"reflect"
 +	"sort"
@@ -8193,6 +9927,15 @@ index 0000000..6bef58f
 +	return nil
 +}
 +
++// hzEntryNames is the names of directory entries, in order (the pins read it).
++func hzEntryNames(ents []fs.DirEntry) []string {
++	var ns []string
++	for _, e := range ents {
++		ns = append(ns, e.Name())
++	}
++	return ns
++}
++
 +// --------------------------------------------------------------------------- known bugs
 +
 +// HZKnown: the recorded bugs (bugs.toml) that the generated cases reach. While a switch is on
@@ -8200,13 +9943,13 @@ index 0000000..6bef58f
 +// documented behaviour and fail while the bug exists.
 +var HZKnown = struct {
 +	zipXzHeaderOffset          bool // Zip{Compression: ZipMethodXz} writes the xz stream header before each entry's local header, and no reader can open the entries
-+	lz4CompressionLevel        bool // Lz4{CompressionLevel: n} with n in 1..9 fails to open a writer: the level is passed as the library's bit-flag constant
-+	zipEmptyStreamMatch        bool // an empty zip (PK\x05\x06) is not matched by stream: Zip.Match reads the stream once per candidate header instead of comparing the same bytes
-+	dirFileReadDirRest         bool // the directory files of ArchiveFS return all their entries from ReadDir(n <= 0), not the remaining ones
-+	openImplicitDirFile        bool // ArchiveFS.Open of an implicit directory before the index is built returns its first descendant file opened as the directory
-+	openDirFreshEntries        bool // ArchiveFS.Open of a directory before the index is built lists as its children the files of subdirectories that have no entry or whose entry comes after them, and files whose names start with ./
-+	statImplicitDirName        bool // ArchiveFS.Stat of an implicit directory returns its full path as Name() before the index is built, and a child's name after
-+	statPrefixMissing          bool // ArchiveFS.Stat of a missing name that is a prefix of an entry's name returns an implicit directory before the index is built
++	lz4CompressionLevel        bool // (read by nothing since part 3) Lz4{CompressionLevel: n} with n in 1..9 fails to open a writer: the level is passed as the library's bit-flag constant
++	zipEmptyStreamMatch        bool // (read by nothing since part 3) an empty zip (PK\x05\x06) is not matched by stream: Zip.Match reads the stream once per candidate header instead of comparing the same bytes
++	dirFileReadDirRest         bool // (read by nothing since part 3) the directory files of ArchiveFS return all their entries from ReadDir(n <= 0), not the remaining ones
++	openImplicitDirFile        bool // (read by nothing since part 3) ArchiveFS.Open of an implicit directory before the index is built returns its first descendant file opened as the directory
++	openDirFreshEntries        bool // (read by nothing since part 3) ArchiveFS.Open of a directory before the index is built lists as its children the files of subdirectories that have no entry or whose entry comes after them, and files whose names start with ./
++	statImplicitDirName        bool // (read by nothing since part 3) ArchiveFS.Stat of an implicit directory returns its full path as Name() before the index is built, and a child's name after
++	statPrefixMissing          bool // (read by nothing since part 3) ArchiveFS.Stat of a missing name that is a prefix of an entry's name returns an implicit directory before the index is built
 +	tarInsertBlockAligned      bool // Tar.Insert after an archive whose last entry's size is a multiple of 512 (an empty file, a directory, a link, an empty archive) leaves a zero block before the new entries, and the archive no longer reads past it
 +	zipInsertDirStops          bool // Zip.Insert returns after a directory entry, and the files after it are not inserted
 +	zipInsertStores            bool // Zip.Insert without SelectiveCompression stores the files, whatever Compression says

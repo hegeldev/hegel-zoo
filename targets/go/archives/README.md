@@ -70,16 +70,28 @@ Brotli's quality 0..11, Gz multithreaded at 30 %), a payload of `hzData`'s popul
 write cut into pieces by a drawn list of lengths. A case costs about a hundred draws for
 either.
 
-The three properties not yet rewritten draw as before: a tree of up to ten entries (files of 0
+`roundTripCase`: a tree of up to ten entries as `filesCase`'s, gathered by FilesFromFS with
+ClearAttributes at 30 %; the archival a Tar (the format none/USTAR/PAX/GNU at a quarter
+each, numeric ids and owner overrides at 20 %) or a Zip (Store, Deflate twice, Bzip2, Zstd,
+Xz at a sixth each; selective compression at 30 %) at 50/50, a tar under a compression
+format of `compressionCase`'s population at 50 % (Lz4's levels included); the bytes written in
+the property under the judge, the construction a check of its own. `archiveFSCase`: an
+archive written by hand with archive/tar or archive/zip (zip at 40 %) for the shapes
+FilesFromFS never produces: up to eight entries at depth one to three (directories,
+files, links in tars at 30/60/10), directory names with a trailing slash at 60 % (always in
+zips), a `./` prefix at 15 %, the parents explicit all, none or each at a coin (40/30/30),
+the order as placed, parents first or shuffled by drawn keys (35/30/35), a `.` entry in
+tars at 20 %, a directory for Sub, and whether the missing-name and ReadDir-rest checks run
+(40 and 50 %). A case costs about 340 draws (850 at most) for the round trip and 310 (800)
+for ArchiveFS.
+
+The Insert property draws as before: a tree of up to ten entries (files of 0
 to 4096 bytes with block-aligned sizes frequent, directories, symbolic links to siblings,
 tree paths, parents, their own directory or nowhere) with permissions and times, written to a
 `fstest.MapFS` or to a directory on disk; names with spaces, dots, upper case, non-ASCII, and
 archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overrides) and
 `Zip` (store, deflate, bzip2, zstd, xz; selective compression), `Tar` under `Gz`, `Bz2`,
-`Xz`, `Zstd`, `Lz4`, `Brotli`, `Sz`, `Lzip`, `Zlib` and `MinLZ` with their levels. Archives
-written by hand with archive/tar and archive/zip for the shapes FilesFromFS never produces:
-implicit directories, entries out of order, `./` prefixes, a `.` entry, directories with and
-without a trailing slash.
+`Xz`, `Zstd`, `Lz4`, `Brotli`, `Sz`, `Lzip`, `Zlib` and `MinLZ` with their levels.
 
 ## Properties
 
@@ -87,7 +99,8 @@ without a trailing slash.
   names the format from the bytes (named or not, seekable or not) and returns them unread;
   `fstest.TestFS` accepts the archive as an ArchiveFS; Python reads the same entries.
 - `TestHegelArchiveFS`: a hand-written archive read through ArchiveFS is the file system of
-  its paths (walk, stat, open, read, readdir, sub, missing names), before and after indexing.
+  its paths (walk, stat, open, read, readdir, the rest after ReadDir(1), sub, missing names),
+  before and after indexing, and `fstest.TestFS` accepts it.
 - `TestHegelInsert`: files inserted into a Tar or Zip archive come out after its entries.
 - `TestHegelFilesFrom`: FilesFromFS and FilesFromDisk on the same tree gather what the
   filenames map documents, with FollowSymlinks and ClearAttributes; a call whose expansion
@@ -101,7 +114,7 @@ without a trailing slash.
   and by name and by no other format, identified, decoded by its reader and by the reference
   tool; gzip members with and without DisableMultistream.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
-- Seventeen narrow properties, one per bug of the four rewritten wide properties (below):
+- Twenty-three narrow properties, one per bug of the six rewritten wide properties (below):
   `TestHegelDotValuesGiveRelativeNames` (14), `TestHegelTrailingSlashKeysEnumerateOnFS` (15),
   `TestHegelTrailingSlashKeysKeepTheValue` (16),
   `TestHegelRelativeLinksResolveFromTheirDirectory` (17),
@@ -111,7 +124,10 @@ without a trailing slash.
   `TestHegelEmptyZipsAreMatchedByStream` (9), `TestHegelLz4LevelsOpenWriters` (10),
   `TestHegelMisnamedStreamsIdentifyAlike` (19), `TestHegelTruncatedLzipStreamsDoNotPanic`
   (20), `TestHegelEmptyLzipStreamsRead` (24), `TestHegelLongBrotliStreamsAreMatched` (25),
-  `TestHegelTgzNamesIdentify` (26), `TestHegelTruncatedLzipHeadersErrAlike` (28).
+  `TestHegelTgzNamesIdentify` (26), `TestHegelTruncatedLzipHeadersErrAlike` (28),
+  `TestHegelXzZipsExtract` (1), `TestHegelFreshOpenOfLateDirectoriesIsADirectory` (4),
+  `TestHegelFreshOpenListsOnlyChildren` (5), `TestHegelFreshStatOfPrefixesIsNotExist` (6),
+  `TestHegelImplicitDirectoriesHaveBaseNames` (7), `TestHegelDirectoryFilesReadTheRest` (8).
 
 ## Bugs
 
@@ -134,15 +150,12 @@ Brotli streams over 1 KiB unmatched (25).
 
 ## Modelled as recorded
 
-The sixteen bugs of FilesFrom, DeepFS, Identify and Compression follow the standard (next
-section). The other twelve keep an `HZKnown` switch, on by default, until their properties
-are rewritten: while it is on the generator keeps away from the shape or the checks skip it:
-no xz method in zips, lz4 level 0 only and empty zips not identified by stream in the round
-trip, the ReadDir-at-EOF lines of TestFS dropped, fresh Open/Stat checks skipped for implicit
-or out-of-order directories and prefix names, Tar.Insert only after a non-aligned regular
-file, Zip.Insert without directories, links or custom methods and its stored method accepted.
-The old collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns those switches off
-and the properties then fail.
+The twenty-three bugs of the six rewritten properties follow the standard (next section).
+The other five (2, 3, 11, 12, 13) keep an `HZKnown` switch, on by default, until the Insert
+property is rewritten: while it is on the generator keeps away from the shape or the checks
+skip it: Tar.Insert only after a non-aligned regular file, Zip.Insert without directories,
+links or custom methods and its stored method accepted. The old collector counts the
+avoidances; `ZOO_KNOWN_OFF=name,name` turns those switches off and the property then fails.
 
 ## Properties and the recorded bugs
 
@@ -229,17 +242,54 @@ random bytes of 1025..4096 made incompressible by a fixed keystream, since the e
 compress a little; 100 % of the cases shaped), 26 (`x.tgz` and its spellings over a tar.gz
 stream, where 19 cannot arise), 28 (a cut of 4 or 5 bytes, judged past 19).
 
+The round-trip and ArchiveFS properties thread the same switch set: the xz compressor
+writing its stream header before archive/zip writes the local file header, so that Extract
+fails at the first non-directory entry, Python's zipfile refuses the archive, TestFS cannot
+open the files and Identify reads the bytes as a corrupt xz stream (1); the un-indexed Open
+handler opening the first entry under the requested directory as the directory when the
+directory's own entry is missing or late (4), and listing the files of implicit or late
+subdirectories, and of `./`-spelt names, as children, since `fileIsIncluded` compares raw
+names with the skip list (5); the un-indexed Stat's fallback on a string prefix (6); the
+implicit directory's Name() the full path before the index and, after it, the name the index
+loop stored under the parent's path - the root's included (7); `dirFile.ReadDir(n <= 0)`
+returning every entry (8); the empty zip (9) and the Lz4 levels (10) by the Identify and
+Compression rules. The model of ArchiveFS is a file system built from the entries, read
+fresh and indexed under the switches, and `fstest.TestFS` is transcribed over it so that the
+check is the set of line classes TestFS reports (empty when it passes).
+
+Over 3000 default cases the ArchiveFS property names about 2710 shapes (90 %), every one
+by sufficiency with the library agreeing with the replica in all of them: 4 in 2175 to 2195,
+8 in 146 to 165, 6 in 149 to 200, 7 in 139 to 147, 5 in 41 to 69; 8 alone would name every
+non-empty archive (TestFS's ReadDir at EOF) and 7 about 2480, but 4 is first in id order.
+The round-trip property names about 2790 (93 %): 8 in 2423 to 2533 (every non-empty
+archive), 1 in 144 to 256, 9 in about 110, 10 in 1 to 5 (an Lz4 level is named 8 first
+unless the tree is empty). Over nine rounds at the default count the round-trip property
+shrank to 9 every time (an empty zip); the ArchiveFS property to 6 four times, 8 three
+times and 4 twice; over forty rounds at a hundred cases both fail every round, the round-trip
+property to 9 in all forty and the ArchiveFS property to 8 in 27 (4 in 10, 6 in 2, 7 once):
+both are mapped plain to those.
+The narrow properties: 1 (a zip with the Xz method over a non-empty tree, a hundred cases
+with a shrink budget of sixty since every case runs Python), 4 (a directory whose entry is
+missing or late, Open fresh; judged past 7 and 8), 5 (an implicit or late subdirectory or a
+`./`-spelt file under an explicit directory), 6 (a missing name that is a string prefix of an
+entry), 7 (an implicit directory, judged past the earlier shapes), 8 (ReadDir(1) then
+ReadDir(-1) on a directory file of any archive).
+
 Under `HEGEL_NO_KNOWN=1` the shapes are off: the fs side's checks of a trailing key are
 dropped (15, counted), the cases the classifier names as 14, 16, 17, 18 or 27 are filtered out
 (10 % of the FilesFrom property's), the upper-cased paths and `.zip` are at weight zero and
 the archive-named directories are renamed (21, 22, 23: nothing filtered). The narrow
-properties draw the region past their shape and pass. The pins and the three old
-properties' gates are unchanged there.
+properties draw the region past their shape and pass. The pins and the Insert
+property's gates are unchanged there.
 Under `HEGEL_NO_KNOWN=1` the Identify property drops the consistency check of the cases the
 classifier names 19 (3 %) and draws no Lz4 level above 0, no lzip cut but the empty one, no
 empty Lzip input, no `.tgz` name and no empty zip; the Compression property draws no Lz4
 level above 0, no empty Lzip input and no long undecodable brotli stream (nothing filtered,
 nothing dropped).
+The round-trip property draws no Xz zip, no Lz4 level above 0 and no empty zip, and drops
+8's TestFS class (93 % of its cases); the ArchiveFS property draws no prefix names and drops
+the fresh-mode checks the shapes of 4, 5 and 7 cover and the ReadDir-rest and TestFS checks
+of 8 (92 % of its cases have a check dropped, counted).
 
 ## Not judged
 
@@ -270,3 +320,7 @@ paths.
   consistency check (a truncated lzip header errs differently by seekability) and recorded;
   the notes of 10 (the bit-flag values are accepted), 19 (never Tar for `x.gz` over a tar) and
   26 (`x.tar.tgz`) corrected.
+- 2026-10-14 (part 3 of four): `TestHegelArchiveRoundTrip` and `TestHegelArchiveFS` rewritten
+  with their eight gates turned into switches, `fstest.TestFS` transcribed over the model,
+  six narrow properties; the pin of 19 hardened (four hundred calls); the notes of 1 (Identify
+  reads the bytes as corrupt xz) and 7 (the root's name after indexing) widened.
