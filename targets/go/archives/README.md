@@ -10,8 +10,11 @@ under every compression format), the compression formats' writers and readers, `
 
 ## Build
 
-The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of five
-`hegel_zoo_*_test.go` files that drive the public API: `go test -count=1 -run TestHegel -v ./hegel`.
+The patch adds `hegel.dev/go/hegel` to `go.mod` and a `hegel/` package of `hegel_zoo_*_test.go`
+files that drive the public API: `go test -count=1 -run TestHegel -v ./hegel`. `HEGEL_TEST_CASES`,
+`HEGEL_SEED` and `HEGEL_VERBOSE` pass through to the engine; `HEGEL_COLLECT=1` records the
+mismatches of the rewritten properties and prints their counts; `HEGEL_NO_KNOWN=1` switches
+their known shapes off (below).
 Two properties compare with tools when they are installed (`python3` for tarfile/zipfile;
 `gzip`, `bzip2`, `xz`, `zstd`, `lz4`, `brotli`, `lzip` to decode streams) and skip the
 comparison otherwise.
@@ -33,18 +36,39 @@ of the test binary with a timeout.
 
 ## Generator
 
-A tree of up to ten entries (files of 0 to 4096 bytes with block-aligned sizes frequent,
-directories, symbolic links to siblings, tree paths, parents, their own directory or nowhere) with permissions and
-times, written to a `fstest.MapFS` or to a directory on disk; names with spaces, dots,
-upper case, non-ASCII, and archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric
-ids, owner overrides) and `Zip` (store, deflate, bzip2, zstd, xz; selective compression),
-`Tar` under `Gz`, `Bz2`, `Xz`, `Zstd`, `Lz4`, `Brotli`, `Sz`, `Lzip`, `Zlib` and `MinLZ`
-with their levels. Archives written by hand with archive/tar and archive/zip for the shapes
-FilesFromFS never produces: implicit directories, entries out of order, `./` prefixes, a
-`.` entry, directories with and without a trailing slash. For DeepFS, a disk tree holding
-archives of every extension DeepFS recognises. For Identify, archives, compressed streams
-(also truncated), random bytes and empty streams under right, wrong, neutral and missing
-names.
+The two rewritten properties (part 1 of the rewrite to the standard, below) draw records from
+package-level generators. `filesCase`: a tree of up to eight entries (a name from the pool of
+twenty-six under the root or, at 60 %, under a directory already drawn; a directory at 25 %,
+a file at 60 - a size from the block-aligned table at 60 % else 0..3000; compressible text,
+one byte or random bytes at a third each -, else a link to a sibling name, an earlier entry's
+path, `../name`, `.` in a subdirectory or `/nowhere/name`; a link to itself or to another
+link is redirected to `/nowhere` by a pure settling pass), the mapping (the root `.` at 25 %
+or when the tree has no file or directory, else a path of the tree; a trailing slash on a
+directory key at 30 - `dieCoin(27)` realises 30 -; the value from `""` (twice), `.`, `x`,
+`x/`, `x/y`, `x/y/`, a file key's `.` and a trailing key's slash-ended value replaced by the
+builder: the two combinations the documentation leaves open), FollowSymlinks and
+ClearAttributes at 30 % each. `deepCase`: a tree of up to six entries with the files and links
+named like archives renamed on disk (DeepFS treats them as archives by its documentation),
+zero to three archives of every extension DeepFS recognises in the root or a directory,
+their names upper-cased at 20 %, each holding an inner tree of up to five entries that the
+library's own Archive writes, and the lexical paths: every model path with its `/`-prefixed,
+`/`-suffixed and upper-cased forms, and one of nine made-up paths. Every weight is drawn
+through the fair-bit dice of the idioms and the realised rate over 3000 cases stands beside
+it (the kinds 25/60/15 realise 24/60/14, the parent 60 realises 62, the size table 60
+realises 60, follow and clear 30 realise 31 and 30, an archive in a directory 50 realises
+48); a case costs about 270 draws (690 at most) for FilesFrom and 480 (1440) for DeepFS.
+
+The five properties not yet rewritten draw as before: a tree of up to ten entries (files of 0
+to 4096 bytes with block-aligned sizes frequent, directories, symbolic links to siblings,
+tree paths, parents, their own directory or nowhere) with permissions and times, written to a
+`fstest.MapFS` or to a directory on disk; names with spaces, dots, upper case, non-ASCII, and
+archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overrides) and
+`Zip` (store, deflate, bzip2, zstd, xz; selective compression), `Tar` under `Gz`, `Bz2`,
+`Xz`, `Zstd`, `Lz4`, `Brotli`, `Sz`, `Lzip`, `Zlib` and `MinLZ` with their levels. Archives
+written by hand with archive/tar and archive/zip for the shapes FilesFromFS never produces:
+implicit directories, entries out of order, `./` prefixes, a `.` entry, directories with and
+without a trailing slash. For Identify, archives, compressed streams (also truncated), random
+bytes and empty streams under right, wrong, neutral and missing names.
 
 ## Properties
 
@@ -55,7 +79,8 @@ names.
   its paths (walk, stat, open, read, readdir, sub, missing names), before and after indexing.
 - `TestHegelInsert`: files inserted into a Tar or Zip archive come out after its entries.
 - `TestHegelFilesFrom`: FilesFromFS and FilesFromDisk on the same tree gather what the
-  filenames map documents, with FollowSymlinks and ClearAttributes.
+  filenames map documents, with FollowSymlinks and ClearAttributes; a call whose expansion
+  the model never finishes still returns (judged in a child process).
 - `TestHegelIdentify`: Identify by name (the extension rules), by stream, both, repeatedly;
   no panic on arbitrary or truncated bytes.
 - `TestHegelDeepFS`: a disk tree with archives walks through DeepFS as the tree with each
@@ -63,6 +88,13 @@ names.
 - `TestHegelCompression`: every compression writer's stream is matched, identified, decoded
   by its reader and by the reference tool; gzip members with and without DisableMultistream.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
+- Nine narrow properties, one per bug of the two rewritten wide properties (below):
+  `TestHegelDotValuesGiveRelativeNames` (14), `TestHegelTrailingSlashKeysEnumerateOnFS` (15),
+  `TestHegelTrailingSlashKeysKeepTheValue` (16),
+  `TestHegelRelativeLinksResolveFromTheirDirectory` (17),
+  `TestHegelDirectoryLinksAreFollowedOnFS` (18), `TestHegelAncestorLinksReturn` (27),
+  `TestHegelPathContainsArchiveIgnoresCase` (21), `TestHegelSplitPathSplitsTheFirstSegment`
+  (22), `TestHegelDirectoriesNamedLikeArchivesAreWalked` (23).
 
 ## Bugs
 
@@ -84,18 +116,72 @@ Brotli streams over 1 KiB unmatched (25).
 
 ## Modelled as recorded
 
-Every bug has an `HZKnown` switch. While a switch is on the generator keeps away from the
-shape or the checks skip it: no xz method in zips, lz4 level 0 only, empty zips not identified
-by stream, the ReadDir-at-EOF lines of TestFS dropped, fresh Open/Stat checks skipped for
-implicit or out-of-order directories and prefix names, Tar.Insert only after a non-aligned
-regular file, Zip.Insert without directories, links or custom methods and its stored method
-accepted, the "." value, trailing-slash keys and directory or relative links under
-FollowSymlinks skipped on the affected side, followed links that lead back to an ancestor
-skipped on both, Identify's determinism not required when the
-name contradicts the stream, truncated lzip streams cut before the panic, mixed-case paths
-for PathContainsArchive, extension-only first segments, archive-named directories renamed,
-Lzip given a byte, brotli streams over 1 KiB not matched. The collector counts the
-avoidances; `ZOO_KNOWN_OFF=name,name` turns switches off and the properties then fail.
+The nine bugs of FilesFrom and DeepFS follow the standard (next section). The other seventeen
+keep an `HZKnown` switch, on by default, until their properties are rewritten: while it is on
+the generator keeps away from the shape or the checks skip it: no xz method in zips, lz4
+level 0 only, empty zips not identified by stream, the ReadDir-at-EOF lines of TestFS
+dropped, fresh Open/Stat checks skipped for implicit or out-of-order directories and prefix
+names, Tar.Insert only after a non-aligned regular file, Zip.Insert without directories,
+links or custom methods and its stored method accepted, Identify's determinism not required
+when the name contradicts the stream, truncated lzip streams cut before the panic, Lzip given
+a byte, brotli streams over 1 KiB not matched. The old collector counts the avoidances;
+`ZOO_KNOWN_OFF=name,name` turns those switches off and the properties then fail.
+
+## Properties and the recorded bugs
+
+The model of the two rewritten properties states the documented behaviour; the `known` switch
+set (`type known [27]bool`, one index per bug id, all off by default) turns a replica of the
+library's rule on in its place, each transcribed from the lines of `archives.go` and `fs.go`
+it follows: `nameOnDiskToNameInArchive` keeping the separator after the root for the value
+`.` (14) and trimming the value's first element for a trailing key, the directory itself
+added (16); `fs.WalkDir` of a slash-ended name (15); `followSymlinkFS` looking a relative
+target up from the walked root (17) and a directory target up inside `fs.Sub` of itself (18);
+an expansion deeper than the tree never returning (27); `PathContainsArchive` on the path as
+written (21); `SplitPath`'s scan from the second character (22); `DirFS.ReadDir` listing the
+archives under an archive-named directory as files (23). The classifier runs the model per
+switch on the case before the library is called and names the first bug in id order whose
+switch alone changes the expected checks (sufficiency), else the first whose switch is needed
+(necessity), else a hole; every mismatch by default is a named shape and no named shape
+passes. The checks: per side (fs, then disk) whether the call returns, the error's kind, the
+sorted names, and per entry the kind, link target, content, permissions and times; the names
+of a call whose documented expansion never finishes are left open (`unspecified`, not
+compared), only its returning is checked.
+
+Over 3000 default cases the FilesFrom property names 259 to 284 shapes (9 %), every one by
+sufficiency with the library agreeing with the replica in all of them: archives/14 in 113 to
+140, 15 in about 135, 17 in 7, 18 in 4; 16 lies behind 15 (every trailing key fails on the fs
+side first; 50 to 72 cases) and 27 behind 17 or 18 (a link that leads back is a link to a
+directory; 4 to 5 cases), so the wide property names neither. The DeepFS property names
+about 2560 (85 %): 21 in 2500 (the upper-cased form of every path is drawn, and an archive's
+name is among the paths), 22 in about 50 (sufficient in 300, behind 21), 23 sufficient in
+about 160, never named. Over nine rounds at the default count the FilesFrom property shrank
+to 15 six times (`{"a/": ""}` on a directory `a`) and to 14 three times (`{".": "."}`); the
+DeepFS property to 21 seven times (`a.ZIP/x`) and to 22 twice (`.zip`); over forty rounds at a
+hundred cases both fail every round, the FilesFrom property to 15 in 22 (14 in 17, 17 once), the
+DeepFS property to 21 in 25 (22 in 15): both are mapped plain to those. A default run takes
+about a minute and a half on this machine (the FilesFrom shrink and the child processes), a
+thousand cases under `HEGEL_NO_KNOWN=1` under three minutes.
+The hang (27): a case whose expansion the model marks as endless - 4 to 5 per 3000 per side -
+runs both library calls in a child process (the test binary re-executed with
+`HZ_ARCHIVES_CHILD=files`, the case as JSON on its stdin, the child's stack capped at a
+mebibyte so that the recursion dies within milliseconds; the parent waits up to four seconds)
+and the other cases call the library in process under a one-second context, which the
+library's walk checks. The narrow properties force the shape with the rest of the case drawn
+as in the wide property: 14 (a key without a trailing slash and the value `.`; 18 % rejected
+for follow errors), 15 (a trailing key, the fs side), 16 (a trailing key with a value, judged
+past 15 on the disk side), 17 (a relative link in a subdirectory, no other link), 18 (a link
+to a directory, no other link), 27 (a link to `.`, judged past 17 and 18 - the fs side's
+resolution is their shape -, every case in two child processes, so twenty cases by default
+and a shrink budget of forty), 21 (an upper-cased extension), 22 (an extension-only first
+segment, no upper case, no trailing slash: `.zip/` splits alike either way), 23 (an
+archive-named directory holding an archive).
+
+Under `HEGEL_NO_KNOWN=1` the shapes are off: the fs side's checks of a trailing key are
+dropped (15, counted), the cases the classifier names as 14, 16, 17, 18 or 27 are filtered out
+(10 % of the FilesFrom property's), the upper-cased paths and `.zip` are at weight zero and
+the archive-named directories are renamed (21, 22, 23: nothing filtered). The narrow
+properties draw the region past their shape and pass. The pins and the five old properties'
+gates are unchanged there.
 
 ## Not judged
 
@@ -116,3 +202,8 @@ paths.
 ## History
 
 - 2026-09-22: new target, seven properties, 27 bugs.
+- 2026-10-14 (part 1 of four): the harness of the standard beside the old one;
+  `TestHegelFilesFrom` and `TestHegelDeepFS` rewritten with their nine gates turned into
+  switches off by default and nine narrow properties; the hang judged in a child process;
+  the notes of archives/14 (the directory itself is skipped, not named `/`) and 27 (a root-level
+  link to `.` hangs too) corrected.

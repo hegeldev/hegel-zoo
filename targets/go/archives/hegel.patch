@@ -29,9 +29,1628 @@ index 4e10237..9182dec 100644
  	go4.org v0.0.0-20260112195520-a5071408f32f // indirect
 +	golang.org/x/sys v0.44.0 // indirect
  )
+diff --git a/hegel/hegel_zoo_deep_test.go b/hegel/hegel_zoo_deep_test.go
+new file mode 100644
+index 0000000..3bade0b
+--- /dev/null
++++ b/hegel/hegel_zoo_deep_test.go
+@@ -0,0 +1,551 @@
++package hegel
++
++// The DeepFS property: the case records (a disk tree, the archives written into it with their
++// inner trees, a made-up lexical path), their generators, the documented model of the walk,
++// the reads and stats and the two lexical functions with the replicas of the recorded bugs
++// threaded on the switch set (deepExpected), and the wide property.
++//
++// The model: DeepFS's doc comment (fs.go :735-764): "a file system that treats archives as
++// directories", "the archive file is treated as a directory and its contents are listed as if
++// they were in a subdirectory", by file extension alone, archives within archives not
++// supported; its ReadDir (:806-810) marks "any entries that appear by their file extension to
++// be archive files" as directories so that fs.WalkDir walks into them. So the walk over
++// DeepFS{Root} visits every entry of the disk tree (a link is a link: not followed, not a
++// directory) and every archive as a directory holding its entries, and every file, on disk or
++// inside an archive, opens and stats as itself. SplitPath (:858-868): "the split point is the
++// first extension of an archive filetype like .zip or .tar.gz that occurs in the path", the
++// real path cleaned, the inner path "." for "precisely an archive file"; PathIsArchive (:954)
++// and PathContainsArchive (:970-974) are "solely by lexical analysis", the one for whether
++// the path ends with an archive, the other for whether it "traverses into" one: a segment
++// that PathIsArchive accepts (lower-cased, as PathIsArchive does; a trailing space trimmed,
++// as SplitPath does). The checks: "walk" (the sorted paths the walk visits, each with its
++// IsDir, or the walk's error), "read <p>" (the size and content hash of a file, or the error
++// kind), "stat <p>" (the size of a file, or the error kind), "split <path>" (the real and
++// inner paths) and "contains <path>" (true or false) per lexical path.
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io/fs"
++	"os"
++	"path"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++
++	"github.com/mholt/archives"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- the records
++
++// deepArchive is one archive written into the tree: its path on disk (slash-separated,
++// relative to the root), the extension it was drawn with (lower case; Path's name may be
++// upper-cased) and the inner tree it holds (never empty: the builder puts the file "only" in
++// an empty one, since an empty tar is not identified as one).
++type deepArchive struct {
++	Path  string
++	Ext   string
++	Inner []fileEntry
++}
++
++// deepCase is one case: the disk tree (files and links named like archives renamed with a
++// "_" suffix by the builder, directories named like archives kept - the shape of
++// archives/23 - unless HEGEL_NO_KNOWN=1 renames them too), the archives, and the made-up
++// lexical path; the lexical paths of the case are lexicalPaths(c). Lower is the strict pool
++// of the narrow properties of archives/22 and 23: the archive names lower-cased and no
++// upper-cased lexical form, so that archives/21 is not named first.
++type deepCase struct {
++	Tree     []fileEntry
++	Archives []deepArchive
++	MadeUp   string
++	Lower    bool
++}
++
++func (c deepCase) GoString() string {
++	var b strings.Builder
++	fmt.Fprintf(&b, "deepCase{made-up path %q, lower %v}\n%s", c.MadeUp, c.Lower, treeString(c.Tree))
++	for _, a := range c.Archives {
++		fmt.Fprintf(&b, "  archive %q (%s):\n", a.Path, a.Ext)
++		for _, line := range strings.Split(strings.TrimRight(treeString(a.Inner), "\n"), "\n") {
++			b.WriteString("  " + line + "\n")
++		}
++	}
++	return b.String()
++}
++
++// --------------------------------------------------------------------------- the generators
++
++// hzArchiveExts is every archive extension DeepFS recognises that the package writes (its
++// archiveExtensions, fs.go :940-952, less ".tar.s2", which no format of the package writes).
++var hzArchiveExts = []string{".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.zst", ".tar.lz4", ".tar.xz", ".tar.sz", ".tar.lz"}
++
++// hzFormatForExt is the format that writes an archive with that extension.
++func hzFormatForExt(ext string) archives.Format {
++	switch ext {
++	case ".zip":
++		return archives.Zip{}
++	case ".tar":
++		return archives.Tar{}
++	}
++	var comp archives.Compression
++	switch ext {
++	case ".tgz", ".tar.gz":
++		comp = archives.Gz{}
++	case ".tar.bz2":
++		comp = archives.Bz2{}
++	case ".tar.zst":
++		comp = archives.Zstd{}
++	case ".tar.lz4":
++		comp = archives.Lz4{}
++	case ".tar.xz":
++		comp = archives.Xz{}
++	case ".tar.sz":
++		comp = archives.Sz{}
++	case ".tar.lz":
++		comp = archives.Lzip{}
++	}
++	return archives.CompressedArchive{Archival: archives.Tar{}, Extraction: archives.Tar{}, Compression: comp}
++}
++
++// madeUpPaths is the made-up lexical path: one of nine evenly (realised 10-12 each); at
++// weight zero under HEGEL_NO_KNOWN=1 "a.ZIP/x" (an upper-cased extension, the shape of
++// archives/21) and ".zip" (a first segment that is an extension alone, the shape of
++// archives/22).
++var madeUpPaths = halvesOver([]int{1, hzUnless(hzNoKnown, 1), 1, 1, 1, 1, 1, hzUnless(hzNoKnown, 1), 1},
++	"a.zip/b.tar/c", "a.ZIP/x", "a.tar.gz", "a.tgz/", "/a/b.tar.zst/c/d", "x.zip /y", "a.tar.gzip", ".zip", "a/.tar/b")
++
++// archiveAmong is one archive among the directories of the tree: in the root or, when there
++// is a directory, in one at 50 (realised 50), a name of arc/ARC/a b/x.y with an extension of
++// hzArchiveExts, upper-cased at 20 (realised 20; weight zero under HEGEL_NO_KNOWN=1, where an
++// upper-cased extension is the shape of archives/21 on every lexical path through it), and
++// an inner tree of up to 5 entries. Path is the archive's path before the builder's renames
++// (the directory as drawn).
++func archiveAmong(dirs []string) hegel.Generator[deepArchive] {
++	dir := hegel.Just("")
++	if len(dirs) > 0 {
++		dir = dieChoice(hzW(50, hegel.Just("")), hzW(50, evenHalves(dirs...)))
++	}
++	return archiveAt(dir)
++}
++
++// archiveAt is an archive in the directory drawn by dir.
++func archiveAt(dir hegel.Generator[string]) hegel.Generator[deepArchive] {
++	return hegel.FlatMap(dir, func(d string) hegel.Generator[deepArchive] {
++		return hegel.FlatMap(evenHalves("arc", "ARC", "a b", "x.y"), func(stem string) hegel.Generator[deepArchive] {
++			return hegel.FlatMap(evenHalves(hzArchiveExts...), func(ext string) hegel.Generator[deepArchive] {
++				return hegel.FlatMap(dieCoin(hzUnless(hzNoKnown, 20)), func(upper bool) hegel.Generator[deepArchive] {
++					name := stem + ext
++					if upper {
++						name = strings.ToUpper(name)
++					}
++					p := name
++					if d != "" {
++						p = d + "/" + name
++					}
++					return hegel.Map(treesOf(5), func(inner []fileEntry) deepArchive { return deepArchive{Path: p, Ext: ext, Inner: inner} })
++				})
++			})
++		})
++	})
++}
++
++// buildDeepCase renames the tree's files and links named like archives (DeepFS treats them
++// as archives by its documentation: not judged) and, under HEGEL_NO_KNOWN=1, its directories
++// named like archives (the shape of archives/23, otherwise kept), composing along the path;
++// makes every directory writable (DeepFS opens them); moves the archives into the renamed
++// directories, dropping one whose path is taken (lower-casing their names for the strict
++// pool); and fills an empty inner tree.
++func buildDeepCase(tree []fileEntry, archs []deepArchive, madeUp string, lower bool) deepCase {
++	renamed := map[string]string{}
++	out := make([]fileEntry, 0, len(tree))
++	for _, e := range tree {
++		p := path.Base(e.Path)
++		if parent := path.Dir(e.Path); parent != "." {
++			p = renamed[parent] + "/" + p
++		}
++		if archives.PathIsArchive(p) && (e.Kind != 'd' || hzNoKnown) {
++			p += "_"
++		}
++		renamed[e.Path] = p
++		e.Path = p
++		if e.Kind == 'd' {
++			e.Mode |= 0o700
++		}
++		out = append(out, e)
++	}
++	taken := map[string]bool{}
++	for _, e := range out {
++		taken[e.Path] = true
++	}
++	var as []deepArchive
++	for _, a := range archs {
++		p := path.Base(a.Path)
++		if lower {
++			p = strings.ToLower(p)
++		}
++		if parent := path.Dir(a.Path); parent != "." {
++			p = renamed[parent] + "/" + p
++		}
++		if taken[p] {
++			continue
++		}
++		taken[p] = true
++		a.Path = p
++		if len(a.Inner) == 0 {
++			a.Inner = []fileEntry{{Path: "only", Kind: 'f', Data: []byte("x"), Mode: 0o644}}
++		}
++		as = append(as, a)
++	}
++	return deepCase{Tree: out, Archives: as, MadeUp: madeUp, Lower: lower}
++}
++
++// deepCasesWith is a case over the trees: up to 3 archives, the count drawn evenly (realised
++// 25 each), and a made-up path of madeUp; lower for the strict pool.
++func deepCasesWith(trees hegel.Generator[[]fileEntry], madeUp hegel.Generator[string], lower bool) hegel.Generator[deepCase] {
++	return hegel.FlatMap(trees, func(tree []fileEntry) hegel.Generator[deepCase] {
++		return hegel.FlatMap(countedHalves(archiveAmong(dirsOf(tree)), 0, 3), func(archs []deepArchive) hegel.Generator[deepCase] {
++			return hegel.Map(madeUp, func(m string) deepCase { return buildDeepCase(tree, archs, m, lower) })
++		})
++	})
++}
++
++var deepCases = deepCasesWith(treesOf(6), madeUpPaths, false)
++
++// --------------------------------------------------------------------------- the model
++
++// modelPaths is every path the walk visits, with its kind: the tree's entries, the archives
++// (as directories) and their inner entries.
++func modelPaths(c deepCase) map[string]byte {
++	m := map[string]byte{}
++	for _, e := range c.Tree {
++		m[e.Path] = e.Kind
++	}
++	for _, a := range c.Archives {
++		m[a.Path] = 'd'
++		for _, e := range a.Inner {
++			m[a.Path+"/"+e.Path] = e.Kind
++		}
++	}
++	return m
++}
++
++// lexicalPaths is the lexical paths of a case: every model path with its "/"-prefixed,
++// "/"-suffixed and (not under HEGEL_NO_KNOWN=1 or in the strict pool, since an upper-cased
++// archive extension is the shape of archives/21) upper-cased forms, and the made-up path.
++func lexicalPaths(c deepCase) []string {
++	var ps []string
++	for p := range modelPaths(c) {
++		ps = append(ps, p, "/"+p, p+"/")
++		if !hzNoKnown && !c.Lower {
++			ps = append(ps, strings.ToUpper(p))
++		}
++	}
++	ps = append(ps, c.MadeUp)
++	sort.Strings(ps)
++	return ps
++}
++
++// inArchiveNamedDir reports whether a directory above p is named like an archive (the
++// region of archives/23).
++func inArchiveNamedDir(c deepCase, p string) bool {
++	for dir := path.Dir(p); dir != "."; dir = path.Dir(dir) {
++		if e := entryAt(c.Tree, dir); e != nil && e.Kind == 'd' && archives.PathIsArchive(dir) {
++			return true
++		}
++	}
++	return false
++}
++
++// splitDocumented is SplitPath as documented: the first segment that is an archive (lower-
++// cased, a trailing space trimmed) ends the real path; the inner path is the rest, "." for a
++// path that is precisely an archive.
++func splitDocumented(p string) (string, string) {
++	segs := strings.Split(p, "/")
++	for i, s := range segs {
++		if archives.PathIsArchive(strings.TrimRight(strings.ToLower(s), " ")) {
++			real := filepath.Clean(filepath.FromSlash(strings.Join(segs[:i+1], "/")))
++			inner := strings.Join(segs[i+1:], "/")
++			if inner == "" && i == len(segs)-1 {
++				inner = "."
++			}
++			return real, inner
++		}
++	}
++	return filepath.Clean(filepath.FromSlash(p)), ""
++}
++
++// splitScanned is SplitPath's own scan, fs.go :869-918 transcribed (archives/22): the scan
++// starts at index 1, so the first character of a relative path's first segment is never
++// examined.
++func splitScanned(p string) (realPath, innerPath string) {
++	if len(p) < 2 {
++		return p, ""
++	}
++	start, end := 1, strings.Index(p[1:], "/")+1
++	if end-start < 0 {
++		end = len(p)
++	}
++	for {
++		part := strings.TrimRight(strings.ToLower(p[start:end]), " ")
++		if archives.PathIsArchive(part) {
++			realPath = filepath.Clean(filepath.FromSlash(p[:end]))
++			if end < len(p) {
++				innerPath = p[end+1:]
++			} else {
++				innerPath = "."
++			}
++			return
++		}
++		start = end + 1
++		if start > len(p) {
++			break
++		}
++		end = strings.Index(p[start:], "/") + start
++		if end-start < 0 {
++			end = len(p)
++		}
++	}
++	return filepath.Clean(filepath.FromSlash(p)), ""
++}
++
++// containsDocumented is PathContainsArchive as documented: a segment of the path is an
++// archive by PathIsArchive.
++func containsDocumented(p string) bool {
++	for _, s := range strings.Split(p, "/") {
++		if archives.PathIsArchive(s) {
++			return true
++		}
++	}
++	return false
++}
++
++// containsAsWritten is PathContainsArchive's own test, fs.go :975-983 transcribed
++// (archives/21): the extensions against the path as given, case-sensitively.
++func containsAsWritten(p string) bool {
++	all := append(append([]string(nil), hzArchiveExts...), ".tar.s2")
++	for _, ext := range all {
++		if strings.Contains(p+"/", ext+"/") {
++			return true
++		}
++	}
++	return false
++}
++
++func fileValue(data []byte) string {
++	sum := sha256.Sum256(data)
++	return fmt.Sprintf("size=%d sha=%s", len(data), hex.EncodeToString(sum[:4]))
++}
++
++// deepExpected states every value the property checks.
++func deepExpected(c deepCase, k known) checks {
++	out := checks{}
++	paths := modelPaths(c)
++	// archives/23: an archive below a directory named like one is read through a DirFS
++	// (getInnerFsys, fs.go :839-856, FileSystem :47-71), whose ReadDir (:223-228) does not
++	// mark it as a directory (DeepFS.ReadDir :828-832 does): the walk takes it for a file,
++	// its entries are absent, and a path into it opens through the DirFS as a path through
++	// a file (ENOTDIR)
++	flat := map[string]bool{}
++	if k[kDeepFSDirNamedArchive] {
++		for _, a := range c.Archives {
++			if inArchiveNamedDir(c, a.Path) {
++				flat[a.Path] = true
++			}
++		}
++	}
++	var lines []string
++	for p, kind := range paths {
++		under := ""
++		for f := range flat {
++			if strings.HasPrefix(p, f+"/") {
++				under = f
++			}
++		}
++		if under != "" {
++			continue
++		}
++		isDir := kind == 'd'
++		if flat[p] {
++			isDir = false
++		}
++		lines = append(lines, fmt.Sprintf("%v %s", isDir, p))
++	}
++	sort.Strings(lines)
++	out.set("walk", strings.Join(lines, "\n"))
++	for _, e := range c.Tree {
++		if e.Kind == 'f' {
++			out.set("read "+e.Path, fileValue(e.Data))
++			out.set("stat "+e.Path, "file size="+strconv.Itoa(len(e.Data)))
++		}
++	}
++	for _, a := range c.Archives {
++		for _, e := range a.Inner {
++			if e.Kind != 'f' {
++				continue
++			}
++			p := a.Path + "/" + e.Path
++			if flat[a.Path] {
++				out.set("read "+p, "error: notdir")
++				out.set("stat "+p, "error: notdir")
++				continue
++			}
++			out.set("read "+p, fileValue(e.Data))
++			out.set("stat "+p, "file size="+strconv.Itoa(len(e.Data)))
++		}
++	}
++	for _, p := range lexicalPaths(c) {
++		real, inner := splitDocumented(p)
++		if k[kSplitPathFirstSegment] {
++			real, inner = splitScanned(p)
++		}
++		out.set("split "+p, fmt.Sprintf("%q %q", real, inner))
++		contains := containsDocumented(p)
++		if k[kPathContainsArchiveCase] {
++			contains = containsAsWritten(p)
++		}
++		out.set("contains "+p, contains)
++	}
++	return out
++}
++
++func init() {
++	for i, name := range []string{"walk", "read", "stat", "split", "contains"} {
++		checkRank[name] = 10 + i
++	}
++}
++
++// --------------------------------------------------------------------------- the library
++
++// deepErrKind is the kind of an error of DeepFS: "notexist", "notdir", "invalid", else the
++// text.
++func deepErrKind(err error) string {
++	switch {
++	case errors.Is(err, fs.ErrNotExist):
++		return "notexist"
++	case errors.Is(err, syscall.ENOTDIR):
++		return "notdir"
++	case errors.Is(err, fs.ErrInvalid):
++		return "invalid"
++	}
++	return err.Error()
++}
++
++// writeArchives writes the case's archives under dir: the bytes are the package's own
++// Archive of FilesFromFS over the inner tree (the archive writer, not the subject).
++func writeArchives(c deepCase, dir string) error {
++	for _, a := range c.Archives {
++		files, err := archives.FilesFromFS(context.Background(), treeMapFS(a.Inner), nil, nil)
++		if err != nil {
++			return fmt.Errorf("FilesFromFS of the inner tree of %s: %w", a.Path, err)
++		}
++		var buf bytes.Buffer
++		if err := hzFormatForExt(a.Ext).(archives.Archiver).Archive(context.Background(), &buf, files); err != nil {
++			return fmt.Errorf("Archive of %s: %w", a.Path, err)
++		}
++		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(a.Path)), buf.Bytes(), 0o644); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// deepActual asks DeepFS{Root: dir} the questions deepExpected answered.
++func deepActual(c deepCase, dir string) checks {
++	out := checks{}
++	dfs := &archives.DeepFS{Root: dir}
++	var lines []string
++	err := fs.WalkDir(dfs, ".", func(p string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return fmt.Errorf("at %q: %w", p, err)
++		}
++		if p != "." {
++			lines = append(lines, fmt.Sprintf("%v %s", d.IsDir(), p))
++		}
++		return nil
++	})
++	if err != nil {
++		out.set("walk", "error: "+err.Error())
++	} else {
++		sort.Strings(lines)
++		out.set("walk", strings.Join(lines, "\n"))
++	}
++	ask := func(p string) {
++		if data, err := fs.ReadFile(dfs, p); err != nil {
++			out.set("read "+p, "error: "+deepErrKind(err))
++		} else {
++			out.set("read "+p, fileValue(data))
++		}
++		if info, err := fs.Stat(dfs, p); err != nil {
++			out.set("stat "+p, "error: "+deepErrKind(err))
++		} else if info.IsDir() {
++			out.set("stat "+p, "dir")
++		} else {
++			out.set("stat "+p, "file size="+strconv.FormatInt(info.Size(), 10))
++		}
++	}
++	for _, e := range c.Tree {
++		if e.Kind == 'f' {
++			ask(e.Path)
++		}
++	}
++	for _, a := range c.Archives {
++		for _, e := range a.Inner {
++			if e.Kind == 'f' {
++				ask(a.Path + "/" + e.Path)
++			}
++		}
++	}
++	for _, p := range lexicalPaths(c) {
++		real, inner := dfs.SplitPath(p)
++		out.set("split "+p, fmt.Sprintf("%q %q", real, inner))
++		out.set("contains "+p, archives.PathContainsArchive(p))
++	}
++	return out
++}
++
++// --------------------------------------------------------------------------- the property
++
++// deepJudgeWith is the judge of the family: the tree and the archives written under a fresh
++// directory of root, then judgeBy over deepExpected and deepActual. The narrow properties
++// share it.
++func deepJudgeWith(root string) func(j *hzCaseJudge, c deepCase) {
++	n := 0
++	return func(j *hzCaseJudge, c deepCase) {
++		n++
++		dir := filepath.Join(root, "t"+strconv.Itoa(n))
++		if err := os.Mkdir(dir, 0o700); err != nil {
++			panic(err)
++		}
++		defer func() { restoreDisk(dir); os.RemoveAll(dir) }()
++		if err := treeToDisk(c.Tree, dir); err != nil {
++			panic(fmt.Sprintf("writing the tree: %v", err))
++		}
++		if err := writeArchives(c, dir); err != nil {
++			j.Fail("writer", "%v for\n%#v", err, c)
++			return
++		}
++		judgeBy(j, &c, deepExpected, func(c *deepCase) checks { return deepActual(*c, dir) })
++	}
++}
++
++// wideDeepCases is the cases of the wide property: under HEGEL_NO_KNOWN=1 the three shapes
++// are off by weight (the upper-cased forms and names, the ".zip" made-up path) and by the
++// builder's renaming; withoutShapes is the backstop (counted "filtered archives/N").
++var wideDeepCases = withoutShapes(deepExpected, deepCases)
++
++// TestHegelDeepFS: a directory on disk holding files, directories, links and archives written
++// by the package (every archive extension DeepFS recognises) walks, through DeepFS, as the
++// disk tree with every archive replaced by a directory of its entries; the files inside read
++// and stat as their contents. SplitPath splits at the first archive extension;
++// PathContainsArchive agrees with PathIsArchive on the path's segments.
++func TestHegelDeepFS(t *testing.T) {
++	judged(t, wideDeepCases, deepJudgeWith(filesRoot(t)))
++}
+diff --git a/hegel/hegel_zoo_files_test.go b/hegel/hegel_zoo_files_test.go
+new file mode 100644
+index 0000000..e8b2985
+--- /dev/null
++++ b/hegel/hegel_zoo_files_test.go
+@@ -0,0 +1,1056 @@
++package hegel
++
++// The FilesFromFS / FilesFromDisk property: the case records (a tree of files, directories
++// and links, the one entry of the filenames map, the options), their generators, the
++// documented model of what the two functions gather with the replicas of the recorded bugs
++// threaded on the switch set (filesExpected), the child process a case whose expansion never
++// ends is judged in, and the wide property.
++//
++// The model: the doc comment of FilesFromDisk (archives.go :52-72; FilesFromFS :165-184 says
++// the same) gives the rules of the filenames map - a key names a file or a directory, which
++// is walked and added "rooted at the named directory"; a key ending in a separator
++// "enumerates contents only, without adding the folder itself"; an empty value is "the base
++// name of the file (sans path) in the root of the archive", "." (nameOnDiskToNameInArchive
++// :292-298) the root of the archive without the base name, and a value ending in a slash
++// "the base name of the file in that folder". FollowSymlinks (:343-346): "the link will not
++// be added as a link, but what the link points to will be added as a file": a link to a file
++// is gathered as that file under the link's name, a link to a directory as that directory
++// and everything in it under the link's name, followed again inside, and a link that points
++// at nothing is an error. ClearAttributes (:348-350): "Name, size, type, and permissions
++// will still be preserved", the time and Sys are not. A link whose expansion leads back to
++// an ancestor directory has no end: the documented outcome of the call is that it returns
++// (the "returns" check); what it returns is not documented (the "error", "names" and "entry"
++// checks are the open marker). The checks per side ("fs" then "disk"): "<side> returns"
++// ("returned" or "hang"), "<side> error" (the kind: "none"; "dangling" for the text
++// "statting dereferenced symlink", the one text both sides give for a followed link whose
++// target cannot be stat'ed; "symlink directory" for "getting files from symlink directory";
++// "loop" and "depth" for followSymlink's own; "open" for an fs.ErrNotExist of the walk's
++// root; else the text), and, when no error is stated, "<side> names" (the sorted names in
++// the archive) and "<side> entry <name>" (the kind, the link target, the size and content
++// hash, the permission bits, the time or "cleared"; the root directory itself, whose
++// attributes are the temporary directory's, is open).
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++	"os/exec"
++	"path"
++	"path/filepath"
++	"runtime/debug"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++	"testing/fstest"
++	"time"
++
++	"github.com/mholt/archives"
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- the records
++
++// fileEntry is one entry of a tree: a slash-separated clean relative path (parents come
++// before children in the list), the kind ('d', 'f', 'l'), the content of a file, the target
++// of a link as written, the permission bits and the time. Fallback is the name a link is
++// redirected to under /nowhere/ when its target would be itself or another link (settle).
++// The fields are exported for the child process, which takes the case as JSON.
++type fileEntry struct {
++	Path     string
++	Kind     byte
++	Data     []byte
++	Link     string
++	Mode     fs.FileMode
++	Mtime    time.Time
++	Fallback string
++}
++
++// filesCase is one case: the tree, the one entry of the filenames map (the key a tree path
++// or "." for the root, with a trailing slash for a directory's contents; the value as
++// documented) and the two options.
++type filesCase struct {
++	Tree   []fileEntry
++	Key    string
++	Value  string
++	Follow bool
++	Clear  bool
++}
++
++func treeString(tree []fileEntry) string {
++	if len(tree) == 0 {
++		return "  (empty)\n"
++	}
++	var b strings.Builder
++	for _, e := range tree {
++		fmt.Fprintf(&b, "  %c %q mode %o", e.Kind, e.Path, e.Mode)
++		if e.Kind == 'f' {
++			fmt.Fprintf(&b, " (%d bytes)", len(e.Data))
++		}
++		if e.Kind == 'l' {
++			fmt.Fprintf(&b, " -> %q", e.Link)
++		}
++		b.WriteString("\n")
++	}
++	return b.String()
++}
++
++func (c filesCase) GoString() string {
++	return fmt.Sprintf("filesCase{%q: %q, FollowSymlinks %v, ClearAttributes %v}\n%s", c.Key, c.Value, c.Follow, c.Clear, treeString(c.Tree))
++}
++
++// --------------------------------------------------------------------------- the pools
++
++// treeNames is the name pool (the old hzNames, byte for byte).
++var treeNames = []string{
++	"a", "b", "c.txt", "d.zip", "e.tar", "f.tar.gz", "g.tgz", "h i", "j.jpg", "K", "l.bak",
++	"m.tar.txt", "n.gz", "o..p", "q-r", "s_t", "u.PNG", "v.7z", "w.zst", "x", "y.json", "z.tar.zst",
++	"caf\u00e9", "0", "1.2.3", "long-name-with-many-characters-in-it-for-headers.txt",
++}
++
++var fileSizes = []int{0, 1, 7, 100, 511, 512, 513, 1023, 1024, 1025, 1500, 4096}
++
++// fileData is the content of a file: a size from the table 60 percent of the time (realised
++// 60), else 0..3000; compressible text, one byte repeated, or random bytes a third each
++// (realised 33/33/34).
++var fileData = hegel.FlatMap(dieChoice(hzW(60, evenHalves(fileSizes...)), hzW(40, rangeHalves(0, 3000))), func(n int) hegel.Generator[[]byte] {
++	return halvesGens([]int{1, 1, 1},
++		hegel.Just(bytes.Repeat([]byte("the quick brown fox "), n/20+1)[:n]),
++		hegel.Map(rangeHalves(0, 255), func(b int) []byte { return bytes.Repeat([]byte{byte(b)}, n) }),
++		hegel.Binary(n, n))
++})
++
++// entryTime is a time in 1981..2099, whole seconds: inside every format's range (zip's MS-DOS
++// time starts in 1980); the engine's integer draw favours the small values, so most times
++// are in the eighties, as the old draw gave them.
++var entryTime = hegel.Map(hegel.Integers(350000000, 4100000000), func(s int) time.Time { return time.Unix(int64(s), 0).UTC() })
++
++var entryName = evenHalves(treeNames...)
++
++var dirMode = hegel.Map(rangeHalves(0, 0o77), func(m int) fs.FileMode { return fs.FileMode(0o700 | m) })
++
++var fileMode = hegel.Map(rangeHalves(0, 0o177), func(m int) fs.FileMode { return fs.FileMode(0o600 | m) })
++
++// --------------------------------------------------------------------------- the tree
++
++func dirsOf(tree []fileEntry) []string {
++	var ds []string
++	for _, e := range tree {
++		if e.Kind == 'd' {
++			ds = append(ds, e.Path)
++		}
++	}
++	return ds
++}
++
++func pathsOf(tree []fileEntry) []string {
++	var ps []string
++	for _, e := range tree {
++		ps = append(ps, e.Path)
++	}
++	return ps
++}
++
++func entryAt(tree []fileEntry, p string) *fileEntry {
++	for i := range tree {
++		if tree[i].Path == p {
++			return &tree[i]
++		}
++	}
++	return nil
++}
++
++// linkTargetAmong is the target of a link at p (under parent) given the entries drawn so
++// far: a sibling name, the path of an earlier entry ("x" when there is none), "../name", "."
++// in a subdirectory (a name at the root), or "/nowhere/name", at a fifth each (realised
++// 21/19/20/20/20).
++func linkTargetAmong(prefix []fileEntry, parent string) hegel.Generator[string] {
++	earlier := hegel.Just("x")
++	if len(prefix) > 0 {
++		earlier = evenHalves(pathsOf(prefix)...)
++	}
++	own := hegel.Just(".")
++	if parent == "" {
++		own = entryName
++	}
++	return halvesGens([]int{1, 1, 1, 1, 1},
++		entryName,
++		earlier,
++		hegel.Map(entryName, func(n string) string { return "../" + n }),
++		own,
++		hegel.Map(entryName, func(n string) string { return "/nowhere/" + n }))
++}
++
++// entryAmong is one entry drawn after the entries of prefix: under a directory drawn so far
++// 60 percent of the time when there is one (realised 60), a name of the pool, and a
++// directory a quarter of the time (mode 0700 | 0..077), a file 60 (mode 0600 | 0..0177), a
++// link 15 (realised 25/60/15), each with a time.
++func entryAmong(prefix []fileEntry) hegel.Generator[fileEntry] {
++	parent := hegel.Just("")
++	if ds := dirsOf(prefix); len(ds) > 0 {
++		parent = dieChoice(hzW(40, hegel.Just("")), hzW(60, evenHalves(ds...)))
++	}
++	return hegel.FlatMap(parent, func(par string) hegel.Generator[fileEntry] {
++		return hegel.FlatMap(entryName, func(name string) hegel.Generator[fileEntry] {
++			p := name
++			if par != "" {
++				p = par + "/" + name
++			}
++			return hegel.FlatMap(entryTime, func(mt time.Time) hegel.Generator[fileEntry] {
++				dir := hegel.Map(dirMode, func(m fs.FileMode) fileEntry { return fileEntry{Path: p, Kind: 'd', Mode: m, Mtime: mt} })
++				file := hegel.FlatMap(fileData, func(data []byte) hegel.Generator[fileEntry] {
++					return hegel.Map(fileMode, func(m fs.FileMode) fileEntry { return fileEntry{Path: p, Kind: 'f', Data: data, Mode: m, Mtime: mt} })
++				})
++				link := hegel.FlatMap(linkTargetAmong(prefix, par), func(target string) hegel.Generator[fileEntry] {
++					return hegel.Map(entryName, func(fallback string) fileEntry {
++						return fileEntry{Path: p, Kind: 'l', Link: target, Mode: 0o777, Mtime: mt, Fallback: fallback}
++					})
++				})
++				return halvesGens([]int{25, 60, 15}, dir, file, link)
++			})
++		})
++	})
++}
++
++// treeFrom draws left more entries after prefix, one after the other (each entry's parent
++// and link target depend on the ones before it); an entry whose path is already there is
++// dropped. The result is settled.
++func treeFrom(prefix []fileEntry, left int) hegel.Generator[[]fileEntry] {
++	if left == 0 {
++		return hegel.Just(prefix)
++	}
++	return hegel.FlatMap(entryAmong(prefix), func(e fileEntry) hegel.Generator[[]fileEntry] {
++		next := prefix
++		if entryAt(prefix, e.Path) == nil {
++			next = append(append([]fileEntry(nil), prefix...), e)
++		}
++		return treeFrom(next, left-1)
++	})
++}
++
++// resolveLink resolves a link target the way a file system does: relative to the link's
++// directory, staying inside the tree. It returns the tree path ("." for the root), or ""
++// when the target leaves the tree or is absolute.
++func resolveLink(linkPath, target string) string {
++	if strings.HasPrefix(target, "/") {
++		return ""
++	}
++	p := path.Join(path.Dir(linkPath), target)
++	if p == ".." || strings.HasPrefix(p, "../") {
++		return ""
++	}
++	return p
++}
++
++// settle redirects every link whose target resolves to itself or to another link to
++// /nowhere/<its fallback name> (a loop of links would not resolve, and fstest.MapFS follows
++// chains without end); the kinds are read from the tree as drawn, so the order of the links
++// does not matter. A pure function of the drawn tree, run once by the builder.
++func settle(tree []fileEntry) []fileEntry {
++	out := append([]fileEntry(nil), tree...)
++	for i := range out {
++		e := &out[i]
++		if e.Kind != 'l' {
++			continue
++		}
++		if r := resolveLink(e.Path, e.Link); r != "" {
++			if r == e.Path {
++				e.Link = "/nowhere/" + e.Fallback
++			} else if t := entryAt(tree, r); t != nil && t.Kind == 'l' {
++				e.Link = "/nowhere/" + e.Fallback
++			}
++		}
++	}
++	return out
++}
++
++// treesOf is a tree of up to n entries, the count drawn evenly (realised 11 each for n 8).
++func treesOf(n int) hegel.Generator[[]fileEntry] {
++	return hegel.Map(hegel.FlatMap(rangeHalves(0, n), func(k int) hegel.Generator[[]fileEntry] { return treeFrom(nil, k) }), settle)
++}
++
++var fileTrees = treesOf(8)
++
++// --------------------------------------------------------------------------- the mapping
++
++// mapValues is the value of the map entry: "" twice, ".", "x", "x/", "x/y", "x/y/" (realised
++// 29/14/14/14/14/14).
++var mapValues = halvesOver([]int{2, 1, 1, 1, 1, 1}, "", ".", "x", "x/", "x/y", "x/y/")
++
++// buildFilesCase settles the two documented-unspecified combinations of the mapping: a file
++// key with the value "." (a file with an empty name in the archive) takes "", and a key with
++// a trailing slash with a slash-ended value (the contents of a folder into a folder named
++// for it) takes "x".
++func buildFilesCase(tree []fileEntry, key, value string, follow, clear bool) filesCase {
++	trailing := strings.HasSuffix(key, "/")
++	isDir := key == "." || trailing || entryAt(tree, key).Kind == 'd'
++	if !isDir && value == "." {
++		value = ""
++	}
++	if trailing && strings.HasSuffix(value, "/") {
++		value = "x"
++	}
++	return filesCase{Tree: tree, Key: key, Value: value, Follow: follow, Clear: clear}
++}
++
++// filesCasesOf is a case over the trees: the key the root "." a quarter of the time or when
++// the tree has no file or directory (realised 25 of the keys drawn, 37 of all cases), else a
++// file or directory of the tree; a directory key with a trailing slash 30 percent of the
++// time (realised 30); a value of mapValues; FollowSymlinks 30 (realised 30), ClearAttributes
++// 30 (realised 30).
++func filesCasesOf(trees hegel.Generator[[]fileEntry]) hegel.Generator[filesCase] {
++	return hegel.FlatMap(trees, func(tree []fileEntry) hegel.Generator[filesCase] {
++		var cands []string
++		for _, e := range tree {
++			if e.Kind != 'l' {
++				cands = append(cands, e.Path)
++			}
++		}
++		key := hegel.Just(".")
++		if len(cands) > 0 {
++			key = dieChoice(hzW(25, hegel.Just(".")), hzW(75, evenHalves(cands...)))
++		}
++		return hegel.FlatMap(key, func(k string) hegel.Generator[filesCase] {
++			trailing := hegel.Just(false)
++			if k != "." && entryAt(tree, k).Kind == 'd' {
++				trailing = dieCoin(27)
++			}
++			return hegel.FlatMap(trailing, func(tr bool) hegel.Generator[filesCase] {
++				if tr {
++					k += "/"
++				}
++				return hegel.FlatMap(mapValues, func(v string) hegel.Generator[filesCase] {
++					return hegel.FlatMap(dieCoin(30), func(follow bool) hegel.Generator[filesCase] {
++						return hegel.Map(dieCoin(30), func(clear bool) filesCase { return buildFilesCase(tree, k, v, follow, clear) })
++					})
++				})
++			})
++		})
++	})
++}
++
++var filesCases = filesCasesOf(fileTrees)
++
++// --------------------------------------------------------------------------- writing a tree
++
++// treeMapFS writes the tree to a fstest.MapFS.
++func treeMapFS(tree []fileEntry) fstest.MapFS {
++	m := fstest.MapFS{}
++	for _, e := range tree {
++		switch e.Kind {
++		case 'd':
++			m[e.Path] = &fstest.MapFile{Mode: fs.ModeDir | e.Mode, ModTime: e.Mtime}
++		case 'f':
++			m[e.Path] = &fstest.MapFile{Data: e.Data, Mode: e.Mode, ModTime: e.Mtime}
++		case 'l':
++			m[e.Path] = &fstest.MapFile{Data: []byte(e.Link), Mode: fs.ModeSymlink | e.Mode, ModTime: e.Mtime}
++		}
++	}
++	return m
++}
++
++// treeToDisk writes the tree under dir (which must exist and be empty); the directories'
++// permissions and times are set last, deepest first, after their contents.
++func treeToDisk(tree []fileEntry, dir string) error {
++	var dirs []fileEntry
++	for _, e := range tree {
++		p := filepath.Join(dir, filepath.FromSlash(e.Path))
++		switch e.Kind {
++		case 'd':
++			if err := os.Mkdir(p, 0o700); err != nil {
++				return err
++			}
++			dirs = append(dirs, e)
++		case 'f':
++			if err := os.WriteFile(p, e.Data, e.Mode); err != nil {
++				return err
++			}
++			if err := os.Chmod(p, e.Mode); err != nil {
++				return err
++			}
++			if err := os.Chtimes(p, e.Mtime, e.Mtime); err != nil {
++				return err
++			}
++		case 'l':
++			if err := os.Symlink(e.Link, p); err != nil {
++				return err
++			}
++		}
++	}
++	for i := len(dirs) - 1; i >= 0; i-- {
++		p := filepath.Join(dir, filepath.FromSlash(dirs[i].Path))
++		if err := os.Chtimes(p, dirs[i].Mtime, dirs[i].Mtime); err != nil {
++			return err
++		}
++		if err := os.Chmod(p, dirs[i].Mode); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// restoreDisk makes every directory under dir writable again so it can be removed.
++func restoreDisk(dir string) {
++	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
++		if err == nil && d.IsDir() {
++			os.Chmod(p, 0o700)
++		}
++		return nil
++	})
++}
++
++// treeRoot is the base name of the directory a tree is written to on disk: the names the
++// disk side gives a root key are built on it (filesExpected takes it as rootBase), so it is
++// the same in every case and in the child process.
++const treeRoot = "tree"
++
++// --------------------------------------------------------------------------- the model
++
++// found is one gathered entry as the model states it: the name in the archive and the
++// attributes the library reports (Root: the root directory itself, whose attributes are the
++// temporary directory's and are not stated).
++type found struct {
++	Name  string
++	Kind  byte
++	Link  string
++	Data  []byte
++	Mode  fs.FileMode
++	Mtime time.Time
++	Root  bool
++}
++
++// entryValue spells the attributes of a gathered entry as the checks compare them.
++func entryValue(f found, clear bool) string {
++	if f.Root {
++		return hzUnspecified
++	}
++	switch f.Kind {
++	case 'l':
++		return "link -> " + f.Link
++	case 'd':
++		return "dir mode=" + strconv.FormatInt(int64(f.Mode), 8) + " " + timeValue(f.Mtime, clear)
++	}
++	sum := sha256.Sum256(f.Data)
++	return fmt.Sprintf("file size=%d read=%d sha=%s mode=%o %s", len(f.Data), len(f.Data), hex.EncodeToString(sum[:4]), f.Mode, timeValue(f.Mtime, clear))
++}
++
++func timeValue(t time.Time, clear bool) string {
++	if clear {
++		return "cleared"
++	}
++	return "mtime=" + strconv.FormatInt(t.Unix(), 10)
++}
++
++// walkKey is the sort key of fs.WalkDir's order (lexical within each directory, a
++// directory's contents right after it): the path with the separator below every other byte.
++func walkKey(p string) string { return strings.ReplaceAll(p, "/", "\x00") }
++
++// trimTopDir and topDir are archives.go :312-329, transcribed.
++func trimTopDir(dir string) string {
++	return strings.TrimPrefix(dir, topDir(dir)+"/")
++}
++
++func topDir(dir string) string {
++	var start int
++	if len(dir) > 0 && dir[0] == '/' {
++		start = 1
++	}
++	if pos := strings.Index(dir[start:], "/"); pos >= 0 {
++		return dir[:pos+start]
++	}
++	return dir
++}
++
++// nameInArchive is nameOnDiskToNameInArchive (archives.go :277-306), transcribed, with the
++// two documented rules in place of the library's where a switch is off: a key with a
++// trailing separator enumerates contents only (the value is the folder of the contents;
++// under kFsTrailingKeyValue the library's :286 trims the value's first element, archives/16),
++// and the name of an entry is its path below the key (the library's :304 keeps the separator
++// after a key without a trailing one, which :305 joins onto an empty root as a leading
++// slash under kFsRootDotLeadingSlash, archives/14).
++func nameInArchive(nameOnDisk, rootOnDisk, rootInArchive string, k known) string {
++	if strings.HasSuffix(rootOnDisk, "/") {
++		if k[kFsTrailingKeyValue] {
++			rootInArchive = trimTopDir(rootInArchive) // :286
++		}
++	} else if rootInArchive == "" {
++		rootInArchive = path.Base(rootOnDisk) // :290
++	}
++	if rootInArchive == "." {
++		rootInArchive = "" // :297
++	}
++	if strings.HasSuffix(rootInArchive, "/") {
++		rootInArchive += path.Base(rootOnDisk) // :302
++	}
++	truncPath := strings.TrimPrefix(nameOnDisk, rootOnDisk) // :304
++	if !k[kFsRootDotLeadingSlash] {
++		truncPath = strings.TrimPrefix(truncPath, "/")
++	}
++	return path.Join(rootInArchive, truncPath) // :305
++}
++
++// errKindOf is the kind of an error of the two functions (the texts of archives.go :492,
++// :531, :501, :540, :505, :544, :125, :232 and the walk's own fs.ErrNotExist).
++func errKindOf(err error) string {
++	if err == nil {
++		return "none"
++	}
++	s := err.Error()
++	switch {
++	case strings.Contains(s, "statting dereferenced symlink"):
++		return "dangling"
++	case strings.Contains(s, "symlink loop"):
++		return "loop"
++	case strings.Contains(s, "maximum symlink depth"):
++		return "depth"
++	case strings.Contains(s, "getting files from symlink directory"):
++		return "symlink directory"
++	case errors.Is(err, fs.ErrNotExist) || strings.Contains(s, "file does not exist") || strings.Contains(s, "no such file"):
++		return "open"
++	}
++	return "other: " + s
++}
++
++// gather walks one side of a case under the switch set: the documented rules with the
++// replicas where a switch is on. The fs side's paths are relative to a root prefix (the
++// subtree a nested walk is rooted at under kFsFollowDirLink); the disk side's root is the
++// directory treeRoot. The walk order is fs.WalkDir's; the first error ends the walk; an
++// expansion deeper than the tree's size is a loop (the documented expansion has no end).
++type gather struct {
++	c        filesCase
++	k        known
++	side     string
++	rootBase string
++	out      []found
++	err      string
++	loop     bool
++}
++
++// onDisk is the name on disk of a tree path (the disk side's absolute names stand in by
++// rootBase, the base of the directory the tree is written to; the fs side's names are the
++// paths themselves relative to the prefix).
++func (g *gather) onDisk(prefix, p string) string {
++	if g.side == "disk" {
++		if p == "." {
++			return g.rootBase
++		}
++		return g.rootBase + "/" + p
++	}
++	if prefix != "" && p == strings.TrimSuffix(prefix, "/") {
++		return "."
++	}
++	return strings.TrimPrefix(p, prefix)
++}
++
++// resolveFS is the fs side's resolution of a link's target: as the file system resolves it,
++// relative to the link's directory (resolveLink), or, under kFsFollowSymlinkRelative for a
++// link below the root of the walked file system, the target as written looked up from that
++// root (followSymlinkFS, archives.go :525-529: fs.Lstat(fsys, linkPath) on the target of
++// fs.ReadLink; fstest.MapFS refuses a path fs.ValidPath refuses, so "../x" and "/nowhere/x"
++// are not found, "." is the root). The result is a tree path, "." for the root of the walked
++// file system (the tree's, or the subtree's at prefix), or "".
++func (g *gather) resolveFS(prefix, linkPath, target string) string {
++	rel := strings.TrimPrefix(linkPath, prefix)
++	if g.k[kFsFollowSymlinkRelative] && strings.Contains(rel, "/") {
++		if !fs.ValidPath(target) {
++			return ""
++		}
++		if target == "." {
++			return "."
++		}
++		return prefix + target
++	}
++	r := resolveLink(rel, target)
++	if r == "" || r == "." {
++		return r
++	}
++	return prefix + r
++}
++
++// follow is followSymlink / followSymlinkFS (archives.go :476-511, :517-550): the chain of
++// links from linkPath to a file or directory, with the loop and depth checks; it returns the
++// tree path of the target ("." for the root) and its entry (nil for the root), or sets the
++// error kind.
++func (g *gather) follow(prefix, linkPath string) (string, *fileEntry, bool) {
++	visited := map[string]bool{linkPath: true}
++	cur := linkPath
++	for {
++		e := entryAt(g.c.Tree, cur)
++		var next string
++		if g.side == "disk" {
++			next = resolveLink(cur, e.Link)
++		} else {
++			next = g.resolveFS(prefix, cur, e.Link)
++		}
++		if next == "" {
++			g.err = "dangling"
++			return "", nil, false
++		}
++		if next == "." {
++			return next, nil, true // the root of the walked file system
++		}
++		te := entryAt(g.c.Tree, next)
++		if te == nil {
++			g.err = "dangling"
++			return "", nil, false
++		}
++		if te.Kind != 'l' {
++			return next, te, true
++		}
++		if visited[next] {
++			g.err = "loop"
++			return "", nil, false
++		}
++		if len(visited) >= 40 {
++			g.err = "depth"
++			return "", nil, false
++		}
++		visited[next] = true
++		cur = next
++	}
++}
++
++// walk is one call of FilesFromDisk/FilesFromFS with the one map entry {key: value}: prefix
++// is the root of the walked file system as a tree path prefix ("" for the whole tree, "d/"
++// for fs.Sub(fsys, "d")), key the walked root relative to it ("." for the root itself, with
++// a trailing slash for contents only), value the name in the archive. depth counts the
++// nested calls a followed directory link makes.
++func (g *gather) walk(prefix, key, value string, depth int) {
++	if g.err != "" || g.loop {
++		return
++	}
++	if depth > len(g.c.Tree)+1 {
++		g.loop = true
++		return
++	}
++	trailing := strings.HasSuffix(key, "/")
++	bare := strings.TrimSuffix(key, "/")
++	if g.side == "fs" && trailing && g.k[kFsTrailingSlashKey] {
++		g.err = "open" // archives/15: fs.WalkDir's fs.Stat of "dir/" fails
++		return
++	}
++	root := bare
++	if prefix != "" {
++		if bare == "." {
++			root = strings.TrimSuffix(prefix, "/")
++		} else {
++			root = prefix + bare
++		}
++	}
++	// the walked entries in fs.WalkDir's order: the root, then everything below it
++	var paths []string
++	if root == "." || root == "" {
++		paths = append(paths, ".")
++		for _, e := range g.c.Tree {
++			paths = append(paths, e.Path)
++		}
++	} else {
++		re := entryAt(g.c.Tree, root)
++		if re == nil {
++			g.err = "open"
++			return
++		}
++		paths = append(paths, root)
++		if re.Kind == 'd' {
++			for _, e := range g.c.Tree {
++				if strings.HasPrefix(e.Path, root+"/") {
++					paths = append(paths, e.Path)
++				}
++			}
++		}
++	}
++	sort.Slice(paths, func(i, j int) bool { return walkKey(paths[i]) < walkKey(paths[j]) })
++	rootOnDisk := g.onDisk(prefix, root)
++	if trailing {
++		rootOnDisk += "/"
++	}
++	for _, p := range paths {
++		isRoot := p == root || (p == "." && (root == "." || root == ""))
++		nameOnDisk := g.onDisk(prefix, p)
++		if isRoot && trailing {
++			nameOnDisk = rootOnDisk // the walk reports its root as given, slash and all
++		}
++		name := nameInArchive(nameOnDisk, rootOnDisk, value, g.k)
++		var e *fileEntry
++		if p != "." {
++			e = entryAt(g.c.Tree, p)
++		}
++		isDir := e == nil || e.Kind == 'd'
++		if isDir && isRoot {
++			// archives.go :98: the root folder is skipped when its name is empty; the
++			// documentation skips it for every key with a trailing separator
++			if name == "" || (trailing && !g.k[kFsTrailingKeyValue]) {
++				continue
++			}
++		}
++		if e == nil {
++			g.out = append(g.out, found{Name: name, Kind: 'd', Root: true})
++			continue
++		}
++		if e.Kind == 'l' && g.c.Follow {
++			target, te, ok := g.follow(prefix, p)
++			if !ok {
++				return
++			}
++			if te != nil && te.Kind == 'f' {
++				g.out = append(g.out, found{Name: name, Kind: 'f', Data: te.Data, Mode: te.Mode, Mtime: te.Mtime})
++				continue
++			}
++			// a directory: FilesFromDisk(ctx, options, {target: name}) at :123, the
++			// directory and its contents under the link's name, its links followed in turn
++			if g.side == "disk" {
++				g.walk("", target, name, depth+1)
++				if g.err != "" {
++					g.err = "symlink directory"
++				}
++				continue
++			}
++			inner := strings.TrimPrefix(target, prefix) // the target relative to the walked fs
++			if target == "." {
++				inner = "."
++			}
++			if !g.k[kFsFollowDirLink] || inner == "." {
++				// the documented walk of the directory under the link's name (and the
++				// library's own when the target is the root: fs.Sub(fsys, ".") is fsys)
++				g.walk(prefix, inner, name, depth+1)
++				if g.err != "" {
++					g.err = "symlink directory"
++				}
++				continue
++			}
++			// archives/18, :226-233: fs.Sub(fsys, target), then the walk of target inside
++			// it, which is target/target of the tree
++			sub := target + "/"
++			if ie := entryAt(g.c.Tree, sub+inner); ie == nil {
++				g.err = "symlink directory"
++				return
++			} else if ie.Kind == 'l' {
++				hzTally("fs walk rooted at a link (outside the model)")
++				g.loop = true // outside the model: judged in a child, "returns" open
++				return
++			}
++			g.walk(sub, inner, name, depth+1)
++			if g.err != "" {
++				g.err = "symlink directory"
++			}
++			continue
++		}
++		switch e.Kind {
++		case 'd':
++			g.out = append(g.out, found{Name: name, Kind: 'd', Mode: e.Mode, Mtime: e.Mtime})
++		case 'f':
++			g.out = append(g.out, found{Name: name, Kind: 'f', Data: e.Data, Mode: e.Mode, Mtime: e.Mtime})
++		case 'l':
++			g.out = append(g.out, found{Name: name, Kind: 'l', Link: e.Link})
++		}
++	}
++}
++
++// sideExpected is the checks of one side: "returns", "error", and when the side returns
++// without an error, "names" and one "entry" per name; a looping expansion leaves the error,
++// the names and the entries open and, under kFollowAncestorLinkHang, the call hangs.
++func sideExpected(c filesCase, k known, side, rootBase string, out checks) {
++	g := &gather{c: c, k: k, side: side, rootBase: rootBase}
++	g.walk("", c.Key, c.Value, 0)
++	if g.loop {
++		if k[kFollowAncestorLinkHang] {
++			out.set(side+" returns", "hang")
++		} else {
++			out.set(side+" returns", "returned")
++		}
++		out.unspecified(side + " error")
++		out.unspecified(side + " names")
++		return
++	}
++	out.set(side+" returns", "returned")
++	if g.err != "" {
++		out.set(side+" error", g.err)
++		return
++	}
++	out.set(side+" error", "none")
++	var names []string
++	for _, f := range g.out {
++		names = append(names, f.Name)
++		if f.Root {
++			out.unspecified(side + " entry " + f.Name)
++		} else {
++			out.set(side+" entry "+f.Name, entryValue(f, c.Clear))
++		}
++	}
++	sort.Strings(names)
++	out.set(side+" names", strings.Join(names, "\n"))
++}
++
++// filesExpected states every value the property checks, for the fs side then the disk side
++// (rootBase is the base name of the directory the tree is written to on disk, which the
++// disk side's names of a root key are built on: the property supplies it).
++func filesExpected(c filesCase, k known, rootBase string) checks {
++	out := checks{}
++	sideExpected(c, k, "fs", rootBase, out)
++	sideExpected(c, k, "disk", rootBase, out)
++	return out
++}
++
++// filesModel is filesExpected for the trees written under a directory named rootBase.
++func filesModel(rootBase string) func(filesCase, known) checks {
++	return func(c filesCase, k known) checks { return filesExpected(c, k, rootBase) }
++}
++
++// filesExpectedAt is filesExpected with treeRoot, the base every tree is written under.
++func filesExpectedAt(c filesCase, k known) checks { return filesExpected(c, k, treeRoot) }
++
++// loopsOn reports whether the side's call never returns by the replica (the "returns" check
++// under every switch, the library as recorded, or under the hang switch alone, the
++// documented expansion without end): such a side is called in a child process.
++func loopsOn(c filesCase, side string) bool {
++	hang := hzValue("hang")
++	return filesExpectedAt(c, hzKnownAll)[side+" returns"] == hang ||
++		filesExpectedAt(c, hzKnownOnly(kFollowAncestorLinkHang))[side+" returns"] == hang
++}
++
++// inProcessWait is the context deadline of a call made in process: a call the replica did
++// not see looping is stopped by the library's own ctx.Err() checks (archives.go :84, :199)
++// and fails the case as "hang (stopped in process)" rather than exhausting the memory.
++const inProcessWait = time.Second
++
++func init() {
++	for i, name := range []string{"fs returns", "fs error", "fs names", "fs entry", "disk returns", "disk error", "disk names", "disk entry"} {
++		checkRank[name] = i
++	}
++}
++
++// --------------------------------------------------------------------------- the library
++
++// sideActual asks one side the questions sideExpected answered: the tree is written at dir
++// on disk and as mfs; ctx is the call's (the in-process deadline, or none in the child).
++func sideActual(ctx context.Context, c filesCase, side, dir string, mfs fstest.MapFS) checks {
++	out := checks{}
++	var files []archives.FileInfo
++	var err error
++	if side == "fs" {
++		files, err = archives.FilesFromFS(ctx, mfs, &archives.FromFSOptions{FollowSymlinks: c.Follow, ClearAttributes: c.Clear}, map[string]string{c.Key: c.Value})
++	} else {
++		key := dir
++		if bare := strings.TrimSuffix(c.Key, "/"); bare != "." {
++			key = filepath.Join(dir, filepath.FromSlash(bare))
++		}
++		if strings.HasSuffix(c.Key, "/") {
++			key += string(filepath.Separator)
++		}
++		files, err = archives.FilesFromDisk(ctx, &archives.FromDiskOptions{FollowSymlinks: c.Follow, ClearAttributes: c.Clear}, map[string]string{key: c.Value})
++	}
++	if errors.Is(err, context.DeadlineExceeded) {
++		out.set(side+" returns", "hang (stopped in process)")
++		return out
++	}
++	out.set(side+" returns", "returned")
++	out.set(side+" error", errKindOf(err))
++	if err != nil {
++		return out
++	}
++	var names []string
++	for _, f := range files {
++		names = append(names, f.NameInArchive)
++		out.set(side+" entry "+f.NameInArchive, fileInfoValue(f, c.Clear))
++	}
++	sort.Strings(names)
++	out.set(side+" names", strings.Join(names, "\n"))
++	return out
++}
++
++// fileInfoValue spells a gathered FileInfo as entryValue spells the model's.
++func fileInfoValue(f archives.FileInfo, clear bool) string {
++	mt := "mtime=" + strconv.FormatInt(f.ModTime().Unix(), 10)
++	if clear {
++		if f.ModTime().IsZero() && f.Sys() == nil {
++			mt = "cleared"
++		} else {
++			mt = fmt.Sprintf("not cleared: mtime=%d sys=%v", f.ModTime().Unix(), f.Sys() != nil)
++		}
++	}
++	switch {
++	case f.Mode()&fs.ModeSymlink != 0:
++		return "link -> " + f.LinkTarget
++	case f.IsDir():
++		return "dir mode=" + strconv.FormatInt(int64(f.Mode().Perm()), 8) + " " + mt
++	}
++	r, err := f.Open()
++	if err != nil {
++		return "file open error: " + err.Error()
++	}
++	b, rerr := io.ReadAll(r)
++	r.Close()
++	if rerr != nil {
++		return "file read error: " + rerr.Error()
++	}
++	sum := sha256.Sum256(b)
++	return fmt.Sprintf("file size=%d read=%d sha=%s mode=%o %s", f.Size(), len(b), hex.EncodeToString(sum[:4]), f.Mode().Perm(), mt)
++}
++
++// --------------------------------------------------------------------------- the child process
++
++// childRequest is what the child process reads from its stdin: the case and the side.
++type childRequest struct {
++	Case filesCase
++	Side string
++}
++
++// childWait is how long the parent waits for a child: a looping call overflows the child's
++// capped stack in well under a second (filesChild caps it at 1 MB), the deadline is the
++// backstop.
++const childWait = 4 * time.Second
++
++// sideInChild asks one side in a child process: the test binary re-executed on this test
++// alone with HZ_ARCHIVES_CHILD=files and the request as JSON on its stdin; the child writes
++// the tree to a directory of its own, calls the library and prints "RETURNED <json of the
++// checks>". A child that prints nothing within childWait (killed by the deadline, or dead of
++// its stack) is the value "hang".
++func sideInChild(c filesCase, side string) checks {
++	req, err := json.Marshal(childRequest{Case: c, Side: side})
++	if err != nil {
++		panic(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), childWait)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run", "^TestHegelFilesFrom$", "-test.timeout", "8s", "-test.count=1")
++	cmd.Env = append(os.Environ(), "HZ_ARCHIVES_CHILD=files")
++	cmd.Stdin = bytes.NewReader(req)
++	start := time.Now()
++	out, _ := cmd.CombinedOutput()
++	hzTally("child " + side)
++	hzTally(fmt.Sprintf("child ms %d", time.Since(start).Milliseconds()/100*100))
++	for _, line := range strings.Split(string(out), "\n") {
++		if rest, ok := strings.CutPrefix(line, "RETURNED "); ok {
++			got := checks{}
++			if err := json.Unmarshal([]byte(rest), &got); err != nil {
++				panic(fmt.Sprintf("child output: %v: %s", err, rest))
++			}
++			return got
++		}
++	}
++	return checks{side + " returns": hzValue("hang")}
++}
++
++// filesChild is the child's half.
++func filesChild() {
++	debug.SetMaxStack(1 << 20) // the recursion without end dies of its stack within milliseconds
++	var req childRequest
++	if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
++		fmt.Printf("RETURNED %s\n", `{"child": "bad request"}`)
++		return
++	}
++	tmp, err := os.MkdirTemp("", "hz-archives-child-")
++	if err != nil {
++		panic(err)
++	}
++	defer func() { restoreDisk(tmp); os.RemoveAll(tmp) }()
++	dir := filepath.Join(tmp, treeRoot)
++	if err := os.Mkdir(dir, 0o700); err != nil {
++		panic(err)
++	}
++	if err := treeToDisk(req.Case.Tree, dir); err != nil {
++		panic(err)
++	}
++	got := sideActual(context.Background(), req.Case, req.Side, dir, treeMapFS(req.Case.Tree))
++	text, err := json.Marshal(got)
++	if err != nil {
++		panic(err)
++	}
++	fmt.Printf("RETURNED %s\n", text)
++}
++
++// --------------------------------------------------------------------------- the property
++
++// filesActual asks both sides: in process, or, for a side whose call never returns by the
++// replica, in a child process. The tree is written under dir (base treeRoot).
++func filesActual(c filesCase, dir string) checks {
++	got := checks{}
++	mfs := treeMapFS(c.Tree)
++	for _, side := range []string{"fs", "disk"} {
++		var part checks
++		if loopsOn(c, side) {
++			hzTally("loop case side " + side)
++			part = sideInChild(c, side)
++		} else {
++			ctx, cancel := context.WithTimeout(context.Background(), inProcessWait)
++			part = sideActual(ctx, c, side, dir, mfs)
++			cancel()
++		}
++		for k, v := range part {
++			got[k] = v
++		}
++	}
++	return got
++}
++
++// filesJudge is the judge of the family: the tree written under a fresh directory of root
++// (named treeRoot), then judgeBy over filesExpectedAt and filesActual; drops lists the
++// switches whose checks are dropped under HEGEL_NO_KNOWN=1 (judgeByDropping) - nil for
++// judgeBy. The narrow properties share it, with their own model where an earlier bug would
++// be named first (pastSwitches).
++func filesJudgeWith(root string, expected func(filesCase, known) checks, drops []int) func(j *hzCaseJudge, c filesCase) {
++	n := 0
++	return func(j *hzCaseJudge, c filesCase) {
++		n++
++		dir := filepath.Join(root, "c"+strconv.Itoa(n), treeRoot)
++		if err := os.MkdirAll(dir, 0o700); err != nil {
++			panic(err)
++		}
++		defer func() { restoreDisk(filepath.Dir(dir)); os.RemoveAll(filepath.Dir(dir)) }()
++		if err := treeToDisk(c.Tree, dir); err != nil {
++			panic(fmt.Sprintf("writing the tree: %v", err))
++		}
++		actual := func(c *filesCase) checks { return filesActual(*c, dir) }
++		if drops == nil {
++			judgeBy(j, &c, expected, actual)
++		} else {
++			judgeByDropping(j, &c, expected, actual, drops)
++		}
++	}
++}
++
++// filesRoot is a temporary root for the trees of one property.
++func filesRoot(t *testing.T) string {
++	t.Helper()
++	root, err := os.MkdirTemp("", "hz-archives-")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { restoreDisk(root); os.RemoveAll(root) })
++	return root
++}
++
++// filesDrops are the switches whose checks the wide property drops under HEGEL_NO_KNOWN=1
++// rather than skipping the case: archives/15 covers the fs side of every key with a trailing
++// slash, and the disk side of such a key with the value "" is the documented case that must
++// stay.
++var filesDrops = []int{kFsTrailingSlashKey}
++
++// wideFilesCases is the cases of the wide property: under HEGEL_NO_KNOWN=1 the cases that
++// have a shape past the dropped checks (the value "." with a key without a trailing slash,
++// archives/14; a trailing key with a non-empty value, 16; a relative link in a subdirectory
++// or a link to a directory followed on the fs side, 17 and 18; an expansion without end,
++// 27) are filtered out by the classifier (withoutShapes, counted "filtered archives/N"); the
++// fs side's checks of a trailing key are dropped (filesDrops).
++var wideFilesCases = withoutShapes(pastSwitches(filesExpectedAt, filesDrops), filesCases)
++
++// TestHegelFilesFrom: FilesFromFS on the tree as a fstest.MapFS and FilesFromDisk on the same
++// tree written to disk gather the entries the documentation describes for the filenames map:
++// the names in the archive, the kinds, the link targets, contents, permissions and times,
++// with and without ClearAttributes; with FollowSymlinks the links to files become the files
++// and the links to directories those directories, and a call whose expansion has no end
++// still returns (such a side is called in a child process).
++func TestHegelFilesFrom(t *testing.T) {
++	if os.Getenv("HZ_ARCHIVES_CHILD") == "files" {
++		filesChild()
++		return
++	}
++	judged(t, wideFilesCases, filesJudgeWith(filesRoot(t), filesExpectedAt, filesDrops))
++}
 diff --git a/hegel/hegel_zoo_gen_test.go b/hegel/hegel_zoo_gen_test.go
 new file mode 100644
-index 0000000..e8d7296
+index 0000000..bd326ed
 --- /dev/null
 +++ b/hegel/hegel_zoo_gen_test.go
 @@ -0,0 +1,665 @@
@@ -113,16 +1732,16 @@ index 0000000..e8d7296
 +
 +func hzData(tc hegel.TestCase) []byte {
 +	var n int
-+	if hzChance(tc, 60) {
-+		n = hzPick(tc, hzSizes)
++	if hzOldChance(tc, 60) {
++		n = hzOldPick(tc, hzSizes)
 +	} else {
-+		n = hzDrawInt(tc, 0, 3000)
++		n = hzOldDrawInt(tc, 0, 3000)
 +	}
-+	switch hzDrawInt(tc, 0, 2) {
++	switch hzOldDrawInt(tc, 0, 2) {
 +	case 0: // compressible text
 +		return bytes.Repeat([]byte("the quick brown fox "), n/20+1)[:n]
 +	case 1: // one byte
-+		return bytes.Repeat([]byte{byte(hzDrawInt(tc, 0, 255))}, n)
++		return bytes.Repeat([]byte{byte(hzOldDrawInt(tc, 0, 255))}, n)
 +	default: // random
 +		return hegel.Draw(tc, hegel.Binary(n, n))
 +	}
@@ -130,20 +1749,20 @@ index 0000000..e8d7296
 +
 +func hzTime(tc hegel.TestCase) time.Time {
 +	// 1981..2099, whole seconds: inside every format's range (zip's MS-DOS time starts in 1980)
-+	return time.Unix(int64(hzDrawInt(tc, 350000000, 4100000000)), 0).UTC()
++	return time.Unix(int64(hzOldDrawInt(tc, 350000000, 4100000000)), 0).UTC()
 +}
 +
 +// hzGenTree draws a tree of up to n entries. Directories are explicit and come before their
 +// contents; symbolic links point at a sibling, a parent's child, an absolute path or nothing.
 +func hzGenTree(tc hegel.TestCase, n int) *hzTree {
 +	t := &hzTree{}
-+	count := hzDrawInt(tc, 0, n)
++	count := hzOldDrawInt(tc, 0, n)
 +	for i := 0; i < count; i++ {
 +		parent := ""
-+		if ds := t.dirs(); len(ds) > 0 && hzChance(tc, 60) {
-+			parent = hzPick(tc, ds)
++		if ds := t.dirs(); len(ds) > 0 && hzOldChance(tc, 60) {
++			parent = hzOldPick(tc, ds)
 +		}
-+		name := hzPick(tc, hzNames)
++		name := hzOldPick(tc, hzNames)
 +		p := name
 +		if parent != "" {
 +			p = parent + "/" + name
@@ -152,43 +1771,43 @@ index 0000000..e8d7296
 +			continue
 +		}
 +		e := hzEntry{path: p, mtime: hzTime(tc)}
-+		switch r := hzDrawInt(tc, 1, 100); {
++		switch r := hzOldDrawInt(tc, 1, 100); {
 +		case r <= 25:
 +			e.kind = 'd'
-+			e.mode = fs.FileMode(0o700 | hzDrawInt(tc, 0, 0o77))
++			e.mode = fs.FileMode(0o700 | hzOldDrawInt(tc, 0, 0o77))
 +		case r <= 85:
 +			e.kind = 'f'
 +			e.data = hzData(tc)
-+			e.mode = fs.FileMode(0o600 | hzDrawInt(tc, 0, 0o177))
++			e.mode = fs.FileMode(0o600 | hzOldDrawInt(tc, 0, 0o177))
 +		default:
 +			e.kind = 'l'
 +			e.mode = 0o777
-+			switch hzDrawInt(tc, 0, 4) {
++			switch hzOldDrawInt(tc, 0, 4) {
 +			case 0: // a sibling (may not exist yet, or ever)
-+				e.link = hzPick(tc, hzNames)
++				e.link = hzOldPick(tc, hzNames)
 +			case 1: // a path from the root, as a relative target
 +				if len(t.entries) > 0 {
-+					e.link = hzPick(tc, t.entries).path
++					e.link = hzOldPick(tc, t.entries).path
 +				} else {
 +					e.link = "x"
 +				}
 +			case 2:
-+				e.link = "../" + hzPick(tc, hzNames)
++				e.link = "../" + hzOldPick(tc, hzNames)
 +			case 3: // the link's own directory (ln -s . self), in a subdirectory
 +				if parent != "" {
 +					e.link = "."
 +				} else {
-+					e.link = hzPick(tc, hzNames)
++					e.link = hzOldPick(tc, hzNames)
 +				}
 +			default:
-+				e.link = "/nowhere/" + hzPick(tc, hzNames)
++				e.link = "/nowhere/" + hzOldPick(tc, hzNames)
 +			}
 +			// no link to a link (a loop would not resolve; fstest.MapFS recurses without end)
 +			if r := hzResolve(p, e.link); r != "" {
 +				if r == p {
-+					e.link = "/nowhere/" + hzPick(tc, hzNames)
++					e.link = "/nowhere/" + hzOldPick(tc, hzNames)
 +				} else if target := t.get(r); target != nil && target.kind == 'l' {
-+					e.link = "/nowhere/" + hzPick(tc, hzNames)
++					e.link = "/nowhere/" + hzOldPick(tc, hzNames)
 +				}
 +			}
 +		}
@@ -203,7 +1822,7 @@ index 0000000..e8d7296
 +		}
 +		if r := hzResolve(e.path, e.link); r != "" {
 +			if target := t.get(r); target != nil && target.kind == 'l' {
-+				e.link = "/nowhere/" + hzPick(tc, hzNames)
++				e.link = "/nowhere/" + hzOldPick(tc, hzNames)
 +			}
 +		}
 +	}
@@ -299,9 +1918,9 @@ index 0000000..e8d7296
 +
 +// hzArchival draws a Tar or a Zip with random options.
 +func hzArchival(tc hegel.TestCase) archives.Archival {
-+	if hzChance(tc, 50) {
++	if hzOldChance(tc, 50) {
 +		t := archives.Tar{}
-+		switch hzDrawInt(tc, 0, 3) {
++		switch hzOldDrawInt(tc, 0, 3) {
 +		case 1:
 +			t.Format = tar.FormatUSTAR
 +		case 2:
@@ -309,21 +1928,21 @@ index 0000000..e8d7296
 +		case 3:
 +			t.Format = tar.FormatGNU
 +		}
-+		if hzChance(tc, 20) {
++		if hzOldChance(tc, 20) {
 +			t.NumericUIDGID = true
 +		}
-+		if hzChance(tc, 20) {
-+			t.Uid = hzDrawInt(tc, 1, 70000)
-+			t.Gid = hzDrawInt(tc, 1, 70000)
++		if hzOldChance(tc, 20) {
++			t.Uid = hzOldDrawInt(tc, 1, 70000)
++			t.Gid = hzOldDrawInt(tc, 1, 70000)
 +		}
-+		if hzChance(tc, 20) {
-+			t.Uname = hzPick(tc, []string{"root", "user", "a name with spaces"})
-+			t.Gname = hzPick(tc, []string{"root", "staff"})
++		if hzOldChance(tc, 20) {
++			t.Uname = hzOldPick(tc, []string{"root", "user", "a name with spaces"})
++			t.Gname = hzOldPick(tc, []string{"root", "staff"})
 +		}
 +		return t
 +	}
 +	z := archives.Zip{}
-+	switch hzDrawInt(tc, 0, 5) {
++	switch hzOldDrawInt(tc, 0, 5) {
 +	case 0:
 +		z.Compression = zip.Store
 +	case 1, 2:
@@ -339,7 +1958,7 @@ index 0000000..e8d7296
 +			z.Compression = zip.Deflate
 +		}
 +	}
-+	if hzChance(tc, 30) {
++	if hzOldChance(tc, 30) {
 +		z.SelectiveCompression = true
 +	}
 +	return z
@@ -347,30 +1966,30 @@ index 0000000..e8d7296
 +
 +// hzCompression draws a compression format with random options.
 +func hzCompression(tc hegel.TestCase) archives.Compression {
-+	switch hzDrawInt(tc, 0, 9) {
++	switch hzOldDrawInt(tc, 0, 9) {
 +	case 0:
-+		return archives.Gz{CompressionLevel: hzDrawInt(tc, 0, 9), Multithreaded: hzChance(tc, 30)}
++		return archives.Gz{CompressionLevel: hzOldDrawInt(tc, 0, 9), Multithreaded: hzOldChance(tc, 30)}
 +	case 1:
-+		return archives.Bz2{CompressionLevel: hzDrawInt(tc, 0, 9)}
++		return archives.Bz2{CompressionLevel: hzOldDrawInt(tc, 0, 9)}
 +	case 2:
 +		return archives.Xz{}
 +	case 3:
 +		return archives.Zstd{}
 +	case 4:
-+		level := hzDrawInt(tc, 0, 9)
++		level := hzOldDrawInt(tc, 0, 9)
 +		if level != 0 && HZKnown.lz4CompressionLevel {
 +			hzAvoid("lz4CompressionLevel")
 +			level = 0
 +		}
 +		return archives.Lz4{CompressionLevel: level}
 +	case 5:
-+		return archives.Brotli{Quality: hzDrawInt(tc, 0, 11)}
++		return archives.Brotli{Quality: hzOldDrawInt(tc, 0, 11)}
 +	case 6:
 +		return archives.Sz{}
 +	case 7:
 +		return archives.Lzip{}
 +	case 8:
-+		return archives.Zlib{CompressionLevel: hzDrawInt(tc, 0, 9)}
++		return archives.Zlib{CompressionLevel: hzOldDrawInt(tc, 0, 9)}
 +	default:
 +		return archives.MinLZ{}
 +	}
@@ -524,18 +2143,18 @@ index 0000000..e8d7296
 +// hzGenRawArchive draws entries with the shapes of real archives and builds the model.
 +func hzGenRawArchive(tc hegel.TestCase, zipOK bool) *hzRawArchive {
 +	a := &hzRawArchive{files: map[string][]byte{}, links: map[string]string{}, dirs: map[string]bool{}}
-+	n := hzDrawInt(tc, 0, 8)
++	n := hzOldDrawInt(tc, 0, 8)
 +	var paths []string
 +	for i := 0; i < n; i++ {
-+		depth := hzDrawInt(tc, 1, 3)
++		depth := hzOldDrawInt(tc, 1, 3)
 +		var parts []string
 +		for j := 0; j < depth; j++ {
-+			parts = append(parts, hzPick(tc, hzNames[:12]))
++			parts = append(parts, hzOldPick(tc, hzNames[:12]))
 +		}
 +		p := strings.Join(parts, "/")
-+		if hzChance(tc, 15) && len(paths) > 0 {
++		if hzOldChance(tc, 15) && len(paths) > 0 {
 +			// a child of an earlier path
-+			p = hzPick(tc, paths) + "/" + hzPick(tc, hzNames[:12])
++			p = hzOldPick(tc, paths) + "/" + hzOldPick(tc, hzNames[:12])
 +		}
 +		// no path may be both a file and a directory, and no duplicates
 +		clash := false
@@ -551,7 +2170,7 @@ index 0000000..e8d7296
 +			continue
 +		}
 +		e := hzRawEntry{mode: 0o644}
-+		switch r := hzDrawInt(tc, 1, 100); {
++		switch r := hzOldDrawInt(tc, 1, 100); {
 +		case r <= 30:
 +			e.kind = 'd'
 +			e.mode = 0o755
@@ -562,7 +2181,7 @@ index 0000000..e8d7296
 +			a.files[p] = e.data
 +		default:
 +			e.kind = 'l'
-+			e.link = hzPick(tc, hzNames[:12])
++			e.link = hzOldPick(tc, hzNames[:12])
 +			e.mode = 0o777
 +			a.links[p] = e.link
 +			a.files[p] = nil
@@ -575,33 +2194,33 @@ index 0000000..e8d7296
 +			}
 +		}
 +		e.name = p
-+		if e.kind == 'd' && (zipOK || hzChance(tc, 60)) {
++		if e.kind == 'd' && (zipOK || hzOldChance(tc, 60)) {
 +			e.name += "/"
 +		}
-+		if hzChance(tc, 15) {
++		if hzOldChance(tc, 15) {
 +			e.name = "./" + e.name
 +		}
 +		a.entries = append(a.entries, e)
 +	}
 +	// explicit parents become explicit directory entries when drawn so
-+	if hzChance(tc, 50) {
++	if hzOldChance(tc, 50) {
 +		for d, explicit := range a.dirs {
-+			if !explicit && hzChance(tc, 50) {
++			if !explicit && hzOldChance(tc, 50) {
 +				a.dirs[d] = true
 +				a.entries = append(a.entries, hzRawEntry{name: d + "/", kind: 'd', mode: 0o755})
 +			}
 +		}
 +	}
 +	// order: as drawn (parents first mostly), or shuffled
-+	if hzChance(tc, 50) {
++	if hzOldChance(tc, 50) {
 +		for i := len(a.entries) - 1; i > 0; i-- {
-+			j := hzDrawInt(tc, 0, i)
++			j := hzOldDrawInt(tc, 0, i)
 +			a.entries[i], a.entries[j] = a.entries[j], a.entries[i]
 +		}
 +	}
-+	if !zipOK && hzChance(tc, 20) {
++	if !zipOK && hzOldChance(tc, 20) {
 +		// a "." directory entry, as tar makes of the current directory
-+		a.entries = append([]hzRawEntry{{name: hzPick(tc, []string{".", "./"}), kind: 'd', mode: 0o755}}, a.entries...)
++		a.entries = append([]hzRawEntry{{name: hzOldPick(tc, []string{".", "./"}), kind: 'd', mode: 0o755}}, a.entries...)
 +	}
 +	return a
 +}
@@ -699,6 +2318,1705 @@ index 0000000..e8d7296
 +		b.WriteString("\n")
 +	}
 +	return b.String()
++}
+diff --git a/hegel/hegel_zoo_idioms_test.go b/hegel/hegel_zoo_idioms_test.go
+new file mode 100644
+index 0000000..0e7ac8a
+--- /dev/null
++++ b/hegel/hegel_zoo_idioms_test.go
+@@ -0,0 +1,619 @@
++package hegel
++
++// The generator idioms the properties share, copied from the excelize/graphql-go/cobra/
++// cascadia/carbon/orb/chi/go-debian/gin/cellbuf/kong/roaring/mergo/gotext/go-envconfig/
++// gronx/gval harness (hegel_zoo_idioms_test.go there) with the hz prefix: hegel-go has no weighted choice,
++// biased coin, tuple or counted-list combinator. Every generator built from them is a
++// package-level value; the simplest alternative comes first so that shrinking lands on it,
++// except the shape of a recorded bug a wide property must reach every run, which goes first
++// at a solid weight and is never drawn under HEGEL_NO_KNOWN=1. The weights are nominal: a
++// weighted choice drawn alone comes out exact (the engine enumerates a small die), but inside
++// a case with other draws the engine favours the small values of any bounded draw at every
++// scale (go/chi and go/go-debian measured it: Integers(0, 99) lands in 0..9 about 29 percent
++// of the time, coins realise about 0.83 of nominal), so the rates are what the probe and the
++// collector (HEGEL_COLLECT=1) measure; hzFair, fairOver, fairInts, evenOver and fairTree
++// (from go/chi) re-roll the favourite face, the die* family (from go/go-debian) draws from
++// fair bits, the halving helpers at the end (from go/gin and go/kong: evenHalves,
++// rangeHalves, countedHalves, halvesOver, halvesGens, evenGens) halve a range by fair bits,
++// and the figure beside every weight in the generator files is the measured one.
++import (
++	"os"
++
++	"hegel.dev/go/hegel"
++)
++
++// hzNoKnown is set by HEGEL_NO_KNOWN=1 and read once: the shapes of the recorded bugs are
++// then not drawn (a weight of zero, hzUnless; the region past the shape, hzShaped; the
++// relation filtered out, hzOnly) or the case is skipped (hzCaseJudge.Shape), for a run that
++// looks past the known bugs. By default every property draws them and fails naming the shape.
++var hzNoKnown = os.Getenv("HEGEL_NO_KNOWN") != ""
++
++// hzChoice is one alternative of a weighted choice.
++type hzChoice[T any] struct {
++	weight int
++	from   hegel.Generator[T]
++}
++
++// hzW is the choice of weight w for g.
++func hzW[T any](w int, g hegel.Generator[T]) hzChoice[T] { return hzChoice[T]{weight: w, from: g} }
++
++// hzWeighted generates from one of the choices, chosen with probability proportional to its
++// weight (a weight of zero is never drawn); it shrinks towards the first choice, so the
++// simplest comes first.
++func hzWeighted[T any](choices ...hzChoice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	if total <= 0 {
++		panic("hzWeighted: every choice has weight 0")
++	}
++	return hegel.FlatMap(hegel.Integers(0, total-1), func(i int) hegel.Generator[T] {
++		for _, c := range choices {
++			if i < c.weight {
++				return c.from
++			}
++			i -= c.weight
++		}
++		panic("unreachable")
++	})
++}
++
++// hzCoin is true pct percent of the time; it shrinks to false (Integers shrinks to 0, so the
++// true range is the top of the die, not the bottom).
++func hzCoin(pct int) hegel.Generator[bool] {
++	return hegel.Map(hegel.Integers(0, 99), func(x int) bool { return x >= 100-pct })
++}
++
++// hzMaybe generates from g pct percent of the time and the zero value otherwise, which is
++// what it shrinks to.
++func hzMaybe[T any](pct int, g hegel.Generator[T]) hegel.Generator[T] {
++	var zero T
++	return hzWeighted(hzW(100-pct, hegel.Just(zero)), hzW(pct, g))
++}
++
++// hzSampled is one of a small table (the first is the shrink target).
++func hzSampled[T any](xs ...T) hegel.Generator[T] { return hegel.SampledFrom(xs) }
++
++// hzInts is an integer in [lo, hi], draw-free when the range is one value.
++func hzInts(lo, hi int) hegel.Generator[int] {
++	if lo == hi {
++		return hegel.Just(lo)
++	}
++	return hegel.Integers(lo, hi)
++}
++
++// hzUnless is the weight w, or zero when off: the clean way to stop drawing a shape under
++// HEGEL_NO_KNOWN=1.
++func hzUnless(off bool, w int) int {
++	if off {
++		return 0
++	}
++	return w
++}
++
++// hzOnly is g filtered by pred when on, g itself otherwise: the form of a generator whose
++// known-bug region is a relation between its parts rather than an alternative (under
++// HEGEL_NO_KNOWN=1 the region is filtered out; the filter gives up after three draws and the
++// case is then a skip, so the region must be a small share of g). Every draw the predicate
++// rejects is counted as "filtered <name>" for the collector.
++func hzOnly[T any](on bool, name string, g hegel.Generator[T], pred func(T) bool) hegel.Generator[T] {
++	if !on {
++		return g
++	}
++	return hegel.Filter(g, func(v T) bool {
++		ok := pred(v)
++		if !ok {
++			hzTally("filtered " + name)
++		}
++		return ok
++	})
++}
++
++// hzShaped is the value for a recorded bug's shape region or, under HEGEL_NO_KNOWN=1, for
++// the neighbouring region past it (the narrow properties).
++func hzShaped[T any](shape, past T) T {
++	if hzNoKnown {
++		return past
++	}
++	return shape
++}
++
++// hzKnown is the plain generator, or the region of a recorded bug's shape one time in five
++// (the shape first, the exception of STYLE.md rule 3); the shape is never drawn under
++// HEGEL_NO_KNOWN=1 (the wide properties).
++func hzKnown[T any](plain, shape hegel.Generator[T]) hegel.Generator[T] {
++	return hzWeighted(hzW(hzUnless(hzNoKnown, 1), shape), hzW(4, plain))
++}
++
++// hzTuple draws one value from each generator (a Composite only because the binding has no
++// tuple combinator).
++func hzTuple[T any](parts ...hegel.Generator[T]) hegel.Generator[[]T] {
++	return hegel.Composite(func(tc hegel.TestCase) []T {
++		out := make([]T, len(parts))
++		for i, g := range parts {
++			out[i] = hegel.Draw(tc, g)
++		}
++		return out
++	})
++}
++
++// hzCounted is a list of lo to hi elements with the count drawn first (Lists alone almost
++// never draws the empty list and skews short); nil for no elements.
++func hzCounted[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	return hegel.FlatMap(hzInts(lo, hi), func(k int) hegel.Generator[[]T] {
++		return hegel.Lists(g).MinSize(k).MaxSize(k)
++	})
++}
++
++// hzSeq concatenates the drawn lists (a prefix, the shape, a suffix).
++func hzSeq[T any](parts ...hegel.Generator[[]T]) hegel.Generator[[]T] {
++	return hegel.Composite(func(tc hegel.TestCase) []T {
++		var out []T
++		for _, g := range parts {
++			out = append(out, hegel.Draw(tc, g)...)
++		}
++		return out
++	})
++}
++
++// hzOne is a list of the one drawn value.
++func hzOne[T any](g hegel.Generator[T]) hegel.Generator[[]T] {
++	return hegel.Map(g, func(v T) []T { return []T{v} })
++}
++
++// weightedOver: a choice over the values at the weights (the first the shrink target), the
++// form of a uniform table here (the go/cascadia helper): the engine favours the first
++// alternative of a weighted choice and index 1 of a SampledFrom table, so a table drawn
++// evenly is a weighted choice with lower first weights, tuned by measurement.
++func weightedOver[T any](weights []int, values ...T) hegel.Generator[T] {
++	if len(weights) != len(values) {
++		panic("weightedOver: weights and values differ in length")
++	}
++	choices := make([]hzChoice[T], len(values))
++	for i, v := range values {
++		choices[i] = hzW(weights[i], hegel.Just(v))
++	}
++	return hzWeighted(choices...)
++}
++
++// evenInts: the integers lo, lo+1, ... at the weights, the form of a uniform range here.
++func evenInts(lo int, weights ...int) hegel.Generator[int] {
++	values := make([]int, len(weights))
++	for i := range weights {
++		values[i] = lo + i
++	}
++	return weightedOver(weights, values...)
++}
++
++// hzFair is hzWeighted with the engine's favourite face re-rolled: inside the routing cases
++// a die of any range lands on its second value about nine points too often (Integers(0, 6)
++// at 23 percent there against 13 elsewhere, SampledFrom and Integers(10, 16) alike: the
++// probe), so a choice of small weights never realises them; here that face draws the choice
++// again, and the rest of the die is the weights. It shrinks as hzWeighted does (the first
++// face is the first choice). Added for go/chi.
++func hzFair[T any](choices ...hzChoice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	if total <= 0 {
++		panic("hzFair: every choice has weight 0")
++	}
++	var g hegel.Generator[T]
++	g = hegel.FlatMap(hegel.Integers(0, total), func(i int) hegel.Generator[T] {
++		if i == 1 {
++			return g
++		}
++		if i > 1 {
++			i--
++		}
++		for _, c := range choices {
++			if i < c.weight {
++				return c.from
++			}
++			i -= c.weight
++		}
++		panic("unreachable")
++	})
++	return g
++}
++
++// fairOver is weightedOver with the favourite face re-rolled (hzFair): a table drawn at its
++// weights. Added for go/chi.
++func fairOver[T any](weights []int, values ...T) hegel.Generator[T] {
++	if len(weights) != len(values) {
++		panic("fairOver: weights and values differ in length")
++	}
++	choices := make([]hzChoice[T], len(values))
++	for i, v := range values {
++		choices[i] = hzW(weights[i], hegel.Just(v))
++	}
++	return hzFair(choices...)
++}
++
++// fairInts is evenInts with the favourite face re-rolled (hzFair).
++func fairInts(lo int, weights ...int) hegel.Generator[int] {
++	values := make([]int, len(weights))
++	for i := range weights {
++		values[i] = lo + i
++	}
++	return fairOver(weights, values...)
++}
++
++// evenOver is a table at one weight each, drawn evenly (fairOver).
++func evenOver[T any](values ...T) hegel.Generator[T] {
++	weights := make([]int, len(values))
++	for i := range weights {
++		weights[i] = 1
++	}
++	return fairOver(weights, values...)
++}
++
++// fairCounted is a list of lo to hi elements with the count drawn evenly (treeInts; hzCounted's
++// hzInts favours the second value of its range here); nil for no elements. countedBy is the
++// same with the counts at weights (lo first).
++func fairCounted[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	weights := make([]int, hi-lo+1)
++	for i := range weights {
++		weights[i] = 1
++	}
++	return countedBy(g, lo, weights...)
++}
++
++func countedBy[T any](g hegel.Generator[T], lo int, weights ...int) hegel.Generator[[]T] {
++	return hegel.FlatMap(treeInts(lo, weights...), func(k int) hegel.Generator[[]T] {
++		return hegel.Lists(g).MinSize(k).MaxSize(k)
++	})
++}
++
++// fairTree is fairOver for a table of more than three entries: the engine's hump over the
++// small faces of a big die (the first choice of a thirteen-face hzFair realised 38 points of
++// its 33 here) cannot be evened by weights, so the table is drawn by a tree of small dice: the
++// entries are cut into three consecutive parts (two below six), a part is drawn at its summed
++// weight (reduced by their common divisor), and the part again, down to fairOver over at most
++// three. A part without weight is left out (hzUnless). The first entry stays the shrink
++// target. evenTree is a table at one weight each; treeInts the integers lo, lo+1, ... at the
++// weights.
++func fairTree[T any](weights []int, values ...T) hegel.Generator[T] {
++	if len(weights) != len(values) {
++		panic("fairTree: weights and values differ in length")
++	}
++	if len(values) == 1 {
++		return hegel.Just(values[0])
++	}
++	if len(values) <= 3 {
++		return fairOver(weights, values...)
++	}
++	parts := 2
++	if len(values) >= 6 {
++		parts = 3
++	}
++	base, rem := len(values)/parts, len(values)%parts
++	var choices []hzChoice[T]
++	var sums []int
++	g := 0
++	for i, p := 0, 0; p < parts; p++ {
++		j := i + base
++		if p >= parts-rem { // the shorter parts first: the engine favours the first faces
++			j++
++		}
++		w := 0
++		for _, x := range weights[i:j] {
++			w += x
++		}
++		if w > 0 {
++			choices = append(choices, hzW(w, fairTree(weights[i:j], values[i:j]...)))
++			sums = append(sums, w)
++			g = gcd(g, w)
++		}
++		i = j
++	}
++	for k := range choices {
++		choices[k].weight = sums[k] / g
++	}
++	return hzFair(choices...)
++}
++
++func evenTree[T any](values ...T) hegel.Generator[T] {
++	weights := make([]int, len(values))
++	for i := range weights {
++		weights[i] = 1
++	}
++	return fairTree(weights, values...)
++}
++
++func treeInts(lo int, weights ...int) hegel.Generator[int] {
++	values := make([]int, len(weights))
++	for i := range weights {
++		values[i] = lo + i
++	}
++	return fairTree(weights, values...)
++}
++
++func gcd(a, b int) int {
++	for b != 0 {
++		a, b = b, a%b
++	}
++	return a
++}
++
++// --------------------------------------------------------------------------- added for
++// go/go-debian: the probe here (hegel-go v0.6.33, a die drawn inside a case of several draws)
++// found the engine's favour on small values at every scale, not on one face: Integers(0, 99)
++// landed 29 points on 0 to 9 (about 6 each on 0 and 1) and Integers(0, 1009) 46 on its first
++// hundred, falling to 3 on its last; Integers(0, 12) 20 on face 1 and 5 to 9 on the others.
++// A coin on such a die (hzCoin) realises about 0.8 of its percentage, and a choice of weights
++// summing to more than a handful (hzFair) favours its first choices by the sum. Only the
++// smallest dice are even once their first two faces are re-rolled (hzDie: 2 faces 51/49, 3
++// faces 34/32/34, 4 faces 25/28/22/25, and the slope starts at 6), so the die* family below
++// draws every choice from dice of two or three faces: an even table by a tree of them
++// (dieTree), a weight by a run of fair bits (hzChance, the binary expansion of the
++// probability), and the generator files use it with the measured figure beside every weight.
++
++// hzDie is the faces 0 to n-1 of a small die (n at most 4), drawn evenly: a die of n+2 faces
++// whose first two draw it again. It shrinks to 0 (face 2).
++func hzDie(n int) hegel.Generator[int] {
++	if n <= 1 {
++		return hegel.Just(0)
++	}
++	var g hegel.Generator[int]
++	g = hegel.FlatMap(hegel.Integers(0, n+1), func(i int) hegel.Generator[int] {
++		if i < 2 {
++			return g
++		}
++		return hegel.Just(i - 2)
++	})
++	return g
++}
++
++// hzChance is true num times in den, drawn as fair bits (hzDie(2)) compared with the binary
++// expansion of num/den until they differ (two bits on average); it shrinks to true (every
++// bit 0 is below any positive probability), so the first choice of a weighted choice is the
++// shrink target.
++func hzChance(num, den int) hegel.Generator[bool] {
++	if num <= 0 {
++		return hegel.Just(false)
++	}
++	if num >= den {
++		return hegel.Just(true)
++	}
++	return hegel.FlatMap(hzDie(2), func(b int) hegel.Generator[bool] {
++		n2, pbit := num*2, 0
++		if n2 >= den {
++			pbit, n2 = 1, n2-den
++		}
++		if b < pbit {
++			return hegel.Just(true)
++		}
++		if b > pbit {
++			return hegel.Just(false)
++		}
++		return hzChance(n2, den)
++	})
++}
++
++// dieChoice is hzWeighted on hzChance: the first choice at its share, else the second at its
++// share of the rest, and so on (a weight of zero is never drawn); it shrinks to the first
++// choice. For more than three choices dieTree is the cheaper form.
++func dieChoice[T any](choices ...hzChoice[T]) hegel.Generator[T] {
++	total := 0
++	for _, c := range choices {
++		total += c.weight
++	}
++	if total <= 0 {
++		panic("dieChoice: every choice has weight 0")
++	}
++	var live []hzChoice[T]
++	for _, c := range choices {
++		if c.weight > 0 {
++			live = append(live, c)
++		}
++	}
++	if len(live) == 1 {
++		return live[0].from
++	}
++	return hegel.FlatMap(hzChance(live[0].weight, total), func(first bool) hegel.Generator[T] {
++		if first {
++			return live[0].from
++		}
++		return dieChoice(live[1:]...)
++	})
++}
++
++// dieTree is a table at its weights (the first the shrink target), drawn by a tree of small
++// dice: the entries are cut into three consecutive parts (two below six), a part drawn by
++// hzDie when their weights are equal and by dieChoice when not, and the part again, down to
++// at most three entries. An entry of weight zero is never drawn. dieInts is the integers lo,
++// lo+1, ... at the weights; dieEven a table at one weight each; dieOver another name for
++// dieTree.
++func dieTree[T any](weights []int, values ...T) hegel.Generator[T] {
++	if len(weights) != len(values) {
++		panic("dieTree: weights and values differ in length")
++	}
++	var ws []int
++	var vs []T
++	for i, w := range weights {
++		if w > 0 {
++			ws = append(ws, w)
++			vs = append(vs, values[i])
++		}
++	}
++	if len(vs) == 0 {
++		panic("dieTree: every entry has weight 0")
++	}
++	if len(vs) == 1 {
++		return hegel.Just(vs[0])
++	}
++	parts := 2
++	if len(vs) >= 6 || len(vs) == 3 {
++		parts = 3
++	}
++	if len(vs) <= 3 {
++		parts = len(vs)
++	}
++	base, rem := len(vs)/parts, len(vs)%parts
++	var subtrees []hegel.Generator[T]
++	var sums []int
++	even := true
++	for i, p := 0, 0; p < parts; p++ {
++		j := i + base
++		if p >= parts-rem { // the shorter parts first
++			j++
++		}
++		w := 0
++		for _, x := range ws[i:j] {
++			w += x
++		}
++		if j-i == 1 {
++			subtrees = append(subtrees, hegel.Just(vs[i]))
++		} else {
++			subtrees = append(subtrees, dieTree(ws[i:j], vs[i:j]...))
++		}
++		sums = append(sums, w)
++		if w != sums[0] {
++			even = false
++		}
++		i = j
++	}
++	if even {
++		return hegel.FlatMap(hzDie(len(subtrees)), func(i int) hegel.Generator[T] { return subtrees[i] })
++	}
++	choices := make([]hzChoice[T], len(subtrees))
++	for i, g := range subtrees {
++		choices[i] = hzW(sums[i], g)
++	}
++	return dieChoice(choices...)
++}
++
++func dieOver[T any](weights []int, values ...T) hegel.Generator[T] {
++	return dieTree(weights, values...)
++}
++
++func dieInts(lo int, weights ...int) hegel.Generator[int] {
++	values := make([]int, len(weights))
++	for i := range weights {
++		values[i] = lo + i
++	}
++	return dieTree(weights, values...)
++}
++
++func dieEven[T any](values ...T) hegel.Generator[T] {
++	weights := make([]int, len(values))
++	for i := range weights {
++		weights[i] = 1
++	}
++	return dieTree(weights, values...)
++}
++
++// dieCoin is true pct percent of the time, shrinking to false; dieMaybe is g pct percent of
++// the time and the zero value otherwise.
++func dieCoin(pct int) hegel.Generator[bool] {
++	return hegel.Map(hzChance(100-pct, 100), func(no bool) bool { return !no })
++}
++
++func dieMaybe[T any](pct int, g hegel.Generator[T]) hegel.Generator[T] {
++	var zero T
++	return dieChoice(hzW(100-pct, hegel.Just(zero)), hzW(pct, g))
++}
++
++// dieCounted is a list of elements with the count at the weights (lo first); nil for none.
++func dieCounted[T any](g hegel.Generator[T], lo int, weights ...int) hegel.Generator[[]T] {
++	return hegel.FlatMap(dieInts(lo, weights...), func(k int) hegel.Generator[[]T] {
++		return hegel.Lists(g).MinSize(k).MaxSize(k)
++	})
++}
++
++// --------------------------------------------------------------------------- added for
++// go/gin: evenHalves is a table at one weight each drawn by halving: a fair-bit choice
++// between the two halves at their sizes (dieChoice), and each half again, down to one value;
++// the first value is the shrink target. dieTree's three-way splits (hzDie(3)) realised their
++// last face at 12 to 27 instead of 33 in gin's harness, so even tables are halved instead.
++// rangeHalves is the integers lo to hi so drawn; countedHalves a list of lo to hi elements.
++func evenHalves[T any](values ...T) hegel.Generator[T] {
++	if len(values) == 1 {
++		return hegel.Just(values[0])
++	}
++	h := (len(values) + 1) / 2
++	return dieChoice(hzW(h, evenHalves(values[:h]...)), hzW(len(values)-h, evenHalves(values[h:]...)))
++}
++
++func rangeHalves(lo, hi int) hegel.Generator[int] {
++	values := make([]int, hi-lo+1)
++	for i := range values {
++		values[i] = lo + i
++	}
++	return evenHalves(values...)
++}
++
++func countedHalves[T any](g hegel.Generator[T], lo, hi int) hegel.Generator[[]T] {
++	return hegel.FlatMap(rangeHalves(lo, hi), func(n int) hegel.Generator[[]T] { return hzCounted(g, n, n) })
++}
++
++// --------------------------------------------------------------------------- added for
++// go/kong (halvesOver, halvesGens) and go/mergo (evenGens): weighted and even choices over
++// generators drawn by halving.
++
++// halvesOver is a table at the weights (the first value the shrink target) drawn by halving
++// like evenHalves (the go/kong helper): the entries are cut where the cumulative weight is
++// nearest half, a fair-bit choice between the two parts at their summed weights (dieChoice),
++// and each part again, down to one value. Every split is two-way; an entry of weight zero is
++// never drawn.
++func halvesOver[T any](weights []int, values ...T) hegel.Generator[T] {
++	gens := make([]hegel.Generator[T], len(values))
++	for i, v := range values {
++		gens[i] = hegel.Just(v)
++	}
++	return halvesGens(weights, gens...)
++}
++
++// halvesGens is halvesOver over generators: the alternatives of a weighted choice at their
++// weights, drawn by halving (the first the shrink target).
++func halvesGens[T any](weights []int, gens ...hegel.Generator[T]) hegel.Generator[T] {
++	if len(weights) != len(gens) {
++		panic("halvesGens: weights and generators differ in length")
++	}
++	var ws []int
++	var gs []hegel.Generator[T]
++	for i, w := range weights {
++		if w > 0 {
++			ws = append(ws, w)
++			gs = append(gs, gens[i])
++		}
++	}
++	if len(gs) == 0 {
++		panic("halvesGens: every alternative has weight 0")
++	}
++	if len(gs) == 1 {
++		return gs[0]
++	}
++	total := 0
++	for _, w := range ws {
++		total += w
++	}
++	cut, acc, best := 1, 0, -1
++	for i := 1; i < len(gs); i++ {
++		acc += ws[i-1]
++		d := 2*acc - total
++		if d < 0 {
++			d = -d
++		}
++		if best < 0 || d < best {
++			cut, best = i, d
++		}
++	}
++	left := 0
++	for _, w := range ws[:cut] {
++		left += w
++	}
++	return dieChoice(hzW(left, halvesGens(ws[:cut], gs[:cut]...)), hzW(total-left, halvesGens(ws[cut:], gs[cut:]...)))
++}
++
++// evenGens is halvesGens at one weight each.
++func evenGens[T any](gens ...hegel.Generator[T]) hegel.Generator[T] {
++	ws := make([]int, len(gens))
++	for i := range ws {
++		ws[i] = 1
++	}
++	return halvesGens(ws, gens...)
++}
+diff --git a/hegel/hegel_zoo_judge_test.go b/hegel/hegel_zoo_judge_test.go
+new file mode 100644
+index 0000000..1ea9660
+--- /dev/null
++++ b/hegel/hegel_zoo_judge_test.go
+@@ -0,0 +1,1068 @@
++package hegel
++
++// The harness of the rewritten properties (the go/excelize ... go/gronx/go/gval judge): hzOpts
++// and hzProperty, the collector with the shrink budget, the known value with one switch per
++// recorded bug, the case judge, the judged runner, the checks and the classifier. The old
++// harness of hegel_zoo_test.go (HZKnown, hzAvoid, hzOld*) stays beside it for the five
++// properties the later parts rewrite.
++//
++// The model of a family is a pure function expected(c, k) checks of a case record and a
++// switch set: with every switch off (hzKnownNone) it states the documented behaviour, which the
++// properties judge the library against; with a switch on it reproduces that bug as a replica
++// of the library's rule, transcribed from archives.go and fs.go at the lines named beside the
++// switch. The classifier shapeBy runs the model per switch BEFORE the library is called and
++// names the recorded bug whose shape the case has; a mismatch then fails "(the shape of
++// archives/N)". Under HEGEL_NO_KNOWN=1 the shapes are not drawn (a weight of zero), filtered
++// out by the classifier (withoutShapes, hzOnly) or their checks dropped (judgeByDropping),
++// and the narrow properties draw the region past the shape (hzShaped, regionOf). A check the
++// documentation leaves open is the marker "unspecified": the judge does not compare it
++// (counted "unspecified check"), the classifier compares it like any other value.
++// HEGEL_COLLECT=1 (or ZOO_COLLECT=1) makes the properties record their mismatches instead of
++// failing and print the counts ("COLLECT TestHegel...: N mismatches; ...", "MISMATCH ...").
++
++import (
++	"fmt"
++	"os"
++	"reflect"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- harness
++
++// hzOpts passes HEGEL_TEST_CASES, HEGEL_SEED and HEGEL_VERBOSE through to the engine, which
++// reads no environment variable itself (the seed is for the rate measurements of the probe
++// and the collector), and asks for one failure per run for the shrink budget.
++func hzOpts() []hegel.Option {
++	var opts []hegel.Option
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			opts = append(opts, hegel.WithTestCases(v))
++		}
++	}
++	if s := os.Getenv("HEGEL_SEED"); s != "" {
++		if seed, err := strconv.ParseInt(s, 10, 64); err == nil {
++			opts = append(opts, hegel.WithSeed(seed))
++		}
++	}
++	if os.Getenv("HEGEL_VERBOSE") != "" {
++		opts = append(opts, hegel.WithVerbosity(hegel.VerbosityVerbose))
++	}
++	if hzShrinkBudget > 0 {
++		// The shrink budget: one failure per run (the engine otherwise generates on while
++		// the cases fail, ten times the count on a property that always fails, and its
++		// re-run of the failures before shrinking would meet a rejected attempt and end the
++		// run as "flaky" with nothing printed).
++		opts = append(opts, hegel.WithReportMultipleFailures(false))
++	}
++	return opts
++}
++
++// hzCases is the case count of a run: HEGEL_TEST_CASES, else the engine's default of 100.
++func hzCases() int {
++	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v > 0 {
++			return v
++		}
++	}
++	return 100
++}
++
++// hzProperty runs a property with the library's panics turned into failures and the wrapped
++// hegel control-flow error let through; extra options come after hzOpts (a property's own
++// case count).
++func hzProperty(t *testing.T, fn func(ht *hegel.T), extra ...hegel.Option) {
++	t.Helper()
++	hegel.Test(t, func(ht *hegel.T) {
++		defer func() {
++			r := recover()
++			if r == nil {
++				return
++			}
++			tn := reflect.TypeOf(r).String()
++			if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++				panic(r)
++			}
++			if e, ok := r.(error); ok && strings.Contains(e.Error(), "hegel") {
++				// A wrapped hegel control-flow error (E_STOP_TEST on an overrun draw).
++				panic(r)
++			}
++			ht.Fatalf("panic in the code under test: %v", r)
++		}()
++		fn(ht)
++	}, append(hzOpts(), extra...)...)
++}
++
++var hzCollecting = os.Getenv("HEGEL_COLLECT") != "" || os.Getenv("ZOO_COLLECT") != ""
++
++// hzCollector counts the classes of one property's cases and mismatches and prints them at
++// the end in collect mode ("COLLECT TestHegel...: N mismatches; class=count ..."), with the
++// judge's counters (hzStats) and the first two messages of each mismatch class ("MISMATCH").
++type hzCollector struct {
++	name   string
++	mu     sync.Mutex
++	counts map[string]int
++	msgs   []string
++	bad    int
++	fails  int  // failing judgements so far (the shrink budget)
++	budget int  // the failing judgements allowed, set at the first failure
++	cap    int  // a property's own cap on the budget (0 for none)
++	armed  bool // past the budget: reject the next attempt before it draws
++	cycles int  // the attempts so rejected
++}
++
++// hzShrinkBudget bounds the shrinking of a failure: the engine (hegel-go v0.6.33 over
++// libhegel) keeps every attempt of a shrink in memory and has no budget for it (go/mergo
++// measured 1.6 GB and 65 s for a shrink of a case of 3000 draws in a module of its own, more
++// inside a test binary). A case here is some hundreds of draws (the probe counts them) and
++// the model is cheap, but a loop case of the FilesFrom property costs a child process, so the
++// budget is kept from the gotext ... gronx harness as it is: after a budget of failing
++// judgements the next attempt is rejected before its first draw (Assume: counted "budget
++// skipped"), which ends the shrink: the engine ends a shrink at an attempt rejected before it
++// drew, then replays the last failing attempt exactly for its report ("budget replayed",
++// printed as usual). Were the engine to shrink on past the undrawn rejection, the drawn
++// attempt that fails arms the next undrawn rejection, and after hzShrinkCycles such cycles
++// every attempt is rejected undrawn and the run ends without a message ("budget exhausted").
++// The budget is hzShrinkBudget bytes of the first failure's message: the attempts allowed
++// are the bytes over the message's length, between 100 and 3000. HEGEL_SHRINK_BUDGET sets
++// the bytes, 0 for no budget. Collect mode records every failure and never shrinks.
++var hzShrinkBudget = func() int {
++	if s := os.Getenv("HEGEL_SHRINK_BUDGET"); s != "" {
++		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
++			return v
++		}
++	}
++	return 400000
++}()
++
++// hzShrinkCycles bounds the alternation past the budget.
++const hzShrinkCycles = 100
++
++// hzShrinkAttempts is the failing judgements the budget allows for a first failure of n
++// bytes.
++func hzShrinkAttempts(n int) int {
++	if n < 1 {
++		n = 1
++	}
++	b := hzShrinkBudget / n
++	if b < 100 {
++		return 100
++	}
++	if b > 3000 {
++		return 3000
++	}
++	return b
++}
++
++func hzNewCollector(t *testing.T) *hzCollector {
++	c := &hzCollector{name: t.Name(), counts: map[string]int{}}
++	t.Cleanup(func() {
++		if !hzCollecting {
++			return
++		}
++		keys := make([]string, 0, len(c.counts))
++		for k := range c.counts {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		var parts []string
++		for _, k := range keys {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, c.counts[k]))
++		}
++		hzStatsMu.Lock()
++		stats := make([]string, 0, len(hzStats))
++		for k := range hzStats {
++			stats = append(stats, k)
++		}
++		sort.Strings(stats)
++		for _, k := range stats {
++			parts = append(parts, fmt.Sprintf("%s=%d", k, hzStats[k]))
++		}
++		hzStats = map[string]int{}
++		hzStatsMu.Unlock()
++		fmt.Printf("COLLECT %s: %d mismatches; %s\n", c.name, c.bad, strings.Join(parts, " "))
++		for _, m := range c.msgs {
++			fmt.Printf("MISMATCH %s\n", m)
++		}
++	})
++	return c
++}
++
++func (c *hzCollector) count(class string) {
++	c.mu.Lock()
++	c.counts[class]++
++	c.mu.Unlock()
++}
++
++// observe records a message of a class that is not a failure (a replica disagreement):
++// counted, and its first two messages kept.
++func (c *hzCollector) observe(class string, format string, args ...any) {
++	c.mu.Lock()
++	c.counts[class]++
++	if c.counts[class] <= 2 {
++		c.msgs = append(c.msgs, c.name+" "+class+": "+fmt.Sprintf(format, args...))
++	}
++	c.mu.Unlock()
++}
++
++// failClass is a failure with a class: in collect mode the class is counted and only its
++// first two messages are kept; otherwise it is fatal, within the shrink budget.
++func (c *hzCollector) failClass(ht *hegel.T, class string, format string, args ...any) {
++	msg := fmt.Sprintf(format, args...)
++	if hzCollecting {
++		c.mu.Lock()
++		c.bad++
++		if class != "" {
++			c.counts["mismatch "+class]++
++		}
++		if (class == "" && len(c.msgs) < 25) || (class != "" && c.counts["mismatch "+class] <= 2) {
++			c.msgs = append(c.msgs, c.name+": "+msg)
++		}
++		c.mu.Unlock()
++		return
++	}
++	c.mu.Lock()
++	if c.fails == 0 && hzShrinkBudget > 0 {
++		c.budget = hzShrinkAttempts(len(msg))
++		if c.cap > 0 && c.budget > c.cap {
++			c.budget = c.cap
++		}
++	}
++	if c.budget > 0 && c.fails >= c.budget {
++		// past the budget: the attempt that drew is the engine's replay of the last failure
++		// (the undrawn rejection before it ended the shrink) and prints as usual; were it a
++		// shrink attempt instead, the next attempt is rejected before drawing again
++		c.armed = true
++		c.counts["budget replayed"]++
++		c.mu.Unlock()
++		ht.Fatalf("%s", msg)
++	}
++	c.fails++
++	if c.fails >= c.budget {
++		c.armed = true
++	}
++	c.mu.Unlock()
++	ht.Fatalf("%s", msg)
++}
++
++// skip is whether the attempt is to be rejected before it draws (the budget spent and the
++// previous attempt drawn); past hzShrinkCycles, always.
++func (c *hzCollector) skip() bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.budget == 0 || c.fails < c.budget {
++		return false
++	}
++	if c.cycles >= hzShrinkCycles {
++		c.counts["budget exhausted"]++
++		return true
++	}
++	if !c.armed {
++		return false
++	}
++	c.armed = false
++	c.cycles++
++	c.counts["budget skipped"]++
++	return true
++}
++
++// rearm: an attempt past the budget that drew and did not fail arms the next.
++func (c *hzCollector) rearm() {
++	c.mu.Lock()
++	if c.budget > 0 && c.fails >= c.budget {
++		c.armed = true
++	}
++	c.mu.Unlock()
++}
++
++// --------------------------------------------------------------------------- the switches
++
++// known: the recorded bugs (bugs.toml), indexed by the constants below (the index of a switch
++// is the bug's id minus one: hzKnownID(i) = "archives/<i+1>"). The expected functions of the
++// rewritten properties (filesExpected in hegel_zoo_files_test.go, deepExpected in
++// hegel_zoo_deep_test.go) are pure functions of (case, known): with every switch off
++// (hzKnownNone) they state the documented behaviour and are what the properties judge the
++// library against; with a switch on they reproduce that bug as a replica of the library's
++// rule, transcribed from archives.go and fs.go at the lines named beside the switch. Part 1
++// of the rewrite reads the nine switches of FilesFromFS/FilesFromDisk and DeepFS; the parts
++// after it read the others (until then those are declared and read by nothing).
++type known [27]bool
++
++const (
++	// archives/1: Zip archives written with ZipMethodXz cannot be read: the xz stream
++	// header precedes each local file header
++	kZipXzHeaderOffset = iota
++	// archives/2: Tar.Insert after an archive whose last entry is a directory, a link or a
++	// 512-multiple file leaves a zero block, and the archive no longer reads past it
++	kTarInsertBlockAligned
++	// archives/3: Zip.Insert returns after a directory entry, and the files after it are
++	// silently not inserted
++	kZipInsertDirStops
++	// archives/4: ArchiveFS.Open of a directory before the index is built returns a
++	// descendant file opened as the directory
++	kOpenImplicitDirFile
++	// archives/5: ArchiveFS.Open of a directory before the index is built lists the files
++	// of later or implicit subdirectories, and of ./ names, as its own
++	kOpenDirFreshEntries
++	// archives/6: ArchiveFS.Stat of a missing name that is a prefix of an entry name
++	// returns an implicit directory
++	kStatPrefixMissing
++	// archives/7: ArchiveFS.Stat of an implicit directory returns its full path as Name()
++	// before indexing, and a child's name after
++	kStatImplicitDirName
++	// archives/8: the directory files of ArchiveFS return all their entries from
++	// ReadDir(n <= 0), not the remaining ones
++	kDirFileReadDirRest
++	// archives/9: an empty zip is not identified by its stream: Zip.Match reads new bytes
++	// for each candidate header
++	kZipEmptyStreamMatch
++	// archives/10: Lz4 rejects every CompressionLevel but 0: the value is passed as the lz4
++	// library's bit-flag constant
++	kLz4CompressionLevel
++	// archives/11: Zip.Insert without SelectiveCompression stores the files, whatever
++	// Compression says
++	kZipInsertStores
++	// archives/12: Zip.Insert with SelectiveCompression and a Bzip2, Zstd or Xz method
++	// fails: the updater does not know the registered methods
++	kZipInsertCustomMethod
++	// archives/13: Zip.Insert stores a symbolic link as a prefix of its target's content,
++	// or fails when the target is missing
++	kZipInsertSymlink
++	// archives/14: FilesFromDisk and FilesFromFS with the in-archive root . give names with
++	// a leading slash (nameOnDiskToNameInArchive, archives.go :277-306: the value "." sets
++	// rootInArchive "" at :292-298 and :304-305 join it with strings.TrimPrefix(nameOnDisk,
++	// rootOnDisk), which keeps the separator for a key without a trailing one)
++	kFsRootDotLeadingSlash
++	// archives/15: FilesFromFS fails on a key ending in a slash, documented as enumerating
++	// the directory's contents (the key is passed as is to fs.WalkDir at archives.go :197,
++	// and fs.ValidPath refuses a trailing slash: "open dir/: file does not exist")
++	kFsTrailingSlashKey
++	// archives/16: FilesFromDisk with a key ending in a separator and a value with a
++	// directory adds the directory itself and drops the value's first element
++	// (nameOnDiskToNameInArchive, archives.go :283-286: rootInArchive = trimTopDir
++	// (rootInArchive), trimTopDir :312-314 and topDir :320-329; the root folder is skipped
++	// at :98 only when its name comes out empty)
++	kFsTrailingKeyValue
++	// archives/17: FilesFromFS with FollowSymlinks resolves a relative link target from the
++	// root of the fs.FS, not from the link's directory (followSymlinkFS, archives.go
++	// :517-550, passes the target of fs.ReadLink at :525 straight to fs.Lstat at :529;
++	// followSymlink on disk joins it with filepath.Dir(filename) at :487-489)
++	kFsFollowSymlinkRelative
++	// archives/18: FilesFromFS with FollowSymlinks fails on a link to a directory: the
++	// directory is looked up inside fs.Sub of itself (archives.go :225-237: subFsys :=
++	// fs.Sub(fsys, filename) at :226, then FilesFromFS(ctx, subFsys, options, {filename:
++	// nameInArchive}) at :230, "getting files from symlink directory ... dereferenced to
++	// ...: open d: file does not exist" at :232)
++	kFsFollowDirLink
++	// archives/19: Identify gives a different answer from call to call when the file name
++	// and the stream point at different formats
++	kIdentifyNondeterministic
++	// archives/20: Identify panics on a truncated lzip stream
++	kIdentifyLzipTruncatedPanic
++	// archives/21: PathContainsArchive compares extensions case-sensitively while
++	// PathIsArchive and SplitPath lower-case the path (fs.go :975-983: strings.Contains
++	// (path+"/", ext+"/") on the path as given; PathIsArchive :957-968 lower-cases)
++	kPathContainsArchiveCase
++	// archives/22: DeepFS.SplitPath skips the first character of the path, so a first
++	// segment that is only an archive extension is not split (fs.go :869-918: the scan
++	// starts at index 1, :880-884)
++	kSplitPathFirstSegment
++	// archives/23: DeepFS treats a directory named like an archive as an archive, and the
++	// archives inside it are listed as plain files (fs.go :811-834: ReadDir splits the path
++	// at the archive-named directory and reads it through getInnerFsys :839-856, which
++	// calls FileSystem :47-117, which returns a DirFS for a real directory at :69-71; DirFS
++	// .ReadDir :223-228 does not wrap archive-named entries in alwaysDirEntry as
++	// DeepFS.ReadDir does at :828-832)
++	kDeepFSDirNamedArchive
++	// archives/24: Lzip's writer closed without a Write produces a stream its reader
++	// rejects
++	kLzipEmptyStream
++	// archives/25: Brotli.Match rejects streams longer than 1 KiB whose first kibibyte does
++	// not decode to its end, so Identify finds no format for them
++	kBrotliMatchTruncated
++	// archives/26: Identify by name does not know .tgz, which PathIsArchive and DeepFS
++	// treat as an archive
++	kIdentifyTgzByName
++	// archives/27: FilesFromDisk and FilesFromFS with FollowSymlinks never return on a
++	// symbolic link to an ancestor directory (archives.go :122-130 and :225-237: a followed
++	// link to a directory calls FilesFromDisk/FilesFromFS again on the directory, whose walk
++	// meets the link again; nothing records the directories being followed)
++	kFollowAncestorLinkHang
++	hzKnownCount
++)
++
++// hzKnownRead are the switches the models read, in bug order: the classifier sweeps these.
++// Every switch is listed; a model that does not read a switch is unchanged by it.
++var hzKnownRead = func() []int {
++	out := make([]int, hzKnownCount)
++	for i := range out {
++		out[i] = i
++	}
++	return out
++}()
++
++// hzKnownID is the bug id of a switch ("archives/N"); hzKnownIndex the switch of a bug id
++// (-1 for none or the hole).
++func hzKnownID(i int) string { return "archives/" + strconv.Itoa(i+1) }
++
++func hzKnownIndex(id string) int {
++	n, err := strconv.Atoi(strings.TrimPrefix(id, "archives/"))
++	if err != nil || n < 1 || n > hzKnownCount {
++		return -1
++	}
++	return n - 1
++}
++
++var (
++	hzKnownNone = known{}
++	hzKnownAll  = func() known {
++		var k known
++		for _, i := range hzKnownRead {
++			k[i] = true
++		}
++		return k
++	}()
++)
++
++// hzKnownOnly is the set of the one switch i; hzKnownAllBut every switch but i.
++func hzKnownOnly(i int) known {
++	var k known
++	k[i] = true
++	return k
++}
++
++func hzKnownAllBut(i int) known {
++	k := hzKnownAll
++	k[i] = false
++	return k
++}
++
++// hzStats counts (hzTally) the shapes of the recorded bugs the cases have ("shape archives/N"
++// per case), the rule of the classifier that named them ("shape via sufficiency", "shape via
++// necessity", "shape via hole", the latter two with the id), the cases skipped for them under
++// HEGEL_NO_KNOWN=1 ("known archives/N"), the cases whose checks were dropped ("dropped
++// archives/N") and the checks ("dropped check <name>"), the draws the filters rejected
++// ("filtered <name>"), the replica's agreement with the library on the shaped cases ("replica
++// agreement", "replica disagreement"), the checks the model leaves unspecified ("unspecified
++// check <name>"), the properties' own tallies of what their cases reached (the rates of the
++// report), and the cases assumed away for an unrecorded candidate bug
++// ("candidate/go/archives-N"); printed and reset by the collector, under hzStatsMu.
++var (
++	hzStatsMu sync.Mutex
++	hzStats   = map[string]int{}
++)
++
++func hzTally(key string) {
++	hzStatsMu.Lock()
++	hzStats[key]++
++	hzStatsMu.Unlock()
++}
++
++// hzCaseJudge judges one drawn case (the go/excelize ... go/gval judge, with the collector's
++// mismatch classes): it names the recorded bug whose shape the case has, so that a mismatch
++// or a library panic fails "(the shape of archives/N)", and under HEGEL_NO_KNOWN=1 skips the
++// case instead (counted as known) or drops the checks the shape covers (Dropped). The wide
++// and the narrow properties share their judge functions and so this. The classifier that
++// names the shape is computed from the case record alone (the model run with several sets of
++// switches).
++type hzCaseJudge struct {
++	ht    *hegel.T
++	col   *hzCollector
++	shape string
++}
++
++// hzNewJudge is the judge of the case drawn by the property ht runs, reporting to col.
++func hzNewJudge(ht *hegel.T, col *hzCollector) *hzCaseJudge { return &hzCaseJudge{ht: ht, col: col} }
++
++// Shape records that the case has the shape of the recorded bug id ("" for none): counted,
++// and the first shape named is the one a failure reports. Under HEGEL_NO_KNOWN=1 the case is
++// assumed away (counted as known); the generators keep that rare (the regions past the shapes
++// are drawn, or the shaped cases filtered out), and the collector measures it.
++func (j *hzCaseJudge) Shape(id string) {
++	if id == "" {
++		return
++	}
++	hzTally("shape " + id)
++	if j.shape == "" {
++		j.shape = id
++	}
++	if hzNoKnown {
++		hzTally("known " + id)
++		j.ht.Assume(false)
++	}
++}
++
++// Dropped is Shape for a shape that is some checks of a case rather than the whole case: by
++// default the shape is named and the checks are made (false); under HEGEL_NO_KNOWN=1 the
++// checks are dropped (true, counted as "dropped archives/N") and the case goes on
++// (judgeByDropping).
++func (j *hzCaseJudge) Dropped(id string) bool {
++	if id == "" {
++		return false
++	}
++	if hzNoKnown {
++		hzTally("dropped " + id)
++		return true
++	}
++	j.Shape(id)
++	return false
++}
++
++// Named is the suffix a failure carries: the shape of the recorded bug, if any.
++func (j *hzCaseJudge) Named() string {
++	if j.shape == "" {
++		return ""
++	}
++	return " (the shape of " + j.shape + ")"
++}
++
++// Fail reports a mismatch of the given collector class, naming the shape: fatal normally,
++// recorded in collect mode (the property then goes on; a mismatch with no shape is counted
++// as "unshaped", the classifier's gap).
++func (j *hzCaseJudge) Fail(class, format string, args ...any) {
++	if j.shape == "" {
++		hzTally("unshaped")
++		class = "unshaped " + class
++	}
++	j.col.failClass(j.ht, class, format+"%s", append(args, j.Named())...)
++}
++
++// Note logs a line Hegel shows with a failure; the line is formatted at once, so a %v of a
++// library value is part of the test.
++func (j *hzCaseJudge) Note(format string, args ...any) {
++	j.ht.Log(fmt.Sprintf(format, args...))
++}
++
++// Recover, deferred in the property body after the judge is made, turns a panic in the code
++// under test into a failure naming the shape (hzProperty's own recovery sees only what this
++// lets through: Hegel's control flow). The properties call the library through hzCall, which
++// turns its panic into the check value "panic" judged like any other value; this is the net
++// under everything else.
++func (j *hzCaseJudge) Recover() {
++	r := recover()
++	if r == nil {
++		return
++	}
++	tn := reflect.TypeOf(r).String()
++	if strings.HasPrefix(tn, "*hegel.") || strings.HasPrefix(tn, "hegel.") || strings.HasPrefix(tn, "libhegel.") {
++		panic(r)
++	}
++	if e, ok := r.(error); ok && strings.Contains(e.Error(), "hegel") {
++		panic(r)
++	}
++	j.Fail("panic", "panic in the code under test: %v", r)
++}
++
++// judged runs one property over the cases: the judge is made, the library's panics are
++// recovered into failures naming the shape, and fn judges the case. The properties run one
++// after the other (each writes its trees under its own temporary directory).
++// judgedWithCount is judged at the case count n, scaled as HEGEL_TEST_CASES scales the
++// default of 100, and with the shrink budget capped at attempts failing judgements (a
++// property whose cases are dear: the child processes).
++func judgedWithCount[T any](t *testing.T, n, attempts int, cases hegel.Generator[T], fn func(j *hzCaseJudge, c T)) {
++	t.Helper()
++	count := n * hzCases() / 100
++	if count < 1 {
++		count = 1
++	}
++	judgedWith(t, cases, fn, attempts, hegel.WithTestCases(count))
++}
++
++func judged[T any](t *testing.T, cases hegel.Generator[T], fn func(j *hzCaseJudge, c T)) {
++	t.Helper()
++	judgedWith(t, cases, fn, 0)
++}
++
++func judgedWith[T any](t *testing.T, cases hegel.Generator[T], fn func(j *hzCaseJudge, c T), attempts int, extra ...hegel.Option) {
++	t.Helper()
++	col := hzNewCollector(t)
++	col.cap = attempts
++	hzProperty(t, func(ht *hegel.T) {
++		if col.skip() {
++			ht.Assume(false)
++		}
++		c := hegel.Draw(ht, cases)
++		j := hzNewJudge(ht, col)
++		defer j.Recover()
++		fn(j, c)
++		col.count("cases")
++		col.rearm()
++	}, extra...)
++}
++
++// --------------------------------------------------------------------------- checks and the
++// classifier (the go/carbon ... go/gval form: every value here is text; a model states a set
++// of acceptable values per check and the library's value agrees by membership).
++
++// checks is the set of values a model states or the library gives, by check name: a model
++// returns the whole map for a case and a switch set, the property asks the library the same
++// questions, and the judge compares the two. Every value is a set of strings spelled
++// `{"a" | "b"}` (hzSet: the members quoted, sorted, unique); the library's is a set of one
++// (hzValue). A model value of "unspecified" (hzUnspecified) is a check the documentation
++// leaves open: the judge does not compare it. The checks of this target are named in the
++// model files.
++type checks map[string]string
++
++// hzUnspecified is the model's marker for a value the documentation leaves open.
++const hzUnspecified = "unspecified"
++
++// hzSet spells a set of acceptable values; hzValue a set of one.
++func hzSet(vals ...string) string {
++	sort.Strings(vals)
++	var parts []string
++	for i, v := range vals {
++		if i > 0 && v == vals[i-1] {
++			continue
++		}
++		parts = append(parts, strconv.Quote(v))
++	}
++	return "{" + strings.Join(parts, " | ") + "}"
++}
++
++func hzValue(v any) string { return hzSet(fmt.Sprint(v)) }
++
++// hzMembers reads a set back (a value that is not a set is a set of itself).
++func hzMembers(s string) []string {
++	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
++		return []string{s}
++	}
++	rest := s[1 : len(s)-1]
++	var out []string
++	for rest != "" {
++		q, err := strconv.QuotedPrefix(rest)
++		if err != nil {
++			return []string{s}
++		}
++		v, _ := strconv.Unquote(q)
++		out = append(out, v)
++		rest = strings.TrimPrefix(rest[len(q):], " | ")
++	}
++	return out
++}
++
++func (c checks) set(name string, v any) { c[name] = hzValue(v) }
++
++// unspecified marks the check as left open by the documentation.
++func (c checks) unspecified(name string) { c[name] = hzUnspecified }
++
++// isUnspecified reports whether a model value is the open marker.
++func isUnspecified(v string) bool { return v == hzUnspecified }
++
++// checkRank is the order the checks of a case are reported in when it fails (and the first
++// differing one classes the failure): the model files fill it; the rest by name.
++var checkRank = map[string]int{}
++
++// rankOf is the rank of a check name: the rank of its longest registered prefix, else 1000.
++func rankOf(name string) int {
++	best, found := 1000, false
++	bestLen := -1
++	for prefix, r := range checkRank {
++		if strings.HasPrefix(name, prefix) && len(prefix) > bestLen {
++			best, found, bestLen = r, true, len(prefix)
++		}
++	}
++	if !found {
++		return 1000
++	}
++	return best
++}
++
++func checkLess(a, b string) bool {
++	ar, br := rankOf(a), rankOf(b)
++	if ar != br {
++		return ar < br
++	}
++	return a < b
++}
++
++func sortedKeys(c checks) []string {
++	keys := make([]string, 0, len(c))
++	for k := range c {
++		keys = append(keys, k)
++	}
++	sort.Slice(keys, func(i, j int) bool { return checkLess(keys[i], keys[j]) })
++	return keys
++}
++
++// sameChecks reports whether two model statements agree: the same checks, each value equal
++// (the classifier's comparison; the sets are spelled canonically, the open marker compared
++// like any value).
++func sameChecks(a, b checks) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, v := range a {
++		if w, ok := b[k]; !ok || w != v {
++			return false
++		}
++	}
++	return true
++}
++
++// agreeValue reports whether the library's value of a check agrees with a model's: every
++// member of the library's set is a member of the model's; an open model value agrees with
++// anything.
++func agreeValue(name, got, want string) bool {
++	if got == want || isUnspecified(want) {
++		return true
++	}
++	ws := hzMembers(want)
++	for _, g := range hzMembers(got) {
++		found := false
++		for _, w := range ws {
++			if g == w {
++				found = true
++				break
++			}
++		}
++		if !found {
++			return false
++		}
++	}
++	return true
++}
++
++// agreeChecks reports whether the library's values agree with a model's: no check the model
++// does not state, every stated check answered by agreeValue - except an open one, which the
++// library may leave unanswered (a call that never returned answers nothing else).
++func agreeChecks(got, want checks) bool {
++	for k := range got {
++		if _, ok := want[k]; !ok {
++			return false
++		}
++	}
++	for k, v := range want {
++		if isUnspecified(v) {
++			continue
++		}
++		if g, ok := got[k]; !ok || !agreeValue(k, g, v) {
++			return false
++		}
++	}
++	return true
++}
++
++// diffChecks lists the checks on which a (the library's values) and b (a model's) differ, in
++// check order; the long values are cut, the explanation of a case shows the difference.
++func diffChecks(a, b checks) string {
++	var parts []string
++	cut := func(s string) string {
++		if len(s) > 400 {
++			return s[:400] + "..."
++		}
++		return s
++	}
++	for _, k := range sortedKeys(a) {
++		if w, ok := b[k]; !ok || !agreeValue(k, a[k], w) {
++			if !ok {
++				parts = append(parts, fmt.Sprintf("%s = %s, want (none)", k, cut(a[k])))
++			} else {
++				parts = append(parts, fmt.Sprintf("%s = %s, want %s", k, cut(a[k]), cut(w)))
++			}
++		}
++	}
++	for _, k := range sortedKeys(b) {
++		if _, ok := a[k]; !ok && !isUnspecified(b[k]) {
++			parts = append(parts, fmt.Sprintf("%s = (none), want %s", k, cut(b[k])))
++		}
++	}
++	return strings.Join(parts, "; ")
++}
++
++// shapeBy names the recorded bug whose shape the case has, from the model alone: none when
++// every switch leaves the model unchanged; else the first bug in bug order whose switch alone
++// moves the model from the documented values ("sufficiency"), else the first whose switch is
++// needed by the full set ("necessity"), else a hole ("archives/?", a defect of the model).
++// The order matters where two shapes meet: sufficiency in bug order names the lower id.
++func shapeBy[T any](c T, expected func(T, known) checks) (string, string) {
++	none, all := expected(c, hzKnownNone), expected(c, hzKnownAll)
++	if sameChecks(none, all) {
++		return "", ""
++	}
++	for _, i := range hzKnownRead {
++		if !sameChecks(expected(c, hzKnownOnly(i)), none) {
++			return hzKnownID(i), "sufficiency"
++		}
++	}
++	for _, i := range hzKnownRead {
++		if !sameChecks(expected(c, hzKnownAllBut(i)), all) {
++			return hzKnownID(i), "necessity"
++		}
++	}
++	return "archives/?", "hole"
++}
++
++// shapeID is the shape alone (the narrow properties' filters).
++func shapeID[T any](c T, expected func(T, known) checks) string {
++	id, _ := shapeBy(c, expected)
++	return id
++}
++
++// classify names the shape of the case and counts the classifier's rule; in collect mode
++// also every switch that alone moves the model ("sufficient archives/N": the overlaps).
++func classify[T any](c T, expected func(T, known) checks) string {
++	shape, rule := shapeBy(c, expected)
++	if rule != "" {
++		hzTally("shape via " + rule)
++		if rule != "sufficiency" {
++			hzTally("shape via " + rule + " " + shape)
++		}
++		if hzCollecting {
++			none := expected(c, hzKnownNone)
++			var ids []string
++			for _, i := range hzKnownRead {
++				if !sameChecks(expected(c, hzKnownOnly(i)), none) {
++					hzTally("sufficient " + hzKnownID(i))
++					ids = append(ids, hzKnownID(i))
++				}
++			}
++			if len(ids) > 1 {
++				hzTally("sufficient together " + strings.Join(ids, "+"))
++			}
++		}
++	}
++	return shape
++}
++
++// restrict is the library's values for the checks a model states; a check the model states
++// and the library cannot answer stays missing ("(none)").
++func restrict(got, to checks) checks {
++	out := checks{}
++	for k, v := range got {
++		if _, ok := to[k]; ok {
++			out[k] = v
++		}
++	}
++	return out
++}
++
++// classOf is the collector class of a check name: its first word.
++func classOf(name string) string {
++	if i := strings.IndexByte(name, ' '); i > 0 {
++		return name[:i]
++	}
++	return name
++}
++
++// explainer is a case record that explains a failure in its own terms; the verdict appends
++// it.
++type explainer interface {
++	explain(got, want checks) string
++}
++
++// countUnspecified tallies the checks the model leaves open in want.
++func countUnspecified(want checks) {
++	for k, v := range want {
++		if isUnspecified(v) {
++			hzTally("unspecified check " + classOf(k))
++		}
++	}
++}
++
++// verdict judges the library's values against the documented ones (one failure listing every
++// differing check, classed by the first, naming the shape) after counting, on a shaped case,
++// whether the replica (every switch on) agrees with the library.
++func verdict[T any](j *hzCaseJudge, c T, got, want checks, shape string, expected func(T, known) checks) {
++	countUnspecified(want)
++	if shape != "" {
++		if replica := expected(c, hzKnownAll); agreeChecks(restrict(got, replica), replica) {
++			hzTally("replica agreement")
++		} else {
++			hzTally("replica disagreement")
++			j.col.observe("replica disagreement", "%s for\n%#v", diffChecks(restrict(got, replica), replica), c)
++		}
++	}
++	got = restrict(got, want)
++	if agreeChecks(got, want) {
++		if shape != "" {
++			// named by the classifier but passing: the replica's values differ from the
++			// documented ones on checks where the library's one value is in both, or where
++			// the documented value is open
++			hzTally("shaped pass")
++			j.col.observe("shaped pass", "%s against %s for\n%#v", diffChecks(expected(c, hzKnownAll), want), shape, c)
++		}
++		return
++	}
++	class := ""
++	for _, k := range sortedKeys(want) {
++		if g, ok := got[k]; !ok || !agreeValue(k, g, want[k]) {
++			class = k
++			break
++		}
++	}
++	if class == "" {
++		for _, k := range sortedKeys(got) {
++			if _, ok := want[k]; !ok {
++				class = k
++				break
++			}
++		}
++	}
++	more := ""
++	if e, ok := any(c).(explainer); ok {
++		more = e.explain(got, want)
++	}
++	j.Fail(classOf(class), "%s for\n%#v%s", diffChecks(got, want), c, more)
++}
++
++// memoized is expected remembering its statements by switch set for one case (the
++// classifier and the verdict ask for the documented and the full replica statements more
++// than once; a known value is a comparable array).
++func memoized[T any](expected func(T, known) checks) func(T, known) checks {
++	memo := map[known]checks{}
++	return func(c T, k known) checks {
++		if out, ok := memo[k]; ok {
++			return out
++		}
++		out := expected(c, k)
++		memo[k] = out
++		return out
++	}
++}
++
++// judgeBy is the judge of a family: the shape first, from the case alone (the classifier
++// runs the model per switch BEFORE the library is called: under HEGEL_NO_KNOWN=1 a shaped
++// case the generators let through is skipped without a library call), then the library. The
++// models here are cheap, so the classifier runs on every case. The case is passed by
++// pointer: actual may record on it what the library left (the explanation of a failure).
++func judgeBy[T any](j *hzCaseJudge, c *T, expected func(T, known) checks, actual func(*T) checks) {
++	expected = memoized(expected)
++	want := expected(*c, hzKnownNone)
++	shape := classify(*c, expected)
++	j.Shape(shape)
++	got := actual(c)
++	verdict(j, *c, got, want, shape, expected)
++}
++
++// droppedChecks is the set of checks the switches ids change on their own: the checks on
++// which expected(c, only id) differs from expected(c, none), by name, with the first id that
++// changes it.
++func droppedChecks[T any](c T, expected func(T, known) checks, ids []int) map[string]int {
++	none := expected(c, hzKnownNone)
++	out := map[string]int{}
++	for _, i := range ids {
++		only := expected(c, hzKnownOnly(i))
++		for name, v := range none {
++			if w, ok := only[name]; !ok || w != v {
++				if _, done := out[name]; !done {
++					out[name] = i
++				}
++			}
++		}
++		for name := range only {
++			if _, ok := none[name]; !ok {
++				if _, done := out[name]; !done {
++					out[name] = i
++				}
++			}
++		}
++	}
++	return out
++}
++
++// pastSwitches is the model over the checks the switches ids do not change on their own (the
++// restricted check set): a wide property's view under HEGEL_NO_KNOWN=1 where a shape's checks
++// are dropped rather than the case skipped, and a narrow property's view where another bug's
++// checks are left out so that the property is judged on its own bug.
++func pastSwitches[T any](expected func(T, known) checks, ids []int) func(T, known) checks {
++	return func(c T, k known) checks {
++		drop := droppedChecks(c, expected, ids)
++		out := checks{}
++		for name, v := range expected(c, k) {
++			if _, gone := drop[name]; !gone {
++				out[name] = v
++			}
++		}
++		return out
++	}
++}
++
++// judgeByDropping is judgeBy for a family whose shapes are some checks of a case rather than
++// the whole case (the go/orb ... go/gronx form): by default the shape is named and every
++// check judged; under HEGEL_NO_KNOWN=1 the checks the switches drops change on their own
++// (droppedChecks) are dropped from the case (hzCaseJudge.Dropped, counted "dropped
++// archives/N" per switch and "dropped check <name>"), the rest classified again and judged,
++// the case not skipped unless a shape remains.
++func judgeByDropping[T any](j *hzCaseJudge, c *T, expected func(T, known) checks, actual func(*T) checks, drops []int) {
++	expected = memoized(expected)
++	want := expected(*c, hzKnownNone)
++	if hzNoKnown {
++		drop := droppedChecks(*c, expected, drops)
++		if len(drop) > 0 {
++			seen := map[int]bool{}
++			for name, i := range drop {
++				if !seen[i] {
++					seen[i] = true
++					j.Dropped(hzKnownID(i))
++				}
++				hzTally("dropped check " + classOf(name))
++				delete(want, name)
++			}
++			hzTally("dropped case")
++		}
++		past := memoized(pastSwitches(expected, drops))
++		shape := classify(*c, past)
++		j.Shape(shape)
++		got := actual(c)
++		verdict(j, *c, got, want, shape, past)
++		return
++	}
++	shape := classify(*c, expected)
++	j.Shape(shape)
++	got := actual(c)
++	verdict(j, *c, got, want, shape, expected)
++}
++
++// regionOf is the cases of the region of the recorded bug id, by the classifier: by default
++// only the cases with that shape, under HEGEL_NO_KNOWN=1 only the cases with none (the
++// rejections are counted as "filtered <id>"); the narrow properties' filter. The classifier
++// runs the model only (no library call), so a rejected draw costs a few model runs. The
++// rejections are also counted by the shape the case had ("filtered <id> as <shape>", "as
++// none" for no shape), which says what the surroundings bring in.
++func regionOf[T any](id string, expected func(T, known) checks, cases hegel.Generator[T]) hegel.Generator[T] {
++	want := hzShaped(id, "")
++	return hzOnly(true, id, cases, func(c T) bool {
++		got := shapeID(c, expected)
++		if got == want {
++			return true
++		}
++		if got == "" {
++			got = "none"
++		}
++		hzTally("filtered " + id + " as " + got)
++		return false
++	})
++}
++
++// withoutShapes is the cases of g with no shape by the classifier under HEGEL_NO_KNOWN=1
++// (each rejection counted "filtered archives/N" by the shape it had), g itself otherwise: a
++// wide property's filter, after the shapes a weight of zero has switched off.
++func withoutShapes[T any](expected func(T, known) checks, g hegel.Generator[T]) hegel.Generator[T] {
++	if !hzNoKnown {
++		return g
++	}
++	return hegel.Filter(g, func(c T) bool {
++		id := shapeID(c, expected)
++		if id != "" {
++			hzTally("filtered " + id)
++		}
++		return id == ""
++	})
++}
++
++// hzCall runs a library call and returns what it panicked with (nil when it returned): the
++// properties turn it into the check value "panic".
++func hzCall(f func()) (panicked any) {
++	defer func() {
++		if r := recover(); r != nil {
++			panicked = r
++		}
++	}()
++	f()
++	return nil
 +}
 diff --git a/hegel/hegel_zoo_pins_test.go b/hegel/hegel_zoo_pins_test.go
 new file mode 100644
@@ -1188,432 +4506,24 @@ index 0000000..c01ad2b
 +}
 diff --git a/hegel/hegel_zoo_props2_test.go b/hegel/hegel_zoo_props2_test.go
 new file mode 100644
-index 0000000..96a2ae8
+index 0000000..ea8e76a
 --- /dev/null
 +++ b/hegel/hegel_zoo_props2_test.go
-@@ -0,0 +1,1060 @@
+@@ -0,0 +1,411 @@
 +package hegel
 +
 +import (
 +	"bytes"
-+	"fmt"
 +	"io"
-+	"io/fs"
-+	"os"
 +	"os/exec"
 +	"path"
 +	"path/filepath"
-+	"sort"
 +	"strings"
-+	"sync"
 +	"testing"
-+	"time"
 +
 +	"github.com/mholt/archives"
 +	"hegel.dev/go/hegel"
 +)
-+
-+// --------------------------------------------------------------------------- FilesFromFS / FilesFromDisk
-+
-+// hzMapping is one key/value of the filenames map, in fs terms (key relative to the tree's
-+// root, "." for the root itself).
-+type hzMapping struct {
-+	key   string // a tree path or ".", possibly with a trailing slash
-+	value string
-+}
-+
-+// hzExpectNames applies the documented rules of FilesFromDisk/FilesFromFS to the tree: the
-+// names in the archive of every entry the mapping gathers (the key's file, or the key's
-+// directory and everything under it), by tree path.
-+func hzExpectNames(tree *hzTree, m hzMapping, rootBase string) map[string]string {
-+	out := map[string]string{}
-+	trailing := strings.HasSuffix(m.key, "/")
-+	k := strings.TrimSuffix(m.key, "/")
-+	base := path.Base(k)
-+	if k == "." {
-+		base = rootBase
-+	}
-+	root := m.value
-+	switch {
-+	case trailing:
-+		// "map keys that end in a separator will enumerate contents only, without adding the
-+		// folder itself to the archive"
-+		if root == "." {
-+			root = ""
-+		}
-+	case root == "":
-+		// "map values that are empty string are interpreted as the base name of the file (sans
-+		// path) in the root of the archive"
-+		root = base
-+	case root == ".":
-+		root = ""
-+	case strings.HasSuffix(root, "/"):
-+		// "map values that end in a slash will use the base name of the file in that folder"
-+		root += base
-+	}
-+	if k == "." && !trailing && root != "" {
-+		out["."] = path.Clean(root) // the root directory itself, under the name given
-+	}
-+	for _, e := range tree.entries {
-+		var rel string
-+		switch {
-+		case k == ".":
-+			rel = e.path
-+		case e.path == k:
-+			rel = ""
-+		case strings.HasPrefix(e.path, k+"/"):
-+			rel = e.path[len(k)+1:]
-+		default:
-+			continue
-+		}
-+		if rel == "" && (trailing || root == "") {
-+			continue // the directory itself is not added
-+		}
-+		out[e.path] = path.Join(root, rel)
-+	}
-+	return out
-+}
-+
-+// TestHegelFilesFrom: FilesFromFS on the tree as a fstest.MapFS and FilesFromDisk on the same
-+// tree written to disk gather the entries the documentation describes for the filenames map:
-+// the names in the archive, the kinds, the link targets, contents, permissions and times,
-+// with and without ClearAttributes; with FollowSymlinks the links to files become the files.
-+func TestHegelFilesFrom(t *testing.T) {
-+	c := hzNewCollector(t)
-+	tmp, err := os.MkdirTemp("", "hz-archives-")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Cleanup(func() { hzRestoreDisk(tmp); os.RemoveAll(tmp) })
-+	n := 0
-+	hzProperty(t, func(ht *hegel.T) {
-+		tree := hzGenTree(ht, 8)
-+		n++
-+		dir := filepath.Join(tmp, fmt.Sprintf("t%d", n))
-+		if err := os.Mkdir(dir, 0o700); err != nil {
-+			ht.Fatalf("mkdir: %v", err)
-+		}
-+		defer func() { hzRestoreDisk(dir); os.RemoveAll(dir) }()
-+		if err := hzWriteDisk(tree, dir); err != nil {
-+			ht.Fatalf("writing the tree: %v", err)
-+		}
-+		mfs := hzMapFS(tree)
-+
-+		// the mapping: one key, a directory or a file of the tree or the root
-+		var m hzMapping
-+		var candidates []string
-+		for _, e := range tree.entries {
-+			if e.kind != 'l' {
-+				candidates = append(candidates, e.path)
-+			}
-+		}
-+		if len(candidates) == 0 || hzChance(ht, 25) {
-+			m.key = "."
-+		} else {
-+			m.key = hzPick(ht, candidates)
-+		}
-+		isDirKey := m.key == "." || tree.get(m.key).kind == 'd'
-+		if isDirKey && m.key != "." && hzChance(ht, 30) {
-+			m.key += "/"
-+		}
-+		m.value = hzPick(ht, []string{"", "", ".", "x", "x/", "x/y", "x/y/"})
-+		if !isDirKey && m.value == "." {
-+			m.value = "" // a file with an empty name in the archive is unspecified
-+		}
-+		if strings.HasSuffix(m.key, "/") && strings.HasSuffix(m.value, "/") {
-+			m.value = "x" // contents only, into a folder named for the directory: unspecified
-+		}
-+		follow := hzChance(ht, 30)
-+		clear := hzChance(ht, 30)
-+		c.count(fmt.Sprintf("key %s value %q follow=%v", hzKeyKind(m.key), m.value, follow))
-+
-+		wantFS := hzExpectNames(tree, m, "")
-+		wantDisk := hzExpectNames(tree, m, filepath.Base(dir))
-+		want := wantFS
-+		// with FollowSymlinks, the links: to a regular file, the file under the link's name; to
-+		// a directory, that directory and its contents under the link's name; otherwise an error
-+		wantErr := false
-+		if follow {
-+			loop := false
-+			for p := range want {
-+				e := tree.get(p)
-+				if e == nil || e.kind != 'l' {
-+					continue
-+				}
-+				target := hzResolve(p, e.link)
-+				te := (*hzEntry)(nil)
-+				if target != "" {
-+					te = tree.get(target)
-+				}
-+				if te == nil {
-+					wantErr = true // and go on: a loop elsewhere must still be seen
-+					continue
-+				}
-+				if te.kind == 'd' {
-+					switch hzExpandDirLink(tree, target, p, wantFS, wantDisk, 0) {
-+					case hzExpandDangling:
-+						wantErr = true
-+					case hzExpandLoop:
-+						loop = true
-+					}
-+				}
-+			}
-+			if loop && HZKnown.followAncestorLinkHang {
-+				hzAvoid("followAncestorLinkHang")
-+				return
-+			}
-+			if loop {
-+				// the switch is off: the call does not return; report it after three seconds
-+				// (once per run: the runaway recursion keeps its goroutine)
-+				hzHangMu.Lock()
-+				seen := hzHangSeen
-+				hzHangSeen = true
-+				hzHangMu.Unlock()
-+				if seen {
-+					c.count("follow: loop skipped")
-+					return
-+				}
-+				done := make(chan error, 1)
-+				go func() {
-+					_, err := archives.FilesFromDisk(hzCtx, &archives.FromDiskOptions{FollowSymlinks: follow}, map[string]string{dir: ""})
-+					done <- err
-+				}()
-+				select {
-+				case <-done:
-+					c.count("follow: loop returned")
-+				case <-time.After(3 * time.Second):
-+					c.failClass(ht, "hang", "disk key %q follow=true: FilesFromDisk did not return within 3s on a link to an ancestor directory\n%s", dir, hzTreeString(tree))
-+				}
-+				return
-+			}
-+		}
-+
-+		for _, side := range []string{"fs", "disk"} {
-+			var files []archives.FileInfo
-+			var err error
-+			want := wantFS
-+			if side == "disk" {
-+				want = wantDisk
-+			}
-+			if strings.HasSuffix(m.key, "/") && m.value != "" && HZKnown.fsTrailingKeyValue {
-+				hzAvoid("fsTrailingKeyValue")
-+				continue
-+			}
-+			if !strings.HasSuffix(m.key, "/") && m.value == "." && HZKnown.fsRootDotLeadingSlash {
-+				hzAvoid("fsRootDotLeadingSlash")
-+				continue
-+			}
-+			if side == "fs" {
-+				if strings.HasSuffix(m.key, "/") && HZKnown.fsTrailingSlashKey {
-+					hzAvoid("fsTrailingSlashKey")
-+					continue
-+				}
-+				if follow && HZKnown.fsFollowSymlinkRelative && hzHasRelativeLinkInSubdir(tree, want) {
-+					hzAvoid("fsFollowSymlinkRelative")
-+					continue
-+				}
-+				if follow && HZKnown.fsFollowDirLink && hzHasDirLink(tree, want) {
-+					hzAvoid("fsFollowDirLink")
-+					continue
-+				}
-+				files, err = archives.FilesFromFS(hzCtx, mfs, &archives.FromFSOptions{FollowSymlinks: follow, ClearAttributes: clear}, map[string]string{m.key: m.value})
-+			} else {
-+				key := filepath.Join(dir, filepath.FromSlash(strings.TrimSuffix(m.key, "/")))
-+				if strings.HasSuffix(m.key, "/") {
-+					key += string(filepath.Separator)
-+				}
-+				files, err = archives.FilesFromDisk(hzCtx, &archives.FromDiskOptions{FollowSymlinks: follow, ClearAttributes: clear}, map[string]string{key: m.value})
-+			}
-+			where := fmt.Sprintf("%s key %q value %q follow=%v clear=%v", side, m.key, m.value, follow, clear)
-+			if wantErr {
-+				if err == nil {
-+					c.failClass(ht, "follow no error", "%s: a dangling link followed, no error; names %v\n%s", where, hzFileNames(files), hzTreeString(tree))
-+				} else {
-+					c.count("follow: dangling link error")
-+				}
-+				continue
-+			}
-+			if err != nil {
-+				c.failClass(ht, "error "+side, "%s: %v\n%s", where, err, hzTreeString(tree))
-+				continue
-+			}
-+			// names: the gathered set equals the model's
-+			got := map[string]archives.FileInfo{}
-+			var gotNames []string
-+			for _, f := range files {
-+				got[f.NameInArchive] = f
-+				gotNames = append(gotNames, f.NameInArchive)
-+			}
-+			var wantNames []string
-+			byName := map[string]string{} // archive name -> tree path
-+			for p, name := range want {
-+				wantNames = append(wantNames, name)
-+				byName[name] = p
-+			}
-+			sort.Strings(gotNames)
-+			sort.Strings(wantNames)
-+			if strings.Join(gotNames, "\n") != strings.Join(wantNames, "\n") {
-+				c.failClass(ht, "names "+side, "%s:\n got  %q\n want %q\n%s", where, gotNames, wantNames, hzTreeString(tree))
-+				continue
-+			}
-+			for name, f := range got {
-+				p := byName[name]
-+				e := tree.get(p)
-+				if e == nil {
-+					// the root itself, or a path under a followed directory link
-+					continue
-+				}
-+				kind := e.kind
-+				var content []byte
-+				link := e.link
-+				if kind == 'l' && follow {
-+					te := tree.get(hzResolve(p, e.link))
-+					kind = te.kind
-+					content = te.data
-+					link = ""
-+				}
-+				if kind == 'f' {
-+					content = tree.get(p).data
-+					if e.kind == 'l' {
-+						content = tree.get(hzResolve(p, e.link)).data
-+					}
-+				}
-+				w := fmt.Sprintf("%s entry %q (%s)", where, name, p)
-+				switch {
-+				case kind == 'd' && !f.IsDir():
-+					c.failClass(ht, "kind "+side, "%s: a directory, gathered as %v", w, f.Mode())
-+				case kind == 'f' && (f.IsDir() || f.Mode()&fs.ModeSymlink != 0):
-+					c.failClass(ht, "kind "+side, "%s: a file, gathered as %v", w, f.Mode())
-+				case kind == 'l' && f.Mode()&fs.ModeSymlink == 0:
-+					c.failClass(ht, "kind "+side, "%s: a link, gathered as %v", w, f.Mode())
-+				}
-+				if f.LinkTarget != link {
-+					c.failClass(ht, "link "+side, "%s: LinkTarget %q, want %q", w, f.LinkTarget, link)
-+				}
-+				if kind == 'f' {
-+					r, err := f.Open()
-+					if err != nil {
-+						c.failClass(ht, "open "+side, "%s: Open: %v", w, err)
-+					} else {
-+						b, _ := io.ReadAll(r)
-+						r.Close()
-+						if !bytes.Equal(b, content) {
-+							c.failClass(ht, "content "+side, "%s: %d bytes, want %d", w, len(b), len(content))
-+						}
-+					}
-+					if f.Size() != int64(len(content)) {
-+						c.failClass(ht, "size "+side, "%s: Size %d, want %d", w, f.Size(), len(content))
-+					}
-+				}
-+				if kind != 'l' {
-+					me := e
-+					if e.kind == 'l' {
-+						me = tree.get(hzResolve(p, e.link))
-+					}
-+					if f.Mode().Perm() != me.mode {
-+						c.failClass(ht, "mode "+side, "%s: mode %v, want %v", w, f.Mode().Perm(), me.mode)
-+					}
-+					if clear {
-+						if !f.ModTime().IsZero() || f.Sys() != nil {
-+							c.failClass(ht, "clear "+side, "%s: ClearAttributes left ModTime %v Sys %v", w, f.ModTime(), f.Sys())
-+						}
-+					} else if !f.ModTime().Equal(me.mtime) {
-+						c.failClass(ht, "mtime "+side, "%s: ModTime %v, want %v", w, f.ModTime(), me.mtime)
-+					}
-+				}
-+			}
-+		}
-+	})
-+}
-+
-+func hzKeyKind(key string) string {
-+	switch {
-+	case key == ".":
-+		return "root"
-+	case strings.HasSuffix(key, "/"):
-+		return "dir/"
-+	default:
-+		return "path"
-+	}
-+}
-+
-+const (
-+	hzExpandOK       = iota
-+	hzExpandDangling // a link inside the followed directory has no target
-+	hzExpandLoop     // a link inside leads back to an ancestor directory (the expansion has no end)
-+)
-+
-+// hzHangSeen: a hang has been reported in this run (the property reports it once).
-+var (
-+	hzHangMu   sync.Mutex
-+	hzHangSeen bool
-+)
-+
-+// hzExpandDirLink adds, under the link p (a directory link with target), the followed contents
-+// of the target: every entry below it under the link's name, and links to directories inside
-+// expanded in turn. A tree of n entries has no legitimate nesting deeper than n.
-+func hzExpandDirLink(tree *hzTree, target, p string, wantFS, wantDisk map[string]string, depth int) int {
-+	if depth > len(tree.entries) {
-+		return hzExpandLoop
-+	}
-+	result := hzExpandOK
-+	for _, sub := range tree.entries {
-+		if !strings.HasPrefix(sub.path, target+"/") {
-+			continue
-+		}
-+		rest := sub.path[len(target)+1:]
-+		wantFS[p+"/"+rest] = wantFS[p] + "/" + rest
-+		wantDisk[p+"/"+rest] = wantDisk[p] + "/" + rest
-+		if sub.kind != 'l' {
-+			continue
-+		}
-+		t2 := hzResolve(sub.path, sub.link)
-+		te := (*hzEntry)(nil)
-+		if t2 != "" {
-+			te = tree.get(t2)
-+		}
-+		if te == nil {
-+			if result == hzExpandOK {
-+				result = hzExpandDangling
-+			}
-+			continue
-+		}
-+		if te.kind == 'd' {
-+			if r := hzExpandDirLink(tree, t2, p+"/"+rest, wantFS, wantDisk, depth+1); r == hzExpandLoop {
-+				return hzExpandLoop
-+			} else if r == hzExpandDangling && result == hzExpandOK {
-+				result = hzExpandDangling
-+			}
-+		}
-+	}
-+	return result
-+}
-+
-+// hzHasDirLink reports whether a gathered link points at a directory of the tree.
-+func hzHasDirLink(tree *hzTree, want map[string]string) bool {
-+	for p := range want {
-+		e := tree.get(p)
-+		if e == nil || e.kind != 'l' {
-+			continue
-+		}
-+		if te := tree.get(hzResolve(p, e.link)); te != nil && te.kind == 'd' {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+// hzHasRelativeLinkInSubdir reports whether a gathered link, in a subdirectory, has a relative
-+// target (the shape FilesFromFS resolves from the root instead of the link's directory).
-+func hzHasRelativeLinkInSubdir(tree *hzTree, want map[string]string) bool {
-+	for p := range want {
-+		e := tree.get(p)
-+		if e != nil && e.kind == 'l' && !strings.HasPrefix(e.link, "/") && strings.Contains(p, "/") {
-+			return true
-+		}
-+	}
-+	return false
-+}
 +
 +// --------------------------------------------------------------------------- Identify
 +
@@ -1659,12 +4569,12 @@ index 0000000..96a2ae8
 +// and returns the stream unread whatever it decides; the same input always gives the same
 +// answer; nothing panics on arbitrary bytes.
 +func TestHegelIdentify(t *testing.T) {
-+	c := hzNewCollector(t)
-+	hzProperty(t, func(ht *hegel.T) {
++	c := hzOldNewCollector(t)
++	hzOldProperty(t, func(ht *hegel.T) {
 +		// the content
 +		var data []byte
 +		var wantExt string // by stream
-+		switch hzDrawInt(ht, 0, 5) {
++		switch hzOldDrawInt(ht, 0, 5) {
 +		case 0:
 +			data = hegel.Draw(ht, hegel.Binary(0, 64))
 +			wantExt = "?"
@@ -1676,7 +4586,7 @@ index 0000000..96a2ae8
 +			files := hzMust(archives.FilesFromFS(hzCtx, hzMapFS(tree), nil, nil))
 +			archival := hzArchival(ht)
 +			var format archives.Format = archival
-+			if _, isTar := archival.(archives.Tar); isTar && hzChance(ht, 50) {
++			if _, isTar := archival.(archives.Tar); isTar && hzOldChance(ht, 50) {
 +				comp := hzCompression(ht)
 +				format = archives.CompressedArchive{Archival: archival, Extraction: archival, Compression: comp}
 +			}
@@ -1717,7 +4627,7 @@ index 0000000..96a2ae8
 +			w.Write(hzData(ht))
 +			w.Close()
 +			data = buf.Bytes()
-+			if n := hzDrawInt(ht, 0, 12); n < len(data) {
++			if n := hzOldDrawInt(ht, 0, 12); n < len(data) {
 +				data = data[:n]
 +			}
 +			if _, isLzip := comp.(archives.Lzip); isLzip && len(data) >= 6 && HZKnown.identifyLzipTruncatedPanic {
@@ -1728,7 +4638,7 @@ index 0000000..96a2ae8
 +		}
 +		// the name
 +		var name string
-+		switch hzDrawInt(ht, 0, 5) {
++		switch hzOldDrawInt(ht, 0, 5) {
 +		case 0:
 +			name = ""
 +		case 1:
@@ -1737,13 +4647,13 @@ index 0000000..96a2ae8
 +				name = "x.bin"
 +			}
 +		case 2:
-+			name = hzPick(ht, []string{"x.txt", "noext", "x.bak", "dir/x.dat", "x.tgz", "x.tbz2", "x.TAR.GZ", ".tar", "x.tar.txt", "x.tar.gz.bak"})
++			name = hzOldPick(ht, []string{"x.txt", "noext", "x.bak", "dir/x.dat", "x.tgz", "x.tbz2", "x.TAR.GZ", ".tar", "x.tar.txt", "x.tar.gz.bak"})
 +		case 3:
-+			name = "x" + hzPick(ht, hzCompressionExts)
++			name = "x" + hzOldPick(ht, hzCompressionExts)
 +		case 4:
-+			name = "x" + hzPick(ht, []string{".zip", ".tar", ".7z", ".rar", ".tar.gz", ".tar.zst", ".zip.gz"})
++			name = "x" + hzOldPick(ht, []string{".zip", ".tar", ".7z", ".rar", ".tar.gz", ".tar.zst", ".zip.gz"})
 +		default:
-+			name = hzPick(ht, []string{"X.ZIP", "x.Tar", "a/b/x.tar.bz2", "x.s2", "x.tar.s2"})
++			name = hzOldPick(ht, []string{"X.ZIP", "x.Tar", "a/b/x.tar.bz2", "x.s2", "x.tar.s2"})
 +		}
 +		byName := hzIdentifyByName(name)
 +		c.count("content " + wantExt)
@@ -1848,247 +4758,6 @@ index 0000000..96a2ae8
 +	return s
 +}
 +
-+// --------------------------------------------------------------------------- DeepFS
-+
-+var hzArchiveExts = []string{".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.zst", ".tar.lz4", ".tar.xz", ".tar.sz", ".tar.lz"}
-+
-+// hzFormatForExt is the format that writes an archive with that extension.
-+func hzFormatForExt(ext string) archives.Format {
-+	switch ext {
-+	case ".zip":
-+		return archives.Zip{}
-+	case ".tar":
-+		return archives.Tar{}
-+	}
-+	var comp archives.Compression
-+	switch ext {
-+	case ".tgz", ".tar.gz":
-+		comp = archives.Gz{}
-+	case ".tar.bz2":
-+		comp = archives.Bz2{}
-+	case ".tar.zst":
-+		comp = archives.Zstd{}
-+	case ".tar.lz4":
-+		comp = archives.Lz4{}
-+	case ".tar.xz":
-+		comp = archives.Xz{}
-+	case ".tar.sz":
-+		comp = archives.Sz{}
-+	case ".tar.lz":
-+		comp = archives.Lzip{}
-+	}
-+	return archives.CompressedArchive{Archival: archives.Tar{}, Extraction: archives.Tar{}, Compression: comp}
-+}
-+
-+// hzSplitPathModel: the first path segment (case-insensitively, trailing spaces trimmed) that
-+// ends with an archive extension splits the path.
-+func hzSplitPathModel(p string) (string, string) {
-+	segs := strings.Split(p, "/")
-+	for i, s := range segs {
-+		if archives.PathIsArchive(strings.TrimRight(strings.ToLower(s), " ")) {
-+			real := filepath.Clean(filepath.FromSlash(strings.Join(segs[:i+1], "/")))
-+			inner := strings.Join(segs[i+1:], "/")
-+			if inner == "" && i == len(segs)-1 {
-+				inner = "." // "precisely an archive file": the root of the archive
-+			}
-+			return real, inner
-+		}
-+	}
-+	return filepath.Clean(filepath.FromSlash(p)), ""
-+}
-+
-+// TestHegelDeepFS: a directory on disk holding files, directories, links and archives written
-+// by the package (every archive extension DeepFS recognises) walks, through DeepFS, as the
-+// disk tree with every archive replaced by a directory of its entries; the files inside read
-+// as their contents. SplitPath splits at the first archive extension; PathContainsArchive
-+// agrees with PathIsArchive on the path's segments.
-+func TestHegelDeepFS(t *testing.T) {
-+	c := hzNewCollector(t)
-+	tmp, err := os.MkdirTemp("", "hz-archives-deep-")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Cleanup(func() { hzRestoreDisk(tmp); os.RemoveAll(tmp) })
-+	n := 0
-+	hzProperty(t, func(ht *hegel.T) {
-+		tree := hzGenTree(ht, 6)
-+		n++
-+		dir := filepath.Join(tmp, fmt.Sprintf("t%d", n))
-+		if err := os.Mkdir(dir, 0o700); err != nil {
-+			ht.Fatalf("mkdir: %v", err)
-+		}
-+		defer func() { hzRestoreDisk(dir); os.RemoveAll(dir) }()
-+		// directories writable: DeepFS opens them. Files and links named like archives are
-+		// archives to DeepFS by its documentation, so they are renamed; directories named like
-+		// archives stay unless the recorded bug is avoided. An entry's name on disk is built
-+		// from its parent's (parents come first), so nested renames compose at any depth.
-+		onDisk := map[string]string{} // tree path -> path on disk
-+		for i := range tree.entries {
-+			e := &tree.entries[i]
-+			if e.kind == 'd' {
-+				e.mode |= 0o700
-+			}
-+			orig := e.path
-+			if parent, ok := onDisk[path.Dir(orig)]; ok {
-+				e.path = parent + "/" + path.Base(orig)
-+			}
-+			if archives.PathIsArchive(e.path) && (e.kind != 'd' || HZKnown.deepFSDirNamedArchive) {
-+				if e.kind == 'd' {
-+					hzAvoid("deepFSDirNamedArchive")
-+				}
-+				e.path += "_"
-+			}
-+			onDisk[orig] = e.path
-+		}
-+		tree.byPath = nil
-+		for i, e := range tree.entries {
-+			if tree.byPath == nil {
-+				tree.byPath = map[string]int{}
-+			}
-+			tree.byPath[e.path] = i
-+		}
-+		if err := hzWriteDisk(tree, dir); err != nil {
-+			ht.Fatalf("writing the tree: %v", err)
-+		}
-+		// the model of the walk: path -> isDir
-+		model := map[string]bool{}
-+		content := map[string][]byte{}
-+		for _, e := range tree.entries {
-+			model[e.path] = e.kind == 'd'
-+			if e.kind == 'f' {
-+				content[e.path] = e.data
-+			}
-+		}
-+		// archives, in the root or in a directory
-+		na := hzDrawInt(ht, 0, 3)
-+		for i := 0; i < na; i++ {
-+			ext := hzPick(ht, hzArchiveExts)
-+			parent := ""
-+			if ds := tree.dirs(); len(ds) > 0 && hzChance(ht, 50) {
-+				parent = hzPick(ht, ds)
-+			}
-+			name := hzPick(ht, []string{"arc", "ARC", "a b", "x.y"}) + ext
-+			if hzChance(ht, 20) {
-+				name = strings.ToUpper(name)
-+			}
-+			p := name
-+			if parent != "" {
-+				p = parent + "/" + name
-+			}
-+			if _, exists := model[p]; exists {
-+				continue
-+			}
-+			inner := hzGenTree(ht, 5)
-+			if len(inner.entries) == 0 {
-+				// an empty tar is not identified as one, and an empty archive would then list itself
-+				inner.add(hzEntry{path: "only", kind: 'f', data: []byte("x"), mode: 0o644, mtime: hzTime(ht)})
-+			}
-+			files := hzMust(archives.FilesFromFS(hzCtx, hzMapFS(inner), nil, nil))
-+			format := hzFormatForExt(strings.ToLower(ext))
-+			var buf bytes.Buffer
-+			if err := format.(archives.Archiver).Archive(hzCtx, &buf, files); err != nil {
-+				ht.Fatalf("archive: %v", err)
-+			}
-+			if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(p)), buf.Bytes(), 0o644); err != nil {
-+				ht.Fatalf("write archive: %v", err)
-+			}
-+			model[p] = true
-+			for _, e := range inner.entries {
-+				model[p+"/"+e.path] = e.kind == 'd'
-+				if e.kind == 'f' {
-+					content[p+"/"+e.path] = e.data
-+				}
-+			}
-+			c.count("archive " + strings.ToLower(ext))
-+		}
-+
-+		dfs := &archives.DeepFS{Root: dir}
-+		visited := map[string]bool{}
-+		err := fs.WalkDir(dfs, ".", func(p string, d fs.DirEntry, err error) error {
-+			if err != nil {
-+				return fmt.Errorf("at %q: %w", p, err)
-+			}
-+			if p != "." {
-+				visited[p] = d.IsDir()
-+			}
-+			return nil
-+		})
-+		if err != nil {
-+			c.failClass(ht, "walk error", "DeepFS WalkDir: %v\n%s", err, hzModelString(model))
-+			return
-+		}
-+		if fmt.Sprint(hzSortedKeys(visited)) != fmt.Sprint(hzSortedKeys(model)) {
-+			c.failClass(ht, "walk paths", "DeepFS WalkDir visited %q\nmodel %q", hzSortedKeys(visited), hzSortedKeys(model))
-+			return
-+		}
-+		for p, isDir := range model {
-+			if visited[p] != isDir {
-+				c.failClass(ht, "walk kind", "DeepFS WalkDir: %q IsDir %v, model %v", p, visited[p], isDir)
-+			}
-+		}
-+		for p, want := range content {
-+			got, err := fs.ReadFile(dfs, p)
-+			if err != nil {
-+				c.failClass(ht, "readfile error", "DeepFS ReadFile(%q): %v", p, err)
-+			} else if !bytes.Equal(got, want) {
-+				c.failClass(ht, "readfile content", "DeepFS ReadFile(%q): %d bytes, want %d", p, len(got), len(want))
-+			}
-+			info, err := fs.Stat(dfs, p)
-+			if err != nil {
-+				c.failClass(ht, "stat error", "DeepFS Stat(%q): %v", p, err)
-+			} else if info.IsDir() || info.Size() != int64(len(want)) {
-+				c.failClass(ht, "stat", "DeepFS Stat(%q): dir %v size %d, want a file of %d", p, info.IsDir(), info.Size(), len(want))
-+			}
-+		}
-+
-+		// the lexical functions on the model's paths and on made-up ones
-+		var paths []string
-+		for p := range model {
-+			paths = append(paths, p, "/"+p, p+"/", strings.ToUpper(p))
-+		}
-+		paths = append(paths, hzPick(ht, []string{"a.zip/b.tar/c", "a.ZIP/x", "a.tar.gz", "a.tgz/", "/a/b.tar.zst/c/d", "x.zip /y", "a.tar.gzip", ".zip", "a/.tar/b"}))
-+		for _, p := range paths {
-+			real, inner := dfs.SplitPath(p)
-+			wantReal, wantInner := hzSplitPathModel(p)
-+			if first := strings.Split(p, "/")[0]; archives.PathIsArchive(first) && !archives.PathIsArchive(first[1:]) && HZKnown.splitPathFirstSegment {
-+				hzAvoid("splitPathFirstSegment")
-+			} else if real != wantReal || inner != wantInner {
-+				c.failClass(ht, "splitpath", "SplitPath(%q) = %q, %q; model %q, %q", p, real, inner, wantReal, wantInner)
-+			}
-+			any := false
-+			for _, s := range strings.Split(p, "/") {
-+				if archives.PathIsArchive(s) {
-+					any = true
-+				}
-+			}
-+			if archives.PathContainsArchive(p) != any {
-+				if HZKnown.pathContainsArchiveCase && strings.ToLower(p) != p {
-+					hzAvoid("pathContainsArchiveCase")
-+				} else {
-+					c.failClass(ht, "contains", "PathContainsArchive(%q) = %v, but a segment is an archive: %v", p, !any, any)
-+				}
-+			}
-+		}
-+	})
-+}
-+
-+func hzSortedKeys(m map[string]bool) []string {
-+	var ks []string
-+	for k := range m {
-+		ks = append(ks, k)
-+	}
-+	sort.Strings(ks)
-+	return ks
-+}
-+
-+func hzModelString(m map[string]bool) string {
-+	var b strings.Builder
-+	for _, k := range hzSortedKeys(m) {
-+		fmt.Fprintf(&b, "%v %q\n", m[k], k)
-+	}
-+	return b.String()
-+}
-+
 +// --------------------------------------------------------------------------- compression
 +
 +// hzDecompressCommand is the command-line decompressor for a format, when installed.
@@ -2123,8 +4792,8 @@ index 0000000..96a2ae8
 +// the reference command-line tool decodes; a gzip stream of several members reads whole
 +// unless DisableMultistream is set.
 +func TestHegelCompression(t *testing.T) {
-+	c := hzNewCollector(t)
-+	hzProperty(t, func(ht *hegel.T) {
++	c := hzOldNewCollector(t)
++	hzOldProperty(t, func(ht *hegel.T) {
 +		comp := hzCompression(ht)
 +		c.count(hzFormatName(comp))
 +		data := hzData(ht)
@@ -2140,7 +4809,7 @@ index 0000000..96a2ae8
 +		}
 +		// written in pieces
 +		for rest := data; len(rest) > 0; {
-+			n := hzDrawInt(ht, 1, len(rest))
++			n := hzOldDrawInt(ht, 1, len(rest))
 +			if _, err := w.Write(rest[:n]); err != nil {
 +				c.failClass(ht, "write", "%s Write: %v", hzFormatName(comp), err)
 +				return
@@ -2254,7 +4923,7 @@ index 0000000..96a2ae8
 +}
 diff --git a/hegel/hegel_zoo_props_test.go b/hegel/hegel_zoo_props_test.go
 new file mode 100644
-index 0000000..0b00ea7
+index 0000000..b9f0299
 --- /dev/null
 +++ b/hegel/hegel_zoo_props_test.go
 @@ -0,0 +1,898 @@
@@ -2294,11 +4963,11 @@ index 0000000..0b00ea7
 +// names the format from the bytes, and returns them unread; the archive is a file system
 +// (ArchiveFS) that testing/fstest accepts; Python's tarfile/zipfile read the same entries.
 +func TestHegelArchiveRoundTrip(t *testing.T) {
-+	c := hzNewCollector(t)
-+	hzProperty(t, func(ht *hegel.T) {
++	c := hzOldNewCollector(t)
++	hzOldProperty(t, func(ht *hegel.T) {
 +		tree := hzGenTree(ht, 10)
 +		mfs := hzMapFS(tree)
-+		opts := &archives.FromFSOptions{ClearAttributes: hzChance(ht, 30)}
++		opts := &archives.FromFSOptions{ClearAttributes: hzOldChance(ht, 30)}
 +		files, err := archives.FilesFromFS(hzCtx, mfs, opts, nil)
 +		if err != nil {
 +			c.failClass(ht, "FilesFromFS error", "FilesFromFS: %v\n%s", err, hzTreeString(tree))
@@ -2307,7 +4976,7 @@ index 0000000..0b00ea7
 +		archival := hzArchival(ht)
 +		var format archives.Format = archival
 +		var comp archives.Compression
-+		if _, isTar := archival.(archives.Tar); isTar && hzChance(ht, 50) {
++		if _, isTar := archival.(archives.Tar); isTar && hzOldChance(ht, 50) {
 +			comp = hzCompression(ht)
 +			format = archives.CompressedArchive{Archival: archival, Extraction: archival, Compression: comp}
 +		}
@@ -2712,9 +5381,9 @@ index 0000000..0b00ea7
 +// lists the children sorted, missing names are ErrNotExist, Sub roots a subtree, and
 +// testing/fstest accepts it.
 +func TestHegelArchiveFS(t *testing.T) {
-+	c := hzNewCollector(t)
-+	hzProperty(t, func(ht *hegel.T) {
-+		useZip := hzChance(ht, 40)
++	c := hzOldNewCollector(t)
++	hzOldProperty(t, func(ht *hegel.T) {
++		useZip := hzOldChance(ht, 40)
 +		a := hzGenRawArchive(ht, useZip)
 +		var data []byte
 +		var format archives.Extractor
@@ -2723,7 +5392,7 @@ index 0000000..0b00ea7
 +			format = archives.Zip{}
 +			c.count("zip")
 +		} else {
-+			data = a.writeTar(hzPick(ht, []tar.Format{tar.FormatUSTAR, tar.FormatPAX, tar.FormatGNU}))
++			data = a.writeTar(hzOldPick(ht, []tar.Format{tar.FormatUSTAR, tar.FormatPAX, tar.FormatGNU}))
 +			format = archives.Tar{}
 +			c.count("tar")
 +		}
@@ -2892,7 +5561,7 @@ index 0000000..0b00ea7
 +				ds = append(ds, d)
 +			}
 +			sort.Strings(ds)
-+			d := hzPick(ht, ds)
++			d := hzOldPick(ht, ds)
 +			sub, err := fresh().Sub(d)
 +			if err != nil {
 +				c.failClass(ht, "sub error", "Sub(%q): %v\n%s", d, err, desc())
@@ -3023,8 +5692,8 @@ index 0000000..0b00ea7
 +// the archive's own entries (Zip: replacing entries of the same name), and the archive stays
 +// readable.
 +func TestHegelInsert(t *testing.T) {
-+	c := hzNewCollector(t)
-+	hzProperty(t, func(ht *hegel.T) {
++	c := hzOldNewCollector(t)
++	hzOldProperty(t, func(ht *hegel.T) {
 +		base := hzGenTree(ht, 6)
 +		extra := hzGenTree(ht, 4)
 +		baseFiles, err := archives.FilesFromFS(hzCtx, hzMapFS(base), nil, nil)
@@ -3156,12 +5825,422 @@ index 0000000..0b00ea7
 +		}
 +	})
 +}
+diff --git a/hegel/hegel_zoo_shapes_test.go b/hegel/hegel_zoo_shapes_test.go
+new file mode 100644
+index 0000000..99e23bc
+--- /dev/null
++++ b/hegel/hegel_zoo_shapes_test.go
+@@ -0,0 +1,404 @@
++package hegel
++
++// The narrow properties: one per recorded bug of the FilesFrom and DeepFS families, each a
++// generator over the bug's shape region with random surroundings (the ingredient forced; the
++// shapes of the earlier ids it would otherwise be named by excluded: the strict pools), judged
++// by the family's expected function and judge; each fails every run by default with the shape
++// of its bug, and under HEGEL_NO_KNOWN=1 draws the neighbouring region (hzShaped) and passes.
++
++import (
++	"io/fs"
++	"strings"
++	"testing"
++	"time"
++
++	"hegel.dev/go/hegel"
++)
++
++// --------------------------------------------------------------------------- the tree builders
++
++// withEntry is the tree with e added (an entry at the same path replaced in place, and the
++// entries below it dropped when the replacement is not a directory), settled.
++func withEntry(tree []fileEntry, e fileEntry) []fileEntry {
++	out := make([]fileEntry, 0, len(tree)+1)
++	replaced := false
++	for _, x := range tree {
++		switch {
++		case x.Path == e.Path:
++			out = append(out, e)
++			replaced = true
++		case e.Kind != 'd' && strings.HasPrefix(x.Path, e.Path+"/"):
++			continue
++		default:
++			out = append(out, x)
++		}
++	}
++	if !replaced {
++		out = append(out, e)
++	}
++	return settle(out)
++}
++
++// withoutLinks is the tree without its links below the root (the shapes of archives/17 and
++// 27 live there) or, when all, without any link.
++func withoutLinks(tree []fileEntry, all bool) []fileEntry {
++	var out []fileEntry
++	for _, e := range tree {
++		if e.Kind == 'l' && (all || strings.Contains(e.Path, "/")) {
++			continue
++		}
++		out = append(out, e)
++	}
++	return out
++}
++
++// dirsWithChildren is the directories of the tree that hold an entry.
++func dirsWithChildren(tree []fileEntry) []string {
++	var out []string
++	for _, d := range dirsOf(tree) {
++		for _, e := range tree {
++			if strings.HasPrefix(e.Path, d+"/") {
++				out = append(out, d)
++				break
++			}
++		}
++	}
++	return out
++}
++
++// aDir is a directory entry at p with a drawn mode and time; aFile a file entry at p with
++// drawn content, mode and time.
++func aDir(p string) hegel.Generator[fileEntry] {
++	return hegel.FlatMap(dirMode, func(m fs.FileMode) hegel.Generator[fileEntry] {
++		return hegel.Map(entryTime, func(mt time.Time) fileEntry { return fileEntry{Path: p, Kind: 'd', Mode: m, Mtime: mt} })
++	})
++}
++
++func aFile(p string) hegel.Generator[fileEntry] {
++	return hegel.FlatMap(fileData, func(data []byte) hegel.Generator[fileEntry] {
++		return hegel.FlatMap(fileMode, func(m fs.FileMode) hegel.Generator[fileEntry] {
++			return hegel.Map(entryTime, func(mt time.Time) fileEntry { return fileEntry{Path: p, Kind: 'f', Data: data, Mode: m, Mtime: mt} })
++		})
++	})
++}
++
++// aDirIn is the tree with a directory in it: one of its own when it has one, else a new one
++// at the root (a drawn name).
++func aDirIn(tree []fileEntry) hegel.Generator[[]fileEntry] {
++	if len(dirsOf(tree)) > 0 {
++		return hegel.Just(tree)
++	}
++	return hegel.FlatMap(entryName, func(name string) hegel.Generator[[]fileEntry] {
++		return hegel.Map(aDir(name), func(d fileEntry) []fileEntry { return withEntry(tree, d) })
++	})
++}
++
++// freshName is name, or name with ".t" when the tree has an entry of that name at the root
++// or in dir (the target of a link must not replace one).
++func freshName(tree []fileEntry, dir, name, other string) string {
++	if name == other || entryAt(tree, name) != nil || entryAt(tree, dir+"/"+name) != nil {
++		return name + ".t"
++	}
++	return name
++}
++
++// plainValues is the values without "." (the shape of archives/14 with a key that has no
++// trailing slash).
++var plainValues = halvesOver([]int{2, 1, 1, 1, 1}, "", "x", "x/", "x/y", "x/y/")
++
++// caseOf is the case: the value and FollowSymlinks drawn by the generators given, ClearAttributes at 30.
++func caseOf(tree []fileEntry, key string, value hegel.Generator[string], follow hegel.Generator[bool]) hegel.Generator[filesCase] {
++	return hegel.FlatMap(value, func(v string) hegel.Generator[filesCase] {
++		return hegel.FlatMap(follow, func(f bool) hegel.Generator[filesCase] {
++			return hegel.Map(dieCoin(30), func(clear bool) filesCase { return buildFilesCase(tree, key, v, f, clear) })
++		})
++	})
++}
++
++// --------------------------------------------------------------------------- archives/14
++
++// dotValueCases: a key without a trailing slash (the root, or a directory holding an entry)
++// with the value "." (the shape; "" past it), a tree with at least one entry.
++var dotValueCases = regionOf("archives/14", filesExpectedAt, hegel.FlatMap(fileTrees, func(tree []fileEntry) hegel.Generator[filesCase] {
++	filled := hegel.Just(tree)
++	if len(tree) == 0 {
++		filled = hegel.Map(entryAmong(nil), func(e fileEntry) []fileEntry { return settle([]fileEntry{e}) })
++	}
++	return hegel.FlatMap(filled, func(tree []fileEntry) hegel.Generator[filesCase] {
++		keys := append([]string{"."}, dirsWithChildren(tree)...)
++		return hegel.FlatMap(evenHalves(keys...), func(key string) hegel.Generator[filesCase] {
++			return caseOf(tree, key, hegel.Just(hzShaped(".", "")), dieCoin(30))
++		})
++	})
++}))
++
++// TestHegelDotValuesGiveRelativeNames: with the value "." (the root of the archive) on a key
++// without a trailing slash, the entries below the key are named by their path below it;
++// archives/14 gives them a leading slash.
++func TestHegelDotValuesGiveRelativeNames(t *testing.T) {
++	judged(t, dotValueCases, filesJudgeWith(filesRoot(t), filesExpectedAt, nil))
++}
++
++// --------------------------------------------------------------------------- archives/15
++
++// trailingKeyCases: a directory key with a trailing slash (without one past the shape), a
++// value without "." (archives/14 would be named first).
++var trailingKeyCases = regionOf("archives/15", filesExpectedAt, hegel.FlatMap(hegel.FlatMap(fileTrees, aDirIn), func(tree []fileEntry) hegel.Generator[filesCase] {
++	return hegel.FlatMap(evenHalves(dirsOf(tree)...), func(d string) hegel.Generator[filesCase] {
++		return caseOf(tree, d+hzShaped("/", ""), plainValues, dieCoin(30))
++	})
++}))
++
++// TestHegelTrailingSlashKeysEnumerateOnFS: FilesFromFS on a key ending in a slash enumerates
++// the directory's contents as documented; archives/15 fails to open the key.
++func TestHegelTrailingSlashKeysEnumerateOnFS(t *testing.T) {
++	judged(t, trailingKeyCases, filesJudgeWith(filesRoot(t), filesExpectedAt, nil))
++}
++
++// --------------------------------------------------------------------------- archives/16
++
++// pastTrailingSlash is the model without the checks archives/15 changes on its own (the fs
++// side of a trailing key): the disk side's view.
++var pastTrailingSlash = pastSwitches(filesExpectedAt, []int{kFsTrailingSlashKey})
++
++// trailingValueCases: a directory key with a trailing slash and a non-empty value (the value
++// "" past the shape).
++var trailingValueCases = regionOf("archives/16", pastTrailingSlash, hegel.FlatMap(hegel.FlatMap(fileTrees, aDirIn), func(tree []fileEntry) hegel.Generator[filesCase] {
++	return hegel.FlatMap(evenHalves(dirsOf(tree)...), func(d string) hegel.Generator[filesCase] {
++		return caseOf(tree, d+"/", hzShaped(halvesOver([]int{1, 1, 1, 1}, "x", "x/", "x/y", "x/y/"), hegel.Just("")), dieCoin(30))
++	})
++}))
++
++// TestHegelTrailingSlashKeysKeepTheValue: FilesFromDisk on a key ending in a separator puts
++// the directory's contents under the value, without the directory itself; archives/16 drops
++// the value's first element and adds the directory. The fs side is left out of the judgement
++// (archives/15 would be named first).
++func TestHegelTrailingSlashKeysKeepTheValue(t *testing.T) {
++	judged(t, trailingValueCases, filesJudgeWith(filesRoot(t), pastTrailingSlash, nil))
++}
++
++// --------------------------------------------------------------------------- archives/17
++
++// relativeLinkCases: FollowSymlinks on, a link in a directory whose relative target names a
++// file beside it ("t"), a file at the root ("t" where only the root has it) or a file at the
++// root through "../t"; past the shape, the link at the root. Values without ".", keys
++// without a trailing slash (14, 15 and 16 would be named first); the tree's other links
++// removed (a dangling one earlier in the walk ends both sides alike, a link to a directory is
++// archives/18: the strict pool). The target's name is fresh (it must not replace an entry).
++var relativeLinkCases = regionOf("archives/17", filesExpectedAt, hegel.FlatMap(hegel.FlatMap(fileTrees, aDirIn), func(tree []fileEntry) hegel.Generator[filesCase] {
++	tree = withoutLinks(tree, true)
++	return hegel.FlatMap(evenHalves(dirsOf(tree)...), func(d string) hegel.Generator[filesCase] {
++		return hegel.FlatMap(entryName, func(linkName string) hegel.Generator[filesCase] {
++			return hegel.FlatMap(entryName, func(target string) hegel.Generator[filesCase] {
++				target = freshName(tree, d, target, linkName)
++				// where the file is and what the link says
++				kinds := halvesOver([]int{1, 1, 1}, "beside", "root", "root via ..")
++				return hegel.FlatMap(kinds, func(kind string) hegel.Generator[filesCase] {
++					filePath, link := d+"/"+target, target
++					switch kind {
++					case "root":
++						filePath = target
++					case "root via ..":
++						filePath, link = target, "../"+target
++					}
++					linkPath := hzShaped(d+"/"+linkName, linkName)
++					if linkPath == linkName {
++						filePath, link = target, target // past the shape: a root link to a root file
++						if entryAt(tree, linkName) != nil {
++							linkPath += ".l" // not in place of an entry (the key's directory)
++						}
++					}
++					return hegel.FlatMap(aFile(filePath), func(f fileEntry) hegel.Generator[filesCase] {
++						t := withEntry(withEntry(tree, f), fileEntry{Path: linkPath, Kind: 'l', Link: link, Mode: 0o777, Fallback: "nowhere"})
++						return hegel.FlatMap(evenHalves(".", d), func(key string) hegel.Generator[filesCase] {
++							return caseOf(t, key, plainValues, hegel.Just(true))
++						})
++					})
++				})
++			})
++		})
++	})
++}))
++
++// TestHegelRelativeLinksResolveFromTheirDirectory: with FollowSymlinks, a link's relative
++// target is resolved from the link's directory, as the file system does; archives/17 resolves
++// it from the root of the fs.FS.
++func TestHegelRelativeLinksResolveFromTheirDirectory(t *testing.T) {
++	judged(t, relativeLinkCases, filesJudgeWith(filesRoot(t), filesExpectedAt, nil))
++}
++
++// --------------------------------------------------------------------------- archives/18
++
++// dirLinkCases: FollowSymlinks on, a link at the root to a directory of the root (past the
++// shape, to a file); the key the root; the tree without any other link (a relative link
++// below the root is archives/17, named first; the root's own links to directories would be
++// the shape too, and a link to a link blurs it). The target is a fresh name (a directory
++// with the tree's entries under it when the name was a directory already).
++var dirLinkCases = regionOf("archives/18", filesExpectedAt, hegel.FlatMap(fileTrees, func(tree []fileEntry) hegel.Generator[filesCase] {
++	tree = withoutLinks(tree, true)
++	return hegel.FlatMap(entryName, func(linkName string) hegel.Generator[filesCase] {
++		return hegel.FlatMap(entryName, func(target string) hegel.Generator[filesCase] {
++			if target == linkName || (entryAt(tree, target) != nil && entryAt(tree, target).Kind != 'd') {
++				target += ".t"
++			}
++			targetEntry := aDir(target)
++			if hzShaped(false, true) {
++				targetEntry = aFile(target)
++			}
++			return hegel.FlatMap(targetEntry, func(te fileEntry) hegel.Generator[filesCase] {
++				t := withEntry(withEntry(tree, te), fileEntry{Path: linkName, Kind: 'l', Link: target, Mode: 0o777, Fallback: "nowhere"})
++				return caseOf(t, ".", plainValues, hegel.Just(true))
++			})
++		})
++	})
++}))
++
++// TestHegelDirectoryLinksAreFollowedOnFS: with FollowSymlinks, FilesFromFS gathers a link to a
++// directory as that directory and its contents under the link's name; archives/18 looks the
++// directory up inside fs.Sub of itself and fails.
++func TestHegelDirectoryLinksAreFollowedOnFS(t *testing.T) {
++	judged(t, dirLinkCases, filesJudgeWith(filesRoot(t), filesExpectedAt, nil))
++}
++
++// --------------------------------------------------------------------------- archives/27
++
++// pastFollowOnFS is the model without the checks archives/17 and 18 change on their own: the
++// fs side's resolution and expansion of a followed link. On the fs side every link to an
++// ancestor is also the shape of 18 (its directory looked up inside fs.Sub of itself, by the
++// documented resolution of "."), so the wide property names 18 (or 17) for such a case; the
++// narrow property of 27 is judged on what is left: whether each side returns, and the disk
++// side.
++var pastFollowOnFS = pastSwitches(filesExpectedAt, []int{kFsFollowSymlinkRelative, kFsFollowDirLink})
++
++// ancestorLinkCases: FollowSymlinks on, a link in a directory to "." - its own directory,
++// an ancestor of itself (past the shape, to a file beside it); the key the root or that
++// directory; the tree without any other link (a loop through a link to a link is the same
++// shape, a link to a directory is 18). Only the "." target is the region: ".." and a path to
++// an ancestor are archives/17 on the fs side (the target as written is invalid or resolved
++// from the root) and named first even past the fs checks of 17 (the disk side differs too).
++var ancestorLinkCases = regionOf("archives/27", pastFollowOnFS, hegel.FlatMap(hegel.FlatMap(fileTrees, aDirIn), func(tree []fileEntry) hegel.Generator[filesCase] {
++	tree = withoutLinks(tree, true)
++	return hegel.FlatMap(evenHalves(dirsOf(tree)...), func(d string) hegel.Generator[filesCase] {
++		return hegel.FlatMap(entryName, func(linkName string) hegel.Generator[filesCase] {
++			return hegel.FlatMap(entryName, func(sibling string) hegel.Generator[filesCase] {
++				sibling = freshName(tree, d, sibling, linkName)
++				link := fileEntry{Path: d + "/" + linkName, Kind: 'l', Link: hzShaped(".", sibling), Mode: 0o777, Fallback: "nowhere"}
++				filled := hegel.Just(tree)
++				if hzNoKnown {
++					filled = hegel.Map(aFile(d+"/"+sibling), func(f fileEntry) []fileEntry { return withEntry(tree, f) })
++				}
++				return hegel.FlatMap(filled, func(tree []fileEntry) hegel.Generator[filesCase] {
++					return hegel.FlatMap(evenHalves(".", d), func(key string) hegel.Generator[filesCase] {
++						return caseOf(withEntry(tree, link), key, plainValues, hegel.Just(true))
++					})
++				})
++			})
++		})
++	})
++}))
++
++// ancestorLinkCount is the case count of TestHegelAncestorLinksReturn: every case calls the
++// library in two child processes (one per side) that die of their capped stack within
++// milliseconds, but each is a test binary started afresh (about 90 ms), so the property runs
++// a fifth of the default count (HEGEL_TEST_CASES scales it) and its shrink is capped at
++// ancestorLinkAttempts failing attempts (two children each).
++const (
++	ancestorLinkCount    = 20
++	ancestorLinkAttempts = 40
++)
++
++// TestHegelAncestorLinksReturn: with FollowSymlinks, a call that meets a link to an ancestor
++// directory returns (what it returns is left open); archives/27 recurses without end on
++// both sides.
++func TestHegelAncestorLinksReturn(t *testing.T) {
++	judgedWithCount(t, ancestorLinkCount, ancestorLinkAttempts, ancestorLinkCases, filesJudgeWith(filesRoot(t), pastFollowOnFS, nil))
++}
++
++// --------------------------------------------------------------------------- archives/21
++
++// upperExtPaths is a made-up path with an upper-cased archive extension (lower-cased past
++// the shape).
++var upperExtPaths = hegel.FlatMap(evenHalves(hzArchiveExts...), func(ext string) hegel.Generator[string] {
++	return hegel.FlatMap(evenHalves("a", "x/a", "A", "/x/a", "a b"), func(stem string) hegel.Generator[string] {
++		return hegel.Map(evenHalves("", "/x", "/x/y", "/"), func(rest string) string {
++			if hzShaped(true, false) {
++				ext = strings.ToUpper(ext)
++			}
++			return stem + ext + rest
++		})
++	})
++})
++
++// upperExtCases: a DeepFS case whose made-up path has an upper-cased archive extension.
++var upperExtCases = regionOf("archives/21", deepExpected, deepCasesWith(treesOf(6), upperExtPaths, false))
++
++// TestHegelPathContainsArchiveIgnoresCase: PathContainsArchive, documented as the same lexical
++// test as PathIsArchive and SplitPath, finds an archive extension whatever its case;
++// archives/21 compares case-sensitively.
++func TestHegelPathContainsArchiveIgnoresCase(t *testing.T) {
++	judged(t, upperExtCases, deepJudgeWith(filesRoot(t)))
++}
++
++// --------------------------------------------------------------------------- archives/22
++
++// extAlonePaths is a made-up path whose first segment is exactly an archive extension (past
++// the shape, a name with the extension), lower case (archives/21 would be named first). The
++// path does not end in a slash: SplitPath's scan and the documented split agree on ".zip/"
++// (an empty inner path either way).
++var extAlonePaths = hegel.FlatMap(evenHalves(hzArchiveExts...), func(ext string) hegel.Generator[string] {
++	return hegel.Map(evenHalves("", "/a", "/a/b"), func(rest string) string {
++		return hzShaped("", "x") + ext + rest
++	})
++})
++
++// extAloneCases: a DeepFS case of the strict pool (no upper-cased form) whose made-up path
++// begins with an extension alone.
++var extAloneCases = regionOf("archives/22", deepExpected, deepCasesWith(treesOf(6), extAlonePaths, true))
++
++// TestHegelSplitPathSplitsTheFirstSegment: SplitPath splits at the first segment that is an
++// archive, even one that is only the extension; archives/22 starts its scan at the second
++// character and misses it.
++func TestHegelSplitPathSplitsTheFirstSegment(t *testing.T) {
++	judged(t, extAloneCases, deepJudgeWith(filesRoot(t)))
++}
++
++// --------------------------------------------------------------------------- archives/23
++
++// madeUpLower is the made-up paths without the shapes of 21 and 22.
++var madeUpLower = halvesOver([]int{1, 1, 1, 1, 1, 1, 1}, "a.zip/b.tar/c", "a.tar.gz", "a.tgz/", "/a/b.tar.zst/c/d", "x.zip /y", "a.tar.gzip", "a/.tar/b")
++
++// archiveNamedDirCases: a DeepFS case of the strict pool with a directory named like an
++// archive (named plainly past the shape) holding an archive, at the root or in a directory.
++var archiveNamedDirCases = regionOf("archives/23", deepExpected, hegel.FlatMap(treesOf(6), func(tree []fileEntry) hegel.Generator[deepCase] {
++	parent := hegel.Just("")
++	if ds := dirsOf(tree); len(ds) > 0 {
++		parent = dieChoice(hzW(50, hegel.Just("")), hzW(50, evenHalves(ds...)))
++	}
++	return hegel.FlatMap(parent, func(par string) hegel.Generator[deepCase] {
++		return hegel.FlatMap(evenHalves("d", "a b", "x.y"), func(stem string) hegel.Generator[deepCase] {
++			return hegel.FlatMap(evenHalves(hzArchiveExts...), func(ext string) hegel.Generator[deepCase] {
++				dirPath := stem + hzShaped(ext, "")
++				if par != "" {
++					dirPath = par + "/" + dirPath
++				}
++				return hegel.FlatMap(aDir(dirPath), func(de fileEntry) hegel.Generator[deepCase] {
++					t := withEntry(tree, de)
++					return hegel.FlatMap(archiveAt(hegel.Just(dirPath)), func(inside deepArchive) hegel.Generator[deepCase] {
++						return hegel.FlatMap(countedHalves(archiveAmong(dirsOf(t)), 0, 3), func(archs []deepArchive) hegel.Generator[deepCase] {
++							return hegel.Map(madeUpLower, func(mu string) deepCase {
++								return buildDeepCase(t, append([]deepArchive{inside}, archs...), mu, true)
++							})
++						})
++					})
++				})
++			})
++		})
++	})
++}))
++
++// TestHegelDirectoriesNamedLikeArchivesAreWalked: DeepFS walks a real directory named like an
++// archive as a directory, the archives in it as directories of their entries; archives/23
++// reads it through a DirFS that lists those archives as plain files.
++func TestHegelDirectoriesNamedLikeArchivesAreWalked(t *testing.T) {
++	judged(t, archiveNamedDirCases, deepJudgeWith(filesRoot(t)))
++}
 diff --git a/hegel/hegel_zoo_test.go b/hegel/hegel_zoo_test.go
 new file mode 100644
-index 0000000..5eaf4e6
+index 0000000..86df4a5
 --- /dev/null
 +++ b/hegel/hegel_zoo_test.go
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,216 @@
 +package hegel
 +
 +// Hegel property tests for mholt/archives, written for the Hegel zoo. See
@@ -3174,9 +6253,21 @@ index 0000000..5eaf4e6
 +// model of the tree as a file system), the package's documentation of the name mapping and of
 +// Identify, and Python's tarfile/zipfile as an independent reader of the archives written.
 +//
++// Two harnesses coexist while the rewrite to the combinator style proceeds in parts. The
++// new one (hegel_zoo_idioms_test.go, hegel_zoo_judge_test.go) carries TestHegelFilesFrom
++// (hegel_zoo_files_test.go), TestHegelDeepFS (hegel_zoo_deep_test.go) and the narrow
++// properties of their recorded bugs (hegel_zoo_shapes_test.go): cases are records drawn from
++// package-level generators, a pure model states the documented values with the replicas of
++// the recorded bugs threaded on a switch set (`known`, all off by default), and a judge
++// names the shape of a failing case; HEGEL_NO_KNOWN=1 switches the shapes off. This file and
++// hegel_zoo_gen_test.go, hegel_zoo_props_test.go, hegel_zoo_props2_test.go are the OLD
++// harness (its names carry the hzOld prefix where the new one took the name) for the
++// properties not yet rewritten (Identify, Compression, ArchiveRoundTrip, ArchiveFS, Insert)
++// and the pins: the switches in HZKnown are gates, all on by default, read by those.
++//
 +// Conventions: hegel-go reads no environment variable itself, so HEGEL_TEST_CASES is passed
-+// through hzOpts; a panic in the code under test is turned into a failure of the current test
-+// case by hzProperty(). ZOO_COLLECT=1 makes the properties record their mismatches instead of
++// through hzOldOpts; a panic in the code under test is turned into a failure of the current test
++// case by hzOldProperty(). ZOO_COLLECT=1 makes the properties record their mismatches instead of
 +// failing.
 +
 +import (
@@ -3195,7 +6286,7 @@ index 0000000..5eaf4e6
 +
 +// --------------------------------------------------------------------------- harness
 +
-+func hzOpts() []hegel.Option {
++func hzOldOpts() []hegel.Option {
 +	if s := os.Getenv("HEGEL_TEST_CASES"); s != "" {
 +		if v, err := strconv.Atoi(s); err == nil && v > 0 {
 +			return []hegel.Option{hegel.WithTestCases(v)}
@@ -3204,7 +6295,7 @@ index 0000000..5eaf4e6
 +	return nil
 +}
 +
-+func hzProperty(t *testing.T, fn func(ht *hegel.T)) {
++func hzOldProperty(t *testing.T, fn func(ht *hegel.T)) {
 +	t.Helper()
 +	hegel.Test(t, func(ht *hegel.T) {
 +		defer func() {
@@ -3223,18 +6314,18 @@ index 0000000..5eaf4e6
 +			ht.Fatalf("panic in the code under test: %v", r)
 +		}()
 +		fn(ht)
-+	}, hzOpts()...)
++	}, hzOldOpts()...)
 +}
 +
-+func hzDrawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
++func hzOldDrawInt(tc hegel.TestCase, lo, hi int) int { return hegel.Draw(tc, hegel.Integers(lo, hi)) }
 +
-+func hzChance(tc hegel.TestCase, pct int) bool { return hzDrawInt(tc, 1, 100) <= pct }
++func hzOldChance(tc hegel.TestCase, pct int) bool { return hzOldDrawInt(tc, 1, 100) <= pct }
 +
-+func hzPick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
++func hzOldPick[T any](tc hegel.TestCase, xs []T) T { return hegel.Draw(tc, hegel.SampledFrom(xs)) }
 +
-+var hzCollecting = os.Getenv("ZOO_COLLECT") != ""
++var hzOldCollecting = os.Getenv("ZOO_COLLECT") != ""
 +
-+type hzCollector struct {
++type hzOldCollector struct {
 +	name   string
 +	mu     sync.Mutex
 +	counts map[string]int
@@ -3242,10 +6333,10 @@ index 0000000..5eaf4e6
 +	bad    int
 +}
 +
-+func hzNewCollector(t *testing.T) *hzCollector {
-+	c := &hzCollector{name: t.Name(), counts: map[string]int{}}
++func hzOldNewCollector(t *testing.T) *hzOldCollector {
++	c := &hzOldCollector{name: t.Name(), counts: map[string]int{}}
 +	t.Cleanup(func() {
-+		if !hzCollecting {
++		if !hzOldCollecting {
 +			return
 +		}
 +		keys := make([]string, 0, len(c.counts))
@@ -3271,7 +6362,7 @@ index 0000000..5eaf4e6
 +	return c
 +}
 +
-+func (c *hzCollector) count(class string) {
++func (c *hzOldCollector) count(class string) {
 +	c.mu.Lock()
 +	c.counts[class]++
 +	c.mu.Unlock()
@@ -3279,9 +6370,9 @@ index 0000000..5eaf4e6
 +
 +// failClass is a failure with a class: in collect mode the class is counted and only its
 +// first two messages are kept.
-+func (c *hzCollector) failClass(ht *hegel.T, class string, format string, args ...any) {
++func (c *hzOldCollector) failClass(ht *hegel.T, class string, format string, args ...any) {
 +	msg := fmt.Sprintf(format, args...)
-+	if hzCollecting {
++	if hzOldCollecting {
 +		c.mu.Lock()
 +		c.bad++
 +		if class != "" {
@@ -3322,19 +6413,19 @@ index 0000000..5eaf4e6
 +	zipInsertStores            bool // Zip.Insert without SelectiveCompression stores the files, whatever Compression says
 +	zipInsertCustomMethod      bool // Zip.Insert with SelectiveCompression and Compression Bzip2, Zstd or Xz fails: the updater does not know the methods the package registers
 +	zipInsertSymlink           bool // Zip.Insert opens a symbolic link's target and stores its content as the link's, instead of the target path Archive stores; a dangling link fails the insertion
-+	fsRootDotLeadingSlash      bool // FilesFromFS/FilesFromDisk with the in-archive root "." give names with a leading slash
-+	fsTrailingSlashKey         bool // FilesFromFS with a key ending in a slash fails (fs paths cannot end in a slash), though documented as enumerating the directory's contents
-+	fsFollowSymlinkRelative    bool // FilesFromFS with FollowSymlinks resolves a relative link target from the root of the fs.FS, not from the link's directory as FilesFromDisk does
++	fsRootDotLeadingSlash      bool // (read by nothing since part 1) FilesFromFS/FilesFromDisk with the in-archive root "." give names with a leading slash
++	fsTrailingSlashKey         bool // (read by nothing since part 1) FilesFromFS with a key ending in a slash fails (fs paths cannot end in a slash), though documented as enumerating the directory's contents
++	fsFollowSymlinkRelative    bool // (read by nothing since part 1) FilesFromFS with FollowSymlinks resolves a relative link target from the root of the fs.FS, not from the link's directory as FilesFromDisk does
 +	identifyNondeterministic   bool // Identify iterates the formats in map order: when the file name and the stream point at different formats, the answer varies from call to call
-+	pathContainsArchiveCase    bool // PathContainsArchive compares the extensions case-sensitively while PathIsArchive and SplitPath lower-case the path
++	pathContainsArchiveCase    bool // (read by nothing since part 1) PathContainsArchive compares the extensions case-sensitively while PathIsArchive and SplitPath lower-case the path
 +	brotliMatchTruncated       bool // Brotli.Match rejects a stream longer than 1 KiB whose first kibibyte does not decode to its end: the decoder's truncation error counts as no match, and Identify finds no format
-+	deepFSDirNamedArchive      bool // a directory named like an archive (dir.zip) is treated by DeepFS as an archive, and the archives inside it are listed as plain files, not walked
++	deepFSDirNamedArchive      bool // (read by nothing since part 1) a directory named like an archive (dir.zip) is treated by DeepFS as an archive, and the archives inside it are listed as plain files, not walked
 +	lzipEmptyStream            bool // Lzip's writer closed without a Write produces a stream without the LZIP header, which Lzip's reader rejects
-+	fsTrailingKeyValue         bool // FilesFromDisk with a key ending in a separator and a non-empty value adds the directory itself, and drops the first path element of the value
-+	splitPathFirstSegment      bool // DeepFS.SplitPath skips the first character of the path, so a first segment that is only an archive extension (.zip) is not split
++	fsTrailingKeyValue         bool // (read by nothing since part 1) FilesFromDisk with a key ending in a separator and a non-empty value adds the directory itself, and drops the first path element of the value
++	splitPathFirstSegment      bool // (read by nothing since part 1) DeepFS.SplitPath skips the first character of the path, so a first segment that is only an archive extension (.zip) is not split
 +	identifyLzipTruncatedPanic bool // Identify panics (slice bounds) on a truncated lzip stream: the lzip reader used to look inside it for an archive panics on short input
-+	fsFollowDirLink            bool // FilesFromFS with FollowSymlinks fails on a link to a directory: the directory is looked up by its own path inside fs.Sub of itself
-+	followAncestorLinkHang     bool // FilesFromDisk and FilesFromFS with FollowSymlinks recurse without end on a link to an ancestor directory (ln -s . self): the link is found again inside the directory it points at
++	fsFollowDirLink            bool // (read by nothing since part 1) FilesFromFS with FollowSymlinks fails on a link to a directory: the directory is looked up by its own path inside fs.Sub of itself
++	followAncestorLinkHang     bool // (read by nothing since part 1) FilesFromDisk and FilesFromFS with FollowSymlinks recurse without end on a link to an ancestor directory (ln -s . self): the link is found again inside the directory it points at
 +}{true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true}
 +
 +// hzAvoided counts the cases where a generator kept away from a known bug (printed by the
