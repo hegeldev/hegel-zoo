@@ -85,13 +85,12 @@ tars at 20 %, a directory for Sub, and whether the missing-name and ReadDir-rest
 (40 and 50 %). A case costs about 340 draws (850 at most) for the round trip and 310 (800)
 for ArchiveFS.
 
-The Insert property draws as before: a tree of up to ten entries (files of 0
-to 4096 bytes with block-aligned sizes frequent, directories, symbolic links to siblings,
-tree paths, parents, their own directory or nowhere) with permissions and times, written to a
-`fstest.MapFS` or to a directory on disk; names with spaces, dots, upper case, non-ASCII, and
-archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overrides) and
-`Zip` (store, deflate, bzip2, zstd, xz; selective compression), `Tar` under `Gz`, `Bz2`,
-`Xz`, `Zstd`, `Lz4`, `Brotli`, `Sz`, `Lzip`, `Zlib` and `MinLZ` with their levels.
+`insertCase`: a base tree of up to six entries and an extra tree of up to four, both of
+`filesCase`'s population, gathered by FilesFromFS; the archival a Tar with its options or a
+Zip (Store, Deflate twice, Bzip2, Zstd at 4/8/4/4; no Xz, which is the round trip's shape;
+selective compression at 30 %) at 50/50; the base archive built in the property under the
+judge and the extras inserted into a copy of its bytes in memory. A case costs about 350
+draws (890 at most).
 
 ## Properties
 
@@ -101,7 +100,8 @@ archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overr
 - `TestHegelArchiveFS`: a hand-written archive read through ArchiveFS is the file system of
   its paths (walk, stat, open, read, readdir, the rest after ReadDir(1), sub, missing names),
   before and after indexing, and `fstest.TestFS` accepts it.
-- `TestHegelInsert`: files inserted into a Tar or Zip archive come out after its entries.
+- `TestHegelInsert`: files inserted into a Tar or Zip archive come out after its entries (a
+  zip's same-named entries replaced), with their contents, link targets and methods.
 - `TestHegelFilesFrom`: FilesFromFS and FilesFromDisk on the same tree gather what the
   filenames map documents, with FollowSymlinks and ClearAttributes; a call whose expansion
   the model never finishes still returns (judged in a child process).
@@ -114,7 +114,7 @@ archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overr
   and by name and by no other format, identified, decoded by its reader and by the reference
   tool; gzip members with and without DisableMultistream.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
-- Twenty-three narrow properties, one per bug of the six rewritten wide properties (below):
+- Twenty-eight narrow properties, one per recorded bug (below):
   `TestHegelDotValuesGiveRelativeNames` (14), `TestHegelTrailingSlashKeysEnumerateOnFS` (15),
   `TestHegelTrailingSlashKeysKeepTheValue` (16),
   `TestHegelRelativeLinksResolveFromTheirDirectory` (17),
@@ -127,7 +127,10 @@ archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overr
   `TestHegelTgzNamesIdentify` (26), `TestHegelTruncatedLzipHeadersErrAlike` (28),
   `TestHegelXzZipsExtract` (1), `TestHegelFreshOpenOfLateDirectoriesIsADirectory` (4),
   `TestHegelFreshOpenListsOnlyChildren` (5), `TestHegelFreshStatOfPrefixesIsNotExist` (6),
-  `TestHegelImplicitDirectoriesHaveBaseNames` (7), `TestHegelDirectoryFilesReadTheRest` (8).
+  `TestHegelImplicitDirectoriesHaveBaseNames` (7), `TestHegelDirectoryFilesReadTheRest` (8),
+  `TestHegelTarInsertAfterAlignedEntries` (2), `TestHegelZipInsertContinuesAfterDirectories`
+  (3), `TestHegelZipInsertCompresses` (11), `TestHegelZipInsertKnowsTheRegisteredMethods`
+  (12), `TestHegelZipInsertStoresLinkTargets` (13).
 
 ## Bugs
 
@@ -148,18 +151,9 @@ directory links (18), and on both sides recurses without end on a link to an anc
 character (22), directories named like archives (23). Streams: Lzip's empty output (24),
 Brotli streams over 1 KiB unmatched (25).
 
-## Modelled as recorded
-
-The twenty-three bugs of the six rewritten properties follow the standard (next section).
-The other five (2, 3, 11, 12, 13) keep an `HZKnown` switch, on by default, until the Insert
-property is rewritten: while it is on the generator keeps away from the shape or the checks
-skip it: Tar.Insert only after a non-aligned regular file, Zip.Insert without directories,
-links or custom methods and its stored method accepted. The old collector counts the
-avoidances; `ZOO_KNOWN_OFF=name,name` turns those switches off and the property then fails.
-
 ## Properties and the recorded bugs
 
-The model of the rewritten properties states the documented behaviour; the `known` switch
+The model states the documented behaviour; the `known` switch
 set (`type known [27]bool`, one index per bug id, all off by default) turns a replica of the
 library's rule on in its place, each transcribed from the lines of `archives.go` and `fs.go`
 it follows: `nameOnDiskToNameInArchive` keeping the separator after the root for the value
@@ -275,12 +269,30 @@ missing or late, Open fresh; judged past 7 and 8), 5 (an implicit or late subdir
 entry), 7 (an implicit directory, judged past the earlier shapes), 8 (ReadDir(1) then
 ReadDir(-1) on a directory file of any archive).
 
+The Insert property threads the switches of its five bugs: `Tar.Insert` rounding an offset
+already on a block boundary up by a whole block, so that the archive reads back its old
+entries and then an invalid header (2); `Zip.Insert` returning at a directory entry (3),
+leaving the inserted files' method Store without SelectiveCompression (11), handing a
+Bzip2, Zstd or Xz method to the updater's own registry with SelectiveCompression (12, the
+same-named base entry removed before the lookup fails) and copying a link's target content
+as the link's text, the first len(target) bytes of it, a missing or directory target failing
+the insertion (13). Over 3000 default cases it names about 1640 shapes (55 %), every one by
+sufficiency with the library agreeing with the replica in all of them: 2 in 616 to 631, 3
+in 445 to 458, 11 in 349 to 423, 12 in 83 to 107, 13 in 85 to 91; the overlaps go to the
+lowest id. Over forty rounds at a hundred cases it shrank to 2 twenty-seven times and to
+11 thirteen (nine rounds at the default count: 2 six times, 11 three), so it is mapped to 2.
+The narrow properties: 2 (a tar whose base's last entry is a directory, a link, an
+empty or 512-multiple file, or no entry at all; 4 % rejected for USTAR surroundings), 3 (a
+zip, the extras a directory followed by a file, no link, no custom method), 11 (a zip with a
+method other than Store and no selective compression, an inserted file), 12 (Bzip2 or Zstd
+with selective compression and a compressible extra file), 13 (a link among the extras,
+its target existing at 3/7).
+
 Under `HEGEL_NO_KNOWN=1` the shapes are off: the fs side's checks of a trailing key are
 dropped (15, counted), the cases the classifier names as 14, 16, 17, 18 or 27 are filtered out
 (10 % of the FilesFrom property's), the upper-cased paths and `.zip` are at weight zero and
 the archive-named directories are renamed (21, 22, 23: nothing filtered). The narrow
-properties draw the region past their shape and pass. The pins and the Insert
-property's gates are unchanged there.
+properties draw the region past their shape and pass. The pins alone fail there.
 Under `HEGEL_NO_KNOWN=1` the Identify property drops the consistency check of the cases the
 classifier names 19 (3 %) and draws no Lz4 level above 0, no lzip cut but the empty one, no
 empty Lzip input, no `.tgz` name and no empty zip; the Compression property draws no Lz4
@@ -290,6 +302,11 @@ The round-trip property draws no Xz zip, no Lz4 level above 0 and no empty zip, 
 8's TestFS class (93 % of its cases); the ArchiveFS property draws no prefix names and drops
 the fresh-mode checks the shapes of 4, 5 and 7 cover and the ReadDir-rest and TestFS checks
 of 8 (92 % of its cases have a check dropped, counted).
+The Insert property draws, under `HEGEL_NO_KNOWN=1`, a base tree whose last entry in
+archive order is a file of an unaligned size (the aligned shape is half of the tars, too
+many to filter), extras without directories or links, no custom method with selective
+compression, and drops the inserted entries' method check without it (11, 24 % of its
+cases, counted).
 
 ## Not judged
 
@@ -324,3 +341,8 @@ paths.
   with their eight gates turned into switches, `fstest.TestFS` transcribed over the model,
   six narrow properties; the pin of 19 hardened (four hundred calls); the notes of 1 (Identify
   reads the bytes as corrupt xz) and 7 (the root's name after indexing) widened.
+- 2026-10-14 (part 4 of four): `TestHegelInsert` rewritten with its five gates turned into
+  switches, five narrow properties; the old harness removed: one harness, twenty-eight
+  switches, seven wide and twenty-eight narrow properties; the notes of 12 (a link meets the
+  same error; the same-named entry is removed first) and 13 (shorter targets, directory
+  targets) widened. The series complete.
