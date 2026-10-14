@@ -124,3 +124,6 @@ long as the rule), the CLI, source maps, the browser bundles.
   closing after the `]`; micromark tolerances added for a nested-quote table's `</thead><tbody>`
   without a newline, a one-column pipe header over a pipeless delimiter row, and an HTML block
   whose last line is text.
+- 2026-10-14: the version-14 differential's skip of a backslash before a terminating space in a
+  destination now covers a definition's destination followed by a title (the weekly run of
+  2026-10-12 met `[ref]: http:///\ ""`, a paragraph in 14.3.0 and a definition in 15.0.2).
