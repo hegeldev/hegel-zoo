@@ -58,7 +58,19 @@ it (the kinds 25/60/15 realise 24/60/14, the parent 60 realises 62, the size tab
 realises 60, follow and clear 30 realise 31 and 30, an archive in a directory 50 realises
 48); a case costs about 270 draws (690 at most) for FilesFrom and 480 (1440) for DeepFS.
 
-The five properties not yet rewritten draw as before: a tree of up to ten entries (files of 0
+`identifyCase`: the content one of five kinds (random bytes of 0..64, an empty stream, an
+archive of a tree of up to four entries written by Tar or Zip - the zip methods without xz,
+part 3's bug - and a tar under a compression format at 50 %, a compressed stream of a
+payload, a truncated compressed stream cut to 0..12 bytes; realising 18/15/32/17/18) and the
+name one of six (none, the content's own extension, a neutral or misleading name, a
+compression extension, an archive extension, an odd spelling; 15 to 18 each); the archive
+and the stream are built in the property under the judge, the construction a check of its
+own. `compressionCase`: a format from the ten at a tenth each (the levels 0..9, Lz4's too,
+Brotli's quality 0..11, Gz multithreaded at 30 %), a payload of `hzData`'s population, and the
+write cut into pieces by a drawn list of lengths. A case costs about a hundred draws for
+either.
+
+The three properties not yet rewritten draw as before: a tree of up to ten entries (files of 0
 to 4096 bytes with block-aligned sizes frequent, directories, symbolic links to siblings,
 tree paths, parents, their own directory or nowhere) with permissions and times, written to a
 `fstest.MapFS` or to a directory on disk; names with spaces, dots, upper case, non-ASCII, and
@@ -67,8 +79,7 @@ archive-like extensions. Formats: `Tar` (USTAR/PAX/GNU, numeric ids, owner overr
 `Xz`, `Zstd`, `Lz4`, `Brotli`, `Sz`, `Lzip`, `Zlib` and `MinLZ` with their levels. Archives
 written by hand with archive/tar and archive/zip for the shapes FilesFromFS never produces:
 implicit directories, entries out of order, `./` prefixes, a `.` entry, directories with and
-without a trailing slash. For Identify, archives, compressed streams (also truncated), random
-bytes and empty streams under right, wrong, neutral and missing names.
+without a trailing slash.
 
 ## Properties
 
@@ -81,31 +92,38 @@ bytes and empty streams under right, wrong, neutral and missing names.
 - `TestHegelFilesFrom`: FilesFromFS and FilesFromDisk on the same tree gather what the
   filenames map documents, with FollowSymlinks and ClearAttributes; a call whose expansion
   the model never finishes still returns (judged in a child process).
-- `TestHegelIdentify`: Identify by name (the extension rules), by stream, both, repeatedly;
-  no panic on arbitrary or truncated bytes.
+- `TestHegelIdentify`: Identify by name (the extension rules), by stream, both, six times
+  over seekable and buffered streams: the documented answer, the stream returned unread, the
+  same answer every time, no panic on arbitrary or truncated bytes.
 - `TestHegelDeepFS`: a disk tree with archives walks through DeepFS as the tree with each
   archive replaced by its entries; SplitPath, PathIsArchive and PathContainsArchive agree.
-- `TestHegelCompression`: every compression writer's stream is matched, identified, decoded
-  by its reader and by the reference tool; gzip members with and without DisableMultistream.
+- `TestHegelCompression`: every compression writer opens, its stream is matched by content
+  and by name and by no other format, identified, decoded by its reader and by the reference
+  tool; gzip members with and without DisableMultistream.
 - `TestHegelPin…`: one pin per recorded bug (expected failures).
-- Nine narrow properties, one per bug of the two rewritten wide properties (below):
+- Seventeen narrow properties, one per bug of the four rewritten wide properties (below):
   `TestHegelDotValuesGiveRelativeNames` (14), `TestHegelTrailingSlashKeysEnumerateOnFS` (15),
   `TestHegelTrailingSlashKeysKeepTheValue` (16),
   `TestHegelRelativeLinksResolveFromTheirDirectory` (17),
   `TestHegelDirectoryLinksAreFollowedOnFS` (18), `TestHegelAncestorLinksReturn` (27),
   `TestHegelPathContainsArchiveIgnoresCase` (21), `TestHegelSplitPathSplitsTheFirstSegment`
-  (22), `TestHegelDirectoriesNamedLikeArchivesAreWalked` (23).
+  (22), `TestHegelDirectoriesNamedLikeArchivesAreWalked` (23),
+  `TestHegelEmptyZipsAreMatchedByStream` (9), `TestHegelLz4LevelsOpenWriters` (10),
+  `TestHegelMisnamedStreamsIdentifyAlike` (19), `TestHegelTruncatedLzipStreamsDoNotPanic`
+  (20), `TestHegelEmptyLzipStreamsRead` (24), `TestHegelLongBrotliStreamsAreMatched` (25),
+  `TestHegelTgzNamesIdentify` (26), `TestHegelTruncatedLzipHeadersErrAlike` (28).
 
 ## Bugs
 
-Twenty-seven, recorded in `bugs.toml`. Unreadable output: zip archives written with
+Twenty-eight, recorded in `bugs.toml`. Unreadable output: zip archives written with
 `ZipMethodXz` (archives/1, the xz header precedes each local header), `Tar.Insert` after a
 block-aligned last entry (2), `Zip.Insert` dropping every file after a directory (3). ArchiveFS
 before its index: Open of an implicit or late directory returns a descendant file (4), wrong
 children (5), Stat of missing prefixes (6), wrong Name() of implicit directories (7),
 ReadDir(-1) after ReadDir(n) (8). Identify: an empty zip unmatched (9), a different answer per
 call when name and stream disagree (19), a panic on a truncated lzip stream (20), .tgz unknown
-by name (26). Options: Lz4 levels 1-9 rejected (10); Zip.Insert storing (11), failing on the
+by name (26), a cut inside the lzip header erring differently by seekability (28).
+Options: Lz4 levels 1-9 rejected (10); Zip.Insert storing (11), failing on the
 custom methods (12), and copying a link's target content as the link (13). The filenames map:
 "." gives leading slashes (14), trailing-slash keys fail on fs.FS (15) and misplace the value's
 directory on disk (16); FollowSymlinks on fs.FS resolves from the root (17) and fails on
@@ -116,20 +134,19 @@ Brotli streams over 1 KiB unmatched (25).
 
 ## Modelled as recorded
 
-The nine bugs of FilesFrom and DeepFS follow the standard (next section). The other seventeen
-keep an `HZKnown` switch, on by default, until their properties are rewritten: while it is on
-the generator keeps away from the shape or the checks skip it: no xz method in zips, lz4
-level 0 only, empty zips not identified by stream, the ReadDir-at-EOF lines of TestFS
-dropped, fresh Open/Stat checks skipped for implicit or out-of-order directories and prefix
-names, Tar.Insert only after a non-aligned regular file, Zip.Insert without directories,
-links or custom methods and its stored method accepted, Identify's determinism not required
-when the name contradicts the stream, truncated lzip streams cut before the panic, Lzip given
-a byte, brotli streams over 1 KiB not matched. The old collector counts the avoidances;
-`ZOO_KNOWN_OFF=name,name` turns those switches off and the properties then fail.
+The sixteen bugs of FilesFrom, DeepFS, Identify and Compression follow the standard (next
+section). The other twelve keep an `HZKnown` switch, on by default, until their properties
+are rewritten: while it is on the generator keeps away from the shape or the checks skip it:
+no xz method in zips, lz4 level 0 only and empty zips not identified by stream in the round
+trip, the ReadDir-at-EOF lines of TestFS dropped, fresh Open/Stat checks skipped for implicit
+or out-of-order directories and prefix names, Tar.Insert only after a non-aligned regular
+file, Zip.Insert without directories, links or custom methods and its stored method accepted.
+The old collector counts the avoidances; `ZOO_KNOWN_OFF=name,name` turns those switches off
+and the properties then fail.
 
 ## Properties and the recorded bugs
 
-The model of the two rewritten properties states the documented behaviour; the `known` switch
+The model of the rewritten properties states the documented behaviour; the `known` switch
 set (`type known [27]bool`, one index per bug id, all off by default) turns a replica of the
 library's rule on in its place, each transcribed from the lines of `archives.go` and `fs.go`
 it follows: `nameOnDiskToNameInArchive` keeping the separator after the root for the value
@@ -176,12 +193,53 @@ and a shrink budget of forty), 21 (an upper-cased extension), 22 (an extension-o
 segment, no upper case, no trailing slash: `.zip/` splits alike either way), 23 (an
 archive-named directory holding an archive).
 
+The Identify and Compression properties thread the same switch set: `Zip.Match` reading four
+new bytes per candidate header, so that an empty zip's end record is never compared (9);
+`Lz4.OpenWriter` handing the level to pierrec/lz4 as a bit flag (10); `Identify` ranging over
+the formats map, so that the archival name in an error, or the answer when name and stream
+disagree, varies by map order (19); lzip-go's header read panicking on a cut of six to
+twenty-one bytes (20); Lzip's writer leaving an empty input headerless (24);
+`isValidBrotliStream` decoding the first kibibyte with the decoder the library uses (25, the
+replica runs that decoder on the bytes); the name rules of `Tar.Match` and `Gz.Match`, which
+know no `.tgz` (26); the rewindReader returning the replayed bytes of a buffered stream with
+io.EOF, so that a cut inside the lzip header errs differently by seekability (28). The
+documented Identify answer is a set, by the doc comment's "and/or": the name's answer, the
+stream's, and the name's archive under the stream's compression; errors are compared by
+kind, and the error of a truncated stream is the decoder's own (the model runs the
+third-party decoders the library wraps). The consistency of six calls (seekable and buffered,
+three times each) is one check with four values: the same, varying by the archival name
+only (19, with "same" allowed since six draws may agree), differing by seekability (28), or
+varying (19 where the answer itself depends on map order, left open).
+
+Over 3000 default cases the Identify property names about 1035 shapes (35 %): 19 in 1020 to
+1052 (an error's archival name varies for every stream a decoder rejects), 10 in 122 to 159,
+9 in 51 to 79, 25 in 0 to 8, 20 in 1 to 10, 24 in 0 to 2, 26 in 0 to 1; the 28-shaped cases
+(5 to 12) are all named 19 first, since their archival name varies too; the library agrees
+with the replica in every shaped case, and 44 to 48 shaped cases pass (19's six calls happen
+to agree, about one in twenty). The Compression property names 10 in 299 to 322, 24 in 15 to
+17, 25 in 30 to 36. Over nine rounds at the default count the Identify property shrank to 19
+every time (`x.gz` or `x.tar.gz` over an empty stream), the Compression property to 24 eight
+times (`Lzip{}` over no bytes) and to 25 once; over forty rounds at a hundred cases both fail
+every round, the Identify property to 19 in all forty, the Compression property to 24 in 35
+(25 in 5): both are mapped plain to those.
+The narrow properties: 9 (an empty zip of every method, plain names), 10 (Lz4 at a level
+1..9), 19 (a misnamed stream over twelve calls, level 0, no truncation, no `.br` name), 20
+(an lzip cut of 6..12 bytes, past 0..3), 24 (Lzip over an empty input), 25 (brotli over
+random bytes of 1025..4096 made incompressible by a fixed keystream, since the engine's bytes
+compress a little; 100 % of the cases shaped), 26 (`x.tgz` and its spellings over a tar.gz
+stream, where 19 cannot arise), 28 (a cut of 4 or 5 bytes, judged past 19).
+
 Under `HEGEL_NO_KNOWN=1` the shapes are off: the fs side's checks of a trailing key are
 dropped (15, counted), the cases the classifier names as 14, 16, 17, 18 or 27 are filtered out
 (10 % of the FilesFrom property's), the upper-cased paths and `.zip` are at weight zero and
 the archive-named directories are renamed (21, 22, 23: nothing filtered). The narrow
-properties draw the region past their shape and pass. The pins and the five old properties'
-gates are unchanged there.
+properties draw the region past their shape and pass. The pins and the three old
+properties' gates are unchanged there.
+Under `HEGEL_NO_KNOWN=1` the Identify property drops the consistency check of the cases the
+classifier names 19 (3 %) and draws no Lz4 level above 0, no lzip cut but the empty one, no
+empty Lzip input, no `.tgz` name and no empty zip; the Compression property draws no Lz4
+level above 0, no empty Lzip input and no long undecodable brotli stream (nothing filtered,
+nothing dropped).
 
 ## Not judged
 
@@ -207,3 +265,8 @@ paths.
   switches off by default and nine narrow properties; the hang judged in a child process;
   the notes of archives/14 (the directory itself is skipped, not named `/`) and 27 (a root-level
   link to `.` hangs too) corrected.
+- 2026-10-14 (part 2 of four): `TestHegelIdentify` and `TestHegelCompression` rewritten with
+  their six gates turned into switches, eight narrow properties; archives/28 found by the
+  consistency check (a truncated lzip header errs differently by seekability) and recorded;
+  the notes of 10 (the bit-flag values are accepted), 19 (never Tar for `x.gz` over a tar) and
+  26 (`x.tar.tgz`) corrected.
