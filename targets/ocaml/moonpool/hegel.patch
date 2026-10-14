@@ -1,0 +1,1719 @@
+diff --git a/hegel/dune b/hegel/dune
+new file mode 100644
+index 0000000..55199e8
+--- /dev/null
++++ b/hegel/dune
+@@ -0,0 +1,5 @@
++(executable
++ (name zoo_tests)
++ (libraries moonpool moonpool.forkjoin hegel sexplib0 threads.posix unix)
++ (preprocess
++  (pps ppx_hegel_test)))
+diff --git a/hegel/zoo.ml b/hegel/zoo.ml
+new file mode 100644
+index 0000000..ce31977
+--- /dev/null
++++ b/hegel/zoo.ml
+@@ -0,0 +1,26 @@
++let hegel_pin = "0.26.1"
++
++let () =
++  if not (String.equal Hegel.version hegel_pin)
++  then failwith (Printf.sprintf "hegel %s is installed, the zoo pins %s" Hegel.version hegel_pin)
++;;
++
++let known = not (Option.equal String.equal (Sys.getenv_opt "HEGEL_NO_KNOWN") (Some "1"))
++
++let run tests =
++  let failed =
++    List.fold_left
++      (fun failed (name, test) ->
++         match test () with
++         | () ->
++           Printf.printf "ZOO ok %s\n%!" name;
++           failed
++         | exception e ->
++           Printf.eprintf "%s: %s\n%!" name (Printexc.to_string e);
++           Printf.printf "ZOO FAILED %s\n%!" name;
++           failed + 1)
++      0
++      tests
++  in
++  exit (if failed = 0 then 0 else 1)
++;;
+diff --git a/hegel/zoo_tests.ml b/hegel/zoo_tests.ml
+new file mode 100644
+index 0000000..d737604
+--- /dev/null
++++ b/hegel/zoo_tests.ml
+@@ -0,0 +1,1670 @@
++open Hegel
++open! Moonpool
++module Ws_deque = Moonpool.Private.Ws_deque_
++module Fork_join = Moonpool_forkjoin
++
++let printed show g = with_printer (fun x -> Sexplib0.Sexp.Atom (show x)) g
++let show_ints l = "[" ^ String.concat "; " (List.map string_of_int l) ^ "]"
++let small = integers ~min_value:0 ~max_value:9 ()
++
++let last_progress = Atomic.make 0.0
++let progress () = Atomic.set last_progress (Unix.gettimeofday ())
++let stall_limit = 60.0
++
++(* Each test runs in a forked child: Moonpool's domain pool can start only after a fork, and
++   a deadlock (no progress for [stall_limit]) costs the child, not the run. *)
++let isolated test () =
++  match Unix.fork () with
++  | 0 ->
++    progress ();
++    let watchdog () =
++      while true do
++        Thread.delay 1.0;
++        if Unix.gettimeofday () -. Atomic.get last_progress > stall_limit
++        then (
++          prerr_endline "no progress for 60s: deadlocked";
++          flush_all ();
++          Unix._exit 2)
++      done
++    in
++    ignore (Thread.create watchdog () : Thread.t);
++    let code =
++      match test () with
++      | () -> 0
++      | exception e ->
++        prerr_endline (Printexc.to_string e);
++        1
++    in
++    flush_all ();
++    Unix._exit code
++  | pid ->
++    (match snd (Unix.waitpid [] pid) with
++     | Unix.WEXITED 0 -> ()
++     | Unix.WEXITED 2 -> failwith "deadlocked"
++     | Unix.WEXITED _ -> failwith "fails (its message is above)"
++     | Unix.WSIGNALED s | Unix.WSTOPPED s -> Printf.ksprintf failwith "killed by signal %d" s)
++;;
++
++let deadline = 5.0
++
++(* [Fut.wait_block] has no timeout, so a future that is never resolved is polled for. *)
++let settle ?(within = deadline) fut =
++  progress ();
++  let until = Unix.gettimeofday () +. within in
++  let rec go () =
++    match Fut.peek fut with
++    | Some r -> Some r
++    | None when Unix.gettimeofday () > until -> None
++    | None ->
++      Thread.delay 0.0002;
++      go ()
++  in
++  go ()
++;;
++
++let eventually what cond =
++  let until = Unix.gettimeofday () +. deadline in
++  while not (cond ()) do
++    if Unix.gettimeofday () > until then Printf.ksprintf failwith "%s after %.0fs" what deadline;
++    Thread.delay 0.0002
++  done
++;;
++
++let outcome (r : 'a Fut.or_error) = Result.map_error (fun ebt -> Printexc.to_string (Exn_bt.exn ebt)) r
++let failure s = Printexc.to_string (Failure s)
++
++let show_outcome show = function
++  | Ok x -> show x
++  | Error e -> "error " ^ e
++;;
++
++let show_int_outcome = show_outcome string_of_int
++let equal_int_outcome = Result.equal ~ok:Int.equal ~error:String.equal
++
++let resolved_within name fut =
++  match settle fut with
++  | Some r -> outcome r
++  | None -> Printf.ksprintf failwith "%s is unresolved after %.0fs" name deadline
++;;
++
++module Log = struct
++  type 'a t =
++    { m : Mutex.t
++    ; mutable items : 'a list
++    }
++
++  let create () = { m = Mutex.create (); items = [] }
++  let add l x = Mutex.protect l.m (fun () -> l.items <- x :: l.items)
++  let to_list l = Mutex.protect l.m (fun () -> List.rev l.items)
++  let length l = Mutex.protect l.m (fun () -> List.length l.items)
++end
++
++let self () = Thread.id (Thread.self ())
++
++(* blocking calls run on threads of their own, so that a round can end *)
++let on_thread f =
++  let fut, promise = Fut.make () in
++  let run () = Fut.fulfill promise (try Ok (f ()) with e -> Error (Exn_bt.get e)) in
++  ignore (Thread.create run () : Thread.t);
++  fut
++;;
++
++let error s = Exn_bt.get_callstack 0 (Failure s)
++
++(* What went through a queue: values are unique and, per producer thread, increasing, so
++   FIFO shows as each consumer seeing each producer's values in increasing order. *)
++module Ledger = struct
++  type t =
++    { sent : (int * int option) Log.t
++    ; received : (int option * int) Log.t
++    ; pending_sends : (int * unit Fut.t) Log.t
++    ; pending_receives : int list Fut.t Log.t
++    ; closing : bool Atomic.t
++    }
++
++  let create () =
++    { sent = Log.create ()
++    ; received = Log.create ()
++    ; pending_sends = Log.create ()
++    ; pending_receives = Log.create ()
++    ; closing = Atomic.make false
++    }
++  ;;
++
++  let sent l ?by v = Log.add l.sent (v, by)
++  let received l ?by v = Log.add l.received (by, v)
++
++  let check_closed_raise l what =
++    if not (Atomic.get l.closing) then Printf.ksprintf failwith "%s raises Closed on an open queue" what
++  ;;
++
++  let distinct_received l =
++    let got = List.map snd (Log.to_list l.received) in
++    if List.length (List.sort_uniq Int.compare got) <> List.length got
++    then Printf.ksprintf failwith "a value is received twice: %s" (show_ints got)
++  ;;
++
++  let check_open l =
++    distinct_received l;
++    let maybe_sent =
++      List.map fst (Log.to_list l.sent) @ List.map fst (Log.to_list l.pending_sends)
++    in
++    List.iter
++      (fun (_, v) ->
++         if not (List.mem v maybe_sent) then Printf.ksprintf failwith "%d is received but never sent" v)
++      (Log.to_list l.received)
++  ;;
++
++  let check_closed ~is_closed l ~drain =
++    List.iter
++      (fun (v, f) ->
++         match settle f with
++         | None -> failwith "a blocked send is not woken by close"
++         | Some (Ok ()) -> sent l v
++         | Some (Error (e, _)) when is_closed e -> ()
++         | Some (Error (e, _)) -> Printf.ksprintf failwith "a send fails with %s" (Printexc.to_string e))
++      (Log.to_list l.pending_sends);
++    List.iter
++      (fun f ->
++         match settle f with
++         | None -> failwith "a blocked receive is not woken by close"
++         | Some (Ok vs) -> List.iter (fun v -> received l v) vs
++         | Some (Error (e, _)) when is_closed e -> ()
++         | Some (Error (e, _)) -> Printf.ksprintf failwith "a receive fails with %s" (Printexc.to_string e))
++      (Log.to_list l.pending_receives);
++    List.iter (fun v -> received l v) (drain ());
++    distinct_received l;
++    let sent_values = List.sort Int.compare (List.map fst (Log.to_list l.sent)) in
++    let got = List.sort Int.compare (List.map snd (Log.to_list l.received)) in
++    if not (List.equal Int.equal sent_values got)
++    then
++      Printf.ksprintf failwith "sent %s but received %s" (show_ints sent_values) (show_ints got);
++    let producer = Hashtbl.create 16 in
++    List.iter (fun (v, by) -> Option.iter (Hashtbl.replace producer v) by) (Log.to_list l.sent);
++    let last = Hashtbl.create 16 in
++    List.iter
++      (fun (by, v) ->
++         match by, Hashtbl.find_opt producer v with
++         | Some c, Some p ->
++           (match Hashtbl.find_opt last (c, p) with
++            | Some u when u > v ->
++              Printf.ksprintf failwith "a consumer receives %d after %d, which was sent after it" u v
++            | _ -> Hashtbl.replace last (c, p) v)
++         | _ -> ())
++      (Log.to_list l.received)
++  ;;
++end
++
++let blocked_queue_after_close = function
++  | Chan.Closed | Blocking_queue.Closed -> true
++  | _ -> false
++;;
++
++module%hegel_concurrent_state_machine Chan_machine = struct
++  type gen =
++    { chan : int Chan.t
++    ; ledger : Ledger.t
++    }
++
++  type state =
++    { mutable gen : gen
++    ; pool : Runner.t
++    ; fresh : int Atomic.t
++    }
++
++  let new_gen tc =
++    let max_size = draw tc (integers ~min_value:1 ~max_value:4 ()) in
++    { chan = Chan.create ~max_size (); ledger = Ledger.create () }
++  ;;
++
++  let fresh st = Atomic.fetch_and_add st.fresh 1
++
++  let try_push _tc () st =
++    let g = st.gen in
++    let v = fresh st in
++    match Chan.try_push g.chan v with
++    | true -> Ledger.sent g.ledger ~by:(self ()) v
++    | false -> ()
++    | exception Chan.Closed -> Ledger.check_closed_raise g.ledger "try_push"
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  let try_pop _tc () st =
++    let g = st.gen in
++    match Chan.try_pop g.chan with
++    | Some v -> Ledger.received g.ledger ~by:(self ()) v
++    | None -> ()
++    | exception Chan.Closed -> Ledger.check_closed_raise g.ledger "try_pop"
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  let push _tc () st =
++    let g = st.gen in
++    let v = fresh st in
++    Log.add g.ledger.pending_sends (v, Fut.spawn ~on:st.pool (fun () -> Chan.push g.chan v))
++  [@@rule]
++  ;;
++
++  let pop _tc () st =
++    let g = st.gen in
++    Log.add g.ledger.pending_receives (Fut.spawn ~on:st.pool (fun () -> [ Chan.pop g.chan ]))
++  [@@rule]
++  ;;
++
++  let close _tc () st =
++    let g = st.gen in
++    Atomic.set g.ledger.closing true;
++    Chan.close g.chan
++  [@@rule { weight = 0.3 }]
++  ;;
++
++  let drain chan () =
++    let rec go acc =
++      match Chan.try_pop chan with
++      | Some v -> go (v :: acc)
++      | None -> go acc
++      | exception Chan.Closed -> List.rev acc
++    in
++    go []
++  ;;
++
++  let conserved tc st =
++    let g = st.gen in
++    if Atomic.get g.ledger.closing
++    then (
++      Ledger.check_closed ~is_closed:blocked_queue_after_close g.ledger ~drain:(drain g.chan);
++      st.gen <- new_gen tc)
++    else Ledger.check_open g.ledger
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let with_pool ?(num_threads = 3) f =
++  let pool = Ws_pool.create ~num_threads () in
++  match f pool with
++  | x ->
++    Runner.shutdown pool;
++    x
++  | exception e ->
++    Runner.shutdown_without_waiting pool;
++    raise e
++;;
++
++let chan_machine concurrency tc =
++  with_pool (fun pool ->
++    let st = { Chan_machine.gen = Chan_machine.new_gen tc; pool; fresh = Atomic.make 0 } in
++    Fun.protect
++      ~finally:(fun () -> Chan.close st.gen.chan)
++      (fun () -> Chan_machine.run ~concurrency tc ~init:st ~min_concurrency:1 ~max_concurrency:4))
++;;
++
++let%hegel_test chan_threads tc = chan_machine Concurrency.threads tc
++let%hegel_test chan_domains tc = chan_machine Concurrency.domains tc
++
++module%hegel_concurrent_state_machine Bq_machine = struct
++  type gen =
++    { q : int Blocking_queue.t
++    ; ledger : Ledger.t
++    }
++
++  type state =
++    { mutable gen : gen
++    ; fresh : int Atomic.t
++    }
++
++  let new_gen () = { q = Blocking_queue.create (); ledger = Ledger.create () }
++  let fresh st = Atomic.fetch_and_add st.fresh 1
++
++  let push _tc () st =
++    let g = st.gen in
++    let v = fresh st in
++    match Blocking_queue.push g.q v with
++    | () -> Ledger.sent g.ledger ~by:(self ()) v
++    | exception Blocking_queue.Closed -> Ledger.check_closed_raise g.ledger "push"
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  let try_push _tc () st =
++    let g = st.gen in
++    let v = fresh st in
++    match Blocking_queue.try_push g.q v with
++    | true -> Ledger.sent g.ledger ~by:(self ()) v
++    | false -> ()
++    | exception Blocking_queue.Closed -> Ledger.check_closed_raise g.ledger "try_push"
++  [@@rule]
++  ;;
++
++  let try_pop tc () st =
++    let g = st.gen in
++    let force_lock = draw tc (booleans ()) in
++    Option.iter (Ledger.received g.ledger ~by:(self ())) (Blocking_queue.try_pop ~force_lock g.q)
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  let pop _tc () st =
++    let g = st.gen in
++    Log.add g.ledger.pending_receives (on_thread (fun () -> [ Blocking_queue.pop g.q ]))
++  [@@rule]
++  ;;
++
++  let transfer _tc () st =
++    let g = st.gen in
++    let batch () =
++      let into = Queue.create () in
++      Blocking_queue.transfer g.q into;
++      List.of_seq (Queue.to_seq into)
++    in
++    Log.add g.ledger.pending_receives (on_thread batch)
++  [@@rule]
++  ;;
++
++  let close _tc () st =
++    let g = st.gen in
++    Atomic.set g.ledger.closing true;
++    Blocking_queue.close g.q
++  [@@rule { weight = 0.3 }]
++  ;;
++
++  let conserved _tc st =
++    let g = st.gen in
++    if Atomic.get g.ledger.closing
++    then (
++      let drain () = List.of_seq (Blocking_queue.to_seq g.q) in
++      Ledger.check_closed ~is_closed:blocked_queue_after_close g.ledger ~drain;
++      if Blocking_queue.size g.q <> 0 then failwith "a drained queue is not empty";
++      st.gen <- new_gen ())
++    else Ledger.check_open g.ledger
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let bq_machine concurrency tc =
++  let st = { Bq_machine.gen = Bq_machine.new_gen (); fresh = Atomic.make 0 } in
++  Fun.protect
++    ~finally:(fun () -> Blocking_queue.close st.gen.q)
++    (fun () -> Bq_machine.run ~concurrency tc ~init:st ~min_concurrency:1 ~max_concurrency:4)
++;;
++
++let%hegel_test blocking_queue_threads tc = bq_machine Concurrency.threads tc
++let%hegel_test blocking_queue_domains tc = bq_machine Concurrency.domains tc
++
++(* Ws_deque holds 255 elements *)
++let ws_capacity = 255
++
++module%hegel_state_machine Deque_model = struct
++  type state =
++    { d : int Ws_deque.t
++    ; mutable m : int list (* bottom first *)
++    ; mutable next : int
++    }
++
++  let sexp_of_state st = Sexplib0.Sexp.Atom (show_ints st.m)
++
++  let push_one st =
++    let v = st.next in
++    st.next <- v + 1;
++    let expected = List.length st.m < ws_capacity in
++    let got = Ws_deque.push st.d v in
++    if got <> expected then Printf.ksprintf failwith "push gives %b with %d elements" got (List.length st.m);
++    if got then st.m <- v :: st.m
++  ;;
++
++  let push _tc st = push_one st [@@rule { weight = 3.0 }]
++
++  let push_many tc st =
++    let n = draw tc (integers ~min_value:1 ~max_value:300 ()) in
++    for _ = 1 to n do
++      push_one st
++    done
++  [@@rule { weight = 0.3 }]
++  ;;
++
++  let pop _tc st =
++    let got = Ws_deque.pop st.d in
++    let expected = List.nth_opt st.m 0 in
++    if not (Option.equal Int.equal got expected) then failwith "pop does not give the bottom element";
++    if Option.is_some got then st.m <- List.tl st.m
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  let steal _tc st =
++    let got = Ws_deque.steal st.d in
++    let expected = List.nth_opt (List.rev st.m) 0 in
++    if not (Option.equal Int.equal got expected) then failwith "steal does not give the top element";
++    if Option.is_some got then st.m <- List.rev (List.tl (List.rev st.m))
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  let size _tc st =
++    if Ws_deque.size st.d <> List.length st.m
++    then Printf.ksprintf failwith "size %d, expected %d" (Ws_deque.size st.d) (List.length st.m)
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let%hegel_test ws_deque_model tc =
++  Deque_model.run tc ~init:{ Deque_model.d = Ws_deque.create ~dummy:(-1) (); m = []; next = 0 }
++;;
++
++(* One owner, many stealers. Owner calls are serialised by [owner], so whichever worker makes
++   them is the owner for that call. *)
++module%hegel_concurrent_state_machine Deque_machine = struct
++  type state =
++    { d : int Ws_deque.t
++    ; owner : Mutex.t
++    ; mutable mine : int list (* pushed and not popped by the owner, newest first *)
++    ; mutable next : int
++    ; mutable gone : int list list (* [mine] when a pop found the deque empty *)
++    ; stolen : (int * int) Log.t
++    }
++
++  let sexp_of_state st = Sexplib0.Sexp.Atom (Printf.sprintf "%d held by the owner" (List.length st.mine))
++
++  let push_one st =
++    let v = st.next in
++    st.next <- v + 1;
++    if Ws_deque.push st.d v
++    then st.mine <- v :: st.mine
++    else if List.length st.mine < ws_capacity
++    then Printf.ksprintf failwith "push fails with %d elements at most" (List.length st.mine)
++  ;;
++
++  let push _tc () st = Mutex.protect st.owner (fun () -> push_one st) [@@rule { weight = 3.0 }]
++
++  let push_many tc () st =
++    let n = draw tc (integers ~min_value:1 ~max_value:300 ()) in
++    Mutex.protect st.owner (fun () ->
++      for _ = 1 to n do
++        push_one st
++      done)
++  [@@rule { weight = 0.3 }]
++  ;;
++
++  let pop _tc () st =
++    Mutex.protect st.owner (fun () ->
++      match Ws_deque.pop st.d, st.mine with
++      | None, mine ->
++        st.gone <- mine :: st.gone;
++        st.mine <- []
++      | Some v, top :: rest when v = top -> st.mine <- rest
++      | Some v, _ -> Printf.ksprintf failwith "pop gives %d, not the newest element" v)
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  let steal _tc () st =
++    match Ws_deque.steal st.d with
++    | Some v -> Log.add st.stolen (self (), v)
++    | None -> ()
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  let conserved _tc st =
++    let stolen = Log.to_list st.stolen in
++    let values = List.map snd stolen in
++    if List.length (List.sort_uniq Int.compare values) <> List.length values
++    then Printf.ksprintf failwith "an element is stolen twice: %s" (show_ints values);
++    let was_stolen v = List.mem v values in
++    List.iter
++      (fun mine ->
++         if not (List.for_all was_stolen mine) then failwith "pop gives None while elements are left")
++      st.gone;
++    (* steals take the oldest elements: the stolen part of [mine] is its oldest end *)
++    let left = List.filter (fun v -> not (was_stolen v)) st.mine in
++    if not (List.equal Int.equal left (List.filteri (fun i _ -> i < List.length left) st.mine))
++    then failwith "an element is stolen from below one that was not";
++    if Ws_deque.size st.d <> List.length left
++    then Printf.ksprintf failwith "size %d, %d elements left" (Ws_deque.size st.d) (List.length left);
++    let last = Hashtbl.create 8 in
++    List.iter
++      (fun (by, v) ->
++         (match Hashtbl.find_opt last by with
++          | Some u when u > v -> Printf.ksprintf failwith "a stealer takes %d after %d" v u
++          | _ -> ());
++         Hashtbl.replace last by v)
++      stolen
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let deque_machine concurrency tc =
++  let init =
++    { Deque_machine.d = Ws_deque.create ~dummy:(-1) ()
++    ; owner = Mutex.create ()
++    ; mine = []
++    ; next = 0
++    ; gone = []
++    ; stolen = Log.create ()
++    }
++  in
++  Deque_machine.run ~concurrency tc ~init ~min_concurrency:1 ~max_concurrency:4
++;;
++
++let%hegel_test ws_deque_threads tc = deque_machine Concurrency.threads tc
++let%hegel_test ws_deque_domains tc = deque_machine Concurrency.domains tc
++
++module%hegel_concurrent_state_machine Lock_machine = struct
++  type state =
++    { lock : int Lock.t
++    ; increments : int Atomic.t
++    ; seen : int Log.t
++    }
++
++  (* counted before the call, so that a read never runs ahead of the count *)
++  let update _tc () st =
++    Atomic.incr st.increments;
++    Lock.update st.lock succ
++  [@@rule]
++  ;;
++
++  let update_map _tc () st =
++    Atomic.incr st.increments;
++    Log.add st.seen (Lock.update_map st.lock (fun x -> x + 1, x))
++  [@@rule]
++  ;;
++
++  let with_raises tc () st =
++    let x = draw tc small in
++    match Lock.with_ st.lock (fun _ -> failwith (string_of_int x)) with
++    | () -> failwith "with_ swallows the exception"
++    | exception Failure s when String.equal s (string_of_int x) -> ()
++  [@@rule]
++  ;;
++
++  let with_reads _tc () st =
++    let x = Lock.with_ st.lock Fun.id in
++    if x > Atomic.get st.increments then Printf.ksprintf failwith "with_ reads %d, ahead of every update" x
++  [@@rule]
++  ;;
++
++  let counted _tc st =
++    let n = Lock.get st.lock in
++    if n <> Atomic.get st.increments
++    then Printf.ksprintf failwith "the lock holds %d after %d increments" n (Atomic.get st.increments);
++    let seen = Log.to_list st.seen in
++    if List.length (List.sort_uniq Int.compare seen) <> List.length seen
++    then Printf.ksprintf failwith "update_map sees a value twice: %s" (show_ints seen)
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let lock_machine concurrency tc =
++  let init = { Lock_machine.lock = Lock.create 0; increments = Atomic.make 0; seen = Log.create () } in
++  Lock_machine.run ~concurrency tc ~init ~min_concurrency:1 ~max_concurrency:4
++;;
++
++let%hegel_test lock_threads tc = lock_machine Concurrency.threads tc
++let%hegel_test lock_domains tc = lock_machine Concurrency.domains tc
++
++type kind =
++  | Ws
++  | Fifo
++  | Background
++
++let show_kind = function
++  | Ws -> "Ws_pool"
++  | Fifo -> "Fifo_pool"
++  | Background -> "Background_thread"
++;;
++
++let create_pool ?on_exn ?(num_threads = 2) = function
++  | Ws -> Ws_pool.create ?on_exn ~num_threads ()
++  | Fifo -> Fifo_pool.create ?on_exn ~num_threads ()
++  | Background -> Background_thread.create ?on_exn ()
++;;
++
++type resolution =
++  | Fulfill_ok
++  | Fulfill_error
++  | Try_cancel
++  | Idempotent
++
++let resolutions =
++  printed
++    (function
++      | Fulfill_ok -> "fulfill Ok"
++      | Fulfill_error -> "fulfill Error"
++      | Try_cancel -> "try_cancel"
++      | Idempotent -> "fulfill_idempotent")
++    (sampled_from [ Fulfill_ok; Fulfill_error; Try_cancel; Idempotent ])
++;;
++
++module%hegel_concurrent_state_machine Fut_machine = struct
++  type entry =
++    { fut : int Fut.t
++    ; promise : int Fut.promise
++    ; wins : (int, string) result Log.t
++    ; idempotent : bool Atomic.t
++    ; watchers : int Atomic.t
++    ; called : (int, string) result Log.t
++    ; derived :
++        (string * ((int, string) result -> (int, string) result) * int Fut.t * bool Atomic.t option) Log.t
++        (* an awaiting task's pool may be shut down, which loses the task *)
++    }
++
++  type lifecycle =
++    { kind : kind
++    ; runner : Runner.t
++    ; shut : bool Atomic.t
++    ; awaited : int Fut.t Log.t
++    }
++
++  type state =
++    { entries : entry Stateful.Concurrent_pool.t
++    ; all : entry Log.t
++    ; pool : Runner.t
++    ; lifecycle : lifecycle array
++    ; fresh : int Atomic.t
++    }
++
++  let new_entry () =
++    let fut, promise = Fut.make () in
++    { fut
++    ; promise
++    ; wins = Log.create ()
++    ; idempotent = Atomic.make false
++    ; watchers = Atomic.make 0
++    ; called = Log.create ()
++    ; derived = Log.create ()
++    }
++  ;;
++
++  let make tc () st =
++    let e = new_entry () in
++    Log.add st.all e;
++    Stateful.Concurrent_pool.add st.entries tc e
++  [@@rule { weight = 0.5 }]
++  ;;
++
++  let pick tc st = draw_silent tc (Stateful.Concurrent_pool.values_reusable st.entries)
++
++  let resolve tc () st =
++    let e = pick tc st in
++    let how = draw tc resolutions in
++    let v = Atomic.fetch_and_add st.fresh 1 in
++    let err = error (string_of_int v) in
++    try
++      match how with
++      | Fulfill_ok ->
++        (match Fut.fulfill e.promise (Ok v) with
++         | () -> Log.add e.wins (Ok v)
++         | exception Fut.Already_fulfilled -> ())
++      | Fulfill_error ->
++        (match Fut.fulfill e.promise (Error err) with
++         | () -> Log.add e.wins (outcome (Error err))
++         | exception Fut.Already_fulfilled -> ())
++      | Try_cancel -> if Fut.try_cancel e.promise err then Log.add e.wins (outcome (Error err))
++      | Idempotent ->
++        Atomic.set e.idempotent true;
++        Fut.fulfill_idempotent e.promise (Ok v)
++    with
++    | Runner.Shutdown -> failwith "resolving a promise raises Shutdown"
++  [@@rule]
++  ;;
++
++  let watch tc () st =
++    let e = pick tc st in
++    Atomic.incr e.watchers;
++    Fut.on_result e.fut (fun r -> Log.add e.called (outcome r))
++  [@@rule]
++  ;;
++
++  let derive tc () st =
++    let e = pick tc st in
++    let on_pool = draw tc (booleans ()) in
++    let on = if on_pool then Some st.pool else None in
++    let name, expect, fut =
++      match draw tc (integers ~min_value:0 ~max_value:6 ()) with
++      | 0 -> "await", Fun.id, Fut.spawn ~on:st.pool (fun () -> Fut.await e.fut)
++      | 1 when on_pool ->
++        let i = draw tc (integers ~min_value:0 ~max_value:(Array.length st.lifecycle - 1) ()) in
++        let l = st.lifecycle.(i) in
++        let name = "await on a " ^ show_kind l.kind in
++        (match Fut.spawn ~on:l.runner (fun () -> Fut.await e.fut) with
++         | fut ->
++           if Atomic.get l.shut then Printf.ksprintf failwith "%s that is shut down does not raise" name;
++           Log.add l.awaited e.fut;
++           name, Fun.id, fut
++         | exception Runner.Shutdown ->
++           if not (Atomic.get l.shut) then Printf.ksprintf failwith "%s raises Shutdown" name;
++           name, Fun.id, Fut.of_result (Ok 0))
++      | 1 -> "map", Result.map succ, Fut.map ?on ~f:succ e.fut
++      | 2 ->
++        ( "map raising"
++        , (fun r -> Result.bind r (fun _ -> Error (Printexc.to_string (Failure "map"))))
++        , Fut.map ?on ~f:(fun _ -> failwith "map") e.fut )
++      | 3 ->
++        ( "bind"
++        , Result.map (fun x -> 2 * x)
++        , Fut.bind ?on ~f:(fun x -> Fut.spawn ~on:st.pool (fun () -> 2 * x)) e.fut )
++      | 4 ->
++        ( "reify_error"
++        , (fun r -> Ok (Result.fold ~ok:Fun.id ~error:(fun _ -> -1) r))
++        , Fut.map ~f:(Result.fold ~ok:Fun.id ~error:(fun _ -> -1)) (Fut.reify_error e.fut) )
++      | 5 -> "wait_block", Fun.id, on_thread (fun () -> Fut.wait_block_exn e.fut)
++      | _ ->
++        ( "join_list"
++        , Result.map (fun x -> 2 * x)
++        , Fut.map ~f:(List.fold_left ( + ) 0) (Fut.join_list [ e.fut; e.fut ]) )
++    in
++    note tc name;
++    let shut =
++      Array.find_map
++        (fun l -> if String.equal name ("await on a " ^ show_kind l.kind) then Some l.shut else None)
++        st.lifecycle
++    in
++    if not (Fut.is_resolved fut && Option.is_some shut) then Log.add e.derived (name, expect, fut, shut)
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  (* moonpool/1: a pool shut down under a task awaiting an unresolved future *)
++  let shutdown tc () st =
++    let i = draw tc (integers ~min_value:0 ~max_value:(Array.length st.lifecycle - 1) ()) in
++    let l = st.lifecycle.(i) in
++    note tc (show_kind l.kind);
++    if Zoo.known && not (Atomic.get l.shut)
++    then (
++      let e = pick tc st in
++      Log.add l.awaited e.fut;
++      Log.add e.derived ("await on a " ^ show_kind l.kind, Fun.id, Fut.spawn ~on:l.runner (fun () -> Fut.await e.fut), Some l.shut));
++    if Zoo.known || List.for_all Fut.is_resolved (Log.to_list l.awaited)
++    then (
++      Runner.shutdown l.runner;
++      Atomic.set l.shut true)
++  [@@rule { group = "lifecycle"; weight = 0.5 }]
++  ;;
++
++  let consistent _tc st =
++    List.iter
++      (fun e ->
++         let wins = Log.to_list e.wins in
++         if List.length wins > 1 then failwith "two resolutions of one promise win";
++         match Fut.peek e.fut with
++         | None ->
++           if wins <> [] then failwith "a promise is unresolved after a fulfill won";
++           if Log.to_list e.called <> [] then failwith "on_result runs before the future is resolved";
++           List.iter
++             (fun (name, _, d, _) ->
++                if Fut.is_resolved d then Printf.ksprintf failwith "%s of an unresolved future is resolved" name)
++             (Log.to_list e.derived)
++         | Some r ->
++           let r = outcome r in
++           (match wins with
++            | [ w ] when not (equal_int_outcome w r) ->
++              Printf.ksprintf failwith "resolved with %s, but %s won" (show_int_outcome r) (show_int_outcome w)
++            | [] when not (Atomic.get e.idempotent) -> failwith "resolved, but no resolution won"
++            | _ -> ());
++           eventually "an on_result callback has not run" (fun () ->
++             Log.length e.called >= Atomic.get e.watchers);
++           List.iter
++             (fun c ->
++                if not (equal_int_outcome c r)
++                then Printf.ksprintf failwith "on_result gets %s, not %s" (show_int_outcome c) (show_int_outcome r))
++             (Log.to_list e.called);
++           if Log.length e.called <> Atomic.get e.watchers then failwith "an on_result callback runs twice";
++           List.iter
++             (fun (name, expect, d, shut) ->
++                let lost = match shut with Some s -> Atomic.get s && not (Fut.is_resolved d) | None -> false in
++                if not lost then
++                let got = resolved_within name d in
++                if not (equal_int_outcome got (expect r))
++                then
++                  Printf.ksprintf failwith "%s gives %s, expected %s" name (show_int_outcome got)
++                    (show_int_outcome (expect r)))
++             (Log.to_list e.derived))
++      (Log.to_list st.all)
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let fut_machine concurrency tc =
++  with_pool (fun pool ->
++    let lifecycle kind =
++      { Fut_machine.kind; runner = create_pool kind; shut = Atomic.make false; awaited = Log.create () }
++    in
++    let init =
++      { Fut_machine.entries = Stateful.Concurrent_pool.create tc
++      ; all = Log.create ()
++      ; pool
++      ; lifecycle = [| lifecycle Ws; lifecycle Fifo; lifecycle Background |]
++      ; fresh = Atomic.make 0
++      }
++    in
++    let first = Fut_machine.new_entry () in
++    Log.add init.all first;
++    Stateful.Concurrent_pool.add init.entries tc first;
++    (* resolving every promise ends the threads blocked in wait_block *)
++    let release () =
++      List.iter
++        (fun e -> try Fut.cancel e.Fut_machine.promise (error "end") with _ -> ())
++        (Log.to_list init.all);
++      Array.iter (fun l -> Runner.shutdown_without_waiting l.Fut_machine.runner) init.lifecycle
++    in
++    Fun.protect ~finally:release (fun () ->
++      Fut_machine.run ~concurrency tc ~init ~min_concurrency:1 ~max_concurrency:4))
++;;
++
++let%hegel_test fut_threads tc = fut_machine Concurrency.threads tc
++let%hegel_test fut_domains tc = fut_machine Concurrency.domains tc
++
++let tls_key : int Task_local_storage.t = Task_local_storage.create ()
++
++module%hegel_concurrent_state_machine Runner_machine = struct
++  type pool =
++    { kind : kind
++    ; runner : Runner.t
++    ; shut : bool Atomic.t
++    ; jobs : (string * (int, string) result * int Fut.t) Log.t
++    ; async_raised : string Log.t
++    ; async_expected : string Log.t
++    }
++
++  type state =
++    { pools : pool array
++    ; fresh : int Atomic.t
++    }
++
++  let sexp_of_state st =
++    Sexplib0.Sexp.List
++      (Array.to_list
++         (Array.map
++            (fun p ->
++               Sexplib0.Sexp.Atom
++                 (Printf.sprintf "%s%s" (show_kind p.kind) (if Atomic.get p.shut then " (shut down)" else "")))
++            st.pools))
++  ;;
++
++  let pick tc st =
++    let i = draw tc (integers ~min_value:0 ~max_value:(Array.length st.pools - 1) ()) in
++    note tc (show_kind st.pools.(i).kind);
++    st.pools.(i)
++  ;;
++
++  let fresh st = Atomic.fetch_and_add st.fresh 1
++
++  let submit p name expect job =
++    match Fut.spawn ~on:p.runner job with
++    | fut ->
++      if Atomic.get p.shut then Printf.ksprintf failwith "%s on a shut down pool does not raise" name;
++      Log.add p.jobs (name, expect, fut)
++    | exception Runner.Shutdown ->
++      if not (Atomic.get p.shut) then Printf.ksprintf failwith "%s on a live pool raises Shutdown" name
++  ;;
++
++  let spawn tc () st =
++    let p = pick tc st in
++    let v = fresh st in
++    if draw tc (booleans ())
++    then submit p "a raising task" (outcome (Error (error (string_of_int v)))) (fun () -> failwith (string_of_int v))
++    else submit p "a task" (Ok v) (fun () -> v)
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  let spawn_tree tc () st =
++    let p = pick tc st in
++    let children = draw tc (lists small ~max_size:4 ()) in
++    let job () =
++      let futs = List.map (fun x -> Fut.spawn_on_current_runner (fun () -> x)) children in
++      List.fold_left (fun acc f -> acc + Fut.await f) 0 futs
++    in
++    submit p "a task awaiting its children" (Ok (List.fold_left ( + ) 0 children)) job
++  [@@rule]
++  ;;
++
++  let yield_and_tls tc () st =
++    let p = pick tc st in
++    let v = fresh st in
++    let yields = draw tc (integers ~min_value:0 ~max_value:3 ()) in
++    let job () =
++      Task_local_storage.set tls_key v;
++      for _ = 1 to yields do
++        Moonpool.yield ()
++      done;
++      Fut.await (Fut.spawn_on_current_runner Fun.id);
++      Task_local_storage.get_exn tls_key
++    in
++    submit p "a task yielding with task-local storage" (Ok v) job
++  [@@rule]
++  ;;
++
++  let for_ tc () st =
++    let p = pick tc st in
++    let n = draw tc (integers ~min_value:0 ~max_value:8 ()) in
++    let how = draw tc (printed (fun i -> List.nth [ "for_"; "for_list"; "for_iter" ] i) (integers ~min_value:0 ~max_value:2 ())) in
++    let counts = Array.init n (fun _ -> Atomic.make 0) in
++    let once () = Array.fold_left (fun acc c -> if Atomic.get c = 1 then acc + 1 else acc) 0 counts in
++    let bump i = Atomic.incr counts.(i) in
++    let l = List.init n Fun.id in
++    match
++      match how with
++      | 0 -> Fut.for_ ~on:p.runner n bump
++      | 1 -> Fut.for_list ~on:p.runner l bump
++      | _ -> Fut.for_iter ~on:p.runner (fun k -> List.iter k l) bump
++    with
++    | fut -> submit p "a parallel for" (Ok n) (fun () -> Fut.await fut; once ())
++    | exception Runner.Shutdown ->
++      if not (Atomic.get p.shut) then failwith "a parallel for on a live pool raises Shutdown"
++  [@@rule]
++  ;;
++
++  let fork_join tc () st =
++    let p = pick tc st in
++    let l = draw tc (lists small ~max_size:12 ()) in
++    let chunk_size = draw tc (optional (integers ~min_value:1 ~max_value:5 ())) in
++    let job () =
++      let a, b =
++        Fork_join.both
++          (fun () -> List.fold_left ( + ) 0 (Fork_join.map_list ?chunk_size succ l))
++          (fun () -> List.length l)
++      in
++      a - b
++    in
++    submit p "fork-join" (Ok (List.fold_left ( + ) 0 l)) job
++  [@@rule]
++  ;;
++
++  let run_wait_block tc () st =
++    let p = pick tc st in
++    let v = fresh st in
++    let raising = draw tc (booleans ()) in
++    match Runner.run_wait_block p.runner (fun () -> if raising then failwith (string_of_int v) else v) with
++    | got ->
++      if raising || got <> v then Printf.ksprintf failwith "run_wait_block gives %d" got
++    | exception Failure s when raising && String.equal s (string_of_int v) -> ()
++    | exception Runner.Shutdown when Atomic.get p.shut -> ()
++  [@@rule]
++  ;;
++
++  let run_async_raising tc () st =
++    let p = pick tc st in
++    let v = fresh st in
++    match Runner.run_async p.runner (fun () -> failwith (string_of_int v)) with
++    | () -> Log.add p.async_expected (Printexc.to_string (Failure (string_of_int v)))
++    | exception Runner.Shutdown ->
++      if not (Atomic.get p.shut) then failwith "run_async on a live pool raises Shutdown"
++  [@@rule { weight = 0.5 }]
++  ;;
++
++  (* Fifo_pool and Background_thread lose tasks suspended at shutdown (moonpool/2, found by
++     shutdown_finishes_work), so their work is let finish first. *)
++  let shutdown tc () st =
++    let p = pick tc st in
++    if p.kind <> Ws then List.iter (fun (name, _, f) -> ignore (resolved_within name f)) (Log.to_list p.jobs);
++    Runner.shutdown p.runner;
++    Atomic.set p.shut true;
++    List.iter
++      (fun (name, _, f) ->
++         if not (Fut.is_resolved f) then Printf.ksprintf failwith "shutdown returns before %s is done" name)
++      (Log.to_list p.jobs)
++  [@@rule { group = "shutdown"; weight = 0.2 }]
++  ;;
++
++  let done_right _tc st =
++    Array.iter
++      (fun p ->
++         List.iter
++           (fun (name, expect, f) ->
++              let got = resolved_within name f in
++              if not (equal_int_outcome got expect)
++              then Printf.ksprintf failwith "%s gives %s, expected %s" name (show_int_outcome got) (show_int_outcome expect))
++           (Log.to_list p.jobs);
++         eventually "on_exn has not seen a raising run_async" (fun () ->
++           Log.length p.async_raised >= Log.length p.async_expected);
++         let sorted l = List.sort String.compare (Log.to_list l) in
++         if not (List.equal String.equal (sorted p.async_raised) (sorted p.async_expected))
++         then failwith "on_exn sees other exceptions than the raising tasks'")
++      st.pools
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let runner_machine concurrency tc =
++  let pool kind =
++    let async_raised = Log.create () in
++    let on_exn e _ = Log.add async_raised (Printexc.to_string e) in
++    { Runner_machine.kind
++    ; runner = create_pool ~on_exn kind
++    ; shut = Atomic.make false
++    ; jobs = Log.create ()
++    ; async_raised
++    ; async_expected = Log.create ()
++    }
++  in
++  let pools = [| pool Ws; pool Fifo; pool Background |] in
++  match Runner_machine.run ~concurrency tc ~init:{ pools; fresh = Atomic.make 0 } ~min_concurrency:1 ~max_concurrency:4 with
++  | () -> Array.iter (fun p -> Runner.shutdown p.Runner_machine.runner) pools
++  | exception e ->
++    Array.iter (fun p -> Runner.shutdown_without_waiting p.Runner_machine.runner) pools;
++    raise e
++;;
++
++let%hegel_test runner_threads tc = runner_machine Concurrency.threads tc
++let%hegel_test runner_domains tc = runner_machine Concurrency.domains tc
++
++module%hegel_state_machine Chan_model = struct
++  type state =
++    { chan : int Chan.t
++    ; max_size : int
++    ; q : int Queue.t
++    ; mutable closed : bool
++    ; mutable next : int
++    }
++
++  let sexp_of_state st =
++    Sexplib0.Sexp.Atom
++      (Printf.sprintf "%s%s" (show_ints (List.of_seq (Queue.to_seq st.q))) (if st.closed then " closed" else ""))
++  ;;
++
++  let fresh st =
++    st.next <- st.next + 1;
++    st.next
++  ;;
++
++  let try_push _tc st =
++    let v = fresh st in
++    match Chan.try_push st.chan v, st.closed with
++    | _, true -> failwith "try_push on a closed channel does not raise"
++    | true, false ->
++      if Queue.length st.q >= st.max_size
++      then Printf.ksprintf failwith "try_push succeeds with %d elements" (Queue.length st.q);
++      Queue.push v st.q
++    | false, false ->
++      if Queue.length st.q < st.max_size then failwith "try_push fails on a channel with room"
++    | exception Chan.Closed -> if not st.closed then failwith "try_push raises Closed"
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  (* outside a runner a push may not block *)
++  let push _tc st =
++    if st.closed || Queue.length st.q < st.max_size
++    then (
++      let v = fresh st in
++      match Chan.push st.chan v with
++      | () ->
++        if st.closed then failwith "push on a closed channel does not raise";
++        Queue.push v st.q
++      | exception Chan.Closed -> if not st.closed then failwith "push raises Closed")
++  [@@rule]
++  ;;
++
++  let try_pop _tc st =
++    match Chan.try_pop st.chan with
++    | got ->
++      if not (Option.equal Int.equal got (Queue.take_opt st.q)) then failwith "try_pop gives the wrong element"
++    | exception Chan.Closed ->
++      if not (st.closed && Queue.is_empty st.q) then failwith "try_pop raises Closed"
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  let pop _tc st =
++    if st.closed || not (Queue.is_empty st.q)
++    then (
++      match Chan.pop st.chan with
++      | got -> if not (Option.equal Int.equal (Some got) (Queue.take_opt st.q)) then failwith "pop gives the wrong element"
++      | exception Chan.Closed -> if not (Queue.is_empty st.q) then failwith "pop raises Closed")
++  [@@rule]
++  ;;
++
++  let close _tc st =
++    Chan.close st.chan;
++    st.closed <- true
++  [@@rule { weight = 0.3 }]
++  ;;
++end
++
++(* moonpool/3: a channel of max_size 0 holds an element *)
++let max_sizes =
++  let sizes = integers ~min_value:1 ~max_value:4 () in
++  if Zoo.known then one_of [ printed string_of_int (just 0); sizes ] else sizes
++;;
++
++let%hegel_test chan_model tc =
++  let max_size = draw tc max_sizes in
++  Chan_model.run tc ~init:{ Chan_model.chan = Chan.create ~max_size (); max_size; q = Queue.create (); closed = false; next = 0 }
++;;
++
++module%hegel_state_machine Bq_model = struct
++  type state =
++    { q : int Blocking_queue.t
++    ; m : int Queue.t
++    ; mutable closed : bool
++    ; mutable next : int
++    }
++
++  let sexp_of_state st =
++    Sexplib0.Sexp.Atom
++      (Printf.sprintf "%s%s" (show_ints (List.of_seq (Queue.to_seq st.m))) (if st.closed then " closed" else ""))
++  ;;
++
++  let push _tc st =
++    st.next <- st.next + 1;
++    match Blocking_queue.push st.q st.next with
++    | () ->
++      if st.closed then failwith "push on a closed queue does not raise";
++      Queue.push st.next st.m
++    | exception Blocking_queue.Closed -> if not st.closed then failwith "push raises Closed"
++  [@@rule { weight = 3.0 }]
++  ;;
++
++  let try_pop _tc st =
++    let got = Blocking_queue.try_pop ~force_lock:true st.q in
++    if not (Option.equal Int.equal got (Queue.take_opt st.m)) then failwith "try_pop gives the wrong element"
++  [@@rule { weight = 2.0 }]
++  ;;
++
++  (* outside a runner a pop may not block *)
++  let pop _tc st =
++    if st.closed || not (Queue.is_empty st.m)
++    then (
++      match Blocking_queue.pop st.q with
++      | got -> if not (Option.equal Int.equal (Some got) (Queue.take_opt st.m)) then failwith "pop gives the wrong element"
++      | exception Blocking_queue.Closed -> if not (Queue.is_empty st.m) then failwith "pop raises Closed")
++  [@@rule]
++  ;;
++
++  let transfer _tc st =
++    if st.closed || not (Queue.is_empty st.m)
++    then (
++      let into = Queue.create () in
++      match Blocking_queue.transfer st.q into with
++      | () ->
++        if not (List.equal Int.equal (List.of_seq (Queue.to_seq into)) (List.of_seq (Queue.to_seq st.m)))
++        then failwith "transfer moves the wrong elements";
++        Queue.clear st.m
++      | exception Blocking_queue.Closed -> if not (Queue.is_empty st.m) then failwith "transfer raises Closed")
++  [@@rule]
++  ;;
++
++  let close _tc st =
++    Blocking_queue.close st.q;
++    st.closed <- true
++  [@@rule { weight = 0.3 }]
++  ;;
++
++  let size _tc st =
++    if Blocking_queue.size st.q <> Queue.length st.m
++    then Printf.ksprintf failwith "size %d, expected %d" (Blocking_queue.size st.q) (Queue.length st.m)
++  [@@invariant { always_check = true }]
++  ;;
++end
++
++let%hegel_test blocking_queue_model tc =
++  Bq_model.run tc ~init:{ Bq_model.q = Blocking_queue.create (); m = Queue.create (); closed = false; next = 0 }
++;;
++
++type source =
++  | Ready of (int, string) result
++  | Later of (int, string) result
++  | Never
++
++let show_source = function
++  | Ready r -> "ready " ^ show_int_outcome r
++  | Later r -> "later " ^ show_int_outcome r
++  | Never -> "never"
++;;
++
++let sources name =
++  let r =
++    printed show_int_outcome
++      (one_of [ printed show_int_outcome (map (fun x -> Ok x) small); printed show_int_outcome (just (Error name)) ])
++  in
++  printed show_source (one_of [ printed show_source (map (fun r -> Ready r) r); printed show_source (map (fun r -> Later r) r); printed show_source (just Never) ])
++;;
++
++let to_or_error r = Result.map_error error r
++
++let combinators =
++  [ "both"; "choose"; "choose_same"; "join_list"; "join_array"; "wait_list"; "map_list"; "reify_error"; "bind"
++  ; "join"; "let+ and+"
++  ]
++;;
++
++let%hegel_test fut_combinators tc =
++  let sa = draw tc (sources "a") in
++  let sb = draw tc (sources "b") in
++  let b_first = draw tc (booleans ()) in
++  let c = draw tc (printed Fun.id (sampled_from combinators)) in
++  let make = function
++    | Ready r -> Fut.of_result (to_or_error r), None
++    | Later r ->
++      let f, p = Fut.make () in
++      f, Some (p, r)
++    | Never -> fst (Fut.make ()), None
++  in
++  let fa, pa = make sa in
++  let fb, pb = make sb in
++  let either = function
++    | Either.Left x -> x
++    | Either.Right y -> 100 + y
++  in
++  let fut =
++    match c with
++    | "both" -> Fut.map ~f:(fun (x, y) -> (10 * x) + y) (Fut.both fa fb)
++    | "choose" -> Fut.map ~f:either (Fut.choose fa fb)
++    | "choose_same" -> Fut.choose_same fa fb
++    | "join_list" -> Fut.map ~f:(fun l -> List.fold_left (fun acc x -> (10 * acc) + x) 0 l) (Fut.join_list [ fa; fb ])
++    | "join_array" ->
++      Fut.map ~f:(fun a -> Array.fold_left (fun acc x -> (10 * acc) + x) 0 a) (Fut.join_array [| fa; fb |])
++    | "wait_list" -> Fut.map ~f:(fun () -> 0) (Fut.wait_list [ fa; fb ])
++    | "map_list" ->
++      Fut.map ~f:(fun l -> List.fold_left (fun acc x -> (10 * acc) + x) 0 l) (Fut.map_list ~f:(fun f -> f) [ fa; fb ])
++    | "reify_error" -> Fut.map ~f:(Result.fold ~ok:Fun.id ~error:(fun _ -> -1)) (Fut.reify_error fa)
++    | "bind" -> Fut.bind ~f:(fun x -> if x mod 2 = 0 then fb else Fut.return x) fa
++    | "join" -> Fut.join (Fut.map ~f:(fun _ -> fb) fa)
++    | _ ->
++      Fut.Infix.(
++        let+ x = fa
++        and+ y = fb in
++        (10 * x) + y)
++  in
++  let resolve = function
++    | Some (p, r) -> Fut.fulfill p (to_or_error r)
++    | None -> ()
++  in
++  if b_first then (resolve pb; resolve pa) else (resolve pa; resolve pb);
++  let final = function
++    | Ready r | Later r -> Some r
++    | Never -> None
++  in
++  let ra = Option.map (Result.map_error failure) (final sa) in
++  let rb = Option.map (Result.map_error failure) (final sb) in
++  let errors = List.filter_map (function Some (Error _ as e) -> Some e | _ -> None) [ ra; rb ] in
++  let pair f =
++    match ra, rb with
++    | Some (Ok x), Some (Ok y) -> [ Ok (f x y) ]
++    | _ -> errors
++  in
++  let pick f =
++    match ra, rb with
++    | Some (Error _), Some (Error _) -> errors
++    | _ ->
++      List.filter_map (function Some (Ok x), g -> Some (Ok (g x)) | _ -> None) [ ra, Fun.id; rb, f ]
++  in
++  (* the acceptable results; none means the future stays unresolved *)
++  let acceptable =
++    match c with
++    | "both" | "join_list" | "join_array" | "map_list" | "let+ and+" -> pair (fun x y -> (10 * x) + y)
++    | "wait_list" -> pair (fun _ _ -> 0)
++    | "choose" -> pick (fun y -> 100 + y)
++    | "choose_same" -> pick Fun.id
++    | "reify_error" -> Option.to_list (Option.map (fun r -> Ok (Result.fold ~ok:Fun.id ~error:(fun _ -> -1) r)) ra)
++    | "bind" ->
++      (match ra with
++       | Some (Ok x) when x mod 2 = 0 -> Option.to_list rb
++       | Some r -> [ r ]
++       | None -> [])
++    | _ ->
++      (match ra with
++       | Some (Ok _) -> Option.to_list rb
++       | Some r -> [ r ]
++       | None -> [])
++  in
++  match Option.map outcome (Fut.peek fut), acceptable with
++  | None, [] -> ()
++  | None, _ -> failwith "unresolved"
++  | Some got, [] -> Printf.ksprintf failwith "resolved with %s" (show_int_outcome got)
++  | Some got, l ->
++    if not (List.exists (equal_int_outcome got) l)
++    then
++      Printf.ksprintf failwith "gives %s, expected one of %s" (show_int_outcome got)
++        (String.concat ", " (List.map show_int_outcome l))
++;;
++
++(* moonpool/4: a negative count *)
++let for_counts =
++  let counts = integers ~min_value:0 ~max_value:12 () in
++  if Zoo.known then one_of [ integers ~min_value:(-3) ~max_value:(-1) (); counts ] else counts
++;;
++
++let%hegel_test fut_for_ tc =
++  let n = draw tc for_counts in
++  with_pool (fun pool ->
++    let counts = Array.init (max n 0) (fun _ -> Atomic.make 0) in
++    let fut = Fut.for_ ~on:pool n (fun i -> Atomic.incr counts.(i)) in
++    match settle ~within:0.5 fut with
++    | None -> failwith "never resolves"
++    | Some (Error (e, _)) -> Printf.ksprintf failwith "fails with %s" (Printexc.to_string e)
++    | Some (Ok ()) ->
++      Array.iteri
++        (fun i c -> if Atomic.get c <> 1 then Printf.ksprintf failwith "runs f %d %d times" i (Atomic.get c))
++        counts)
++;;
++
++let%hegel_test fork_join_matches_list tc =
++  let l = draw tc (lists small ~max_size:30 ()) in
++  let chunk_size = draw tc (optional (integers ~min_value:1 ~max_value:8 ())) in
++  let raise_at = draw tc (optional (integers ~min_value:0 ~max_value:29 ())) in
++  let how = draw tc (printed Fun.id (sampled_from [ "map_list"; "map_array"; "all_init"; "all_list"; "for_" ])) in
++  let f i x = if Option.equal Int.equal (Some i) raise_at then failwith "f" else (2 * x) + i in
++  let expected =
++    match List.mapi f l with
++    | l -> Ok l
++    | exception Failure s -> Error s
++  in
++  let indexed = List.mapi (fun i x -> i, x) l in
++  let run () =
++    match how with
++    | "map_list" -> Fork_join.map_list ?chunk_size (fun (i, x) -> f i x) indexed
++    | "map_array" -> Array.to_list (Fork_join.map_array ?chunk_size (fun (i, x) -> f i x) (Array.of_list indexed))
++    | "all_init" -> Fork_join.all_init ?chunk_size (List.length l) (fun i -> f i (List.nth l i))
++    | "all_list" -> Fork_join.all_list ?chunk_size (List.map (fun (i, x) () -> f i x) indexed)
++    | _ ->
++      let out = Array.make (List.length l) 0 in
++      Fork_join.for_ ?chunk_size (List.length l) (fun lo hi ->
++        for i = lo to hi do
++          out.(i) <- f i (List.nth l i)
++        done);
++      Array.to_list out
++  in
++  let got =
++    with_pool (fun pool ->
++      match Runner.run_wait_block pool run with
++      | l -> Ok l
++      | exception Failure s -> Error s)
++  in
++  if not (Result.equal ~ok:(List.equal Int.equal) ~error:String.equal got expected)
++  then
++    Printf.ksprintf failwith "gives %s"
++      (match got with
++       | Ok l -> show_ints l
++       | Error s -> s)
++;;
++
++let%hegel_test main_runs_tasks tc =
++  let children = draw tc (lists small ~max_size:6 ()) in
++  let yields = draw tc (integers ~min_value:0 ~max_value:3 ()) in
++  let raising = draw tc (booleans ()) in
++  let got =
++    with_pool (fun pool ->
++      match
++        Main.main (fun main ->
++          let futs =
++            List.mapi (fun i x -> Fut.spawn ~on:(if i mod 2 = 0 then main else pool) (fun () -> x)) children
++          in
++          for _ = 1 to yields do
++            Moonpool.yield ()
++          done;
++          let sum = List.fold_left (fun acc f -> acc + Fut.await f) 0 futs in
++          if raising then failwith "main" else sum)
++      with
++      | x -> Ok x
++      | exception Failure s -> Error s)
++  in
++  let expected = if raising then Error "main" else Ok (List.fold_left ( + ) 0 children) in
++  if not (Result.equal ~ok:Int.equal ~error:String.equal got expected)
++  then Printf.ksprintf failwith "main gives %s" (match got with Ok x -> string_of_int x | Error s -> s)
++;;
++
++(* moonpool/5: the thread that ran Main.main *)
++let after_main_threads =
++  let fresh = printed (fun _ -> "a fresh thread") (just false) in
++  if Zoo.known then one_of [ printed (fun _ -> "the thread that ran Main.main") (just true); fresh ] else fresh
++;;
++
++let%hegel_test combinators_after_main tc =
++  let same_thread = draw tc after_main_threads in
++  let x = draw tc small in
++  let how = draw tc (printed Fun.id (sampled_from [ "map"; "bind"; "let+"; "spawn_on_current_runner"; "current runner" ])) in
++  ignore (Main.main (fun _ -> x) : int);
++  let check () =
++    let got =
++      match how with
++      | "current runner" -> Option.fold ~none:(Ok x) ~some:(fun _ -> Error "a current runner") (Runner.get_current_runner ())
++      | "map" -> Option.get (Option.map outcome (Fut.peek (Fut.map ~f:Fun.id (Fut.return x))))
++      | "bind" -> Option.get (Option.map outcome (Fut.peek (Fut.bind ~f:Fut.return (Fut.return x))))
++      | "let+" ->
++        let p, promise = Fut.make () in
++        let f = Fut.Infix.(let+ v = p in v) in
++        Fut.fulfill promise (Ok x);
++        Option.get (Option.map outcome (Fut.peek f))
++      | _ ->
++        (match Fut.spawn_on_current_runner (fun () -> x) with
++         | _ -> Error "spawns"
++         | exception Failure _ -> Ok x)
++    in
++    if not (equal_int_outcome got (Ok x)) then Printf.ksprintf failwith "%s gives %s" how (show_int_outcome got)
++  in
++  match same_thread with
++  | true -> check ()
++  | false -> Fut.wait_block_exn (on_thread check)
++;;
++
++type waiter =
++  | Callback
++  | Wait_block
++  | Await_on of kind
++  | Await_on_shut_down of kind
++
++let show_waiter = function
++  | Callback -> "on_result"
++  | Wait_block -> "wait_block"
++  | Await_on k -> "await on a " ^ show_kind k
++  | Await_on_shut_down k -> "await on a shut down " ^ show_kind k
++;;
++
++let kinds = printed show_kind (sampled_from [ Ws; Fifo; Background ])
++
++(* moonpool/1: a task suspended on a pool that is then shut down *)
++let waiters =
++  let live =
++    List.map (printed show_waiter) [ just Callback; just Wait_block; map (fun k -> Await_on k) kinds ]
++  in
++  printed
++    (fun l -> "[" ^ String.concat "; " (List.map show_waiter l) ^ "]")
++    (lists
++       ~min_size:1
++       (one_of
++          (if Zoo.known then printed show_waiter (map (fun k -> Await_on_shut_down k) kinds) :: live else live))
++       ~max_size:5
++       ())
++;;
++
++let%hegel_test fulfill_wakes_every_waiter tc =
++  let waiters = draw tc waiters in
++  let how = draw tc resolutions in
++  let fut, promise = Fut.make () in
++  let pools = ref [] in
++  let watch = function
++    | Callback ->
++      let seen, p = Fut.make () in
++      Fut.on_result fut (fun r -> Fut.fulfill_idempotent p (Ok (outcome r)));
++      Some ("on_result", seen)
++    | Wait_block -> Some ("wait_block", on_thread (fun () -> outcome (Fut.wait_block fut)))
++    | Await_on k ->
++      let pool = create_pool k in
++      pools := pool :: !pools;
++      Some ("await on a " ^ show_kind k, Fut.spawn ~on:pool (fun () -> outcome (Ok (Fut.await fut))))
++    | Await_on_shut_down k ->
++      let pool = create_pool k in
++      ignore (Fut.spawn ~on:pool (fun () -> Fut.await fut) : int Fut.t);
++      (* shutdown runs the queued task, which then suspends *)
++      Runner.shutdown pool;
++      None
++  in
++  let watched = List.filter_map watch waiters in
++  let err = error "cancelled" in
++  let expected = match how with Fulfill_ok | Idempotent -> Ok 1 | _ -> outcome (Error err) in
++  Fun.protect
++    ~finally:(fun () -> List.iter Runner.shutdown !pools)
++    (fun () ->
++      (match
++         match how with
++         | Fulfill_ok -> Fut.fulfill promise (Ok 1)
++         | Fulfill_error -> Fut.fulfill promise (Error err)
++         | Try_cancel -> ignore (Fut.try_cancel promise err : bool)
++         | Idempotent -> Fut.fulfill_idempotent promise (Ok 1)
++       with
++       | () -> ()
++       | exception e -> Printf.ksprintf failwith "resolving the promise raises %s" (Printexc.to_string e));
++      List.iter
++        (fun (name, f) ->
++           match settle ~within:1.0 f with
++           | None -> Printf.ksprintf failwith "%s is not woken" name
++           | Some r ->
++             let got = Result.join (outcome r) in
++             if not (equal_int_outcome got expected)
++             then Printf.ksprintf failwith "%s sees %s" name (show_int_outcome got))
++        watched)
++;;
++
++type task =
++  | Plain
++  | Await_child
++  | Yield
++
++let show_task = function
++  | Plain -> "plain"
++  | Await_child -> "awaiting a child task"
++  | Yield -> "yielding"
++;;
++
++(* moonpool/2: a task of a Fifo_pool or Background_thread suspended at shutdown *)
++let shutdown_shapes =
++  let suspending = printed show_task (sampled_from [ Await_child; Yield ]) in
++  let plain = printed show_task (just Plain) in
++  printed (fun (kind, task, n) -> Printf.sprintf "%s, a %s task and %d plain ones" (show_kind kind) (show_task task) n)
++  @@ flat_map
++    (fun kind ->
++       map
++         (fun (task, plain_tasks) -> kind, task, plain_tasks)
++         (tuples2
++            (if Zoo.known || kind = Ws then one_of [ suspending; plain ] else plain)
++            (integers ~min_value:0 ~max_value:3 ())))
++    (if Zoo.known then printed show_kind (sampled_from [ Fifo; Background; Ws ]) else kinds)
++;;
++
++let%hegel_test shutdown_finishes_work tc =
++  let shape = draw tc shutdown_shapes in
++  let kind, task, plain_tasks = shape in
++  (* the lost resumption's Shutdown reaches on_exn; the unresolved future is the failure *)
++  let pool = create_pool ~on_exn:(fun _ _ -> ()) kind in
++  let gate = Atomic.make false in
++  let started = Atomic.make false in
++  let wait_gate () =
++    while not (Atomic.get gate) do
++      Thread.yield ()
++    done
++  in
++  let job () =
++    match task with
++    | Plain ->
++      Atomic.set started true;
++      0
++    | Await_child ->
++      let child =
++        Fut.spawn_on_current_runner (fun () ->
++          wait_gate ();
++          1)
++      in
++      Atomic.set started true;
++      Fut.await child
++    | Yield ->
++      Atomic.set started true;
++      wait_gate ();
++      Moonpool.yield ();
++      2
++  in
++  let fut = Fut.spawn ~on:pool job in
++  let plain = List.init plain_tasks (fun i -> Fut.spawn ~on:pool (fun () -> i)) in
++  eventually "the task has not started" (fun () -> Atomic.get started);
++  Runner.shutdown_without_waiting pool;
++  Atomic.set gate true;
++  Runner.shutdown pool;
++  let expected = match task with Plain -> 0 | Await_child -> 1 | Yield -> 2 in
++  (match Fut.peek fut with
++   | None -> failwith "the task is unresolved after shutdown"
++   | Some r ->
++     if not (equal_int_outcome (outcome r) (Ok expected))
++     then Printf.ksprintf failwith "the task gives %s" (show_int_outcome (outcome r)));
++  List.iter (fun f -> if not (Fut.is_resolved f) then failwith "a plain task is unresolved after shutdown") plain
++;;
++
++let pin_main_leaves_current_runner () =
++  ignore (Main.main (fun _ -> ()) : unit);
++  match Fut.map ~f:succ (Fut.return 1) with
++  | _ -> ()
++  | exception e -> Printf.ksprintf failwith "Fut.map after Main.main raises %s" (Printexc.to_string e)
++;;
++
++let pin_fulfill_after_shutdown_raises () =
++  let fut, promise = Fut.make () in
++  let called = ref false in
++  Fut.on_result fut (fun _ -> called := true);
++  let pool = Ws_pool.create ~num_threads:1 () in
++  ignore (Fut.spawn ~on:pool (fun () -> Fut.await fut) : int Fut.t);
++  Runner.shutdown pool;
++  (match Fut.fulfill promise (Ok 1) with
++   | () -> ()
++   | exception e -> Printf.ksprintf failwith "fulfill raises %s" (Printexc.to_string e));
++  if not !called then failwith "on_result callback not called"
++;;
++
++let pin_fifo_shutdown_drops_awaiting_task () =
++  let pool = Fifo_pool.create ~num_threads:1 () in
++  let gate = Atomic.make false in
++  let started = Atomic.make false in
++  let parent =
++    Fut.spawn ~on:pool (fun () ->
++      let child =
++        Fut.spawn_on_current_runner (fun () ->
++          while not (Atomic.get gate) do
++            Thread.yield ()
++          done;
++          41)
++      in
++      Atomic.set started true;
++      Fut.await child + 1)
++  in
++  eventually "the task has not started" (fun () -> Atomic.get started);
++  Runner.shutdown_without_waiting pool;
++  Atomic.set gate true;
++  Runner.shutdown pool;
++  match Fut.peek parent with
++  | Some (Ok 42) -> ()
++  | Some r -> Printf.ksprintf failwith "the task gives %s" (show_int_outcome (outcome r))
++  | None -> failwith "the task is unresolved after shutdown"
++;;
++
++let pin_chan_max_size_zero () =
++  let c = Chan.create ~max_size:0 () in
++  if Chan.try_push c 1 then failwith "a channel of max_size 0 takes an element"
++;;
++
++let pin_fut_for_negative () =
++  with_pool (fun pool ->
++    match settle ~within:0.5 (Fut.for_ ~on:pool (-1) ignore) with
++    | Some (Ok ()) -> ()
++    | Some (Error (e, _)) -> Printf.ksprintf failwith "fails with %s" (Printexc.to_string e)
++    | None -> failwith "never resolves")
++;;
++
++let () =
++  Zoo.run
++    [ "chan_threads", isolated chan_threads
++    ; "chan_domains", isolated chan_domains
++    ; "blocking_queue_threads", isolated blocking_queue_threads
++    ; "blocking_queue_domains", isolated blocking_queue_domains
++    ; "ws_deque_model", isolated ws_deque_model
++    ; "ws_deque_threads", isolated ws_deque_threads
++    ; "ws_deque_domains", isolated ws_deque_domains
++    ; "lock_threads", isolated lock_threads
++    ; "lock_domains", isolated lock_domains
++    ; "fut_threads", isolated fut_threads
++    ; "fut_domains", isolated fut_domains
++    ; "runner_threads", isolated runner_threads
++    ; "runner_domains", isolated runner_domains
++    ; "chan_model", isolated chan_model
++    ; "blocking_queue_model", isolated blocking_queue_model
++    ; "fut_combinators", isolated fut_combinators
++    ; "fut_for_", isolated fut_for_
++    ; "fork_join_matches_list", isolated fork_join_matches_list
++    ; "main_runs_tasks", isolated main_runs_tasks
++    ; "combinators_after_main", isolated combinators_after_main
++    ; "fulfill_wakes_every_waiter", isolated fulfill_wakes_every_waiter
++    ; "shutdown_finishes_work", isolated shutdown_finishes_work
++    ; "pin_main_leaves_current_runner", isolated pin_main_leaves_current_runner
++    ; "pin_fulfill_after_shutdown_raises", isolated pin_fulfill_after_shutdown_raises
++    ; "pin_fifo_shutdown_drops_awaiting_task", isolated pin_fifo_shutdown_drops_awaiting_task
++    ; "pin_chan_max_size_zero", isolated pin_chan_max_size_zero
++    ; "pin_fut_for_negative", isolated pin_fut_for_negative
++    ]
++;;
